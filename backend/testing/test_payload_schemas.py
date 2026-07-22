@@ -304,7 +304,6 @@ def test_parse_acceptance_evidence_context_vocab_unchanged_by_normalization():
 EXPECTED_TYPES = {
     "create",
     "review",
-    "panel_review",
     "fix",
     "plan",
     "research",

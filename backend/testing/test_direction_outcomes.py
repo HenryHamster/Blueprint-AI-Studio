@@ -5717,16 +5717,16 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
         context={"pr_number": 88},
         title="review-of-open-pr",
     )
-    # (9) COMPLETED 'panel_review' child attached to an open PR via the payload
+    # (9) COMPLETED 'review' child attached to an open PR via the payload
     #     pr_number — excluded too.
     await _create_child_task(
         db_session,
         research_task.id,
         project.id,
         status=TaskStatus.COMPLETED,
-        payloads=[{"type": "panel_review", "pr_number": 91}],
+        payloads=[{"type": "review", "pr_number": 91, "branch": "feat/x"}],
         context={},
-        title="panel-review-of-open-pr",
+        title="review-of-open-pr-2",
     )
     await db_session.flush()
 
@@ -5738,13 +5738,13 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
     )
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    # Only child (1) qualifies: the fix/review/panel_review children attached to
+    # Only child (1) qualifies: the fix/review children attached to
     # open PRs (7-9) are NOT no-CODE no-ops even though _opened_pr is False.
     assert entry["tasks_completed_no_pr"] == 1
     # Sanity: the other completed children are still reflected in their buckets.
     assert entry["prs_merged"] == 1
     assert entry["prs_rejected"] == 1
-    # The open-PR fix/review/panel_review children DID complete, so they are
+    # The open-PR fix/review children DID complete, so they are
     # still part of tasks_completed (1 no-op + merged + rejected + opened-pr + 3).
     assert entry["tasks_completed"] == 7
 

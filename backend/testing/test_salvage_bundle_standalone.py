@@ -5700,9 +5700,6 @@ def test_image_cache_by_project_structure():
     )
 
 
-# ── rc-1: blind_multi_reviewer_gate_enabled default-on alignment ─────────────
-
-
 def _find_backend_app_file(rel_path: str):
     """Locate a backend/app file using standard candidate paths."""
     import pathlib
@@ -5730,54 +5727,6 @@ def _find_repo_file(rel_path: str):
         if c.exists():
             return c
     raise FileNotFoundError(f"Could not locate repo/{rel_path}")
-
-
-def test_blind_multi_reviewer_gate_registered_default_true():
-    """blind_multi_reviewer_gate_enabled must be registered True in runtime_config_state.
-
-    Finding rc-1: the knob was registered True but read with a False fallback in
-    task_lifecycle.py, silently disabling blind multi-review on any config path
-    that omits the key. The registry default must be True and every read-site
-    must use True as its fallback.
-    """
-    src = _find_backend_app_file("runtime_config_state.py").read_text()
-    assert '"blind_multi_reviewer_gate_enabled": True' in src, (
-        "runtime_config_state.py must register blind_multi_reviewer_gate_enabled as True — "
-        "any config path that omits the key must enable blind multi-review"
-    )
-
-
-def test_blind_multi_reviewer_gate_task_lifecycle_fallback_true():
-    """task_lifecycle.py must read blind_multi_reviewer_gate_enabled with fallback True.
-
-    Finding rc-1: the fallback was False, so bare/test/reset configs silently
-    disabled blind multi-review. The fallback must match the registered default.
-    """
-    import ast
-
-    src = _find_backend_app_file("task_lifecycle.py").read_text()
-    tree = ast.parse(src)
-    bad_fallbacks = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == "get"):
-            continue
-        if not node.args:
-            continue
-        first = node.args[0]
-        if not (isinstance(first, ast.Constant) and first.value == "blind_multi_reviewer_gate_enabled"):
-            continue
-        if len(node.args) < 2:
-            continue
-        fallback = node.args[1]
-        if not (isinstance(fallback, ast.Constant) and fallback.value is True):
-            bad_fallbacks.append(f"line {node.lineno}: fallback={ast.unparse(fallback)}")
-    assert not bad_fallbacks, (
-        "task_lifecycle.py reads blind_multi_reviewer_gate_enabled with wrong fallback — "
-        f"must use True to match the registry default; found: {bad_fallbacks}"
-    )
 
 
 # ── rc-2: max_active_directions fallback alignment ────────────────────────────

@@ -95,7 +95,7 @@ def _locate_agent_binary() -> list[str] | None:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_TASK_TYPES = frozenset({
-    "review", "panel_review", "plan", "research", "strategic_review",
+    "review", "plan", "research", "strategic_review",
     "design_doc_update", "security_audit", "investigate", "self_audit",
     "release_audit", "release_audit_challenge", "release_merge_grade",
     "memo", "verify_tests", "compute_experiment", "web_research",

@@ -279,10 +279,6 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
         "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING; self_repair_burn_share from Task.format_compliance_summary.format_repair_attempts; by_failure_class from Task.context.failure_category",
         "consumer": "read_baseline_with_drift -> llm_cost_attribution (strategic_spawning digest payload)",
     },
-    "panel_review_effectiveness": {
-        "ground_truth": "Task.context.review_second_opinion.state (challenged_confirmed / challenged_revised / challenged_rejected)",
-        "consumer": "efficiency_snapshot.write_snapshot (durable gate ROI signal in daily snapshot)",
-    },
     "effort_model_efficiency": {
         "ground_truth": "Task.first_payload[effort] + Task.provider + Task.model + Task.context.pr_merged + api_call_summary tokens priced via LLM_TOKEN_PRICING",
         "consumer": "efficiency_snapshot.write_snapshot → read_baseline_with_drift (persisted by_model efficiency breakdown for DeepSeek vs Anthropic A/B)",
@@ -453,8 +449,7 @@ async def _load_recent_tasks(
                 # strategic_cycle_id: required for strategic_cycle_cost_per_event
                 # aggregation in _compact_llm_cost_attribution.
                 Task.strategic_cycle_id,
-                # updated_at: loaded so compute_panel_review_effectiveness can
-                # filter tasks to a post-deploy window via the since_dt parameter.
+                # updated_at: used for ordering and windowed filtering.
                 Task.updated_at,
                 raiseload=True,
             )
@@ -2175,325 +2170,6 @@ def _compute_cold_start_breakdown_p50(
 
 
 
-def compute_panel_review_effectiveness(
-    tasks: list[Task], *, since_dt: datetime | None = None
-) -> Dict[str, Any] | None:
-    """Panel review gate effectiveness: overturn, confirmation, revision, and fail-open counts.
-
-    Reads ``context["review_second_opinion"]`` from every terminal task in the
-    window and buckets each record by its reconciliation state:
-      * ``challenged_confirmed``  — panel upholds the primary verdict unchanged.
-      * ``challenged_revised``    — same verdict direction, surviving issue set changed.
-      * ``challenged_rejected``   — panel overturns the verdict direction (the ROI signal).
-
-    The plain ``unchallenged`` state (gate off or primary was not an APPROVE) is
-    excluded because it does not represent a gate invocation.  Records where
-    ``unchallenged`` is combined with ``escalated=True`` capture a distinct class:
-    the challenger task crashed or returned an unparseable verdict, so the merge was
-    BLOCKED and escalated for manual review (fail-CLOSED/safe).  These are counted
-    as ``challenged_escalated`` for operator awareness but are excluded from
-    ``fail_open_rate`` because no auto-merge occurred.
-
-    Records with ``state == 'degraded_model_unavailable'`` represent the true
-    fail-open path: the challenger's model was inaccessible, so the primary verdict
-    was adopted and (for APPROVE + trunk target) the PR was auto-merged with no
-    independent second opinion.  These are counted as ``challenged_degraded`` and
-    drive ``fail_open_rate``.
-
-    Records with ``state == 'sampled_out'`` represent invocation opportunities that
-    were skipped due to sample_rate < 1.0. These are counted separately so
-    effective_coverage can be computed: the fraction of invocation opportunities
-    where the challenger actually ran (challenged + degraded + escalated) vs.
-    the total opportunities (including sampled_out).
-
-    Returns ``None`` when no gate invocations exist in the window.
-
-    ``overturn_rate`` = challenged_rejected / total_challenged — the share of
-    primary APPROVEs that the independent panel flipped to REQUEST_CHANGES. A rate
-    near 0 means the gate is expensive (full Opus-tier run) with marginal catch;
-    a high rate justifies the spend.
-
-    ``cost_per_challenge_usd`` = total LLM cost of panel_review tasks / total_challenged.
-    Provides the spend-per-invocation needed to compute gate ROI alongside overturn_rate.
-
-    ``challenged_escalated`` — count of invocations where the challenger crashed or
-    returned an unparseable verdict, triggering a manual escalation (merge BLOCKED).
-    Informational only; excluded from ``fail_open_rate``.
-
-    ``challenged_degraded`` — count of invocations where the challenger's model was
-    unavailable, causing a silent auto-merge with no independent second opinion.
-    This is the true fail-open path.
-
-    ``sampled_out_count`` — count of invocation opportunities skipped due to
-    sample_rate < 1.0. When sample_rate < 1.0, many merges are never challenged,
-    so a low fail_open_rate can coexist with high overall fail-open risk if
-    coverage is low (most merges untested).
-
-    ``effective_coverage`` = (challenged + degraded + escalated) / (challenged +
-    degraded + escalated + sampled_out). The fraction of invocation opportunities
-    where the gate actually ran (successful challenge, fail-open, or escalation).
-    None only when sampled_out_count is 0 and gate was never invoked.
-
-    ``fail_open_rate`` = challenged_degraded / (total_challenged + challenged_degraded).
-    """
-    from app.task_completion import (  # noqa: PLC0415
-        REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-    )
-
-    confirmed = 0
-    revised = 0
-    rejected = 0
-    escalated = 0
-    degraded = 0
-    sampled_out = 0
-    for t in tasks:
-        if since_dt is not None and t.updated_at is not None and t.updated_at < since_dt:
-            continue
-        recon = (t.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
-        if not isinstance(recon, dict):
-            continue
-        state = recon.get("state")
-        if state == "challenged_confirmed":
-            confirmed += 1
-        elif state == "challenged_revised":
-            revised += 1
-        elif state == "challenged_rejected":
-            rejected += 1
-        elif state == "unchallenged" and recon.get("escalated"):
-            escalated += 1
-        elif state == "degraded_model_unavailable":
-            degraded += 1
-        elif state == "sampled_out":
-            sampled_out += 1
-
-    total = confirmed + revised + rejected
-    if total == 0 and escalated == 0 and degraded == 0 and sampled_out == 0:
-        return None
-
-    # Sum LLM cost across panel_review challenger tasks in the window.
-    panel_review_llm_cost = sum(
-        _task_llm_cost(t)[0]
-        for t in tasks
-        if (t.first_payload or {}).get("type") == "panel_review"
-        and (since_dt is None or t.updated_at is None or t.updated_at >= since_dt)
-    )
-    cost_per_challenge = round(panel_review_llm_cost / total, 4) if total > 0 else None
-
-    # Effective coverage: fraction of invocation opportunities where gate ran
-    # (challenged + degraded + escalated) vs. total opportunities (including sampled_out).
-    challenged_total = total + degraded + escalated
-    all_opportunities = challenged_total + sampled_out
-    effective_coverage = (
-        round(challenged_total / all_opportunities, 4) if all_opportunities > 0 else None
-    )
-
-    return {
-        "challenged_confirmed": confirmed,
-        "challenged_revised": revised,
-        "challenged_rejected": rejected,
-        "total_challenged": total,
-        "overturn_rate": round(rejected / total, 4) if total > 0 else None,
-        "cost_per_challenge_usd": cost_per_challenge,
-        "challenged_escalated": escalated,
-        "challenged_degraded": degraded,
-        "sampled_out_count": sampled_out,
-        "effective_coverage": effective_coverage,
-        # 0.0 when gate invoked and no degraded events (confirmed-zero, distinct from no-data).
-        # None when total_challenged == 0 and degraded == 0 — includes escalated-only windows.
-        "fail_open_rate": round(degraded / (total + degraded), 4) if (total > 0 or degraded > 0) else None,
-    }
-
-
-_PANEL_MIN_SAMPLE = 30
-_PANEL_EARNING_THRESHOLD = 0.10  # 10% overturn rate = gate earns its cost
-
-# Gate-health verdict state strings — the single source of truth mirrored by the
-# operator dashboard's GateHealthBadge (admin-ui/src/components/AdversarialQualityPanel.tsx).
-# Promoting them into the backend lets the autonomous strategist read the same
-# calibrated ≤5% fail-open verdict the operator sees, instead of recomputing it.
-GATE_HEALTH_NO_DATA = "NO_DATA"
-GATE_HEALTH_DEGRADED = "DEGRADED"
-GATE_HEALTH_INSUFFICIENT = "INSUFFICIENT"
-GATE_HEALTH_LOW_COVERAGE = "LOW_COVERAGE"
-GATE_HEALTH_PARTIAL = "PARTIAL"
-GATE_HEALTH_HEALTHY = "HEALTHY"
-
-# fail_open_rate thresholds — kept identical to the frontend GateHealthBadge.
-_GATE_DEGRADED_RATE = 0.05  # at/above → DEGRADED (takes priority over min-sample)
-_GATE_PARTIAL_RATE = 0.01  # at/above (and enough sample) → PARTIAL
-_GATE_MIN_COVERAGE = 0.5  # effective_coverage below this → LOW_COVERAGE, not HEALTHY
-
-
-def compute_gate_health_verdict(
-    panel_review_effectiveness: Dict[str, Any] | None,
-    *,
-    min_sample: int = _PANEL_MIN_SAMPLE,
-) -> Dict[str, Any]:
-    """Classify the panel-review challenge gate's fail-open health.
-
-    Pure and DB-free: depends only on the dict shape returned by
-    ``compute_panel_review_effectiveness`` (or ``None``). Returns the verdict
-    ``state`` plus the supporting numbers (``fail_open_rate``,
-    ``total_invocations``, ``min_sample``) so a consumer sees WHY.
-
-    Mirrors the operator dashboard's ``GateHealthBadge`` semantics EXACTLY so the
-    two surfaces never diverge. Evaluation order (the order matters):
-
-      * ``None`` input or zero gate invocations → ``NO_DATA``.
-      * ``fail_open_rate >= 0.05`` → ``DEGRADED``. This is checked BEFORE the
-        min-sample gate, so a degraded rate on a tiny sample is still DEGRADED,
-        never HEALTHY or INSUFFICIENT.
-      * fewer than ``min_sample`` (30) gate invocations → ``INSUFFICIENT``. This
-        is the calibration that prevents reporting HEALTHY off a window with too
-        few (or zero) real gate invocations.
-      * ``effective_coverage < 0.5`` → ``LOW_COVERAGE``. Checked after
-        INSUFFICIENT so a sufficient-sample window with low coverage is flagged
-        before considering the rate-based tiers.
-      * ``fail_open_rate >= 0.01`` → ``PARTIAL``.
-      * otherwise → ``HEALTHY``.
-
-    Gate invocations = ``total_challenged + challenged_degraded`` (matches the
-    frontend's ``total + failOpen``); the rate equals the emitted
-    ``fail_open_rate`` = degraded / invocations.
-    """
-    if panel_review_effectiveness is None:
-        return {
-            "state": GATE_HEALTH_NO_DATA,
-            "fail_open_rate": None,
-            "total_invocations": 0,
-            "min_sample": min_sample,
-        }
-
-    total = panel_review_effectiveness.get("total_challenged", 0) or 0
-    degraded = panel_review_effectiveness.get("challenged_degraded", 0) or 0
-    invocations = total + degraded
-    rate = panel_review_effectiveness.get("fail_open_rate")
-    if rate is None and invocations > 0:
-        rate = degraded / invocations
-
-    effective_coverage = (panel_review_effectiveness or {}).get("effective_coverage")
-
-    if invocations == 0:
-        state = GATE_HEALTH_NO_DATA
-    elif rate is not None and rate >= _GATE_DEGRADED_RATE:
-        state = GATE_HEALTH_DEGRADED
-    elif invocations < min_sample:
-        state = GATE_HEALTH_INSUFFICIENT
-    elif effective_coverage is not None and effective_coverage < _GATE_MIN_COVERAGE:
-        state = GATE_HEALTH_LOW_COVERAGE
-    elif rate is not None and rate >= _GATE_PARTIAL_RATE:
-        state = GATE_HEALTH_PARTIAL
-    else:
-        state = GATE_HEALTH_HEALTHY
-
-    return {
-        "state": state,
-        "fail_open_rate": rate,
-        "total_invocations": invocations,
-        "min_sample": min_sample,
-    }
-
-
-async def _resolve_deploy_since(
-    session: AsyncSession, project_id: uuid.UUID
-) -> datetime | None:
-    """Resolve the post-deployment boundary for a project.
-
-    The boundary is the ``captured_at`` of the earliest persisted efficiency
-    baseline snapshot recorded under the current serving SHA. Used as ``since_dt``
-    to scope ``compute_panel_review_effectiveness`` to post-deployment traffic.
-
-    Returns ``None`` when the serving SHA is unknown, the project is missing, or
-    no snapshot has yet been captured under the current build — callers must NOT
-    fabricate a boundary in that case.
-    """
-    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
-
-    serving_sha = get_serving_sha()
-    if not serving_sha:
-        return None
-    project_row = await session.get(Project, project_id)
-    if project_row is None:
-        return None
-    container = (project_row.design_doc or {}).get(DESIGN_DOC_KEY) or {}
-    for snap in container.get("snapshots") or []:
-        if snap.get("serving_sha") == serving_sha:
-            try:
-                return datetime.fromisoformat(snap["captured_at"])
-            except (KeyError, ValueError, TypeError):
-                return None
-    return None
-
-
-def compute_recommended_challenger_sample_rate(
-    panel_review_effectiveness: Dict[str, Any] | None,
-) -> Dict[str, Any]:
-    """Data-driven recommended sample_rate for the panel_review challenger gate.
-
-    Thresholds:
-    - no_data: no gate invocations in the window → no recommendation.
-    - insufficient_data: fewer than 30 challenges → sample too small.
-    - gate_earning: overturn_rate >= 10% → gate justifies full cost; keep 1.0.
-    - reduce: overturn_rate < 10% → recommended = clamp(rate/0.10, 0.10, 1.0).
-    """
-    if panel_review_effectiveness is None:
-        return {
-            "status": "no_data",
-            "recommended_sample_rate": None,
-            "rationale": "No gate invocations in the snapshot window.",
-        }
-    total = panel_review_effectiveness.get("total_challenged", 0)
-    if total < _PANEL_MIN_SAMPLE:
-        return {
-            "status": "insufficient_data",
-            "recommended_sample_rate": None,
-            "rationale": f"Only {total} challenges — need {_PANEL_MIN_SAMPLE} for a reliable estimate.",
-        }
-    overturn_rate = panel_review_effectiveness.get("overturn_rate", 0.0)
-    if overturn_rate >= _PANEL_EARNING_THRESHOLD:
-        return {
-            "status": "gate_earning",
-            "recommended_sample_rate": 1.0,
-            "rationale": (
-                f"overturn_rate={overturn_rate:.1%} ≥ {_PANEL_EARNING_THRESHOLD:.0%} threshold"
-                " — gate earns its cost; keep sample_rate=1.0."
-            ),
-        }
-    recommended = max(
-        0.10, min(1.0, round(overturn_rate / _PANEL_EARNING_THRESHOLD, 2))
-    )
-    savings_pct = round((1.0 - recommended) * 100)
-    return {
-        "status": "reduce",
-        "recommended_sample_rate": recommended,
-        "rationale": (
-            f"overturn_rate={overturn_rate:.1%} < {_PANEL_EARNING_THRESHOLD:.0%} threshold"
-            f" — recommend sample_rate={recommended} to save ~{savings_pct}% of challenger runs."
-        ),
-    }
-
-
-def assess_post_deploy_gate_health(
-    panel_review_effectiveness_post_deploy: Dict[str, Any] | None,
-) -> Dict[str, Any]:
-    """Assess gate health for a post-deployment time window.
-
-    Computes the gate health verdict for tasks completed after a deployment
-    boundary. Used by the strategist and operator dashboard to validate that
-    the deployed version meets the ≤5% fail-open health threshold.
-
-    Returns the gate health verdict dict with state, fail_open_rate,
-    total_invocations, and min_sample fields. State will be:
-    - NO_DATA: no gate invocations post-deploy.
-    - DEGRADED: ≥5% fail-open (takes priority).
-    - INSUFFICIENT: <30 invocations (too few to certify).
-    - LOW_COVERAGE: <50% effective coverage with sufficient invocations.
-    - PARTIAL: 1-5% fail-open with sufficient invocations.
-    - HEALTHY: <1% fail-open with ≥30 invocations and ≥50% coverage.
-    """
-    return compute_gate_health_verdict(panel_review_effectiveness_post_deploy)
-
-
 def _find_agent_src() -> str | None:
     """Locate the agent/src directory for prompt.ts static-size introspection.
 
@@ -3054,13 +2730,6 @@ async def compute_current_axes(
     except Exception:
         pass
 
-    # Deploy-scoped boundary: the earliest snapshot captured under the current
-    # serving SHA, so panel_review_effectiveness can be computed for
-    # post-deployment traffic only. None when the SHA is unknown or this is the
-    # first snapshot under the current build. Shared with the agent fetch surface
-    # via _resolve_deploy_since so both derive the boundary identically.
-    _deploy_since: datetime | None = await _resolve_deploy_since(session, project_id)
-
     # Honest net-cost companion: fold the project's warm-pool idle cost into the
     # cost_per_merged_pr numerator so pre-warming a pool can't make the headline
     # axis look better while real spend rises. Kept SEPARATE from the immutable
@@ -3077,22 +2746,6 @@ async def compute_current_axes(
     cost_incl_pool_idle: float | None = (
         round((total_vm_cost + windowed_idle["total"]) / merged, 4) if merged else None
     )
-
-    # Panel-review gate effectiveness (rolling window) with its calibrated
-    # fail-open health verdict folded in. The verdict is purely additive — all
-    # existing keys are untouched — so older consumers keep working while the
-    # operator response now carries the same HEALTHY/PARTIAL/DEGRADED/INSUFFICIENT
-    # classification the agent fetch surface exposes.
-    _peff = compute_panel_review_effectiveness(tasks)
-    if _peff is not None:
-        _peff["gate_health"] = compute_gate_health_verdict(_peff)
-    _peff_post_deploy = (
-        compute_panel_review_effectiveness(tasks, since_dt=_deploy_since)
-        if _deploy_since is not None
-        else None
-    )
-    if _peff_post_deploy is not None:
-        _peff_post_deploy["gate_health"] = compute_gate_health_verdict(_peff_post_deploy)
 
     # Salvage-bundle effectiveness: count of salvage tasks spawned in the
     # window and the fraction that reached a merged state.
@@ -3184,33 +2837,12 @@ async def compute_current_axes(
         "llm_cost_attribution": _compact_llm_cost_attribution(tasks),
         # VM cost by-task-type attribution: compact breakdown of total VM dollars
         # by task type so operators can see how much of cost_per_merged_pr drift
-        # comes from primary tasks (review, create) vs quality-gate side-cars
-        # (panel_review, investigate graders). Reconciles with cost_per_merged_pr
-        # via the shared get_task_total_vm_cost_usd path.
+        # comes from primary tasks (review, create) vs quality-gate side-cars.
+        # Reconciles with cost_per_merged_pr via the shared get_task_total_vm_cost_usd path.
         "vm_cost_attribution": {
             "by_task_type": compute_vm_cost_by_task_type(tasks),
             "total_vm_usd": round(sum(get_task_total_vm_cost_usd(t) for t in tasks), 6),
         },
-        # Panel review gate ROI: overturn/confirmation/revision counts over the
-        # window. Null when no gate invocations exist (gate disabled or no
-        # APPROVE primary verdicts in the window). overturn_rate is the headline
-        # signal: near-zero = gate is expensive with marginal catch; high =
-        # gate earns its Opus-tier cost. Reads context.review_second_opinion
-        # which the task_lifecycle path stamps on every challenged review task.
-        "panel_review_effectiveness": _peff,
-        # Deploy-scoped companion: same metric but restricted to tasks completed
-        # after the earliest snapshot captured under the current serving SHA.
-        # Lets an operator confirm the <=5% fail_open_rate target for the current
-        # deployment specifically, independent of the rolling 7-day window.
-        # None when no deploy boundary is known (first snapshot under this SHA).
-        "panel_review_effectiveness_post_deploy": _peff_post_deploy,
-        # Data-driven recommended sample_rate for the challenger gate, derived from
-        # the live overturn_rate in the same window. Status is one of: no_data,
-        # insufficient_data, gate_earning, or reduce (with a rationale string and
-        # recommended_sample_rate float or None).
-        "panel_review_recommended_sample_rate": compute_recommended_challenger_sample_rate(
-            _peff
-        ),
         # Provider routing A/B verdict (direction d-cf39cb40): DeepSeek vs
         # Anthropic cost ratio + verified-merge-rate delta, persisted in the
         # daily snapshot so the A/B is machine-checkable on the deployed instance.
@@ -3305,7 +2937,6 @@ async def write_snapshot(
                 "agent_timeout_rate",
                 FORMAT_COMPLIANCE_KEY,
                 "llm_cost_attribution",
-                "panel_review_effectiveness",
                 "effort_model_efficiency",
             ):
                 if snapshot.get(_key) is not None:
@@ -3334,7 +2965,6 @@ async def write_snapshot(
                     "agent_timeout_rate",
                     FORMAT_COMPLIANCE_KEY,
                     "llm_cost_attribution",
-                    "panel_review_effectiveness",
                     "effort_model_efficiency",
                 ]:
                     _bval = baseline.get(_member)
@@ -3430,17 +3060,6 @@ async def write_snapshot(
             ):
                 baseline["llm_cost_attribution"] = snapshot["llm_cost_attribution"]
                 provenance["llm_cost_attribution"] = {
-                    "seeded_at": captured_at,
-                    "snapshot_captured_at": captured_at,
-                }
-            if (
-                baseline.get("panel_review_effectiveness") is None
-                and snapshot.get("panel_review_effectiveness") is not None
-            ):
-                baseline["panel_review_effectiveness"] = snapshot[
-                    "panel_review_effectiveness"
-                ]
-                provenance["panel_review_effectiveness"] = {
                     "seeded_at": captured_at,
                     "snapshot_captured_at": captured_at,
                 }
@@ -3881,7 +3500,6 @@ async def read_baseline_with_drift(
             "agent_timeout_rate",
             FORMAT_COMPLIANCE_KEY,
             "llm_cost_attribution",
-            "panel_review_effectiveness",
             "effort_model_efficiency",
         ]:
             _bval = baseline.get(_member)
@@ -4192,15 +3810,6 @@ async def read_baseline_with_drift(
         "llm_cost_attribution_window_delta": compute_llm_cost_attribution_window_delta(
             llm_cost_attribution_trend
         ),
-        # Panel review effectiveness: the overturn rate, count of challenges by
-        # outcome (confirmed/revised/rejected), and total gate invocations. Null
-        # when no gate invocations exist in the window.
-        "panel_review_effectiveness": latest.get("panel_review_effectiveness"),
-        # Deploy-scoped companion: same metric restricted to post-deployment traffic.
-        # None on snapshots predating this field or when the deploy boundary is unknown.
-        "panel_review_effectiveness_post_deploy": latest.get(
-            "panel_review_effectiveness_post_deploy"
-        ),
         # Provider routing A/B verdict (direction d-cf39cb40): DeepSeek-vs-Anthropic
         # cost ratio + verified-merge-rate delta, persisted in the daily snapshot and
         # surfaced here from the latest snapshot so the A/B is machine-checkable.
@@ -4215,12 +3824,6 @@ async def read_baseline_with_drift(
         # aggregate totals. Persisted in the daily snapshot for retroactive A/B
         # verification of DeepSeek vs Anthropic routing across daily snapshots.
         "effort_model_efficiency": latest.get("effort_model_efficiency"),
-        # Recommended sample_rate for the challenger gate, computed on-the-fly from
-        # the latest snapshot's panel_review_effectiveness so operators always see a
-        # fresh recommendation without waiting for the next daily snapshot write.
-        "panel_review_recommended_sample_rate": compute_recommended_challenger_sample_rate(
-            latest.get("panel_review_effectiveness")
-        ),
         # VM cost attribution: per-task-type breakdown of VM spend, mirroring the
         # structure of llm_cost_attribution but for infrastructure costs. Allows
         # operators to see which task types (review, create, side-car, etc.)

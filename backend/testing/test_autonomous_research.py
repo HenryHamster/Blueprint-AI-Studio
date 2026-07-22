@@ -3219,8 +3219,8 @@ async def test_autonomous_budget_classifies_downstream_churn_out_of_initiative_c
         ),
         Task(
             project_id=project.id,
-            title="Panel Review: servicing",
-            payloads=[{"type": "panel_review", "pr_number": 101}],
+            title="Review: servicing",
+            payloads=[{"type": "review", "pr_number": 101, "branch": "feat/servicing"}],
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             parent_task_id=parent_research.id,
@@ -3270,9 +3270,8 @@ async def test_autonomous_budget_classifies_downstream_churn_out_of_initiative_c
     assert snapshot.task_type_counts["initiative"] == {"create": 1, "research": 1}
     assert snapshot.task_type_counts["servicing"] == {
         "fix": 1,
-        "panel_review": 1,
         "perf": 1,
-        "review": 1,
+        "review": 2,
     }
     assert snapshot.task_type_counts["other"] == {"new_future_type": 1}
 
@@ -7920,10 +7919,10 @@ async def test_stage_dropout_breakdown(db_session):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# tasks_completed_no_pr type-awareness — review/fix/panel_review children that
-# are ATTACHED to a real (open) PR are NOT genuine no-CODE no-ops.  They carry a
-# pr_number (context/payload) even without a PULL_REQUEST artifact of their own,
-# so they must be EXCLUDED from the no-op bucket.  (This is the no-op gate; the
+# tasks_completed_no_pr type-awareness — review/fix children that are ATTACHED
+# to a real (open) PR are NOT genuine no-CODE no-ops.  They carry a pr_number
+# (context/payload) even without a PULL_REQUEST artifact of their own, so they
+# must be EXCLUDED from the no-op bucket.  (This is the no-op gate; the
 # separate _opened_pr type-skip for the merge-VOLUME metrics is unchanged.)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -8151,80 +8150,6 @@ async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
     # a real PR, so it is excluded from tasks_completed_no_pr.
     assert entry.get("tasks_completed_no_pr") == 0, (
         f"Fix task attached to a real PR (pr_number in payload) should NOT count as "
-        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
-        f"entry={entry}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
-    """A completed panel_review task with pr_number in payload and no PULL_REQUEST
-    artifact is ATTACHED to a real (open) PR, so it must NOT be counted as a
-    no-CODE no-op. PanelReviewPayload.pr_number is the PR under review (input) —
-    a real PR association that disqualifies the child from tasks_completed_no_pr.
-    """
-    direction_id = "d-openedpr004"
-    direction = _active_direction(direction_id, "Panel-review PR classification")
-    project = Project(
-        name="Panel Review PR Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    research_task = await _make_research_task(project, direction, db_session)
-
-    panel_review_task = Task(
-        project_id=project.id,
-        title="Panel review of PR #77",
-        payloads=[{"type": "panel_review", "pr_number": 77, "branch": "feature/z"}],
-        status=TaskStatus.COMPLETED,
-        context={"research_task_id": str(research_task.id)},
-        parent_task_id=research_task.id,
-        created_by="ORCHESTRATOR",
-    )
-    db_session.add(panel_review_task)
-    await db_session.commit()
-    await db_session.refresh(panel_review_task)
-
-    dirs = project.directions or []
-    for d in dirs:
-        if d.get("id") == direction_id:
-            d["research_history"] = [
-                {
-                    "timestamp": "2026-04-07T00:00:00",
-                    "task_id": str(research_task.id),
-                    "tasks_created": 1,
-                    "finding_titles": [],
-                }
-            ]
-            break
-    project.directions = dirs
-    from sqlalchemy.orm.attributes import flag_modified
-
-    flag_modified(project, "directions")
-    db_session.add(project)
-    await db_session.commit()
-
-    await _update_direction_research_outcomes(
-        project_id=project.id,
-        direction_id=direction_id,
-        research_task_id=str(research_task.id),
-        session=db_session,
-    )
-
-    await db_session.refresh(project)
-    dirs = project.directions or []
-    d = next(x for x in dirs if x.get("id") == direction_id)
-    entry = d["research_history"][0]
-
-    # panel_review task attached to an open PR (pr_number in payload) → NOT a
-    # no-CODE no-op, so it is excluded from tasks_completed_no_pr.
-    assert entry.get("tasks_completed_no_pr") == 0, (
-        f"Panel_review task attached to a real PR (pr_number in payload) should NOT count as "
         f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
         f"entry={entry}"
     )

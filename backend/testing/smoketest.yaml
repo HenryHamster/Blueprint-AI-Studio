@@ -43,7 +43,7 @@ suites:
 
   regression:
     description: "Remainder of the CI standalone gate — manifests, migration chain, deprecations (no DB, ~212 tests)"
-    pytest_args: "testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_panel_review_metric_manifest.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_monthly_budget_alerts.py testing/test_migration_chain.py testing/test_salvage_bundle_standalone.py --noconftest -v --tb=short"
+    pytest_args: "testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_monthly_budget_alerts.py testing/test_migration_chain.py testing/test_salvage_bundle_standalone.py --noconftest -v --tb=short"
     fail_action: "fix_normal_priority"
 
 guardrails:

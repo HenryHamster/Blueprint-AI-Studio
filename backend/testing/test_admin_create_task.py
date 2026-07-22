@@ -93,26 +93,6 @@ async def test_hotfix_fix_task_rejected_with_400(client: AsyncClient, db_session
 
 
 @pytest.mark.asyncio
-async def test_panel_review_task_requires_branch(client: AsyncClient, db_session):
-    """panel_review manual creation must reject missing branch before persistence."""
-    await _make_project_with_member(db_session, "acme/widget")
-
-    resp = await client.post(
-        "/api/admin/tasks",
-        json={
-            "github_repo": "acme/widget",
-            "title": "Panel review without branch",
-            "prompt": "review this PR",
-            "task_type": "panel_review",
-            "pr_number": 123,
-        },
-    )
-
-    assert resp.status_code == 422, resp.text
-    assert "branch is required for task_type 'panel_review'" in resp.text
-
-
-@pytest.mark.asyncio
 async def test_hotfix_plan_task_accepted(client: AsyncClient, db_session):
     """hotfix=true on a plan task is allowed — the documented hotfix path —
     and the hotfix flag is persisted in the stored task payload so the agent

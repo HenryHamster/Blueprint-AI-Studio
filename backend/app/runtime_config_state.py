@@ -82,28 +82,6 @@ runtime_config: Dict = {
     # update so the queue and the agent fix path never double-fire. Genuine
     # dirty conflicts outlive the window and use the agent path unchanged.
     "rollup_merge_queue_enabled": True,
-    # Default-on second-opinion gate for high-stakes ordinary review verdicts.
-    # When True, a trunk-targeting APPROVE→merge from an ordinary ``review``
-    # task (PR base = integration branch or promotion target) does not commit
-    # until an independent panel_review challenge has been recorded and
-    # reconciled against the primary verdict. Other verdicts (REQUEST_CHANGES,
-    # non-trunk APPROVEs) proceed synchronously. Disabling it
-    # restores today's synchronous review-finalization behavior WITHOUT removing
-    # the panel_review task type (it stays available as a user-launchable
-    # advisory workflow); reconciliation records then read ``unchallenged``.
-    "review_second_opinion_gate_enabled": True,
-    # Default-on blind multi-reviewer gate for judgment-shaped acceptance
-    # decisions (pillar 2 of independent acceptance verification). When True
-    # (default), eligible high-stakes decisions spawn N independent blind
-    # reviewers (panel_review with is_blind=True and majority voting) instead
-    # of a single second-opinion review. Operator can disable via
-    # PATCH /api/admin/settings.
-    "blind_multi_reviewer_gate_enabled": True,
-    # Fraction of high-stakes trunk-targeting APPROVEs that spawn a panel_review
-    # challenger (0.0 = none, 1.0 = all). Default 1.0 preserves existing behavior.
-    # Uses deterministic task-ID-based sampling so operators can safely dial down
-    # challenger frequency without randomness between restarts.
-    "review_second_opinion_sample_rate": 1.0,
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "retry_after_reset_alert_threshold": int(
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")

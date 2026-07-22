@@ -16,7 +16,6 @@ from typing import Literal
 class TaskType(str, Enum):
     create = "create"
     review = "review"
-    panel_review = "panel_review"
     fix = "fix"
     plan = "plan"
     research = "research"
@@ -270,23 +269,6 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="review_only",
         cost_ceiling_usd=3.0,
         evaluation="none",
-    ),
-    TaskCapability(
-        TaskType.panel_review,
-        "Panel Review",
-        "read_only",
-        default_category="review",
-        user_launchable=True,
-        description=(
-            "Run a fixed multi-agent review workflow over an existing PR and "
-            "persist a structured verdict artifact."
-        ),
-        run_shape="workflow",
-        output_kind="verdict",
-        evaluation_strategy="review_only",
-        cost_ceiling_usd=6.0,
-        completion_handler="panel_review",
-        evaluation="structured-verdict",
     ),
     TaskCapability(
         TaskType.fix,
@@ -1006,7 +988,6 @@ AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES: frozenset[str] = frozenset(
 AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
     {
         TaskType.review.value,
-        TaskType.panel_review.value,
         TaskType.fix.value,
         TaskType.perf.value,
         TaskType.verify_tests.value,

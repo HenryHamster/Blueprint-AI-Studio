@@ -52,7 +52,7 @@ from app.json_extract import scan_balanced_json_objects
 from app.task_blocked import reset_task_for_fresh_attempt
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project, _sanitize_log
-from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
+from app.payload_schemas import validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
     SPAWN_REASON_DEFERRED,
@@ -71,9 +71,6 @@ from app.review_pipeline import (
 )
 from app.failure_classification import (
     classify_failure,
-    classify_external_api_subtype,
-    EXTERNAL_API,
-    EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
 )
 from app.branch_resolution import (
     classify_rollup_merge_outcome,
@@ -834,316 +831,6 @@ async def _resolve_quality_grader_completion(
         logger.debug("[GRADER] broadcast after grade failed", exc_info=True)
 
 
-
-async def _resolve_review_second_opinion(
-    challenger: Task, payload: AgentStatusPayload, session: AsyncSession
-) -> None:
-    """Resolve an independent panel-review challenge and reconcile it.
-
-    The challenger (spawned by
-    ``task_evaluators.spawn_review_second_opinion``) ran an independent
-    multi-lens panel review of the same PR. Here we parse its verdict,
-    reconcile it against the parked primary verdict, persist a durable
-    reconciliation record on the review task's context, and re-dispatch the
-    review task through the normal finalization path with the reconciled
-    verdict. Fail-closed: if the challenge FAILED or its output is
-    unparseable, do NOT merge or spawn.
-    """
-    from app.task_evaluators import (
-        BLIND_REVIEW_SOURCE_KEY,
-        REVIEW_SECOND_OPINION_SOURCE_KEY,
-        REVIEW_SECOND_OPINION_AWAITING_KEY,
-        REVIEW_SECOND_OPINION_PARKED_KEY,
-    )
-    from app.task_completion import (
-        _parse_panel_review_output,
-        reconcile_review_second_opinion,
-        REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-    )
-    from app.broadcast import broadcast_to_project
-
-    source_id = (challenger.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY)
-    try:
-        source_uuid = uuid.UUID(str(source_id))
-    except (ValueError, TypeError):
-        await session.commit()
-        return
-
-    review = (
-        (
-            await session.execute(
-                select(Task).where(Task.id == source_uuid).with_for_update()
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if review is None:
-        await session.commit()
-        logger.warning(
-            "[REVIEW SECOND-OPINION] Review task %s for challenger %s is gone; verdict dropped",
-            source_id,
-            challenger.id,
-        )
-        return
-
-    _review_ctx = review.context or {}
-    lane = "review_second_opinion"
-    pending_application = _sidecar_application_pending(
-        dict(_review_ctx), lane=lane, sidecar_id=challenger.id
-    )
-    if not pending_application and (
-        REVIEW_SECOND_OPINION_RECONCILIATION_KEY in _review_ctx
-        or REVIEW_SECOND_OPINION_AWAITING_KEY not in _review_ctx
-    ):
-        await session.commit()
-        logger.info(
-            "[REVIEW SECOND-OPINION] Challenge %s for review %s already resolved — ignoring replayed terminal status",
-            challenger.id,
-            review.id,
-        )
-        return
-
-    parked = (review.context or {}).get(REVIEW_SECOND_OPINION_PARKED_KEY) or {}
-    primary_verdict = parked.get("verdict") or "REQUEST_CHANGES"
-    primary_issues = parked.get("issues") or []
-
-    if pending_application:
-        record = dict(
-            (review.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY) or {}
-        )
-        panel = {"pending_replay": True} if record else None
-    else:
-        completed = payload.status == TaskStatus.COMPLETED
-        panel = (
-            _parse_panel_review_output(
-                payload.logs or challenger.latest_status_message or ""
-            )
-            if completed
-            else None
-        )
-
-    if panel is None:
-        # Model-config-rejection: the challenger's model is operator-configured but
-        # inaccessible (e.g. "model does not exist or you do not have access").
-        # Silently failing closed would set requires_approval=True on every trunk
-        # APPROVE — converting the gate into an invisible universal merge block.
-        # Instead: degrade visibly, preserve the primary verdict, signal operators.
-        if (
-            not pending_application
-            and payload.status == TaskStatus.FAILED
-            and classify_failure(challenger, logs=payload.logs) == EXTERNAL_API
-            and classify_external_api_subtype(challenger, logs=payload.logs)
-            == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
-        ):
-            logger.warning(
-                "[REVIEW SECOND-OPINION] Challenge %s for review %s: panel model "
-                "unavailable (provider model-config rejection) — degrading gracefully, "
-                "primary verdict %r preserved",
-                challenger.id,
-                review.id,
-                primary_verdict,
-            )
-            try:
-                from app.alert_dispatch import (
-                    _maybe_create_adversarial_gate_fail_open_alert,
-                )
-
-                await _maybe_create_adversarial_gate_fail_open_alert(
-                    review, challenger, session
-                )
-            except Exception as _ae:
-                logger.warning(
-                    "[REVIEW SECOND-OPINION] fail-open alert dispatch failed: %s", _ae
-                )
-            _deg_record: dict = {
-                "state": "degraded_model_unavailable",
-                "reconciled_verdict": primary_verdict,
-                "surviving_issues": primary_issues,
-                "challenger_task_id": str(challenger.id),
-                "review_task_id": str(review.id),
-            }
-            _deg_ctx = dict(review.context or {})
-            _deg_ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
-            _deg_ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = _deg_record
-            _set_sidecar_application_pending(
-                _deg_ctx,
-                lane=lane,
-                sidecar_id=challenger.id,
-                verdict_key=REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-            )
-            review.context = _deg_ctx
-            flag_modified(review, "context")
-            review.status = TaskStatus.COMPLETED
-            session.add(review)
-            challenger.latest_status_message = (
-                "Second-opinion panel model unavailable — degraded to primary verdict"
-            )[:500]
-            session.add(challenger)
-            await session.commit()
-            _deg_reconstructed = AgentStatusPayload(
-                task_id=review.id,
-                status=TaskStatus.COMPLETED,
-                verdict_json=json.dumps(
-                    {
-                        "verdict": _deg_record["reconciled_verdict"],
-                        "issues": _deg_record.get("surviving_issues", []),
-                        "feedback": parked.get("feedback", ""),
-                        "investigated_files": parked.get("investigated_files", []),
-                    }
-                ),
-            )
-            await session.commit()
-            await _process_post_commit(review.id, _deg_reconstructed)
-            await session.refresh(review)
-            _deg_ctx2 = dict(review.context or {})
-            _deg_ctx2.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
-            review.context = _deg_ctx2
-            _clear_sidecar_application_pending(
-                review, lane=lane, sidecar_id=challenger.id
-            )
-            session.add(review)
-            await session.commit()
-            return
-
-        original_task_id = parked.get("original_task_id") or ""
-        ctx = dict(review.context or {})
-        ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
-        ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = {
-            "state": "unchallenged",
-            "escalated": True,
-            "reason": (
-                "second-opinion challenge failed or produced an unparseable "
-                "verdict — escalated to manual review"
-            ),
-            "primary_verdict": primary_verdict,
-            "challenger_task_id": str(challenger.id),
-            "review_task_id": str(review.id),
-        }
-        ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
-        review.context = ctx
-        flag_modified(review, "context")
-        review.status = TaskStatus.COMPLETED
-        review.latest_status_message = (
-            "Second-opinion challenge unresolved — manual review required; "
-            "no merge or fix spawned"
-        )[:500]
-        session.add(review)
-        challenger.latest_status_message = (
-            "Second-opinion panel review failed/unparseable — review escalated"
-        )[:500]
-        session.add(challenger)
-        _gates_on = _runtime_config.get("require_approval_gates", True)
-        if original_task_id:
-            try:
-                orig = await session.get(Task, uuid.UUID(original_task_id))
-                if orig:
-                    if _gates_on:
-                        orig.requires_approval = True
-                    orig.latest_status_message = (
-                        "Second-opinion review challenge unresolved — manual "
-                        "review required"
-                    )[:500]
-                    session.add(orig)
-            except (ValueError, TypeError):
-                pass
-        await session.commit()
-        logger.warning(
-            "[REVIEW SECOND-OPINION] Challenge %s for review %s failed/unparseable — fail-closed escalation, no action taken",
-            challenger.id,
-            review.id,
-        )
-        try:
-            await broadcast_to_project(
-                str(review.project_id),
-                "task_updated",
-                {"task_id": str(review.id), "status": review.status},
-            )
-        except Exception:
-            logger.debug(
-                "[REVIEW SECOND-OPINION] broadcast after escalation failed",
-                exc_info=True,
-            )
-        return
-
-    if not pending_application:
-        record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
-        record["challenger_task_id"] = str(challenger.id)
-        record["review_task_id"] = str(review.id)
-        # Distinguish blind multi-reviewer from single second-opinion challenger
-        # so the reconciliation record is self-describing for telemetry.
-        record["is_blind"] = bool(
-            (challenger.context or {}).get(BLIND_REVIEW_SOURCE_KEY)
-        )
-
-        ctx = dict(review.context or {})
-        ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
-        ctx.pop(REVIEW_SECOND_OPINION_AWAITING_KEY, None)
-        _set_sidecar_application_pending(
-            ctx,
-            lane=lane,
-            sidecar_id=challenger.id,
-            verdict_key=REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-        )
-        review.context = ctx
-        flag_modified(review, "context")
-        review.status = TaskStatus.COMPLETED
-        session.add(review)
-        challenger.latest_status_message = (
-            f"Second-opinion panel: {record['state']} → {record['reconciled_verdict']}"
-        )[:500]
-        session.add(challenger)
-        await session.commit()
-
-    reconstructed = AgentStatusPayload(
-        task_id=review.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json=json.dumps(
-            {
-                # ``record`` may be a stored record loaded on the pending-application
-                # REPLAY path; a fail-closed escalation can persist one without a
-                # ``reconciled_verdict`` key. Fall back to the (in-scope) primary
-                # verdict — the fail-closed value that preserves current behavior on
-                # every reachable path (reconcile_review_second_opinion always sets
-                # the key, so the default is only used by a keyless replay record).
-                "verdict": record.get("reconciled_verdict", primary_verdict),
-                "issues": record.get("surviving_issues", []),
-                "feedback": parked.get("feedback", ""),
-                "investigated_files": parked.get("investigated_files", []),
-            }
-        ),
-    )
-    _blind = " blind" if record.get("is_blind") else ""
-    logger.info(
-        "[REVIEW SECOND-OPINION]%s Challenge %s for review %s reconciled as %s (%s → %s); re-dispatching review",
-        _blind,
-        challenger.id,
-        review.id,
-        record["state"],
-        primary_verdict,
-        record.get("reconciled_verdict", primary_verdict),
-    )
-    # Release the review row's FOR UPDATE lock (acquired above) BEFORE
-    # _process_post_commit: it opens a SEPARATE session and re-acquires FOR UPDATE
-    # SKIP LOCKED on this same review row. On the pending_application=True REPLAY
-    # path the commit inside `if not pending_application:` above is skipped, so
-    # without this the outer lock is still held → the inner acquire returns None
-    # every retry → PostCommitLocked, the marker cleanup below is never reached,
-    # and the reconciled verdict is never applied (deadlock-by-construction on
-    # PostgreSQL). Mirrors the invariant honored at routers/agent_status.py and by
-    # the non-replay branch's commit above; a second commit on the already-committed
-    # non-replay path is a harmless no-op.
-    await session.commit()
-    await _process_post_commit(review.id, reconstructed)
-    await session.refresh(review)
-    ctx = dict(review.context or {})
-    ctx.pop(REVIEW_SECOND_OPINION_PARKED_KEY, None)
-    review.context = ctx
-    _clear_sidecar_application_pending(review, lane=lane, sidecar_id=challenger.id)
-    session.add(review)
-    await session.commit()
-
-
 async def _resolve_finding_challenge_completion(
     challenge: Task, payload: AgentStatusPayload, session: AsyncSession
 ) -> None:
@@ -1318,7 +1005,6 @@ async def trigger_stranded_sidecar_resolution(
     from app.task_evaluators import (
         QUALITY_GRADER_SOURCE_KEY,
         FINDING_CHALLENGE_SOURCE_KEY,
-        REVIEW_SECOND_OPINION_SOURCE_KEY,
     )
 
     synthetic = AgentStatusPayload(
@@ -1331,8 +1017,6 @@ async def trigger_stranded_sidecar_resolution(
         await _resolve_quality_grader_completion(sidecar, synthetic, session)
     elif ctx.get(FINDING_CHALLENGE_SOURCE_KEY):
         await _resolve_finding_challenge_completion(sidecar, synthetic, session)
-    elif ctx.get(REVIEW_SECOND_OPINION_SOURCE_KEY):
-        await _resolve_review_second_opinion(sidecar, synthetic, session)
     else:
         logger.warning(
             "[SIDECAR-RECOVERY] Sidecar %s has no recognised source key; cannot route",
@@ -1368,7 +1052,6 @@ async def _process_post_commit(
     from app.task_completion import (
         _handle_plan_completion,
         _handle_design_doc_completion,
-        _handle_panel_review_completion,
         _handle_security_audit_completion,
         _handle_perf_completion,
         _handle_compute_experiment_completion,
@@ -1625,21 +1308,6 @@ async def _process_post_commit(
         # fail-closed rather than stranding it EVALUATING forever.
         if (task.context or {}).get(FINDING_CHALLENGE_SOURCE_KEY):
             await _resolve_finding_challenge_completion(task, payload, session)
-            return {"status": "accepted"}
-
-        # Review second-opinion challenger side-car: a panel_review task spawned
-        # by the second-opinion gate carries REVIEW_SECOND_OPINION_SOURCE_KEY
-        # pointing at the parked ordinary review task. Its completion resolves
-        # the challenge and re-dispatches the review with the reconciled verdict
-        # — it does NOT flow through the panel_review completion handler, and
-        # (critically) it never re-enters the review-finalization branch, so the
-        # challenger can never recursively re-trigger the gate. Handled before
-        # the COMPLETED-gated pipeline so a FAILED challenger fails closed
-        # (escalates) rather than stranding the review EVALUATING.
-        from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
-
-        if (task.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY):
-            await _resolve_review_second_opinion(task, payload, session)
             return {"status": "accepted"}
 
         # Immediately unblock dependents when task terminally fails (retries exhausted).
@@ -3034,257 +2702,6 @@ async def _process_post_commit(
                                 f"[REVIEW PIPELINE] Failed to mark requires_approval on {original_task_id}: {e}",
                                 exc_info=True,
                             )
-
-                # ── Default-on second-opinion gate ──────────────────────────
-                # Before a high-stakes ordinary review verdict commits, require
-                # an independent panel_review challenge and reconcile it against
-                # this primary verdict. High-stakes = an APPROVE on a PR
-                # targeting a trunk branch (integration branch or promotion
-                # target) — the only verdict that commits an irreversible
-                # auto-merge. REQUEST_CHANGES and non-trunk reviews proceed
-                # synchronously (recorded ``unchallenged``): a wrong rejection
-                # self-corrects through the fix loop, and research-branch PRs
-                # are re-reviewed at the rollup boundary. Default-on; operator
-                # rollback via the ``review_second_opinion_gate_enabled``
-                # runtime flag restores fully synchronous behavior.
-                #
-                # Re-entry: once the challenge has reconciled, the review task
-                # carries the reconciliation record. That record (a) overrides
-                # ``verdict``/``issues`` with the reconciled, surviving set and
-                # (b) suppresses re-spawning the gate (single-shot), so the rest
-                # of this branch runs exactly once more with the reconciled
-                # verdict and every downstream gate unchanged.
-                from app.task_completion import (
-                    REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-                )
-                from app.task_evaluators import (
-                    review_is_high_stakes,
-                    spawn_blind_multi_reviewer,
-                    spawn_review_second_opinion,
-                )
-                from app.review_heuristics import (
-                    _diff_lines_changed,
-                    _is_test_file,
-                )
-
-                _recon_record = (task.context or {}).get(
-                    REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-                )
-                if isinstance(_recon_record, dict) and _recon_record.get(
-                    "review_task_id"
-                ) != str(task.id):
-                    # The record belongs to a DIFFERENT review task (or predates
-                    # ownership stamping): it leaked in via a context copy, e.g.
-                    # the review→fix→review propagation. Adopting it would
-                    # clobber this review's fresh verdict with the earlier
-                    # iteration's verdict + verbatim issues — the identical
-                    # issue set then trips the stuck-cycle detector and falsely
-                    # parks the chain (PR #9243). Scrub the whole inherited
-                    # second-opinion family and run the gate fresh.
-                    logger.warning(
-                        "[REVIEW PIPELINE] PR #%s: ignoring second-opinion "
-                        "record inherited from review %s on review %s",
-                        pr_number,
-                        _recon_record.get("review_task_id"),
-                        task.id,
-                    )
-                    from app.task_completion import (
-                        REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS,
-                    )
-
-                    _scrubbed_ctx = dict(task.context or {})
-                    for _so_key in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS:
-                        _scrubbed_ctx.pop(_so_key, None)
-                    task.context = _scrubbed_ctx
-                    session.add(task)
-                    _recon_record = None
-                if _recon_record is not None:
-                    # Re-entrant pass after reconciliation: adopt the reconciled
-                    # verdict + surviving issue set, then fall through to the
-                    # normal action branches without re-evaluating the gate.
-                    _reconciled = _recon_record.get("reconciled_verdict")
-                    if _reconciled in ("APPROVE", "REQUEST_CHANGES"):
-                        verdict = _reconciled
-                    _surviving = _recon_record.get("surviving_issues")
-                    if isinstance(_surviving, list):
-                        issues = _surviving
-                elif not verdict_unparseable and _runtime_config.get(
-                    "review_second_opinion_gate_enabled", True
-                ):
-                    # Load source task diff stats for the size-exemption check.
-                    # The review task itself does not carry _pr_diff_summary /
-                    # _pr_changed_files (both are excluded from context
-                    # propagation in review_pipeline._PROPAGATE_UNDERSCORE_KEYS),
-                    # so we read them from the original create/fix/refactor task.
-                    # One extra DB read per APPROVE-to-trunk verdict; skipped
-                    # when original_task_id is unavailable (fail-open: challenge).
-                    _so_diff_lines: int | None = None
-                    _so_file_count: int | None = None
-                    _is_observable_behavior: bool = False
-                    if original_task_id:
-                        try:
-                            _so_source = await session.get(
-                                Task, uuid.UUID(original_task_id)
-                            )
-                            if _so_source is not None:
-                                _so_ctx = _so_source.context or {}
-                                _so_diff_lines = _diff_lines_changed(
-                                    _so_ctx.get("_pr_diff_summary"),
-                                    exclude_test_files=True,
-                                )
-                                _so_files = _so_ctx.get("_pr_changed_files") or []
-                                _so_file_count = sum(
-                                    1
-                                    for f in _so_files
-                                    if not _is_test_file(f)
-                                )
-                                # Check whether the source task declared
-                                # observable_behavior acceptance evidence.
-                                # These tasks always get a second opinion
-                                # regardless of diff size — their proof is
-                                # entirely self-reported with no
-                                # machine-checkable assertion.
-                                try:
-                                    _evidence = read_acceptance_evidence(
-                                        _so_source.first_payload
-                                    )
-                                    if (
-                                        _evidence is not None
-                                        and _evidence.kind == "observable_behavior"
-                                    ):
-                                        _is_observable_behavior = True
-                                except Exception:
-                                    pass
-                        except Exception:
-                            logger.debug(
-                                "[REVIEW PIPELINE] PR #%s: could not load source task "
-                                "%s for diff-size check — proceeding with challenge",
-                                pr_number,
-                                original_task_id,
-                            )
-                    if review_is_high_stakes(
-                        verdict,
-                        issues,
-                        investigated_files,
-                        task,
-                        base_branch=base_branch,
-                        trunk_branches=(
-                            _shared_state.get_project_integration_branch(
-                                _review_project
-                            ),
-                            _shared_state.get_project_promotion_target(_review_project),
-                        ),
-                        diff_non_test_lines=_so_diff_lines,
-                        diff_non_test_file_count=_so_file_count,
-                        is_observable_behavior=_is_observable_behavior,
-                    ):
-                        _sample_rate = float(
-                            _runtime_config.get(
-                                "review_second_opinion_sample_rate", 1.0
-                            )
-                        )
-                        _task_slot = task.id.int % 1_000_000 / 1_000_000.0
-                        if _task_slot >= _sample_rate:
-                            logger.info(
-                                "[REVIEW PIPELINE] PR #%s: challenger sampled out "
-                                "(slot=%.6f >= rate=%.4f) — proceeding synchronously",
-                                pr_number,
-                                _task_slot,
-                                _sample_rate,
-                            )
-                            task.context = {
-                                **(task.context or {}),
-                                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
-                                    "state": "sampled_out",
-                                    "sample_rate": _sample_rate,
-                                    "primary_verdict": verdict,
-                                    "reconciled_verdict": verdict,
-                                    "surviving_issues": issues,
-                                    "review_task_id": str(task.id),
-                                },
-                            }
-                            session.add(task)
-                        else:
-                            _use_blind = bool(
-                                _runtime_config.get(
-                                    "blind_multi_reviewer_gate_enabled", True
-                                )
-                            )
-                            if _use_blind:
-                                _challenger = await spawn_blind_multi_reviewer(
-                                    task,
-                                    session,
-                                    verdict=verdict,
-                                    issues=issues,
-                                    feedback=feedback,
-                                    pr_number=pr_number,
-                                    branch=branch,
-                                    base_branch=base_branch,
-                                    original_task_id=original_task_id,
-                                    original_prompt=original_prompt,
-                                    investigated_files=investigated_files,
-                                )
-                            else:
-                                _challenger = await spawn_review_second_opinion(
-                                    task,
-                                    session,
-                                    verdict=verdict,
-                                    issues=issues,
-                                    feedback=feedback,
-                                    pr_number=pr_number,
-                                    branch=branch,
-                                    base_branch=base_branch,
-                                    original_task_id=original_task_id,
-                                    original_prompt=original_prompt,
-                                    investigated_files=investigated_files,
-                                )
-                            if _challenger is not None:
-                                logger.info(
-                                    "[REVIEW PIPELINE] PR #%s: parked review %s "
-                                    "awaiting second-opinion challenge %s "
-                                    "(primary verdict=%s) — not acting yet",
-                                    pr_number,
-                                    task.id,
-                                    _challenger.id,
-                                    verdict,
-                                )
-                                return {"status": "accepted"}
-                            # spawn refused: a challenge is already in flight. Stay
-                            # parked rather than act on the unreconciled verdict.
-                            if (task.context or {}).get(
-                                "awaiting_review_second_opinion"
-                            ):
-                                return {"status": "accepted"}
-                    else:
-                        # Gate on but verdict not high-stakes — proceed
-                        # synchronously and record the unchallenged outcome.
-                        task.context = {
-                            **(task.context or {}),
-                            REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
-                                "state": "unchallenged",
-                                "reason": "verdict not high-stakes",
-                                "primary_verdict": verdict,
-                                "reconciled_verdict": verdict,
-                                "surviving_issues": issues,
-                                "review_task_id": str(task.id),
-                            },
-                        }
-                        session.add(task)
-                elif not verdict_unparseable:
-                    # Gate disabled — preserve today's synchronous behavior and
-                    # record the unchallenged outcome.
-                    task.context = {
-                        **(task.context or {}),
-                        REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
-                            "state": "unchallenged",
-                            "reason": "second-opinion gate disabled",
-                            "primary_verdict": verdict,
-                            "reconciled_verdict": verdict,
-                            "surviving_issues": issues,
-                            "review_task_id": str(task.id),
-                        },
-                    }
-                    session.add(task)
 
                 # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
@@ -5893,7 +5310,6 @@ async def _process_post_commit(
                     "design_doc": _handle_design_doc_completion,
                     "strategic": _handle_strategic_completion,
                     "research": _handle_research_completion,
-                    "panel_review": _handle_panel_review_completion,
                     "security_audit": _handle_security_audit_completion,
                     "perf": _handle_perf_completion,
                     "compute_experiment": _handle_compute_experiment_completion,
@@ -6464,7 +5880,7 @@ async def close_orphan_pr_if_any(
         for payload in (task.payloads or [])
         if isinstance(payload, dict)
     }
-    if payload_types & {"review", "panel_review"}:
+    if payload_types & {"review"}:
         # Review tasks reference the PR they inspect; they do not own it.
         # In particular, review_loop.pr_number is shared with create/fix
         # tasks, so treating that reference as ownership lets cancelling a

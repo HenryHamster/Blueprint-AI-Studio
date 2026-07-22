@@ -2674,12 +2674,12 @@ async def _spawn_pipeline_task(
             func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
         )
         type_match = func.json_extract(Task.payloads, "$[0].type").in_(
-            ("review", "fix", "panel_review")
+            ("review", "fix")
         )
     else:
         pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
         type_match = (
-            Task.payloads[0]["type"].as_string().in_(("review", "fix", "panel_review"))
+            Task.payloads[0]["type"].as_string().in_(("review", "fix"))
         )
     pr_pipeline_tasks = (
         (
@@ -2935,9 +2935,7 @@ async def _spawn_pipeline_task(
     # For the upcoming spawn, fix_reason and task_type determine the lane more
     # precisely than source_task's completed context (which may be from a prior
     # review or a different fix iteration). Override with spawn parameters.
-    if task_type == "panel_review":
-        _spawn_lane = LANE_ARBITRATION
-    elif fix_reason in ("merge_conflict", "update_branch_failed", "migration_guard"):
+    if fix_reason in ("merge_conflict", "update_branch_failed", "migration_guard"):
         _spawn_lane = LANE_CONFLICT
     elif fix_reason == "ci_failure":
         _spawn_lane = LANE_CI

@@ -2311,7 +2311,6 @@ class CreateTaskPayload(BaseModel):
             self.task_type
             in (
                 TaskType.review,
-                TaskType.panel_review,
                 TaskType.fix,
             )
             and self.pr_number is None
@@ -2323,7 +2322,6 @@ class CreateTaskPayload(BaseModel):
             self.task_type
             in (
                 TaskType.review,
-                TaskType.panel_review,
                 TaskType.fix,
             )
             and not self.branch
@@ -2587,7 +2585,6 @@ async def create_task_manually(
         payload.task_type
         in (
             TaskType.review,
-            TaskType.panel_review,
             TaskType.fix,
         )
         and payload.pr_number is not None
@@ -2595,7 +2592,7 @@ async def create_task_manually(
     ):
         task_payload["pr_number"] = payload.pr_number
         task_payload["branch"] = payload.branch
-        if payload.task_type in (TaskType.review, TaskType.panel_review):
+        if payload.task_type == TaskType.review:
             task_payload["original_prompt"] = payload.prompt
     # Research tasks auto-include project directions. For ad-hoc manual
     # spawns we ship lightweight direction summaries (id/text/priority/

@@ -1430,16 +1430,16 @@ async def _update_direction_research_outcomes(
         """True when *ct* opened a PR (via any reliable signal).
 
         PULL_REQUEST artifact is the authoritative signal.  The pr_number
-        fallbacks below are intentionally skipped for 'review', 'fix', and
-        'panel_review' task types: ReviewPayload/PanelReviewPayload.pr_number
-        is the PR under review (not one opened by the task), and fix tasks
+        fallbacks below are intentionally skipped for 'review' and 'fix'
+        task types: ReviewPayload.pr_number is the PR under review (not one
+        opened by the task), and fix tasks
         iterate an existing PR rather than opening a new one (see
         _PR_OPENING_COMPLETION_TYPES in task_lifecycle.py).
         """
         if ct.id in _pr_artifact_task_ids:
             return True
         ct_type = (ct.first_payload or {}).get("type", "")
-        if ct_type in ("review", "fix", "panel_review"):
+        if ct_type in ("review", "fix"):
             return False
         ctx_ = ct.context or {}
         if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
@@ -1450,7 +1450,7 @@ async def _update_direction_research_outcomes(
         """True when *ct* is associated with a real PR — for the no-op gate ONLY.
 
         Unlike ``_opened_pr``, this predicate does NOT skip the pr_number
-        signals for 'review', 'fix', and 'panel_review' types.  For the
+        signals for 'review' and 'fix' types.  For the
         no-CODE-no-op question, ANY association with a real pull request
         disqualifies the child: a fix task that pushed code onto an existing
         open (not-yet-landed) PR carries ``context['review_loop']['pr_number']``
@@ -1459,7 +1459,7 @@ async def _update_direction_research_outcomes(
         code and is NOT a "work already exists" no-op.
 
         Do NOT reuse this for the merge-VOLUME metrics (``merged_prs_any_base``
-        and others): there the fix/review/panel_review pr_number skip in
+        and others): there the fix/review pr_number skip in
         ``_opened_pr`` is correct (a review's pr_number is the PR under review,
         not a merge that task produced).
         """
@@ -1589,7 +1589,7 @@ async def _update_direction_research_outcomes(
     #
     # Excludes merged completions (is_merged_completion) and pr_rejected ones,
     # AND — via ``_associated_with_pr`` rather than ``_opened_pr`` — any
-    # fix/review/panel_review child attached to an open (unmerged) PR.  A fix
+    # fix/review child attached to an open (unmerged) PR.  A fix
     # task that pushed code onto an existing open PR carries a pr_number in
     # context/review_loop but no PULL_REQUEST artifact of its own, so
     # ``_opened_pr`` returns False for it; counting it here would wrongly treat

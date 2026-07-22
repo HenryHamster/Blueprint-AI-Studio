@@ -5580,17 +5580,6 @@ class TestDirectionLifecycleInvariants:
             "this controls direction sprawl and must not change without approval."
         )
 
-    def test_blind_multi_reviewer_gate_enabled_default(self):
-        """blind_multi_reviewer_gate_enabled must remain True — default-on blind
-        multi-reviewer gate for judgment-shaped acceptance decisions."""
-        from app.shared_state import runtime_config
-
-        assert runtime_config["blind_multi_reviewer_gate_enabled"] is True, (
-            f"blind_multi_reviewer_gate_enabled changed to "
-            f"{runtime_config['blind_multi_reviewer_gate_enabled']} — "
-            "this controls whether high-stakes decisions spawn blind multi-reviewer panels."
-        )
-
     def test_max_parallel_research_per_project_default(self):
         """max_parallel_research_per_project must remain at 6 — controls
         simultaneous research task parallelism per project."""
@@ -5700,32 +5689,6 @@ class TestDirectionLifecycleInvariants:
         assert not bad, (
             "max_active_directions read-sites have wrong fallback defaults "
             f"(registry declares 10): {bad}"
-        )
-
-    def test_blind_multi_reviewer_gate_enabled_read_site_default_matches_registry(self):
-        """The task_lifecycle.py read-site for blind_multi_reviewer_gate_enabled must default to
-        True, matching the runtime_config_state registry declaration.
-        """
-        import re
-
-        path = os.path.join(
-            os.path.dirname(__file__), "..", "app", "task_lifecycle.py"
-        )
-        with open(path) as f:
-            content = f.read()
-        bad = []
-        for m in re.finditer(
-            r'get\s*\(\s*["\']blind_multi_reviewer_gate_enabled["\']\s*,\s*(False|True)\s*\)',
-            content,
-        ):
-            if m.group(1) != "True":
-                lineno = content[: m.start()].count("\n") + 1
-                bad.append(
-                    f"task_lifecycle.py:{lineno} uses default {m.group(1)!r} (registry declares True)"
-                )
-        assert not bad, (
-            "blind_multi_reviewer_gate_enabled read-site in task_lifecycle.py uses wrong "
-            f"fallback default: {bad}"
         )
 
 # ── Module Size Guardrails ─────────────────────────────────────────────────
@@ -11053,7 +11016,6 @@ def test_task_type_evaluation_registry_is_consistent():
     expected_registry = {
         "create": "code-ci-review",
         "review": "none",
-        "panel_review": "structured-verdict",
         "fix": "code-ci-review",
         "plan": "none",
         "research": "forward-quality",

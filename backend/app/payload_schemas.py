@@ -567,10 +567,6 @@ class ReviewPayload(BasePayload):
         return _validate_branch_name(v)  # type: ignore[return-value]
 
 
-class PanelReviewPayload(ReviewPayload):
-    """Read-only PR review payload for the fixed multi-agent panel workflow."""
-
-
 # ---------------------------------------------------------------------------
 # fix — requires prompt + pr_number + branch
 # ---------------------------------------------------------------------------
@@ -1240,7 +1236,6 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.migrate: MigratePayload,
     TaskType.investigate: InvestigatePayload,
     TaskType.review: ReviewPayload,
-    TaskType.panel_review: PanelReviewPayload,
     TaskType.fix: FixPayload,
     TaskType.research: ResearchPayload,
     TaskType.strategic_review: StrategicReviewPayload,

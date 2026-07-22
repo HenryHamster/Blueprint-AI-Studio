@@ -10902,12 +10902,12 @@ class TestEvergreenFillSettingsPersist:
             "max_global_autonomous_initiative_tasks_per_hour": 7,
             "autonomous_spawn_budget_categories": {
                 "initiative": ["research", "create", "strategic_review"],
-                "servicing": ["review", "fix", "perf", "panel_review"],
+                "servicing": ["review", "fix", "perf"],
             },
         }
         expected_categories = {
             "initiative": ["create", "research", "strategic_review"],
-            "servicing": ["fix", "panel_review", "perf", "review"],
+            "servicing": ["fix", "perf", "review"],
         }
         resp = await client.patch("/api/admin/settings", json=payload)
         assert resp.status_code == 200, resp.text
@@ -28171,14 +28171,14 @@ class TestCloudRunAllowlistPersistence:
             resp = await client.patch(
                 "/api/admin/settings",
                 json={
-                    "cloud_run_task_type_allowlist": "research,web_research,panel_review"
+                    "cloud_run_task_type_allowlist": "research,web_research"
                 },
             )
             assert resp.status_code == 200
 
             get_resp = await client.get("/api/admin/settings")
             result = sorted(get_resp.json()["cloud_run_task_type_allowlist"])
-            assert result == ["panel_review", "research", "web_research"]
+            assert result == ["research", "web_research"]
         finally:
             await client.patch(
                 "/api/admin/settings",

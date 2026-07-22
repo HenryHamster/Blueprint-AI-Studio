@@ -17,7 +17,7 @@ import re
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +33,6 @@ from app.github import (
     delete_branch,
     get_branch_sha,
     get_open_pull_requests,
-    submit_pr_review,
 )
 from app.models import (
     Artifact,
@@ -71,10 +70,6 @@ from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
 )
 from app.task_evaluators import (
-    BLIND_REVIEW_SOURCE_KEY,
-    REVIEW_SECOND_OPINION_AWAITING_KEY,
-    REVIEW_SECOND_OPINION_PARKED_KEY,
-    REVIEW_SECOND_OPINION_SOURCE_KEY,
     EvaluationVerdict,
     _extract_compute_measurement,
     describe_emitted_compute_metric_keys,
@@ -176,7 +171,7 @@ async def _persist_direction_field_update(
     await with_directions_locked(session, project.id, _apply)
 
 
-def _estimated_task_cost_usd(task: Task) -> Optional[float]:
+def _estimated_task_cost_usd(task: Task) -> float | None:
     """Return the VM cost for a task, or None when timing data is incomplete."""
     if not task.vm_provisioned_at or not task.vm_stopped_at:
         return None
@@ -184,7 +179,7 @@ def _estimated_task_cost_usd(task: Task) -> Optional[float]:
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 
-def _extract_compute_result_reference(logs: str) -> Optional[str]:
+def _extract_compute_result_reference(logs: str) -> str | None:
     try:
         payload = json.loads(logs)
     except json.JSONDecodeError:
@@ -198,7 +193,7 @@ def _extract_compute_result_reference(logs: str) -> Optional[str]:
     return None
 
 
-def _extract_compute_job_id(logs: str) -> Optional[uuid.UUID]:
+def _extract_compute_job_id(logs: str) -> uuid.UUID | None:
     try:
         payload = json.loads(logs)
     except json.JSONDecodeError:
@@ -457,8 +452,8 @@ def _derive_artifact_delivery_record(resource: dict) -> dict:
 def build_blueprint_pr_footer(
     task: Task,
     *,
-    iteration_count: Optional[int] = None,
-    direction_title: Optional[str] = None,
+    iteration_count: int | None = None,
+    direction_title: str | None = None,
 ) -> str:
     """Build a badge-style footer string for a Blueprint PR body.
 
@@ -502,7 +497,7 @@ async def patch_pr_body_with_blueprint_meta(
     footer: str,
 ) -> None:
     """Best-effort: append or replace the blueprint:meta footer in a GitHub PR body."""
-    import httpx  # noqa: PLC0415
+    import httpx
 
     headers = {
         "Authorization": f"Bearer {gh_token}",
@@ -563,7 +558,7 @@ def _stamp_orphan_remediation_outcome(
     if fingerprint:
         outcome["fingerprint"] = str(fingerprint)
     if not merged:
-        from app.failure_classification import classify_failure  # noqa: PLC0415
+        from app.failure_classification import classify_failure
 
         outcome["failure_class"] = classify_failure(
             task, at_time=task.last_heartbeat or task.started_at
@@ -739,7 +734,7 @@ async def _record_remediation_outcome(
                         f"siblings for direction {direction_id}: {exc!r}"
                     )
         else:
-            from app.failure_classification import classify_failure  # noqa: PLC0415
+            from app.failure_classification import classify_failure
 
             target["last_remediation_failure_class"] = classify_failure(
                 task, at_time=task.last_heartbeat or task.started_at
@@ -786,7 +781,7 @@ def _propagate_remediation_success_to_siblings(
     project: Project,
     directions: List[Dict[str, Any]],
     fingerprint: str,
-    successful_direction_id: Optional[str],
+    successful_direction_id: str | None,
     task: Task,
 ) -> None:
     """Un-pause sibling directions sharing ``fingerprint`` and stamp prior-art context.
@@ -802,7 +797,7 @@ def _propagate_remediation_success_to_siblings(
 
     Mutates ``directions`` in place; the caller persists via ``flag_modified``.
     """
-    from app.anomaly_detection import find_directions_sharing_fingerprint  # noqa: PLC0415
+    from app.anomaly_detection import find_directions_sharing_fingerprint
 
     siblings = find_directions_sharing_fingerprint(
         project,
@@ -880,10 +875,10 @@ def _propagate_remediation_failure_to_siblings(
     project: Project,
     directions: List[Dict[str, Any]],
     fingerprint: str,
-    failed_direction_id: Optional[str],
+    failed_direction_id: str | None,
     task: Task,
-    failure_class: Optional[str],
-    error_summary: Optional[str],
+    failure_class: str | None,
+    error_summary: str | None,
 ) -> None:
     """Inject a 'do not repeat' note into sibling directions sharing ``fingerprint``.
 
@@ -894,7 +889,7 @@ def _propagate_remediation_failure_to_siblings(
 
     Mutates ``directions`` in place; the caller persists via ``flag_modified``.
     """
-    from app.anomaly_detection import find_directions_sharing_fingerprint  # noqa: PLC0415
+    from app.anomaly_detection import find_directions_sharing_fingerprint
 
     siblings = find_directions_sharing_fingerprint(
         project,
@@ -970,10 +965,10 @@ async def _record_project_remediation_outcome(
     }
     if fingerprint:
         entry["fingerprint"] = str(fingerprint)
-    failure_class: Optional[str] = None
-    error_summary: Optional[str] = None
+    failure_class: str | None = None
+    error_summary: str | None = None
     if not merged:
-        from app.failure_classification import classify_failure  # noqa: PLC0415
+        from app.failure_classification import classify_failure
 
         failure_class = classify_failure(
             task, at_time=task.last_heartbeat or task.started_at
@@ -1047,7 +1042,7 @@ async def _record_project_remediation_outcome(
 _MIGRATION_FINALIZATION_CONTEXT_KEY = "_migration_finalization"
 
 
-def _migration_finalized_revision_from_context(task: Task | None) -> Optional[str]:
+def _migration_finalized_revision_from_context(task: Task | None) -> str | None:
     if task is None:
         return None
     finalization = (task.context or {}).get(_MIGRATION_FINALIZATION_CONTEXT_KEY)
@@ -1112,7 +1107,7 @@ async def _finalize_migration_reservation_after_merge(
     terminal_merge: bool = True,
 ) -> None:
     """Finalize the task's ACTIVE migration reservation after a terminal PR merge."""
-    from app.migration_reservations import (  # noqa: PLC0415
+    from app.migration_reservations import (
         finalize_migration_reservation,
         get_migration_reservation_for_task,
     )
@@ -1158,7 +1153,7 @@ async def _expire_migration_reservation_if_terminal(
     """Expire an ACTIVE reservation once its owning task terminally fails."""
     if status not in (TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED):
         return
-    from app.migration_reservations import expire_migration_reservation  # noqa: PLC0415
+    from app.migration_reservations import expire_migration_reservation
 
     expired = await expire_migration_reservation(session, task_id=task.id)
     if expired is not None:
@@ -1173,7 +1168,7 @@ async def _release_pool_member_if_terminal(
     task: Task,
     status: "TaskStatus",
     session: AsyncSession,
-) -> Optional[str]:
+) -> str | None:
     """Return or retire the warm-pool member that served a now-terminal task.
 
     A leased :class:`~app.models.PoolVm` row stays ``LEASED`` — counting against
@@ -1200,8 +1195,8 @@ async def _release_pool_member_if_terminal(
         return None
     # Deferred imports: keep the module-level surface stable and avoid importing
     # the warm-pool registry on the hot completion path when the pool is dark.
-    from app.models import PoolVmState  # noqa: PLC0415
-    from app.warm_pool import (  # noqa: PLC0415
+    from app.models import PoolVmState
+    from app.warm_pool import (
         get_pool_vm,
         is_warm_pool_enabled,
         mark_pool_vm_retiring,
@@ -1514,7 +1509,7 @@ async def _ensure_branch(
         ``_capture_branch_creation_snapshot`` — content fields only.
     """
     # Deferred import to avoid circular dependency
-    from app.alert_dispatch import _maybe_create_failure_alert  # noqa: PLC0415
+    from app.alert_dispatch import _maybe_create_failure_alert
 
     # Round 4 W1: capture snapshot BEFORE the release-commit so the
     # snapshot reflects the pre-commit content, not the post-commit
@@ -1718,8 +1713,8 @@ async def _ensure_branch(
     task.latest_status_message = (
         f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
     )
-    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+    from app.failure_classification import classify_failure, persist_failure_category
+    from app.routers.agent_status import record_task_result
 
     _fc = classify_failure(task, at_time=task.last_heartbeat or task.started_at)
     persist_failure_category(task, _fc)
@@ -1762,7 +1757,7 @@ async def _maybe_release_safeguard_gate(
         merge. Fire the merge directly here, guarded by an idempotency flag
         (_safeguard_merge_fired) so a re-run / concurrent path cannot double-merge.
     """
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
     safeguard_for_id = (safeguard_task.context or {}).get("safeguard_for_task_id")
     if not safeguard_for_id:
@@ -1796,7 +1791,7 @@ async def _maybe_release_safeguard_gate(
         # polling loop. arm_ci_wait co-stamps pr_number + a fresh ci_wait_started
         # so this re-arm never parks the identity-less {ci_waiting} shape that the
         # merge poll would skip / that would silently disable the CI-wait timeout.
-        from app.ci_merge_helpers import arm_ci_wait  # noqa: PLC0415
+        from app.ci_merge_helpers import arm_ci_wait
 
         _rearm_loop = dict(orig_ctx.get("review_loop") or {})
         arm_ci_wait(
@@ -1831,7 +1826,7 @@ async def _maybe_release_safeguard_gate(
         # idempotency flag was committed above, so even if this raises the merge
         # is never re-attempted from here (avoids a double-merge loop); a manual
         # re-arm is then the operator's call. Merge only if the PR is still open.
-        from app.github import (  # noqa: PLC0415
+        from app.github import (
             get_pull_request,
             merge_pull_request,
         )
@@ -1857,7 +1852,7 @@ async def _maybe_release_safeguard_gate(
                 # duplicate revision / dual head. Only guard integration/promotion
                 # targets; on a block-or-defer verdict skip the merge and leave the
                 # PR open so the guarded retry/resolver flow can handle it.
-                from app.shared_state import (  # noqa: PLC0415
+                from app.shared_state import (
                     get_project_promotion_target,
                 )
 
@@ -1873,7 +1868,7 @@ async def _maybe_release_safeguard_gate(
                 )
                 _sg_ok = True
                 if _sg_gated:
-                    from app.rollup_migration_validation import (  # noqa: PLC0415
+                    from app.rollup_migration_validation import (
                         enforce_premerge_migration_guard,
                     )
 
@@ -2636,7 +2631,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 async def _persist_compute_experiment_knowledge_best_effort(
     task: Task,
     logs: str,
-    criterion: Optional[dict],
+    criterion: dict | None,
     session: AsyncSession,
 ) -> bool:
     """Persist a compute_experiment's measured verdict as durable knowledge.
@@ -2719,11 +2714,11 @@ async def _stamp_compute_terminal_diagnostics(
     Never raises — a missing job or classification error must not block the
     FAILED finalization.
     """
-    from app.failure_classification import (  # noqa: PLC0415
+    from app.failure_classification import (
         classify_compute_terminal_reason,
         persist_failure_category,
     )
-    from app.knowledge_completion import _extract_job_terminal_diagnostics  # noqa: PLC0415
+    from app.knowledge_completion import _extract_job_terminal_diagnostics
 
     try:
         job_id = _extract_compute_job_id(logs)
@@ -2760,7 +2755,7 @@ async def _finalize_compute_experiment(
     task: Task,
     status: TaskStatus,
     logs: str,
-    criterion: Optional[dict],
+    criterion: dict | None,
     *,
     owns_commit: bool,
 ) -> None:
@@ -2950,7 +2945,7 @@ _COMPUTE_INTENTIONAL_KILL_OUTCOMES: frozenset[str] = frozenset(
 )
 
 
-def _is_unmeasured_declared_metric(task: Task, criterion: Optional[dict]) -> bool:
+def _is_unmeasured_declared_metric(task: Task, criterion: dict | None) -> bool:
     """True when ``task`` declared a kind=metric criterion that produced NO value.
 
     The loud unmeasured-criterion failure applies ONLY to ``kind="metric"``
@@ -3703,10 +3698,10 @@ async def _handle_capability_proof_trial_completion(
             )
             return
 
-        from app.capability_proof import (  # noqa: PLC0415
+        from app.capability_proof import (
             record_capability_named_test_execution_proof,
         )
-        from app.ci_resolution import (  # noqa: PLC0415
+        from app.ci_resolution import (
             capability_proof_trial_is_green,
         )
 
@@ -3765,7 +3760,7 @@ async def _handle_capability_proof_trial_completion(
         # was never enrolled. On ANY mismatch, record NO proof and surface the
         # contradiction on the task context for strategist visibility (mirroring the
         # non-green fail-open branch).
-        from app.capability_registry import normalize_capability_name as _norm_cap  # noqa: PLC0415
+        from app.capability_registry import normalize_capability_name as _norm_cap
 
         enrolled = task.first_payload
         if not isinstance(enrolled, dict):
@@ -4006,7 +4001,7 @@ async def _handle_compute_experiment_completion(
     # and route to the failure path before the gate logic runs.
     _early_meas = _extract_compute_measurement(logs)
     if _early_meas is not None and _early_meas[0] == "SMOKE_FAILED":
-        from app.failure_classification import (  # noqa: PLC0415
+        from app.failure_classification import (
             COMPUTE_PREFLIGHT_SMOKE_FAILED,
             persist_failure_category,
         )
@@ -4250,7 +4245,7 @@ async def _handle_compute_experiment_completion(
             _is_unmeasured_declared_metric(task, criterion)
             and outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES
         ):
-            from app.failure_classification import (  # noqa: PLC0415
+            from app.failure_classification import (
                 COMPUTE_UNMEASURED_CRITERION,
                 persist_failure_category,
             )
@@ -4371,144 +4366,12 @@ async def _handle_compute_experiment_completion(
 
 
 # ---------------------------------------------------------------------------
-# Panel-review completion — persist a structured verdict artifact, no PR, no children
+# Review second-opinion reconciliation — context keys for the review pipeline
 # ---------------------------------------------------------------------------
 
-
-_PANEL_REVIEW_REQUIRED_LENSES = (
-    "correctness",
-    "security",
-    "code_quality",
-    "test_coverage",
-)
-_PANEL_REVIEW_ARTIFACT_TYPE = "PANEL_REVIEW_VERDICT"
-
-
-def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Normalize a panel-review verdict.
-
-    ``overall_verdict`` (APPROVE / REQUEST_CHANGES) is the only required field.
-    ``lenses`` is optional telemetry: when a well-formed lenses object is present
-    it is captured and preserved; when missing or malformed the overall verdict
-    resolution still proceeds so a correctly-decided review is never discarded on
-    a structural check for a field nothing downstream consumes.
-    """
-    overall_verdict = str(raw.get("overall_verdict") or "").strip()
-    if overall_verdict not in {"APPROVE", "REQUEST_CHANGES"}:
-        return None
-
-    raw_lenses = raw.get("lenses")
-    lens_map: Dict[str, Dict[str, Any]] = {}
-    if isinstance(raw_lenses, dict):
-        for name, payload in raw_lenses.items():
-            if isinstance(name, str) and isinstance(payload, dict):
-                lens_map[name] = payload
-    elif isinstance(raw_lenses, list):
-        for item in raw_lenses:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("lens") or item.get("name") or item.get("id")
-            if isinstance(name, str):
-                lens_map[name] = item
-
-    # Normalize per-lens telemetry where available; skip lenses that are
-    # missing or malformed — never gate the overall verdict on their presence.
-    normalized_lenses: Dict[str, Dict[str, Any]] = {}
-    for lens in _PANEL_REVIEW_REQUIRED_LENSES:
-        payload = lens_map.get(lens)
-        if not isinstance(payload, dict):
-            continue
-        lens_verdict = str(payload.get("verdict") or "").strip()
-        if not lens_verdict:
-            continue
-        summary = str(
-            payload.get("summary")
-            or payload.get("feedback")
-            or payload.get("reasoning")
-            or ""
-        ).strip()
-        if not summary:
-            continue
-        issues = payload.get("issues")
-        normalized_lenses[lens] = {
-            "verdict": lens_verdict,
-            "summary": summary,
-            "issues": issues if isinstance(issues, list) else [],
-        }
-
-    normalized: Dict[str, Any] = {
-        "overall_verdict": overall_verdict,
-        "summary": str(raw.get("summary") or raw.get("feedback") or "").strip(),
-    }
-    if normalized_lenses:
-        normalized["lenses"] = normalized_lenses
-    overall_issues = raw.get("issues")
-    if isinstance(overall_issues, list):
-        normalized["issues"] = overall_issues
-    investigated_files = raw.get("investigated_files")
-    if isinstance(investigated_files, list):
-        normalized["investigated_files"] = [
-            str(path).strip() for path in investigated_files if str(path).strip()
-        ]
-    return normalized
-
-
-def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
-    """Best-effort extract the structured panel-review verdict from agent output.
-
-    Uses the same three-method cascade as the primary review path so the two
-    paths cannot diverge in strictness:
-
-    Method 1 — top-level JSON with ``overall_verdict``.
-    Method 2 — balanced-bracket JSON scan for ``overall_verdict`` or ``lenses``
-               embedded in prose.
-    Method 3 — anchored-prose floor via ``_resolve_fallback_verdict`` (same
-               safety gate as the primary review); returns None only when no
-               APPROVE/REQUEST_CHANGES signal is present anywhere.
-    """
-    if not text:
-        return None
-    snippet = text[:500_000]
-    candidates: List[str] = []
-    try:
-        parsed = json.loads(snippet)
-    except (json.JSONDecodeError, ValueError):
-        parsed = None
-    if isinstance(parsed, dict) and "overall_verdict" in parsed:
-        candidates.append(snippet)
-
-    # Scan for embedded JSON objects carrying either key.
-    for search_key in ("overall_verdict", "lenses"):
-        candidate = _extract_json_object(snippet, search_key)
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    for candidate_text in candidates:
-        try:
-            obj = json.loads(candidate_text)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(obj, dict):
-            normalized = _normalize_panel_review_verdict(obj)
-            if normalized is not None:
-                return normalized
-
-    # Method 3: anchored-prose floor — the same safety floor the primary review
-    # uses. Returns None (→ fail-closed escalation) when no anchored
-    # APPROVE/REQUEST_CHANGES signal is present, so genuinely absent verdicts
-    # still escalate to manual review.
-    from app.task_lifecycle import _resolve_fallback_verdict  # noqa: PLC0415
-
-    verdict = _resolve_fallback_verdict(snippet)
-    if verdict is not None:
-        return {"overall_verdict": verdict, "summary": ""}
-    return None
-
-
-# ── Review second-opinion reconciliation ──────────────────────────────────
 # Context key on the REVIEW task holding the durable reconciliation record of a
 # primary verdict against its independent panel-review challenge. Exactly one of
-# four states (see ``reconcile_review_second_opinion``):
+# four states:
 #   unchallenged          gate off / not high-stakes (recorded inline, never here)
 #   challenged_confirmed  challenge upholds the verdict AND the surviving issues
 #   challenged_revised    same verdict direction, surviving issue set changed
@@ -4524,335 +4387,7 @@ REVIEW_SECOND_OPINION_RECONCILIATION_KEY = "review_second_opinion"
 # the chain (PR #9243). Spawn paths that copy context must exclude these.
 REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS = (
     REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-    REVIEW_SECOND_OPINION_AWAITING_KEY,
-    REVIEW_SECOND_OPINION_PARKED_KEY,
-    REVIEW_SECOND_OPINION_SOURCE_KEY,
-    BLIND_REVIEW_SOURCE_KEY,
 )
-
-
-def _review_issue_signature(issue: Any) -> str:
-    """Stable identity for a review issue, for set comparison across reviewers."""
-    if not isinstance(issue, dict):
-        return str(issue).strip().lower()
-    desc = str(issue.get("description") or "").strip().lower()
-    file = str(issue.get("file") or "").strip().lower()
-    line = str(issue.get("line") or "").strip()
-    return f"{file}:{line}:{desc}"
-
-
-def reconcile_review_second_opinion(
-    primary_verdict: str,
-    primary_issues: List[Dict[str, Any]] | None,
-    panel: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Reconcile a primary review verdict against a normalized panel challenge.
-
-    ``panel`` is the output of :func:`_parse_panel_review_output` (already
-    validated to carry ``overall_verdict`` ∈ {APPROVE, REQUEST_CHANGES}).
-
-    Returns a record with exactly one of three challenge states
-    (``challenged_confirmed`` / ``challenged_revised`` / ``challenged_rejected``
-    — the fourth, ``unchallenged``, is recorded inline by the gate and never
-    reaches this function) plus the reconciled verdict and the surviving /
-    agreed issue set downstream consumers act on.
-    """
-    primary_verdict = (
-        primary_verdict
-        if primary_verdict in ("APPROVE", "REQUEST_CHANGES")
-        else "REQUEST_CHANGES"
-    )
-    challenge_verdict = panel.get("overall_verdict")
-    if challenge_verdict not in ("APPROVE", "REQUEST_CHANGES"):
-        # Defensive: parser guarantees one of the two, but fail toward
-        # confirming the primary rather than inventing an overturn.
-        challenge_verdict = primary_verdict
-    challenge_issues = panel.get("issues")
-    challenge_issues = challenge_issues if isinstance(challenge_issues, list) else []
-
-    if challenge_verdict != primary_verdict:
-        # Challenge overturns the verdict direction.
-        state = "challenged_rejected"
-        reconciled_verdict = challenge_verdict
-        surviving = challenge_issues if challenge_verdict == "REQUEST_CHANGES" else []
-    elif primary_verdict == "APPROVE":
-        # Both APPROVE — no blocking issue set to compare.
-        state = "challenged_confirmed"
-        reconciled_verdict = "APPROVE"
-        surviving = []
-    else:
-        # Both REQUEST_CHANGES — compare the surviving issue set.
-        primary_sigs = {_review_issue_signature(i) for i in (primary_issues or [])}
-        challenge_sigs = {_review_issue_signature(i) for i in challenge_issues}
-        reconciled_verdict = "REQUEST_CHANGES"
-        if primary_sigs == challenge_sigs:
-            state = "challenged_confirmed"
-            surviving = list(primary_issues or [])
-        else:
-            # Surviving set changed: keep the primary issues the challenge still
-            # upholds (intersection); fall back to the challenge's own set, then
-            # the primary's, so the fix is never spawned with an empty issue set.
-            agreed = [
-                i
-                for i in (primary_issues or [])
-                if _review_issue_signature(i) in challenge_sigs
-            ]
-            surviving = agreed or challenge_issues or list(primary_issues or [])
-            state = "challenged_revised"
-
-    return {
-        "state": state,
-        "primary_verdict": primary_verdict,
-        "challenge_verdict": challenge_verdict,
-        "reconciled_verdict": reconciled_verdict,
-        "surviving_issues": surviving,
-        "challenge_summary": str(panel.get("summary") or "")[:2000],
-    }
-
-
-async def _handle_panel_review_completion(task: Task, logs: str, session: AsyncSession):
-    """Persist a terminal structured verdict for ``panel_review`` tasks."""
-    from app.models import Artifact  # noqa: PLC0415
-
-    verdict = evaluate_terminal_output(task, logs)
-    if not verdict.passed:
-        record_failed_gate(task, verdict)
-        session.add(task)
-        await session.commit()
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(task.id), "status": TaskStatus.FAILED},
-        )
-        logger.info(
-            "[PANEL_REVIEW] Task %s did not clear the structured-verdict gate: %s",
-            task.id,
-            verdict.reason,
-        )
-        return
-
-    parsed = _parse_panel_review_output(logs)
-    if parsed is None:
-        record_failed_gate(
-            task,
-            EvaluationVerdict(
-                False,
-                "structured verdict output not parseable after gate",
-                "structured-verdict",
-            ),
-        )
-        session.add(task)
-        await session.commit()
-        return
-
-    artifact = Artifact(
-        task_id=task.id,
-        artifact_type=_PANEL_REVIEW_ARTIFACT_TYPE,
-        logs=json.dumps(parsed),
-    )
-    stamp_artifact_logical_key(artifact, task)
-    session.add(artifact)
-
-    task.plan_output = parsed
-    flag_modified(task, "plan_output")
-    task.status = TaskStatus.COMPLETED
-    task.latest_status_message = (
-        f"Panel review verdict recorded ({parsed['overall_verdict']}; "
-        f"{len(parsed.get('lenses') or {})} lenses)"
-    )
-    session.add(task)
-    await session.commit()
-    await session.refresh(artifact)
-
-    await deliver_artifact_to_dependents(task, artifact, session, commit=True)
-
-    await broadcast_to_project(
-        str(task.project_id),
-        "task_updated",
-        {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
-    )
-    logger.info("[PANEL_REVIEW] Persisted verdict artifact for task %s", task.id)
-
-    # Surface the verdict on the PR (and raise an operator signal for
-    # REQUEST_CHANGES). Best-effort — the durable artifact and COMPLETED
-    # status above are the source of truth and must never be undone by a
-    # transient posting failure.
-    await _post_panel_review_to_pr(task, parsed, session)
-
-
-def _build_panel_review_pr_body(parsed: Dict[str, Any]) -> str:
-    """Render a panel-review verdict into a Markdown PR-review body.
-
-    Clearly labelled "Blueprint Panel Review" so it does not read as a
-    duplicate of the ordinary single-reviewer "Blueprint Code Review"
-    posted by the ``review`` task type.
-    """
-
-    def _render_issues(issues: List[Any]) -> List[str]:
-        rendered: List[str] = []
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            sev = str(issue.get("severity", "minor")).upper()
-            desc = issue.get("description") or issue.get("summary") or ""
-            loc = ""
-            if issue.get("file"):
-                loc = f" (`{issue['file']}`"
-                if issue.get("line"):
-                    loc += f":{issue['line']}"
-                loc += ")"
-            rendered.append(f"- [{sev}] {desc}{loc}")
-        return rendered
-
-    overall = parsed.get("overall_verdict", "")
-    lines: List[str] = [f"## Blueprint Panel Review — {overall}", ""]
-    summary = str(parsed.get("summary") or "").strip()
-    if summary:
-        lines.extend([summary, ""])
-
-    lenses = parsed.get("lenses") or {}
-    for lens, data in lenses.items():
-        if not isinstance(data, dict):
-            continue
-        label = lens.replace("_", " ").title()
-        lines.append(f"### {label} — {data.get('verdict', '')}")
-        lens_summary = str(data.get("summary") or "").strip()
-        if lens_summary:
-            lines.append(lens_summary)
-        lines.extend(_render_issues(data.get("issues") or []))
-        lines.append("")
-
-    top_issues = parsed.get("issues") or []
-    if top_issues:
-        lines.append("### Cross-cutting issues")
-        lines.extend(_render_issues(top_issues))
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-
-async def _post_panel_review_to_pr(
-    task: Task, parsed: Dict[str, Any], session: AsyncSession
-) -> None:
-    """Best-effort: surface a completed panel-review verdict on its PR.
-
-    Posts the verdict as a real GitHub review (parity with the ordinary
-    ``review`` task type, reusing ``submit_pr_review``) and, for a
-    REQUEST_CHANGES overall verdict, raises an operator ``Alert`` so a
-    blocking panel outcome is visible rather than an indistinguishable
-    COMPLETED. Every failure is swallowed and logged — the durable
-    artifact and COMPLETED status are authoritative and must survive any
-    GitHub/posting error.
-    """
-    from app.models import Alert, AlertSeverity  # noqa: PLC0415
-
-    # Greenlet-safe PR-number fetch. ``task.first_payload`` reads
-    # ``task.payloads``, which is a deferred-loadable column in some dispatch
-    # paths (recovery sweep / load_only projections); touching it implicitly
-    # here would trigger lazy IO outside a greenlet and raise MissingGreenlet
-    # (which previously crashed the reaper). An explicit awaited query is
-    # safe regardless of how the task was loaded.
-    try:
-        row = (
-            await session.execute(select(Task.payloads).where(Task.id == task.id))
-        ).first()
-    except Exception as exc:  # noqa: BLE001 — best-effort surfacing
-        logger.warning(
-            "[PANEL_REVIEW] could not load payload for task %s: %s", task.id, exc
-        )
-        return
-
-    payloads = row[0] if row else None
-    first = (payloads or [{}])[0] if isinstance(payloads, list) and payloads else {}
-    pr_number = first.get("pr_number") if isinstance(first, dict) else None
-    if not pr_number:
-        logger.info(
-            "[PANEL_REVIEW] task %s has no pr_number; skipping PR post", task.id
-        )
-        return
-
-    overall = parsed.get("overall_verdict")
-    event = "APPROVE" if overall == "APPROVE" else "REQUEST_CHANGES"
-
-    # Split located issues into inline comments vs the review body, mirroring
-    # the `review` task type's posting path. Both per-lens issues and any
-    # top-level issues are considered.
-    all_issues: List[Dict[str, Any]] = []
-    for lens_data in (parsed.get("lenses") or {}).values():
-        if isinstance(lens_data, dict):
-            all_issues.extend(
-                i for i in (lens_data.get("issues") or []) if isinstance(i, dict)
-            )
-    all_issues.extend(i for i in (parsed.get("issues") or []) if isinstance(i, dict))
-    inline_comments: List[Dict[str, Any]] = []
-    for issue in all_issues:
-        if issue.get("file") and issue.get("line"):
-            sev = str(issue.get("severity", "minor")).upper()
-            desc = issue.get("description") or issue.get("summary") or ""
-            inline_comments.append(
-                {
-                    "path": issue["file"],
-                    "line": issue["line"],
-                    "body": f"[{sev}] {desc}",
-                }
-            )
-
-    body = _build_panel_review_pr_body(parsed)
-
-    try:
-        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-        await submit_pr_review(
-            gh_token, owner, repo, int(pr_number), event, body, inline_comments
-        )
-        logger.info(
-            "[PANEL_REVIEW] posted %s review to PR #%s for task %s",
-            event,
-            pr_number,
-            task.id,
-        )
-    except Exception as exc:  # noqa: BLE001 — posting is best-effort
-        logger.warning(
-            "[PANEL_REVIEW] failed to post review to PR #%s for task %s: %s",
-            pr_number,
-            task.id,
-            exc,
-        )
-
-    if event != "REQUEST_CHANGES":
-        return
-
-    # REQUEST_CHANGES → visible, actionable operator signal (parity with other
-    # blocking review outcomes, which raise a WARNING Alert).
-    try:
-        alert = Alert(
-            project_id=task.project_id,
-            severity=AlertSeverity.WARNING,
-            title=f"Panel review requested changes on PR #{pr_number}",
-            message=(
-                f"The multi-lens panel review for PR #{pr_number} returned "
-                "REQUEST_CHANGES. Review the per-lens findings in the task "
-                "detail drawer and on the PR before merging."
-            ),
-            task_id=task.id,
-            event_type="review.escalated",
-        )
-        session.add(alert)
-        await session.commit()
-        await broadcast_to_project(
-            str(task.project_id),
-            "alert_created",
-            {
-                "alert_id": str(alert.id),
-                "severity": "WARNING",
-                "title": alert.title,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001 — surfacing is best-effort
-        logger.warning(
-            "[PANEL_REVIEW] failed to raise REQUEST_CHANGES alert for task %s: %s",
-            task.id,
-            exc,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -4863,7 +4398,7 @@ async def _post_panel_review_to_pr(
 _MEMO_REQUIRED_KEYS = ("summary", "reasoning", "citations", "tags")
 
 
-def _parse_memo_output(text: str) -> Optional[Dict[str, Any]]:
+def _parse_memo_output(text: str) -> Dict[str, Any] | None:
     """Best-effort extract the structured memo object from agent ``logs``.
 
     The agent's contract is to emit a JSON object with the keys
@@ -4931,7 +4466,7 @@ def _apply_synthesized_memo(
     Called at spawn time for dispatcher memos whose full reasoning is already
     known — avoids provisioning a VM solely to reformat known text.
     """
-    from app.models import Artifact, ArtifactType  # noqa: PLC0415
+    from app.models import Artifact, ArtifactType
 
     normalized = _normalize_memo(memo)
     artifact = Artifact(
@@ -4978,7 +4513,7 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
     # Local import keeps the module-level import surface stable and
     # avoids pulling Artifact into the strategic-completion re-export
     # chain (other handlers use the same lazy-import pattern).
-    from app.models import Artifact, ArtifactType  # noqa: PLC0415
+    from app.models import Artifact, ArtifactType
 
     # Forward evaluation gate (registry-resolved 'forward-quality' strategy):
     # an unparseable or empty memo must NOT complete clean. Marking it FAILED
@@ -5178,7 +4713,7 @@ async def _try_recover_memo_from_parse_failure(
 # Importers should keep using `from app.task_completion import ...`; the
 # re-export block at the bottom of this module preserves the facade.
 # ---------------------------------------------------------------------------
-from app.task_completion_self_audit import (  # noqa: E402,F401
+from app.task_completion_self_audit import (  # noqa: F401,E402
     _AUDIT_CLEARABLE_MODES,
     _MODE_STRICTNESS,
     _PROPAGATION_RECORD_MAX_ENTRIES,
@@ -5220,13 +4755,13 @@ async def _handle_design_doc_completion(
     ``docs/concurrency.md``.
     """
     # Deferred imports to avoid circular dependency
-    from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
-    from app.strategic_spawning import (  # noqa: PLC0415
+    from app.strategic_spawning import _spawn_strategic_review
+    from app.strategic_spawning import (
         STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
     )
-    from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
-    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
-    from app.strategic_events import emit_strategic_cycle_completed  # noqa: PLC0415
+    from app.alert_dispatch import _create_strategic_alert
+    from app.task_locking import lock_project_for_strategic_transition
+    from app.strategic_events import emit_strategic_cycle_completed
 
     # Phase 1 emitted strategic_cycle_started at spawn time. Every path out of
     # this handler that does NOT chain to Phase 2 must pair it with a
@@ -5433,7 +4968,7 @@ async def _handle_design_doc_completion(
             },
         }
         if cycle_id:
-            from app import strategic_cycle as _sc  # noqa: PLC0415
+            from app import strategic_cycle as _sc
 
             await _sc.mark_failure(
                 session,

@@ -23,7 +23,7 @@ from app.models import Alert, Task, TaskStatus
 
 # ── Lane waste taxonomy (v10 pilot baseline) ──────────────────────────────────
 # Pilot-useful classification of WHY a review/fix iteration was spent. Every
-# review-loop iteration-task (review / fix / panel_review), including terminal
+# review-loop iteration-task (review / fix), including terminal
 # FAILED/CANCELLED ones, maps to exactly one category. Ordering of the resolver
 # below is the priority: infra terminal failures dominate, then lost repo state
 # (drift), lost reasoning (fix-loop divergence), then the mechanical review-fix

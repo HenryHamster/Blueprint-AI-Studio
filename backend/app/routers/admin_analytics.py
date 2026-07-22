@@ -459,7 +459,7 @@ def _compute_lane_diag(tasks: List[Task], pr_breakdown_limit: int) -> Dict[str, 
 
         if task.started_at:
             active_seconds = max((completed_at - task.started_at).total_seconds(), 0.0)
-            if payload_type in {"review", "panel_review"}:
+            if payload_type == "review":
                 phase["review_seconds"] += active_seconds
             elif payload_type in _LANE_DIAG_FIX_TYPES:
                 phase["fix_seconds"] += active_seconds

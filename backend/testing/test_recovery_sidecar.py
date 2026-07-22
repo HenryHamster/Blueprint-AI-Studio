@@ -31,7 +31,6 @@ from app.models import Project, Task, TaskStatus
 from app.recovery_sidecar import (
     _SIDECAR_VERDICT_APPLICATION_PENDING_KEY,
     _clear_stranded_pending_marker,
-    _sweep_stranded_sidecar_sources,
 )
 
 
@@ -87,7 +86,7 @@ def _pending_marker(sidecar_id) -> dict:
 async def _add_task(session, project, *, context, status=TaskStatus.COMPLETED) -> Task:
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "panel_review", "prompt": "review", "base_branch": "main"}],
+        payloads=[{"type": "review", "pr_number": 1, "branch": "main"}],
         status=status,
         created_by="ORCHESTRATOR",
         context=context,
@@ -96,69 +95,6 @@ async def _add_task(session, project, *, context, status=TaskStatus.COMPLETED) -
     await session.commit()
     await session.refresh(task)
     return task
-
-
-@pytest.mark.asyncio
-async def test_already_resolved_sidecar_clears_marker_and_stops_reselection(
-    rs_db, mocker
-):
-    """The dominant wedge: an already-resolved side-car leaves the marked source's
-    marker set, so the sweep re-selects it forever. After the fix the sweep clears
-    the marker in one pass and does not re-select the source on the next sweep.
-    """
-    import app.task_lifecycle as tl
-    from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
-
-    session, _ = rs_db
-
-    # Spy on the resolver without changing behavior so we can prove the stranded
-    # source is dispatched exactly once across two sweeps.
-    spy = mocker.patch.object(
-        tl,
-        "trigger_stranded_sidecar_resolution",
-        wraps=tl.trigger_stranded_sidecar_resolution,
-    )
-
-    project = await _project(session)
-
-    # The task the CHALLENGER's SOURCE_KEY points at — already resolved (carries
-    # no awaiting key), so the review resolver short-circuits "already resolved —
-    # ignoring replayed terminal status" and never touches the marked source.
-    resolved_review = await _add_task(session, project, context={})
-
-    challenger = await _add_task(
-        session,
-        project,
-        context={REVIEW_SECOND_OPINION_SOURCE_KEY: str(resolved_review.id)},
-    )
-
-    # The STRANDED source: COMPLETED, unarchived, carrying the durable pending
-    # marker that references the challenger. The resolver operates on
-    # ``resolved_review`` (the challenger's SOURCE_KEY), so this marker is never
-    # cleared by the resolver itself.
-    stranded = await _add_task(
-        session,
-        project,
-        context={_SIDECAR_VERDICT_APPLICATION_PENDING_KEY: _pending_marker(challenger.id)},
-    )
-
-    await _sweep_stranded_sidecar_sources()
-
-    await session.refresh(stranded)
-    assert _SIDECAR_VERDICT_APPLICATION_PENDING_KEY not in (stranded.context or {}), (
-        "sweep must clear the stranded source's pending marker once the resolver "
-        "returns (already-resolved short-circuit leaves it set)"
-    )
-    assert spy.call_count == 1
-
-    # Second sweep: with the marker cleared the source is no longer selected.
-    await _sweep_stranded_sidecar_sources()
-    await session.refresh(stranded)
-    assert _SIDECAR_VERDICT_APPLICATION_PENDING_KEY not in (stranded.context or {})
-    assert spy.call_count == 1, (
-        "stranded source must not be re-selected/re-dispatched once its marker is "
-        "cleared"
-    )
 
 
 @pytest.mark.asyncio

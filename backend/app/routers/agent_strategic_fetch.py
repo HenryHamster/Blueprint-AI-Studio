@@ -1165,9 +1165,6 @@ async def agent_fetch_efficiency_snapshot(
         _compute_llm_cache_hit_rate,
         _compute_vm_reuse_rate,
         _load_recent_tasks,
-        _resolve_deploy_since,
-        compute_gate_health_verdict,
-        compute_panel_review_effectiveness,
     )
     from app.llm_cost_attribution import (  # noqa: PLC0415
         _compact_llm_cost_attribution,
@@ -1181,29 +1178,6 @@ async def agent_fetch_efficiency_snapshot(
     format_compliance = compute_format_compliance_metrics(tasks)
     llm_cost_attribution = _compact_llm_cost_attribution(tasks)
 
-    # Rolling-window panel-review gate effectiveness plus its calibrated fail-open
-    # health verdict, so the strategist sees the same HEALTHY/PARTIAL/DEGRADED/
-    # INSUFFICIENT/NO_DATA classification the operator dashboard shows.
-    panel_review_effectiveness = compute_panel_review_effectiveness(tasks)
-    gate_health = compute_gate_health_verdict(panel_review_effectiveness)
-
-    # Deploy-scoped companion: restrict the same metric to tasks completed after
-    # the post-deployment boundary (earliest snapshot under the current serving
-    # SHA, derived identically to compute_current_axes). None when no boundary is
-    # known — never fabricated — so the strategist can confirm the per-deployment
-    # ≤5% fail-open target specifically.
-    deploy_since = await _resolve_deploy_since(session, project_id)
-    panel_review_effectiveness_post_deploy = (
-        compute_panel_review_effectiveness(tasks, since_dt=deploy_since)
-        if deploy_since is not None
-        else None
-    )
-    gate_health_post_deploy = (
-        compute_gate_health_verdict(panel_review_effectiveness_post_deploy)
-        if deploy_since is not None
-        else None
-    )
-
     return {
         "status": "success",
         "data": {
@@ -1215,10 +1189,6 @@ async def agent_fetch_efficiency_snapshot(
             AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
             FORMAT_COMPLIANCE_KEY: format_compliance,
             "llm_cost_attribution": llm_cost_attribution,
-            "panel_review_effectiveness": panel_review_effectiveness,
-            "gate_health": gate_health,
-            "panel_review_effectiveness_post_deploy": panel_review_effectiveness_post_deploy,
-            "gate_health_post_deploy": gate_health_post_deploy,
             "window_days": _AXIS_WINDOW_DAYS,
         },
     }

@@ -4171,7 +4171,6 @@ async def claim_task(
         "research",
         "plan",
         "investigate",
-        "panel_review",
     }
     if project_for_playbook and task_type in _SKILLS_TASK_TYPES:
         try:

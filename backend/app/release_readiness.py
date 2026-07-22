@@ -191,7 +191,7 @@ _READINESS_MIN_RESOLVED_OUTCOMES = 5
 # ``compute_promotion_readiness``.  Every field the function returns must have an
 # entry here with a named ground-truth source and consumer, or a dated
 # retired/pending annotation — so a new field cannot land without declaring who
-# reads it.  Mirrors PANEL_REVIEW_METRIC_MANIFEST / TIMEOUT_RATE_METRIC_MANIFEST.
+# reads it.  Mirrors TIMEOUT_RATE_METRIC_MANIFEST.
 PROMOTION_READINESS_METRIC_MANIFEST: dict[str, dict] = {
     # ── core readiness verdict ──
     "ready": {

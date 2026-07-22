@@ -628,7 +628,7 @@ def detect_hedges_in_diff(diff_files: list[dict]) -> list[dict]:
 # Lane values:
 #   conflict         — merge_conflict or update_branch_failed fix iterations
 #   ci               — ci_failure fix iterations
-#   arbitration      — panel_review (second-opinion/dispute) iterations
+#   arbitration      — second-opinion/dispute iterations
 #   review_convergence — everything else (code-review fix + review tasks)
 LANE_CONFLICT = "conflict"
 LANE_CI = "ci"
@@ -712,10 +712,6 @@ def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined] 
     alongside the global cap. The classifier is a pure function of the task's
     payload type and ``review_loop.fix_reason``.
     """
-    payload = (task.first_payload or {}) if hasattr(task, "first_payload") else {}
-    payload_type = payload.get("type", "")
-    if payload_type == "panel_review":
-        return LANE_ARBITRATION
     fix_reason = (
         (task.context or {}).get("review_loop", {}).get("fix_reason", "code_review")
     )

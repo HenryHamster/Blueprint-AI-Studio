@@ -29,7 +29,6 @@ import pytest
 VALID_TASK_TYPES: set[str] = {
     "create",
     "review",
-    "panel_review",
     "fix",
     "plan",
     "research",

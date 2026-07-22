@@ -66,7 +66,6 @@ def test_task_capability_ui_subsets_only_reference_known_types():
     assert USER_LAUNCHABLE_TASK_TYPES == (
         "create",
         "review",
-        "panel_review",
         "fix",
         "plan",
         "research",
@@ -119,7 +118,6 @@ def test_completion_handler_declarations_match_legacy_dispatch():
     task_lifecycle is behaviour-preserving."""
     assert COMPLETION_HANDLER_BY_TASK_TYPE == {
         "plan": "plan",
-        "panel_review": "panel_review",
         "design_doc_update": "design_doc",
         "strategic_review": "strategic",
         "research": "research",
@@ -231,7 +229,6 @@ def test_code_pr_types_keep_code_ci_review_gate():
         assert EVALUATION_STRATEGY_BY_TASK_TYPE[t] == "forward-quality"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["perf"] == "metric"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["compute_experiment"] == "artifact-delivery"
-    assert EVALUATION_STRATEGY_BY_TASK_TYPE["panel_review"] == "structured-verdict"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
 
 
@@ -609,15 +606,12 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
     }
-    # Panel review is a multi-agent workflow producing a verdict artifact with a
-    # higher cost ceiling than the normal review path and is now launchable
-    # because the executable workflow is live.
-    assert by_id["panel_review"]["run_shape"] == "workflow"
-    assert by_id["panel_review"]["output_kind"] == "verdict"
-    assert by_id["panel_review"]["user_launchable"] is True
-    assert by_id["panel_review"]["cost_ceiling_usd"] > by_id["review"][
-        "cost_ceiling_usd"
-    ]
+    assert by_id["strategic_resident_turn"]["execution_owner"] == "agent"
+    assert by_id["strategic_resident_turn"]["filter_visible"] is False
+    assert by_id["strategic_resident_turn"]["provider_configurable"] is True
+    assert by_id["strategic_resident_turn"]["user_launchable"] is False
+    assert by_id["strategic_resident_turn"]["requires_code"] is False
+    assert by_id["strategic_resident_turn"]["cost_ceiling_usd"] == 4.0
 
 
 def test_enrichment_leaves_agent_mode_derived_sets_consistent():
@@ -634,7 +628,6 @@ def test_every_capability_declares_valid_run_shape_and_catalog_round_trips():
         assert capability.run_shape in _VALID_RUN_SHAPES, capability.id.value
         expected_by_id[capability.id.value] = capability.run_shape
 
-    assert expected_by_id["panel_review"] == "workflow"
     assert {
         entry["id"]: entry["run_shape"] for entry in task_type_catalog()
     } == expected_by_id

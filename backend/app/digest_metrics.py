@@ -3494,54 +3494,6 @@ TIMEOUT_RATE_METRIC_MANIFEST: dict[str, dict] = {
 }
 
 
-PANEL_REVIEW_METRIC_MANIFEST: dict[str, dict] = {
-    "challenged_confirmed": {
-        "ground_truth": "Task.context.review_second_opinion.state == 'challenged_confirmed' (panel upholds verdict)",
-        "consumer": "efficiency_snapshot.write_snapshot (durable panel ROI signal in daily snapshot)",
-    },
-    "challenged_revised": {
-        "ground_truth": "Task.context.review_second_opinion.state == 'challenged_revised' (verdict direction same, issue set changed)",
-        "consumer": "efficiency_snapshot.write_snapshot (durable panel ROI signal in daily snapshot)",
-    },
-    "challenged_rejected": {
-        "ground_truth": "Task.context.review_second_opinion.state == 'challenged_rejected' (panel overturns verdict, ROI signal)",
-        "consumer": "efficiency_snapshot.write_snapshot (durable panel ROI signal in daily snapshot)",
-    },
-    "total_challenged": {
-        "ground_truth": "sum of challenged_confirmed + challenged_revised + challenged_rejected",
-        "consumer": "efficiency_snapshot.write_snapshot, compute_gate_health_verdict, compute_recommended_challenger_sample_rate (gate invocation denominator)",
-    },
-    "overturn_rate": {
-        "ground_truth": "challenged_rejected / total_challenged if total_challenged > 0 else None",
-        "consumer": "efficiency_snapshot.write_snapshot, admin-ui AdversarialQualityPanel (gate effectiveness metric)",
-    },
-    "cost_per_challenge_usd": {
-        "ground_truth": "sum of panel_review task LLM cost / total_challenged if total_challenged > 0 else None",
-        "consumer": "efficiency_snapshot.write_snapshot (gate ROI spending breakdown)",
-    },
-    "challenged_escalated": {
-        "ground_truth": "Task.context.review_second_opinion.state == 'unchallenged' AND escalated=True (challenger crashed/unparseable)",
-        "consumer": "efficiency_snapshot.write_snapshot (informational gate health indicator, excluded from fail_open_rate)",
-    },
-    "challenged_degraded": {
-        "ground_truth": "Task.context.review_second_opinion.state == 'degraded_model_unavailable' (silent auto-merge, true fail-open path)",
-        "consumer": "efficiency_snapshot.write_snapshot, compute_gate_health_verdict, compute_recommended_challenger_sample_rate (fail_open_rate numerator)",
-    },
-    "sampled_out_count": {
-        "ground_truth": "Task.context.review_second_opinion.state == 'sampled_out' (invocation skipped due to sample_rate < 1.0)",
-        "consumer": "efficiency_snapshot.write_snapshot, compute_gate_health_verdict (effective_coverage denominator adjustment)",
-    },
-    "effective_coverage": {
-        "ground_truth": "(total_challenged + challenged_degraded + challenged_escalated) / (total_challenged + challenged_degraded + challenged_escalated + sampled_out) if denominator > 0 else None",
-        "consumer": "efficiency_snapshot.write_snapshot, compute_gate_health_verdict, admin-ui AdversarialQualityPanel (gate invocation coverage metric)",
-    },
-    "fail_open_rate": {
-        "ground_truth": "challenged_degraded / (total_challenged + challenged_degraded) if (total_challenged > 0 or challenged_degraded > 0) else None",
-        "consumer": "efficiency_snapshot.write_snapshot, compute_gate_health_verdict, admin-ui AdversarialQualityPanel (primary gate health signal, must be <= 5%)",
-    },
-}
-
-
 def _format_timeout_rate_drift(drift: Dict[str, Any] | None) -> str | None:
     """Render the AGENT_TIMEOUT-rate before/after sentence from the overall block.
 

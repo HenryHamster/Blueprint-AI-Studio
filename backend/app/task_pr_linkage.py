@@ -29,7 +29,7 @@ _PR_NUMBER_FROM_URL = re.compile(r"/pull/(\d+)/?$")
 # NOT a PR they opened themselves. The standalone "PR opened — review owns
 # merge" terminal message must never overwrite these tasks' messages, since
 # their pr_number points at a PR owned by another task.
-PR_INPUT_TASK_TYPES = frozenset({"review", "panel_review", "fix", "verify_tests"})
+PR_INPUT_TASK_TYPES = frozenset({"review", "fix", "verify_tests"})
 
 
 def parse_pr_number_from_url(pr_url: str | None) -> int | None:
