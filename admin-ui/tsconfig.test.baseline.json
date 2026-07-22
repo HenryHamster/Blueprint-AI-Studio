@@ -75,14 +75,6 @@
       "TS18047: 'root' is possibly 'null'.": 1,
       "TS2345: Argument of type '{ window_days: number; generated_at: string; by_provider: never[]; by_model: { provider: string; model: string; total_input_tokens: number; total_output_tokens: number; total_cost_usd: number; ... 5 more ...; approximate_priced: boolean; }[]; totals: { ...; }; unpriced_combos: string[]; approximate_priced_combos: ne...' is not assignable to parameter of type 'LlmCostBreakdownResponse'.": 1
     },
-    "src/components/MessagesPanel.test.tsx": {
-      "TS2322: Type '{ id: string; name: string; query: string; prefs: {}; sort: \"importance\"; showResolved: false; routineExpanded: false; createdAt: number; }[]' is not assignable to type 'SavedView[]'.": 1,
-      "TS2741: Property 'showOnlyNew' is missing in type '{ id: string; name: string; query: string; prefs: { pr_merged: \"mute\"; }; sort: \"recent\"; showResolved: true; routineExpanded: true; createdAt: number; }' but required in type 'SavedView'.": 1,
-      "TS2741: Property 'showOnlyNew' is missing in type '{ id: string; name: string; query: string; prefs: {}; sort: \"importance\"; showResolved: false; routineExpanded: false; createdAt: number; }' but required in type 'SavedView'.": 2,
-      "TS2741: Property 'from_task_id' is missing in type '{ id: string; project_id: string; message_type: string; from_type: string; content: string; context: {}; status: string; resolution: null; resolved_at: null; created_at: string; }' but required in type 'ProjectMessage'.": 1,
-      "TS2345: Argument of type '{ id: string; project_id: string; message_type: string; from_type: string; content: string; context: {}; status: string; resolution: null; resolved_at: null; created_at: string; }[]' is not assignable to parameter of type 'ProjectMessage[]'.": 2,
-      "TS18047: 'root' is possibly 'null'.": 1
-    },
     "src/components/MessagesPanel.utils.test.ts": {
       "TS2339: Property 'msg' does not exist on type '{ kind: \"single\"; msg: TestMessage; } | { kind: \"daily_digest\"; day: string; count: number; breakdown: Record<string, number>; msgs: TestMessage[]; }'.": 1,
       "TS2339: Property 'count' does not exist on type 'RoutineRow<{ id: string; context: { event_type: string; }; created_at: string; }>'.": 1,
@@ -201,6 +193,9 @@
     "src/components/StrategicContextWorkspace.viewport.test.tsx": {
       "TS2322: Type '{ open: true; state: StrategicStateResponse; accountSpend: { totalAccounts: number; availableAccounts: number; enabledAccounts: number; trackedSpendUsd: number; }; ... 5 more ...; onUpdateSessionRefs: Mock<...>; }' is not assignable to type 'IntrinsicAttributes & StrategicContextWorkspaceProps'.": 1
     },
+    "src/components/StrategicLiveTurn.viewport.test.tsx": {
+      "TS2322: Type 'string' is not assignable to type 'number'.": 1
+    },
     "src/components/SystemHealthCard.test.tsx": {
       "TS2820: Type '\"completed\"' is not assignable to type 'TaskStatus'. Did you mean '\"COMPLETED\"'?": 1
     },
@@ -250,8 +245,7 @@
     },
     "src/components/WorkbenchComposition.viewport.test.tsx": {
       "TS2352: Conversion of type '{ project_id: string; strategic: { active_cycle: null; active_task: null; active_phase: null; latest_cycle: { id: string; outcome: string; phase1_task_id: null; phase2_task_id: null; phase1_started_at: string; ... 10 more ...; running_update_changed: true; }; refresh: { ...; }; }; ... 9 more ...; design: { ...; }; }' to type 'StrategicStateResponse' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.": 1,
-      "TS2322: Type '{ onOpenCommandPalette: Mock<Procedure> | (() => void); tasks: never[]; onRefresh: () => void; showResearchBrowser: boolean; onToggleResearchBrowser: () => void; showKnowledgeBrowser: boolean; ... 19 more ...; detailedHealth: null; }' is not assignable to type 'HeaderBarProps'.": 1,
-      "TS18048: 'STATE.runtime' is possibly 'undefined'.": 1
+      "TS2322: Type '{ onOpenCommandPalette: Mock<Procedure> | (() => void); tasks: never[]; onRefresh: () => void; showResearchBrowser: boolean; onToggleResearchBrowser: () => void; showKnowledgeBrowser: boolean; ... 19 more ...; detailedHealth: null; }' is not assignable to type 'HeaderBarProps'.": 1
     },
     "src/hooks/useLogViewer.test.ts": {
       "TS1294: This syntax is not allowed when 'erasableSyntaxOnly' is enabled.": 1

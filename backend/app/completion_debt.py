@@ -1135,6 +1135,7 @@ async def seed_completion_debt_design_doc_section(session: Any, project_id: Any)
     section_key = "systems/completion-debt-ledger"
     new_section = _build_completion_debt_design_doc_section()
     changed = [False]  # Use list to allow modification in nested function
+    doc_section_value: list = [None]  # Captures the written section for dual-write
 
     def _mutate(doc: dict) -> None:
         now = _utcnow().isoformat()
@@ -1162,9 +1163,15 @@ async def seed_completion_debt_design_doc_section(session: Any, project_id: Any)
             meta["revision"] = meta.get("revision", 0) + 1
             meta["last_updated"] = now
             doc["_meta"] = meta
+            doc_section_value[0] = doc[section_key]
 
     try:
         await with_design_doc_locked(session, project_id, _mutate, skip_locked=True)
+        if changed[0]:
+            from app.project_telemetry import set_project_telemetry
+            await set_project_telemetry(
+                session, project_id, section_key, doc_section_value[0]
+            )
         return changed[0]
     except Exception:  # noqa: BLE001
         logger.warning(

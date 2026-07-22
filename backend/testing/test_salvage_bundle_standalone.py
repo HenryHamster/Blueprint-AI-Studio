@@ -7469,6 +7469,157 @@ def test_n1_note_shim_uses_json_str_not_sed():
     )
 
 
+# =========================================================================== #
+# 6-finding salvage bundle, task 5aac862d, 2026-07-22                         #
+# sb5-1 — wipe-risk alert wired in strategic_completion.py (not just logger)  #
+# sb5-2 — RUNNER_LOW_MEMORY in default notification events (already done)     #
+# sb5-3 — fleet cloud_cost_avoided_usd in health-summary response (already)   #
+# sb5-4 — migration 0672 heals poisoned problem_model rows (truncated key)    #
+# sb5-5 — TELEMETRY_KEYS includes systems/completion-debt-ledger dual-write   #
+# sb5-6 — FleetRunnersDashboard.tsx exists and wired in App.tsx (already done)#
+# =========================================================================== #
+
+
+def test_sb5_1_wipe_risk_alert_wired_in_strategic_completion():
+    """strategic_completion.py must call _maybe_create_problem_model_wipe_alert
+    (not just logger.warning) when gaps_wipe_risk or capabilities_wipe_risk is
+    detected in the problem_model diff.
+
+    Finding sb5-1: admin_agent_ops.py already fired the alert; strategic_completion.py
+    only logged a warning, leaving the strategic write path without the fail-loud guard.
+    """
+    import inspect
+    from app import strategic_completion
+
+    source = inspect.getsource(strategic_completion)
+    assert "_maybe_create_problem_model_wipe_alert" in source, (
+        "strategic_completion.py must call _maybe_create_problem_model_wipe_alert "
+        "when a wipe-without-deletions is detected, mirroring the admin_agent_ops.py path"
+    )
+    assert "wipe_risk" in source, (
+        "strategic_completion.py must check for gaps_wipe_risk / capabilities_wipe_risk "
+        "in the problem_model diff to fire the alert"
+    )
+
+
+def test_sb5_2_runner_low_memory_in_default_notification_events():
+    """admin_settings.py default notification events must include RUNNER_LOW_MEMORY.
+
+    Finding sb5-2 (already done): RUNNER_LOW_MEMORY and RUNNER_LOW_DISK are both
+    present in the fallback default list returned to non-admin callers.
+    """
+    import inspect
+    from app.routers import admin_settings
+
+    source = inspect.getsource(admin_settings)
+    assert "RUNNER_LOW_MEMORY" in source, (
+        "admin_settings.py must include RUNNER_LOW_MEMORY in the default notification "
+        "events list so operators relying on webhooks receive memory alerts by default"
+    )
+    assert "RUNNER_LOW_DISK" in source, (
+        "RUNNER_LOW_DISK must remain in the default notification events list alongside "
+        "RUNNER_LOW_MEMORY for parity"
+    )
+
+
+def test_sb5_3_fleet_cost_avoided_in_health_summary():
+    """fleet_runners_health_summary must return cloud_cost_avoided_usd.
+
+    Finding sb5-3 (already done): fleet_health_summary aggregates per-runner
+    compute cost avoidance and surfaces it as cloud_cost_avoided_usd in the
+    fleet-wide summary returned by GET /api/admin/fleet/runners/health-summary.
+    """
+    import inspect
+    from app.routers import admin_runners
+
+    source = inspect.getsource(admin_runners)
+    assert "cloud_cost_avoided_usd" in source, (
+        "admin_runners.py fleet_runners_health_summary must compute and return "
+        "cloud_cost_avoided_usd so operators can see fleet-wide cost avoidance "
+        "in a single call"
+    )
+    assert "fleet_cost_avoided_usd" in source, (
+        "admin_runners.py must accumulate fleet_cost_avoided_usd by summing "
+        "per-runner compute job runtimes multiplied by on-demand rates"
+    )
+
+
+def test_sb5_4_migration_0672_exists_and_strips_truncated():
+    """Migration 0672 must exist, chain from 0671, and strip the truncated key
+    (and sibling packer markers) from project.problem_model JSONB rows.
+
+    Finding sb5-4: poisoned rows with truncated:true stay wedged until an agent
+    write triggers the self-heal in apply_agent_update.  Migration 0672 heals
+    all existing rows at deploy time so no project waits indefinitely.
+    (Renumbered from 0671 to 0672 because 0671 was taken by the base branch.)
+    """
+    from pathlib import Path
+
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    migration_path = versions_dir / "0672_heal_poisoned_problem_model_truncated.py"
+    assert migration_path.exists(), (
+        "Migration 0672 (0672_heal_poisoned_problem_model_truncated.py) must exist "
+        "to strip ephemeral packer keys (truncated, _gap_memory_trimmed, "
+        "_agent_view_floor_applied) from poisoned problem_model rows at deploy time"
+    )
+
+    source = migration_path.read_text(encoding="utf-8")
+    assert 'revision = "0672"' in source, "Migration must declare revision='0672'"
+    assert 'down_revision = "0671"' in source, "Migration must chain from 0671"
+    assert "truncated" in source, (
+        "Migration 0672 must strip the 'truncated' packer marker from problem_model JSONB"
+    )
+    assert "_gap_memory_trimmed" in source, (
+        "Migration 0672 must also strip '_gap_memory_trimmed' — a second ephemeral key "
+        "that can leak into stored rows from the packer"
+    )
+
+
+def test_sb5_5_completion_debt_key_in_telemetry_keys():
+    """TELEMETRY_KEYS must include 'systems/completion-debt-ledger' so completion_debt.py
+    dual-writes the system description to project_telemetry alongside design_doc.
+
+    Finding sb5-5: completion_debt.py still wrote the system-description section only
+    to design_doc; adding dual-write to project_telemetry reduces design_doc pressure
+    and makes the section queryable without holding the design_doc lock.
+    """
+    from app.project_telemetry import TELEMETRY_KEYS
+
+    assert "systems/completion-debt-ledger" in TELEMETRY_KEYS, (
+        "TELEMETRY_KEYS in project_telemetry.py must include 'systems/completion-debt-ledger' "
+        "so completion_debt.seed_completion_debt_design_doc_section dual-writes to "
+        "project_telemetry when the section is seeded or refreshed"
+    )
+
+
+def test_sb5_6_fleet_runners_dashboard_exists_and_wired():
+    """FleetRunnersDashboard.tsx must exist as a standalone page component and
+    be lazy-imported in App.tsx under the 'fleet' tab.
+
+    Finding sb5-6 (already done): a dedicated full-page runner fleet dashboard
+    component was built and routed, allowing operators to monitor fleet health
+    and cost avoidance without opening a per-project drawer.
+    """
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    dashboard_path = repo_root / "admin-ui" / "src" / "components" / "FleetRunnersDashboard.tsx"
+    assert dashboard_path.exists(), (
+        "admin-ui/src/components/FleetRunnersDashboard.tsx must exist as the dedicated "
+        "full-page runner fleet dashboard component"
+    )
+
+    app_path = repo_root / "admin-ui" / "src" / "App.tsx"
+    app_source = app_path.read_text(encoding="utf-8")
+    assert "FleetRunnersDashboard" in app_source, (
+        "App.tsx must import and render FleetRunnersDashboard so operators can "
+        "access the runner fleet dashboard from the top-level navigation"
+    )
+    assert "fleet" in app_source, (
+        "App.tsx must route the 'fleet' tab to FleetRunnersDashboard"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Findings covered here (5-finding creation-path fail-closed/attention/lifecycle
 # salvage bundle, task 880a32f4, 2026-07-22):

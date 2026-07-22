@@ -4806,6 +4806,12 @@ async def _handle_strategic_completion(
                             f"{_wipe_field} with no _deletions directive; existing "
                             f"{_wipe_field} preserved via non-destructive merge"
                         )
+                        from app.alert_dispatch import (
+                            _maybe_create_problem_model_wipe_alert,
+                        )
+                        await _maybe_create_problem_model_wipe_alert(
+                            project.id, session, field=_wipe_field
+                        )
                 # Normalize stale active_moves via shared helper so both write
                 # paths (op-endpoint + log-parse fallback) stay converged.
                 _active_dir_ids = {

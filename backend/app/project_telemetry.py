@@ -34,6 +34,10 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         # Per-direction first-attempt review feedback tallies.  Writers dual-write
         # to both design_doc and this table; readers fall back to design_doc.
         "direction_first_attempt_feedback",
+        # Completion-debt-ledger system description seeded by completion_debt.py.
+        # Writers dual-write to both design_doc (for strategist visibility) and
+        # this table; readers may fall back to design_doc.
+        "systems/completion-debt-ledger",
     }
 )
 
