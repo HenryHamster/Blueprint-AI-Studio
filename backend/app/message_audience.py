@@ -92,6 +92,11 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # Criterion mutation removes/replaces a quality gate → operator-action-needed
     "criterion_retracted": OPERATOR_ACTION_NEEDED,
     "criterion_superseded": OPERATOR_ACTION_NEEDED,
+    # alert_dispatch._maybe_create_problem_model_wipe_risk_alert: an agent write
+    # proposed dropping ALL entries of a problem-model field without an explicit
+    # _deletions directive (merged non-destructively). The operator should
+    # investigate recent problem_model writes → operator-action-needed.
+    "problem_model.wipe_risk": OPERATOR_ACTION_NEEDED,
     # Directly-authored operator escalations (previously unregistered → landed
     # with a NULL audience that both read filters fail OPEN on).  Registering
     # them with their intended, operator-facing audience makes the audience gate
@@ -525,6 +530,7 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     "RUNNER_DEGRADED_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_FLEET_OFFLINE": OPERATOR_ACTION_NEEDED,
     "RUNNER_LOW_DISK": OPERATOR_ACTION_NEEDED,
+    "RUNNER_LOW_MEMORY": OPERATOR_ACTION_NEEDED,
     "RUNNER_OUTAGE_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_LOCAL_HOLD": OPERATOR_ACTION_NEEDED,
     "RUNNER_CONTAINER_HOLD": OPERATOR_ACTION_NEEDED,
@@ -569,6 +575,7 @@ _LOGICAL_EVENT_PAIRS: dict[str, str] = {
     "runner.deactivated": "RUNNER_DEACTIVATED",
     "runner.degraded": "RUNNER_DEGRADED",
     "runner.low_disk": "RUNNER_LOW_DISK",
+    "runner.low_memory": "RUNNER_LOW_MEMORY",
 }
 
 

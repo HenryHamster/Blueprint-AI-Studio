@@ -1611,6 +1611,55 @@ async def fleet_runners_health_summary(
         if view["health"].get("memory_low"):
             fleet["low_memory"] += 1
 
+    # Fleet-wide cloud cost avoided — sum across all physical runners.
+    # Query terminal jobs attributed to any runner in the fleet and price them.
+    fleet_cost_avoided_usd = 0.0
+    if all_runners:
+        runner_ids = [r.id for r in all_runners]
+        terminal_statuses = {
+            ComputeJobStatus.SUCCEEDED,
+            ComputeJobStatus.FAILED,
+            ComputeJobStatus.CANCELLED,
+            ComputeJobStatus.TIMED_OUT,
+        }
+        fleet_cost_rows = (
+            await session.execute(
+                select(
+                    ComputeJob.machine_type,
+                    ComputeJob.accelerator_type,
+                    ComputeJob.accelerator_count,
+                    ComputeJob.started_at,
+                    ComputeJob.completed_at,
+                ).where(
+                    ComputeJob.ran_on_runner_id.in_(runner_ids),
+                    ComputeJob.status.in_(terminal_statuses),
+                    ComputeJob.started_at.is_not(None),
+                    ComputeJob.completed_at.is_not(None),
+                )
+            )
+        ).all()
+
+        fleet_seconds_by_group: Dict[tuple, float] = {}
+        for machine_type, accel_type, accel_count, started_at, completed_at in fleet_cost_rows:
+            runtime_secs = (completed_at - started_at).total_seconds()
+            if runtime_secs <= 0:
+                continue
+            key = (machine_type, accel_type, accel_count)
+            fleet_seconds_by_group[key] = fleet_seconds_by_group.get(key, 0.0) + runtime_secs
+
+        for (machine_type, accel_type, accel_count), total_secs in fleet_seconds_by_group.items():
+            try:
+                rate = get_compute_rate_per_second(
+                    machine_type=machine_type,
+                    accelerator=accel_type,
+                    count=accel_count or 1,
+                    spot=False,
+                )
+            except AcceleratorRejection:
+                continue
+            fleet_cost_avoided_usd += total_secs * rate
+
+    fleet["cloud_cost_avoided_usd"] = round(fleet_cost_avoided_usd, 2)
     fleet["per_project"] = per_project_entries
     fleet["generated_at"] = now.isoformat()
     fleet["project_count"] = len(per_project_entries)

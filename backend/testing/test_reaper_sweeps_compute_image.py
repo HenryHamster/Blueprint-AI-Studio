@@ -2406,347 +2406,6 @@ async def test_deferred_alert_type_not_confused_with_rebuilt_alert(db):
         .all()
     )
     assert len(rebuilt_alerts) == 0
-
-
-# ── ProjectComputeImageBuild model round-trip ─────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_project_compute_image_build_import():
-    """ProjectComputeImageBuild and ComputeImageBuildStatus are importable."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild  # noqa: F401
-
-    assert ComputeImageBuildStatus.PENDING.value == "PENDING"
-    assert ComputeImageBuildStatus.BUILDING.value == "BUILDING"
-    assert ComputeImageBuildStatus.SUCCEEDED.value == "SUCCEEDED"
-    assert ComputeImageBuildStatus.FAILED.value == "FAILED"
-    assert ComputeImageBuildStatus.TIMED_OUT.value == "TIMED_OUT"
-
-
-@pytest.mark.asyncio
-async def test_project_compute_image_build_round_trip(db):
-    """ProjectComputeImageBuild inserts and reads back correctly."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-
-    project = await _make_project(db, name="build-test-proj")
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="abc123",
-        registry_repo="us-central1-docker.pkg.dev/myproj/compute-images",
-        image_name="compute-myproj",
-        builder_vm_id="builder-vm-001",
-        zone="us-central1-a",
-        status=ComputeImageBuildStatus.PENDING,
-    )
-    db.add(row)
-    await db.commit()
-    await db.refresh(row)
-
-    assert row.id is not None
-    assert row.project_id == project.id
-    assert row.dep_hash == "abc123"
-    assert row.registry_repo == "us-central1-docker.pkg.dev/myproj/compute-images"
-    assert row.image_name == "compute-myproj"
-    assert row.builder_vm_id == "builder-vm-001"
-    assert row.zone == "us-central1-a"
-    assert row.status == ComputeImageBuildStatus.PENDING
-    assert row.started_at is None
-    assert row.deadline_at is None
-    assert row.result_json is None
-    assert row.error_reason is None
-    assert row.created_at is not None
-    assert row.updated_at is not None
-
-    fetched = (
-        await db.execute(
-            select(ProjectComputeImageBuild).where(
-                ProjectComputeImageBuild.id == row.id
-            )
-        )
-    ).scalar_one()
-    assert fetched.dep_hash == "abc123"
-    assert fetched.status == ComputeImageBuildStatus.PENDING
-
-
-@pytest.mark.asyncio
-async def test_project_compute_image_build_cloud_build_id_fields(db):
-    """cloud_build_id and cloud_build_staged_object fields persist and load correctly."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-
-    project = await _make_project(db, name="cloud-build-fields-proj")
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="def456",
-        registry_repo="us-central1-docker.pkg.dev/myproj/compute-images",
-        image_name="compute-myproj",
-        status=ComputeImageBuildStatus.BUILDING,
-        cloud_build_id="cb-12345678-abcd",
-        cloud_build_staged_object="build-sources/deadbeef.tar.gz",
-    )
-    db.add(row)
-    await db.commit()
-    await db.refresh(row)
-
-    assert row.cloud_build_id == "cb-12345678-abcd"
-    assert row.cloud_build_staged_object == "build-sources/deadbeef.tar.gz"
-
-
-# ── sweep_reconcile_inflight_cloud_builds ─────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_sweep_reconcile_inflight_cloud_builds_no_rows(db):
-    """Returns all-zero counts when no BUILDING rows exist."""
-    from app.reaper_sweeps import sweep_reconcile_inflight_cloud_builds
-
-    result = await sweep_reconcile_inflight_cloud_builds(db, now=_NOW)
-    assert result == {"checked": 0, "resolved": 0, "still_running": 0, "errors": 0}
-
-
-@pytest.mark.asyncio
-async def test_sweep_reconcile_inflight_cloud_builds_terminal_resolved(db):
-    """A BUILDING row whose Cloud Build reached SUCCESS is updated to SUCCEEDED."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-    from app.reaper_sweeps import sweep_reconcile_inflight_cloud_builds
-
-    project = await _make_project(db, name="reconcile-terminal-proj")
-    stale_time = _NOW - timedelta(minutes=10)
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="aabbcc",
-        registry_repo=_REGISTRY_REPO,
-        image_name=_IMAGE_NAME,
-        status=ComputeImageBuildStatus.BUILDING,
-        cloud_build_id="cb-terminal-001",
-        cloud_build_staged_object="build-sources/abc.tar.gz",
-        updated_at=stale_time,
-        created_at=stale_time,
-    )
-    db.add(row)
-    await db.commit()
-
-    result = await sweep_reconcile_inflight_cloud_builds(
-        db,
-        now=_NOW,
-        _get_status_fn=lambda build_id: "SUCCESS",
-    )
-
-    assert result["checked"] == 1
-    assert result["resolved"] == 1
-    assert result["still_running"] == 0
-    assert result["errors"] == 0
-
-    await db.refresh(row)
-    assert row.status == ComputeImageBuildStatus.SUCCEEDED
-    assert "SUCCESS" in (row.error_reason or "")
-
-
-@pytest.mark.asyncio
-async def test_sweep_reconcile_inflight_cloud_builds_failure_resolved(db):
-    """A BUILDING row whose Cloud Build reached FAILURE is updated to FAILED."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-    from app.reaper_sweeps import sweep_reconcile_inflight_cloud_builds
-
-    project = await _make_project(db, name="reconcile-failure-proj")
-    stale_time = _NOW - timedelta(minutes=10)
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="ddeeff",
-        registry_repo=_REGISTRY_REPO,
-        image_name=_IMAGE_NAME,
-        status=ComputeImageBuildStatus.BUILDING,
-        cloud_build_id="cb-failure-001",
-        cloud_build_staged_object="build-sources/xyz.tar.gz",
-        updated_at=stale_time,
-        created_at=stale_time,
-    )
-    db.add(row)
-    await db.commit()
-
-    result = await sweep_reconcile_inflight_cloud_builds(
-        db,
-        now=_NOW,
-        _get_status_fn=lambda build_id: "FAILURE",
-    )
-
-    assert result["resolved"] == 1
-    await db.refresh(row)
-    assert row.status == ComputeImageBuildStatus.FAILED
-
-
-@pytest.mark.asyncio
-async def test_sweep_reconcile_inflight_cloud_builds_still_running(db):
-    """A BUILDING row whose Cloud Build is still WORKING is left unchanged."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-    from app.reaper_sweeps import sweep_reconcile_inflight_cloud_builds
-
-    project = await _make_project(db, name="reconcile-running-proj")
-    stale_time = _NOW - timedelta(minutes=10)
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="112233",
-        registry_repo=_REGISTRY_REPO,
-        image_name=_IMAGE_NAME,
-        status=ComputeImageBuildStatus.BUILDING,
-        cloud_build_id="cb-running-001",
-        updated_at=stale_time,
-        created_at=stale_time,
-    )
-    db.add(row)
-    await db.commit()
-
-    result = await sweep_reconcile_inflight_cloud_builds(
-        db,
-        now=_NOW,
-        _get_status_fn=lambda build_id: "WORKING",
-    )
-
-    assert result["checked"] == 1
-    assert result["still_running"] == 1
-    assert result["resolved"] == 0
-    await db.refresh(row)
-    assert row.status == ComputeImageBuildStatus.BUILDING  # unchanged
-
-
-@pytest.mark.asyncio
-async def test_sweep_reconcile_inflight_cloud_builds_api_error_is_fail_open(db):
-    """API errors per-row are counted and do not abort the sweep."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-    from app.reaper_sweeps import sweep_reconcile_inflight_cloud_builds
-
-    project = await _make_project(db, name="reconcile-error-proj")
-    stale_time = _NOW - timedelta(minutes=10)
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="445566",
-        registry_repo=_REGISTRY_REPO,
-        image_name=_IMAGE_NAME,
-        status=ComputeImageBuildStatus.BUILDING,
-        cloud_build_id="cb-error-001",
-        updated_at=stale_time,
-        created_at=stale_time,
-    )
-    db.add(row)
-    await db.commit()
-
-    def raise_api_error(build_id):
-        raise RuntimeError("Cloud Build API unavailable")
-
-    result = await sweep_reconcile_inflight_cloud_builds(
-        db,
-        now=_NOW,
-        _get_status_fn=raise_api_error,
-    )
-
-    assert result["errors"] == 1
-    assert result["resolved"] == 0
-    # Row must be unchanged — fail open.
-    await db.refresh(row)
-    assert row.status == ComputeImageBuildStatus.BUILDING
-
-
-@pytest.mark.asyncio
-async def test_sweep_reconcile_inflight_cloud_builds_fresh_rows_skipped(db):
-    """Rows updated recently (within threshold) are not queried — they may still be polling."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-    from app.reaper_sweeps import sweep_reconcile_inflight_cloud_builds
-
-    project = await _make_project(db, name="reconcile-fresh-proj")
-
-    # Row updated 30 seconds ago — within the default 300s threshold.
-    fresh_time = _NOW - timedelta(seconds=30)
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="778899",
-        registry_repo=_REGISTRY_REPO,
-        image_name=_IMAGE_NAME,
-        status=ComputeImageBuildStatus.BUILDING,
-        cloud_build_id="cb-fresh-001",
-        updated_at=fresh_time,
-        created_at=fresh_time,
-    )
-    db.add(row)
-    await db.commit()
-
-    status_calls: list = []
-    result = await sweep_reconcile_inflight_cloud_builds(
-        db,
-        now=_NOW,
-        _get_status_fn=lambda build_id: status_calls.append(build_id) or "WORKING",
-    )
-
-    assert result["checked"] == 0
-    assert status_calls == [], "fresh rows must not be queried"
-
-
-@pytest.mark.asyncio
-async def test_sweep_reconcile_inflight_cloud_builds_no_cloud_build_id_skipped(db):
-    """BUILDING rows without cloud_build_id (e.g. old VM-based lane) are ignored."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-    from app.reaper_sweeps import sweep_reconcile_inflight_cloud_builds
-
-    project = await _make_project(db, name="reconcile-no-id-proj")
-    stale_time = _NOW - timedelta(minutes=10)
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="aabbccdd",
-        registry_repo=_REGISTRY_REPO,
-        image_name=_IMAGE_NAME,
-        status=ComputeImageBuildStatus.BUILDING,
-        cloud_build_id=None,  # old VM lane — no cloud_build_id
-        updated_at=stale_time,
-        created_at=stale_time,
-    )
-    db.add(row)
-    await db.commit()
-
-    result = await sweep_reconcile_inflight_cloud_builds(db, now=_NOW)
-    assert result["checked"] == 0
-
-
-@pytest.mark.asyncio
-async def test_project_compute_image_build_terminal_statuses(db):
-    """SUCCEEDED and FAILED rows round-trip with result/error fields."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-
-    project = await _make_project(db, name="terminal-test-proj")
-
-    succeeded = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="hash-ok",
-        registry_repo="us-central1-docker.pkg.dev/proj/imgs",
-        image_name="compute-proj",
-        status=ComputeImageBuildStatus.SUCCEEDED,
-        result_json='{"pinned_ref": "registry@sha256:abc"}',
-    )
-    failed = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="hash-bad",
-        registry_repo="us-central1-docker.pkg.dev/proj/imgs",
-        image_name="compute-proj",
-        status=ComputeImageBuildStatus.FAILED,
-        error_reason="docker build exited with code 1",
-    )
-    db.add(succeeded)
-    db.add(failed)
-    await db.commit()
-    await db.refresh(succeeded)
-    await db.refresh(failed)
-
-    assert succeeded.result_json == '{"pinned_ref": "registry@sha256:abc"}'
-    assert succeeded.error_reason is None
-    assert failed.result_json is None
-    assert failed.error_reason == "docker build exited with code 1"
-
-
 def test_migration_head_matches_expected_schema_revision():
     """Alembic migration head must equal EXPECTED_SCHEMA_REVISION in main.py."""
     from pathlib import Path
@@ -3066,7 +2725,9 @@ class TestGcGuardDbPinReconciliation:
         import app.reaper_sweeps as _rs
 
         _rs._gc_guard_last_reconciliation = None
+        _rs._last_gc_guard_reconcile_sweep = None  # ensure cadence gate is open
         yield
+        _rs._last_gc_guard_reconcile_sweep = None  # clean up after
 
     @pytest.mark.asyncio
     async def test_all_pinned_digests_protected_is_clean(self, db):
@@ -3236,10 +2897,11 @@ async def test_inuse_guard_sweep_emits_machine_readable_arming_signal(db):
 
     # (e) reconciliation leg: run the DB-pin reconciliation sweep.
     # With the protection tag present in the registry, clean must be True.
-    await sweep_reconcile_gc_guard_db_pins(
-        db,
-        _list_tags=lambda repo: [current_tag],  # digest IS protected in registry
-    )
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", None):
+        await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [current_tag],  # digest IS protected in registry
+        )
 
     signal_after_reconcile = get_compute_image_gc_guard_readiness()
     assert signal_after_reconcile["reconciliation"] is not None, (
@@ -3257,4 +2919,103 @@ async def test_inuse_guard_sweep_emits_machine_readable_arming_signal(db):
     # Verify the function exists and returns the same shape as the signal.
     from app.routers.admin_project_tools import get_compute_image_registry_readiness  # noqa: F401
     assert callable(get_compute_image_registry_readiness)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# sweep_reconcile_gc_guard_db_pins — cadence gate and happy paths
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gc_guard_db_pins_cadence_gate_skips_when_too_soon(db):
+    """Sweep returns skipped_cadence=1 and no registry I/O when within hourly cadence."""
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    list_calls: list[str] = []
+
+    def tracking_list_tags(repo):
+        list_calls.append(repo)
+        return []
+
+    # Last reconciliation was only 10 minutes ago — within the 1-hour window.
+    recent_past = _NOW - timedelta(minutes=10)
+
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", recent_past):
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            now=_NOW,
+            _list_tags=tracking_list_tags,
+        )
+
+    assert result["skipped_cadence"] == 1
+    assert result["clean"] is True
+    assert result["risk_findings"] == []
+    assert list_calls == [], "list_tags must not be called when cadence gate fires"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gc_guard_db_pins_runs_when_interval_elapsed(db):
+    """Sweep runs normally when the cadence gate is open (>1 h since last run)."""
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    from app.compute_image_build import protection_tag_for_digest
+
+    current_tag = protection_tag_for_digest(_DIGEST_A)
+
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", _PAST_NOW):
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            now=_NOW,
+            _list_tags=lambda repo: [current_tag],  # tag present → clean
+        )
+
+    assert result["skipped_cadence"] == 0
+    assert result["clean"] is True
+    assert result["risk_findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gc_guard_db_pins_detects_missing_tag(db):
+    """A DB-pinned digest whose inuse- tag is absent is reported as a risk finding."""
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", _PAST_NOW):
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            now=_NOW,
+            _list_tags=lambda repo: [],  # no tags → digest unprotected
+        )
+
+    assert result["skipped_cadence"] == 0
+    assert result["clean"] is False
+    assert len(result["risk_findings"]) == 1
+    finding = result["risk_findings"][0]
+    assert finding["digest"] == _DIGEST_A
+    assert finding["project_id"] == str(project.id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gc_guard_db_pins_stamps_cadence_timer(db):
+    """After a successful run, _last_gc_guard_reconcile_sweep is updated."""
+    import app.reaper_sweeps as _rs
+
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    original = _rs._last_gc_guard_reconcile_sweep
+    try:
+        _rs._last_gc_guard_reconcile_sweep = None  # force cadence gate open
+        await sweep_reconcile_gc_guard_db_pins(
+            db,
+            now=_NOW,
+            _list_tags=lambda repo: [],
+        )
+        assert _rs._last_gc_guard_reconcile_sweep == _NOW, (
+            "_last_gc_guard_reconcile_sweep must be stamped with now after a real run"
+        )
+    finally:
+        _rs._last_gc_guard_reconcile_sweep = original
 

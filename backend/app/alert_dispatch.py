@@ -1338,6 +1338,57 @@ async def _maybe_create_self_repair_burn_share_alert(
     )
 
 
+async def _maybe_create_problem_model_wipe_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    field: str,
+) -> None:
+    """Create a deduplicated WARNING alert when a problem_model write would have
+    wiped all entries from ``field`` (``'gaps'`` or ``'capabilities'``) without
+    an explicit ``_deletions`` directive.
+
+    The non-destructive merge in ``apply_agent_update`` already prevents the
+    actual wipe; this alert surfaces the signal so operators can investigate
+    whether the agent is acting on a truncated or dropped payload view.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` on a stable
+    title — an agent that repeatedly submits empty payloads raises exactly ONE
+    alert per project per field until the operator dismisses it.
+    """
+    title = f"Problem-model {field} wipe blocked on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    message = (
+        f"An agent write proposed dropping ALL {field} from the problem model "
+        f"without an explicit _deletions directive. The write was merged "
+        f"non-destructively (existing {field} preserved), but this pattern "
+        f"usually means the agent is acting on a truncated payload view. "
+        f"Investigate recent problem_model writes on this project."
+    )
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        event_type="problem_model.wipe_risk",
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+
+
 async def _maybe_create_precondition_blocker_alert(
     task: "Task",
     session: AsyncSession,

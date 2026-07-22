@@ -2810,6 +2810,58 @@ def normalize_active_moves_writeback(
     return new_pm_raw, corrections
 
 
+_WIPE_RISK_SENTINEL = object()  # detect_wipe_risk: sentinel for absent-key check
+
+
+def detect_wipe_risk(
+    current: ProblemModel,
+    proposed: ProblemModel,
+    deletions: Any,
+    *,
+    proposed_raw: dict | None = None,
+) -> dict[str, bool]:
+    """Detect a proposed full-collection wipe without explicit _deletions coverage.
+
+    Called BEFORE :func:`_merge_agent_owned_collections` so ``proposed``
+    still reflects what the agent actually submitted (pre-merge). The merge
+    itself prevents the wipe; this function surfaces the intent so callers
+    can fire an alert.
+
+    ``proposed_raw`` is the raw dict the agent submitted BEFORE pydantic
+    validation (after directives like ``_deletions`` are lifted out). When
+    supplied, a collection is only flagged when the raw dict EXPLICITLY
+    submitted an empty list for that key.  An absent key is a partial update
+    — the merge's omission=keep semantics handle it, and no alarm is needed.
+    When ``proposed_raw`` is not supplied (legacy / test callers), the
+    function falls back to checking the parsed model's empty-collection field.
+
+    Returns a dict with ``gaps_wipe_risk`` and/or ``capabilities_wipe_risk``
+    set to ``True`` when the condition fires:
+      - durable model has at least one entry
+      - proposed payload explicitly submitted an empty list for that collection
+      - ``_deletions`` carries no explicit removals for that collection
+        (a full explicit deletion is intentional and not flagged)
+    """
+    result: dict[str, bool] = {}
+
+    def _explicitly_empty(field: str) -> bool:
+        if proposed_raw is None:
+            # Fallback when raw dict is unavailable: use the parsed model.
+            return not getattr(proposed, field)
+        raw_val = proposed_raw.get(field, _WIPE_RISK_SENTINEL)
+        if raw_val is _WIPE_RISK_SENTINEL:
+            return False  # absent key is a partial update, not a wipe
+        return isinstance(raw_val, list) and len(raw_val) == 0
+
+    del_gap_ids = set(_as_str_list(deletions, "gaps"))
+    if current.gaps and _explicitly_empty("gaps") and not del_gap_ids:
+        result["gaps_wipe_risk"] = True
+    del_cap_names = set(_as_str_list(deletions, "capabilities"))
+    if current.capabilities and _explicitly_empty("capabilities") and not del_cap_names:
+        result["capabilities_wipe_risk"] = True
+    return result
+
+
 def apply_agent_update(
     current_raw: dict | None,
     proposed_raw: dict,
@@ -2988,6 +3040,14 @@ def apply_agent_update(
         e["gap_id"] for e in compaction_events if "past_moves_watermark" in e
     }
 
+    # Detect wipe-without-deletions BEFORE the merge restores omitted entries.
+    # The merge below is non-destructive so the actual wipe is prevented, but
+    # a proposed payload with zero gaps/capabilities and no _deletions signals
+    # that the agent either truncated its view or is attempting a silent wipe.
+    # Pass proposed_raw so detect_wipe_risk can distinguish an explicit empty
+    # list (wipe-without-deletions) from an absent key (partial update).
+    _wipe_risk = detect_wipe_risk(current, proposed, deletions, proposed_raw=proposed_raw)
+
     # Non-destructive merge of agent-owned collections: an agent acting on a
     # trimmed/dropped payload view must not wipe entries it never saw. Runs
     # before the diff so the diff reflects the true merged state.
@@ -3013,6 +3073,11 @@ def apply_agent_update(
     # Surface blocked gap deletions (already filtered before merge above).
     if _blocked_gap_deletions:
         diff["gaps_deletion_blocked"] = sorted(_blocked_gap_deletions)
+    # Surface wipe-without-deletions signals detected before the merge.
+    if _wipe_risk.get("gaps_wipe_risk"):
+        diff["gaps_wipe_risk"] = True
+    if _wipe_risk.get("capabilities_wipe_risk"):
+        diff["capabilities_wipe_risk"] = True
 
     # Record compaction events in the diff for observability.
     if compaction_events:

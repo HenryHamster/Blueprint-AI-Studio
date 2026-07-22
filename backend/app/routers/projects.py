@@ -220,12 +220,6 @@ async def deploy_blueprint(
         session.add(task)
         created_tasks.append(task)
 
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-    await initialize_strategic_resident(  # noqa: F821
-        session, project.id, locked_project=project
-    )
     await session.commit()
 
     # Populate branch columns from GitHub immediately so that the first task

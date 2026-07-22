@@ -54,10 +54,8 @@ from app.shared_state import limiter
 from app.models import (
     ArtifactRef,
     ArtifactRefPromotionIntent,
-    ComputeImageBuildStatus,
     Project,
     ProjectComputeImage,
-    ProjectComputeImageBuild,
     ProjectMessageAttachmentUpload,
     ProjectTool,
     _utcnow,
@@ -2126,150 +2124,6 @@ async def trigger_project_compute_image_build(
 # (identical to the build path's hash computation) to detect staleness.
 
 
-async def _compute_image_build_metrics(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    registry_repo: str,
-    image_name: str,
-    *,
-    lookback_days: int = 30,
-    limit: int = 100,
-) -> Dict[str, Any]:
-    """Aggregate operational metrics over terminal compute-image build rows.
-
-    Queries up to ``limit`` terminal (SUCCEEDED/FAILED/TIMED_OUT)
-    ``ProjectComputeImageBuild`` rows for this project/image within
-    ``lookback_days``, newest first, and computes:
-
-    - ``total_builds``, ``succeeded``, ``failed``, ``timed_out``
-    - ``success_rate``: succeeded / total (null when no builds)
-    - ``cache_hit_rate``: fraction of SUCCEEDED rows whose ``result_json``
-      records ``already_present=true`` (null when no succeeded builds)
-    - ``avg_build_seconds``: mean of ``image_published_at - started_at`` for
-      SUCCEEDED rows that have both timestamps (null when none qualify)
-    - ``in_flight_count``: PENDING + BUILDING rows (cross-checks active_builds)
-    """
-    cutoff = _utcnow() - timedelta(days=lookback_days)
-
-    terminal_rows = (
-        (
-            await session.execute(
-                select(ProjectComputeImageBuild)
-                .where(
-                    ProjectComputeImageBuild.project_id == project_id,
-                    ProjectComputeImageBuild.registry_repo == registry_repo,
-                    ProjectComputeImageBuild.image_name == image_name,
-                    ProjectComputeImageBuild.status.in_(
-                        [
-                            ComputeImageBuildStatus.SUCCEEDED,
-                            ComputeImageBuildStatus.FAILED,
-                            ComputeImageBuildStatus.TIMED_OUT,
-                        ]
-                    ),
-                    ProjectComputeImageBuild.created_at >= cutoff,
-                )
-                .order_by(ProjectComputeImageBuild.created_at.desc())
-                .limit(limit)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    succeeded = [r for r in terminal_rows if r.status == ComputeImageBuildStatus.SUCCEEDED]
-    failed = [r for r in terminal_rows if r.status == ComputeImageBuildStatus.FAILED]
-    timed_out = [r for r in terminal_rows if r.status == ComputeImageBuildStatus.TIMED_OUT]
-    total = len(terminal_rows)
-
-    success_rate: float | None = (len(succeeded) / total) if total > 0 else None
-
-    cache_hits = sum(
-        1
-        for r in succeeded
-        if r.result_json and _json.loads(r.result_json).get("already_present")
-    )
-    cache_hit_rate: float | None = (cache_hits / len(succeeded)) if succeeded else None
-
-    durations = [
-        (r.image_published_at - r.started_at).total_seconds()
-        for r in succeeded
-        if r.started_at and r.image_published_at
-    ]
-    avg_build_seconds: float | None = (sum(durations) / len(durations)) if durations else None
-
-    in_flight_count_result = await session.execute(
-        select(func.count(ProjectComputeImageBuild.id)).where(
-            ProjectComputeImageBuild.project_id == project_id,
-            ProjectComputeImageBuild.registry_repo == registry_repo,
-            ProjectComputeImageBuild.image_name == image_name,
-            ProjectComputeImageBuild.status.in_(
-                [ComputeImageBuildStatus.PENDING, ComputeImageBuildStatus.BUILDING]
-            ),
-        )
-    )
-    in_flight_count = in_flight_count_result.scalar() or 0
-
-    return {
-        "lookback_days": lookback_days,
-        "total_builds": total,
-        "succeeded": len(succeeded),
-        "failed": len(failed),
-        "timed_out": len(timed_out),
-        "success_rate": success_rate,
-        "cache_hit_rate": cache_hit_rate,
-        "avg_build_seconds": avg_build_seconds,
-        "in_flight_count": in_flight_count,
-    }
-
-
-async def _list_active_image_builds(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    registry_repo: str,
-    image_name: str,
-) -> list[Dict[str, Any]]:
-    """Serialize in-flight (PENDING/BUILDING) off-orchestrator builds for an image.
-
-    Returns the async-build tracking rows the reaper poll sweep has not yet
-    finalized, newest first, so the status endpoint can surface a dispatched
-    build before its ``ProjectComputeImage`` pin exists. Empty list when the
-    async builder lane is unused (the common case today).
-    """
-    rows = (
-        (
-            await session.execute(
-                select(ProjectComputeImageBuild)
-                .where(
-                    ProjectComputeImageBuild.project_id == project_id,
-                    ProjectComputeImageBuild.registry_repo == registry_repo,
-                    ProjectComputeImageBuild.image_name == image_name,
-                    ProjectComputeImageBuild.status.in_(
-                        [
-                            ComputeImageBuildStatus.PENDING,
-                            ComputeImageBuildStatus.BUILDING,
-                        ]
-                    ),
-                )
-                .order_by(ProjectComputeImageBuild.created_at.desc())
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return [
-        {
-            "build_id": str(b.id),
-            "status": b.status.value if hasattr(b.status, "value") else str(b.status),
-            "dep_hash": b.dep_hash,
-            "builder_vm_id": b.builder_vm_id,
-            "started_at": b.started_at.isoformat() if b.started_at else None,
-            "deadline_at": b.deadline_at.isoformat() if b.deadline_at else None,
-            "created_at": b.created_at.isoformat() if b.created_at else None,
-        }
-        for b in rows
-    ]
-
-
 @router.get("/projects/{project_id}/compute-image/status")
 async def get_project_compute_image_status(
     project_id: uuid.UUID,
@@ -2296,13 +2150,6 @@ async def get_project_compute_image_status(
     when the project does not declare a compute image it reports
     ``no_compute_image_declared`` — both as clean status values, not errors.
 
-    ``active_builds`` (present on ``built`` and ``never_built`` responses) lists
-    any in-flight off-orchestrator builds (PENDING/BUILDING
-    ``ProjectComputeImageBuild`` rows) the reaper poll sweep has not yet
-    finalized — this is how a caller polls an async build dispatched by the
-    trigger endpoint's 202 path. It is an empty list when no async build is in
-    flight (the common case today).
-
     The optional ``?check_drift=true`` param adds a ``drift`` object to the
     response, computed by cloning the project repo and running the same
     dependency-hash computation as the build pipeline (``dry_run=True``).  The
@@ -2322,14 +2169,6 @@ async def get_project_compute_image_status(
     name = compute_image.get("name", "")
     registry_repo, image_name, _ = _cb._split_image_ref(name)
 
-    # In-flight off-orchestrator builds (PENDING/BUILDING) for this exact image,
-    # surfaced alongside the durable ProjectComputeImage record so an operator can
-    # see an async build that has been dispatched but not yet finalized. Additive:
-    # the existing ``status`` values are unchanged.
-    active_builds = await _list_active_image_builds(
-        session, project_id, registry_repo, image_name
-    )
-
     # Query the latest ProjectComputeImage row matching this project/image.
     row = (
         await session.execute(
@@ -2345,11 +2184,7 @@ async def get_project_compute_image_status(
     ).scalar_one_or_none()
 
     if row is None:
-        return {"status": "never_built", "active_builds": active_builds}
-
-    build_metrics = await _compute_image_build_metrics(
-        session, project_id, registry_repo, image_name
-    )
+        return {"status": "never_built"}
 
     build_age_hours: float | None = None
     if row.updated_at:
@@ -2365,8 +2200,6 @@ async def get_project_compute_image_status(
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         "is_digest_pinned": row.digest is not None,
-        "active_builds": active_builds,
-        "build_metrics": build_metrics,
         "build_age_hours": build_age_hours,
     }
 

@@ -22,6 +22,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.alert_dispatch import _maybe_create_problem_model_wipe_alert
 from app.broadcast import broadcast_to_project
 from app.capability_proof import carry_proof_records_for_consolidation
 from app.capability_trial_verdict import (
@@ -3891,6 +3892,13 @@ async def strategic_operation(
             warnings.append(  # noqa: PERF401
                 f"gap deletion blocked: {_bid} is still referenced by an active direction"
             )
+        # Fire a deduplicated WARNING alert when the agent attempted a full
+        # collection wipe without an explicit _deletions directive.
+        for _wipe_field in ("gaps", "capabilities"):
+            if pm_diff.get(f"{_wipe_field}_wipe_risk"):
+                await _maybe_create_problem_model_wipe_alert(
+                    project.id, session, field=_wipe_field
+                )
         # Normalize stale active_moves via the shared helper so both write paths
         # (op-endpoint + log-parse fallback) stay converged.
         _active_dir_ids = {

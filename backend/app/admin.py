@@ -2540,14 +2540,9 @@ async def create_task_manually(
         )
         session.add(project)
         await session.flush()
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_checkpointing import (
-#             initialize_strategic_resident,
-#         )
-
-        await initialize_strategic_resident(  # noqa: F821
-            session, project.id, locked_project=project
-        )
+        # [RESIDENT-REMOVAL] strategic-resident initialization removed with the
+        # resident subsystem (#15963); project creation no longer bootstraps a
+        # resident session.
         await session.commit()
         await session.refresh(project)
         # Auto-add owner membership
@@ -3326,14 +3321,9 @@ async def create_compute_experiment_task(
         )
         session.add(project)
         await session.flush()
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_checkpointing import (
-#             initialize_strategic_resident,
-#         )
-
-        await initialize_strategic_resident(  # noqa: F821
-            session, project.id, locked_project=project
-        )
+        # [RESIDENT-REMOVAL] strategic-resident initialization removed with the
+        # resident subsystem (#15963); project creation no longer bootstraps a
+        # resident session.
         await session.commit()
         await session.refresh(project)
         session.add(

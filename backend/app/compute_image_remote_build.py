@@ -384,19 +384,8 @@ def remote_build_and_push(*, repo_dir: str, registry_repo: str, image_name: str,
                           build_args: Dict[str, str] | None = None, dry_run: bool = False,
                           cancel_event=None, _tag_exists_fn=None, _submit_fn=None,
                           _poll_fn=None, _resolve_digest_fn=None,
-                          _persist_fn=None, _load_inflight_fn=None,
                           **_ignored) -> BuildResult:
-    """Hash, validate, remotely build, scan, publish, and return a digest pin.
-
-    *_persist_fn* ``(dep_hash, build_id, staged_object) -> None`` — called immediately after
-    Cloud Build submission succeeds, before the poll loop starts.  Use this to write the
-    build-id to a durable store so an orchestrator restart can recover the in-flight build.
-
-    *_load_inflight_fn* ``(dep_hash) -> dict | None`` — called before submission.  If it
-    returns ``{"build_id": str, "staged_object": str | None}``, the submission step is
-    skipped entirely and polling resumes from the stored build-id.  This is the restart-
-    recovery path: callers load any previously-persisted state and hand it in here.
-    """
+    """Hash, validate, remotely build, scan, publish, and return a digest pin."""
     from app.compute_image_build import CredentialLeakError
     if not _remote_build_configured():
         raise RuntimeError("Remote compute-image build is not configured")
@@ -428,34 +417,6 @@ def remote_build_and_push(*, repo_dir: str, registry_repo: str, image_name: str,
     tag_exists = _tag_exists_fn or remote_registry_tag_exists
     resolve_digest = _resolve_digest_fn or _resolve_registry_digest_from_api
 
-    # Restart-recovery path: resume polling a build submitted before the last restart.
-    if _load_inflight_fn is not None:
-        inflight = _load_inflight_fn(dep_hash)
-        if inflight is not None:
-            build_id = inflight["build_id"]
-            staged_object = inflight.get("staged_object")
-            try:
-                result = (_poll_fn or _poll_cloud_build)(
-                    build_id,
-                    deadline_at=time.monotonic() + _REMOTE_BUILD_TIMEOUT_SECONDS + _REMOTE_QUEUE_TIMEOUT_SECONDS + 300,
-                    cancel_event=cancel_event,
-                )
-            except BaseException:
-                _cancel_cloud_build(build_id)
-                _wait_for_cloud_build_terminal(build_id)
-                raise
-            finally:
-                if staged_object:
-                    with contextlib.suppress(Exception):
-                        _delete_staged_object(staged_object)
-            if result.get("status") != "SUCCESS":
-                raise RuntimeError(f"Resumed Cloud Build {build_id} failed: {result.get('status')}")
-            digest = resolve_digest(full_repo, dep_hash)
-            if not digest:
-                raise RuntimeError("resumed build: published image digest could not be resolved")
-            return BuildResult(pinned_ref=f"{full_repo}@{digest}", tag=dep_hash, dep_hash=dep_hash,
-                               already_present=False, built=True, digest=digest)
-
     if tag_exists(full_repo, dep_hash):
         digest = resolve_digest(full_repo, dep_hash)
         return BuildResult(pinned_ref=f"{full_repo}@{digest}" if digest else f"{full_repo}:{dep_hash}",
@@ -473,11 +434,6 @@ def remote_build_and_push(*, repo_dir: str, registry_repo: str, image_name: str,
         submission = (_submit_fn or _submit_cloud_build)(
             source_tarball=archive, full_image_ref=f"{full_repo}:{dep_hash}",
             dockerfile_rel=dockerfile, build_args=build_args, parent=parent, tag=dep_hash)
-        # Persist build-id BEFORE entering the poll loop so an orchestrator restart
-        # can recover and resume polling rather than orphaning the in-flight build.
-        if _persist_fn is not None:
-            _persist_fn(dep_hash=dep_hash, build_id=submission.build_id,
-                        staged_object=submission.staged_object)
         try:
             result = (_poll_fn or _poll_cloud_build)(
                 submission.build_id,

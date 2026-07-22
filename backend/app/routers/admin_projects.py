@@ -1728,19 +1728,12 @@ async def set_project_paused(
 
     project.paused = bool(payload["paused"])
     session.add(project)
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_wakeups import sync_resident_background_policy
-
-    wake = await sync_resident_background_policy(  # noqa: F821
-        session,
-        project_id=project.id,
-        paused=project.paused,
-        now=_utcnow(),
-    )
+    # [RESIDENT-REMOVAL] resident background-policy wakeup removed with the
+    # resident subsystem (#15963); pause/resume no longer arms a resident wakeup.
     await session.commit()
     return {
         "paused": project.paused,
-        "resident_wakeup_state": wake.state if wake is not None else None,
+        "resident_wakeup_state": None,
     }
 
 

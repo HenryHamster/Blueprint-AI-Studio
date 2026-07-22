@@ -49,6 +49,7 @@ from app.problem_model import (
     compute_model_size_signal,
     capability_evidence_status,
     gap_evidence_status,
+    detect_wipe_risk,
     gc_problem_model,
     is_empty,
     normalize_active_moves_writeback,
@@ -1713,13 +1714,17 @@ def test_apply_agent_update_bootstrap_over_mature_preserves_collections():
 def test_apply_agent_update_explicit_empty_collections_preserve_via_merge():
     """Explicitly submitting empty arrays for all three collections over a
     mature model still preserves them — an empty list is no upserts, not a
-    wipe. Removal is only via the explicit ``_deletions`` directive."""
+    wipe. Removal is only via the explicit ``_deletions`` directive.
+    The diff now also carries wipe-risk signals for gaps and capabilities."""
     current = _mature_current()
     proposed = {"capabilities": [], "gaps": [], "friction": []}
-    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
     assert {c["name"] for c in new_raw["capabilities"]} == {"Billing", "Metering"}
     assert {g["id"] for g in new_raw["gaps"]} == {"g-1"}
     assert {f["id"] for f in new_raw["friction"]} == {"f-1"}
+    # Wipe-risk signals surface in the diff even though the merge preserved entries.
+    assert diff.get("gaps_wipe_risk") is True
+    assert diff.get("capabilities_wipe_risk") is True
 
 
 def test_apply_agent_update_close_by_status_edit_passes():
@@ -6314,3 +6319,129 @@ def test_sanitize_problem_model_raw_output_is_pydantic_parseable():
     model = parse_problem_model(sanitized)
     assert model.revision == 2
     assert model.intent.purpose == "test purpose"
+
+
+# ---------------------------------------------------------------------------
+# detect_wipe_risk + apply_agent_update wipe-risk diff signals
+# ---------------------------------------------------------------------------
+
+
+def _model_with_gaps_and_caps() -> ProblemModel:
+    return parse_problem_model({
+        "revision": 3,
+        "capabilities": [{"name": "Auth", "status": "working"}],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    })
+
+
+def test_detect_wipe_risk_gaps_no_deletions():
+    """Empty proposed gaps over a non-empty durable model with no _deletions
+    fires gaps_wipe_risk."""
+    current = _model_with_gaps_and_caps()
+    proposed = parse_problem_model({
+        "capabilities": [{"name": "Auth", "status": "working"}],
+        "gaps": [],
+    })
+    result = detect_wipe_risk(current, proposed, deletions=None)
+    assert result.get("gaps_wipe_risk") is True
+    assert "capabilities_wipe_risk" not in result
+
+
+def test_detect_wipe_risk_capabilities_no_deletions():
+    """Empty proposed capabilities over a non-empty durable model with no
+    _deletions fires capabilities_wipe_risk."""
+    current = _model_with_gaps_and_caps()
+    proposed = parse_problem_model({
+        "capabilities": [],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    })
+    result = detect_wipe_risk(current, proposed, deletions=None)
+    assert result.get("capabilities_wipe_risk") is True
+    assert "gaps_wipe_risk" not in result
+
+
+def test_detect_wipe_risk_with_deletions_not_blocked():
+    """When _deletions.gaps explicitly names the gap ids, the wipe is intentional
+    and the risk flag must NOT fire."""
+    current = _model_with_gaps_and_caps()
+    proposed = parse_problem_model({
+        "capabilities": [],
+        "gaps": [],
+    })
+    deletions = {"gaps": ["g-1"], "capabilities": ["Auth"]}
+    result = detect_wipe_risk(current, proposed, deletions=deletions)
+    assert result == {}
+
+
+def test_detect_wipe_risk_empty_current_not_blocked():
+    """First-cycle write: current model is empty, so there is nothing to wipe.
+    No risk flags should fire."""
+    current = parse_problem_model(None)
+    proposed = parse_problem_model({"gaps": [], "capabilities": []})
+    result = detect_wipe_risk(current, proposed, deletions=None)
+    assert result == {}
+
+
+def test_full_collection_wipe_without_deletions_is_rejected():
+    """apply_agent_update must surface gaps_wipe_risk and capabilities_wipe_risk
+    in the diff when the agent proposes empty collections over a non-empty
+    durable model without a _deletions directive, AND must preserve the existing
+    entries via the non-destructive merge."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {"name": "Billing", "status": "working"},
+            {"name": "Metering", "status": "partial"},
+        ],
+        "gaps": [
+            {"id": "g-1", "name": "invoicing", "status": "active"},
+            {"id": "g-2", "name": "reporting", "status": "active"},
+        ],
+    }
+    # Agent proposes completely empty collections with no _deletions directive.
+    proposed = {"capabilities": [], "gaps": []}
+    new_raw, diff = apply_agent_update(current, proposed, "2026-07-22T10:00:00")
+
+    # Wipe risk signals must appear in the diff.
+    assert diff.get("gaps_wipe_risk") is True, (
+        "Expected gaps_wipe_risk in diff when agent proposes empty gaps "
+        "over a non-empty durable model without _deletions"
+    )
+    assert diff.get("capabilities_wipe_risk") is True, (
+        "Expected capabilities_wipe_risk in diff when agent proposes empty "
+        "capabilities over a non-empty durable model without _deletions"
+    )
+
+    # Existing entries must still be preserved (non-destructive merge).
+    assert {c["name"] for c in new_raw["capabilities"]} == {"Billing", "Metering"}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-1", "g-2"}
+
+
+def test_apply_agent_update_wipe_risk_absent_when_deletions_cover_all():
+    """When _deletions explicitly names every gap and capability, the wipe is
+    intentional — no wipe-risk flags appear in the diff."""
+    current = {
+        "revision": 2,
+        "capabilities": [{"name": "Auth", "status": "working"}],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    }
+    proposed = {
+        "capabilities": [],
+        "gaps": [],
+        "_deletions": {"gaps": ["g-1"], "capabilities": ["Auth"]},
+    }
+    _, diff = apply_agent_update(current, proposed, "2026-07-22T10:00:00")
+    assert "gaps_wipe_risk" not in diff
+    assert "capabilities_wipe_risk" not in diff
+
+
+def test_apply_agent_update_no_wipe_risk_on_first_cycle():
+    """A genuine first cycle (empty current) bootstrapping an empty model must
+    not produce wipe-risk signals — there is nothing to preserve."""
+    _, diff = apply_agent_update(
+        None,
+        {"intent": {"purpose": "Bootstrap."}, "gaps": [], "capabilities": []},
+        "2026-07-22T10:00:00",
+    )
+    assert "gaps_wipe_risk" not in diff
+    assert "capabilities_wipe_risk" not in diff

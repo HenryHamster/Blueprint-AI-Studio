@@ -316,8 +316,8 @@ from app.reaper_sweeps import (
     sweep_decay_stale_pending_confirmations,
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
+    sweep_reconcile_gc_guard_db_pins,
     sweep_refresh_project_compute_images,
-    sweep_reconcile_inflight_cloud_builds,
     sweep_stranded_runner_subprocess_compute_jobs,
     sweep_proof_earn_loop,
     sweep_silent_runner_compute_jobs,
@@ -3422,6 +3422,21 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 22c-ii: DB-pin reconciliation — verify every DB-pinned
+                # compute-image digest has its ``inuse-`` tag in the registry,
+                # surfacing the case where GC would delete an in-use image.
+                # Hourly cadence-gated on an independent timer. Fail-open.
+                _mark_reaper_progress()
+                try:
+                    await sweep_reconcile_gc_guard_db_pins(session, now=now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] GC-guard DB-pin reconciliation error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 22d: Compute-image auto-refresh — rebuild a project's baked
                 # compute image when its declared dependency manifest changes, so
                 # the image can't silently drift from the code's real deps until an
@@ -3444,21 +3459,8 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 22e: Inflight Cloud Build reconciliation — detect
-                # ProjectComputeImageBuild rows stuck in BUILDING status because
-                # the orchestrator was replaced mid-poll. Checks Cloud Build API
-                # for the current status and updates the DB row to the terminal
-                # state so callers can detect the outcome. Per-row fail-open.
-                _mark_reaper_progress()
-                try:
-                    await sweep_reconcile_inflight_cloud_builds(session, now)
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Inflight Cloud Build reconciliation error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
+                # Step 22e (was inflight Cloud Build reconciliation — removed;
+                # the ProjectComputeImageBuild table was dead code).
 
                 # Step 22f: Auto-clear moot pending_user_confirmation items —
                 # remove credentials_needed/access_needed asks the runtime can

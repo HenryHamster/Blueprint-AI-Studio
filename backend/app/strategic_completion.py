@@ -4801,6 +4801,14 @@ async def _handle_strategic_completion(
                         f"[STRATEGIC] Task {task.id}: gap deletion(s) blocked — "
                         f"still referenced by active direction(s): {_blocked_dels}"
                     )
+                for _wipe_field in ("gaps", "capabilities"):
+                    if pm_diff.get(f"{_wipe_field}_wipe_risk"):
+                        logger.warning(
+                            f"[STRATEGIC] Task {task.id}: problem_model {_wipe_field} "
+                            f"wipe-without-deletions detected — agent proposed empty "
+                            f"{_wipe_field} with no _deletions directive; existing "
+                            f"{_wipe_field} preserved via non-destructive merge"
+                        )
                 # Normalize stale active_moves via shared helper so both write
                 # paths (op-endpoint + log-parse fallback) stay converged.
                 _active_dir_ids = {
