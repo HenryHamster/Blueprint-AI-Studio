@@ -21,12 +21,13 @@ from app.time_utils import _utcnow
 
 TELEMETRY_KEYS: frozenset[str] = frozenset(
     {
-        "efficiency_baseline",
-        "lane_baselines",
+        # efficiency_baseline, lane_baselines, and sr_catch_rate_trends were moved
+        # to dedicated tables (project_efficiency_snapshot, project_lane_baseline,
+        # project_sr_analytics) as of migration 0656 and are no longer stored in
+        # design_doc, so they are excluded from this set.
         "cochange_index",
         "cochange_applied_prs",
         "module_feedback",
-        "sr_catch_rate_trends",
         "retired_diagnoses_archive",
         "playbook_archive",
         "proposed_changes",

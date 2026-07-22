@@ -268,12 +268,9 @@ def test_agent_cap_not_breached_with_large_reserved_blobs():
 
 def test_telemetry_keys_set():
     expected = {
-        "efficiency_baseline",
-        "lane_baselines",
         "cochange_index",
         "cochange_applied_prs",
         "module_feedback",
-        "sr_catch_rate_trends",
         "retired_diagnoses_archive",
         "playbook_archive",
         "proposed_changes",

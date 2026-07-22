@@ -638,6 +638,85 @@ describe('ProjectToolHost — delete confirmation gate', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Operator-tools walkthrough: acceptance criterion c-5214996f
+// "Tool placement control must actually move the tool (no phantom control)"
+//
+// The placement dropdown was removed from the Configure dialog in #15978.
+// These tests are the machine-readable re-walk: they verify that the Configure
+// dialog does NOT expose any placement control, and that the PATCH call emitted
+// on Save does NOT include a placement field (so backend placement changes must
+// be made outside the per-tool Configure panel — via a future explicit control).
+// ---------------------------------------------------------------------------
+
+describe('ProjectToolHost — no phantom placement control (c-5214996f re-walk)', () => {
+  beforeEach(() => {
+    vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
+    vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
+    vi.mocked(updateProjectTool).mockResolvedValue({ ...TOOL });
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
+  });
+
+  afterEach(() => {
+    if (root) act(() => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  test('Configure dialog exposes no placement select or input', async () => {
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    await act(async () => { requireButton('Configure').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    // No select elements at all — placement dropdown was removed (#15978).
+    expect(h().querySelectorAll('select').length).toBe(0);
+
+    // No input or select element whose name or data-attribute signals placement.
+    const placementControls = Array.from(
+      h().querySelectorAll<HTMLElement>('input, select')
+    ).filter(
+      el =>
+        el.getAttribute('name') === 'placement' ||
+        el.getAttribute('data-field') === 'placement' ||
+        el.getAttribute('aria-label')?.toLowerCase().includes('placement'),
+    );
+    expect(placementControls.length).toBe(0);
+  });
+
+  test('Save in Configure dialog does not include placement in the PATCH call', async () => {
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    await act(async () => { requireButton('Configure').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { requireButton('Save').click(); });
+
+    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledTimes(1);
+    const [, , patch] = vi.mocked(updateProjectTool).mock.calls[0];
+    expect('placement' in (patch as Record<string, unknown>)).toBe(false);
+  });
+
+  test('owner can Configure a tool without exposure to a phantom placement dropdown', async () => {
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    // Configure button is present and opens a panel.
+    expect(findButton('Configure')).toBeTruthy();
+    await act(async () => { requireButton('Configure').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    // Panel is open (Save button visible).
+    expect(findButton('Save')).toBeTruthy();
+
+    // No phantom placement selector anywhere in the open panel.
+    expect(h().querySelector('select')).toBeNull();
+
+    // The title field is editable (non-phantom configure control).
+    const titleInput = h().querySelector('input[type="text"]') as HTMLInputElement;
+    expect(titleInput).toBeTruthy();
+    expect(titleInput.value).toBe('My Widget');
+  });
+});
+
 describe('ProjectToolHost — project-scoped async actions', () => {
   beforeEach(() => {
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });

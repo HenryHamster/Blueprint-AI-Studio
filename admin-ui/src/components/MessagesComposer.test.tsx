@@ -1,5 +1,5 @@
 import { afterEach, describe, test, expect, vi } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { createRef } from 'react';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
 
@@ -46,11 +46,13 @@ function renderComposer(props: Partial<React.ComponentProps<typeof MessagesCompo
 }
 
 describe('MessagesComposer — live math preview', () => {
-  test('shows a math preview strip with KaTeX when the draft contains $...$ delimiters', () => {
+  test('shows a math preview strip with KaTeX when the draft contains $...$ delimiters', async () => {
     const { container } = renderComposer({ newContent: 'Energy $E = mc^2$ is famous.' });
     const preview = screen.getByLabelText('Math preview');
     expect(preview).toBeTruthy();
-    expect(container.querySelector('.katex')).toBeTruthy();
+    await waitFor(() => {
+      expect(container.querySelector('.katex')).toBeTruthy();
+    });
   });
 
   test('does not render a preview strip for plain text without math delimiters', () => {

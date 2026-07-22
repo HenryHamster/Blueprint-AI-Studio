@@ -3479,3 +3479,145 @@ async def test_path_token_route_wrong_slug_rejected(
             f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
         )
         assert resp.status_code == 401
+
+
+# ===========================================================================
+# Placement persistence: PATCH placement must actually move the tool
+# (c-dfdc9d82 / acceptance-criteria re-walk: operator-tools flow)
+# ===========================================================================
+#
+# The phantom-control acceptance criterion requires that a saved placement
+# change is reflected in subsequent GET /tools responses — not just in the
+# PATCH response body.  These tests encode that invariant.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_placement_patch_persists_in_list(client: AsyncClient, db_session):
+    """PATCH placement is reflected in subsequent GET /tools — not just the PATCH body.
+    The admin-UI list drives what surface the tool appears on; if the list does not
+    reflect the change the control is a phantom (save succeeds, nothing moves)."""
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard"},
+        )
+    ).json()
+    tool_id = created["id"]
+    assert created["placement"] == "project_section"
+
+    patch_resp = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "sidebar"},
+    )
+    assert patch_resp.status_code == 200
+    assert patch_resp.json()["placement"] == "sidebar"
+
+    list_resp = await client.get(f"{_BASE}/projects/{project.id}/tools")
+    assert list_resp.status_code == 200
+    tools = {t["id"]: t for t in list_resp.json()["tools"]}
+    assert tools[tool_id]["placement"] == "sidebar", (
+        "placement change must persist to the list endpoint, not just the PATCH response — "
+        "a phantom control would save successfully but the list would still return the old value"
+    )
+
+
+@pytest.mark.asyncio
+async def test_placement_all_valid_values_round_trip_through_list(
+    client: AsyncClient, db_session
+):
+    """All three documented placement values are accepted, persisted, and visible in
+    the admin list.  Ensures that no placement value silently falls back to the default."""
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "placement-cycle"},
+        )
+    ).json()
+    tool_id = created["id"]
+
+    for placement in ("sidebar", "toolbar", "project_section"):
+        patch_resp = await client.patch(
+            f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+            json={"placement": placement},
+        )
+        assert patch_resp.status_code == 200, f"placement={placement!r}: {patch_resp.text}"
+        assert patch_resp.json()["placement"] == placement
+
+        list_resp = await client.get(f"{_BASE}/projects/{project.id}/tools")
+        listed = next(t for t in list_resp.json()["tools"] if t["id"] == tool_id)
+        assert listed["placement"] == placement, (
+            f"placement={placement!r} must persist to GET /tools, "
+            "not just the PATCH response body"
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_tool_with_explicit_placement_persists(
+    client: AsyncClient, db_session
+):
+    """POST /tools with an explicit placement stores that placement — the default
+    is not silently applied when an explicit value is supplied."""
+    project = await _make_project_member(db_session)
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "slug": "sidebar-board", "placement": "sidebar"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["placement"] == "sidebar"
+
+    list_resp = await client.get(f"{_BASE}/projects/{project.id}/tools")
+    tool = next(
+        t for t in list_resp.json()["tools"] if t["slug"] == "sidebar-board"
+    )
+    assert tool["placement"] == "sidebar", (
+        "placement supplied at creation must be stored and returned by GET /tools"
+    )
+
+
+@pytest.mark.asyncio
+async def test_placement_change_walkthrough(client: AsyncClient, db_session):
+    """Operator placement-change walkthrough: create → verify default → move to sidebar
+    → verify list → move to toolbar → verify list → move back to project_section.
+
+    This is the machine-readable re-walk of the 'operator tools' acceptance criterion:
+    each placement transition is a discrete verifiable step, not a one-shot smoke test."""
+    project = await _make_project_member(db_session)
+
+    # Step 1: create with default placement
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "walkthrough-tool"},
+        )
+    ).json()
+    tool_id = created["id"]
+    assert created["placement"] == "project_section", "default placement is project_section"
+
+    # Step 2: move to sidebar — verify list shows the change
+    await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "sidebar"},
+    )
+    tools = {t["id"]: t for t in (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]}
+    assert tools[tool_id]["placement"] == "sidebar", "step 2: list must show sidebar"
+
+    # Step 3: move to toolbar — verify list shows the change
+    await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "toolbar"},
+    )
+    tools = {t["id"]: t for t in (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]}
+    assert tools[tool_id]["placement"] == "toolbar", "step 3: list must show toolbar"
+
+    # Step 4: move back to project_section — verify list shows the change
+    await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "project_section"},
+    )
+    tools = {t["id"]: t for t in (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]}
+    assert tools[tool_id]["placement"] == "project_section", (
+        "step 4: list must show project_section after moving back"
+    )
