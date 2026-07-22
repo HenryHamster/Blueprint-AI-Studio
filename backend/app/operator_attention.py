@@ -76,6 +76,7 @@ _HIGH_SIGNAL_MESSAGE_TYPES = (
 )
 # Reserved keys in MessagesNoisePrefs.prefs that are not event-type visibility prefs.
 _PREFS_RESERVED_KEYS = frozenset({"_temp_mutes", "_mute_window", "_strategic_workbench"})
+# Derived from NEEDS_ACTION_MESSAGE_TYPES in message_convergence — single source of truth.
 _NEEDS_OPERATOR_MESSAGE_TYPES = tuple(
     mt for mt in MessageType if mt.value in NEEDS_ACTION_MESSAGE_TYPES
 )
