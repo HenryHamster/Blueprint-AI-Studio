@@ -4,7 +4,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import type { Components } from 'react-markdown';
 
-// Lazy KaTeX CSS: only import when content contains math delimiters ($ or $$).
+// Lazy KaTeX CSS: only import when content contains math delimiters.
 // KaTeX CSS is ~30KB; eagerly loading it on every view inflates the initial
 // bundle on routes that never render math.
 let _katexCssLoaded = false;
@@ -12,6 +12,15 @@ function ensureKaTexCss(): void {
   if (_katexCssLoaded) return;
   _katexCssLoaded = true;
   import('katex/dist/katex.min.css').catch(() => { /* CSS import failure is non-fatal */ });
+}
+
+// Normalize LaTeX-style delimiters to the remark-math dollar syntax:
+//   \(...\)  →  $...$   (inline)
+//   \[...\]  →  $$...$$ (block)
+function normalizeMathDelimiters(content: string): string {
+  let out = content.replace(/\\\(([\s\S]+?)\\\)/g, (_, m) => `$${m}$`);
+  out = out.replace(/\\\[([\s\S]+?)\\\]/g, (_, m) => `$$${m}$$`);
+  return out;
 }
 
 const mdComponents: Components = {
@@ -38,10 +47,13 @@ const mdComponents: Components = {
 };
 
 export default function MarkdownContentInner({ content }: { content: string }) {
-  // Lazily load KaTeX CSS only when the content contains math delimiters.
-  // Checking for $ / $$ is cheap and avoids the redundant import on non-math views.
-  const hasMath = typeof content === 'string' && /(?<!\$)\${1,2}(?!\$)/.test(content);
+  // Detect any math delimiter form: $/$$ or the backslash variants \(...\)/\[...\].
+  const hasMath = typeof content === 'string' && (
+    /(?<!\$)\${1,2}(?!\$)/.test(content) || /\\\(|\\\[/.test(content)
+  );
   if (hasMath) ensureKaTexCss();
+
+  const normalized = hasMath ? normalizeMathDelimiters(content) : content;
 
   return (
     <ReactMarkdown
@@ -49,7 +61,7 @@ export default function MarkdownContentInner({ content }: { content: string }) {
       rehypePlugins={[rehypeKatex]}
       components={mdComponents}
     >
-      {content}
+      {normalized}
     </ReactMarkdown>
   );
 }

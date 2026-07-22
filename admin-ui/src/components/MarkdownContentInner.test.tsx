@@ -39,4 +39,18 @@ describe('MarkdownContentInner — math rendering', () => {
     expect(katexEl).toBeTruthy();
     expect(container.textContent).toContain('per unit');
   });
+
+  test('renders \\(...\\) inline math via KaTeX', () => {
+    const { container } = render(
+      <MarkdownContentInner content={'Inline \\(E = mc^2\\) formula.'} />
+    );
+    expect(container.querySelector('.katex')).toBeTruthy();
+  });
+
+  test('renders \\[...\\] block math via KaTeX', () => {
+    const { container } = render(
+      <MarkdownContentInner content={'\\[\nE = mc^2\n\\]'} />
+    );
+    expect(container.querySelector('.katex')).toBeTruthy();
+  });
 });

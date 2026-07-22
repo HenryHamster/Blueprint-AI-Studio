@@ -45,6 +45,25 @@ function renderComposer(props: Partial<React.ComponentProps<typeof MessagesCompo
   );
 }
 
+describe('MessagesComposer — live math preview', () => {
+  test('shows a math preview strip with KaTeX when the draft contains $...$ delimiters', () => {
+    const { container } = renderComposer({ newContent: 'Energy $E = mc^2$ is famous.' });
+    const preview = screen.getByLabelText('Math preview');
+    expect(preview).toBeTruthy();
+    expect(container.querySelector('.katex')).toBeTruthy();
+  });
+
+  test('does not render a preview strip for plain text without math delimiters', () => {
+    renderComposer({ newContent: 'Hello, just a plain message.' });
+    expect(screen.queryByLabelText('Math preview')).toBeNull();
+  });
+
+  test('does not render a preview strip when the draft is empty', () => {
+    renderComposer({ newContent: '' });
+    expect(screen.queryByLabelText('Math preview')).toBeNull();
+  });
+});
+
 describe('MessagesComposer — clickable pending image preview', () => {
   test('renders an exact-revision source chip and exposes explicit removal', () => {
     const onRemoveArtifactRef = vi.fn();
