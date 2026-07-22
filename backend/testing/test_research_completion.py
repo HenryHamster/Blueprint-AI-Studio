@@ -59,7 +59,6 @@ from app.task_evaluators import (
 )
 from app.research_completion import _is_high_stakes_finding, _compute_direction_productivity
 from app.time_utils import _utcnow
-from app.task_locking import reload_project_full
 
 
 class TestRecordResearchSurvivalSignal:
@@ -7245,12 +7244,7 @@ async def test_design_doc_observation_dedup_on_reprocessing(db_session, mocker):
 
     # Process the same observation twice
     await _handle_research_completion(task, "", db_session)
-    # Safe re-read: the completion handler mutates project JSON columns under
-    # ``with_*_locked`` (load_only projection → raiseload on the shared instance), so
-    # ``db_session.refresh()`` would honor that raiseload and leave the asserted column
-    # expired → MissingGreenlet on the sync read below. A full populate_existing
-    # re-SELECT reloads every column. See app.task_locking.reload_project_full.
-    await reload_project_full(db_session, _project)
+    await db_session.refresh(_project)
     proposals_after_first = _project.design_doc.get("proposed_changes", [])
     first_count = len(proposals_after_first)
 
@@ -7274,7 +7268,7 @@ async def test_design_doc_observation_dedup_on_reprocessing(db_session, mocker):
         return_value=[obs_finding],
     )
     await _handle_research_completion(task2, "", db_session)
-    await reload_project_full(db_session, _project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
+    await db_session.refresh(_project)
     proposals_after_second = _project.design_doc.get("proposed_changes", [])
     second_count = len(proposals_after_second)
 
@@ -17792,7 +17786,7 @@ async def test_no_findings_proven_direction_with_covered_criterion_completes(
 
     await _stamp_no_findings_refractory(task, db_session)
 
-    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
+    await db_session.refresh(project)
     target = next(d for d in project.directions if d.get("id") == direction_id)
     assert target.get("status") == "completed", (
         "Direction whose owned criterion is covered must still auto-complete"
@@ -17817,7 +17811,7 @@ async def test_no_findings_proven_direction_owning_no_criteria_completes(db_sess
 
     await _stamp_no_findings_refractory(task, db_session)
 
-    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
+    await db_session.refresh(project)
     target = next(d for d in project.directions if d.get("id") == direction_id)
     assert target.get("status") == "completed", (
         "Direction owning no criteria must auto-complete unchanged"
@@ -18753,7 +18747,7 @@ async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
         0,   # research_depth
         None,  # parent_research_task_id
     )
-    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
+    await db_session.refresh(project)
 
     # Direction must be terminally completed.
     d = project.directions[0]

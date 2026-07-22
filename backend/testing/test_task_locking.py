@@ -2060,3 +2060,184 @@ async def test_raise_on_size_limit_does_not_fire_for_shrinking_write(db_session)
 
     await db_session.refresh(project)
     assert project.design_doc.get("pad") == "small", "shrink must be persisted"
+
+
+# ---------------------------------------------------------------------------
+# Projection-lock loader-downgrade regression (see _undo_projection_downgrade)
+# ---------------------------------------------------------------------------
+
+
+async def _fully_loaded_project(session, name: str) -> Project:
+    """Create a project and force every column to be materialized on the
+    identity-mapped instance, so a later projection lock has something to
+    downgrade."""
+    project = Project(
+        name=name,
+        user_id="test-user-123",
+        vision={"purpose": "p"},
+        directions=[{"id": "d1", "status": "active"}],
+        design_doc={"proposed_changes": []},
+        problem_model={"gaps": []},
+    )
+    session.add(project)
+    await session.commit()
+    await session.execute(
+        select(Project)
+        .where(Project.id == project.id)
+        .execution_options(populate_existing=True)
+    )
+    return project
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_does_not_downgrade_preloaded_project(db_session):
+    """A ``load_columns`` lock must not leave a already-loaded project less
+    loaded than it found it.
+
+    Before the fix the lock stored its ``load_only(..., raiseload=True)`` options
+    on the InstanceState permanently. The damage was invisible until something
+    expired the instance: the next ``refresh()`` honored those stored options,
+    reloaded only the projected columns, and left the rest expired — so a sync
+    read of any other column lazy-loaded outside the greenlet and raised
+    MissingGreenlet.
+    """
+    project = await _fully_loaded_project(db_session, "projection-no-downgrade")
+
+    async with project_lock(
+        db_session, project.id, load_columns=[Project.id, Project.vision]
+    ) as locked:
+        assert locked is project, "lock must yield the identity-mapped instance"
+
+    # The expire cycle that used to detonate the stored projection.
+    await db_session.refresh(project)
+
+    # Every one of these is a SYNC attribute read. Under the bug the first
+    # raised MissingGreenlet.
+    assert project.directions == [{"id": "d1", "status": "active"}]
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.problem_model == {"gaps": []}
+    assert project.autonomous_enabled is True
+    assert project.name == "projection-no-downgrade"
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_survives_explicit_expire(db_session):
+    """Same invariant, driven by the explicit ``session.expire()`` several
+    completion paths perform — the shape that bit the research spawn flow.
+
+    Note the app runs ``expire_on_commit=False``, so a bare ``commit()`` does
+    NOT expire the instance and would leave the values sitting in ``state.dict``
+    where a sync read finds them regardless of the projection. The expire is
+    what hands control to the stored loaders, so it is what makes this test
+    discriminate between a fixed and an unfixed lock.
+    """
+    project = await _fully_loaded_project(db_session, "projection-commit-expiry")
+
+    async with project_lock(
+        db_session, project.id, load_columns=[Project.id, Project.directions]
+    ) as locked:
+        assert locked is not None
+    await db_session.commit()
+    db_session.expire(project)
+    await db_session.refresh(project)
+
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.vision == {"purpose": "p"}
+
+
+@pytest.mark.asyncio
+async def test_with_vision_locked_leaves_project_readable(db_session):
+    """``with_vision_locked`` both projects the instance AND leaves ``vision``
+    dirty. The dirty-plus-projected combination is what escalated a lazy-load
+    into a session-poisoning autoflush outside the greenlet."""
+    project = await _fully_loaded_project(db_session, "vision-locked-readable")
+
+    def _mutate(vision: dict) -> None:
+        vision["purpose"] = "changed"
+
+    assert await with_vision_locked(db_session, project.id, _mutate) is True
+    await db_session.commit()
+    # Expire before reading: with expire_on_commit=False the pre-lock values
+    # would otherwise still be in state.dict, and the sync reads below would
+    # pass whether or not the projection had been undone.
+    db_session.expire(project)
+    await db_session.refresh(project)
+
+    assert project.directions == [{"id": "d1", "status": "active"}]
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.vision == {"purpose": "changed"}, "mutation must still persist"
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_still_defers_columns_on_cold_instance(db_session):
+    """The fix must NOT disarm the projection for an instance the lock itself
+    loaded — deferring the 500KB design_doc is the entire point of
+    ``load_columns``, and the raiseload is the intended guard."""
+    project = Project(
+        name="projection-cold-guard",
+        user_id="test-user-123",
+        vision={"purpose": "p"},
+        design_doc={"proposed_changes": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    project_id = project.id
+    db_session.expunge(project)
+
+    async with project_lock(
+        db_session, project_id, load_columns=[Project.id, Project.vision]
+    ) as locked:
+        assert locked is not None
+        assert locked.vision == {"purpose": "p"}, "projected column must load"
+        with pytest.raises(Exception) as exc_info:
+            _ = locked.design_doc
+        assert "raiseload" in str(exc_info.value).lower(), (
+            "non-projected column must still be guarded by raiseload on a cold "
+            f"instance, got: {exc_info.value!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_lock_project_or_429_does_not_downgrade_preloaded_project(db_session):
+    """Same invariant for the handler-path lock, which returns the project
+    directly rather than yielding it."""
+    project = await _fully_loaded_project(db_session, "or429-no-downgrade")
+
+    locked = await lock_project_or_429(
+        db_session, project.id, load_columns=[Project.id, Project.vision]
+    )
+    assert locked is project
+
+    await db_session.refresh(project)
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.directions == [{"id": "d1", "status": "active"}]
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_undoes_downgrade_on_error_path(db_session):
+    """The undo runs in a ``finally``: an exception inside the lock body is
+    normally followed by a rollback, and a rollback is precisely the expire
+    cycle that detonates a leaked projection."""
+    project = await _fully_loaded_project(db_session, "projection-error-path")
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        async with project_lock(
+            db_session, project.id, load_columns=[Project.id, Project.vision]
+        ):
+            raise _Boom()
+
+    await db_session.rollback()
+
+    # A rollback expires EVERY instance in the session, so the values have to be
+    # re-fetched here no matter what — that part is ordinary and no in-memory fix
+    # can avoid it. What the undo controls is WHICH columns come back. With the
+    # projection still leaked onto the state, this awaited refresh honours it and
+    # reloads only id/vision, leaving everything else expired so the sync reads
+    # below lazy-load outside the greenlet and raise MissingGreenlet.
+    await db_session.refresh(project)
+
+    assert project.directions == [{"id": "d1", "status": "active"}]
+    assert project.design_doc == {"proposed_changes": []}

@@ -165,7 +165,6 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
     SPEND_BUDGET_APPROVAL_HOLD_REASON,
 )
 from app.task_locking import (
-    reload_project_full,
     with_design_doc_locked,
     with_directions_locked,
     with_problem_model_locked,
@@ -1807,16 +1806,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await with_vision_locked(
             session, task.project_id, _increment_research_spawn_count
         )
-        # ``with_vision_locked`` re-loaded the shared ``project_obj`` under a
-        # load_only(id, vision) projection AND left ``vision`` dirty/uncommitted.
-        # If any later code SYNC-reads a now-raiseloaded column (e.g. the branch
-        # resolver reading ``integration_branch`` at get_project_integration_branch),
-        # that read triggers a reload SELECT whose autoflush emits the dirty
-        # ``vision`` UPDATE OUTSIDE the asyncpg greenlet → MissingGreenlet, which
-        # poisons the whole session. Re-materialize the project HERE — inside the
-        # greenlet — so the dirty vision flushes safely (in-greenlet UPDATE, no
-        # data loss) and every column is reloaded before those sync reads.
-        await reload_project_full(session, project_obj)
 
     # Assess whether this research task encountered a provider capacity/rate-limit
     # error mid-run but still completed (rather than hard-failing). When detected,

@@ -36,7 +36,7 @@ from typing import AsyncIterator, Callable
 
 import uuid
 from fastapi import HTTPException
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect as sa_inspect, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -243,6 +243,58 @@ async def deployment_state_lock(
         ds.version = starting_version + 1
 
 
+def _undo_projection_downgrade(instance) -> None:
+    """Undo the loader damage a ``load_only(..., raiseload=True)`` lock does to an
+    instance that was ALREADY more fully loaded than the projection.
+
+    A projection lock is supposed to be a cheap read of a few columns. What it
+    actually does to a shared identity-mapped instance is permanent: the SELECT
+    stores its loader options on the ``InstanceState`` (``state.load_options``)
+    and installs a deferred/raiseload callable for every non-projected column
+    (``state.callables``). The column VALUES already in ``state.dict`` survive —
+    so nothing looks wrong, and sync reads keep working right after the lock.
+
+    The damage only detonates later. Anything that expires the instance — an
+    explicit ``session.expire()``, a ``session.refresh()``, a ``rollback()`` —
+    hands control to those stored loaders, so the reload fetches ONLY the
+    projected columns and leaves everything else expired. (A bare ``commit()``
+    does NOT expire here: the app configures ``expire_on_commit=False``, which
+    is why several completion paths call ``session.expire()`` by hand to drop a
+    stale snapshot — those are the detonation sites.) The next SYNC read then
+    lazy-loads
+    outside the asyncpg greenlet → ``MissingGreenlet``. Worse, if the lock also
+    left a column dirty, the reload SELECT autoflushes that UPDATE from sync
+    context, and the resulting MG poisons the whole session so the traceback
+    surfaces at an unrelated downstream reader.
+
+    This restores the invariant a lock owes its caller: **acquiring a lock must
+    not leave the instance less loaded than it found it.** Dropping the stored
+    options and the now-stale callables is pure in-memory bookkeeping — no IO,
+    no extra SELECT — and a later refresh/expire then behaves normally.
+
+    Deliberately a no-op for a genuinely cold instance (one the lock itself
+    brought into the session). There, every non-projected column is legitimately
+    unloaded, the raiseload is the intended guard, and keeping the projection is
+    the whole point of ``load_columns``. The discriminator is exact: a stale
+    callable is one whose attribute ALSO has a live value in ``state.dict``,
+    which can only happen if the instance was loaded more fully before the lock.
+    """
+    if instance is None:
+        return
+    state = sa_inspect(instance)
+    callables = getattr(state, "callables", None) or {}
+    stale = [key for key in callables if key in state.dict]
+    if not stale:
+        # Cold instance (or no projection applied) — nothing was downgraded.
+        return
+    for key in stale:
+        del callables[key]
+    # The callables above are re-derived from the stored loader options on every
+    # expire cycle, so clearing them alone is not enough — the projection grows
+    # back on the next refresh. This is the actual persistent carrier.
+    state.load_options = ()
+
+
 async def lock_project_or_429(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -282,6 +334,7 @@ async def lock_project_or_429(
     result = await session.execute(stmt)
     project = result.scalars().first()
     if project is not None:
+        _undo_projection_downgrade(project)
         return project
     # Distinguish "row locked" from "row missing" with a non-locking read.
     exists = (
@@ -428,7 +481,18 @@ async def project_lock(
             skip_locked,
         )
         raise OperationalError("project_lock acquisition timed out", None, e) from e
-    yield result.scalar_one_or_none()
+    project = result.scalar_one_or_none()
+    try:
+        yield project
+    finally:
+        # In a finally, not just on the success path: the error path is where
+        # this matters most. An exception inside the lock body is usually
+        # followed by a rollback, and a rollback is exactly the expire cycle
+        # that detonates a leaked projection. This is IO-free in-memory
+        # bookkeeping, so it is safe to run while the stack is unwinding.
+        # See ``_undo_projection_downgrade`` — a projection lock must not leave
+        # the shared instance less loaded than it found it.
+        _undo_projection_downgrade(project)
 
 
 @asynccontextmanager
@@ -892,33 +956,6 @@ async def with_vision_locked(
             return False
         _apply(project)
     return True
-
-
-async def reload_project_full(session: AsyncSession, project: Project) -> None:
-    """Re-materialize a projected ``project`` fully in place — the
-    MissingGreenlet-safe replacement for ``session.refresh(project)`` after a
-    projection lock.
-
-    :func:`project_lock` / :func:`with_vision_locked` load the project under a
-    ``load_only(..., raiseload=True)`` projection, which leaves a PERSISTENT
-    raiseload loader on the shared identity-mapped instance. A later
-    ``session.refresh(project)`` RESPECTS that loader — it expires the
-    projected-away columns without reloading them — so the next SYNC attribute
-    read (``problem_model``, ``build_config``, ``autonomous_enabled``, …)
-    lazy-loads outside the asyncpg greenlet → ``MissingGreenlet``. This is the
-    projection-deferred-identity fault documented on :func:`task_lock`.
-
-    A full ``populate_existing`` re-SELECT (no ``load_only``) reloads EVERY
-    column's value into the instance ``__dict__`` and resets the loaders, so
-    later sync reads never reach the raiseload. Use this — not
-    ``session.refresh`` — whenever a project may have passed through a
-    projection lock and its non-projected columns are read afterward.
-    """
-    await session.execute(
-        select(Project)
-        .where(Project.id == project.id)
-        .execution_options(populate_existing=True)
-    )
 
 
 async def with_task_context_locked(
