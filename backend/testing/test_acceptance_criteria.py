@@ -11144,3 +11144,303 @@ async def test_walkthrough_merge_evidence_flips_criterion_coverage(db_session):
     assert summary_after["covered"] == 3
     assert summary_after["uncovered"] == 0
     assert summary_after["total"] == 3
+
+
+# ---------------------------------------------------------------------------
+# executed_named_test 'covered' tier (execution-trial earn loop)
+# ---------------------------------------------------------------------------
+
+
+def test_executed_named_test_covers_only_when_fresh_and_sha_pinned():
+    """An ``executed_named_test`` row is 'covered' ONLY when fresh AND SHA-pinned.
+
+      (a) fresh + SHA-pinned            => 'covered'
+      (b) stale (older than the window) => NOT covered (falls back to 'partial')
+      (c) missing/blank executed_sha    => NOT covered (falls back to 'partial')
+      (d) no recorded_at                => NOT covered
+    """
+    sha = "a1b2c3d4e5f6"
+
+    fresh_pinned = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": sha, "test_refs": ["testing/test_x.py"]},
+        recorded_at=_utcnow() - timedelta(days=ac.EXECUTED_NAMED_TEST_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_executed_named_test_covered(fresh_pinned) is True
+    assert ac._evidence_proves_covered(fresh_pinned) is True
+    assert ac.compute_criterion_coverage([fresh_pinned]) == "covered"
+    # covered maps onto the shared EvidenceStatus axis as full machine-proof.
+    assert ac.criterion_evidence_status([fresh_pinned]) == "proven"
+
+    stale_pinned = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": sha},
+        recorded_at=_utcnow() - timedelta(days=ac.EXECUTED_NAMED_TEST_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_executed_named_test_covered(stale_pinned) is False
+    assert ac._evidence_proves_covered(stale_pinned) is False
+    assert ac.compute_criterion_coverage([stale_pinned]) == "partial"
+
+    for bad_detail in ({"executed_sha": ""}, {"foo": "bar"}, None):
+        fresh_unpinned = _make_evidence(
+            ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+            detail=bad_detail,
+            recorded_at=_utcnow() - timedelta(days=1),
+        )
+        assert ac._evidence_is_executed_named_test_covered(fresh_unpinned) is False
+        assert ac.compute_criterion_coverage([fresh_unpinned]) == "partial"
+
+    no_ts = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": sha},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_executed_named_test_covered(no_ts) is False
+
+
+def test_executed_named_test_covered_outranks_backfilled_and_is_additive():
+    """A fresh executed row lifts a backfilled criterion to 'covered' (additive)."""
+    backfilled = _make_evidence(
+        ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+        detail={"proven": True, "backfilled": True},
+    )
+    assert ac.compute_criterion_coverage([backfilled]) == "backfilled"
+    executed = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": "f00dfeed1234"},
+    )
+    # The backfilled fallback is untouched; the executed row wins the tie.
+    assert ac.compute_criterion_coverage([backfilled, executed]) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_record_executed_named_test_evidence_mints_covered_idempotently(db_session):
+    """A green trial mints exactly one SHA-pinned covered row; re-ingest is a no-op."""
+    project = await _make_project(db_session, "ExecMint")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Exec crit")
+
+    n = await ac.record_executed_named_test_evidence(
+        db_session,
+        project_id=project.id,
+        criteria=[crit],
+        executed_sha="a1b2c3d4e5f6a1b2",
+        test_refs=["testing/test_exec.py"],
+        source_task_id="src-task-1",
+    )
+    assert n == 1
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].source_kind == ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND
+    assert ev[0].detail["executed_sha"] == "a1b2c3d4e5f6a1b2"
+    assert ev[0].detail["test_refs"] == ["testing/test_exec.py"]
+    assert ev[0].detail["proven"] is True
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+    # Re-ingesting the SAME green result mints nothing new (idempotent).
+    n2 = await ac.record_executed_named_test_evidence(
+        db_session,
+        project_id=project.id,
+        criteria=[crit],
+        executed_sha="a1b2c3d4e5f6a1b2",
+        test_refs=["testing/test_exec.py"],
+        source_task_id="src-task-1",
+    )
+    assert n2 == 0
+    ev2 = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev2) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_executed_named_test_evidence_blank_sha_records_nothing(db_session):
+    """A blank executed_sha cannot pin coverage — records nothing."""
+    project = await _make_project(db_session, "ExecBlank")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Exec crit")
+    n = await ac.record_executed_named_test_evidence(
+        db_session,
+        project_id=project.id,
+        criteria=[crit],
+        executed_sha="   ",
+        test_refs=["testing/test_exec.py"],
+        source_task_id="src-task-1",
+    )
+    assert n == 0
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+# ---------------------------------------------------------------------------
+# enroll_criterion_coverage_trial
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enroll_criterion_coverage_trial_flag_off_is_noop(db_session):
+    """Flag OFF ⇒ no trial task is created (returns None)."""
+    project = await _make_project(db_session, "EnrollOff")
+    rc = {"acceptance_earn_execution_trials_enabled": False}
+    with patch("app.shared_state.runtime_config", new=rc):
+        task = await ac.enroll_criterion_coverage_trial(
+            db_session,
+            project.id,
+            criterion_ids=["c-1"],
+            source_task_id="t-1",
+            test_refs=["testing/test_x.py"],
+        )
+    assert task is None
+
+
+@pytest.mark.asyncio
+async def test_enroll_criterion_coverage_trial_creates_bounded_task_and_dedups(db_session):
+    """Flag ON ⇒ a bounded criterion_coverage_trial is created; refs capped; deduped."""
+    project = await _make_project(db_session, "EnrollOn")
+    rc = {"acceptance_earn_execution_trials_enabled": True}
+    many_refs = [f"testing/test_{i}.py" for i in range(15)]
+    with patch("app.shared_state.runtime_config", new=rc):
+        task = await ac.enroll_criterion_coverage_trial(
+            db_session,
+            project.id,
+            criterion_ids=["c-1", "c-2"],
+            source_task_id="t-1",
+            test_refs=many_refs,
+        )
+    assert task is not None
+    p = task.first_payload
+    assert p["type"] == "criterion_coverage_trial"
+    assert p["source_task_id"] == "t-1"
+    assert p["criterion_ids"] == ["c-1", "c-2"]
+    # Refs are capped to the per-trial bound.
+    assert len(p["test_refs"]) == ac.MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES
+    assert p["max_test_files"] == ac.MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES
+    assert p["wall_clock_seconds"] == ac.CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS
+    assert task.status == TaskStatus.QUEUED
+
+    # A second enroll for the same source task is skipped while the first is in-flight.
+    with patch("app.shared_state.runtime_config", new=rc):
+        dup = await ac.enroll_criterion_coverage_trial(
+            db_session,
+            project.id,
+            criterion_ids=["c-1"],
+            source_task_id="t-1",
+            test_refs=["testing/test_x.py"],
+        )
+    assert dup is None
+
+
+# ---------------------------------------------------------------------------
+# backfill_merged_named_test_coverage — execution-trial enrollment
+# ---------------------------------------------------------------------------
+
+
+async def _make_merged_named_test_task(db_session, project, criterion, test_path):
+    """Build a COMPLETED merged task whose declared named_test shipped in the PR."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {"kind": "named_test", "test_path": test_path},
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [test_path, "backend/app/target_module.py"],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _criterion_coverage_trials(db_session, project_id):
+    rows = (
+        await db_session.execute(select(Task).where(Task.project_id == project_id))
+    ).scalars().all()
+    return [
+        t
+        for t in rows
+        if isinstance(t.first_payload, dict)
+        and t.first_payload.get("type") == "criterion_coverage_trial"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_flag_off_records_backfilled_and_enrolls_no_trial(db_session):
+    """Flag OFF ⇒ byte-for-byte prior behaviour: backfilled row, NO trial enrolled."""
+    project = await _make_project(db_session, "BackfillFlagOff")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Off crit")
+    await _make_merged_named_test_task(
+        db_session, project, crit, "testing/test_off_backfill.py"
+    )
+
+    rc = {"acceptance_earn_execution_trials_enabled": False}
+    with patch("app.shared_state.runtime_config", new=rc):
+        result = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    assert result == 1  # int value = backfilled rows recorded
+    assert result.trials_enrolled == 0
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    assert ac.compute_criterion_coverage(ev) == "backfilled"
+    assert await _criterion_coverage_trials(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_backfill_flag_on_enrolls_execution_trial(db_session):
+    """Flag ON ⇒ backfilled row still recorded AND a bounded execution trial enrolled."""
+    project = await _make_project(db_session, "BackfillFlagOn")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "On crit")
+    src = await _make_merged_named_test_task(
+        db_session, project, crit, "testing/test_on_backfill.py"
+    )
+
+    rc = {"acceptance_earn_execution_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        result = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    # The backfilled fallback is still recorded...
+    assert result == 1
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert ev[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    # ...and exactly one execution trial was enrolled for the source task.
+    assert result.trials_enrolled == 1
+    trials = await _criterion_coverage_trials(db_session, project.id)
+    assert len(trials) == 1
+    p = trials[0].first_payload
+    assert p["source_task_id"] == str(src.id)
+    assert p["criterion_ids"] == [crit.criterion_key]
+    assert p["test_refs"] == ["testing/test_on_backfill.py"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_enrollment_cap_bounds_trials(db_session):
+    """The per-pass enrollment cap bounds how many trials a single pass enrolls."""
+    project = await _make_project(db_session, "BackfillCap")
+    version = await _make_version(db_session, project)
+    for i in range(3):
+        crit = await ac.create_criterion(
+            db_session, project.id, version.id, f"Cap crit {i}"
+        )
+        await _make_merged_named_test_task(
+            db_session, project, crit, f"testing/test_cap_{i}.py"
+        )
+
+    rc = {"acceptance_earn_execution_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        result = await ac.backfill_merged_named_test_coverage(
+            db_session, project.id, max_trial_enrollments=2
+        )
+
+    # All three criteria still get their backfilled fallback...
+    assert result == 3
+    # ...but only two trials are enrolled — the cap bounds test execution.
+    assert result.trials_enrolled == 2
+    assert len(await _criterion_coverage_trials(db_session, project.id)) == 2

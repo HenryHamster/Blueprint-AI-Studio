@@ -3822,11 +3822,24 @@ async def sweep_backfill_merged_named_test_coverage(session, now=None) -> int:
     Hourly cadence-gated on an independent timer.  Iterates projects with an open
     release version.  Returns the total number of new ``CriterionEvidence`` rows
     recorded across all projects.
+
+    When ``acceptance_earn_execution_trials_enabled`` is ON, each per-project pass
+    also enrolls bounded ``criterion_coverage_trial`` execution trials (which,
+    on green, mint the machine-verified ``covered`` tier asynchronously via the
+    completion handler). This sweep threads a SHRINKING global enrollment budget
+    (:data:`~app.acceptance_criteria.MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS`)
+    across projects so the WHOLE pass is bounded — not just each project — and
+    logs the per-project + total counts of trials enrolled for observability. The
+    ``covered``-row MINT counts are logged separately by the completion handler
+    (execution is asynchronous, so a single enrollment pass never knows them).
     """
     global _last_backfill_named_test_sweep
     from app.models import Project
     from app.release_version import current_open_version as _cur_open_ver
-    from app.acceptance_criteria import backfill_merged_named_test_coverage as _backfill
+    from app.acceptance_criteria import (
+        backfill_merged_named_test_coverage as _backfill,
+        MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS,
+    )
 
     _now = now or _utcnow()
     if not _is_cadence_due(
@@ -3839,6 +3852,11 @@ async def sweep_backfill_merged_named_test_coverage(session, now=None) -> int:
     # criteria that can be backfilled.
     _BATCH = 50
     total = 0
+    total_trials = 0
+    # Global execution-trial enrollment budget for THIS sweep pass, shrinking as
+    # projects consume it so test execution can never grow unbounded across
+    # projects × merged tasks.
+    trial_budget = MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS
     last_id: uuid.UUID | None = None
     while True:
         query = select(Project.id).order_by(Project.id).limit(_BATCH)
@@ -3855,15 +3873,22 @@ async def sweep_backfill_merged_named_test_coverage(session, now=None) -> int:
                 open_ver = await _cur_open_ver(session, pid)
                 if open_ver is None:
                     continue
-                recorded = await _backfill(session, pid)
-                if recorded:
+                result = await _backfill(
+                    session, pid, max_trial_enrollments=max(0, trial_budget)
+                )
+                recorded = int(result)
+                enrolled = getattr(result, "trials_enrolled", 0)
+                if recorded or enrolled:
                     logger.info(
                         "[REAPER] Step 21a: backfill_merged_named_test_coverage "
-                        "project=%s recorded=%d",
+                        "project=%s recorded=%d trials_enrolled=%d",
                         pid,
                         recorded,
+                        enrolled,
                     )
-                    total += recorded
+                total += recorded
+                total_trials += enrolled
+                trial_budget -= enrolled
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "[REAPER] Step 21a: backfill_merged_named_test_coverage failed "
@@ -3877,10 +3902,12 @@ async def sweep_backfill_merged_named_test_coverage(session, now=None) -> int:
         if len(rows) < _BATCH:
             break
 
-    if total:
+    if total or total_trials:
         logger.info(
-            "[REAPER] Step 21a: backfill_merged_named_test_coverage total=%d",
+            "[REAPER] Step 21a: backfill_merged_named_test_coverage total=%d "
+            "trials_enrolled=%d",
             total,
+            total_trials,
         )
     return total
 

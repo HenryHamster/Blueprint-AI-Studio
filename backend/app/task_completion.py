@@ -3935,6 +3935,294 @@ async def _handle_capability_proof_trial_completion(
             )
 
 
+def _parse_criterion_coverage_trial_result(task: Task, logs: str) -> dict | None:
+    """Extract a ``criterion_coverage_trial`` agent-reported result dict.
+
+    The agent's bespoke handler reports
+    ``{type, criterion_ids, source_task_id, head_sha, queued_head_sha, test_refs,
+    ran, passed, could_not_run}``. We accept it from either the durable
+    ``task.plan_output`` (a dict) or the raw reported ``logs`` (JSON, optionally
+    wrapped under a ``criterion_coverage_trial_result`` key). Returns the result
+    dict, or ``None`` when nothing parseable is present. Never raises.
+    """
+    po = getattr(task, "plan_output", None)
+    if isinstance(po, dict) and (
+        "ran" in po or po.get("type") == "criterion_coverage_trial"
+    ):
+        return po
+    if isinstance(logs, str) and logs.strip():
+        try:
+            parsed = json.loads(logs)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            inner = parsed.get("criterion_coverage_trial_result")
+            if isinstance(inner, dict):
+                return inner
+            if "ran" in parsed or parsed.get("type") == "criterion_coverage_trial":
+                return parsed
+    return None
+
+
+async def _handle_criterion_coverage_trial_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Ingest a ``criterion_coverage_trial``'s executed-test result into the ledger.
+
+    The INGESTION half of the acceptance earn-loop's execution-trial lane (the
+    ENROLL half is :func:`app.acceptance_criteria.enroll_criterion_coverage_trial`).
+    The agent handler runs ONLY a merged task's declared ``named_test`` covering
+    tests as a targeted runner job and reports the result contract:
+
+      ``{type, criterion_ids, source_task_id, head_sha, queued_head_sha,
+        test_refs, ran, passed, could_not_run}``
+
+    On a GREEN result (:func:`ci_resolution.criterion_coverage_trial_is_green` —
+    the tests actually RAN and PASSED and the executed ``head_sha`` matches the
+    enrolled checkout), it mints the machine-verified ``covered`` tier via
+    :func:`acceptance_criteria.record_executed_named_test_evidence`, SHA-pinned to
+    the executed checkout. On RED / skipped / could-not-run / SHA-mismatch it
+    records NOTHING and NEVER demotes existing evidence (fail-closed); the
+    contradiction is stamped on ``task.context`` for visibility only.
+
+    **Receipt validation**: the receipt must name the enrolled ``source_task_id``,
+    the complete enrolled ``test_refs`` set (exact — neither subset nor superset),
+    and ``criterion_ids`` drawn from the enrolled set; when the enrollment bound a
+    ``head_sha`` the reported ``head_sha`` must match it. Any mismatch records no
+    evidence.
+
+    Operator-disableable + fail-open: gated on
+    ``acceptance_earn_execution_trials_enabled`` (default OFF), and any
+    parse/lookup/record error leaves existing coverage untouched, never worse.
+    Non-raising.
+    """
+    try:
+        if not _runtime_config.get("acceptance_earn_execution_trials_enabled", False):
+            logger.info(
+                "[CRIT_TRIAL] flag off — ingestion skipped for task %s", task.id
+            )
+            return
+
+        from app.acceptance_criteria import (
+            get_criteria_by_keys,
+            record_executed_named_test_evidence,
+        )
+        from app.ci_resolution import criterion_coverage_trial_is_green
+        from app.release_version import current_open_version
+
+        result = _parse_criterion_coverage_trial_result(task, logs)
+        if result is None:
+            logger.warning(
+                "[CRIT_TRIAL] no parseable trial result for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+
+        reported_source = (
+            str(result.get("source_task_id")).strip()
+            if result.get("source_task_id")
+            else ""
+        )
+        reported_crit_ids = [
+            c
+            for c in (result.get("criterion_ids") or [])
+            if isinstance(c, str) and c.strip()
+        ]
+        reported_refs = [
+            r
+            for r in (result.get("test_refs") or [])
+            if isinstance(r, str) and r.strip()
+        ]
+
+        # --- Read enrollment contract (task.first_payload, orchestrator-authored) ---
+        enrolled = task.first_payload
+        if not isinstance(enrolled, dict):
+            logger.warning(
+                "[CRIT_TRIAL] no enrollment payload for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+        source_enrolled = (
+            str(enrolled.get("source_task_id")).strip()
+            if enrolled.get("source_task_id")
+            else ""
+        )
+        crit_ids_enrolled = [
+            c
+            for c in (enrolled.get("criterion_ids") or [])
+            if isinstance(c, str) and c.strip()
+        ]
+        refs_enrolled = [
+            r
+            for r in (enrolled.get("test_refs") or [])
+            if isinstance(r, str) and r.strip()
+        ]
+        head_sha_enrolled = (
+            enrolled.get("head_sha")
+            if isinstance(enrolled.get("head_sha"), str)
+            else None
+        )
+        if not source_enrolled or not crit_ids_enrolled:
+            logger.warning(
+                "[CRIT_TRIAL] enrollment for task %s missing source/criteria — "
+                "ingesting nothing",
+                task.id,
+            )
+            return
+
+        async def _record_contradiction(reason: str) -> None:
+            """Persist an auditable rejection without changing coverage state."""
+            ctx = dict(task.context or {})
+            ctx["criterion_coverage_trial_contradiction"] = {
+                "reason": reason,
+                "ran": bool(result.get("ran")),
+                "passed": bool(result.get("passed")),
+                "could_not_run": bool(result.get("could_not_run")),
+                "recorded_at": _utcnow().isoformat(),
+            }
+            task.context = ctx
+            flag_modified(task, "context")
+            await session.commit()
+
+        # (1) source_task_id must match the enrolled contract.
+        if reported_source != source_enrolled:
+            logger.warning(
+                "[CRIT_TRIAL] source_task_id mismatch for task %s — reported=%r "
+                "enrolled=%r — ingesting nothing",
+                task.id,
+                reported_source,
+                source_enrolled,
+            )
+            await _record_contradiction("source_task_mismatch")
+            return
+
+        # (2) test_refs must name exactly the enrolled target set. A subset would
+        #     let a runner omit a hard test then have a green aggregate recorded as
+        #     though the complete covering suite ran.
+        if not reported_refs or set(reported_refs) != set(refs_enrolled):
+            logger.warning(
+                "[CRIT_TRIAL] test_refs mismatch for task %s — reported=%s "
+                "enrolled=%s — ingesting nothing",
+                task.id,
+                sorted(reported_refs),
+                sorted(refs_enrolled),
+            )
+            await _record_contradiction("test_refs_mismatch")
+            return
+
+        # (3) criterion_ids must be drawn from the enrolled set (no fabricating
+        #     coverage for a criterion the trial was never enrolled to cover).
+        cover_keys = [c for c in reported_crit_ids if c in set(crit_ids_enrolled)]
+        if not cover_keys or set(reported_crit_ids) - set(crit_ids_enrolled):
+            logger.warning(
+                "[CRIT_TRIAL] criterion_ids mismatch for task %s — reported=%s "
+                "enrolled=%s — ingesting nothing",
+                task.id,
+                sorted(reported_crit_ids),
+                sorted(crit_ids_enrolled),
+            )
+            await _record_contradiction("criterion_ids_mismatch")
+            return
+
+        # (4) If the enrollment bound a head_sha, the reported executed SHA must
+        #     match it (an empty/missing reported SHA cannot satisfy a bound trial).
+        reported_sha = (
+            result.get("head_sha") if isinstance(result.get("head_sha"), str) else None
+        )
+        if head_sha_enrolled and reported_sha != head_sha_enrolled:
+            logger.warning(
+                "[CRIT_TRIAL] head_sha mismatch for task %s — reported=%s "
+                "enrolled=%s — ingesting nothing",
+                task.id,
+                reported_sha,
+                head_sha_enrolled,
+            )
+            await _record_contradiction("head_sha_mismatch")
+            return
+
+        if not criterion_coverage_trial_is_green(result):
+            # Non-green: NEVER demote (fail-closed). Surface the contradiction only.
+            await _record_contradiction("not_green")
+            logger.info(
+                "[CRIT_TRIAL] non-green trial for source_task=%s (task %s) — "
+                "ran=%s passed=%s could_not_run=%s — no evidence minted",
+                source_enrolled,
+                task.id,
+                bool(result.get("ran")),
+                bool(result.get("passed")),
+                bool(result.get("could_not_run")),
+            )
+            return
+
+        # --- GREEN: mint the SHA-pinned covered tier ---
+        project = await session.get(Project, task.project_id)
+        if project is None:
+            logger.warning(
+                "[CRIT_TRIAL] project %s gone for trial task %s — ingesting nothing",
+                task.project_id,
+                task.id,
+            )
+            return
+        open_version = await current_open_version(session, task.project_id)
+        if open_version is None:
+            logger.info(
+                "[CRIT_TRIAL] no open version for project %s — cannot resolve active "
+                "criteria for task %s",
+                task.project_id,
+                task.id,
+            )
+            return
+        criteria = await get_criteria_by_keys(
+            session,
+            task.project_id,
+            cover_keys,
+            release_version_id=open_version.id,
+        )
+        active = [c for c in criteria if c.status == "active"]
+        if not active:
+            logger.info(
+                "[CRIT_TRIAL] no active criteria among %s for task %s — nothing to mint",
+                cover_keys,
+                task.id,
+            )
+            return
+        # The executed checkout SHA is the pin. criterion_coverage_trial_is_green
+        # already guaranteed reported_sha is a non-empty string matching any bound
+        # enrolled SHA.
+        recorded = await record_executed_named_test_evidence(
+            session,
+            project_id=task.project_id,
+            criteria=active,
+            executed_sha=reported_sha or head_sha_enrolled or "",
+            test_refs=refs_enrolled,
+            source_task_id=source_enrolled,
+        )
+        await session.commit()
+        logger.info(
+            "[CRIT_TRIAL] GREEN trial — minted %d covered row(s) for source_task=%s "
+            "(task %s, sha=%s, criteria=%s)",
+            recorded,
+            source_enrolled,
+            task.id,
+            reported_sha,
+            cover_keys,
+        )
+    except Exception:  # noqa: BLE001 — ingestion must fail open, never raise
+        logger.warning(
+            "[CRIT_TRIAL] ingestion failed for task %s (fail-open — coverage left "
+            "unchanged)",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CRIT_TRIAL] rollback after ingestion failure also failed",
+                exc_info=True,
+            )
+
+
 async def _handle_walkthrough_e2e_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:

@@ -11160,6 +11160,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "repo_bootstrap": "none",
         "salvage_bundle": "code-ci-review",
         "capability_proof_trial": "none",
+        "criterion_coverage_trial": "none",
         "walkthrough_e2e": "none",
     }
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == expected_registry, (
@@ -13231,7 +13232,7 @@ class TestProblemModelWritePathInvariants:
         # lifecycle.py: sanitize_problem_model_raw caller
         ("lifecycle.py", 369): "sanitize_problem_model_raw(dict(project.problem_model))",
         # task_locking.py: sanitize_problem_model_raw inside with_problem_model_locked
-        ("task_locking.py", 1021): "sanitize_problem_model_raw(…) upstream, variable assigned to .problem_model",
+        ("task_locking.py", 1058): "sanitize_problem_model_raw(…) upstream, variable assigned to .problem_model",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
         ("direction_lifecycle.py", 812): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
@@ -13243,9 +13244,9 @@ class TestProblemModelWritePathInvariants:
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
         ("strategic_completion.py", 6171): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 997): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1088): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1106): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1197): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
         ("routers/admin_projects.py", 737): "validated pydantic model_dump",
         # admin_projects.py: current_model.model_dump()

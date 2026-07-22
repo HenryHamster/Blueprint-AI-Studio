@@ -1062,6 +1062,7 @@ async def _process_post_commit(
         _handle_memo_completion,
         _handle_repo_bootstrap_completion,
         _handle_capability_proof_trial_completion,
+        _handle_criterion_coverage_trial_completion,
         _handle_walkthrough_e2e_completion,
         _try_recover_memo_from_parse_failure,
         _record_remediation_if_terminal,
@@ -5369,6 +5370,7 @@ async def _process_post_commit(
                     "design": _handle_design_completion,
                     "repo_bootstrap": _handle_repo_bootstrap_completion,
                     "capability_proof_trial": _handle_capability_proof_trial_completion,
+                    "criterion_coverage_trial": _handle_criterion_coverage_trial_completion,
                     "walkthrough_e2e": _handle_walkthrough_e2e_completion,
                 }
                 _capability = (

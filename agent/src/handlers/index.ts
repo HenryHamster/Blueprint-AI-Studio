@@ -34,6 +34,7 @@ import { handleComputeExperiment } from './compute-experiment.js';
 import { handleWebResearch } from './web-research.js';
 import { handleDesign } from './design.js';
 import { handleCapabilityProofTrial } from './capability-proof-trial.js';
+import { handleCriterionCoverageTrial } from './criterion-coverage-trial.js';
 import {
   resolveTaskCapabilityContract,
   resolveGenericRunner,
@@ -116,6 +117,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   repo_bootstrap: handleRepoBootstrap,
   salvage_bundle: handleSalvageBundle,
   capability_proof_trial: handleCapabilityProofTrial,
+  criterion_coverage_trial: handleCriterionCoverageTrial,
   walkthrough_e2e: handleWalkthroughE2e,
 };
 

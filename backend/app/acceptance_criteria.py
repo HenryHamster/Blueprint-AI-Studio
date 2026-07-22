@@ -272,6 +272,22 @@ UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND = "unverified_merge_backfill"
 #: :func:`_evidence_is_walkthrough_e2e_covered`.
 WALKTHROUGH_E2E_EVIDENCE_KIND = "walkthrough_e2e"
 
+#: ``source_kind`` for genuine machine-verified ``covered`` evidence minted by the
+#: acceptance earn-loop's execution trials: a merged task's declared ``named_test``
+#: covering tests were actually EXECUTED (green) as a bounded targeted runner job
+#: (the ``criterion_coverage_trial`` task) and the completion handler ingested the
+#: green receipt via :func:`record_executed_named_test_evidence`. This is strictly
+#: ADDITIVE and sits ABOVE the lower-confidence ``backfilled`` tier
+#: (:data:`UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND`): the backfill only proves the
+#: test SHIPPED in the PR's changed files, whereas this proves it RAN and PASSED.
+#: A row earns ``covered`` ONLY when it is BOTH SHA-pinned
+#: (``detail["executed_sha"]`` is non-empty — the exact checkout the tests ran
+#: against) AND fresh (recorded within :data:`EXECUTED_NAMED_TEST_WINDOW_DAYS`); a
+#: stale or unpinned row decays to the underlying lower tier so classification is
+#: fail-closed (see :func:`_evidence_is_executed_named_test_covered`). Recognised
+#: as covering by :func:`_evidence_proves_covered`.
+EXECUTED_NAMED_TEST_EVIDENCE_KIND = "executed_named_test"
+
 # Markers that identify a criterion (or the Direction it is mapped to) as tracking
 # the data-integrity / metrics-integrity-sweep signal. Kept as a tight, specific
 # set so sweep evidence is attached ONLY to criteria whose success condition
@@ -333,6 +349,36 @@ MACHINE_PROBE_WINDOW_DAYS = 14
 #: trust and returns ``False`` in :func:`_evidence_is_walkthrough_e2e`.
 WALKTHROUGH_E2E_WINDOW_DAYS = 14
 
+#: Coverage-tier constant: how long an ``executed_named_test`` evidence row (a
+#: green ``criterion_coverage_trial`` execution against a pinned checkout) counts
+#: as full ``'covered'`` tier before it expires and the criterion falls back to
+#: its underlying evidence state (typically ``backfilled``). Mirrors
+#: :data:`WALKTHROUGH_E2E_WINDOW_DAYS`: machine-verifiable on re-run, so a stale
+#: row should decay and be re-earned rather than coasting. Measured from
+#: ``recorded_at``; a row with no ``recorded_at`` cannot grant perpetual trust and
+#: returns ``False`` in :func:`_evidence_is_executed_named_test_covered`.
+EXECUTED_NAMED_TEST_WINDOW_DAYS = 14
+
+#: Hard cap on how many covering test files ONE ``criterion_coverage_trial`` may
+#: execute. Bounds the runner job so a task that (mis)declares a huge covering
+#: surface cannot fan out into an unbounded targeted test run. Mirrors
+#: ``capability_proof.MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES``.
+MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES = 10
+
+#: Wall-clock timeout (seconds) carried in the trial launch contract. The agent
+#: handler runs ONLY the targeted covering tests under this bound; a trial that
+#: exceeds it is a no-op (records nothing), never a demotion. Mirrors
+#: ``capability_proof.CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS``.
+CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS = 900
+
+#: Hard cap on how many ``criterion_coverage_trial`` enrollments a single
+#: :func:`backfill_merged_named_test_coverage` pass may create. Bounds test
+#: execution so the earn loop can never grow unbounded across
+#: projects × merged tasks. The reaper sweep (step 21a) threads a shrinking
+#: global budget across projects so the WHOLE pass is bounded, not just per
+#: project.
+MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS = 25
+
 #: ``source_kind`` set for machine-probe coverage evidence — a mechanism-ran
 #: signal that grants the lower-confidence, time-bounded ``'probed'`` tier via
 #: :func:`_evidence_is_probed` rather than full ``'covered'`` parity.
@@ -380,6 +426,42 @@ def _evidence_is_walkthrough_e2e_covered(e: CriterionEvidence) -> bool:
         return False
     return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
         days=WALKTHROUGH_E2E_WINDOW_DAYS
+    )
+
+
+def _evidence_is_executed_named_test_covered(e: CriterionEvidence) -> bool:
+    """Whether a single ``executed_named_test`` row is fresh AND SHA-pinned covering.
+
+    Returns ``True`` only for ``source_kind == EXECUTED_NAMED_TEST_EVIDENCE_KIND``
+    whose evidence is BOTH:
+
+      * **SHA-pinned** — ``detail`` is a dict carrying a non-empty
+        ``executed_sha`` (the exact checkout the covering tests ran against). A
+        row with no ``detail``, a non-dict ``detail``, or a missing/blank
+        ``executed_sha`` is NOT covering — it cannot prove which commit it
+        exercised, so it must not forge coverage.
+      * **fresh** — ``recorded_at`` is within
+        :data:`EXECUTED_NAMED_TEST_WINDOW_DAYS` of now (mirroring the
+        walkthrough_e2e time-bounding). A stale row, or one with no
+        ``recorded_at`` at all, is NOT covering — a missing timestamp cannot grant
+        perpetual trust.
+
+    Either failure drops the row out of the ``covered`` tier; because no other
+    covering predicate recognises this ``source_kind`` it then classifies at the
+    underlying lower tier (typically ``backfilled`` when a merge-backfill row also
+    exists, else ``partial``). This is the whole point of the execution-trial
+    lane: stale or unpinned executed evidence must stop counting.
+    """
+    if e.source_kind != EXECUTED_NAMED_TEST_EVIDENCE_KIND:
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    executed_sha = detail.get("executed_sha")
+    if not isinstance(executed_sha, str) or not executed_sha.strip():
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=EXECUTED_NAMED_TEST_WINDOW_DAYS
     )
 
 
@@ -436,6 +518,16 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         if "verdict" in detail and detail.get("verdict") != "PASS":
             return False
         return _evidence_is_walkthrough_e2e_covered(e)
+    if e.source_kind == EXECUTED_NAMED_TEST_EVIDENCE_KIND:
+        # A merged task's declared named_test covering tests were EXECUTED green
+        # against a pinned checkout (the criterion_coverage_trial earn loop).
+        # Covering iff BOTH SHA-pinned (``detail["executed_sha"]`` present) AND
+        # fresh (within EXECUTED_NAMED_TEST_WINDOW_DAYS) — see
+        # :func:`_evidence_is_executed_named_test_covered`. A stale or unpinned
+        # row is not covering and decays to the underlying lower tier (the
+        # ``backfilled`` fallback remains). Strictly additive: this branch never
+        # weakens or reorders the tiers above it.
+        return _evidence_is_executed_named_test_covered(e)
     # Unverified-merge backfill evidence is deliberately NOT covering here.  The
     # evidence only proves that the declared named_test was in the PR's changed
     # files — i.e. the test shipped — not that the merge was CI-verified or that
@@ -1032,6 +1124,263 @@ async def get_evidence_for_criteria_batch(
     for row in result.scalars().all():
         grouped[row.criterion_id].append(row)
     return grouped
+
+
+async def record_executed_named_test_evidence(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    criteria: list[VersionAcceptanceCriterion],
+    executed_sha: str,
+    test_refs: list[str],
+    source_task_id: str,
+) -> int:
+    """Mint machine-verified ``executed_named_test`` (``covered``-tier) evidence.
+
+    The tier-upgrade write path for the acceptance earn-loop's execution trials:
+    records one :class:`CriterionEvidence` row per criterion, **idempotently**,
+    ONLY when the caller has already confirmed a GREEN trial result (see
+    :func:`~app.ci_resolution.criterion_coverage_trial_is_green`). Each row is:
+
+      * **SHA-pinned** to the executed checkout (``detail["executed_sha"]``), and
+      * **freshness-stamped** via ``recorded_at`` (the model default),
+
+    so a stale or unpinned row decays out of the ``covered`` tier (see
+    :func:`_evidence_is_executed_named_test_covered`) and classification stays
+    fail-closed. The ``source_id`` embeds the executed SHA, so a re-verification
+    at a NEW head mints a fresh row (the old-SHA row decays by the window) while a
+    duplicate ingestion of the SAME result is an idempotent no-op (the
+    unique ``(criterion_id, source_kind, source_id)`` constraint turns the race
+    into a skip).
+
+    Best-effort and non-raising: it never demotes existing evidence — it only
+    ever ADDS covered rows for a green receipt. Returns the number of NEW rows
+    recorded.
+    """
+    sha = executed_sha.strip() if isinstance(executed_sha, str) else ""
+    if not sha:
+        logger.warning(
+            "record_executed_named_test_evidence: blank executed_sha for "
+            "source_task=%s — recording nothing",
+            source_task_id,
+        )
+        return 0
+    refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+    src = str(source_task_id)
+    evaluated_at = _utcnow().isoformat()
+    recorded = 0
+    for criterion in criteria:
+        source_id = (
+            f"executed_named_test:{src}:{criterion.criterion_key}:{sha[:12]}"
+        )
+        # Pre-check existence so a duplicate ingestion is a clean no-op: skip the
+        # redundant insert entirely rather than letting record_evidence hit the
+        # unique constraint and rollback (which would expire live ORM objects).
+        # The unique ``(criterion_id, source_kind, source_id)`` constraint still
+        # protects a genuine concurrent race inside record_evidence.
+        existing = await get_evidence_for_criterion(session, criterion.id)
+        already = any(
+            ev.source_kind == EXECUTED_NAMED_TEST_EVIDENCE_KIND
+            and ev.source_id == source_id
+            for ev in existing
+        )
+        if already:
+            continue
+        detail: dict[str, Any] = {
+            "executed_sha": sha,
+            "test_refs": refs,
+            "evaluated_at": evaluated_at,
+            "source_task_id": src,
+            "proven": True,
+        }
+        await record_evidence(
+            session,
+            criterion_id=criterion.id,
+            project_id=project_id,
+            source_kind=EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+            source_id=source_id,
+            detail=detail,
+        )
+        recorded += 1
+    if recorded:
+        logger.info(
+            "record_executed_named_test_evidence: minted %d covered row(s) for "
+            "source_task=%s sha=%s (criteria=%s)",
+            recorded,
+            src,
+            sha,
+            [c.criterion_key for c in criteria],
+        )
+    return recorded
+
+
+async def enroll_criterion_coverage_trial(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    criterion_ids: list[str],
+    source_task_id: str,
+    test_refs: list[str],
+    head_sha: str | None = None,
+) -> Any:
+    """Create + persist a bounded ``criterion_coverage_trial`` Task.
+
+    The ENROLL half of the acceptance earn-loop's execution-trial lane — a
+    parallel of :func:`app.capability_proof.enroll_capability_proof_trial`, keyed
+    on acceptance criteria / merged tasks rather than capabilities (the two
+    systems are deliberately NOT entangled). The trial is a bounded, targeted
+    runner job: the agent handler runs ONLY the passed ``test_refs`` (a merged
+    task's declared ``named_test`` covering tests), and on a GREEN run the
+    ingestion completion handler mints genuine ``covered`` criterion evidence via
+    :func:`record_executed_named_test_evidence`.
+
+    Gated on the ``acceptance_earn_execution_trials_enabled`` runtime flag
+    (default OFF / dark ship); with the flag off it is a no-op returning ``None``,
+    so the surrounding backfill pass is byte-for-byte identical to today.
+
+    Bounded launch contract: ``test_refs`` is normalised and capped to
+    :data:`MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES`, and a wall-clock timeout
+    (:data:`CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS`) is stamped into the
+    payload. A trial that cannot be built cleanly (flag off, no criteria, no
+    source task, or no usable test refs) is a no-op returning ``None`` — never a
+    raise, never a fabricated evidence row.
+
+    Dedup: only blocks re-enrollment when an IN-FLIGHT (non-terminal) trial for
+    the SAME ``source_task_id`` exists. Terminal trials do not block a fresh
+    enrollment (a completed trial may be re-run after a new commit lands).
+
+    Returns the persisted Task on success, or ``None`` on any no-op/degraded path.
+    Non-raising: any error is logged at WARNING level and yields ``None``.
+    """
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        if not (_rc or {}).get("acceptance_earn_execution_trials_enabled", False):
+            return None
+
+        crit_ids = [
+            c for c in (criterion_ids or []) if isinstance(c, str) and c.strip()
+        ]
+        if not crit_ids:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial — no criterion_ids for "
+                "source_task=%r",
+                source_task_id,
+            )
+            return None
+        src = str(source_task_id).strip() if source_task_id else ""
+        if not src:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial — no source_task_id (crits=%s)",
+                crit_ids,
+            )
+            return None
+        refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+        if not refs:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial for source_task=%s — no usable "
+                "test refs",
+                src,
+            )
+            return None
+        refs = refs[:MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES]
+        # Belt-and-suspenders: the cap must never be 0, but guard defensively so
+        # a misconfigured constant can't produce a fabricated empty trial.
+        if not refs:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial for source_task=%s — refs empty "
+                "after cap (MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES=%d)",
+                src,
+                MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES,
+            )
+            return None
+
+        from app.models import Task, TaskStatus
+
+        # Dedup guard: only block re-enrollment when an in-flight (non-terminal)
+        # trial exists for the same source task. A narrow TOCTOU window is
+        # tolerated (idempotent evidence recording handles the duplicate) and only
+        # risks one extra runner job per source task per sweep cycle.
+        in_flight_statuses = [
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ]
+        try:
+            existing_q = await session.execute(
+                select(Task.id).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(in_flight_statuses),
+                    Task.payloads.contains(
+                        [{"type": "criterion_coverage_trial", "source_task_id": src}]
+                    ),
+                ).limit(1)
+            )
+            if existing_q.scalar_one_or_none() is not None:
+                logger.info(
+                    "[CRIT_TRIAL] skipping duplicate enrollment for source_task=%s "
+                    "— a trial is already in-flight",
+                    src,
+                )
+                return None
+        except Exception:  # noqa: BLE001 — dedup failure is non-fatal; enroll anyway
+            logger.warning(
+                "[CRIT_TRIAL] dedup check failed for source_task=%s — proceeding "
+                "with enroll",
+                src,
+                exc_info=True,
+            )
+
+        payload: dict[str, Any] = {
+            "type": "criterion_coverage_trial",
+            "criterion_ids": crit_ids,
+            "source_task_id": src,
+            "test_refs": refs,
+            "head_sha": head_sha if isinstance(head_sha, str) else None,
+            "max_test_files": MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES,
+            "wall_clock_seconds": CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS,
+        }
+        task = Task(
+            project_id=project_id,
+            title=f"Criterion coverage trial: {src[:8]}",
+            description=(
+                "Execute the discovered covering tests for a merged task's declared "
+                "named_test as a targeted runner job; a green run mints "
+                "machine-verified ``covered`` criterion evidence."
+            ),
+            payloads=[payload],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        logger.info(
+            "[CRIT_TRIAL] enrolled trial task %s for source_task=%s crits=%s "
+            "refs=%s sha=%s",
+            task.id,
+            src,
+            crit_ids,
+            refs,
+            head_sha,
+        )
+        return task
+    except Exception:  # noqa: BLE001 — enrollment must degrade, never raise
+        logger.warning(
+            "[CRIT_TRIAL] failed to enroll criterion_coverage_trial for "
+            "source_task=%r",
+            source_task_id,
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CRIT_TRIAL] rollback after enroll failure also failed",
+                exc_info=True,
+            )
+        return None
 
 
 def criterion_coverage_to_evidence_status(coverage: str) -> str:
@@ -3772,12 +4121,36 @@ async def spawn_corroboration_task(
         )
 
 
+class NamedTestBackfillResult(int):
+    """Return of :func:`backfill_merged_named_test_coverage` — extended observably.
+
+    Subclasses :class:`int` so its integer VALUE remains the count of new
+    ``backfilled``-tier rows recorded this pass (byte-for-byte compatible with the
+    prior ``-> int`` contract and every caller/test that treats the return as that
+    count). The additional ``trials_enrolled`` attribute carries the number of
+    ``criterion_coverage_trial`` execution trials the pass enrolled, for the
+    reaper step-21a per-pass observability log. Executed/passed/minted counts are
+    produced ASYNCHRONOUSLY by the completion handler
+    (:func:`app.task_completion._handle_criterion_coverage_trial_completion`),
+    which logs its own ``covered``-row mint counts, so they are not knowable inside
+    this enrollment pass.
+    """
+
+    trials_enrolled: int
+
+    def __new__(cls, backfilled_recorded: int = 0, *, trials_enrolled: int = 0):
+        obj = super().__new__(cls, backfilled_recorded)
+        obj.trials_enrolled = int(trials_enrolled)
+        return obj
+
+
 async def backfill_merged_named_test_coverage(
     session: AsyncSession,
     project_id: uuid.UUID,
     *,
     batch_size: int = 500,
-) -> int:
+    max_trial_enrollments: int = MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS,
+) -> NamedTestBackfillResult:
     """Backfill criterion evidence for merged tasks whose named_test shipped in changed files.
 
     The acceptance gate classifies >95% of merged code tasks as 'unproven' because
@@ -3794,12 +4167,39 @@ async def backfill_merged_named_test_coverage(
     whose criteria were added AFTER the merge (so ``record_task_merge_evidence``
     never fired) also qualifies.
 
+    **Execution-trial upgrade** (gated on ``acceptance_earn_execution_trials_enabled``,
+    default OFF): when the flag is ON, for a qualifying task whose covering tests
+    are cleanly discoverable AND at least one of its active criteria is not yet
+    ``covered`` (the cadence guard — a fresh executed ``covered`` row short-circuits
+    re-enrollment), this ALSO enrolls a bounded :func:`enroll_criterion_coverage_trial`
+    to actually RUN the covering tests and earn the machine-verified ``covered``
+    tier. The ``backfilled`` row is still recorded as the fail-closed fallback, so
+    when the flag is off / no enrollment budget / not cleanly targetable /
+    enrollment fails, behaviour is byte-for-byte identical to today. Enrollments
+    are bounded by ``max_trial_enrollments`` so test execution can never grow
+    unbounded across projects × merged tasks.
+
     Best-effort: errors are logged and swallowed so a backfill failure never blocks
     the caller (the reaper sweep).
 
-    Returns the count of new ``CriterionEvidence`` rows recorded.
+    Returns a :class:`NamedTestBackfillResult` — an ``int`` whose value is the
+    count of new ``backfilled`` rows recorded, carrying ``.trials_enrolled`` for
+    observability.
     """
+    trials_enrolled = 0
+    total = 0
     try:
+        from app.shared_state import runtime_config as _rc
+
+        _trials_enabled = bool(
+            (_rc or {}).get("acceptance_earn_execution_trials_enabled", False)
+        )
+        # Remaining execution-trial enrollment budget for THIS pass. Zero when the
+        # flag is off, so the enrollment branch is a guaranteed no-op and behaviour
+        # is byte-for-byte identical to the backfilled-only path.
+        enroll_budget = (
+            max(0, int(max_trial_enrollments)) if _trials_enabled else 0
+        )
         from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
         from app.acceptance_gate import _changed_files, _paths_match, _is_test_path
         from app.landed_signal import is_merged_completion, landed_signal_predicate
@@ -3843,7 +4243,9 @@ async def backfill_merged_named_test_coverage(
                         "project %s — cannot resolve active criteria",
                         project_id,
                     )
-                    return total
+                    return NamedTestBackfillResult(
+                        total, trials_enrolled=trials_enrolled
+                    )
 
             # Batch-load all existing backfill evidence for this batch in one query.
             task_id_strs = [str(t.id) for t in batch]
@@ -3975,6 +4377,36 @@ async def backfill_merged_named_test_coverage(
                         detail=detail,
                     ))
 
+                # Execution-trial upgrade (flag-gated; enroll_budget is 0 when the
+                # flag is off, making this a guaranteed no-op). The backfilled row
+                # above is the fail-closed fallback; here we ALSO enroll a bounded
+                # trial to actually RUN the covering test and earn the ``covered``
+                # tier. Cadence guard: only enroll for active criteria that are not
+                # already ``covered`` (a fresh executed ``covered`` row therefore
+                # short-circuits re-enrollment). Fail-closed: any no-op/None just
+                # leaves the ``backfilled`` fallback in place.
+                if enroll_budget > 0:
+                    uncovered_keys = [
+                        c.criterion_key
+                        for c in active
+                        if compute_criterion_coverage(
+                            evidence_by_criterion.get(c.id, [])
+                        )
+                        != "covered"
+                    ]
+                    if uncovered_keys:
+                        enrolled_task = await enroll_criterion_coverage_trial(
+                            session,
+                            project_id,
+                            criterion_ids=uncovered_keys,
+                            source_task_id=task_id_str,
+                            test_refs=[declared_test],
+                            head_sha=None,
+                        )
+                        if enrolled_task is not None:
+                            trials_enrolled += 1
+                            enroll_budget -= 1
+
             if evidence_batch:
                 batch_recorded = await _record_evidence_batch(session, evidence_batch)
                 total += batch_recorded
@@ -3995,18 +4427,19 @@ async def backfill_merged_named_test_coverage(
                 release_version_id=open_version.id,
             )
 
-        if total:
+        if total or trials_enrolled:
             logger.info(
                 "backfill_merged_named_test_coverage: project=%s "
-                "tasks_scanned=%d recorded=%d",
+                "tasks_scanned=%d recorded=%d trials_enrolled=%d",
                 project_id,
                 offset,
                 total,
+                trials_enrolled,
             )
-        return total
+        return NamedTestBackfillResult(total, trials_enrolled=trials_enrolled)
     except Exception:
         logger.exception(
             "backfill_merged_named_test_coverage: failed for project %s",
             project_id,
         )
-        return 0
+        return NamedTestBackfillResult(total, trials_enrolled=trials_enrolled)

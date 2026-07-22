@@ -115,6 +115,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "capability_proof_gate_auto_graduation_observe_threshold",
         "capability_proof_gate_auto_graduation_enforce_threshold",
         "capability_proof_execution_trials_enabled",
+        "acceptance_earn_execution_trials_enabled",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -631,6 +632,9 @@ async def get_settings(
         "capability_proof_trial_projection": capability_proof_trial_projection,
         "capability_proof_execution_trials_enabled": bool(
             _runtime_config.get("capability_proof_execution_trials_enabled", False)
+        ),
+        "acceptance_earn_execution_trials_enabled": bool(
+            _runtime_config.get("acceptance_earn_execution_trials_enabled", False)
         ),
         "metrics_integrity_sweep_interval_minutes": int(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
@@ -1412,6 +1416,14 @@ async def _apply_settings(
                 detail="capability_proof_execution_trials_enabled must be a boolean",
             )
         _runtime_config["capability_proof_execution_trials_enabled"] = val
+    if "acceptance_earn_execution_trials_enabled" in payload:
+        val = payload["acceptance_earn_execution_trials_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="acceptance_earn_execution_trials_enabled must be a boolean",
+            )
+        _runtime_config["acceptance_earn_execution_trials_enabled"] = val
     for _cap_grad_key, _cap_grad_default in (
         ("capability_proof_gate_auto_graduation_observe_threshold", 0.5),
         ("capability_proof_gate_auto_graduation_enforce_threshold", 0.95),
@@ -3844,6 +3856,13 @@ async def _apply_settings(
                     "capability_proof_execution_trials_enabled": bool(
                         _runtime_config.get(
                             "capability_proof_execution_trials_enabled", False
+                        )
+                    ),
+                    # Persist the dark acceptance earn-loop execution-trial flag so
+                    # an operator enable survives a Cloud Run restart.
+                    "acceptance_earn_execution_trials_enabled": bool(
+                        _runtime_config.get(
+                            "acceptance_earn_execution_trials_enabled", False
                         )
                     ),
                     "adversarial_spawn_gate_infra_failure_mode": str(

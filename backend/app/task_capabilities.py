@@ -43,6 +43,7 @@ class TaskType(str, Enum):
     repo_bootstrap = "repo_bootstrap"
     salvage_bundle = "salvage_bundle"
     capability_proof_trial = "capability_proof_trial"
+    criterion_coverage_trial = "criterion_coverage_trial"
     walkthrough_e2e = "walkthrough_e2e"
 
 
@@ -740,6 +741,41 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         run_shape="single_agent",
     ),
     TaskCapability(
+        TaskType.criterion_coverage_trial,
+        "Criterion Coverage Trial",
+        "read_only",
+        default_category="ops",
+        # No LLM provider runs — the handler runs a bounded, targeted test suite
+        # (a merged task's declared named_test covering tests) and reports a
+        # pass/fail verdict; it never selects a model/account.
+        user_launchable=False,
+        provider_configurable=False,
+        # Not operator/strategist-spawnable and not a plan child: it is enrolled
+        # programmatically by the acceptance earn loop (via
+        # ``acceptance_criteria.enroll_criterion_coverage_trial`` from the reaper's
+        # step-21a backfill sweep), never authored by an agent or operator.
+        description=(
+            "Acceptance earn-loop execution trial: run ONLY a merged task's "
+            "declared ``named_test`` covering tests as a targeted runner job, "
+            "decoupled from the merge gate. A green run mints machine-verified "
+            "``covered`` criterion evidence (``executed_named_test``); a red run "
+            "records nothing and NEVER demotes existing evidence. Operators can "
+            "pause it with ``acceptance_earn_execution_trials_enabled``."
+        ),
+        # A single targeted agent run produces the verdict; it needs a code
+        # checkout to run the tests, but opens no PR — its durable product is the
+        # ingested covered-tier evidence, so output_kind is ``none`` and there is
+        # no forward merge gate (``evaluation="none"``). The ingestion completion
+        # handler consumes the reported result.
+        output_kind="none",
+        requires_code=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=2.0,
+        completion_handler="criterion_coverage_trial",
+        evaluation="none",
+        run_shape="single_agent",
+    ),
+    TaskCapability(
         TaskType.walkthrough_e2e,
         "Walkthrough E2E",
         "read_only",
@@ -1022,6 +1058,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
+        TaskType.criterion_coverage_trial.value,
         TaskType.walkthrough_e2e.value,
     }
 )

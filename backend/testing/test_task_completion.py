@@ -4519,3 +4519,184 @@ class TestHandleWalkthroughE2eCompletionStandalone:
             call_kwargs = mock_rwe.call_args.kwargs
             assert call_kwargs["candidate_sha"] == sha, "candidate_sha must match artifact git_sha"
             assert call_kwargs["results"] == results, "results list must be passed through"
+
+
+# ---------------------------------------------------------------------------
+# _handle_criterion_coverage_trial_completion — acceptance earn-loop ingestion
+# ---------------------------------------------------------------------------
+
+
+async def _setup_criterion_trial(
+    db_session,
+    *,
+    enrolled_head_sha=None,
+    criterion_text="Executed-test criterion",
+    source_task_id="src-task-1",
+    test_refs=("testing/test_exec.py",),
+):
+    """Create an open version + criterion + an enrolled criterion_coverage_trial task."""
+    from app import acceptance_criteria as ac
+    from app.models import Project, ReleaseVersion
+
+    project = Project(name="CCT-Ingest", user_id="cct-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, criterion_text)
+
+    enrollment = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": source_task_id,
+        "test_refs": list(test_refs),
+        "head_sha": enrolled_head_sha,
+        "max_test_files": 10,
+        "wall_clock_seconds": 900,
+    }
+    task = make_task(
+        project_id=project.id,
+        payloads=[enrollment],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, version, crit, task
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_trial_green_mints_covered(db_session):
+    """A green trial result mints exactly one SHA-pinned covered executed row."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(db_session)
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "deadbeefcafe0001",
+        "queued_head_sha": None,
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": True},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].source_kind == ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND
+    assert ev[0].detail["executed_sha"] == "deadbeefcafe0001"
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_trial_flag_off_is_noop(db_session):
+    """Flag OFF ⇒ a green result mints nothing (no-op)."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(db_session)
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "deadbeefcafe0001",
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": False},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"passed": False},           # red run
+        {"ran": False},              # never executed
+        {"could_not_run": True},     # infra could not target the tests
+        {"head_sha": ""},            # no executed SHA to pin
+    ],
+)
+async def test_criterion_coverage_trial_non_green_mints_nothing(db_session, mutation):
+    """Red / not-run / could-not-run / no-SHA results mint nothing and never demote."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(db_session)
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "deadbeefcafe0001",
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    result.update(mutation)
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": True},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_trial_sha_mismatch_mints_nothing(db_session):
+    """A reported SHA that does not match the enrolled bound SHA mints nothing."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(
+        db_session, enrolled_head_sha="1111111111111111"
+    )
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "2222222222222222",  # drifted from enrolled checkout
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": True},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+    # The rejection is stamped for visibility, not silently dropped.
+    await db_session.refresh(task)
+    assert "criterion_coverage_trial_contradiction" in (task.context or {})

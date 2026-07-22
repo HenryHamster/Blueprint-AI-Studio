@@ -1150,6 +1150,16 @@ runtime_config: Dict = {
     # walkthrough evidence lane for one project without touching the fleet default.
     # Mirrors ``promotion_enabled_by_project``.
     "walkthrough_e2e_enabled_by_project": {},
+    # acceptance_earn_execution_trials_enabled gates the acceptance earn-loop's
+    # execution-trial lane: when ON, the reaper step-21a backfill enrolls a bounded
+    # ``criterion_coverage_trial`` that actually RUNS a merged task's declared
+    # named_test covering tests and, on green, mints the machine-verified
+    # ``covered`` evidence tier (instead of only the lower-confidence ``backfilled``
+    # tier). Ships DARK (default False): the lane spawns real targeted test runs,
+    # so it is armed fleet-wide only once proven. When off, the backfill is
+    # byte-for-byte identical to the backfilled-only behaviour. Operator-tunable
+    # via PATCH /api/admin/settings (runtime_config_json); persisted across restarts.
+    "acceptance_earn_execution_trials_enabled": False,
     # env_preflight_enabled gates the boot-prerequisite hard gate (Slice 3).
     # Armed True: a new candidate must declare its required boot-time env vars;
     # missing or absent declarations block promotion.  This gate was built to
@@ -2158,6 +2168,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "capability_proof_execution_trials_enabled",
                         bool(config_json["capability_proof_execution_trials_enabled"]),
+                    )
+                if "acceptance_earn_execution_trials_enabled" in config_json:
+                    _set(
+                        "acceptance_earn_execution_trials_enabled",
+                        bool(config_json["acceptance_earn_execution_trials_enabled"]),
                     )
                 for _cap_grad_float_key in (
                     "capability_proof_gate_auto_graduation_observe_threshold",
