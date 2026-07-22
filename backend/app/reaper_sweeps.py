@@ -71,6 +71,7 @@ from app.models import (
     TaskStatus,
 )
 from app.storage import (
+    MESSAGE_ATTACHMENT_RETENTION_DAYS,
     VIEWABLE_ARTIFACT_RETENTION_DAYS,
     delete_storage_uri_best_effort,
 )
@@ -3642,6 +3643,69 @@ async def sweep_retire_viewable_artifacts(
     return removed
 
 
+async def sweep_retire_consumed_message_attachments(
+    session,
+    *,
+    retention_days: int = MESSAGE_ATTACHMENT_RETENTION_DAYS,
+    batch_size: int = 100,
+) -> int:
+    """Step 24: Delete GCS objects and DB rows for consumed message attachments
+    older than ``retention_days`` (default
+    ``storage.MESSAGE_ATTACHMENT_RETENTION_DAYS`` = 180).
+
+    Consumed attachments at ``message-attachments/<project>/<id>/`` are
+    intentionally excluded from the GCS bucket lifecycle rules (see
+    infra/terraform/iam.tf — they are referenced durably by ProjectMessage rows
+    and must not be purged on a fixed calendar schedule).  This sweep is their
+    sole reaper: once the receipt was consumed more than the retention window ago
+    the GCS object is deleted best-effort and the receipt row is removed.
+
+    A receipt is eligible when ``consumed_at IS NOT NULL`` and
+    ``consumed_at < cutoff``.  Unconsumed/orphan receipts are handled by
+    ``sweep_expired_message_attachment_uploads`` instead.
+
+    At most ``batch_size`` receipts are processed per call.  Returns the number
+    of rows deleted.
+    """
+    cutoff = _utcnow() - timedelta(days=max(1, int(retention_days)))
+
+    rows = (
+        await session.execute(
+            select(ProjectMessageAttachmentUpload)
+            .where(
+                ProjectMessageAttachmentUpload.consumed_at.is_not(None),
+                ProjectMessageAttachmentUpload.consumed_at < cutoff,
+            )
+            .order_by(ProjectMessageAttachmentUpload.consumed_at.asc())
+            .limit(max(1, min(int(batch_size), 500)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+
+    if not rows:
+        return 0
+
+    deleted_flags = await asyncio.gather(
+        *(delete_storage_uri_best_effort(row.storage_uri) for row in rows)
+    )
+
+    removed = 0
+    for row, ok in zip(rows, deleted_flags, strict=True):
+        if ok:
+            await session.delete(row)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Retired %d consumed message attachment(s) older than %d days",
+            removed,
+            retention_days,
+        )
+    else:
+        await session.rollback()
+    return removed
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -3701,4 +3765,6 @@ __all__ = [
     "sweep_stranded_runner_subprocess_compute_jobs",
     "VIEWABLE_ARTIFACT_RETENTION_DAYS",
     "sweep_retire_viewable_artifacts",
+    "MESSAGE_ATTACHMENT_RETENTION_DAYS",
+    "sweep_retire_consumed_message_attachments",
 ]

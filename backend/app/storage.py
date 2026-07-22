@@ -50,6 +50,15 @@ ATTACHMENT_DELETE_RETRY_DEADLINE_SECONDS = 3
 # drift-guard test in test_reaper_sweeps_viewable_retire.py enforces this.
 VIEWABLE_ARTIFACT_RETENTION_DAYS = 180
 
+# Consumed operator-chat message attachments at message-attachments/<project>/<id>/
+# are EXCLUDED from the GCS bucket lifecycle rules (see infra/terraform/iam.tf).
+# They are retired by the reaper sweep
+# (reaper_sweeps.sweep_retire_consumed_message_attachments) at this window.
+# NOTE: This is the SINGLE authoritative value for consumed-attachment retention.
+# The reaper sweep must consume this same constant.  The drift-guard test in
+# test_message_attachment_retention.py enforces this.
+MESSAGE_ATTACHMENT_RETENTION_DAYS = 180
+
 
 def artifact_expires_at(ts: datetime.datetime | None) -> str | None:
     """Return the ISO-8601 timestamp when viewable artifacts are expected to

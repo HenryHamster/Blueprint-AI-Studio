@@ -164,8 +164,13 @@ resource "google_storage_bucket" "artifacts" {
   # Viewable media objects at compute-jobs/*/artifacts/viewable/* are indexed by
   # durable ComputeJobFile DB rows and must outlive the 7-day bundle reap so the
   # strategic canvas keeps rendering plots/images/videos for jobs older than 7 days.
-  # They are intentionally matched by NO rule below (not .tar.gz, not tasks/,
-  # viewport-shots/, viewport-failures/, or message-attachments/).
+  # Consumed operator-chat attachments at message-attachments/<project>/<id>/ are
+  # referenced durably by ProjectMessage rows and signed download URLs are
+  # re-generated on demand — they must not be purged on a fixed calendar schedule.
+  # Both are intentionally matched by NO rule below (not .tar.gz, not tasks/,
+  # viewport-shots/, or viewport-failures/).  The DB-aware reaper sweeps
+  # (sweep_retire_viewable_artifacts, sweep_retire_consumed_message_attachments)
+  # in backend/app/reaper_sweeps.py handle their retirement.
 
   # Bundle tarballs (compute-jobs/<id>/artifacts/bundle.tar.gz) and transfer
   # tarballs (compute-jobs/<id>/artifacts/transfers/<id>.tar.gz) are ephemeral.
@@ -204,14 +209,6 @@ resource "google_storage_bucket" "artifacts" {
     action { type = "Delete" }
   }
 
-  # Operator message attachment uploads (admin_project_strategic_session.py).
-  lifecycle_rule {
-    condition {
-      age            = 7
-      matches_prefix = ["message-attachments/"]
-    }
-    action { type = "Delete" }
-  }
 }
 
 # Orchestrator can read/write to the bucket

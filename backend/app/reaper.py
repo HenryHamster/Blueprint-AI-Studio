@@ -316,6 +316,7 @@ from app.reaper_sweeps import (
     sweep_proof_earn_loop,
     sweep_silent_runner_compute_jobs,
     sweep_retire_viewable_artifacts,
+    sweep_retire_consumed_message_attachments,
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
@@ -3395,6 +3396,27 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         "[REAPER] Viewable artifact retirement sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 24: Retire consumed operator-chat message attachments and
+                # their DB rows for receipts consumed more than 180 days ago.
+                # message-attachments/ is exempt from the GCS bucket lifecycle
+                # rules and relies on this sweep for cleanup.
+                _mark_reaper_progress()
+                try:
+                    _attachments_retired = await sweep_retire_consumed_message_attachments(session)
+                    if _attachments_retired:
+                        logger.info(
+                            "[REAPER] Step 24: retired %d consumed message attachment(s)",
+                            _attachments_retired,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Consumed message attachment retirement sweep error: %s",
                         e,
                         exc_info=True,
                     )
