@@ -545,8 +545,9 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
         }
         smoketestResult.tests.push({ name: `HTTP GET ${url}`, status: curlStatus, message: curlMessage });
       }
-      // Recompute passed: true only if all tests pass or skip
-      smoketestResult.passed = smoketestResult.tests.every(t => t.status === 'pass' || t.status === 'skip');
+      // Health checks may turn a pass into a failure, but never erase an
+      // earlier suite/test failure from the parseable result.
+      smoketestResult.passed = smoketestResult.passed && smoketestResult.tests.every(t => t.status === 'pass' || t.status === 'skip');
     }
 
     // Candidate-side env-preflight evidence (Slice 2, design 245212a4). Run the

@@ -2389,10 +2389,8 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
 
     tests = result.get("tests")
     if not isinstance(tests, list) or not tests:
-        # No tests ran: if the overall result claims passed, treat as a full
-        # score; otherwise as zero (but not a hard blocker — startup is the
-        # blocker, handled above).
-        return 1.0 if result.get("passed") is True else 0.0
+        # A top-level claim cannot substitute for actual test evidence.
+        return 0.0
 
     total = len(tests)
     # Only status=="pass" counts toward the score — a "skip" (or any non-pass

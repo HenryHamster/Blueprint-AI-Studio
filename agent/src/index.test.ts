@@ -5573,6 +5573,7 @@ describe('main non-pool startup OAuth rotation', () => {
   });
 
   afterEach(() => {
+    _stopHeartbeatForTesting();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     vi.mocked(fs.existsSync).mockReset();
@@ -5625,6 +5626,16 @@ describe('main non-pool startup OAuth rotation', () => {
 
     fetchMock.mockImplementation((input: unknown, init?: RequestInit) => {
       const url = String(input);
+      if (url.endsWith('/api/agent/heartbeat')) {
+        events.push('cold-heartbeat');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ status: 'ok' }),
+          headers: { get: () => null },
+        });
+      }
       if (url.endsWith('/api/agent/credentials/rotate')) {
         events.push('rotate');
         rotateBody = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as Record<string, unknown>;
@@ -5655,9 +5666,10 @@ describe('main non-pool startup OAuth rotation', () => {
 
     await expect(main()).rejects.toThrow('POST /api/agent/claim failed (400): claim stopped test');
 
-    expect(events).toEqual(expect.arrayContaining(['provider-validation', 'rotate', 'claim']));
+    expect(events).toEqual(expect.arrayContaining(['provider-validation', 'cold-heartbeat', 'rotate', 'claim']));
     expect(events.indexOf('provider-validation')).toBeLessThan(events.indexOf('rotate'));
     expect(events.indexOf('rotate')).toBeLessThan(events.indexOf('claim'));
+    expect(events.indexOf('cold-heartbeat')).toBeLessThan(events.indexOf('claim'));
     expect(rotateBody).toEqual({
       secret: '{"refresh_token":"new"}',
       task_id: 'cold-preclaim-task',
@@ -7458,9 +7470,27 @@ describe('apiRequest body-read timeout', () => {
 
     // retries=1 (single attempt), timeout=5s.
     const p = apiRequest('POST', '/api/agent/heartbeat', () => ({ method: 'POST' }), 1, 5_000);
-    const settled = expect(p).rejects.toThrow(/aborted/);
+    const settled = expect(p).rejects.toThrow('POST /api/agent/heartbeat timed out during body phase on attempt 1/1 after 5000ms');
     // Without the body-phase timer this advance would not settle the promise.
     await vi.advanceTimersByTimeAsync(5_000);
+    await settled;
+  });
+
+  it('identifies a header-phase timeout with request and attempt context', async () => {
+    vi.useFakeTimers();
+    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
+      const signal = init?.signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(new Error('The operation was aborted'));
+        });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const p = apiRequest('GET', '/api/agent/claim', () => ({ method: 'GET' }), 1, 2_000);
+    const settled = expect(p).rejects.toThrow('GET /api/agent/claim timed out during headers phase on attempt 1/1 after 2000ms');
+    await vi.advanceTimersByTimeAsync(2_000);
     await settled;
   });
 

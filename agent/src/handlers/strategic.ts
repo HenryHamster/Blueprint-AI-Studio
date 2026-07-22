@@ -88,6 +88,28 @@ export function renderStrategicPromptSuffix(payload: Record<string, unknown>): s
     : '';
 }
 
+export function resolveStrategicPurpose(
+  payload: Record<string, unknown>,
+  problemModel: Record<string, unknown> | undefined,
+): string | undefined {
+  const intent = problemModel?.intent as Record<string, unknown> | undefined;
+  const vision = payload.vision as Record<string, unknown> | undefined;
+  const candidates = [
+    payload.effective_purpose,
+    intent?.user_purpose,
+    intent?.purpose,
+    vision?.user_purpose,
+    vision?.purpose,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const normalized = candidate.trim();
+    if (normalized && normalized !== '...' && !/^<[^>]+>$/.test(normalized)) return normalized;
+  }
+  return undefined;
+}
+
 /**
  * Render an ISO timestamp as a deterministic recency string relative to a
  * caller-supplied reference epoch (`refMs`) — NOT the VM wall clock. Passing the
@@ -574,22 +596,8 @@ export async function handleStrategic(
     const problemModelJson = problemModel && Object.keys(problemModel).length > 0
       ? JSON.stringify(problemModel, null, 2)
       : '';
-    // Extract the operator-set durable intent.purpose so it can be threaded
-    // into the thinker's repair/reopen prompt — without it, a repair session
-    // that runs fresh (no prior conversation) has no source-of-truth for the
-    // purpose string and may echo a schema placeholder, exhausting retries.
-    const intent = problemModel?.intent as Record<string, unknown> | undefined;
-    // When intent.purpose is blank/schema-placeholder but intent.user_purpose
-    // is populated, fall back to user_purpose — the backend's
-    // _preserve_operator_intent would heal the blank from user_purpose on
-    // write-back, but the agent-side thinker validation rejects before that
-    // healing runs. Pre-applying the fallback here lets the thinker's repair
-    // prompt supply the real ground truth.
-    const rawPurpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : '';
-    const isPlaceholder = rawPurpose === '' || rawPurpose === '...' || /^<[^>]+>$/.test(rawPurpose);
-    const currentPurpose = isPlaceholder
-      ? (typeof intent?.user_purpose === 'string' ? intent.user_purpose.trim() : undefined)
-      : rawPurpose;
+    // Use the backend-resolved value first, with legacy payload fallbacks.
+    const currentPurpose = resolveStrategicPurpose(payload, problemModel);
 
     // ── Problem-model size/health signal (soft) ──
     // Computed by the backend from the DURABLE pre-trim model (honest counts).

@@ -412,6 +412,24 @@ describe('handleSmoketest — URL health checks', () => {
     expect(stored.tests[0].status).toBe('pass');
   });
 
+  it('does not let a passing URL health check erase an earlier test failure', async () => {
+    const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+
+    await handleSmoketest(
+      TASK_ID,
+      { ...BASE_PAYLOAD, health_check_urls: ['https://example.com/health'] },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const stored = JSON.parse(call.logs as string) as { passed: boolean; tests: Array<{ status: string }> };
+    expect(stored.passed).toBe(false);
+    expect(stored.tests).toHaveLength(2);
+    expect(stored.tests[1].status).toBe('pass');
+  });
+
   it('appends failing URL health check results and flips passed to false', async () => {
     const smoketestResult = { passed: true, tests: [] as Array<{ name: string; status: string; message: string }> };
     vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);

@@ -424,6 +424,11 @@ describe('runCodeChangeTask forced terminal-verb continuation', () => {
 
     // The continuation must have fired exactly once (two total runClaudeCode calls).
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const continuationPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(continuationPrompt).toContain(`task_id=${taskId}`);
+    expect(continuationPrompt).toContain(`repo=${baseOpts.owner}/${baseOpts.repo}`);
+    expect(continuationPrompt).toContain(`work_branch=${baseOpts.workBranch}`);
+    expect(continuationPrompt).toContain('changed_files=agent/src/handlers/code-change.ts');
     // The done marker wins → the bash ./done already posted COMPLETED, so the
     // wrapper must NOT post any terminal status itself, and definitely not FAILED.
     const failedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(

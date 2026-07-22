@@ -80,7 +80,10 @@ from app.capability_registry import (
     registry_capability_names,
     registry_capability_vocabulary,
 )
-from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
+from app.problem_model import (
+    REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY,
+    resolve_project_purpose,
+)
 
 # The agent-view problem_model builder cluster (count-based trim, guaranteed-
 # small floor shrink, and the packer summarize/floor callbacks) lives in a
@@ -2182,6 +2185,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "prompt_suffix": {"priority": "high", "exempt": True},
     # Vision + intent — small but load-bearing for every decision
     "vision": {"priority": "critical"},
+    "effective_purpose": {"priority": "critical"},
     # User-facing state the agent must respond to. Core section: the open-message
     # inbox has BOTH a summarize fallback AND a floor callback, so at least its
     # floored form (top survival-priority items, tight excerpts) ALWAYS ships —
@@ -2469,6 +2473,7 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
     "vision": {"priority": "critical"},
+    "effective_purpose": {"priority": "critical"},
     # Trim-proof authoritative count of unresolved open operator messages — see
     # _STRATEGIC_REVIEW_SCHEMA["open_message_count"]. Critical tier so the agent
     # sees the true inbox depth even when open_messages is dropped under budget.
@@ -4194,6 +4199,7 @@ async def _spawn_design_doc_update(
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": _agent_visible_vision(project.vision),
+            "effective_purpose": resolve_project_purpose(project),
             **(
                 {"missing_capability_demand": _missing_demand}
                 if _missing_demand_present
@@ -5777,6 +5783,7 @@ async def _spawn_strategic_review(
                     "base_branch": get_project_integration_branch(project),
                     # Cheap in-memory ORM scalars (no I/O).
                     "vision": _agent_visible_vision(project.vision),
+                    "effective_purpose": resolve_project_purpose(project),
                     "problem_model": _agent_view_problem_model(project.problem_model),
                     "running_update": project.running_update or "",
                     # Pure-computation direction grounding (no I/O).
@@ -7625,6 +7632,7 @@ async def _spawn_strategic_review(
                 )
             ),
             "vision": _agent_visible_vision(project.vision),
+            "effective_purpose": resolve_project_purpose(project),
             "problem_model": _verified_problem_model,
             **(
                 {"cycle_start_reconciliation": _cycle_start_reconciliation}

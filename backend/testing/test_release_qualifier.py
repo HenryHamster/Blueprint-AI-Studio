@@ -5960,10 +5960,10 @@ class TestScoreSmoketest:
         """A None result (no artifact) is treated as a startup failure."""
         assert rq._score_smoketest(None) is None
 
-    def test_no_tests_but_passed_scores_one(self):
-        """A passing result with no individual tests scores 1.0."""
+    def test_no_tests_cannot_score_as_passing_evidence(self):
+        """A top-level pass claim without test evidence scores zero."""
         result = {"passed": True, "tests": [], "suites": {}}
-        assert rq._score_smoketest(result) == pytest.approx(1.0)
+        assert rq._score_smoketest(result) == pytest.approx(0.0)
 
 
 class TestExtractTestErosionDetail:
