@@ -27,7 +27,6 @@ from app.task_outcomes import (
     KIND_VERIFICATION_VERDICT,
     OUTCOME_EVALUATORS,
     TaskOutcome,
-    _panel_lens_passed,
     build_task_evaluation_summary,
     evaluate_task_outcome,
     is_successful_outcome,
@@ -1277,56 +1276,6 @@ def test_summary_acceptance_evidence_absent_no_findings_stays_none():
     """No declaration AND no findings ⇒ summary stays None (unchanged)."""
     task = _make_task("create", status=TaskStatus.COMPLETED, context={})
     assert build_task_evaluation_summary(task) is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# _panel_lens_passed: full synonym-table coverage
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestPanelLensPassed:
-    """_panel_lens_passed normalizes panel-review lens verdicts to True/False/None.
-
-    The production set is {approve, pass, passed, ok} -> True and
-    {request_changes, fail, failed} -> False; everything else -> None.
-    Tests here document the exact contract and catch divergence when the
-    synonym table changes.
-    """
-
-    def test_pass_tokens_return_true(self):
-        for token in ("approve", "pass", "passed", "ok"):
-            assert _panel_lens_passed(token) is True, (
-                f"token {token!r} should return True"
-            )
-
-    def test_fail_tokens_return_false(self):
-        for token in ("request_changes", "fail", "failed"):
-            assert _panel_lens_passed(token) is False, (
-                f"token {token!r} should return False"
-            )
-
-    def test_case_insensitive(self):
-        assert _panel_lens_passed("APPROVE") is True
-        assert _panel_lens_passed("REQUEST_CHANGES") is False
-        assert _panel_lens_passed("Pass") is True
-        assert _panel_lens_passed("Failed") is False
-
-    def test_absent_aliases_return_none(self):
-        """Tokens present in other parsers but not this one must return None."""
-        for token in ("accept", "approved", "reject", "rejected"):
-            result = _panel_lens_passed(token)
-            assert result is None, (
-                f"token {token!r} is not in _panel_lens_passed synonym table; "
-                f"expected None, got {result!r}"
-            )
-
-    def test_empty_and_none_return_none(self):
-        assert _panel_lens_passed("") is None
-        assert _panel_lens_passed(None) is None
-
-    def test_unrecognized_token_returns_none(self):
-        assert _panel_lens_passed("unknown") is None
-        assert _panel_lens_passed("yes") is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -12850,3 +12850,62 @@ def test_record_task_merge_evidence_gates_on_acceptance_is_proven():
         "The acceptance_is_proven gate before recording CriterionEvidence rows "
         "has been removed or renamed. Restore it."
     )
+
+
+@pytest.mark.timeout(300)
+def test_all_backend_test_files_collect_without_error():
+    """Guard that every backend/testing/test_*.py file can be collected by pytest.
+
+    Catches the class of regression where a production module has a symbol
+    deleted but a test file still imports it at module level — silently
+    dropping every test in that file from the run without any visible error.
+
+    Runs pytest --collect-only --noconftest so it works in the standalone
+    smoketest lane (no DB required) and mirrors the CI standalone gate.
+    """
+    testing_dir = Path(__file__).resolve().parent
+    backend_root = testing_dir.parent
+
+    env = os.environ.copy()
+    env.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+    env.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
+    env.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pytest",
+            "--collect-only",
+            "--noconftest",
+            "-q",
+            "--tb=line",
+            # Disable heavyweight plugins that add latency at collection time
+            # without affecting which collection errors are surfaced.
+            "-p", "no:testmon",        # skips test-impact-analysis DB scan
+            "-p", "no:rerunfailures",  # no retry logic on collect-only
+            "-p", "no:timeout",        # no per-test timers during collection
+            "-p", "no:cacheprovider",  # skip cache reads/writes
+            str(testing_dir),
+        ],
+        cwd=str(backend_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=240,
+    )
+
+    # Collection errors appear as lines starting with "ERROR collecting ..."
+    # or "ERROR testing/..." in stdout/stderr.
+    all_output = result.stdout + result.stderr
+    error_lines = [
+        line for line in all_output.splitlines()
+        if line.startswith("ERROR ")
+    ]
+
+    assert not error_lines, (
+        f"{len(error_lines)} backend test file(s) failed pytest collection "
+        "(ImportError, NameError, or other module-level error):\n"
+        + "\n".join(error_lines[:30])
+        + "\n\nFull output tail:\n"
+        + "\n".join(all_output.splitlines()[-40:])
+    )

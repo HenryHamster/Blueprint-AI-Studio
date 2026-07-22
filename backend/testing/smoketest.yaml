@@ -37,7 +37,7 @@ suites:
     fail_action: "critical"
 
   curated:
-    description: "Critical-path invariants — security, auth, pipeline, core invariants (no DB, ~614 tests)"
+    description: "Critical-path invariants — security, auth, pipeline, core invariants, collection guard (no DB, ~615 tests)"
     pytest_args: "testing/test_security.py testing/test_invariants.py testing/test_admin_auth_invariant.py testing/test_pipeline.py --noconftest -v --tb=short"
     fail_action: "fix_high_priority"
 
