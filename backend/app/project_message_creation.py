@@ -39,7 +39,6 @@ from app.strategic_trigger import (
     maybe_arm_operator_refresh,
     strategic_refresh_pending,
 )
-from app.strategic_resident_session import resident_session_snapshot
 from app.workbench_state import (
     build_message_strategic_session_snapshot,
     persist_strategic_workbench_update,
@@ -627,6 +626,7 @@ async def create_operator_project_message(
         .execution_options(populate_existing=True)
     )
     locked_vision = locked_project.vision if locked_project is not None else None
+    from app.strategic_resident_session import resident_session_snapshot  # noqa: PLC0415
     resident_snapshot = resident_session_snapshot(locked_vision)
     resident_active = bool(
         resident_snapshot
@@ -667,6 +667,7 @@ async def create_operator_project_message(
             .execution_options(populate_existing=True)
         )
         locked_vision = locked_project.vision if locked_project is not None else None
+        from app.strategic_resident_session import resident_session_snapshot  # noqa: PLC0415
         resident_snapshot = resident_session_snapshot(locked_vision)
         resident_active = bool(
             resident_snapshot
