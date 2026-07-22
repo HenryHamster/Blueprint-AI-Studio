@@ -334,6 +334,12 @@ class SourceKind(str, Enum):
     RESEARCH_AUDIT = "research_audit"
     REPO_DOMAIN = "repo_domain"
     DIRECTION_RETIREMENT = "direction_retirement"
+    # A single durable behavioral-memory fact written by the ``set_memory``
+    # strategic op. Each fact is one individually-addressable, trigram-searchable
+    # ``KnowledgeDocument`` row (title/body/summary/topic/tags), replacing the
+    # capped ``Project.strategic_memory_notes`` JSONB list — giving strategic
+    # memory unbounded capacity, keyword retrieval, and per-fact lifecycle.
+    STRATEGIC_MEMORY = "strategic_memory"
     UNKNOWN = "unknown"
 
 
@@ -4403,13 +4409,20 @@ class KnowledgeDocument(SQLModel, table=True):
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
 
     # Provenance: the task whose terminal output produced this document.
-    # ON DELETE CASCADE: removing the source task also removes the derived doc.
-    source_task_id: uuid.UUID = Field(
+    # ON DELETE SET NULL (nullable): most documents are provenance-bound to their
+    # producing task, but ``strategic_memory`` facts must OUTLIVE the task that
+    # wrote them — a set_memory fact is durable behavioral memory, not a task
+    # artifact. Nulling (rather than cascading) on task deletion preserves the
+    # fact; ``source_citations`` retains the immutable provenance. Serialization
+    # and read joins already treat this column as optional (see
+    # knowledge_query.serialize_knowledge_document / the isouter join).
+    source_task_id: uuid.UUID | None = Field(
+        default=None,
         sa_column=Column(
-            ForeignKey("task.id", ondelete="CASCADE"),
-            nullable=False,
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
             index=True,
-        )
+        ),
     )
 
     # Which task kind produced this document (``design`` vs ``web_research``).

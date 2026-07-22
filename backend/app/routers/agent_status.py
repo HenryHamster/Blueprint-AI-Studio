@@ -2498,7 +2498,10 @@ async def update_agent_status(
                             session,
                             _prior_resident_ctx,
                         )
-                        ctx = dict(task.context or {})
+                        # Merge retry-critical context back after resident-binding
+                        # may have updated task.context (_retry_context keys are
+                        # disjoint from _resident_* / strategic_session_id).
+                        ctx = {**dict(task.context or {}), **_retry_context}
                         task.context = ctx
                         if external_retry_delay_minutes is not None:
                             set_retry_after(task, external_retry_delay_minutes)

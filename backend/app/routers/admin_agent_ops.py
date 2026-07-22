@@ -53,6 +53,7 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    SourceKind,
     Task,
     TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
@@ -4496,42 +4497,168 @@ async def strategic_operation(
         )
 
     elif payload.op == "set_memory":
-        # Append a durable behavioral-memory note to project.strategic_memory_notes.
-        # The strategist uses this to persist lessons and operator
-        # preferences across sessions. No challenge gate — personal memory op.
-        if not isinstance(data, dict) or not isinstance(data.get("note"), str) or not data["note"].strip():
+        # Persist a durable behavioral-memory fact. Each fact becomes ONE
+        # individually-addressable, trigram-searchable KnowledgeDocument row
+        # (source_kind='strategic_memory'), giving strategic memory unbounded
+        # capacity, keyword retrieval (./fetch knowledge --source-kind
+        # strategic_memory), and per-fact lifecycle — replacing the capped
+        # strategic_memory_notes JSONB list. No challenge gate — personal
+        # memory op; the fact is agent-self-attested.
+        #
+        # Backward-compatible op shape: the legacy `note` field is still
+        # accepted (mapped to the document body); richer optional fields
+        # (title/summary/topic/tags/supersedes_id) let the agent categorize and
+        # supersede facts. During the migration window we ALSO dual-write a
+        # compact entry to strategic_memory_notes so agents on older images keep
+        # seeing memory via the legacy section.
+        if not isinstance(data, dict):
             raise HTTPException(
                 status_code=400,
-                detail="set_memory requires data.note as a non-empty string",
+                detail="set_memory requires a data object",
             )
-        note = data["note"].strip()
-        # Per-note length cap (10 KB UTF-8) to keep JSONB columns lean,
-        # consistent with set_session_summary's 10 KB limit.
+        # Body accepts `body` (new) or `note` (legacy); at least one non-empty.
+        raw_body = data.get("body")
+        if not isinstance(raw_body, str) or not raw_body.strip():
+            raw_body = data.get("note")
+        if not isinstance(raw_body, str) or not raw_body.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="set_memory requires data.note (or data.body) as a non-empty string",
+            )
+        # Per-fact body cap (10 KB UTF-8) to keep any single row lean, consistent
+        # with the prior note cap and set_session_summary's 10 KB limit.
         _MAX_MEMORY_NOTE_BYTES = 10_000
-        note_bytes = note.encode("utf-8")
-        if len(note_bytes) > _MAX_MEMORY_NOTE_BYTES:
-            note = note_bytes[:_MAX_MEMORY_NOTE_BYTES].decode("utf-8", errors="replace")
-        entry = {"note": note, "set_at": _utcnow().isoformat()}
+        body_bytes = raw_body.strip().encode("utf-8")
+        if len(body_bytes) > _MAX_MEMORY_NOTE_BYTES:
+            fact_body = body_bytes[:_MAX_MEMORY_NOTE_BYTES].decode("utf-8", errors="replace")
+        else:
+            fact_body = raw_body.strip()
+
+        # Title: agent-supplied short descriptor, else derived from the body's
+        # first line (≤120 chars) so every row is recognizable in the index.
+        raw_title = data.get("title")
+        if isinstance(raw_title, str) and raw_title.strip():
+            fact_title = raw_title.strip()[:120]
+        else:
+            fact_title = " ".join(fact_body.split())[:120]
+
+        # Summary: one-line distillation for the compact spawn index; falls back
+        # to a truncation of the body.
+        raw_summary = data.get("summary")
+        if isinstance(raw_summary, str) and raw_summary.strip():
+            fact_summary = " ".join(raw_summary.split())[:280]
+        else:
+            fact_summary = " ".join(fact_body.split())[:280]
+
+        # Topic: constrained to a stable taxonomy so the index/browse vocabulary
+        # cannot drift. Unknown topics are rejected at write time. Optional.
+        _ALLOWED_MEMORY_TOPICS = {
+            "operator_preference",
+            "technical_constraint",
+            "architecture_pattern",
+            "process_rule",
+            "known_failure_mode",
+            "self_improvement_observation",
+        }
+        raw_topic = data.get("topic")
+        fact_topic: str | None = None
+        if raw_topic is not None:
+            if not isinstance(raw_topic, str) or raw_topic.strip() not in _ALLOWED_MEMORY_TOPICS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "set_memory data.topic must be one of "
+                        f"{sorted(_ALLOWED_MEMORY_TOPICS)}"
+                    ),
+                )
+            fact_topic = raw_topic.strip()
+
+        # Tags: optional free-form list of short string labels.
+        raw_tags = data.get("tags")
+        fact_tags: list[str] = []
+        if isinstance(raw_tags, list):
+            fact_tags = [str(t).strip()[:64] for t in raw_tags if str(t).strip()][:20]
+
+        # supersedes_id: optionally mark an existing strategic_memory fact as
+        # dismissed (superseded) in the same transaction.
+        superseded_id = None
+        raw_supersedes = data.get("supersedes_id")
+        if raw_supersedes:
+            try:
+                superseded_id = uuid.UUID(str(raw_supersedes))
+            except (ValueError, AttributeError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_memory data.supersedes_id must be a valid document UUID",
+                ) from None
+
+        direction_id = None
+        if isinstance(task.context, dict):
+            direction_id = task.context.get("direction_id")
+
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind=SourceKind.STRATEGIC_MEMORY.value,
+            title=fact_title,
+            summary=fact_summary,
+            body=fact_body,
+            topic=fact_topic,
+            direction_id=direction_id if isinstance(direction_id, str) else None,
+            tags=fact_tags,
+            # Provenance survives task cleanup (FK is ON DELETE SET NULL).
+            source_citations=[{"task_id": str(task.id)}],
+            # Agent-self-attested: strategic memory is written directly, not
+            # through a forward-quality grader task. Consumers that filter on
+            # quality can include or exclude on this strategy marker.
+            forward_quality_verdict={"passed": True, "strategy": "agent_self_attested"},
+            # Active fact. Superseding a fact marks the OLD doc dismissed below.
+            lifecycle_status="consumed",
+        )
+        session.add(doc)
+
+        if superseded_id is not None:
+            old = (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.id == superseded_id,
+                        KnowledgeDocument.project_id == project.id,
+                        KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+                    )
+                )
+            ).scalar_one_or_none()
+            if old is not None:
+                old.lifecycle_status = "dismissed"
+                old.dismissed_at = _utcnow()
+                old.dismissed_reason = f"superseded by {doc.id}"
+                session.add(old)
+
+        # Dual-write a compact entry to the legacy JSONB list during the
+        # migration window (bounded to last 100, as before).
+        entry = {"note": fact_body, "set_at": _utcnow().isoformat(), "doc_id": str(doc.id)}
         if project.strategic_memory_notes is None:
             project.strategic_memory_notes = []
         project.strategic_memory_notes.append(entry)
-        # Keep last 100 entries for defense-in-depth against JSONB column bloat
         project.strategic_memory_notes = project.strategic_memory_notes[-100:]
         flag_modified(project, "strategic_memory_notes")
         session.add(project)
+
         ctx = task.context or {}
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         logger.info(
-            f"[STRATEGIC API] Appended strategic_memory note for project {project.id} "
-            f"(entry count: {len(project.strategic_memory_notes)})"
+            f"[STRATEGIC API] Wrote strategic_memory KnowledgeDocument {doc.id} "
+            f"for project {project.id} (topic={fact_topic})"
         )
         return _resp(
             {
                 "status": "ok",
                 "op": "set_memory",
+                "doc_id": str(doc.id),
+                "source_kind": SourceKind.STRATEGIC_MEMORY.value,
+                "superseded_id": str(superseded_id) if superseded_id is not None else None,
                 "entry_count": len(project.strategic_memory_notes),
             }
         )

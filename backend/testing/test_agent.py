@@ -27331,10 +27331,7 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
             "playbook/lint-rules": "hidden",
             "playbook_archive": [],
             "proposed_changes": {},
-            "lane_baselines": {},
             "module_feedback": {},
-            "sr_catch_rate_trends": {},
-            "efficiency_baseline": {},
             "retired_diagnoses_archive": [],
         },
     )
@@ -27367,13 +27364,13 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
     keys = resp.json()["keys"]
     assert "normal-key" in keys
     assert "playbook/lint-rules" not in keys
+    # NOTE: lane_baselines, sr_catch_rate_trends, and efficiency_baseline were
+    # moved out of design_doc into dedicated tables (migration 0658) and removed
+    # from _RESERVED_DESIGN_DOC_KEYS — they are no longer reserved design-doc keys.
     for reserved in (
         "playbook_archive",
         "proposed_changes",
-        "lane_baselines",
         "module_feedback",
-        "sr_catch_rate_trends",
-        "efficiency_baseline",
         "retired_diagnoses_archive",
     ):
         assert reserved not in keys, f"Reserved key '{reserved}' must not appear in list"
@@ -27406,13 +27403,12 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
     assert "playbook" in resp.json()["error"]["message"].lower()
 
     # set/delete on each exact reserved key must return 400
+    # (lane_baselines/sr_catch_rate_trends/efficiency_baseline are no longer
+    # reserved — moved to dedicated tables in migration 0658.)
     for reserved in (
         "playbook_archive",
         "proposed_changes",
-        "lane_baselines",
         "module_feedback",
-        "sr_catch_rate_trends",
-        "efficiency_baseline",
         "retired_diagnoses_archive",
     ):
         r_set = await client.post(

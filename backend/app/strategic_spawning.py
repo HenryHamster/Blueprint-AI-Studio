@@ -32,7 +32,7 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
-from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index, build_pending_followups
+from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index, build_pending_followups, build_strategic_memory_index
 from app.models import (
     Task,
     Project,
@@ -7321,6 +7321,10 @@ async def _spawn_strategic_review(
     _knowledge_index = await build_knowledge_index(session, project.id)
     _compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
     _pending_followups = await build_pending_followups(session, project.id)
+    # Compact, bounded index of active strategic-memory facts (KnowledgeDocument
+    # rows, source_kind='strategic_memory') — replaces shipping the full
+    # strategic_memory_notes JSONB list. Full bodies via ./fetch knowledge.
+    _strategic_memory_index = await build_strategic_memory_index(session, project.id)
     # Live self-hosted local-runner availability, so the strategist avoids
     # authoring GPU compute_experiment tasks (which silently fall back to
     # billable cloud GPU) while the operator's hardware is offline. Included in
@@ -7503,7 +7507,7 @@ async def _spawn_strategic_review(
                 )
                 else {}
             ),
-            "strategic_memory_notes": project.strategic_memory_notes or [],
+            "strategic_memory_notes": _strategic_memory_index,
             # De-gated from the raw project.is_self_repo column to the deploy-repo
             # predicate: the strategist's self-improvement framing (modify your own
             # prompts/schemas/orchestration) keys off this field, so it must follow

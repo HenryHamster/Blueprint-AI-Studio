@@ -4,6 +4,34 @@
 
   "protect": [
     {
+      "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
+      "reason": "Covers the StrategicSessionControl component — operator UI for starting, stopping, and messaging into a conversational Workday session. Restored in d8b2468/#16075.",
+      "test_ids": [
+        "StrategicSessionControl lifecycle authority > keeps the legacy active fallback when lifecycle state is absent"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
+      "reason": "Viewport snapshot test for StrategicSessionControl. Restored in d8b2468/#16075.",
+      "test_ids": [
+        "Workday controls remain contained at 375px"
+      ]
+    },
+    {
+      "path": "admin-ui/src/hooks/useStrategicSession.test.tsx",
+      "reason": "Covers the useStrategicSession hook — primary React hook for conversational Workday session state. Restored in d8b2468/#16075.",
+      "test_ids": [
+        "useStrategicSession liveness fallback > resolves mode + session fields from the liveness probe before the read model lands"
+      ]
+    },
+    {
+      "path": "admin-ui/src/utils/strategicSessionLive.test.ts",
+      "reason": "Covers the strategicSessionLive utility — live-streaming helpers for the conversational session. Restored in d8b2468/#16075.",
+      "test_ids": [
+        "treats message / reasoning / kind-less as reply, activity kinds as not"
+      ]
+    },
+    {
       "path": "backend/testing/test_strategic_session_messages.py",
       "reason": "Covers the agent-side message-poll endpoint (GET /api/agent/projects/{id}/messages) — the inbound operator-to-agent channel for the conversational Workday session. Removing this leaves zero test coverage on the agent message delivery contract.",
       "test_ids": [
