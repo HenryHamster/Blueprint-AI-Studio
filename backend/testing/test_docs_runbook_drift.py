@@ -57,6 +57,37 @@ def _extract_min_node_major() -> int:
     return int(m.group(1))
 
 
+def _extract_pinned_codex_version() -> str:
+    """Parse PINNED_CODEX_VERSION from scripts/blueprint_runner.py without importing it."""
+    source = _BLUEPRINT_RUNNER.read_text()
+    m = re.search(r'^PINNED_CODEX_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
+    if not m:
+        raise AssertionError("PINNED_CODEX_VERSION not found in scripts/blueprint_runner.py")
+    return m.group(1)
+
+
+def test_codex_version_in_runbook() -> None:
+    """The runbook's Prerequisites table must document the pinned Codex CLI version.
+
+    Reads ``PINNED_CODEX_VERSION`` from ``scripts/blueprint_runner.py`` (the
+    source of truth for which ``@openai/codex`` version is required) and asserts
+    the runbook's Prerequisites table mentions that exact version string, so an
+    operator following the runbook installs a compatible Codex CLI.
+
+    This test intentionally parses the source rather than importing it so the
+    backend test suite does not depend on the scripts/ Python path.
+    """
+    runbook = _RUNBOOK_PATH.read_text()
+    codex_version = _extract_pinned_codex_version()
+
+    assert codex_version in runbook, (
+        f"PINNED_CODEX_VERSION={codex_version!r} in scripts/blueprint_runner.py "
+        f"but docs/RUNNER_RUNBOOK.md does not mention '{codex_version}' — "
+        "update the Prerequisites table in the runbook to document the pinned "
+        "Codex CLI version so operators install a compatible version."
+    )
+
+
 def test_all_preset_names_appear_in_runbook() -> None:
     """Every RunnerPreset name appears in the runbook."""
     text = _RUNBOOK_PATH.read_text()

@@ -16,6 +16,7 @@ can execute agent tasks. Install them first:
 |---|---|---|
 | Node.js | v22 | https://nodejs.org |
 | Claude Code CLI | latest | `npm install -g @anthropic-ai/claude-code` |
+| Codex CLI | 0.144.1 | `npm install -g --include=optional @openai/codex@0.144.1` |
 
 The runner binary itself is part of the repo (no separate install):
 
