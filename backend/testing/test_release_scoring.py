@@ -1745,17 +1745,17 @@ class TestEnvPreflightArmedDefault:
         assert result["promote"] is False
 
 
-class TestSmoketestArmedDefault:
-    """Guards the armed-by-default state for smoketest_enabled.
+class TestSmoketestDisabledDefault:
+    """Guards the opt-in default for smoketest_enabled.
 
     The qualifier records the per-run smoketest_enabled flag at spawn time.
     Tests that exercise specific smoketest scenarios set it explicitly on the
     record.  These tests read the source literal directly via AST to verify the
-    literal default is True, and confirm the active-gate behaviour.
+    literal default is False, and confirm explicitly enabled gate behaviour.
     """
 
-    def test_smoketest_literal_default_is_true(self):
-        """runtime_config_state.py dict literal must have smoketest_enabled=True."""
+    def test_smoketest_literal_default_is_false(self):
+        """runtime_config_state.py must not enable VM smoketests by default."""
         import ast
         import pathlib
 
@@ -1776,9 +1776,9 @@ class TestSmoketestArmedDefault:
                     break
             if found is not None:
                 break
-        assert found is True, (
-            f"runtime_config literal smoketest_enabled must be True (armed), "
-            f"got {found!r}. Change the literal intentionally — do not flip to False."
+        assert found is False, (
+            f"runtime_config literal smoketest_enabled must be False (opt-in), "
+            f"got {found!r}."
         )
 
     def test_armed_smoketest_blocks_on_missing_score(self):

@@ -956,12 +956,12 @@ async def test_env_preflight_dropped_from_reuse_on_same_sha_redrive(
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_only(
+async def test_run_qualification_does_not_spawn_smoketest_for_env_preflight_only(
     db_session, mocker
 ):
     """Audit H3 / boot-gate: with smoketest_enabled=False but env_preflight_enabled=True,
-    run_qualification still spawns the smoketest child (carrying the env-preflight
-    run) and stamps smoketest_task_id non-None so the finalize gate can wait for it."""
+    run_qualification preserves the cheap env check without spawning a VM-backed
+    smoketest child."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = False
@@ -989,14 +989,12 @@ async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_onl
     assert result["status"] == "spawned"
     assert result["smoketest_enabled"] is False
     assert result["env_preflight_enabled"] is True
-    # smoketest child IS spawned even though smoketest_enabled is False,
-    # because env_preflight_enabled triggers the same spawn path.
-    assert result["smoketest_task_id"] is not None
+    assert result["smoketest_task_id"] is None
 
     await db_session.refresh(version)
     assert version.last_qualification["smoketest_enabled"] is False
     assert version.last_qualification["env_preflight_enabled"] is True
-    assert version.last_qualification["smoketest_task_id"] is not None
+    assert version.last_qualification["smoketest_task_id"] is None
 
     from sqlmodel import select
 
@@ -1006,8 +1004,7 @@ async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_onl
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    # Both release_audit and smoketest children are spawned.
-    assert types == ["release_audit", "smoketest"]
+    assert types == ["release_audit"]
 
 
 @pytest.mark.asyncio

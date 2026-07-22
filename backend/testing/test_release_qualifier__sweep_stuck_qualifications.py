@@ -1099,70 +1099,53 @@ async def test_maybe_finalize_smoketest_disabled_audit_only(db_session):
 
 
 @pytest.mark.asyncio
-async def test_maybe_finalize_env_preflight_only_waits_for_smoketest_child(db_session):
-    """Boot-gate: when smoketest_enabled=False but env_preflight_enabled=True,
-    maybe_finalize_qualification must wait for the smoketest child (which carries
-    the env-preflight run) before finalizing — it must NOT call _finalize_qualification
-    while the smoketest child is still non-terminal."""
+async def test_maybe_finalize_env_preflight_only_does_not_require_smoketest_child(
+    db_session,
+):
+    """Env preflight uses candidate evidence and must not require a smoke child.
+
+    With the smoke lane disabled, an audit-only qualification must finalize
+    even when env preflight is enabled. Missing preflight evidence should
+    produce its normal fail-closed verdict instead of wedging in pending.
+    """
     from app import shared_state
-    from app.time_utils import _utcnow
 
     shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session)
-
-    attempt_id = uuid.uuid4()
-    attempt_text = str(attempt_id)
-
-    audit_task = Task(
-        project_id=project.id,
-        title="audit-child",
-        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
-        vm_instance_id="vm-audit-epf",
-        status=TaskStatus.COMPLETED,
-        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
+    audit_task = await _seed_audit_only_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {"deleted_test_files": []},
+        },
     )
-    # Smoketest child still running (env-preflight in progress).
-    smoke_task = Task(
-        project_id=project.id,
-        title="smoke-child",
-        payloads=[{"type": "smoketest", "base_branch": "automain", "qualification_attempt_id": attempt_text}],
-        vm_instance_id="vm-smoke-epf",
-        status=TaskStatus.IN_PROGRESS,
-        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
-    )
-    db_session.add(audit_task)
-    db_session.add(smoke_task)
-    await db_session.commit()
-    await db_session.refresh(audit_task)
-    await db_session.refresh(smoke_task)
 
-    version.last_qualification = {
-        "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
-        "qualification_attempt_id": attempt_text,
-        "candidate_sha": "cafe" * 10,
-        "ci_green": True,
-        "smoketest_enabled": False,
-        "env_preflight_enabled": True,
-        "started_at": _utcnow().isoformat(),
-        "audit_task_id": str(audit_task.id),
-        "smoketest_task_id": str(smoke_task.id),
-    }
-    version.active_qualification_attempt_id = attempt_id
+    qual = dict(version.last_qualification or {})
+    qual["env_preflight_enabled"] = True
+    qual["env_preflight_evidence"] = None
+    version.last_qualification = qual
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
 
-    # Triggering via the audit task — audit is done but smoketest is IN_PROGRESS.
     result = await rq.maybe_finalize_qualification(
         audit_task, session_factory=_shared_session_factory(db_session)
     )
+    await db_session.commit()
 
-    # Must NOT finalize — smoketest child (env-preflight) is still running.
-    assert result is None
+    assert result is not None
+    assert result["status"] == "not_promoted"
+
     await db_session.refresh(version)
-    assert version.last_qualification["status"] == "pending"
+    rec = version.last_qualification
+    assert rec["status"] == "not_promoted"
+    assert rec["blocker"] == "boot_prereq_evidence_missing"
+    assert rec["smoketest_task_id"] is None
 
 
 @pytest.mark.asyncio

@@ -1132,10 +1132,11 @@ runtime_config: Dict = {
     # Release qualifier (Phase 3+). promotion_enabled gates whether the
     # qualifier may promote a qualified automain candidate to main — default
     # False ships the qualifier in dry-run (score + log, never promote).
-    # smoketest_enabled gates smoketest task spawns. Operator-tunable via
-    # runtime_config_json; persisted across restarts.
+    # Qualifier VM smoketests are opt-in. CI supplies deterministic test
+    # coverage, while env-preflight evidence is collected without a VM.
+    # Operator-tunable via runtime_config_json; persisted across restarts.
     "promotion_enabled": False,
-    "smoketest_enabled": True,
+    "smoketest_enabled": False,
     # walkthrough_e2e_enabled gates the qualifier-spawned ``walkthrough_e2e``
     # child task (the live-stack Playwright walkthrough evidence lane).
     # Defaults True: the walkthrough_e2e lane is armed fleet-wide, producing

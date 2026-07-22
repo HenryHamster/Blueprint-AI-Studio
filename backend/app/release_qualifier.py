@@ -2889,11 +2889,10 @@ async def run_qualification(
     # changeset than was qualified.
     diff_range = f"{promotion_target}...{candidate_sha}"
     # Audit H3: the qualifier-smoketest child is spawned only when the
-    # smoketest subsystem is enabled.  smoketest_enabled defaults True (armed);
-    # a qualifying run spawns a qualifier-smoketest child and compute_composite
-    # scores the smoketest dimension — see _finalize_qualification /
-    # compute_composite.  A per-project build_config override can hold a specific
-    # project out of the smoketest; absent that, the fleet default applies.
+    # smoketest subsystem is explicitly enabled. smoketest_enabled defaults
+    # False (opt-in); an explicit fleet or per-project setting can enable it.
+    # When enabled, compute_composite scores the smoketest dimension -- see
+    # _finalize_qualification / compute_composite.
     # Per-project override on the build_config seam (a project may or may not
     # have a smoke suite), falling back to the fleet-global runtime_config flag.
     smoketest_enabled = bool(
@@ -3228,11 +3227,12 @@ async def run_qualification(
     _audit_needed = not (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
-    # The qualifier-smoketest child is the evidence producer for BOTH the
-    # smoketest score AND the candidate-side env-preflight evidence (Slice 2,
-    # design 245212a4).  Spawn it when EITHER subsystem is enabled so the
-    # env-preflight gate is independently enforceable without smoketest.
-    _smoketest_needed = (smoketest_enabled or env_preflight_enabled) and "smoketest" not in resolved_dims
+    # The VM-backed qualifier smoketest is opt-in and produces the smoketest
+    # score. Candidate-side env-preflight evidence is collected independently
+    # below via the GitHub contents API, so that cheap gate must not launch a VM.
+    _smoketest_needed = (
+        smoketest_enabled and "smoketest" not in resolved_dims
+    )
     # The walkthrough_e2e child is evidence-only (no scored dimension), so it is
     # gated purely on the enablement flag.
     _walkthrough_e2e_needed = walkthrough_e2e_enabled
@@ -6380,10 +6380,9 @@ async def _finalize_qualification(
                 pass
     else:
         smoketest_result: dict[str, Any] | None = None
-        # Read the SMOKETEST_RESULT when EITHER smoketest or env-preflight
-        # was enabled (both use the same qualifier-smoketest child to
-        # produce the artifact).  When neither was enabled the child was
-        # never spawned and smoketest_task_id is None.
+        # Read an opt-in smoketest result, or a legacy result whose child was
+        # spawned only to carry env-preflight evidence. New env-preflight
+        # evidence is collected independently and does not require this child.
         if (smoketest_enabled or env_preflight_enabled) and smoketest_task_id:
             try:
                 smoketest_result = await _latest_artifact_logs(
@@ -8425,10 +8424,7 @@ async def _required_children_terminal(
     smoketest_resolved = "smoketest" in resolved_dims
     merge_grade_resolved = "merge_grade" in resolved_dims
 
-    smoketest_required = bool(
-        qual.get("smoketest_enabled", True)
-        or qual.get("env_preflight_enabled", False)
-    )
+    smoketest_required = bool(qual.get("smoketest_enabled", True))
     audit_task_id_raw = qual.get("audit_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
     smoketest_task_id_raw = qual.get("smoketest_task_id")
