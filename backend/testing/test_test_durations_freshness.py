@@ -68,6 +68,52 @@ def test_durations_key_format() -> None:
     )
 
 
+def test_durations_values_have_variance() -> None:
+    """
+    The durations map must not be uniform placeholder data.
+
+    pytest-split balances shards by wall-clock time; if every entry is the
+    same value (e.g. all 0.5 s) the splitting devolves to pure count-based,
+    silently defeating the whole point.  We require:
+      - At least 2 distinct duration values, AND
+      - At least 5 % of entries differ from the single most-common value.
+
+    A freshly generated .test_durations file from a real pytest run will
+    easily satisfy both: real suites span milliseconds to tens of seconds.
+    """
+    data = _load_durations()
+    if not data:
+        return  # Empty file is caught by coverage check
+
+    from collections import Counter
+
+    counts = Counter(data.values())
+    unique_values = len(counts)
+    most_common_count = counts.most_common(1)[0][1]
+    total = len(data)
+    dominant_fraction = most_common_count / total
+
+    # Real pytest-split duration files span milliseconds to tens of seconds
+    # with hundreds of distinct values.  Two-value placeholder data (e.g. all
+    # 0.1 s / 0.5 s) has at most a handful of unique values and a dominant
+    # fraction well above 50 %.  Both thresholds must hold.
+    MIN_UNIQUE_VALUES = 10
+    MAX_DOMINANT_FRACTION = 0.50
+
+    assert unique_values >= MIN_UNIQUE_VALUES, (
+        f"backend/.test_durations has only {unique_values} unique duration "
+        f"value(s) across {total} entries — this looks like placeholder data. "
+        f"Real timing data has {MIN_UNIQUE_VALUES}+ distinct values. "
+        "Regenerate via scripts/store-backend-durations.sh."
+    )
+    assert dominant_fraction <= MAX_DOMINANT_FRACTION, (
+        f"backend/.test_durations: {most_common_count}/{total} entries "
+        f"({dominant_fraction:.1%}) share the same value — effectively uniform "
+        "placeholder data that defeats CI time-balancing. "
+        "Regenerate via scripts/store-backend-durations.sh."
+    )
+
+
 def test_durations_coverage_fraction_within_threshold() -> None:
     """
     At least MIN_COVERAGE_FRACTION of current test_*.py files must appear in the
