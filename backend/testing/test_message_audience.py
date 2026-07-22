@@ -679,6 +679,31 @@ def test_valid_notification_events_all_present_in_webhook_registry():
     )
 
 
+# ── Strategist reply audience contract ──────────────────────────────────
+
+
+def test_strategist_reply_to_operator_is_operator_visible():
+    """A strategist reply (event_type="question_answer") must resolve to OPERATOR_FYI.
+
+    admin_agent_ops.create_message defaults to "question_answer" when reply_to
+    is present and no explicit event_type was supplied, so the operator receives
+    a notification that a reply arrived.  This test pins the registry contract
+    the fix depends on: "question_answer" → OPERATOR_FYI, and
+    stamp_message_audience stamps that audience on the context dict.
+    """
+    # registry resolution
+    assert route_event("question_answer") == OPERATOR_FYI
+
+    # stamp_message_audience writes the correct audience for a reply context
+    ctx = stamp_message_audience({"reply_to": "some-message-id"}, "question_answer")
+    assert ctx["audience"] == OPERATOR_FYI
+    assert ctx["event_type"] == "question_answer"
+
+    # "strategic_message" (the non-reply fallback) must remain STRATEGIST_INTERNAL
+    # so only genuine replies get upgraded — no regression on the existing fallback.
+    assert route_event("strategic_message") == STRATEGIST_INTERNAL
+
+
 # ── post_event_message audience gating (via notification_dispatch) ──────
 
 

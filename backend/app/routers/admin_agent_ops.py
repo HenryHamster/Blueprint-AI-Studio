@@ -2798,7 +2798,16 @@ async def strategic_operation(
         from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
 
         event_type = str(msg_ctx.get("event_type") or "").strip() or None
-        msg_ctx = stamp_message_audience(msg_ctx, event_type or "strategic_message", message_type=msg_type.value)
+        # When replying to a specific message (reply_to present) and no explicit
+        # event_type was supplied, default to "question_answer" (OPERATOR_FYI)
+        # instead of "strategic_message" (STRATEGIST_INTERNAL).  Without this,
+        # the operator never receives a notification that a reply arrived.
+        _default_event_type = (
+            "question_answer"
+            if event_type is None and msg_ctx.get("reply_to") is not None
+            else "strategic_message"
+        )
+        msg_ctx = stamp_message_audience(msg_ctx, event_type or _default_event_type, message_type=msg_type.value)
         is_routine = event_type in ROUTINE_EVENT_TYPES
         reply_to_message_id: uuid.UUID | None = None
         raw_reply_to = msg_ctx.get("reply_to")
