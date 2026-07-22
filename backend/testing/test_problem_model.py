@@ -6185,8 +6185,6 @@ def test_alias_forgery_rejected_at_existence_check():
 # apply_agent_update — packer/view marker sanitization (regression for
 # poisoned stored problem_model containing "truncated": true)
 # ---------------------------------------------------------------------------
-
-
 def test_apply_agent_update_poisoned_current_raw_with_truncated_self_heals():
     """A stored problem_model containing 'truncated': true at the top level
     (a stale packer marker that was somehow persisted) must not block every
