@@ -384,6 +384,58 @@ def test_no_removed_resident_strategic_backend_modules():
     )
 
 
+def test_workday_invariant_suite_is_protected_with_all_tests():
+    """The Workday invariant suite must appear in the protect manifest with all tests.
+
+    test_workday_resident_invariants.py is the primary guard for conversational
+    Workday seams. Deleting or emptying it without operator sign-off must trip a
+    manifest guard. This test verifies: (a) the file is in the protect section,
+    (b) every def/async-def test function in the actual file is listed, and
+    (c) the count matches, so a silently-added test doesn't escape the manifest.
+    """
+    import re
+
+    manifest = _load_manifest()
+    invariant_path = "backend/testing/test_workday_resident_invariants.py"
+
+    # (a) The file must appear in the protect section.
+    entries = [e for e in manifest["protect"] if e["path"] == invariant_path]
+    assert entries, (
+        f"{invariant_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so silent deletion of the invariant suite "
+        "is caught at every CI run."
+    )
+    entry = entries[0]
+
+    # (b/c) Every test function in the file must be listed and counts must match.
+    full_path = REPO_ROOT / invariant_path
+    if not full_path.exists():
+        pytest.skip(f"{invariant_path} not found — test_all_protect_paths_exist covers the missing-file case")
+
+    source = full_path.read_text(encoding="utf-8")
+    actual_tests = re.findall(
+        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
+        source,
+        re.MULTILINE,
+    )
+    listed_tests = entry["test_ids"]
+
+    missing_from_manifest = sorted(set(actual_tests) - set(listed_tests))
+    extra_in_manifest = sorted(set(listed_tests) - set(actual_tests))
+
+    assert not missing_from_manifest, (
+        "These test functions exist in test_workday_resident_invariants.py but "
+        "are NOT listed in the protect manifest. Add them so deletion of any "
+        "invariant test is caught:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "test_workday_resident_invariants.py. Update the manifest:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
 def test_no_removed_resident_task_type_in_task_capabilities():
     """R3: The strategic_resident_turn TaskType must not reappear.
 

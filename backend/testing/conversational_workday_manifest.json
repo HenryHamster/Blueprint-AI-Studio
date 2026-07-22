@@ -171,6 +171,47 @@
         "detects mutating ./strategic verbs",
         "detects ./messages send in various shells"
       ]
+    },
+    {
+      "path": "backend/testing/test_workday_resident_invariants.py",
+      "reason": "Primary protection for conversational Workday seams — 18 invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
+      "test_ids": [
+        "test_workday_availability_does_not_consult_removed_global_gate",
+        "test_workday_active_session_reports_active_on_its_pinned_runner",
+        "test_workday_retry_wait_is_legible_in_cheap_availability",
+        "test_active_workday_message_never_arms_one_shot_cadence",
+        "test_resident_fresh_attempt_restores_actual_runner_columns",
+        "test_retry_wait_projection_failure_keeps_durable_retry",
+        "test_cheap_and_full_resident_reads_use_authoritative_snapshot",
+        "test_all_three_fresh_attempt_paths_reapply_resident_binding",
+        "test_resident_retry_reloads_live_project_before_repinning",
+        "test_operator_send_serializes_with_resident_transition",
+        "test_resident_mutations_reject_expired_continuation_but_messages_pass",
+        "test_resident_mutations_reject_overlapping_one_shot_but_messages_pass",
+        "test_terminal_reconciler_ignores_requeued_worker",
+        "test_terminal_reconciler_replaces_exact_continuous_generation",
+        "test_terminal_reconciler_exposes_start_after_replacement_failure",
+        "test_terminal_reconciler_never_restarts_superseded_or_stopped_worker",
+        "test_active_one_shot_records_cycle_reason_then_completion_retries",
+        "test_workbench_and_work_session_arming_suppressed_during_resident_session"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_resident_session.py",
+      "reason": "Covers the core conversational Workday session lifecycle — start/adopt, liveness heartbeat/lease, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
+      "test_ids": [
+        "test_start_adopts_task_and_liveness_heartbeat_preserves_lease",
+        "test_stop_ends_task_releases_continuation_and_hands_off_messages",
+        "test_handoff_releases_unanswered_and_resolves_answered"
+      ]
+    },
+    {
+      "path": "agent/src/handlers/strategic-resident.test.ts",
+      "reason": "Covers handleStrategicResident — the agent-side handler that drives the conversational Workday session loop (operator reply, compaction restart, workspace recovery, corrective tick, provider-error guard). This is the deepest coverage of the resident session path on the agent side; deleting it leaves the handler entirely untested.",
+      "test_ids": [
+        "removes stale reply artifacts before the session starts or autonomous work runs",
+        "primes the compacted session WITH the settled operator decision and WITHOUT the answered message after atomic reply handling"
+      ]
     }
   ],
 
