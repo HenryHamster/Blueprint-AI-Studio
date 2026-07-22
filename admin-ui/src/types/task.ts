@@ -54,32 +54,6 @@ export interface TaskEvaluationSummary {
   highlights?: TaskEvaluationSummaryItem[];
 }
 
-export interface PanelReviewIssue {
-  severity?: string;
-  description: string;
-  file?: string;
-  line?: number;
-  lens?: 'correctness' | 'security' | 'code_quality' | 'test_coverage';
-}
-
-interface PanelReviewLensVerdict {
-  verdict: 'APPROVE' | 'REQUEST_CHANGES';
-  summary: string;
-  issues?: PanelReviewIssue[];
-}
-
-export interface PanelReviewVerdict {
-  overall_verdict: 'APPROVE' | 'REQUEST_CHANGES';
-  summary: string;
-  issues?: PanelReviewIssue[];
-  investigated_files?: string[];
-  lenses: {
-    correctness: PanelReviewLensVerdict;
-    security: PanelReviewLensVerdict;
-    code_quality: PanelReviewLensVerdict;
-    test_coverage: PanelReviewLensVerdict;
-  };
-}
 
 export interface TaskArtifact {
   artifact_type: string;

@@ -188,7 +188,6 @@ describe('PRMonitorSection — viewport regression', () => {
             tasks={tasks}
             onViewTask={() => {}}
             onSpawnFixTask={() => {}}
-            onPanelReviewPr={() => {}}
           />,
         );
       });

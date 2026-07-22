@@ -1,6 +1,6 @@
 /* eslint-disable react-hooks/immutability, react-hooks/set-state-in-effect */
 import { memo, useCallback, useState, useRef, useEffect } from 'react';
-import { Terminal, X, Copy, Check, CheckCircle, CheckSquare, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download, Diff, ChevronDown, ChevronRight, Plus, Minus, CopyPlus } from 'lucide-react';
+import { Terminal, X, Copy, Check, CheckCircle, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download, Diff, ChevronDown, ChevronRight, Plus, Minus, CopyPlus } from 'lucide-react';
 import { LogsTab } from './TaskDetailDrawerLogs';
 import type { LogLevel } from './TaskDetailDrawerLogs';
 import { StatusBadge, TaskTypeBadge } from './TaskCard';
@@ -29,7 +29,6 @@ interface TaskDetailDrawerProps {
   onNavigateToTask?: (taskId: string) => void;
   onWidthChange?: (width: number) => void;
   onDuplicate?: (task: Task) => void;
-  onPanelReview?: (task: Task) => void;
   onResetIterationCap?: (id: string) => void;
   onTriggerRollup?: (id: string) => void;
 }
@@ -51,14 +50,6 @@ interface CancelImpactResponse {
 }
 
 type CancelImpactStatus = 'idle' | 'loading' | 'ready' | 'error';
-
-// A panel_review can be launched from a review/fix task only when that task
-// carries the PR context (number) the fixed workflow grades against.
-function panelReviewablePr(task: Task): boolean {
-  if (task.task_type !== 'review' && task.task_type !== 'fix') return false;
-  const payload = (task.payloads?.[0] ?? {}) as Record<string, unknown>;
-  return payload.pr_number != null;
-}
 
 // A task has a PR number in context if it carries review_loop.pr_number or rollup_pr_number.
 // Used to determine whether "Reset Iteration Cap" is available.
@@ -298,7 +289,6 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
   onNavigateToTask,
   onWidthChange,
   onDuplicate,
-  onPanelReview,
   onResetIterationCap,
   onTriggerRollup,
 }: TaskDetailDrawerProps) {
@@ -334,7 +324,6 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
   const handleRetry = useCallback(() => onRetry(task.id), [onRetry, task.id]);
   const handleDismiss = useCallback(() => onDismiss(task.id), [onDismiss, task.id]);
   const handleDuplicate = useCallback(() => onDuplicate?.(task), [onDuplicate, task]);
-  const handlePanelReview = useCallback(() => onPanelReview?.(task), [onPanelReview, task]);
   const handleResetIterationCap = useCallback(() => onResetIterationCap?.(task.id), [onResetIterationCap, task.id]);
   const handleTriggerRollup = useCallback(() => onTriggerRollup?.(task.id), [onTriggerRollup, task.id]);
 
@@ -551,15 +540,6 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
               </div>
             </div>
             <div className="flex items-center gap-1 shrink-0">
-              {onPanelReview && panelReviewablePr(task) && (
-                <button
-                  onClick={handlePanelReview}
-                  title="Panel review this PR"
-                  className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-                >
-                  <CheckSquare className="w-5 h-5" />
-                </button>
-              )}
               {onDuplicate && (
                 <button
                   onClick={handleDuplicate}

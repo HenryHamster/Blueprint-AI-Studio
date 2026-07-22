@@ -24,11 +24,6 @@ describe('task capability registry', () => {
     expect(FILTER_TASK_TYPE_IDS).toContain('self_audit');
   });
 
-  it('surfaces panel_review as a launchable operator task', () => {
-    expect(USER_LAUNCHABLE_TASK_TYPE_IDS).toContain('panel_review');
-    expect(getTaskTypeLabel('panel_review')).toBe('Panel Review');
-  });
-
   it('does not invent labels for unknown future task types', () => {
     expect(getTaskTypeLabel('future_capability')).toBe('future_capability');
   });

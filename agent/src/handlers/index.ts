@@ -19,7 +19,6 @@ import type WebSocket from 'ws';
 import type { AgentTaskType } from '../taskCapabilities.js';
 import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA, handleSalvageBundle } from './standard.js';
 import { handleReview, handleFix } from './review-fix.js';
-import { handlePanelReview } from './panel-review.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
@@ -72,7 +71,6 @@ const dispatchResearch: Handler = (taskId, payload, task, ghToken, owner, repo, 
 export const handlers: Record<AgentTaskType, Handler> = {
   create: handleCreate,
   review: handleReview,
-  panel_review: handlePanelReview,
   fix: handleFix,
   plan: handlePlan,
   research: dispatchResearch,

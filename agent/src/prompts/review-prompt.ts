@@ -165,9 +165,6 @@ export const REVIEW_ANTI_HEDGE_CRITERION =
   'disabled, or `fail-open` without documented rationale? ' +
   'New behavior must default ON/committed — flag unjustified hedges as a correctness issue.';
 
-// Per-lens checklist text used by buildLensScopedChecklistSection.
-// Each panel_review lens agent receives only its own section so it does not
-// re-read the full four-section list it was explicitly told to ignore.
 const LENS_CHECKLIST_ITEMS: Record<string, string> = {
   correctness: `**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
@@ -205,17 +202,6 @@ ${LENS_CHECKLIST_ITEMS.test_coverage}
 ${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
 }
 
-// Returns a checklist section scoped to a single panel_review lens. The lens
-// agent only receives its own dimension's bullets so it is not prompted to
-// judge dimensions explicitly outside its scope. Falls back to the full
-// checklist for unrecognised lens IDs to avoid silent regressions.
-export function buildLensScopedChecklistSection(lensId: string, buildConfig?: BuildConfig, baseBranch?: string): string {
-  const lensSection = LENS_CHECKLIST_ITEMS[lensId];
-  if (!lensSection) {
-    return buildReviewChecklistSection(buildConfig, baseBranch);
-  }
-  return `Review the changes through your lens using this checklist:\n\n${lensSection}\n\n${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
-}
 
 export function buildReviewSeverityGuideSection(): string {
   return `**Severity Classification Guide:**

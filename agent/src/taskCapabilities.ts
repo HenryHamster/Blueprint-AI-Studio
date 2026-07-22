@@ -18,7 +18,6 @@
 export const AGENT_TASK_TYPE_IDS = [
   'create',
   'review',
-  'panel_review',
   'fix',
   'plan',
   'research',

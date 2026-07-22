@@ -741,7 +741,7 @@ describe('DetailsTab — Merge Test Gate', () => {
 
   it('colors an approve panel verdict as a positive (emerald) badge', () => {
     const task = makeTask({
-      task_type: 'panel_review',
+      task_type: 'review',
       evaluation_summary: {
         status: 'COMPLETED',
         verdict: 'approve',
@@ -757,7 +757,7 @@ describe('DetailsTab — Merge Test Gate', () => {
 
   it('colors a request_changes panel verdict as a blocking (red) badge', () => {
     const task = makeTask({
-      task_type: 'panel_review',
+      task_type: 'review',
       evaluation_summary: {
         status: 'COMPLETED',
         verdict: 'request_changes',
@@ -971,55 +971,6 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-verify-1\/artifacts\/metrics\.json/i })).toBeInTheDocument();
   });
 
-  it('renders structured panel review verdict details without falling back to raw plan JSON', () => {
-    const task = makeTask({
-      task_type: 'panel_review',
-      plan_output: {
-        overall_verdict: 'REQUEST_CHANGES',
-        summary: 'Two blocking findings remain.',
-        investigated_files: [
-          'agent/src/handlers/panel-review.ts',
-          'admin-ui/src/components/TaskDetailDrawerMeta.tsx',
-        ],
-        lenses: {
-          correctness: {
-            verdict: 'REQUEST_CHANGES',
-            summary: 'A caller compatibility issue remains.',
-            issues: [
-              {
-                severity: 'major',
-                description: 'Caller still expects the old payload shape.',
-                file: 'agent/src/handlers/panel-review.ts',
-                line: 120,
-              },
-            ],
-          },
-          security: {
-            verdict: 'APPROVE',
-            summary: 'No security regressions were found.',
-            issues: [],
-          },
-          code_quality: {
-            verdict: 'APPROVE',
-            summary: 'The workflow stays inside the existing review infrastructure.',
-            issues: [],
-          },
-          test_coverage: {
-            verdict: 'APPROVE',
-            summary: 'Targeted tests cover the new workflow.',
-            issues: [],
-          },
-        },
-      },
-    });
-    render(<DetailsTab task={task} />);
-    expect(screen.getByText('Panel Review Verdict')).toBeInTheDocument();
-    expect(screen.getAllByText('Request Changes').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText(/Two blocking findings remain/)).toBeInTheDocument();
-    expect(screen.getByText('Correctness')).toBeInTheDocument();
-    expect(screen.getByText('agent/src/handlers/panel-review.ts:120')).toBeInTheDocument();
-    expect(screen.queryByText('Plan Output')).toBeNull();
-  });
 
   it('shows the fall-open reason when a suite was detected but every test was skipped', () => {
     const task = makeTask({

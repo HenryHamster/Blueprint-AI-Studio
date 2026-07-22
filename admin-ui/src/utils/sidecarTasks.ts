@@ -17,7 +17,7 @@ export type SidecarKind =
 
 /** Back-reference context keys written ON THE SIDE-CAR (backend task_evaluators.py). */
 export const SIDECAR_BACKREF_KEYS: Record<string, SidecarKind> = {
-  // REVIEW_SECOND_OPINION_SOURCE_KEY — panel_review challenger of a review verdict
+  // REVIEW_SECOND_OPINION_SOURCE_KEY — challenger of a review verdict
   review_second_opinion_for_task_id: 'second-opinion',
   // QUALITY_GRADER_SOURCE_KEY — forward-quality grade OR adversarial finding gate
   // (the adversarial side-car reuses the same back-reference key and is

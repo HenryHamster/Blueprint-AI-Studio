@@ -612,44 +612,29 @@ export function useTaskModal(
       return;
     }
     const normalizedPrBranch = newTaskPrBranch.trim();
-    if (newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') {
+    if (newTaskType === 'review' || newTaskType === 'fix') {
       const prNum = parseInt(newTaskPrNumber, 10);
       if (!newTaskPrNumber || isNaN(prNum) || prNum < 1) {
         addToast('PR number must be a positive integer', 'error');
         return;
       }
       if (!normalizedPrBranch) {
-        const taskLabel = newTaskType === 'fix'
-          ? 'fix'
-          : newTaskType === 'panel_review'
-            ? 'panel review'
-            : 'review';
+        const taskLabel = newTaskType === 'fix' ? 'fix' : 'review';
         addToast(`PR branch is required for ${taskLabel} tasks`, 'error');
         return;
       }
     }
-    // panel_review runs a FIXED multi-lens workflow whose driving prompt is
-    // built by the handler; an operator-authored title/prompt is not required.
-    // The backend still mandates non-empty title/prompt (min_length=1), so fill
-    // sensible defaults from the PR context when the operator left them blank.
-    const isPanelReview = newTaskType === 'panel_review';
-    const effectiveTitle = newTaskTitle.trim() || (isPanelReview
-      ? `Panel review PR #${newTaskPrNumber || '?'}`
-      : newTaskTitle);
-    const effectivePrompt = newTaskPrompt.trim() || (isPanelReview
-      ? `Run the fixed multi-agent panel review on PR #${newTaskPrNumber || '?'}.`
-      : newTaskPrompt);
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks`, {
         method: 'POST',
         headers: await authHeaders(),
         body: JSON.stringify({
           github_repo: newTaskRepo,
-          title: effectiveTitle,
-          prompt: effectivePrompt,
+          title: newTaskTitle,
+          prompt: newTaskPrompt,
           base_branch: newTaskBranch,
           task_type: newTaskType,
-          ...(newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix' ? {
+          ...(newTaskType === 'review' || newTaskType === 'fix' ? {
             pr_number: parseInt(newTaskPrNumber, 10),
             branch: normalizedPrBranch || undefined,
           } : {}),
@@ -695,8 +680,8 @@ export function useTaskModal(
     setModalOpener('duplicate');
     setShowNewTaskModal(true);
     setNewTaskRepo(repo);
-    // Prefer the PR's own base branch (so a panel_review launched from a PR
-    // grades against the right base); fall back to the project default.
+    // Prefer the PR's own base branch (so a task launched from a PR
+    // targets the right base); fall back to the project default.
     setNewTaskBranch(baseBranch || getDefaultTaskBranch() || '');
     setNewTaskTitle(title);
     setNewTaskPrompt(prompt);

@@ -101,7 +101,6 @@ export interface DashboardHomeProps {
   onScopeClick?: (scope: string) => void;
   onConfigureTargets?: () => void;
   onSpawnOrphanFix?: (pr: OpenPR) => void;
-  onPanelReviewPr?: (pr: OpenPR) => void;
   gatedTaskTypes?: FailingTaskTypeEntry[];
   userRole?: 'admin' | 'user' | null;
 }
@@ -116,7 +115,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, gatedTaskTypes }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, gatedTaskTypes }: DashboardHomeProps) {
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
@@ -612,7 +611,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             integrationBranch={openPRsIntegrationBranch}
             promotionTarget={openPRsPromotionTarget}
             onSpawnFixTask={onSpawnOrphanFix}
-            onPanelReviewPr={onPanelReviewPr}
             stale={openPRsStale}
             degraded={openPRsDegraded}
           />

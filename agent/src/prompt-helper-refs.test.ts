@@ -173,7 +173,6 @@ describe.skipIf(!SUPPORTS_EXEC_BIT)('per-handler prompt/helper provisioning pari
     { type: 'security_audit', sources: ['handlers/audits.ts'] },
     { type: 'self_audit', sources: ['handlers/audits.ts'] },
     { type: 'release_audit', sources: ['handlers/audits.ts'] },
-    { type: 'panel_review', sources: ['handlers/panel-review.ts'] },
   ];
 
   let ws: string;

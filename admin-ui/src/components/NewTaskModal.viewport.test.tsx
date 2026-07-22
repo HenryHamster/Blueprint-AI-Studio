@@ -518,7 +518,7 @@ describe('NewTaskModal — viewport regression', () => {
           setBranchOptions={() => {}}
           launchableTaskTypeOptions={[
             { value: 'create', label: 'Create', description: 'Write code, open PR' },
-            { value: 'panel_review', label: 'Panel Review', description: 'Multi-agent registered type with no static icon' },
+            { value: 'custom_backend_type', label: 'Custom Backend Type', description: 'A backend-registered type with no static icon' },
           ]}
           taskBranchDefaultsReady={true}
           taskBranchDefaultsLoading={false}
@@ -531,9 +531,9 @@ describe('NewTaskModal — viewport regression', () => {
     });
     // The unknown task-type id renders its label (fallback icon, no crash).
     const buttons = Array.from(document.querySelectorAll('button'));
-    const panelButton = buttons.find(b => b.textContent?.includes('Panel Review'));
-    expect(panelButton).toBeTruthy();
-    expect(panelButton?.querySelector('svg')).toBeTruthy();
+    const customButton = buttons.find(b => b.textContent?.includes('Custom Backend Type'));
+    expect(customButton).toBeTruthy();
+    expect(customButton?.querySelector('svg')).toBeTruthy();
   });
 
   test('renders compute experiment preflight error state at 1280px', async () => {

@@ -150,54 +150,6 @@ const mergeTestTask: Task = {
   ],
 };
 
-const panelReviewTask: Task = {
-  id: 'task-panel-review-550e8400e29b41d4a716446655440088',
-  title: 'Panel review verdict',
-  description: 'Run the fixed multi-lens panel review',
-  status: 'COMPLETED',
-  task_type: 'panel_review',
-  created_at: '2024-01-01T00:00:00Z',
-  created_by: 'ORCHESTRATOR',
-  requires_approval: false,
-  plan_output: {
-    overall_verdict: 'REQUEST_CHANGES',
-    summary: 'Two blocking findings remain after the fixed panel review workflow.',
-    investigated_files: [
-      'agent/src/handlers/panel-review.ts',
-      'admin-ui/src/components/TaskDetailDrawerMeta.tsx',
-      'backend/testing/test_panel_review_completion.py',
-    ],
-    lenses: {
-      correctness: {
-        verdict: 'REQUEST_CHANGES',
-        summary: 'A caller compatibility issue remains.',
-        issues: [
-          {
-            severity: 'major',
-            description: 'Caller still expects the old payload shape.',
-            file: 'agent/src/handlers/panel-review.ts',
-            line: 120,
-          },
-        ],
-      },
-      security: {
-        verdict: 'APPROVE',
-        summary: 'No security regressions were found.',
-        issues: [],
-      },
-      code_quality: {
-        verdict: 'APPROVE',
-        summary: 'The workflow stays inside the existing review infrastructure.',
-        issues: [],
-      },
-      test_coverage: {
-        verdict: 'APPROVE',
-        summary: 'Targeted tests cover the new workflow and UI rendering path.',
-        issues: [],
-      },
-    },
-  },
-};
 
 describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
   let root: Root | null = null;
@@ -418,16 +370,6 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<DetailsTab task={memoTask} />); });
-    });
-  });
-
-  test('panel review verdict layout stays readable at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await act(async () => { r.render(<DetailsTab task={panelReviewTask} />); });
     });
   });
 

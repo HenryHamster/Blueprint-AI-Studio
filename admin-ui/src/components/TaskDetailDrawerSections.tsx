@@ -10,7 +10,7 @@ import { isComputeJobActive, computeJobTerminalLabel, computeJobExecutionLocatio
 import { ComputeArtifactGallery } from './ComputeArtifactGallery';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { EvidenceTierBadge } from './EvidenceTierBadge';
-import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
+import type { AdversarialGateDiagnostic, Task, TaskEvaluationSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import { CopyableId, SectionHeader, DetailRow, Sparkline, DependencyItem } from './TaskDetailDrawerPrimitives';
@@ -625,119 +625,6 @@ export function EvaluationSummarySection({ summary }: { summary: TaskEvaluationS
             </div>
           </div>
         )}
-      </div>
-    </>
-  );
-}
-
-const PANEL_REVIEW_LENS_LABELS: Record<keyof PanelReviewVerdict['lenses'], string> = {
-  correctness: 'Correctness',
-  security: 'Security',
-  code_quality: 'Code Quality',
-  test_coverage: 'Test Coverage',
-};
-
-const PANEL_REVIEW_BADGES: Record<'APPROVE' | 'REQUEST_CHANGES', string> = {
-  APPROVE: 'bg-emerald-900/40 text-emerald-300 border-emerald-800/40',
-  REQUEST_CHANGES: 'bg-red-900/40 text-red-300 border-red-800/40',
-};
-
-function flattenPanelReviewIssues(verdict: PanelReviewVerdict): PanelReviewIssue[] {
-  if (Array.isArray(verdict.issues) && verdict.issues.length > 0) {
-    return verdict.issues;
-  }
-  return Object.entries(verdict.lenses).flatMap(([lensId, lens]) => (
-    (lens.issues ?? []).map(issue => ({
-      ...issue,
-      lens: issue.lens ?? lensId as PanelReviewIssue['lens'],
-    }))
-  ));
-}
-
-function formatIssueLocation(issue: PanelReviewIssue): string {
-  if (!issue.file) return '';
-  return issue.line ? `${issue.file}:${issue.line}` : issue.file;
-}
-
-export function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVerdict }) {
-  const issues = flattenPanelReviewIssues(verdict);
-
-  return (
-    <>
-      <SectionHeader>Panel Review Verdict</SectionHeader>
-      <div className="space-y-4 rounded-lg border border-fuchsia-900/30 bg-fuchsia-950/10 p-3">
-        <div className="flex flex-wrap items-start gap-3">
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-neutral-500">Overall</span>
-            <span className={`text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${PANEL_REVIEW_BADGES[verdict.overall_verdict]}`}>
-              {verdict.overall_verdict === 'APPROVE' ? 'Approve' : 'Request Changes'}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-neutral-500">Findings</span>
-            <span className="text-sm text-neutral-200">{issues.length}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-neutral-500">Files Investigated</span>
-            <span className="text-sm text-neutral-200">{verdict.investigated_files?.length ?? 0}</span>
-          </div>
-        </div>
-
-        <div className="flex items-start gap-2">
-          <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Summary</span>
-          <p className="text-sm text-neutral-200 min-w-0 break-words">{verdict.summary}</p>
-        </div>
-
-        {verdict.investigated_files && verdict.investigated_files.length > 0 && (
-          <div className="flex items-start gap-2">
-            <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Investigated</span>
-            <div className="flex min-w-0 flex-wrap gap-1.5">
-              {verdict.investigated_files.map((file, index) => (
-                <span key={`${file}-${index}`} className="rounded border border-fuchsia-800/40 bg-neutral-900/70 px-2 py-1 font-mono text-ui-md text-neutral-200 break-all">
-                  {file}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {Object.entries(verdict.lenses).map(([lensId, lens]) => (
-            <div key={lensId} className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
-              <div className="mb-2 flex flex-wrap items-center gap-2">
-                <span className="text-sm font-semibold text-neutral-100">
-                  {PANEL_REVIEW_LENS_LABELS[lensId as keyof PanelReviewVerdict['lenses']]}
-                </span>
-                <span className={`text-ui-md font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${PANEL_REVIEW_BADGES[lens.verdict]}`}>
-                  {lens.verdict === 'APPROVE' ? 'Approve' : 'Request Changes'}
-                </span>
-              </div>
-              <p className="text-sm text-neutral-300 break-words">{lens.summary}</p>
-              {lens.issues && lens.issues.length > 0 && (
-                <div className="mt-3 space-y-2">
-                  {lens.issues.map((issue, index) => (
-                    <div key={`${lensId}-${index}`} className="rounded border border-neutral-800 bg-neutral-900/70 p-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        {issue.severity && (
-                          <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-ui-sm font-semibold uppercase tracking-wider text-neutral-300">
-                            {issue.severity}
-                          </span>
-                        )}
-                        {formatIssueLocation(issue) && (
-                          <span className="inline-flex items-center gap-1 font-mono text-ui-md text-blue-300 break-all">
-                            <Hash className="h-3 w-3 shrink-0" />
-                            {formatIssueLocation(issue)}
-                          </span>
-                        )}
-                      </div>
-                      <p className="mt-1 text-xs text-neutral-200 break-words">{issue.description}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
       </div>
     </>
   );

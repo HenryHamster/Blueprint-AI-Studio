@@ -52,7 +52,6 @@ describe('task-capability contract loading', () => {
 
     expect(isReadOnlyTaskType('self_audit')).toBe(true);
     expect(isReadOnlyTaskType('review')).toBe(true);
-    expect(isReadOnlyTaskType('panel_review')).toBe(true);
     expect(isReadOnlyTaskType('create')).toBe(false);
     expect(isReadOnlyTaskType('fix')).toBe(false);
     // Unknown types are not read-only (preserved fallback; dispatch rejects them first).

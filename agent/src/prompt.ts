@@ -182,7 +182,7 @@ export const VIEWPORT_FAILURE_SCREENSHOT_HINT =
  * component+width key rather than emitting a flat list. Returns '' when no
  * screenshots were downloaded, so non-visual PRs are unaffected.
  *
- * Shared by the review, fix, and panel_review prompt builders so a downstream
+ * Shared by the review and fix prompt builders so a downstream
  * agent receives the same screenshot brief regardless of which lane forwarded
  * the PNGs.
  */
@@ -245,7 +245,6 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
 // TASK_TYPE_HINTS or be explicitly opted-out here with justification.
 export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'review',           // Uses review-fix.ts bespoke prompt assembly
-  'panel_review',     // Uses panel-review.ts bespoke fixed-lens review assembly
   'plan',             // Uses research-plan.ts bespoke prompt assembly
   'research',         // Uses research-plan.ts bespoke prompt assembly
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly

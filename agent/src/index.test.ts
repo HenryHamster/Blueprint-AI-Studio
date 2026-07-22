@@ -1144,10 +1144,6 @@ describe('TMP_OUTPUT_NAMES (scratch-file cleanup list)', () => {
   // in sync so the test catches future drift.
   const KNOWN_HANDLER_OUTPUTS = [
     'review_verdict',
-    'panel_review_lens_correctness',
-    'panel_review_lens_security',
-    'panel_review_lens_code_quality',
-    'panel_review_lens_test_coverage',
     'plan_output',
     'research_findings',
     'security_findings',
@@ -1842,8 +1838,7 @@ describe('matchesAuthFailure', () => {
   it('detects a Codex OAuth refresh-token-reuse 401 (prod 2026-06-14 SavarinCodex)', () => {
     // The codex CLI emits this when its stored refresh token was already
     // consumed/rotated. Before coverage was added, runClaudeCode returned a bare
-    // non-zero exit instead of throwing AuthFailureError, so panel_review
-    // fail-closed the challenge and stranded the gated PR's merge.
+    // non-zero exit instead of throwing AuthFailureError.
     const body =
       'ERROR codex_login::auth::manager: Failed to refresh token: 401 Unauthorized: ' +
       '{"error":{"message":"Your refresh token has already been used to generate a new ' +

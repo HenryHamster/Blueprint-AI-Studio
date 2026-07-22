@@ -404,7 +404,6 @@ const TASK_CLASS_MAP = {
   salvage_bundle:    'code-change',
   // Read-only / investigative (13): analysis only, must not push code
   review:            'read-only',
-  panel_review:      'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
   release_audit:     'read-only',

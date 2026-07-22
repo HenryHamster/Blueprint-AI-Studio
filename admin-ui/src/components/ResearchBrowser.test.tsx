@@ -227,7 +227,7 @@ describe('ResearchBrowser evidence panel', () => {
   it('renders a request_changes verdict as a humanized blocking pill', async () => {
     const user = userEvent.setup();
     const implementation = makeImplementationTask({
-      task_type: 'panel_review',
+      task_type: 'review',
       evaluation_summary: {
         status: 'COMPLETED',
         verdict: 'request_changes',

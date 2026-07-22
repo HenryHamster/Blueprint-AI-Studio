@@ -161,7 +161,6 @@ interface RuntimeWorkspaceProps {
   onDirectionClick: (directionId: string) => void;
   onConfigureTargets: () => void;
   onSpawnOrphanFix: DashboardHomeProps['onSpawnOrphanFix'];
-  onPanelReviewPr: DashboardHomeProps['onPanelReviewPr'];
   gatedTaskTypes?: FailingTaskTypeEntry[];
   onApproveExperiment: (taskId: string) => Promise<void>;
   onDismissExperiment: (taskId: string) => Promise<void>;
@@ -202,7 +201,6 @@ export function RuntimeWorkspace({
   onDirectionClick,
   onConfigureTargets,
   onSpawnOrphanFix,
-  onPanelReviewPr,
   gatedTaskTypes,
   onApproveExperiment,
   onDismissExperiment,
@@ -405,7 +403,6 @@ export function RuntimeWorkspace({
             onDirectionClick={onDirectionClick}
             onConfigureTargets={onConfigureTargets}
             onSpawnOrphanFix={onSpawnOrphanFix}
-            onPanelReviewPr={onPanelReviewPr}
             gatedTaskTypes={gatedTaskTypes}
             userRole={userRole}
           />

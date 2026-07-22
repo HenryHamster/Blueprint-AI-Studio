@@ -49,7 +49,6 @@ afterAll(() => {
 // fixture only — production sources this from the live endpoint.
 const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'review',
-  'panel_review',
   'plan',
   'research',
   'strategic_review',
