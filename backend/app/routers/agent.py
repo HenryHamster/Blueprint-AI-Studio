@@ -3148,9 +3148,11 @@ async def claim_task(
                 direction_first_attempt_feedback: Dict[str, int] | None = None
                 dfa_entry: dict = {}
                 try:
-                    dfa_all = (project_for_playbook.design_doc or {}).get(
-                        "direction_first_attempt_feedback"
-                    ) or {}
+                    from app.review_learning import (  # noqa: PLC0415
+                        read_direction_first_attempt_feedback as _read_dfa,
+                    )
+
+                    dfa_all = await _read_dfa(session, project_for_playbook)
                     dfa_entry = dfa_all.get(str(direction_id)) or {}
                     dfa_cats = {
                         k: v
@@ -3411,12 +3413,12 @@ async def claim_task(
                 research_dfa_entry: dict = {}
                 try:
                     if project_for_playbook and current_direction_id:
-                        research_dfa_entry = (
-                            (project_for_playbook.design_doc or {}).get(
-                                "direction_first_attempt_feedback"
-                            )
-                            or {}
-                        ).get(str(current_direction_id)) or {}
+                        from app.review_learning import (  # noqa: PLC0415
+                            read_direction_first_attempt_feedback as _read_dfa_r,
+                        )
+
+                        _dfa_all = await _read_dfa_r(session, project_for_playbook)
+                        research_dfa_entry = _dfa_all.get(str(current_direction_id)) or {}
                 except Exception:
                     logger.exception(
                         "[AGENT] Failed to read direction_first_attempt_feedback for research (non-critical)"
@@ -3449,9 +3451,11 @@ async def claim_task(
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         related_files = _claimed_context.get("related_files", [])
         if related_files:
-            cochange_index = (project_for_playbook.design_doc or {}).get(
-                "cochange_index"
+            from app.direction_outcomes import (  # noqa: PLC0415
+                read_cochange_index as _read_cochange_index,
             )
+
+            cochange_index = await _read_cochange_index(session, project_for_playbook)
             if cochange_index:
                 cochange_scores: dict[str, float] = {}
                 related_set = set(related_files)
@@ -3478,9 +3482,11 @@ async def claim_task(
     if task_type == "plan" and project_for_playbook:
         plan_related_files = _claimed_context.get("related_files", [])
         if plan_related_files:
-            cochange_index = (project_for_playbook.design_doc or {}).get(
-                "cochange_index"
-            ) or {}
+            from app.direction_outcomes import (  # noqa: PLC0415
+                read_cochange_index as _read_cochange_index_plan,
+            )
+
+            cochange_index = await _read_cochange_index_plan(session, project_for_playbook) or {}
             cochange_hints: dict[str, dict[str, float]] = {}
             related_set = set(plan_related_files)
             for rf in plan_related_files:

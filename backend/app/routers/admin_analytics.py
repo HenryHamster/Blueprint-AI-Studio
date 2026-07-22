@@ -1983,13 +1983,17 @@ async def get_lane_baselines(
     aggregates (phase wall-clock, iteration distribution, waste-source
     classification) plus per-PR relay medians for the v10 lane-pilot comparison.
 
-    Up to the last 20 versions are stored under ``project.design_doc``; reads
-    are cheap because the data lives on the already-loaded project row.
+    Up to the last 20 versions are stored per project. Reads prefer the
+    dedicated ``project_lane_baseline`` table and fall back to
+    ``project.design_doc['lane_baselines']`` for versions absent from the table
+    (before backfill or after a rollback of the dual-write).
 
     Returns 404 when the project is not found.  Returns an empty
     ``baselines`` list when the project exists but has no stored baselines yet.
     """
-    from app.lane_baseline_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+    from app.lane_baseline_snapshot import (  # noqa: PLC0415
+        read_all_lane_baselines_preferring_table,
+    )
 
     proj_doc = (
         await session.execute(
@@ -2007,9 +2011,11 @@ async def get_lane_baselines(
 
             raise HTTPException(status_code=404, detail="Project not found")
 
-    raw_baselines: dict = {}
-    if isinstance(proj_doc, dict):
-        raw_baselines = proj_doc.get(DESIGN_DOC_KEY) or {}
+    raw_baselines = await read_all_lane_baselines_preferring_table(
+        session,
+        project_id,
+        proj_doc if isinstance(proj_doc, dict) else None,
+    )
 
     # Sort versions descending so the most recent appears first.
     sorted_baselines = sorted(

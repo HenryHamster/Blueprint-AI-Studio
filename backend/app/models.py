@@ -6046,8 +6046,6 @@ class ProjectTelemetry(SQLModel, table=True):
     transition; readers continue to use design_doc until migrated.
     """
 
-    __tablename__ = "project_telemetry"
-
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(
         sa_column=Column(
@@ -6068,4 +6066,3 @@ class ProjectTelemetry(SQLModel, table=True):
         ),
         Index("ix_project_telemetry_project_id", "project_id"),
     )
-

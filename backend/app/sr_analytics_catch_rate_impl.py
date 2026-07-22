@@ -3,7 +3,7 @@
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -76,15 +76,15 @@ async def _compute_sr_catch_rate_trends_impl(
     project_id: uuid.UUID,
     session: AsyncSession,
     all_tasks: list,
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     now = _utcnow()
 
     def _naive(dt: datetime) -> datetime:
         return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
     use_cycle_mode = False
-    current_cycle_id: Optional[str] = None
-    previous_cycle_id: Optional[str] = None
+    current_cycle_id: str | None = None
+    previous_cycle_id: str | None = None
     current_count = 0
     previous_count = 0
     current_stats: dict[str, dict] = {}
@@ -226,7 +226,7 @@ async def _compute_sr_catch_rate_trends_impl(
     ):
         # skip_locked=True: a concurrent refresh holding the SR analytics row is
         # already updating this marker — drop rather than serialize the claim.
-        from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
+        from app.task_locking import with_sr_analytics_locked
 
         _now_iso = now.isoformat()
 
@@ -307,7 +307,7 @@ async def _compute_sr_catch_rate_trends_impl(
                 trend = "decreasing"
             else:
                 trend = "stable"
-            trend_significant: Optional[bool] = (
+            trend_significant: bool | None = (
                 sig and abs(delta) >= _TREND_DELTA_THRESHOLD
             )
         else:
@@ -367,17 +367,17 @@ async def _compute_sr_catch_rate_trends_impl(
             if prev_sr_failed > 0
             else None
         )
-        recall_delta: Optional[float] = (
+        recall_delta: float | None = (
             round(current_hit_rate - previous_hit_rate, 3)
             if current_hit_rate is not None and previous_hit_rate is not None
             else None
         )
-        precision_delta: Optional[float] = (
+        precision_delta: float | None = (
             round(precision - previous_precision, 3)
             if precision is not None and previous_precision is not None
             else None
         )
-        precision_recall_quadrant: Optional[str] = None
+        precision_recall_quadrant: str | None = None
         if recall_delta is not None and precision_delta is not None:
             q = _PRECISION_RECALL_QUADRANT_THRESHOLD
             p_up = precision_delta >= q
@@ -438,8 +438,8 @@ async def _compute_sr_catch_rate_trends_impl(
     # behind it. scalar_one_or_none() returns None when the row is held (or
     # absent), and the existing not-found guard below skips the write — the
     # in-flight refresh produces the updated trend, so behavior is preserved.
-    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
-    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+    from app.task_locking import with_sr_analytics_locked
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     # Ensure the SR analytics row exists, then lock it.
     await session.execute(
@@ -464,7 +464,7 @@ async def _compute_sr_catch_rate_trends_impl(
 
     doc = dict(sr_row.data or {})
     existing: dict = dict(doc.get("sr_catch_rate_trends") or {})
-    existing_computed_at: Optional[str] = existing.get("computed_at")
+    existing_computed_at: str | None = existing.get("computed_at")
 
     is_new_window = True
     if use_cycle_mode:
@@ -569,7 +569,7 @@ async def _compute_sr_catch_rate_trends_impl(
         else:
             data["fp_trend"] = "stable"
         # Recompute precision_delta and precision_recall_quadrant from consistent basis
-        precision_delta_new: Optional[float] = (
+        precision_delta_new: float | None = (
             round(data["precision"] - prev_precision, 3)
             if data["precision"] is not None and prev_precision is not None
             else None
@@ -860,12 +860,12 @@ async def _compute_sr_catch_rate_trends_impl(
         if p.get("human_count", 0) > 0:
             previous_sr_alone_hits += p.get("sr_alone_hit_count", 0)
             previous_sr_alone_humans += p["human_count"]
-    overall_sr_alone_hit_rate: Optional[float] = (
+    overall_sr_alone_hit_rate: float | None = (
         round(current_sr_alone_hits / current_sr_alone_humans, 3)
         if current_sr_alone_humans > 0
         else None
     )
-    previous_overall_sr_alone_hit_rate: Optional[float] = (
+    previous_overall_sr_alone_hit_rate: float | None = (
         round(previous_sr_alone_hits / previous_sr_alone_humans, 3)
         if previous_sr_alone_humans > 0
         else None
@@ -890,7 +890,7 @@ async def _compute_sr_catch_rate_trends_impl(
             overall_sr_alone_trend_verdict = "declining"
         else:
             overall_sr_alone_trend_verdict = "stable"
-        overall_sr_alone_trend_significant: Optional[bool] = (
+        overall_sr_alone_trend_significant: bool | None = (
             sr_alone_sig and abs(sr_alone_delta) >= _TREND_DELTA_THRESHOLD
         )
     else:
@@ -917,7 +917,7 @@ async def _compute_sr_catch_rate_trends_impl(
             overall_trend_verdict = "declining"
         else:
             overall_trend_verdict = "stable"
-        overall_trend_significant: Optional[bool] = (
+        overall_trend_significant: bool | None = (
             overall_sig and abs(overall_delta) >= _TREND_DELTA_THRESHOLD
         )
     else:
@@ -926,10 +926,10 @@ async def _compute_sr_catch_rate_trends_impl(
 
     pv_counter = _collect_prompt_versions(current_window_tasks)
     pv_counter_prev = _collect_prompt_versions(previous_window_tasks)
-    current_prompt_version: Optional[str] = (
+    current_prompt_version: str | None = (
         pv_counter.most_common(1)[0][0] if pv_counter else None
     )
-    prev_prompt_version: Optional[str] = (
+    prev_prompt_version: str | None = (
         pv_counter_prev.most_common(1)[0][0] if pv_counter_prev else None
     )
 
@@ -1043,18 +1043,18 @@ async def _compute_sr_catch_rate_trends_impl(
         if isinstance(task_total, int) and isinstance(task_filtered, int):
             prev_hall_total += task_total
             prev_hall_filtered += task_filtered
-    curr_hall_rate: Optional[float] = (
+    curr_hall_rate: float | None = (
         round(curr_hall_filtered / curr_hall_total, 3)
         if curr_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
         else None
     )
-    prev_hall_rate: Optional[float] = (
+    prev_hall_rate: float | None = (
         round(prev_hall_filtered / prev_hall_total, 3)
         if prev_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
         else None
     )
     if curr_hall_rate is not None or prev_hall_rate is not None:
-        hall_delta: Optional[float] = (
+        hall_delta: float | None = (
             round(curr_hall_rate - prev_hall_rate, 3)
             if curr_hall_rate is not None and prev_hall_rate is not None
             else None
@@ -1103,7 +1103,7 @@ async def _compute_sr_catch_rate_trends_impl(
         alertable = {**regressing, **fp_spiking}
         if alertable or regressing_severities:
             alert_state: dict = dict(doc.get("sr_catch_rate_trends_alert") or {})
-            alert_computed_at: Optional[str] = alert_state.get("computed_at")
+            alert_computed_at: str | None = alert_state.get("computed_at")
             alerted_cats: list = list(alert_state.get("categories") or [])
             alerted_sevs: list = list(alert_state.get("severities") or [])
             current_regressing_cats = sorted(alertable.keys())
@@ -1315,7 +1315,7 @@ async def _compute_sr_catch_rate_trends_impl(
                     and floor_alerted_cats == current_floor_cats
                 )
             else:
-                floor_alert_at: Optional[str] = floor_alert_state.get("computed_at")
+                floor_alert_at: str | None = floor_alert_state.get("computed_at")
                 if floor_alert_at:
                     try:
                         last_floor_dt = datetime.fromisoformat(floor_alert_at)
@@ -1472,7 +1472,7 @@ async def _compute_sr_catch_rate_trends_impl(
                     and q_alerted_cats == current_quadrant_cats
                 )
             else:
-                q_alert_at: Optional[str] = quadrant_alert_state.get("computed_at")
+                q_alert_at: str | None = quadrant_alert_state.get("computed_at")
                 if q_alert_at:
                     try:
                         last_q_dt = datetime.fromisoformat(q_alert_at)
@@ -1633,7 +1633,7 @@ async def _compute_sr_catch_rate_trends_impl(
                     and eng_alerted_cats == current_thinning_cats
                 )
             else:
-                eng_alert_at: Optional[str] = eng_alert_state.get("computed_at")
+                eng_alert_at: str | None = eng_alert_state.get("computed_at")
                 if eng_alert_at:
                     try:
                         last_eng_dt = datetime.fromisoformat(eng_alert_at)

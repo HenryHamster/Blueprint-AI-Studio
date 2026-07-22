@@ -10255,6 +10255,7 @@ async def test_coverage_summary_evidence_carries_tier_and_provenance(db_session)
 
 # ---------------------------------------------------------------------------
 # walkthrough_e2e evidence ingestion (record_walkthrough_e2e_evidence + endpoint)
+# backfill_merged_named_test_coverage
 # ---------------------------------------------------------------------------
 
 
@@ -10426,3 +10427,331 @@ async def test_walkthrough_e2e_endpoint_rejects_mismatched_sha(
     # The app reshapes HTTPException into {"error": {"code", "message": detail}}.
     assert resp.json()["error"]["message"]["reason"] == "candidate_sha_mismatch"
     assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_covers_uncovered_criterion(db_session):
+    """Merged task with named_test in changed files SHOULD get backfill evidence.
+
+    When a task's criteria were added AFTER the merge (so record_task_merge_evidence
+    never fired), the backfill must find such tasks, verify the test was in changed
+    files, and record UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND evidence.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestCoverage")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Merged named-test criterion",
+        created_by="strategist",
+    )
+
+    # Simulate a completed merged task that declared named_test in its payload.
+    # Criteria were added after the merge, so record_task_merge_evidence never ran.
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_merged_backfill.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_merged_backfill.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Before backfill: the criterion has no evidence (coverage = uncovered).
+    evidence_before = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence_before == [], "No evidence before backfill"
+    assert ac.compute_criterion_coverage(evidence_before) == "uncovered"
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    assert recorded == 1, (
+        f"Expected 1 evidence row for 1 criterion; got {recorded}"
+    )
+    evidence_after = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_after) == 1
+    assert evidence_after[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    assert evidence_after[0].source_id == str(task.id)
+    assert evidence_after[0].detail is not None
+    assert evidence_after[0].detail.get("proven") is True
+    assert evidence_after[0].detail.get("backfill_reason") == "merged_named_test_matches_changed"
+
+    coverage = ac.compute_criterion_coverage(evidence_after)
+    assert coverage == "backfilled", f"Expected 'backfilled', got '{coverage}'"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_already_covered(db_session):
+    """Criteria already machine-verified as covered get NO new backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestSkipCovered")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Already covered criterion",
+    )
+
+    # Record covering evidence first (task_merge with proven=True).
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_already_covered.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_already_covered.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Record covering evidence (proven task_merge).
+    await ac.record_evidence(
+        db_session,
+        criterion_id=criterion.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id=str(task.id),
+        detail={"proven": True},
+    )
+
+    # Verify criterion is already 'covered'.
+    evidence_before = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert ac.compute_criterion_coverage(evidence_before) == "covered"
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Already-covered criterion must not get backfill evidence"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_test_not_in_changed(db_session):
+    """Declared named_test NOT in changed files gets NO backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestSkipMissing")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Missing test criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_not_shipped.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Test not in changed files must not get backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_no_named_test(db_session):
+    """Task with no named_test declaration gets NO backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestSkipNoNamed")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "No named-test criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_no_named.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "No named_test declaration must not get backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_idempotent(db_session):
+    """Second call to backfill_merged_named_test_coverage records 0 new rows."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestIdempotent")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Idempotent criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_idempotent_backfill.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_idempotent_backfill.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # First call: records evidence.
+    recorded1 = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded1 == 1
+
+    # Second call: should record 0 new rows.
+    recorded2 = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded2 == 0, "Second backfill call must be idempotent"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_no_criterion_ids(db_session):
+    """Task with no criterion_ids gets NO backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestNoCriterionIds")
+    _ = await _make_version(db_session, project)  # open version needed for backfill to proceed
+
+    # Create a task that has a named_test but NO criterion_ids.
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_no_criterion_ids.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_no_criterion_ids.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Task with no criterion_ids must not get backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_no_seam_files(db_session):
+    """Test-only diff (no production seam) gets NO backfill evidence.
+
+    A named_test that ships NO production seam cannot exercise changed code,
+    so the backfill must skip it.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestNoSeam")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "No-seam criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "test only change",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_only.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_only.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Test-only diff must not get backfill evidence"

@@ -266,6 +266,94 @@ async def test_compute_sr_catch_rate_trends_data_sufficient_true_on_success(
 
 
 @pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_dual_writes_telemetry_on_success(
+    db_session: AsyncSession,
+):
+    """A successful computation dual-writes sr_catch_rate_trends to project_telemetry.
+
+    Exercises the Phase-1 dual-write in _compute_sr_catch_rate_trends_impl: the
+    design_doc copy is kept AND an identical blob is upserted into the dedicated
+    KV row, so a telemetry-preferring reader sees the same value.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.project_telemetry import read_telemetry
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    assert result is not None
+    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    assert stored.get("data_sufficient") is True
+
+    # Telemetry row mirrors the design_doc copy.
+    tel = await read_telemetry(db_session, project.id, "sr_catch_rate_trends")
+    assert tel is not None
+    assert tel.get("data_sufficient") is True
+    assert tel == stored
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_dual_writes_insufficient_marker(
+    db_session: AsyncSession,
+):
+    """The insufficient-sample marker is also mirrored into project_telemetry."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.project_telemetry import read_telemetry
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(4):  # below _MIN_SR_FINDINGS=5
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(4):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    assert result is None
+    tel = await read_telemetry(db_session, project.id, "sr_catch_rate_trends")
+    assert tel is not None
+    assert tel.get("data_sufficient") is False
+
+
+@pytest.mark.asyncio
 async def test_compute_sr_catch_rate_trends_data_sufficient_preserves_last_sufficient_on_low(
     db_session: AsyncSession,
 ):
@@ -5874,11 +5962,13 @@ async def test_compute_fresh_reviewer_trend_stable_classification(
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_persists_to_design_doc(
+async def test_compute_fresh_reviewer_trend_persists_to_telemetry_table(
     db_session: AsyncSession,
 ):
-    """Writes fresh_reviewer_trend to project.design_doc."""
+    """Persists fresh_reviewer_trend to the project_telemetry table (migration
+    0678 moved it off design_doc)."""
     from app.playbook_learning import compute_fresh_reviewer_trend
+    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -5895,14 +5985,14 @@ async def test_compute_fresh_reviewer_trend_persists_to_design_doc(
 
     result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
     await db_session.flush()
-    await db_session.refresh(project)
 
+    persisted = await read_telemetry(db_session, project.id, "fresh_reviewer_trend")
     assert result is not None
-    assert project.design_doc.get("fresh_reviewer_trend") is not None
-    assert (
-        project.design_doc["fresh_reviewer_trend"]["computed_at"]
-        == result["computed_at"]
-    )
+    assert persisted is not None
+    assert persisted["computed_at"] == result["computed_at"]
+    # No longer copied into design_doc.
+    await db_session.refresh(project)
+    assert (project.design_doc or {}).get("fresh_reviewer_trend") is None
 
 
 @pytest.mark.asyncio
@@ -7075,9 +7165,11 @@ async def test_compute_edges_trend_stable_classification(db_session: AsyncSessio
 
 
 @pytest.mark.asyncio
-async def test_compute_edges_trend_persists_to_design_doc(db_session: AsyncSession):
-    """Writes edges_trend to project.design_doc."""
+async def test_compute_edges_trend_persists_to_telemetry_table(db_session: AsyncSession):
+    """Persists edges_trend to the project_telemetry table (migration 0678 moved
+    it off design_doc)."""
     from app.playbook_learning import compute_edges_trend
+    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -7092,12 +7184,14 @@ async def test_compute_edges_trend_persists_to_design_doc(db_session: AsyncSessi
 
     result = await compute_edges_trend(project.id, db_session, tasks)
     await db_session.flush()
-    await db_session.refresh(project)
 
+    persisted = await read_telemetry(db_session, project.id, "edges_trend")
     assert result is not None
-    assert project.design_doc.get("edges_trend") is not None
-    assert project.design_doc["edges_trend"]["computed_at"] == result["computed_at"]
-    assert project.design_doc["edges_trend"]["trend"] == result["trend"]
+    assert persisted is not None
+    assert persisted["computed_at"] == result["computed_at"]
+    assert persisted["trend"] == result["trend"]
+    await db_session.refresh(project)
+    assert (project.design_doc or {}).get("edges_trend") is None
 
 
 @pytest.mark.asyncio
@@ -7136,9 +7230,11 @@ async def test_compute_edges_trend_history_capped_at_5(db_session: AsyncSession)
 
         await compute_edges_trend(project.id, db_session, tasks)
         await db_session.flush()
-        await db_session.refresh(project)
 
-    history = project.design_doc["edges_trend"]["rate_history"]
+    from app.project_telemetry import read_telemetry
+
+    persisted = await read_telemetry(db_session, project.id, "edges_trend")
+    history = persisted["rate_history"]
     assert len(history) <= 5
 
 
@@ -7568,11 +7664,13 @@ async def test_compute_sr_regression_risk_test_signal_trends_skip_envelope_exclu
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_regression_risk_test_signal_trends_persists_to_design_doc(
+async def test_compute_sr_regression_risk_test_signal_trends_persists_to_table(
     db_session: AsyncSession,
 ):
-    """Result is written to project.design_doc under the new key."""
+    """Result is written to the project_telemetry table under the key (migration
+    0678 moved it off design_doc)."""
     from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -7592,12 +7690,16 @@ async def test_compute_sr_regression_risk_test_signal_trends_persists_to_design_
     assert result is not None
 
     await db_session.flush()
-    await db_session.refresh(project)
-    assert project.design_doc is not None
-    persisted = project.design_doc.get("sr_regression_risk_test_signal_trends")
+    persisted = await read_telemetry(
+        db_session, project.id, "sr_regression_risk_test_signal_trends"
+    )
     assert persisted is not None
     assert persisted["computed_at"] == result["computed_at"]
     assert persisted["current"]["sample_size"] == 5
+    await db_session.refresh(project)
+    assert (project.design_doc or {}).get(
+        "sr_regression_risk_test_signal_trends"
+    ) is None
 
 
 @pytest.mark.asyncio

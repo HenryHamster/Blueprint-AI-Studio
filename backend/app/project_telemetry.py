@@ -4,20 +4,47 @@ Provides get/set access to the ``project_telemetry`` table, which stores
 large code-written reserved blobs that were previously crowding
 ``project.design_doc``.  Writers dual-write to both design_doc (for backward
 compat with readers not yet migrated) and this table.
+
+The ``project.design_doc`` JSONB column had accreted ~10 unrelated telemetry
+blobs, bloating the row to 500 KB+ and forcing every background telemetry
+writer to serialize through a single ``Project`` row lock
+(``with_design_doc_locked`` rewrites the entire blob on each write). Migration
+0659 introduced three dedicated tables; this module is the shared accessor the
+follow-on writer subtasks consume so each caller does NOT re-implement the
+upsert / retention logic:
+
+* ``project_telemetry`` — latest-value KV store, keyed by (project_id, key)
+* ``project_efficiency_snapshot`` — rolling time-series (retention-pruned)
+* ``project_lane_baseline`` — per-release-version baselines (retention-pruned)
+
+Every upsert here takes only the affected row lock (via ``ON CONFLICT DO
+UPDATE`` on the natural key) — never the ``Project`` row lock. Callers are
+responsible for committing the session.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Dict, List, Mapping
 
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as _pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
 
-from app.models import ProjectTelemetry
+from app.models import (
+    ProjectEfficiencySnapshot,
+    ProjectLaneBaseline,
+    ProjectTelemetry,
+)
 from app.time_utils import _utcnow
+
+# HEAD's set_project_telemetry uses `pg_insert` — alias for the same function
+pg_insert = _pg_insert
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 TELEMETRY_KEYS: frozenset[str] = frozenset(
     {
@@ -40,6 +67,31 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         "systems/completion-debt-ledger",
     }
 )
+
+# Retention caps mirror the pre-existing in-design_doc caps so behavior is
+# preserved after cutover:
+#   * efficiency_snapshot.py::_SNAPSHOT_HISTORY_MAX = 7
+#   * lane_baseline_snapshot.py::_MAX_BASELINES_STORED = 20
+_EFFICIENCY_SNAPSHOT_HISTORY_MAX = 7
+_LANE_BASELINE_VERSIONS_MAX = 20
+
+__all__ = [
+    "get_project_telemetry",
+    "set_project_telemetry",
+    "read_telemetry",
+    "read_telemetry_many",
+    "read_telemetry_or_doc",
+    "upsert_telemetry",
+    "insert_efficiency_snapshot",
+    "read_recent_efficiency_snapshots",
+    "upsert_lane_baseline",
+    "read_version_lane_baseline",
+    "read_all_lane_baselines",
+]
+
+# ---------------------------------------------------------------------------
+# Latest-value KV store: project_telemetry
+# ---------------------------------------------------------------------------
 
 
 async def get_project_telemetry(
@@ -100,3 +152,254 @@ async def set_project_telemetry(
         )
     )
     await session.execute(stmt)
+
+
+async def upsert_telemetry(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    key: str,
+    blob: Dict[str, Any],
+) -> None:
+    """Insert-or-overwrite the latest telemetry blob for (project_id, key).
+
+    Acquires only the (project_id, key) row lock via ``ON CONFLICT
+    (uq_project_telemetry) DO UPDATE`` — never the ``Project`` row lock.
+    Caller commits.
+    """
+    stmt = _pg_insert(ProjectTelemetry).values(
+        project_id=project_id,
+        key=key,
+        blob=blob,
+        updated_at=func.now(),
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_project_telemetry",
+        set_={
+            "blob": stmt.excluded.blob,
+            "updated_at": func.now(),
+        },
+    )
+    await session.execute(stmt)
+
+
+async def read_telemetry(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    key: str,
+) -> Dict[str, Any] | None:
+    """Return the telemetry blob for (project_id, key), or ``None`` if absent."""
+    result = await session.execute(
+        select(ProjectTelemetry.blob).where(
+            ProjectTelemetry.project_id == project_id,
+            ProjectTelemetry.key == key,
+        )
+    )
+    row = result.first()
+    return row[0] if row is not None else None
+
+
+async def read_telemetry_many(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    keys: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Batch-fetch telemetry blobs for several keys via ``WHERE key = ANY(...)``.
+
+    Returns a ``{key: blob}`` dict containing only the keys that exist.
+    """
+    if not keys:
+        return {}
+    result = await session.execute(
+        select(ProjectTelemetry.key, ProjectTelemetry.blob).where(
+            ProjectTelemetry.project_id == project_id,
+            ProjectTelemetry.key.in_(list(keys)),
+        )
+    )
+    return dict(result.all())
+
+
+async def read_telemetry_or_doc(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    design_doc: Mapping[str, Any] | None,
+    key: str,
+    default: Any = None,
+) -> Any:
+    """Telemetry-preferring read with a ``design_doc`` fallback.
+
+    Prefers the ``project_telemetry`` row for ``key``; when no row exists (e.g.
+    before backfill, or after a rollback that reverted the writer) falls back to
+    ``design_doc[key]``, and finally ``default``. This is the single read seam
+    that lets a value written only to the new table be observed by consumers
+    while the legacy design_doc copy remains authoritative on rollback.
+    """
+    stored = await read_telemetry(session, project_id, key)
+    if stored is not None:
+        return stored
+    if design_doc:
+        return design_doc.get(key, default)
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Time-series: project_efficiency_snapshot
+# ---------------------------------------------------------------------------
+
+
+async def insert_efficiency_snapshot(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    captured_at: datetime,
+    metric_def_version: str,
+    blob: Dict[str, Any],
+) -> None:
+    """Append (or overwrite by captured_at) an efficiency snapshot, then prune.
+
+    Idempotent on (project_id, captured_at) via ``ON CONFLICT
+    (uq_proj_efficiency_snap) DO UPDATE``. After the write, retains only the
+    newest ``_EFFICIENCY_SNAPSHOT_HISTORY_MAX`` rows for the project,
+    mirroring the WINDOW cap that ``efficiency_snapshot.py`` enforced inside
+    ``design_doc``. Caller commits.
+    """
+    stmt = _pg_insert(ProjectEfficiencySnapshot).values(
+        project_id=project_id,
+        captured_at=captured_at,
+        metric_def_version=metric_def_version,
+        blob=blob,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_proj_efficiency_snap",
+        set_={
+            "metric_def_version": stmt.excluded.metric_def_version,
+            "blob": stmt.excluded.blob,
+        },
+    )
+    await session.execute(stmt)
+    await _prune_efficiency_snapshots(session, project_id)
+
+
+async def _prune_efficiency_snapshots(
+    session: AsyncSession, project_id: uuid.UUID
+) -> None:
+    """Delete all but the newest ``_EFFICIENCY_SNAPSHOT_HISTORY_MAX`` rows."""
+    keep_ids = (
+        select(ProjectEfficiencySnapshot.id)
+        .where(ProjectEfficiencySnapshot.project_id == project_id)
+        .order_by(ProjectEfficiencySnapshot.captured_at.desc())
+        .limit(_EFFICIENCY_SNAPSHOT_HISTORY_MAX)
+        .scalar_subquery()
+    )
+    await session.execute(
+        delete(ProjectEfficiencySnapshot).where(
+            ProjectEfficiencySnapshot.project_id == project_id,
+            ProjectEfficiencySnapshot.id.not_in(keep_ids),
+        )
+    )
+
+
+async def read_recent_efficiency_snapshots(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    limit: int = _EFFICIENCY_SNAPSHOT_HISTORY_MAX,
+) -> List[ProjectEfficiencySnapshot]:
+    """Return the newest ``limit`` snapshots for the project, captured_at DESC."""
+    result = await session.execute(
+        select(ProjectEfficiencySnapshot)
+        .where(ProjectEfficiencySnapshot.project_id == project_id)
+        .order_by(ProjectEfficiencySnapshot.captured_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+# ---------------------------------------------------------------------------
+# Per-version keyed: project_lane_baseline
+# ---------------------------------------------------------------------------
+
+
+async def upsert_lane_baseline(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    version_number: int,
+    captured_at: datetime,
+    baseline_def_version: str,
+    blob: Dict[str, Any],
+) -> None:
+    """Insert-or-overwrite the lane baseline for (project_id, version_number).
+
+    Idempotent via ``ON CONFLICT (uq_proj_lane_baseline) DO UPDATE``. After the
+    write, retains only the most recent ``_LANE_BASELINE_VERSIONS_MAX``
+    versions per project, mirroring the ``_MAX_BASELINES_STORED`` cap that
+    ``lane_baseline_snapshot.py`` enforced inside ``design_doc``. Caller
+    commits.
+    """
+    stmt = _pg_insert(ProjectLaneBaseline).values(
+        project_id=project_id,
+        version_number=version_number,
+        captured_at=captured_at,
+        baseline_def_version=baseline_def_version,
+        blob=blob,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_proj_lane_baseline",
+        set_={
+            "captured_at": stmt.excluded.captured_at,
+            "baseline_def_version": stmt.excluded.baseline_def_version,
+            "blob": stmt.excluded.blob,
+        },
+    )
+    await session.execute(stmt)
+    await _prune_lane_baselines(session, project_id)
+
+
+async def _prune_lane_baselines(
+    session: AsyncSession, project_id: uuid.UUID
+) -> None:
+    """Delete all but the most recent ``_LANE_BASELINE_VERSIONS_MAX`` versions."""
+    keep_ids = (
+        select(ProjectLaneBaseline.id)
+        .where(ProjectLaneBaseline.project_id == project_id)
+        .order_by(ProjectLaneBaseline.version_number.desc())
+        .limit(_LANE_BASELINE_VERSIONS_MAX)
+        .scalar_subquery()
+    )
+    await session.execute(
+        delete(ProjectLaneBaseline).where(
+            ProjectLaneBaseline.project_id == project_id,
+            ProjectLaneBaseline.id.not_in(keep_ids),
+        )
+    )
+
+
+async def read_version_lane_baseline(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    version_number: int,
+) -> Dict[str, Any] | None:
+    """Return the lane-baseline blob for (project_id, version_number), or None."""
+    result = await session.execute(
+        select(ProjectLaneBaseline.blob).where(
+            ProjectLaneBaseline.project_id == project_id,
+            ProjectLaneBaseline.version_number == version_number,
+        )
+    )
+    row = result.first()
+    return row[0] if row is not None else None
+
+
+async def read_all_lane_baselines(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> List[ProjectLaneBaseline]:
+    """Return every stored lane baseline row for the project, version DESC.
+
+    The summary reader (``admin_analytics.get_lane_baselines``) enumerates all
+    per-version baselines; this accessor lets it prefer the dedicated table over
+    ``design_doc['lane_baselines']`` without re-implementing the query.
+    """
+    result = await session.execute(
+        select(ProjectLaneBaseline)
+        .where(ProjectLaneBaseline.project_id == project_id)
+        .order_by(ProjectLaneBaseline.version_number.desc())
+    )
+    return list(result.scalars().all())

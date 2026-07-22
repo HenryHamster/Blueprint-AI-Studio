@@ -19,6 +19,10 @@ from app.lane_baseline_snapshot import (
     read_version_lane_baseline,
 )
 from app.models import ReleaseVersion, TaskStatus
+from app.project_telemetry import (
+    read_version_lane_baseline as _read_lane_baseline_row,
+    upsert_lane_baseline as _upsert_lane_baseline_row,
+)
 from app.review_fix_lane_pilot import LANE_RECOVERY_REASON_KEY
 from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
@@ -133,8 +137,9 @@ class TestReadVersionLaneBaseline:
 
 class TestPersistVersionLaneBaseline:
     @pytest.mark.asyncio
-    async def test_persist_writes_baseline_to_design_doc(self, db_session):
-        """persist_version_lane_baseline stores a non-None dict in design_doc."""
+    async def test_persist_writes_baseline_to_table(self, db_session):
+        """persist_version_lane_baseline stores a non-None dict in the dedicated
+        project_lane_baseline table (migration 0678 moved it off design_doc)."""
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -184,11 +189,12 @@ class TestPersistVersionLaneBaseline:
         assert "per_pr_phase_breakdown" not in result
         assert "chains" not in result.get("lane_waste", {})
 
-        # Verify it landed in design_doc
-        await db_session.refresh(project)
-        stored = read_version_lane_baseline(project, 9)
+        # Verify it landed in the dedicated table (not design_doc).
+        stored = await _read_lane_baseline_row(db_session, project.id, 9)
         assert stored is not None
         assert stored["pr_count"] == 1
+        await db_session.refresh(project)
+        assert DESIGN_DOC_KEY not in (project.design_doc or {})
 
     @pytest.mark.asyncio
     async def test_persist_first_write_wins(self, db_session):
@@ -253,25 +259,35 @@ class TestPersistVersionLaneBaseline:
 
     @pytest.mark.asyncio
     async def test_persist_history_cap_evicts_oldest(self, db_session):
-        """Storing more than _MAX_BASELINES_STORED evicts the oldest entries."""
+        """Storing more than _MAX_BASELINES_STORED evicts the oldest versions.
+
+        Retention is now enforced by the dedicated project_lane_baseline table's
+        accessor (_LANE_BASELINE_VERSIONS_MAX), not a design_doc dict cap.
+        """
+        from testing.conftest import USE_POSTGRES
+
+        if not USE_POSTGRES:
+            pytest.skip("project_lane_baseline retention uses Postgres ON CONFLICT")
+
         project = make_project()
         db_session.add(project)
         await db_session.commit()
 
         now = _utcnow()
 
-        # Pre-populate with _MAX_BASELINES_STORED entries directly
-        doc = {
-            DESIGN_DOC_KEY: {
-                str(i): {"version_number": i, "captured_at": now.isoformat()}
-                for i in range(1, _MAX_BASELINES_STORED + 1)
-            }
-        }
-        project.design_doc = doc
-        db_session.add(project)
+        # Pre-populate the table with _MAX_BASELINES_STORED versions directly.
+        for i in range(1, _MAX_BASELINES_STORED + 1):
+            await _upsert_lane_baseline_row(
+                db_session,
+                project.id,
+                i,
+                now,
+                "v1",
+                {"version_number": i, "captured_at": now.isoformat()},
+            )
         await db_session.commit()
 
-        # Adding one more should evict version 1
+        # Adding one more should evict version 1 (the lowest version number).
         new_version = _MAX_BASELINES_STORED + 1
         await persist_version_lane_baseline(
             db_session,
@@ -283,11 +299,11 @@ class TestPersistVersionLaneBaseline:
         )
         await db_session.commit()
 
-        await db_session.refresh(project)
-        baselines = project.design_doc.get(DESIGN_DOC_KEY, {})
-        assert len(baselines) == _MAX_BASELINES_STORED
-        assert "1" not in baselines
-        assert str(new_version) in baselines
+        assert await _read_lane_baseline_row(db_session, project.id, 1) is None
+        assert (
+            await _read_lane_baseline_row(db_session, project.id, new_version)
+            is not None
+        )
 
     @pytest.mark.asyncio
     async def test_persist_for_nonexistent_project_returns_none(self, db_session):
@@ -356,12 +372,12 @@ class TestPersistVersionLaneBaseline:
             f"Stored entry is {entry_bytes} bytes, exceeds {_MAX_BASELINE_ENTRY_BYTES}"
         )
 
-        # (b) full section under 500 KB
-        await db_session.refresh(project)
-        section = project.design_doc.get(DESIGN_DOC_KEY, {})
-        section_bytes = len(json.dumps(section, default=str).encode())
-        assert section_bytes <= 500_000, (
-            f"Full section is {section_bytes} bytes, exceeds 500 KB"
+        # (b) the stored table row is under the per-entry byte budget
+        stored_row = await _read_lane_baseline_row(db_session, project.id, 12)
+        assert stored_row is not None
+        row_bytes = len(json.dumps(stored_row, default=str).encode())
+        assert row_bytes <= _MAX_BASELINE_ENTRY_BYTES, (
+            f"Stored table row is {row_bytes} bytes, exceeds {_MAX_BASELINE_ENTRY_BYTES}"
         )
 
         # (c) all required readback fields present
@@ -383,48 +399,12 @@ class TestPersistVersionLaneBaseline:
         assert "relay_counts_by_lane" not in result
         assert "chains" not in lw
 
-    @pytest.mark.asyncio
-    async def test_persist_self_heals_existing_bloated_entries(self, db_session):
-        """Writing a new version re-slims existing oversized entries."""
-        project = make_project()
-        # Pre-populate with a bloated entry (simulates state before byte budget)
-        bloated_entry = {
-            "version_number": 8,
-            "captured_at": "2026-01-01T00:00:00",
-            "terminal_status": "promoted",
-            "relay_medians": {"pr_count": 1},
-            "per_pr_phase_breakdown": [{"pr_number": str(i)} for i in range(100)],
-            "relay_counts_by_lane": {"review": 5},
-            "lane_waste": {
-                "waste_taxonomy": {},
-                "waste_task_count": 0,
-                "chains": [{"key": str(i), "tasks": []} for i in range(100)],
-            },
-        }
-        project.design_doc = {DESIGN_DOC_KEY: {"8": bloated_entry}}
-        db_session.add(project)
-        await db_session.commit()
-
-        now = _utcnow()
-        await persist_version_lane_baseline(
-            db_session,
-            project_id=project.id,
-            version_number=9,
-            opened_at=now - timedelta(days=7),
-            closed_at=now - timedelta(days=1),
-            terminal_status="promoted",
-        )
-        await db_session.commit()
-
-        await db_session.refresh(project)
-        healed = project.design_doc[DESIGN_DOC_KEY]["8"]
-        assert "per_pr_phase_breakdown" not in healed
-        assert "relay_counts_by_lane" not in healed
-        assert "chains" not in healed.get("lane_waste", {})
-        # Slimmed entry must be within byte budget
-        assert (
-            len(json.dumps(healed, default=str).encode()) <= _MAX_BASELINE_ENTRY_BYTES
-        )
+    # NOTE: the former test_persist_self_heals_existing_bloated_entries was
+    # removed with migration 0678: baselines now live one-per-row in the
+    # dedicated project_lane_baseline table and each row is slimmed at write
+    # time, so there is no shared design_doc dict to re-slim on subsequent
+    # writes. The per-write slimming is still covered by
+    # test_persist_bounds_entry_bytes_preserving_readback above.
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +438,7 @@ class TestBackfillMissingLaneBaselines:
 
         assert backfilled == [9]
 
-        await db_session.refresh(project)
-        stored = read_version_lane_baseline(project, 9)
+        stored = await _read_lane_baseline_row(db_session, project.id, 9)
         assert stored is not None
         assert stored["version_number"] == 9
         assert stored["terminal_status"] == "promoted"
@@ -467,17 +446,27 @@ class TestBackfillMissingLaneBaselines:
 
     @pytest.mark.asyncio
     async def test_backfill_skips_already_stored_version(self, db_session):
-        """backfill_missing_lane_baselines is a no-op for versions with existing baselines."""
+        """backfill_missing_lane_baselines is a no-op for versions already present
+        in the dedicated project_lane_baseline table."""
+        from testing.conftest import USE_POSTGRES
+
+        if not USE_POSTGRES:
+            pytest.skip("project_lane_baseline gap check uses Postgres ON CONFLICT")
+
         project = make_project()
-        project.design_doc = {
-            DESIGN_DOC_KEY: {
-                "9": {"version_number": 9, "captured_at": "2026-01-01T00:00:00"}
-            }
-        }
         db_session.add(project)
         await db_session.commit()
 
         now = _utcnow()
+        # Seed the existing baseline directly into the table.
+        await _upsert_lane_baseline_row(
+            db_session,
+            project.id,
+            9,
+            now,
+            "v1",
+            {"version_number": 9, "captured_at": "2026-01-01T00:00:00"},
+        )
         version = ReleaseVersion(
             project_id=project.id,
             version_number=9,
@@ -491,9 +480,8 @@ class TestBackfillMissingLaneBaselines:
         backfilled = await backfill_missing_lane_baselines(project_id=project.id)
 
         assert backfilled == []
-        # Original entry must be unchanged (first-write-wins)
-        await db_session.refresh(project)
-        stored = read_version_lane_baseline(project, 9)
+        # Original entry must be unchanged (first-write-wins).
+        stored = await _read_lane_baseline_row(db_session, project.id, 9)
         assert stored["captured_at"] == "2026-01-01T00:00:00"
 
     @pytest.mark.asyncio
@@ -545,8 +533,7 @@ class TestBackfillMissingLaneBaselines:
         backfilled = await backfill_missing_lane_baselines(project_id=project.id)
 
         assert backfilled == [7]
-        await db_session.refresh(project)
-        stored = read_version_lane_baseline(project, 7)
+        stored = await _read_lane_baseline_row(db_session, project.id, 7)
         assert stored is not None
         assert stored["terminal_status"] == "abandoned"
 
@@ -831,3 +818,165 @@ class TestPersistCheckpointRecoveryWasteInBaseline:
         assert crw["exhausted_count"] == 1
         assert crw["total"] == 0  # No recovery tasks, only exhausted kills from lanes
         assert crw["by_reason"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Dual-write to project_lane_baseline (design_doc God-column decomposition)
+# ---------------------------------------------------------------------------
+
+
+class TestLaneBaselineDualWrite:
+    @pytest.mark.asyncio
+    async def test_persist_writes_only_to_lane_baseline_table(self, db_session):
+        """persist_version_lane_baseline upserts a row into project_lane_baseline
+        and no longer copies it into design_doc (migration 0678 = a move)."""
+        from testing.conftest import USE_POSTGRES
+
+        if not USE_POSTGRES:
+            pytest.skip("project_lane_baseline write uses Postgres ON CONFLICT")
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=9,
+            opened_at=now - timedelta(days=7),
+            closed_at=now - timedelta(days=1),
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        # The dedicated table carries the slimmed blob keyed by version.
+        table_blob = await _read_lane_baseline_row(db_session, project.id, 9)
+        assert table_blob is not None
+        assert table_blob["version_number"] == 9
+        assert table_blob["terminal_status"] == "promoted"
+        # design_doc must NOT carry it (the write is a move, not a dual-write).
+        await db_session.refresh(project)
+        assert DESIGN_DOC_KEY not in (project.design_doc or {})
+        assert read_version_lane_baseline(project, 9) is None
+
+    @pytest.mark.asyncio
+    async def test_preferring_table_reads_table_only_baseline(self, db_session):
+        """read_version_lane_baseline_preferring_table returns a table-only baseline."""
+        from testing.conftest import USE_POSTGRES
+
+        if not USE_POSTGRES:
+            pytest.skip("project_lane_baseline dual-write uses Postgres ON CONFLICT")
+
+        from app.lane_baseline_snapshot import (
+            read_version_lane_baseline_preferring_table,
+        )
+        from app.project_telemetry import upsert_lane_baseline
+
+        project = make_project()
+        project.design_doc = {}  # design_doc has NO lane_baselines
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        await upsert_lane_baseline(
+            db_session, project.id, 7, now, "v1", {"version_number": 7, "m": "table"}
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        got = await read_version_lane_baseline_preferring_table(
+            db_session, project, 7
+        )
+        assert got == {"version_number": 7, "m": "table"}
+
+    @pytest.mark.asyncio
+    async def test_preferring_table_falls_back_to_design_doc(self, db_session):
+        """When the table has no row, the design_doc blob is returned."""
+        project = make_project()
+        project.design_doc = {
+            DESIGN_DOC_KEY: {"3": {"version_number": 3, "m": "doc"}}
+        }
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from app.lane_baseline_snapshot import (
+            read_version_lane_baseline_preferring_table,
+        )
+
+        got = await read_version_lane_baseline_preferring_table(
+            db_session, project, 3
+        )
+        assert got == {"version_number": 3, "m": "doc"}
+        # Absent version -> None.
+        assert (
+            await read_version_lane_baseline_preferring_table(db_session, project, 99)
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_read_all_preferring_table_merges_and_keys_per_version(
+        self, db_session
+    ):
+        """read_all merges table rows over design_doc, keyed by version_number."""
+        from testing.conftest import USE_POSTGRES
+
+        if not USE_POSTGRES:
+            pytest.skip("project_lane_baseline dual-write uses Postgres ON CONFLICT")
+
+        from app.lane_baseline_snapshot import (
+            read_all_lane_baselines_preferring_table,
+        )
+        from app.project_telemetry import upsert_lane_baseline
+
+        project = make_project()
+        # design_doc has v1 (doc-only) and v2 (also in table); table has v2, v3.
+        design_doc = {
+            DESIGN_DOC_KEY: {
+                "1": {"version_number": 1, "src": "doc"},
+                "2": {"version_number": 2, "src": "doc"},
+            }
+        }
+        project.design_doc = design_doc
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        await upsert_lane_baseline(
+            db_session, project.id, 2, now, "v1", {"version_number": 2, "src": "table"}
+        )
+        await upsert_lane_baseline(
+            db_session, project.id, 3, now, "v1", {"version_number": 3, "src": "table"}
+        )
+        await db_session.commit()
+
+        merged = await read_all_lane_baselines_preferring_table(
+            db_session, project.id, design_doc
+        )
+        # Per-version keying preserved; table wins for v2; doc-only v1 kept.
+        assert set(merged.keys()) == {"1", "2", "3"}
+        assert merged["1"]["src"] == "doc"
+        assert merged["2"]["src"] == "table"
+        assert merged["3"]["src"] == "table"
+
+    @pytest.mark.asyncio
+    async def test_read_all_preferring_table_empty_table_uses_design_doc(
+        self, db_session
+    ):
+        """With an empty table, read_all returns exactly the design_doc versions."""
+        from app.lane_baseline_snapshot import (
+            read_all_lane_baselines_preferring_table,
+        )
+
+        project = make_project()
+        design_doc = {DESIGN_DOC_KEY: {"5": {"version_number": 5, "src": "doc"}}}
+        project.design_doc = design_doc
+        db_session.add(project)
+        await db_session.commit()
+
+        merged = await read_all_lane_baselines_preferring_table(
+            db_session, project.id, design_doc
+        )
+        assert merged == {"5": {"version_number": 5, "src": "doc"}}

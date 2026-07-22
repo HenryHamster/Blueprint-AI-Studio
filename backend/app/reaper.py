@@ -317,6 +317,7 @@ from app.reaper_sweeps import (
     sweep_silent_runner_compute_jobs,
     sweep_retire_viewable_artifacts,
     sweep_retire_consumed_message_attachments,
+    sweep_backfill_merged_named_test_coverage,
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
@@ -3231,6 +3232,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Backfill-acceptance-verdicts sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 21a: Auto-backfill acceptance evidence from pre-existing test
+                # coverage.  Finds merged tasks whose declared named_test matches
+                # test files that shipped in the same PR, and records backfilled
+                # criterion evidence — upgrading from 'unproven' to 'backfilled' on
+                # the coverage ladder.  Hourly cadence-gated; independent timer.
+                _mark_reaper_progress()
+                try:
+                    await sweep_backfill_merged_named_test_coverage(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Backfill-merged-named-test-coverage sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

@@ -1854,13 +1854,101 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
     # Audit additions: background analytics/sweep keys still written to design_doc
     # (keys moved to project_efficiency_snapshot, project_lane_baseline, and
     # project_sr_analytics in migration 0656 are no longer listed here)
+    # NOTE: fresh_reviewer_trend, edges_trend, sr_regression_risk_test_signal_trends
+    # and sr_false_attestation_trends were REMOVED here by migration 0678, which
+    # moved them into project_telemetry and stripped the design_doc copy — see
+    # test_migrated_telemetry_keys_dropped_from_reserved_set below.
     audit_keys = {
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
+        "sr_reviewer_disagreements",
+        "sr_catch_rate_trends_alert",
+        "sr_catch_rate_floor_alert",
+        "sr_quadrant_alert",
+        "sr_pass_engagement_alert",
+        "sr_blind_spot_signal_last_computed_at",
+        "fix_loop_divergence_signal_last_computed_at",
+        "fix_loop_divergence_alerted_window",
+        "fix_loop_divergence_regressions",
+        "fix_loop_divergence_detected_at",
+        "viewport_coverage_snapshot",
     }
     missing = audit_keys - _RESERVED_DESIGN_DOC_KEYS
     assert not missing, f"code-written keys not yet reserved: {sorted(missing)}"
+
+
+# Keys migrated to dedicated telemetry tables by migration 0678 and stripped
+# from design_doc — they no longer need (or may keep) the write-cap exemption.
+_MIGRATED_STRIPPED_KEYS = (
+    "lane_baselines",
+    "fresh_reviewer_trend",
+    "edges_trend",
+    "sr_false_attestation_trends",
+    "sr_regression_risk_test_signal_trends",
+)
+
+
+def test_migrated_telemetry_keys_dropped_from_reserved_set():
+    """Migration 0678 strips these keys from design_doc, so they MUST NOT remain
+    in the reserved set (a key that no longer lives in design_doc must not keep
+    the write-cap exemption). Keys still transitional in design_doc stay reserved.
+    """
+    from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+
+    still_reserved = {
+        k for k in _MIGRATED_STRIPPED_KEYS if k in _RESERVED_DESIGN_DOC_KEYS
+    }
+    assert not still_reserved, (
+        f"stripped keys must be removed from _RESERVED_DESIGN_DOC_KEYS: "
+        f"{sorted(still_reserved)}"
+    )
+
+    # Not-yet-cut-over blobs that still live in design_doc keep their exemption.
+    for key in (
+        "efficiency_baseline",
+        "sr_catch_rate_trends",
+        "cochange_index",
+        "cochange_applied_prs",
+    ):
+        assert key in _RESERVED_DESIGN_DOC_KEYS, (
+            f"{key} still lives in design_doc and must keep its exemption"
+        )
+
+
+@pytest.mark.asyncio
+async def test_stripped_key_counts_toward_agent_ceiling(db_session):
+    """Behavioral coverage of the reserved-set shrink: because migration 0678
+    removed ``lane_baselines`` from ``_RESERVED_DESIGN_DOC_KEYS``, a large
+    ``lane_baselines`` blob now COUNTS toward the agent-owned ceiling (the
+    ``_agent_owned_size`` computation in ``with_design_doc_locked`` no longer
+    excludes it), so an agent write that pushes the total over the ceiling is
+    rejected. Before the shrink the same blob was exempt and the write succeeded.
+    """
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    # A lane_baselines blob on its own over the ceiling — now agent-owned.
+    over_ceiling_blob = "z" * (DESIGN_DOC_MAX_BYTES + 50_000)
+    project = Project(name="stripped-key-counts", user_id="user")
+    project.design_doc = {"lane_baselines": over_ceiling_blob}
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    def _add_agent_key(doc: dict) -> None:
+        doc["agent_key"] = "small"
+
+    result = await with_design_doc_locked(db_session, project.id, _add_agent_key)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result is False, (
+        "lane_baselines is no longer reserved, so it counts toward the agent "
+        "ceiling and an over-ceiling agent write must be rejected"
+    )
+    assert "agent_key" not in project.design_doc, (
+        "rejected agent write must not be persisted"
+    )
 
 
 # ── raise_on_size_limit: opt-in exception path ──────────────────────────────

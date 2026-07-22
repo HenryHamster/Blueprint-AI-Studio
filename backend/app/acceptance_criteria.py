@@ -3570,3 +3570,243 @@ async def spawn_corroboration_task(
             criterion_key,
             project_id,
         )
+
+
+async def backfill_merged_named_test_coverage(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    batch_size: int = 500,
+) -> int:
+    """Backfill criterion evidence for merged tasks whose named_test shipped in changed files.
+
+    The acceptance gate classifies >95% of merged code tasks as 'unproven' because
+    the automated earn loop only mints ``path_proven`` tiers — it never executes
+    the covering tests it already discovers statically to mint the real ``proven``
+    tier.  This backfill finds merged COMPLETED tasks whose declared ``named_test``
+    acceptance evidence matches test files that shipped in the same PR, and records
+    :data:`UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND` evidence for their active
+    criteria — upgrading them from 'unproven' to at least 'backfilled' on the
+    coverage ladder.
+
+    Unlike :func:`backfill_unverified_merge_evidence`, this function processes
+    ALL merged tasks regardless of merge-verification status: a verified merge
+    whose criteria were added AFTER the merge (so ``record_task_merge_evidence``
+    never fired) also qualifies.
+
+    Best-effort: errors are logged and swallowed so a backfill failure never blocks
+    the caller (the reaper sweep).
+
+    Returns the count of new ``CriterionEvidence`` rows recorded.
+    """
+    try:
+        from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+        from app.acceptance_gate import _changed_files, _paths_match, _is_test_path
+        from app.landed_signal import is_merged_completion, landed_signal_predicate
+        from app.models import Task, TaskStatus
+        from app.payload_schemas import read_acceptance_evidence
+        from app.release_version import current_open_version as _cur_open_ver
+
+        _BATCH_LIMIT = batch_size
+        total = 0
+        offset = 0
+        open_version: Any = None
+        # Criteria (key -> text) covered by backfill this run — each gets a
+        # corroboration task so the 'backfilled' tier has an earn-up-or-downgrade
+        # path, mirroring operator attestation and unverified-merge backfill.
+        corroboration_targets: dict[str, str] = {}
+        while True:
+            query = (
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    landed_signal_predicate(session),
+                    Task.criterion_ids != None,  # noqa: E711 — SQLAlchemy IS NOT NULL
+                )
+                .order_by(Task.id)
+                .limit(_BATCH_LIMIT)
+                .offset(offset)
+            )
+
+            batch_result = await session.execute(query)
+            batch = list(batch_result.scalars().all())
+            if not batch:
+                break
+            offset += len(batch)
+
+            if open_version is None:
+                open_version = await _cur_open_ver(session, project_id)
+                if open_version is None:
+                    logger.info(
+                        "backfill_merged_named_test_coverage: no open version for "
+                        "project %s — cannot resolve active criteria",
+                        project_id,
+                    )
+                    return total
+
+            # Batch-load all existing backfill evidence for this batch in one query.
+            task_id_strs = [str(t.id) for t in batch]
+            ev_batch_result = await session.execute(
+                select(CriterionEvidence).where(
+                    CriterionEvidence.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                    CriterionEvidence.source_id.in_(task_id_strs),
+                )
+            )
+            all_present: dict[str, set[uuid.UUID]] = {}
+            for ev in ev_batch_result.scalars().all():
+                all_present.setdefault(ev.source_id, set()).add(ev.criterion_id)
+
+            # First pass: identify qualifying tasks and collect their criterion_ids
+            # so we can fetch all criteria in a single query instead of one per task.
+            qualified: list[tuple] = []
+            all_batch_criterion_ids: set[str] = set()
+            for task in batch:
+                if not task_matches_criterion_release_version(task, open_version):
+                    continue
+                if not is_merged_completion(task):
+                    continue
+
+                # Must have at least one criterion_id to backfill.
+                task_criterion_ids: list[str] = list(
+                    getattr(task, "criterion_ids", None) or []
+                )
+                if not task_criterion_ids:
+                    continue
+
+                # Must have changed files to verify the test shipped.
+                changed = _changed_files(task)
+                if not changed:
+                    continue
+
+                # Must have declared named_test acceptance evidence.
+                evidence = read_acceptance_evidence(task.first_payload)
+                if evidence is None or evidence.kind != "named_test":
+                    continue
+                if evidence.test_path is None:
+                    continue
+
+                # ``partition`` yields the whole path when there is no ``::NODE``
+                # selector — matching acceptance_gate._evaluate_named_test's read.
+                declared_test = evidence.test_path.partition("::")[0].strip()
+                if not declared_test:
+                    continue
+
+                # Verify the test IS in changed files — it was genuinely shipped.
+                test_present = any(_paths_match(p, declared_test) for p in changed)
+                if not test_present:
+                    continue
+
+                # Must also have a production seam to exercise.
+                seam = [p for p in changed if not _is_test_path(p)]
+                if not seam:
+                    continue
+
+                qualified.append((task, task_criterion_ids, declared_test))
+                all_batch_criterion_ids.update(task_criterion_ids)
+
+            # Single criteria query for all qualifying tasks in this batch.
+            criteria_by_key: dict[str, VersionAcceptanceCriterion] = {}
+            if all_batch_criterion_ids:
+                batch_criteria = await get_criteria_by_keys(
+                    session,
+                    project_id,
+                    list(all_batch_criterion_ids),
+                    release_version_id=open_version.id,
+                )
+                criteria_by_key = {
+                    c.criterion_key: c for c in batch_criteria if c.status == "active"
+                }
+
+            if not criteria_by_key:
+                continue
+
+            # Batch-fetch evidence for all active criteria to check current coverage.
+            active_criterion_ids = list(criteria_by_key.values())
+            evidence_by_criterion = await get_evidence_for_criteria_batch(
+                session,
+                [c.id for c in active_criterion_ids],
+            )
+
+            # Second pass: record evidence for criteria not already covered.
+            evidence_batch: list[CriterionEvidence] = []
+            for task, task_criterion_ids, declared_test in qualified:
+                active = [
+                    criteria_by_key[k]
+                    for k in task_criterion_ids
+                    if k in criteria_by_key
+                ]
+                if not active:
+                    continue
+
+                already_present: set[uuid.UUID] = all_present.get(str(task.id), set())
+                task_id_str = str(task.id)
+                verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY, {})
+                proof_ref = (
+                    (isinstance(verdict, dict) and verdict.get("proof_ref"))
+                    or declared_test
+                )
+                for criterion in active:
+                    # Queue a corroboration task for every active backfilled
+                    # criterion, whether or not its evidence row is new — this
+                    # earns-up or downgrades pre-existing backfill too.
+                    corroboration_targets[criterion.criterion_key] = criterion.text
+                    if criterion.id in already_present:
+                        continue
+
+                    # Skip if the criterion is already machine-verified as covered
+                    # by other evidence (e.g. a reachability badge or a prior
+                    # task_merge with proven=True).
+                    existing = evidence_by_criterion.get(criterion.id, [])
+                    if compute_criterion_coverage(existing) == "covered":
+                        continue
+
+                    detail: dict[str, Any] = {
+                        "proven": True,
+                        "backfilled": True,
+                        "backfill_reason": "merged_named_test_matches_changed",
+                        "proof_ref": proof_ref,
+                    }
+                    evidence_batch.append(CriterionEvidence(
+                        criterion_id=criterion.id,
+                        project_id=project_id,
+                        source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                        source_id=task_id_str,
+                        detail=detail,
+                    ))
+
+            if evidence_batch:
+                batch_recorded = await _record_evidence_batch(session, evidence_batch)
+                total += batch_recorded
+
+        # Give each backfilled criterion an earn-up path: spawn a corroboration
+        # task (deduped by the existing ``Verify: {key}`` title guard) so the
+        # lower-confidence backfill tier is re-verified toward machine-verified
+        # coverage — and downgraded to 'partial' if that verification fails.
+        for _ck, _ctext in corroboration_targets.items():
+            await spawn_corroboration_task(
+                session,
+                project_id,
+                _ck,
+                _ctext,
+                "merged named_test backfill: the declared test shipped in the PR's "
+                "changed files but may not exercise the criterion's specific condition",
+                spawned_by=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                release_version_id=open_version.id,
+            )
+
+        if total:
+            logger.info(
+                "backfill_merged_named_test_coverage: project=%s "
+                "tasks_scanned=%d recorded=%d",
+                project_id,
+                offset,
+                total,
+            )
+        return total
+    except Exception:
+        logger.exception(
+            "backfill_merged_named_test_coverage: failed for project %s",
+            project_id,
+        )
+        return 0

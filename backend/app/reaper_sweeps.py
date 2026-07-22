@@ -3706,6 +3706,94 @@ async def sweep_retire_consumed_message_attachments(
     return removed
 
 
+# Hourly cadence for the merged named-test backfill sweep (Step 21a).
+# Independent timer so it is not suppressed by another sweep's timer stamp
+# earlier in the same reaper cycle.
+_BACKFILL_NAMED_TEST_INTERVAL_SECONDS = 3600
+_last_backfill_named_test_sweep: datetime | None = None
+
+
+async def sweep_backfill_merged_named_test_coverage(session, now=None) -> int:
+    """Step 21a: Auto-backfill acceptance evidence from pre-existing test coverage.
+
+    Finds merged COMPLETED tasks whose declared ``named_test`` acceptance evidence
+    matches test files that shipped in the same PR (the test path is in the task's
+    ``_pr_changed_files`` context), and records
+    :data:`~app.acceptance_criteria.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND`
+    evidence for their active acceptance criteria — upgrading them from 'unproven'
+    to at least 'backfilled' on the coverage ladder.
+
+    This is distinct from the unverified-merge backfill: it processes ALL merged
+    tasks regardless of verification status.  A verified merge whose criteria were
+    added AFTER the merge (so ``record_task_merge_evidence`` never fired) also
+    qualifies.
+
+    Hourly cadence-gated on an independent timer.  Iterates projects with an open
+    release version.  Returns the total number of new ``CriterionEvidence`` rows
+    recorded across all projects.
+    """
+    global _last_backfill_named_test_sweep
+    from app.models import Project
+    from app.release_version import current_open_version as _cur_open_ver
+    from app.acceptance_criteria import backfill_merged_named_test_coverage as _backfill
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_backfill_named_test_sweep, _BACKFILL_NAMED_TEST_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_backfill_named_test_sweep = _now
+
+    # Find projects that have an open release version — only they have active
+    # criteria that can be backfilled.
+    _BATCH = 50
+    total = 0
+    last_id: uuid.UUID | None = None
+    while True:
+        query = select(Project.id).order_by(Project.id).limit(_BATCH)
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+        last_id = rows[-1]
+
+        for pid in rows:
+            try:
+                open_ver = await _cur_open_ver(session, pid)
+                if open_ver is None:
+                    continue
+                recorded = await _backfill(session, pid)
+                if recorded:
+                    logger.info(
+                        "[REAPER] Step 21a: backfill_merged_named_test_coverage "
+                        "project=%s recorded=%d",
+                        pid,
+                        recorded,
+                    )
+                    total += recorded
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 21a: backfill_merged_named_test_coverage failed "
+                    "for project %s:",
+                    pid,
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
+
+    if total:
+        logger.info(
+            "[REAPER] Step 21a: backfill_merged_named_test_coverage total=%d",
+            total,
+        )
+    return total
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -3767,4 +3855,5 @@ __all__ = [
     "sweep_retire_viewable_artifacts",
     "MESSAGE_ATTACHMENT_RETENTION_DAYS",
     "sweep_retire_consumed_message_attachments",
+    "sweep_backfill_merged_named_test_coverage",
 ]

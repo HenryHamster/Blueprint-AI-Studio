@@ -2,11 +2,12 @@
 
 When a ReleaseVersion reaches a terminal status (promoted or abandoned), this
 module captures the version's lane-diagnostic aggregates and persists them
-durably under ``project.design_doc["lane_baselines"][str(version_number)]``.
+durably as one row per version in the dedicated ``project_lane_baseline`` table
+(migration 0678 backfilled history off the former
+``project.design_doc["lane_baselines"]`` blob and stripped that key).
 
-Uses the same JSONB round-trip pattern as ``efficiency_snapshot`` — no
-migration is required.  The stored blob is a subset of the lane-diag response
-plus per-PR relay medians for the v10 lane-pilot comparison.
+The stored blob is a subset of the lane-diag response plus per-PR relay medians
+for the v10 lane-pilot comparison.
 """
 
 from __future__ import annotations
@@ -22,8 +23,14 @@ from sqlmodel import select
 
 from app.digest_metrics import compute_lane_waste_diagnostics
 from app.models import ImprovementLane, Project, Task, TaskStatus, _utcnow
+from app.project_telemetry import (
+    read_all_lane_baselines,
+    upsert_lane_baseline,
+)
+from app.project_telemetry import (
+    read_version_lane_baseline as _read_table_lane_baseline,
+)
 from app.review_fix_lane_pilot import LANE_RECOVERY_MANIFEST_KEY, LANE_RECOVERY_REASON_KEY
-from app.task_locking import with_lane_baseline_locked
 from app.routers.admin_analytics import (
     _compute_lane_diag,
     _review_loop_pr_number,
@@ -190,8 +197,8 @@ async def persist_version_lane_baseline(
     """Compute and store the lane baseline for a just-closed ReleaseVersion.
 
     Queries the version's task window, computes full lane-diag aggregates plus
-    per-PR relay medians, and persists the result under
-    ``project.design_doc["lane_baselines"][str(version_number)]``.
+    per-PR relay medians, and persists the result as a ``project_lane_baseline``
+    row keyed by ``version_number``.
 
     First-write-wins: a second call for the same version is a no-op.  Always
     called from a separate ``AsyncSessionLocal`` so a failure here never aborts
@@ -302,36 +309,30 @@ async def persist_version_lane_baseline(
         **diag,
     }
 
-    result: Dict[str, Any] = {"stored": None, "skipped": False}
-    _captured_baselines: dict = {}
-    version_key = str(version_number)
+    slimmed = _slim_baseline(baseline)
 
-    def _store_baseline(doc: dict) -> None:
-        baselines = dict(doc.get(DESIGN_DOC_KEY) or {})
-        if version_key in baselines:
-            result["skipped"] = True
-            result["stored"] = baselines[version_key]
-            return
-        # Re-slim all existing entries on every write to self-heal bloated state that
-        # was stored before the byte budget was enforced.
-        for k, v in list(baselines.items()):
-            if isinstance(v, dict):
-                baselines[k] = _slim_baseline(v)
-        slimmed = _slim_baseline(baseline)
-        baselines[version_key] = slimmed
-        if len(baselines) > _MAX_BASELINES_STORED:
-            sorted_keys = sorted(baselines, key=lambda k: int(k))
-            for old_key in sorted_keys[: len(baselines) - _MAX_BASELINES_STORED]:
-                del baselines[old_key]
-        doc[DESIGN_DOC_KEY] = baselines
-        result["stored"] = slimmed
-        _captured_baselines.update(baselines)
+    # First-write-wins: if a baseline already exists for this version in the
+    # dedicated project_lane_baseline table, leave it untouched and return it.
+    # Migration 0678 backfilled history and stripped design_doc['lane_baselines'],
+    # so the table is now the sole store and existence is checked there (this
+    # replaces the former with_design_doc_locked read-modify-write, which also
+    # means no Project row lock is taken — the row-scoped upsert below is enough).
+    existing = await _read_table_lane_baseline(session, project_id, version_number)
+    if existing is not None:
+        logger.info(
+            "[LANE_BASELINE] v%d baseline already stored for project=%s "
+            "(first-write-wins, skip)",
+            version_number,
+            project_id,
+        )
+        return existing
 
-    applied = await with_lane_baseline_locked(session, project_id, _store_baseline)
-    if applied and _captured_baselines:
-        from app.project_telemetry import set_project_telemetry
-        await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, dict(_captured_baselines))
-    if not applied:
+    # Project-existence guard (non-locking): a missing project cannot own a
+    # baseline row (FK), and the legacy path returned None in that case.
+    _exists = (
+        await session.execute(select(Project.id).where(Project.id == project_id))
+    ).first()
+    if _exists is None:
         logger.warning(
             "[LANE_BASELINE] project %s not found; v%d baseline not persisted",
             project_id,
@@ -339,14 +340,17 @@ async def persist_version_lane_baseline(
         )
         return None
 
-    if result["skipped"]:
-        logger.info(
-            "[LANE_BASELINE] v%d baseline already stored for project=%s "
-            "(first-write-wins, skip)",
-            version_number,
-            project_id,
-        )
-        return result["stored"]
+    # Row-scoped ON CONFLICT upsert into the dedicated table; the accessor
+    # enforces the _LANE_BASELINE_VERSIONS_MAX retention cap (matching the former
+    # _MAX_BASELINES_STORED design_doc cap).
+    await upsert_lane_baseline(
+        session,
+        project_id=project_id,
+        version_number=version_number,
+        captured_at=now,
+        baseline_def_version=BASELINE_DEF_VERSION,
+        blob=slimmed,
+    )
 
     logger.info(
         "[LANE_BASELINE] persisted v%d lane baseline for project=%s "
@@ -357,7 +361,7 @@ async def persist_version_lane_baseline(
         diag.get("pr_count", 0),
         diag.get("task_count", 0),
     )
-    return result["stored"]
+    return slimmed
 
 
 async def backfill_missing_lane_baselines(
@@ -391,17 +395,13 @@ async def backfill_missing_lane_baselines(
         if project_row is None:
             return []
 
-        from app.models import ProjectLaneBaseline  # noqa: PLC0415
-
-        lb_row = await session.get(ProjectLaneBaseline, project_id)
-        if lb_row is not None:
-            existing_keys = set((lb_row.data or {}).keys())
-        else:
-            # Backward compat: fall back to design_doc for projects written
-            # before migration 0656.
-            existing_keys = set(
-                (project_row.design_doc or {}).get(DESIGN_DOC_KEY, {}).keys()
-            )
+        # Existing versions now live in the dedicated project_lane_baseline table
+        # (migration 0678 stripped design_doc['lane_baselines']); read the gap set
+        # from there rather than the design_doc blob.
+        existing_keys = {
+            str(row.version_number)
+            for row in await read_all_lane_baselines(session, project_id)
+        }
 
         versions = list(
             (
@@ -486,3 +486,44 @@ def read_version_lane_baseline(
     if not baselines:
         return None
     return baselines.get(str(version_number))
+
+
+async def read_version_lane_baseline_preferring_table(
+    session: Any,
+    project: Project,
+    version_number: int,
+) -> Dict[str, Any] | None:
+    """Return the lane baseline for a version, preferring the dedicated table.
+
+    Prefers the ``project_lane_baseline`` row; falls back to the design_doc blob
+    on the already-loaded ``project`` row when the table has no row for that
+    version (before backfill or after a rollback that reverted the dual-write).
+    """
+    row = await _read_table_lane_baseline(session, project.id, version_number)
+    if row is not None:
+        return row
+    return read_version_lane_baseline(project, version_number)
+
+
+async def read_all_lane_baselines_preferring_table(
+    session: Any,
+    project_id: uuid.UUID,
+    design_doc: Dict[str, Any] | None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return ``{version_key: blob}`` for every stored version, preferring the table.
+
+    Rows from ``project_lane_baseline`` override the design_doc
+    ``lane_baselines`` map for the same version; versions present only in
+    design_doc (pre-backfill or post-rollback) are still included so no stored
+    baseline is dropped during the dual-write window. Keys are the stringified
+    ``version_number`` so callers keep the same per-version keying they had when
+    reading straight from ``design_doc['lane_baselines']``.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    if design_doc:
+        for key, value in (design_doc.get(DESIGN_DOC_KEY) or {}).items():
+            if isinstance(value, dict):
+                merged[str(key)] = value
+    for row in await read_all_lane_baselines(session, project_id):
+        merged[str(row.version_number)] = row.blob
+    return merged

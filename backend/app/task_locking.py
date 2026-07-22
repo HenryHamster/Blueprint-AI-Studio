@@ -47,6 +47,13 @@ from app.models import DeploymentState, Project, Task
 
 logger = logging.getLogger(__name__)
 
+# Agent-owned write ceiling for project.design_doc. The God-column
+# decomposition (design 52f97baa) is migrating the code-written telemetry blobs
+# out to dedicated tables so design_doc converges on architectural content only
+# (<50KB target). Several large blobs (efficiency_baseline, sr_catch_rate_trends,
+# cochange_*) are still transitional and remain reserved below, so the ceiling
+# stays at 500KB until the remaining keys are cut over; it can be lowered once
+# design_doc holds architectural content alone.
 DESIGN_DOC_MAX_BYTES = 500_000
 
 
@@ -95,6 +102,28 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
+        "sr_reviewer_disagreements",
+        "sr_catch_rate_trends_alert",
+        "sr_catch_rate_floor_alert",
+        "sr_quadrant_alert",
+        "sr_pass_engagement_alert",
+        "sr_blind_spot_signal_last_computed_at",
+        "fix_loop_divergence_signal_last_computed_at",
+        "fix_loop_divergence_alerted_window",
+        "fix_loop_divergence_regressions",
+        "fix_loop_divergence_detected_at",
+        "viewport_coverage_snapshot",
+        # NOTE: lane_baselines, fresh_reviewer_trend, edges_trend,
+        # sr_false_attestation_trends and sr_regression_risk_test_signal_trends
+        # were REMOVED from this set by migration 0678, which backfilled their
+        # data into the dedicated telemetry tables (project_lane_baseline /
+        # project_telemetry) and stripped the keys from design_doc. They no
+        # longer live in design_doc, so they neither need nor may keep the
+        # write-cap exemption. Reserved keys that still live in design_doc
+        # (efficiency_baseline, sr_catch_rate_trends, sr_reviewer_disagreements,
+        # cochange_index/applied_prs) are intentionally KEPT here — their readers
+        # are not yet repointed, so they retain the exemption until a follow-up
+        # cutover.
     }
 )
 

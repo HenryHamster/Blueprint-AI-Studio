@@ -2908,6 +2908,119 @@ def test_cochange_index_caps_total_files():
     assert len(idx) <= 200
 
 
+@pytest.mark.asyncio
+async def test_cochange_state_dual_written_to_telemetry(db_session: AsyncSession):
+    """The merge path dual-writes the co-change blob to project_telemetry.
+
+    Exercises the Phase-1 dual-write added to _update_direction_research_outcomes:
+    the design_doc cochange_index/cochange_applied_prs keys are kept AND the
+    merged {"index", "applied_prs"} blob is upserted to the 'cochange_state' KV
+    row; the telemetry-preferring readers return the reconstructed values.
+    """
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+    from app.project_telemetry import read_telemetry
+
+    direction_id = "d-cochange-dual"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
+    await db_session.flush()
+
+    child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "pr_number": 201,
+            "_pr_changed_files": ["alpha.py", "beta.py"],
+        },
+        title="merged with files",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    # design_doc copy preserved as the rollback fallback.
+    doc = project.design_doc or {}
+    assert "alpha.py" in (doc.get("cochange_index") or {})
+    assert str(child.id) in (doc.get("cochange_applied_prs") or [])
+
+    # cochange_state telemetry row mirrors the merged blob shape.
+    state = await read_telemetry(db_session, project.id, "cochange_state")
+    assert state is not None
+    assert "alpha.py" in state["index"]
+    assert "beta.py" in state["index"]["alpha.py"]
+    assert str(child.id) in state["applied_prs"]
+
+    # Telemetry-preferring readers reconstruct index + applied_prs.
+    idx = await read_cochange_index(db_session, project)
+    assert "beta.py" in idx["alpha.py"]
+    applied = await read_cochange_applied_prs(db_session, project)
+    assert str(child.id) in applied
+
+
+@pytest.mark.asyncio
+async def test_read_cochange_prefers_telemetry_only_value(db_session: AsyncSession):
+    """A cochange_state present ONLY in telemetry wins over stale design_doc keys."""
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+    from app.project_telemetry import upsert_telemetry
+
+    project = await _create_project(db_session, directions=[])
+    project.design_doc = {
+        "cochange_index": {"stale.py": {"x.py": 1.0}},
+        "cochange_applied_prs": ["old-pr"],
+    }
+    await db_session.flush()
+
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        "cochange_state",
+        {"index": {"fresh.py": {"y.py": 2.0}}, "applied_prs": ["new-pr"]},
+    )
+    await db_session.flush()
+
+    assert await read_cochange_index(db_session, project) == {"fresh.py": {"y.py": 2.0}}
+    assert await read_cochange_applied_prs(db_session, project) == ["new-pr"]
+
+
+@pytest.mark.asyncio
+async def test_read_cochange_falls_back_to_design_doc(db_session: AsyncSession):
+    """With no telemetry row, cochange readers fall back to design_doc (rollback safe)."""
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+
+    project = await _create_project(db_session, directions=[])
+    project.design_doc = {
+        "cochange_index": {"a.py": {"b.py": 1.0}},
+        "cochange_applied_prs": ["pr-1"],
+    }
+    await db_session.flush()
+
+    assert await read_cochange_index(db_session, project) == {"a.py": {"b.py": 1.0}}
+    assert await read_cochange_applied_prs(db_session, project) == ["pr-1"]
+
+
 def test_apply_cochange_idempotent_same_pr_not_double_counted():
     """Calling _apply_cochange_to_doc twice with the same pr_key leaves score at 1.0."""
     doc: dict = {}

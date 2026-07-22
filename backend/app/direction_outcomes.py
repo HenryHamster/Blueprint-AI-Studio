@@ -54,6 +54,7 @@ from app.models import (
     TaskStatus,
     get_task_cost_by_provider_model,
 )
+from app.project_telemetry import read_telemetry, upsert_telemetry
 from app.task_capabilities import PRODUCT_TASK_TYPES, READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
@@ -641,6 +642,31 @@ def _update_cochange_index(
     _apply_cochange_to_doc(doc, merged_files_lists)
     project.design_doc = doc
     flag_modified(project, "design_doc")
+
+
+async def read_cochange_index(session: AsyncSession, project: Project) -> dict:
+    """Return the co-change affinity index, preferring the KV table.
+
+    Prefers the ``project_telemetry`` ``cochange_state`` row (shape
+    ``{"index": {...}, "applied_prs": [...]}``) written by
+    :func:`_update_direction_research_outcomes`, reconstructing the index from
+    it; falls back to the legacy ``design_doc['cochange_index']`` when no row
+    exists (pre-backfill or post-rollback).
+    """
+    state = await read_telemetry(session, project.id, "cochange_state")
+    if state is not None:
+        return dict(state.get("index") or {})
+    return dict((project.design_doc or {}).get("cochange_index") or {})
+
+
+async def read_cochange_applied_prs(
+    session: AsyncSession, project: Project
+) -> list:
+    """Return the co-change applied-PR dedup list, preferring the KV table."""
+    state = await read_telemetry(session, project.id, "cochange_state")
+    if state is not None:
+        return list(state.get("applied_prs") or [])
+    return list((project.design_doc or {}).get("cochange_applied_prs") or [])
 
 
 # ---------------------------------------------------------------------------
@@ -2678,25 +2704,32 @@ async def _update_direction_research_outcomes(
         # clobber the newly-added research_history metrics in the same session.
         await session.flush()
         session.expire(project, ["design_doc"])
-        _cochange_captured: dict = {}
+        cochange_capture: dict = {}
 
-        def _cochange_mutate(doc: dict) -> None:
+        def _apply_and_capture(doc: dict) -> None:
             _apply_cochange_to_doc(doc, merged_files_lists, pr_keys=merged_pr_keys)
-            _cochange_captured["cochange_index"] = doc.get("cochange_index")
-            _cochange_captured["cochange_applied_prs"] = doc.get("cochange_applied_prs")
-
-        await with_design_doc_locked(session, project_id, _cochange_mutate)
-        from app.project_telemetry import set_project_telemetry
-        if _cochange_captured.get("cochange_index") is not None:
-            await set_project_telemetry(
-                session, project_id, "cochange_index", _cochange_captured["cochange_index"]
+            # Snapshot the post-mutation co-change state so we can mirror it into
+            # the merged 'cochange_state' KV row (index + applied_prs together).
+            cochange_capture["index"] = doc.get("cochange_index") or {}
+            cochange_capture["applied_prs"] = list(
+                doc.get("cochange_applied_prs") or []
             )
-        if _cochange_captured.get("cochange_applied_prs") is not None:
-            await set_project_telemetry(
+
+        applied = await with_design_doc_locked(
+            session, project_id, _apply_and_capture
+        )
+        if applied and cochange_capture:
+            # Dual-write the merged co-change blob into the dedicated KV table.
+            # The design_doc cochange_index/cochange_applied_prs keys above stay
+            # as the rollback fallback for this phase.
+            await upsert_telemetry(
                 session,
                 project_id,
-                "cochange_applied_prs",
-                _cochange_captured["cochange_applied_prs"],
+                "cochange_state",
+                {
+                    "index": cochange_capture["index"],
+                    "applied_prs": cochange_capture["applied_prs"],
+                },
             )
 
     await session.commit()

@@ -1,4 +1,4 @@
-"""Regression tests for the ProjectTelemetry dual-write path.
+"""Regression tests for the ProjectTelemetry accessor API.
 
 Verifies that:
 1. set_project_telemetry/get_project_telemetry round-trip correctly.
@@ -8,21 +8,47 @@ Verifies that:
 3. Agent design-doc writes succeed while relocated blobs hold large data
    (i.e. the blobs don't count toward the 500 KB agent cap).
 4. design_doc_fallback is used when the telemetry row is absent.
+5. The dedicated-table accessors (upsert_telemetry, insert_efficiency_snapshot,
+   upsert_lane_baseline) round-trip correctly and enforce retention caps.
+
+The accessors use PostgreSQL-specific constructs — ``INSERT ... ON CONFLICT DO
+UPDATE`` on a named constraint and ``key = ANY(:array)`` — so these exercises
+require the real Postgres backend (``USE_TEST_POSTGRES=true``). Under SQLite the
+``postgresql.insert`` construct does not compile, so the suite is skipped there
+rather than asserting against a dialect the production code never runs on.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 
 from app.models import Project
 from app.project_telemetry import (
+    _EFFICIENCY_SNAPSHOT_HISTORY_MAX,
+    _LANE_BASELINE_VERSIONS_MAX,
     TELEMETRY_KEYS,
     get_project_telemetry,
+    insert_efficiency_snapshot,
+    read_recent_efficiency_snapshots,
+    read_telemetry,
+    read_telemetry_many,
+    read_version_lane_baseline,
     set_project_telemetry,
+    upsert_lane_baseline,
+    upsert_telemetry,
 )
 from app.task_locking import DESIGN_DOC_MAX_BYTES, _RESERVED_DESIGN_DOC_KEYS
+from app.time_utils import _utcnow
+from testing.conftest import USE_POSTGRES
+from testing.factories import make_project
+
+pytestmark = pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_telemetry accessors use Postgres ON CONFLICT / ARRAY ANY",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +102,7 @@ def _make_large_cochange_index(target_bytes: int = 38_000) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# basic round-trip
+# HEAD-style round-trip (set/get_project_telemetry)
 # ---------------------------------------------------------------------------
 
 
@@ -229,7 +255,7 @@ def test_reserved_keys_excluded_from_agent_owned_size():
     from the agent-owned byte measurement."""
     doc: dict = {}
     for key in TELEMETRY_KEYS:
-        doc[key] = {"data": "x" * 30_000}  # ~30 KB per key → >270 KB total reserved
+        doc[key] = {"data": "x" * 30_000}  # ~30 KB per key
 
     agent_page = "y" * 1_000  # 1 KB agent-written content
     doc["architecture"] = agent_page
@@ -248,8 +274,8 @@ def test_telemetry_keys_are_subset_of_reserved_keys():
 
 
 def test_agent_cap_not_breached_with_large_reserved_blobs():
-    """An agent doc with 373 KB of reserved data + 400 KB of agent pages is
-    within the 500 KB cap because only agent pages are measured."""
+    """An agent doc with reserved data + agent pages is within the 500 KB cap
+    because only agent pages are measured."""
     reserved_data = {key: {"x": "z" * 40_000} for key in TELEMETRY_KEYS}
     agent_pages = {f"page_{i}": "a" * 40_000 for i in range(10)}  # 400 KB
     doc = {**reserved_data, **agent_pages}
@@ -274,5 +300,164 @@ def test_telemetry_keys_set():
         "retired_diagnoses_archive",
         "playbook_archive",
         "proposed_changes",
+        "direction_first_attempt_feedback",
+        "systems/completion-debt-ledger",
     }
     assert TELEMETRY_KEYS == expected
+
+
+# ---------------------------------------------------------------------------
+# Branch-style accessors (upsert/read_telemetry, snapshots, lane baselines)
+# ---------------------------------------------------------------------------
+
+
+async def _make_project(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+async def test_upsert_telemetry_roundtrip(db_session):
+    """upsert then read returns the stored blob; a second upsert overwrites."""
+    project = await _make_project(db_session)
+
+    await upsert_telemetry(db_session, project.id, "catch_rate", {"v": 1, "n": 10})
+    await db_session.commit()
+
+    got = await read_telemetry(db_session, project.id, "catch_rate")
+    assert got == {"v": 1, "n": 10}
+
+    # Missing key -> None.
+    assert await read_telemetry(db_session, project.id, "nope") is None
+
+    # Second upsert on the same (project_id, key) OVERWRITES, does not duplicate.
+    await upsert_telemetry(db_session, project.id, "catch_rate", {"v": 2, "n": 20})
+    await db_session.commit()
+
+    got = await read_telemetry(db_session, project.id, "catch_rate")
+    assert got == {"v": 2, "n": 20}
+
+    # Exactly one row survives for that key.
+    from sqlalchemy import func, select
+
+    from app.models import ProjectTelemetry
+
+    count = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(ProjectTelemetry)
+            .where(
+                ProjectTelemetry.project_id == project.id,
+                ProjectTelemetry.key == "catch_rate",
+            )
+        )
+    ).scalar_one()
+    assert count == 1
+
+
+async def test_read_telemetry_many_batch(db_session):
+    """Batch read returns only existing keys, scoped to the project."""
+    project = await _make_project(db_session)
+    other = await _make_project(db_session)
+
+    await upsert_telemetry(db_session, project.id, "a", {"x": 1})
+    await upsert_telemetry(db_session, project.id, "b", {"x": 2})
+    # A key on a DIFFERENT project must not leak into the result.
+    await upsert_telemetry(db_session, other.id, "c", {"x": 99})
+    await db_session.commit()
+
+    got = await read_telemetry_many(db_session, project.id, ["a", "b", "c"])
+    assert got == {"a": {"x": 1}, "b": {"x": 2}}
+
+    # Empty key list short-circuits to {}.
+    assert await read_telemetry_many(db_session, project.id, []) == {}
+
+
+async def test_efficiency_snapshot_retention_prune(db_session):
+    """Retention keeps only the newest _EFFICIENCY_SNAPSHOT_HISTORY_MAX rows."""
+    project = await _make_project(db_session)
+
+    base = _utcnow()
+    total = _EFFICIENCY_SNAPSHOT_HISTORY_MAX + 5
+    for i in range(total):
+        await insert_efficiency_snapshot(
+            db_session,
+            project.id,
+            captured_at=base + timedelta(minutes=i),
+            metric_def_version="v1",
+            blob={"i": i},
+        )
+    await db_session.commit()
+
+    recent = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(recent) == _EFFICIENCY_SNAPSHOT_HISTORY_MAX
+    # Newest-first ordering, and only the newest window is retained.
+    kept_is = [snap.blob["i"] for snap in recent]
+    expected = list(range(total - 1, total - 1 - _EFFICIENCY_SNAPSHOT_HISTORY_MAX, -1))
+    assert kept_is == expected
+
+
+async def test_efficiency_snapshot_upsert_same_captured_at(db_session):
+    """A second insert at the same captured_at overwrites, not duplicates."""
+    project = await _make_project(db_session)
+    ts = _utcnow()
+
+    await insert_efficiency_snapshot(
+        db_session, project.id, ts, "v1", {"score": 1}
+    )
+    await insert_efficiency_snapshot(
+        db_session, project.id, ts, "v2", {"score": 2}
+    )
+    await db_session.commit()
+
+    recent = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(recent) == 1
+    assert recent[0].blob == {"score": 2}
+    assert recent[0].metric_def_version == "v2"
+
+
+async def test_lane_baseline_per_version_keying_and_prune(db_session):
+    """Lane baselines are keyed per version; prune keeps the newest N versions."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+
+    # Upsert version 5, then read it back.
+    await upsert_lane_baseline(db_session, project.id, 5, now, "b1", {"m": 5})
+    await db_session.commit()
+    assert await read_version_lane_baseline(db_session, project.id, 5) == {"m": 5}
+
+    # Re-upserting the SAME version overwrites in place.
+    await upsert_lane_baseline(db_session, project.id, 5, now, "b2", {"m": 55})
+    await db_session.commit()
+    assert await read_version_lane_baseline(db_session, project.id, 5) == {"m": 55}
+
+    # Missing version -> None.
+    assert await read_version_lane_baseline(db_session, project.id, 999) is None
+
+    # Fill past the cap; only the most recent _LANE_BASELINE_VERSIONS_MAX
+    # versions survive.
+    total = _LANE_BASELINE_VERSIONS_MAX + 5
+    for v in range(1, total + 1):
+        await upsert_lane_baseline(db_session, project.id, v, now, "b", {"m": v})
+    await db_session.commit()
+
+    from sqlalchemy import func, select
+
+    from app.models import ProjectLaneBaseline
+
+    count = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(ProjectLaneBaseline)
+            .where(ProjectLaneBaseline.project_id == project.id)
+        )
+    ).scalar_one()
+    assert count == _LANE_BASELINE_VERSIONS_MAX
+
+    # The lowest versions were pruned; the highest survive.
+    assert await read_version_lane_baseline(db_session, project.id, 1) is None
+    assert await read_version_lane_baseline(db_session, project.id, total) == {
+        "m": total
+    }

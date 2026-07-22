@@ -13,6 +13,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import get_session, resolve_dialect_name
+from app.project_telemetry import read_telemetry_or_doc as _read_telemetry_or_doc
 from app.digest_cache import DigestCache, get_digest_cache
 from app.digest_precompute import (
     DIGEST_KIND,
@@ -27,7 +28,6 @@ from app.models import (
     Task,
     TaskStatus,
     Project,
-    ProjectSRAnalytics,
     Artifact,
     ArtifactType,
     _utcnow,
@@ -1525,19 +1525,27 @@ async def _compute_digest(
         )
         memo_ever_cited = await _strategic_cycle.ever_cited_memo(session, project_id)
         if _proj:
-            _dig_sr_row = await session.get(ProjectSRAnalytics, project_id)
-            _dig_sr_src = (_dig_sr_row.data if _dig_sr_row else None) or (_proj.design_doc or {})
-            _sr_trends = _dig_sr_src.get("sr_catch_rate_trends") or {}
+            _sr_trends = (
+                await _read_telemetry_or_doc(
+                    session, _proj.id, _proj.design_doc, "sr_catch_rate_trends"
+                )
+                or {}
+            )
             if _sr_trends:
                 self_review_prediction_accuracy_trends = (
                     _serialize_sr_catch_rate_trends(_sr_trends)
                 )
-            _sr_rrts = _dig_sr_src.get(
-                "sr_regression_risk_test_signal_trends"
+            _sr_rrts = await _read_telemetry_or_doc(
+                session,
+                _proj.id,
+                _proj.design_doc,
+                "sr_regression_risk_test_signal_trends",
             )
             if _sr_rrts:
                 sr_regression_risk_test_signal_trends = _sr_rrts
-            _sft = _dig_sr_src.get("sr_false_attestation_trends")
+            _sft = await _read_telemetry_or_doc(
+                session, _proj.id, _proj.design_doc, "sr_false_attestation_trends"
+            )
             if _sft:
                 sr_false_attestation_trends = _sft
             # Read the newest terminal cycle from the StrategicCycle table.
@@ -1606,7 +1614,12 @@ async def _compute_digest(
             # payload key had no named reader (see retirement note above). The
             # underlying design_doc["fresh_reviewer_trend"] persistence is untouched.
             # Edges-considered cycle-over-cycle trend persisted by compute_edges_trend.
-            _et = _dig_sr_src.get("edges_trend") or {}
+            _et = (
+                await _read_telemetry_or_doc(
+                    session, _proj.id, _proj.design_doc, "edges_trend"
+                )
+                or {}
+            )
             if _et:
                 edges_trend = {
                     "computed_at": _et.get("computed_at"),
@@ -1797,7 +1810,9 @@ async def _compute_digest(
             # medians computed live, plus deltas.  Only bounded scalars are
             # stored — no per-PR row arrays or per-task chains.
             try:
-                from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
+                from app.lane_baseline_snapshot import (  # noqa: PLC0415
+                    read_version_lane_baseline_preferring_table,
+                )
                 from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
 
                 _latest_rv = (
@@ -1816,14 +1831,8 @@ async def _compute_digest(
                     .first()
                 )
                 if _latest_rv is not None and _digest_project is not None:
-                    from app.models import ProjectLaneBaseline as _PLB  # noqa: PLC0415
-
-                    _plb_row = await session.get(_PLB, project_id)
-                    _lb_data = _plb_row.data if _plb_row is not None else None
-                    _rb = read_version_lane_baseline(
-                        _digest_project,
-                        _latest_rv.version_number,
-                        lane_baseline_data=_lb_data,
+                    _rb = await read_version_lane_baseline_preferring_table(
+                        session, _digest_project, _latest_rv.version_number
                     )
                     if _rb is not None:
                         _relay_m = _rb.get("relay_medians") or {}

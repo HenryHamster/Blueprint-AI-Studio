@@ -78,6 +78,10 @@ from app.llm_cost_attribution import (
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
 )
+from app.project_telemetry import (
+    insert_efficiency_snapshot,
+    read_recent_efficiency_snapshots,
+)
 from app.task_capabilities import is_pr_eligible_task_type
 from app.task_locking import project_lock
 from app.vm_cost_rates import idle_cost_usd
@@ -383,6 +387,65 @@ _SNAPSHOT_HISTORY_MAX = 7
 #      blocked_provisioned_vm_spend_usd (VM spend by BLOCKED tasks in the window),
 #      making silent sampling and BLOCKED exclusion explicit.
 METRIC_DEF_VERSION = "v16"
+
+
+async def _read_snapshot_history(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    container: Mapping[str, Any],
+) -> list[Dict[str, Any]]:
+    """Return the daily snapshot history, MERGING the table and design_doc.
+
+    Rows from ``project_efficiency_snapshot`` (returned newest-first by
+    :func:`app.project_telemetry.read_recent_efficiency_snapshots`) are merged
+    with the design_doc container's ``snapshots`` list, deduped by
+    ``captured_at`` (table rows win on conflict), sorted oldest-first and
+    truncated to the newest ``_SNAPSHOT_HISTORY_MAX`` entries.
+
+    Migration 0678 deliberately leaves ``efficiency_baseline`` dual-written and
+    does NOT backfill the table, so on a mature project the table starts empty
+    while design_doc still holds up to ``_SNAPSHOT_HISTORY_MAX`` historical
+    snapshots. A prefer-table-exclusive read would drop those older design_doc
+    snapshots until the table naturally refills (~7 daily cycles), transiently
+    truncating operator-facing trend arrays and hiding a ``serving_sha`` whose
+    only snapshot still lives in design_doc. Merging (mirroring the sibling
+    :func:`app.lane_baseline_snapshot.read_all_lane_baselines_preferring_table`)
+    keeps every stored snapshot visible throughout the dual-write window; once
+    the table fully refills its rows simply override the equal-``captured_at``
+    design_doc entries with no change in output.
+    """
+    by_captured_at: Dict[Any, Dict[str, Any]] = {}
+    order: list[Any] = []
+
+    def _add(snap: Any) -> None:
+        if not isinstance(snap, Mapping):
+            return
+        # Fall back to object identity when captured_at is missing so a
+        # timestamp-less snapshot is never silently collapsed with another.
+        key = snap.get("captured_at")
+        if key is None:
+            key = ("__no_captured_at__", id(snap))
+        if key not in by_captured_at:
+            order.append(key)
+        by_captured_at[key] = dict(snap)
+
+    # design_doc first so equal-captured_at table rows override them.
+    for snap in container.get("snapshots") or []:
+        _add(snap)
+    for row in await read_recent_efficiency_snapshots(session, project_id):
+        _add(row.blob)
+
+    def _sort_key(key: Any) -> tuple[int, str]:
+        captured = by_captured_at[key].get("captured_at")
+        if isinstance(captured, str) and captured:
+            return (1, captured)
+        # captured_at-less snapshots sort to the front (treated as oldest).
+        return (0, "")
+
+    merged = [by_captured_at[key] for key in sorted(order, key=_sort_key)]
+    if len(merged) > _SNAPSHOT_HISTORY_MAX:
+        merged = merged[-_SNAPSHOT_HISTORY_MAX:]
+    return merged
 
 
 async def _load_recent_tasks(
@@ -2171,6 +2234,323 @@ def _compute_cold_start_breakdown_p50(
 
 
 
+def compute_panel_review_effectiveness(
+    tasks: list[Task], *, since_dt: datetime | None = None
+) -> Dict[str, Any] | None:
+    """Panel review gate effectiveness: overturn, confirmation, revision, and fail-open counts.
+
+    Reads ``context["review_second_opinion"]`` from every terminal task in the
+    window and buckets each record by its reconciliation state:
+      * ``challenged_confirmed``  — panel upholds the primary verdict unchanged.
+      * ``challenged_revised``    — same verdict direction, surviving issue set changed.
+      * ``challenged_rejected``   — panel overturns the verdict direction (the ROI signal).
+
+    The plain ``unchallenged`` state (gate off or primary was not an APPROVE) is
+    excluded because it does not represent a gate invocation.  Records where
+    ``unchallenged`` is combined with ``escalated=True`` capture a distinct class:
+    the challenger task crashed or returned an unparseable verdict, so the merge was
+    BLOCKED and escalated for manual review (fail-CLOSED/safe).  These are counted
+    as ``challenged_escalated`` for operator awareness but are excluded from
+    ``fail_open_rate`` because no auto-merge occurred.
+
+    Records with ``state == 'degraded_model_unavailable'`` represent the true
+    fail-open path: the challenger's model was inaccessible, so the primary verdict
+    was adopted and (for APPROVE + trunk target) the PR was auto-merged with no
+    independent second opinion.  These are counted as ``challenged_degraded`` and
+    drive ``fail_open_rate``.
+
+    Records with ``state == 'sampled_out'`` represent invocation opportunities that
+    were skipped due to sample_rate < 1.0. These are counted separately so
+    effective_coverage can be computed: the fraction of invocation opportunities
+    where the challenger actually ran (challenged + degraded + escalated) vs.
+    the total opportunities (including sampled_out).
+
+    Returns ``None`` when no gate invocations exist in the window.
+
+    ``overturn_rate`` = challenged_rejected / total_challenged — the share of
+    primary APPROVEs that the independent panel flipped to REQUEST_CHANGES. A rate
+    near 0 means the gate is expensive (full Opus-tier run) with marginal catch;
+    a high rate justifies the spend.
+
+    ``cost_per_challenge_usd`` = total LLM cost of panel_review tasks / total_challenged.
+    Provides the spend-per-invocation needed to compute gate ROI alongside overturn_rate.
+
+    ``challenged_escalated`` — count of invocations where the challenger crashed or
+    returned an unparseable verdict, triggering a manual escalation (merge BLOCKED).
+    Informational only; excluded from ``fail_open_rate``.
+
+    ``challenged_degraded`` — count of invocations where the challenger's model was
+    unavailable, causing a silent auto-merge with no independent second opinion.
+    This is the true fail-open path.
+
+    ``sampled_out_count`` — count of invocation opportunities skipped due to
+    sample_rate < 1.0. When sample_rate < 1.0, many merges are never challenged,
+    so a low fail_open_rate can coexist with high overall fail-open risk if
+    coverage is low (most merges untested).
+
+    ``effective_coverage`` = (challenged + degraded + escalated) / (challenged +
+    degraded + escalated + sampled_out). The fraction of invocation opportunities
+    where the gate actually ran (successful challenge, fail-open, or escalation).
+    None only when sampled_out_count is 0 and gate was never invoked.
+
+    ``fail_open_rate`` = challenged_degraded / (total_challenged + challenged_degraded).
+    """
+    from app.task_completion import (  # noqa: PLC0415
+        REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+    )
+
+    confirmed = 0
+    revised = 0
+    rejected = 0
+    escalated = 0
+    degraded = 0
+    sampled_out = 0
+    for t in tasks:
+        if since_dt is not None and t.updated_at is not None and t.updated_at < since_dt:
+            continue
+        recon = (t.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
+        if not isinstance(recon, dict):
+            continue
+        state = recon.get("state")
+        if state == "challenged_confirmed":
+            confirmed += 1
+        elif state == "challenged_revised":
+            revised += 1
+        elif state == "challenged_rejected":
+            rejected += 1
+        elif state == "unchallenged" and recon.get("escalated"):
+            escalated += 1
+        elif state == "degraded_model_unavailable":
+            degraded += 1
+        elif state == "sampled_out":
+            sampled_out += 1
+
+    total = confirmed + revised + rejected
+    if total == 0 and escalated == 0 and degraded == 0 and sampled_out == 0:
+        return None
+
+    # Sum LLM cost across panel_review challenger tasks in the window.
+    panel_review_llm_cost = sum(
+        _task_llm_cost(t)[0]
+        for t in tasks
+        if (t.first_payload or {}).get("type") == "panel_review"
+        and (since_dt is None or t.updated_at is None or t.updated_at >= since_dt)
+    )
+    cost_per_challenge = round(panel_review_llm_cost / total, 4) if total > 0 else None
+
+    # Effective coverage: fraction of invocation opportunities where gate ran
+    # (challenged + degraded + escalated) vs. total opportunities (including sampled_out).
+    challenged_total = total + degraded + escalated
+    all_opportunities = challenged_total + sampled_out
+    effective_coverage = (
+        round(challenged_total / all_opportunities, 4) if all_opportunities > 0 else None
+    )
+
+    return {
+        "challenged_confirmed": confirmed,
+        "challenged_revised": revised,
+        "challenged_rejected": rejected,
+        "total_challenged": total,
+        "overturn_rate": round(rejected / total, 4) if total > 0 else None,
+        "cost_per_challenge_usd": cost_per_challenge,
+        "challenged_escalated": escalated,
+        "challenged_degraded": degraded,
+        "sampled_out_count": sampled_out,
+        "effective_coverage": effective_coverage,
+        # 0.0 when gate invoked and no degraded events (confirmed-zero, distinct from no-data).
+        # None when total_challenged == 0 and degraded == 0 — includes escalated-only windows.
+        "fail_open_rate": round(degraded / (total + degraded), 4) if (total > 0 or degraded > 0) else None,
+    }
+
+
+_PANEL_MIN_SAMPLE = 30
+_PANEL_EARNING_THRESHOLD = 0.10  # 10% overturn rate = gate earns its cost
+
+# Gate-health verdict state strings — the single source of truth mirrored by the
+# operator dashboard's GateHealthBadge (admin-ui/src/components/AdversarialQualityPanel.tsx).
+# Promoting them into the backend lets the autonomous strategist read the same
+# calibrated ≤5% fail-open verdict the operator sees, instead of recomputing it.
+GATE_HEALTH_NO_DATA = "NO_DATA"
+GATE_HEALTH_DEGRADED = "DEGRADED"
+GATE_HEALTH_INSUFFICIENT = "INSUFFICIENT"
+GATE_HEALTH_LOW_COVERAGE = "LOW_COVERAGE"
+GATE_HEALTH_PARTIAL = "PARTIAL"
+GATE_HEALTH_HEALTHY = "HEALTHY"
+
+# fail_open_rate thresholds — kept identical to the frontend GateHealthBadge.
+_GATE_DEGRADED_RATE = 0.05  # at/above → DEGRADED (takes priority over min-sample)
+_GATE_PARTIAL_RATE = 0.01  # at/above (and enough sample) → PARTIAL
+_GATE_MIN_COVERAGE = 0.5  # effective_coverage below this → LOW_COVERAGE, not HEALTHY
+
+
+def compute_gate_health_verdict(
+    panel_review_effectiveness: Dict[str, Any] | None,
+    *,
+    min_sample: int = _PANEL_MIN_SAMPLE,
+) -> Dict[str, Any]:
+    """Classify the panel-review challenge gate's fail-open health.
+
+    Pure and DB-free: depends only on the dict shape returned by
+    ``compute_panel_review_effectiveness`` (or ``None``). Returns the verdict
+    ``state`` plus the supporting numbers (``fail_open_rate``,
+    ``total_invocations``, ``min_sample``) so a consumer sees WHY.
+
+    Mirrors the operator dashboard's ``GateHealthBadge`` semantics EXACTLY so the
+    two surfaces never diverge. Evaluation order (the order matters):
+
+      * ``None`` input or zero gate invocations → ``NO_DATA``.
+      * ``fail_open_rate >= 0.05`` → ``DEGRADED``. This is checked BEFORE the
+        min-sample gate, so a degraded rate on a tiny sample is still DEGRADED,
+        never HEALTHY or INSUFFICIENT.
+      * fewer than ``min_sample`` (30) gate invocations → ``INSUFFICIENT``. This
+        is the calibration that prevents reporting HEALTHY off a window with too
+        few (or zero) real gate invocations.
+      * ``effective_coverage < 0.5`` → ``LOW_COVERAGE``. Checked after
+        INSUFFICIENT so a sufficient-sample window with low coverage is flagged
+        before considering the rate-based tiers.
+      * ``fail_open_rate >= 0.01`` → ``PARTIAL``.
+      * otherwise → ``HEALTHY``.
+
+    Gate invocations = ``total_challenged + challenged_degraded`` (matches the
+    frontend's ``total + failOpen``); the rate equals the emitted
+    ``fail_open_rate`` = degraded / invocations.
+    """
+    if panel_review_effectiveness is None:
+        return {
+            "state": GATE_HEALTH_NO_DATA,
+            "fail_open_rate": None,
+            "total_invocations": 0,
+            "min_sample": min_sample,
+        }
+
+    total = panel_review_effectiveness.get("total_challenged", 0) or 0
+    degraded = panel_review_effectiveness.get("challenged_degraded", 0) or 0
+    invocations = total + degraded
+    rate = panel_review_effectiveness.get("fail_open_rate")
+    if rate is None and invocations > 0:
+        rate = degraded / invocations
+
+    effective_coverage = (panel_review_effectiveness or {}).get("effective_coverage")
+
+    if invocations == 0:
+        state = GATE_HEALTH_NO_DATA
+    elif rate is not None and rate >= _GATE_DEGRADED_RATE:
+        state = GATE_HEALTH_DEGRADED
+    elif invocations < min_sample:
+        state = GATE_HEALTH_INSUFFICIENT
+    elif effective_coverage is not None and effective_coverage < _GATE_MIN_COVERAGE:
+        state = GATE_HEALTH_LOW_COVERAGE
+    elif rate is not None and rate >= _GATE_PARTIAL_RATE:
+        state = GATE_HEALTH_PARTIAL
+    else:
+        state = GATE_HEALTH_HEALTHY
+
+    return {
+        "state": state,
+        "fail_open_rate": rate,
+        "total_invocations": invocations,
+        "min_sample": min_sample,
+    }
+
+
+async def _resolve_deploy_since(
+    session: AsyncSession, project_id: uuid.UUID
+) -> datetime | None:
+    """Resolve the post-deployment boundary for a project.
+
+    The boundary is the ``captured_at`` of the earliest persisted efficiency
+    baseline snapshot recorded under the current serving SHA. Used as ``since_dt``
+    to scope ``compute_panel_review_effectiveness`` to post-deployment traffic.
+
+    Returns ``None`` when the serving SHA is unknown, the project is missing, or
+    no snapshot has yet been captured under the current build — callers must NOT
+    fabricate a boundary in that case.
+    """
+    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+
+    serving_sha = get_serving_sha()
+    if not serving_sha:
+        return None
+    project_row = await session.get(Project, project_id)
+    if project_row is None:
+        return None
+    container = (project_row.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    for snap in await _read_snapshot_history(session, project_id, container):
+        if snap.get("serving_sha") == serving_sha:
+            try:
+                return datetime.fromisoformat(snap["captured_at"])
+            except (KeyError, ValueError, TypeError):
+                return None
+    return None
+
+
+def compute_recommended_challenger_sample_rate(
+    panel_review_effectiveness: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Data-driven recommended sample_rate for the panel_review challenger gate.
+
+    Thresholds:
+    - no_data: no gate invocations in the window → no recommendation.
+    - insufficient_data: fewer than 30 challenges → sample too small.
+    - gate_earning: overturn_rate >= 10% → gate justifies full cost; keep 1.0.
+    - reduce: overturn_rate < 10% → recommended = clamp(rate/0.10, 0.10, 1.0).
+    """
+    if panel_review_effectiveness is None:
+        return {
+            "status": "no_data",
+            "recommended_sample_rate": None,
+            "rationale": "No gate invocations in the snapshot window.",
+        }
+    total = panel_review_effectiveness.get("total_challenged", 0)
+    if total < _PANEL_MIN_SAMPLE:
+        return {
+            "status": "insufficient_data",
+            "recommended_sample_rate": None,
+            "rationale": f"Only {total} challenges — need {_PANEL_MIN_SAMPLE} for a reliable estimate.",
+        }
+    overturn_rate = panel_review_effectiveness.get("overturn_rate", 0.0)
+    if overturn_rate >= _PANEL_EARNING_THRESHOLD:
+        return {
+            "status": "gate_earning",
+            "recommended_sample_rate": 1.0,
+            "rationale": (
+                f"overturn_rate={overturn_rate:.1%} ≥ {_PANEL_EARNING_THRESHOLD:.0%} threshold"
+                " — gate earns its cost; keep sample_rate=1.0."
+            ),
+        }
+    recommended = max(
+        0.10, min(1.0, round(overturn_rate / _PANEL_EARNING_THRESHOLD, 2))
+    )
+    savings_pct = round((1.0 - recommended) * 100)
+    return {
+        "status": "reduce",
+        "recommended_sample_rate": recommended,
+        "rationale": (
+            f"overturn_rate={overturn_rate:.1%} < {_PANEL_EARNING_THRESHOLD:.0%} threshold"
+            f" — recommend sample_rate={recommended} to save ~{savings_pct}% of challenger runs."
+        ),
+    }
+
+
+def assess_post_deploy_gate_health(
+    panel_review_effectiveness_post_deploy: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Assess gate health for a post-deployment time window.
+
+    Computes the gate health verdict for tasks completed after a deployment
+    boundary. Used by the strategist and operator dashboard to validate that
+    the deployed version meets the ≤5% fail-open health threshold.
+
+    Returns the gate health verdict dict with state, fail_open_rate,
+    total_invocations, and min_sample fields. State will be:
+    - NO_DATA: no gate invocations post-deploy.
+    - DEGRADED: ≥5% fail-open (takes priority).
+    - INSUFFICIENT: <30 invocations (too few to certify).
+    - LOW_COVERAGE: <50% effective coverage with sufficient invocations.
+    - PARTIAL: 1-5% fail-open with sufficient invocations.
+    - HEALTHY: <1% fail-open with ≥30 invocations and ≥50% coverage.
+    """
+    return compute_gate_health_verdict(panel_review_effectiveness_post_deploy)
 def _find_agent_src() -> str | None:
     """Locate the agent/src directory for prompt.ts static-size introspection.
 
@@ -2898,7 +3278,8 @@ async def write_snapshot(
     """
     # Compute axes before acquiring lock — reads only Task rows, not the project.
     axes = await compute_current_axes(session, project_id)
-    captured_at = _utcnow().isoformat()
+    captured_dt = _utcnow()
+    captured_at = captured_dt.isoformat()
     from app.deployed_sha import get_serving_sha
 
     snapshot: Dict[str, Any] = {
@@ -3096,6 +3477,20 @@ async def write_snapshot(
 
     from app.project_telemetry import set_project_telemetry
     await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, container)
+
+    # Dual-write the snapshot time-series to the dedicated
+    # project_efficiency_snapshot table. Done OUTSIDE the project_lock block so
+    # the row-scoped ON CONFLICT upsert never takes the Project row lock; the
+    # accessor enforces the same _SNAPSHOT_HISTORY_MAX retention the design_doc
+    # container used. The design_doc write above stays authoritative for safe
+    # rollback until the read path is fully cut over. Caller commits.
+    await insert_efficiency_snapshot(
+        session,
+        project_id,
+        captured_at=captured_dt,
+        metric_def_version=METRIC_DEF_VERSION,
+        blob=snapshot,
+    )
 
     logger.info(
         "[EFFICIENCY_SNAPSHOT] project=%s captured_at=%s axes=%s",
@@ -3419,7 +3814,7 @@ async def read_baseline_with_drift(
     else:
         container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     baseline = container.get("baseline") or {}
-    snapshots = container.get("snapshots") or []
+    snapshots = await _read_snapshot_history(session, project_id, container)
     latest = snapshots[-1] if snapshots else {}
 
     # Durable warm-reuse drop-out: the latest persisted ranking plus a day-over-
@@ -4749,12 +5144,8 @@ async def agent_get_efficiency_snapshot_format_compliance(
     if project is None:
         raise HTTPException(status_code=404, detail="project_not_found")
 
-    eff_row = await session.get(ProjectEfficiencySnapshot, project_id)
-    if eff_row is not None:
-        container = dict(eff_row.data or {})
-    else:
-        container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
-    snapshots = container.get("snapshots") or []
+    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    snapshots = await _read_snapshot_history(session, project.id, container)
     if not snapshots:
         raise HTTPException(status_code=404, detail="no_snapshot_available")
 

@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.project_telemetry import read_telemetry_or_doc as _read_telemetry_or_doc
 from app.models import (
     Alert,
     AlertSeverity,
@@ -136,10 +137,14 @@ async def _run_signal_staleness_watchdog(
     doc = project_design_doc or {}
     now = _utcnow()
     windows = _SIGNAL_STALENESS_WINDOWS
+    _sr_catch_rate_trends = (
+        await _read_telemetry_or_doc(session, project_id, doc, "sr_catch_rate_trends")
+        or {}
+    )
     specs: list[tuple[str, Any, timedelta]] = [
         (
             "sr_catch_rate",
-            (doc.get("sr_catch_rate_trends") or {}).get("last_sufficient_computed_at"),
+            _sr_catch_rate_trends.get("last_sufficient_computed_at"),
             windows["sr_catch_rate"],
         ),
         (
@@ -191,7 +196,7 @@ async def _run_signal_staleness_watchdog(
             )
             created += 1
     # Frozen-signal sub-alert: heartbeat is fresh but the real data is stale.
-    sr_trends = doc.get("sr_catch_rate_trends") or {}
+    sr_trends = _sr_catch_rate_trends
     signal_ts = sr_trends.get("signal_last_computed_at")
     sufficient_ts = sr_trends.get("last_sufficient_computed_at")
     if signal_ts and sufficient_ts:

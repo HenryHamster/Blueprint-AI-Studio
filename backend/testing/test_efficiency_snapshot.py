@@ -844,21 +844,29 @@ async def test_read_baseline_with_drift_returns_drift_pct(db_session):
     await write_snapshot(db_session, project.id)
     await db_session.commit()
 
-    # Mutate the latest snapshot in-place to simulate a regression of +50%.
-    container = dict(project.design_doc[DESIGN_DOC_KEY])
-    snaps = list(container["snapshots"])
-    latest = dict(snaps[-1])
-    base_cpm = container["baseline"][AXIS_COST_PER_MERGED_PR]
-    latest[AXIS_COST_PER_MERGED_PR] = round(base_cpm * 1.5, 6)
-    snaps[-1] = latest
-    container["snapshots"] = snaps
-    new_doc = dict(project.design_doc)
-    new_doc[DESIGN_DOC_KEY] = container
-    project.design_doc = new_doc
+    # read_baseline_with_drift prefers the project_efficiency_snapshot table
+    # (write_snapshot dual-wrote the latest snapshot there). Mutate the latest
+    # TABLE row in-place to simulate a regression of +50%; the immutable baseline
+    # stays in design_doc.
+    from sqlalchemy import select as _select
     from sqlalchemy.orm.attributes import flag_modified
 
-    flag_modified(project, "design_doc")
-    db_session.add(project)
+    from app.models import ProjectEfficiencySnapshot
+
+    base_cpm = project.design_doc[DESIGN_DOC_KEY]["baseline"][AXIS_COST_PER_MERGED_PR]
+    latest_row = (
+        await db_session.execute(
+            _select(ProjectEfficiencySnapshot)
+            .where(ProjectEfficiencySnapshot.project_id == project.id)
+            .order_by(ProjectEfficiencySnapshot.captured_at.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    new_blob = dict(latest_row.blob)
+    new_blob[AXIS_COST_PER_MERGED_PR] = round(base_cpm * 1.5, 6)
+    latest_row.blob = new_blob
+    flag_modified(latest_row, "blob")
+    db_session.add(latest_row)
     await db_session.commit()
 
     result = await read_baseline_with_drift(db_session, project.id)
@@ -1047,24 +1055,33 @@ async def test_snapshot_carries_definition_version_and_change_boundary(db_sessio
     assert snap2.get("metric_def_version") == METRIC_DEF_VERSION
 
     # Simulate a pre-existing snapshot from a prior definition era by back-
-    # patching the first stored snapshot to an older version string.  This models
+    # patching the oldest stored snapshot to drop its version stamp.  This models
     # the real scenario: persisted snapshots 2026-06-06..09 have no version stamp
     # (metric_def_version absent), while future snapshots carry v6.
+    # read_baseline_with_drift prefers the project_efficiency_snapshot table, so
+    # back-patch the oldest TABLE row's blob (write_snapshot dual-wrote both rows).
+    from sqlalchemy import select as _select
     from sqlalchemy.orm.attributes import flag_modified
-    from app.models import Project
 
-    proj = await db_session.get(Project, project.id)
-    assert proj is not None
-    doc = dict(proj.design_doc or {})
-    container = dict(doc.get("efficiency_baseline") or {})
-    snapshots = list(container.get("snapshots") or [])
-    assert len(snapshots) >= 2, "expected at least 2 snapshots to be stored"
-    # Remove version from first snapshot to simulate a pre-v6 era entry.
-    snapshots[0] = {k: v for k, v in snapshots[0].items() if k != "metric_def_version"}
-    container["snapshots"] = snapshots
-    doc["efficiency_baseline"] = container
-    proj.design_doc = doc
-    flag_modified(proj, "design_doc")
+    from app.models import ProjectEfficiencySnapshot
+
+    rows = list(
+        (
+            await db_session.execute(
+                _select(ProjectEfficiencySnapshot)
+                .where(ProjectEfficiencySnapshot.project_id == project.id)
+                .order_by(ProjectEfficiencySnapshot.captured_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) >= 2, "expected at least 2 snapshots to be stored"
+    oldest = rows[0]
+    # Remove version from the oldest snapshot blob to simulate a pre-v6 era entry.
+    oldest.blob = {k: v for k, v in oldest.blob.items() if k != "metric_def_version"}
+    flag_modified(oldest, "blob")
+    db_session.add(oldest)
     await db_session.commit()
 
     # Now read back via the public API and verify def_version is surfaced.
@@ -11366,3 +11383,141 @@ async def test_load_recent_tasks_is_terminal_time_ordered(db_session):
     assert dates == sorted(dates, reverse=True), (
         "Tasks must be ordered by updated_at descending"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dual-write to project_efficiency_snapshot (design_doc God-column decomposition)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_write_snapshot_dual_writes_to_efficiency_table(db_session):
+    """write_snapshot appends a row to project_efficiency_snapshot alongside design_doc."""
+    from app.project_telemetry import read_recent_efficiency_snapshots
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    rows = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(rows) == 1
+    # The dedicated table carries the full snapshot blob and the metric-def stamp.
+    assert rows[0].blob["captured_at"] == snap["captured_at"]
+    assert rows[0].metric_def_version == METRIC_DEF_VERSION
+    assert rows[0].blob[AXIS_COST_PER_MERGED_PR] == snap[AXIS_COST_PER_MERGED_PR]
+
+    # design_doc still carries the same snapshot (dual-write, not a move).
+    await db_session.refresh(project)
+    container = project.design_doc[DESIGN_DOC_KEY]
+    assert container["snapshots"][-1]["captured_at"] == snap["captured_at"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_read_baseline_prefers_table_over_design_doc(db_session):
+    """A snapshot present ONLY in the table (not design_doc) is read back by drift."""
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    # Seed the baseline via a normal write (populates both stores).
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Insert a NEWER snapshot into the table only, with a sentinel cost value
+    # that is absent from any design_doc snapshot.
+    await db_session.refresh(project)
+    container = dict(project.design_doc[DESIGN_DOC_KEY])
+    latest_doc = container["snapshots"][-1]
+    table_only = dict(latest_doc)
+    table_only["captured_at"] = (_utcnow() + timedelta(minutes=1)).isoformat()
+    table_only[AXIS_COST_PER_MERGED_PR] = 4242.0
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=_utcnow() + timedelta(minutes=1),
+        metric_def_version=METRIC_DEF_VERSION,
+        blob=table_only,
+    )
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    # current reflects the LATEST stored snapshot — which is the table-only row.
+    assert drift["axes"][AXIS_COST_PER_MERGED_PR]["current"] == 4242.0
+
+
+@pytest.mark.asyncio
+async def test_read_snapshot_history_falls_back_to_design_doc(db_session):
+    """When the table has no rows, _read_snapshot_history returns the design_doc list."""
+    from app.efficiency_snapshot import _read_snapshot_history
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = {"snapshots": [{"captured_at": "2026-01-01T00:00:00", "x": 1}]}
+    history = await _read_snapshot_history(db_session, project.id, container)
+    assert history == container["snapshots"]
+    # Empty container + empty table -> empty list, not an error.
+    assert await _read_snapshot_history(db_session, project.id, {}) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_efficiency_table_retention_caps_at_seven(db_session):
+    """Repeated write_snapshot calls keep the table pruned to _SNAPSHOT_HISTORY_MAX rows."""
+    from app.efficiency_snapshot import _SNAPSHOT_HISTORY_MAX
+    from app.project_telemetry import read_recent_efficiency_snapshots
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    # Each write_snapshot stamps captured_at = _utcnow(); force distinct
+    # timestamps by inserting directly through the accessor so ON CONFLICT on
+    # (project_id, captured_at) does not collapse same-instant writes.
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    base = _utcnow()
+    for i in range(_SNAPSHOT_HISTORY_MAX + 4):
+        await insert_efficiency_snapshot(
+            db_session,
+            project.id,
+            captured_at=base + timedelta(minutes=i),
+            metric_def_version=METRIC_DEF_VERSION,
+            blob={"captured_at": (base + timedelta(minutes=i)).isoformat(), "i": i},
+        )
+    await db_session.commit()
+
+    rows = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(rows) == _SNAPSHOT_HISTORY_MAX
+    # Newest window retained.
+    assert rows[0].blob["i"] == _SNAPSHOT_HISTORY_MAX + 3
