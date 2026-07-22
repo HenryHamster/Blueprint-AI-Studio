@@ -71,6 +71,7 @@ const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
 const OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS = 45_000;
+const TRIAGE_PAGE_SIZE = 30;
 
 function artifactRefIdentity(ref: Record<string, unknown>): string {
   return String(ref.artifact_ref_id || ref.id || '');
@@ -549,6 +550,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const messagesRef = useRef<ProjectMessage[]>([]);
   messagesRef.current = messages;
   const [loading, setLoading] = useState(true);
+  // Triage pagination: small initial page (~30) with load-older-on-demand
+  const [triageOffset, setTriageOffset] = useState(0);
+  const [triageTotal, setTriageTotal] = useState(0);
+  const [loadingOlderTriage, setLoadingOlderTriage] = useState(false);
+  const loadingOlderTriageRef = useRef(false);
+  const triageOffsetRef = useRef(0);
   const [expandedConfirmationItemId, setExpandedConfirmationItemId] = useState<string | null>(null);
   const [resolvedConfirmationIds, setResolvedConfirmationIds] = useState<Set<string>>(() => new Set());
   const [chatChromeExpanded, persistChatChrome] = useChatChrome();
@@ -938,6 +945,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     setWebhookStats(null);
     optimisticStrategicRefreshRef.current = null;
     if (!usesStrategicReadModelRef.current) setStrategicRefresh(null);
+    // Reset triage pagination when switching projects
+    setTriageOffset(0);
+    setTriageTotal(0);
+    setLoadingOlderTriage(false);
+    loadingOlderTriageRef.current = false;
+    triageOffsetRef.current = 0;
     const lastSeen = loadLastSeen(currentActorUserId, selectedProjectId);
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
@@ -1003,6 +1016,19 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (!focusComposerSignal) return;
     focusComposerTextarea();
   }, [focusComposerSignal, focusComposerTextarea]);
+  // Reset triage pagination offset when search query changes so the first page
+  // reflects the newest matching messages.
+  const prevSearchQueryRef = useRef(searchQuery);
+  useEffect(() => {
+    if (prevSearchQueryRef.current !== searchQuery) {
+      prevSearchQueryRef.current = searchQuery;
+      setTriageOffset(0);
+      setTriageTotal(0);
+      triageOffsetRef.current = 0;
+      setLoadingOlderTriage(false);
+      loadingOlderTriageRef.current = false;
+    }
+  }, [searchQuery]);
   // Memoized message-list derivation: open/resolved split, high-signal vs routine,
   // pinned blockers/questions, auto-promoted failing groups, visible-resolved, and
   // new-message counts — all behind one pure hook so the panel stays focused on
@@ -1363,13 +1389,16 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         }
         return;
       }
-      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: searchQuery.trim() ? '200' : '100' });
+      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: String(TRIAGE_PAGE_SIZE) });
+      if (triageOffsetRef.current > 0) params.set('offset', String(triageOffsetRef.current));
       if (searchQuery.trim()) params.set('q', searchQuery.trim());
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (!isCurrentRequest()) return;
       const msgs: ProjectMessage[] = data.messages ?? [];
+      const total = (data as { total?: number }).total ?? 0;
+      setTriageTotal(total);
       // Detect new needs-action messages for toast alerts. The canonical
       // attention model (not local mute prefs) is the exclusive gate: if the
       // server marks a message needs_operator it must trigger a toast regardless
@@ -1396,11 +1425,34 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // Update tracking of seen message IDs
       msgs.forEach(m => seenMessageIdsRef.current.add(m.id));
       hasInitiallyLoadedRef.current = true;
-      // Only update state if messages actually changed — prevents scroll jumps from polling
-      setMessages(prev => {
-        if (messageListsEqual(prev, msgs)) return prev;
-        return msgs;
-      });
+      // Merge or replace messages depending on load mode
+      if (loadingOlderTriageRef.current) {
+        // Load-older: merge with existing, update in place for same IDs
+        loadingOlderTriageRef.current = false;
+        setLoadingOlderTriage(false);
+        setMessages(prev => {
+          const merged = new Map(prev.map(m => [m.id, m]));
+          let changed = false;
+          for (const m of msgs) {
+            const existing = merged.get(m.id);
+            if (!existing) {
+              merged.set(m.id, m);
+              changed = true;
+            } else if (!messagesEqual(existing, m)) {
+              merged.set(m.id, m);
+              changed = true;
+            }
+          }
+          if (!changed) return prev;
+          return [...merged.values()];
+        });
+      } else {
+        // Initial load or poller refresh: replace state with fetched messages
+        setMessages(prev => {
+          if (messageListsEqual(prev, msgs)) return prev;
+          return msgs;
+        });
+      }
       if (!usesStrategicReadModelRef.current) {
         onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
       }
@@ -1454,6 +1506,18 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       }
     }
   }, [conversationMode, selectedProjectId, onMessageCountChange, refreshConversation, searchQuery, usesStrategicReadModel]);
+  // Load older triage messages (offset-based pagination). Increments the offset
+  // ref and triggers fetchMessages; the ref is read inside fetchMessages to
+  // determine the offset param and the merge-vs-replace behaviour.
+  const loadOlderTriageMessages = useCallback(() => {
+    if (!selectedProjectId || loadingOlderTriageRef.current || loading) return;
+    loadingOlderTriageRef.current = true;
+    setLoadingOlderTriage(true);
+    triageOffsetRef.current += TRIAGE_PAGE_SIZE;
+    setTriageOffset(triageOffsetRef.current);
+    void fetchMessages();
+  }, [selectedProjectId, loading, fetchMessages]);
+  const hasMoreTriage = !conversationMode && !searchQuery.trim() && triageTotal > (triageOffset + TRIAGE_PAGE_SIZE);
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
   useEffect(() => {
     if (conversationMode || !realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
@@ -1484,8 +1548,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
     const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
     if (isInitialLoad) {
-      // First load — jump to bottom instantly
-      requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
+      // First load — jump to bottom instantly. Use the list's API when available
+      // (react-window scrollHeight is an estimate that lands mid-history).
+      if (conversationMode && conversationListRef.current?.scrollToBottom) {
+        requestAnimationFrame(() => conversationListRef.current?.scrollToBottom());
+      } else {
+        requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
+      }
     } else if (currentCount > prevMessageCountRef.current) {
       // Operator's own just-sent message (optimistic bubble) — always scroll.
       // For incoming messages use a generous threshold (200 px) to absorb mobile
@@ -2923,6 +2992,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         hasOlderConversationMessages={conversationMode && conversationHasMore}
         loadingOlderConversationMessages={loadingOlderConversation}
         onLoadOlderConversationMessages={() => loadOlderConversation()}
+        hasOlderTriageMessages={!conversationMode ? hasMoreTriage : undefined}
+        loadingOlderTriageMessages={loadingOlderTriage}
+        onLoadOlderTriageMessages={loadOlderTriageMessages}
         conversationListRef={conversationListRef}
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
         scrollRef={scrollRef}

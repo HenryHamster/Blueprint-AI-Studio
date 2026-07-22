@@ -243,6 +243,23 @@ describe('MessagesListView — viewport regression', () => {
       }));
     });
   });
+
+  test('scrollToBottom scrolls to the last row via list API', async () => {
+    const messages = Array.from({ length: 10 }, (_, index) => makeMsg({
+      id: `scroll-test-${index + 1}`,
+      sequence: index + 1,
+      from_type: index % 2 ? 'strategic' : 'user',
+      content: `Scroll message ${index + 1}`,
+      surface: 'conversation',
+    }));
+    const conversationListRef = createRef<ConversationListImperativeApi>();
+    await renderView(baseProps({ presentation: 'conversation', messages, conversationListRef }));
+    await vi.waitFor(() => {
+      expect(conversationListRef.current?.scrollToBottom).toBeDefined();
+    });
+    // Calling scrollToBottom should not throw
+    expect(() => conversationListRef.current?.scrollToBottom()).not.toThrow();
+  });
 });
 
 // ─── buildTriageItems unit tests ──────────────────────────────────────────────

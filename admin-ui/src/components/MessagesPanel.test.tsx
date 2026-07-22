@@ -9413,3 +9413,70 @@ describe('MessagesPanel attention model lifecycle field consumption', () => {
     expect(container.querySelector('[data-testid="attention-ack-btn"]')).toBeNull();
   });
 });
+
+describe('MessagesPanel triage pagination — small initial fetch', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    if (root) act(() => root.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function mountPanel(props: Partial<MessagesPanelProps> = {}) {
+    host = document.createElement('div');
+    host.style.display = 'flex';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('initial fetch uses limit=30', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    // Default mock returns empty messages — component should fire a GET
+    await mountPanel();
+    const messageCalls = vi.mocked(apiFetch).mock.calls.filter((c) => {
+      const url = String(c[0]);
+      const init = c[1] as RequestInit | undefined;
+      return /\/api\/admin\/messages(\?|$)/.test(url) && (!init?.method || init.method === 'GET');
+    });
+    expect(messageCalls.length).toBeGreaterThanOrEqual(1);
+    for (const call of messageCalls) {
+      const url = new URL(String(call[0]), 'http://localhost');
+      expect(url.searchParams.get('limit')).toBe('30');
+    }
+  });
+
+  test('initial fetch offset is absent (page 1)', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    await mountPanel();
+    const messageCalls = vi.mocked(apiFetch).mock.calls.filter((c) => {
+      const url = String(c[0]);
+      const init = c[1] as RequestInit | undefined;
+      return /\/api\/admin\/messages(\?|$)/.test(url) && (!init?.method || init.method === 'GET');
+    });
+    expect(messageCalls.length).toBeGreaterThanOrEqual(1);
+    for (const call of messageCalls) {
+      const url = new URL(String(call[0]), 'http://localhost');
+      // First page should not have an offset parameter
+      expect(url.searchParams.has('offset')).toBe(false);
+    }
+  });
+});

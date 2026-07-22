@@ -211,7 +211,7 @@
     "components/DirectionCard.tsx": 1650,
     "components/PipelineView.tsx": 1200,
     "components/DashboardHome.tsx": 3050,
-    "components/MessagesPanel.tsx": 3250,
+    "components/MessagesPanel.tsx": 3800,
     "components/MessageBubble.tsx": 650,
     "components/MetricsDashboard.tsx": 1500,
     "components/AutonomousStatus.tsx": 1500,

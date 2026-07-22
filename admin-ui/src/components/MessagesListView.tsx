@@ -759,6 +759,10 @@ export interface MessagesListViewProps {
   hasOlderConversationMessages?: boolean;
   loadingOlderConversationMessages?: boolean;
   onLoadOlderConversationMessages?: () => void | Promise<void>;
+  /** Triage mode: whether there are older messages beyond the initial page. */
+  hasOlderTriageMessages?: boolean;
+  loadingOlderTriageMessages?: boolean;
+  onLoadOlderTriageMessages?: () => void;
   conversationListRef?: RefObject<ConversationListImperativeApi | null>;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
@@ -850,6 +854,7 @@ export function MessagesListView(props: MessagesListViewProps) {
 
 export interface ConversationListImperativeApi {
   scrollToMessage: (messageId: string) => Promise<boolean>;
+  scrollToBottom: () => void;
 }
 
 type ConversationRow =
@@ -984,6 +989,11 @@ function ConversationVirtualList({
         listRef.current?.scrollToRow({ index, align: 'center', behavior: 'instant' });
       });
     },
+    scrollToBottom: () => {
+      const lastIndex = rows.length - 1;
+      if (lastIndex < 0 || !listRef.current) return;
+      listRef.current?.scrollToRow({ index: lastIndex, align: 'end', behavior: 'instant' });
+    },
   }), [conversationListRef, listRef, rows]);
 
   const handleConversationRowsRendered = useCallback((visible: { startIndex: number; stopIndex: number }) => {
@@ -1109,6 +1119,9 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     getTop3NoisyEventTypes,
     handleResolveGroup,
     handleBulkDeleteResolved,
+    hasOlderTriageMessages,
+    loadingOlderTriageMessages,
+    onLoadOlderTriageMessages,
   } = props;
   const listRef = useListRef(null);
   const messagesById = useMemo(
@@ -1217,6 +1230,18 @@ function TriageVirtualList(props: TriageVirtualListProps) {
 
   return (
     <div className="relative flex-1 overflow-hidden bg-workbench-surface">
+      {!!hasOlderTriageMessages && (
+        <div className="flex justify-center py-2 border-b border-neutral-800/60">
+          <button
+            type="button"
+            onClick={() => onLoadOlderTriageMessages?.()}
+            disabled={!!loadingOlderTriageMessages}
+            className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+          >
+            {loadingOlderTriageMessages ? 'Loading older messages…' : 'Load older messages'}
+          </button>
+        </div>
+      )}
       <List
         rowCount={items.length}
         rowComponent={TriageRow}

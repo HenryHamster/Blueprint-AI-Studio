@@ -156,12 +156,12 @@ export function useConversation({
       const result = await fetchStrategicConversation(
         projectId,
         requestedTargetId
-          ? { includeMessageId: requestedTargetId, limit: 100 }
+          ? { includeMessageId: requestedTargetId, limit: 30 }
           : normalizedSearch
-          ? { search: normalizedSearch, limit: 100 }
+          ? { search: normalizedSearch, limit: 30 }
           : forwardFrom != null
-          ? { afterSequence: forwardFrom, limit: 100 }
-          : { includeMessageId: requestedTargetId, limit: 100 },
+          ? { afterSequence: forwardFrom, limit: 30 }
+          : { includeMessageId: requestedTargetId, limit: 30 },
         controller.signal,
         forwardFrom == null ? etagRef.current : null,
       );
@@ -189,7 +189,7 @@ export function useConversation({
         forwardCursor = lastSequence;
         const gapResult = await fetchStrategicConversation(projectId, {
           afterSequence: lastSequence,
-          limit: 100,
+          limit: 30,
         }, controller.signal);
         if (!isCurrentRequest()) return;
         if (isStrategicConversationNotModified(gapResult)) break;
@@ -237,7 +237,7 @@ export function useConversation({
     try {
       const result = await fetchStrategicConversation(projectId, {
         beforeSequence: nextBeforeSequence,
-        limit: 100,
+        limit: 30,
       }, controller.signal);
       if (isStrategicConversationNotModified(result) || !isCurrentRequest()) return;
       setMessages(previous => mergeConversationPages(previous, result.conversation.items ?? []));

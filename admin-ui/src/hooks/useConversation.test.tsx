@@ -181,7 +181,7 @@ describe('conversation pagination', () => {
     await act(async () => { await result.current.refresh(); });
     expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
       includeMessageId: 'message-7',
-      limit: 100,
+      limit: 30,
     });
     expect(fetchStrategicConversation.mock.calls[0][1]).not.toHaveProperty('search');
     expect(onTargetFetched).toHaveBeenCalledWith('message-7');
