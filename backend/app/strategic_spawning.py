@@ -83,6 +83,7 @@ from app.capability_registry import (
 from app.problem_model import (
     REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY,
     resolve_project_purpose,
+    sanitize_problem_model_raw,
 )
 
 # The agent-view problem_model builder cluster (count-based trim, guaranteed-
@@ -4286,7 +4287,7 @@ async def _spawn_design_doc_update(
         cycle_id=cycle_id,
         phase1_task_id=new_task.id,
         baseline_vision=project.vision or {},
-        baseline_problem_model=project.problem_model or {},
+        baseline_problem_model=sanitize_problem_model_raw(project.problem_model or {}),
         baseline_running_update=project.running_update,
     )
     await commit_legacy_authorized(
@@ -5504,7 +5505,7 @@ async def _spawn_strategic_review(
         # an architecture cycle's Phase 2.
         cycle_id = strategic_cycle.new_cycle_id()
         _base_vision = dict(project.vision or {})
-        _base_problem_model = dict(project.problem_model or {})
+        _base_problem_model = sanitize_problem_model_raw(project.problem_model or {})
         _base_running_update = (
             project.running_update if isinstance(project.running_update, str) else ""
         )

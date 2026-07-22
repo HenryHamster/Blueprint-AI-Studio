@@ -32,6 +32,7 @@ from app.models import (
     StrategicCycle,
     Task,
 )
+from app.problem_model import sanitize_problem_model_raw
 from app.strategic_constants import CYCLE_SUMMARY_MAX
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 from app.time_utils import _utcnow
@@ -524,7 +525,7 @@ def baseline_problem_model(cycle: StrategicCycle) -> dict[str, Any]:
     operator-owned field is not clobbered by the agent's stale write."""
     meta = cycle.cycle_metadata or {}
     snap = meta.get("baseline_problem_model")
-    return dict(snap) if isinstance(snap, dict) else {}
+    return sanitize_problem_model_raw(dict(snap)) if isinstance(snap, dict) else {}
 
 
 AGENT_PM_PROPOSAL_KEY = "agent_problem_model_proposal"

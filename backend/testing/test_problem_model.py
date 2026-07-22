@@ -6445,3 +6445,43 @@ def test_apply_agent_update_no_wipe_risk_on_first_cycle():
     )
     assert "gaps_wipe_risk" not in diff
     assert "capabilities_wipe_risk" not in diff
+
+
+# ---------------------------------------------------------------------------
+# Regression: poisoned baseline_raw must not wedge apply_agent_update
+# ---------------------------------------------------------------------------
+
+
+def test_apply_agent_update_poisoned_baseline_sanitized():
+    """apply_agent_update succeeds when stored row AND baseline snapshot both
+    carry packer-injected markers (e.g. 'truncated': True).  Before the fix,
+    parse_problem_model(baseline_raw) threw extra_forbidden; the handler
+    converted that to HTTP 400, wedging every strategist problem-model write
+    for cycles that already had a poisoned snapshot."""
+    poisoned_marker = {"truncated": True, "_agent_view_floor_applied": True}
+
+    current = {
+        "revision": 7,
+        "intent": {"purpose": "Current purpose.", "current_focus": ""},
+        **poisoned_marker,
+    }
+    proposed = {
+        "intent": {"purpose": "Updated purpose.", "current_focus": ""},
+    }
+    baseline_raw = {
+        "revision": 6,
+        "intent": {"purpose": "Baseline purpose.", "current_focus": ""},
+        **poisoned_marker,
+    }
+
+    new_raw, diff = apply_agent_update(
+        current,
+        proposed,
+        "2026-07-22T10:00:00",
+        baseline_raw=baseline_raw,
+    )
+
+    assert new_raw["revision"] == 8
+    assert "truncated" not in new_raw
+    assert "_agent_view_floor_applied" not in new_raw
+    assert new_raw["intent"]["purpose"] == "Updated purpose."

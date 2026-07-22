@@ -3019,7 +3019,7 @@ def apply_agent_update(
     # operator edit is honored and reported faithfully.
     rejected_edits: list[dict[str, Any]] = []
     if baseline_raw is not None:
-        baseline = parse_problem_model(baseline_raw)
+        baseline = parse_problem_model(sanitize_problem_model_raw(baseline_raw))
         rejected_edits = _merge_operator_owned_fields(
             baseline, current, proposed, now_iso
         )
