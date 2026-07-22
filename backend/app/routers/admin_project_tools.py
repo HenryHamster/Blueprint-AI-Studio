@@ -220,9 +220,6 @@ _MANIFEST_TOOL_KNOWN_KEYS = {
     "slug", "title", "description", "placement", "entry",
 }
 
-# Valid placements (must match admin-ui rendering buckets).
-_VALID_PLACEMENTS = {"project_section", "toolbar", "sidebar"}
-
 # ── Skill schema (same manifest, parallel array) ─────────────────────────────
 #
 # Skills are declared in the same ``.blueprint/tools.json`` manifest as an
@@ -399,9 +396,6 @@ def _validate_manifest_tool(entry: Dict[str, Any], index: int) -> Optional[str]:
     # Reject paths containing ".." (traversal) or starting with "/" (absolute).
     if ".." in entry_path or entry_path.startswith("/"):
         return f"tools[{index}]: entry path must be relative and must not contain '..'"
-    placement = entry.get("placement", "project_section")
-    if placement not in _VALID_PLACEMENTS:
-        return f"tools[{index}]: placement must be one of {sorted(_VALID_PLACEMENTS)}"
     # Extra unknown keys: silently ignored.
     return None
 

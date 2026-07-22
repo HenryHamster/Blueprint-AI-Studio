@@ -864,15 +864,14 @@ def test_validate_manifest_tool_path_traversal_entry():
     assert "relative" in err2.lower() or "absolute" in err2.lower() or "'/'" in err2
 
 
-def test_validate_manifest_tool_bad_placement():
-    """Unknown placement values are rejected."""
+def test_validate_manifest_tool_accepts_any_placement():
+    """Placement is no longer validated — any value is accepted (Phase 2 of custom-tools CUT)."""
     from app.routers.admin_project_tools import _validate_manifest_tool
 
     err = _validate_manifest_tool(
         {"slug": "ok", "title": "T", "entry": "e.html", "placement": "bad_spot"}, 0
     )
-    assert err is not None
-    assert "placement" in err
+    assert err is None
 
 
 def test_normalize_manifest_tool_shape():
