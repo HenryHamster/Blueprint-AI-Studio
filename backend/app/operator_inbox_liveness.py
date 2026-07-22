@@ -36,7 +36,7 @@ from collections import deque
 from datetime import datetime
 from typing import Any, Deque, Dict, List, NamedTuple
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlmodel import select
 
 from app.time_utils import _utcnow
@@ -333,7 +333,7 @@ async def _find_open_quarantine_alert(
 
 async def _escalate_reply_quarantine_alert(
     session: Any,
-    result: "LivenessResult",
+    result: LivenessResult,
 ) -> None:
     """Create or update an OPERATOR_ACTION_NEEDED alert for reply-audience quarantine.
 
@@ -581,6 +581,8 @@ async def run_operator_inbox_liveness_check(
         # audience (STRATEGIST_INTERNAL or PIPELINE_LOG).  These are operator-
         # directed replies that silently resolve to the wrong audience and are
         # never surfaced — the exact 'dropped operator replies' bug class.
+        # Covers both reply_to-threaded messages and cover-style messages
+        # (with _resident_reply_covered_message_ids but no reply_to).
         quarantined_reply_count = int(
             (
                 await session.execute(
@@ -588,7 +590,10 @@ async def run_operator_inbox_liveness_check(
                     .select_from(ProjectMessage)
                     .where(
                         ProjectMessage.project_id == project_id,
-                        ProjectMessage.reply_to_message_id.isnot(None),
+                        or_(
+                            ProjectMessage.reply_to_message_id.isnot(None),
+                            ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
+                        ),
                         ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
                         ProjectMessage.context["audience"].as_string().in_(
                             _NON_OPERATOR_AUDIENCES
@@ -663,7 +668,10 @@ async def run_operator_inbox_liveness_check(
                     select(ProjectMessage)
                     .where(
                         ProjectMessage.project_id == project_id,
-                        ProjectMessage.reply_to_message_id.isnot(None),
+                        or_(
+                            ProjectMessage.reply_to_message_id.isnot(None),
+                            ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
+                        ),
                         ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
                         ProjectMessage.context["audience"].as_string().in_(
                             _NON_OPERATOR_AUDIENCES

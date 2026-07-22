@@ -1207,6 +1207,38 @@ async def _create_reply_message(
     return str(reply.id), reply_to_id
 
 
+async def _create_cover_message(
+    session,
+    project_id: str,
+    *,
+    audience: str,
+    status: str = "open",
+) -> str:
+    """Create a ProjectMessage with _resident_reply_covered_message_ids but
+    no reply_to_message_id — simulating a conversational/resident reply that
+    covers operator messages without threading a single reply_to.
+
+    Returns the new message's id.
+    """
+    from app.models import ProjectMessage
+
+    pid = _uuid.UUID(project_id)
+    msg = ProjectMessage(
+        project_id=pid,
+        from_type="system",
+        message_type="NOTE",
+        status=status,
+        content="Cover message (no reply_to) with quarantined audience",
+        context={
+            "audience": audience,
+            "_resident_reply_covered_message_ids": ["parent-1", "parent-2"],
+        },
+    )
+    session.add(msg)
+    await session.flush()
+    return str(msg.id)
+
+
 @pytest.mark.asyncio
 async def test_reply_audience_quarantined_detected_for_strategist_internal_reply(db_session):
     """A reply_to-bearing message with STRATEGIST_INTERNAL audience is flagged
@@ -1332,6 +1364,97 @@ async def test_message_without_reply_to_not_quarantined(db_session):
                 f"Non-reply STRATEGIST_INTERNAL message must not be quarantined, "
                 f"got reply_audience_quarantined={proj[0].reply_audience_quarantined}"
             )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_cover_message_quarantined_detected(db_session):
+    """A cover-style message (no reply_to, but _resident_reply_covered_message_ids set)
+    with STRATEGIST_INTERNAL audience is flagged with reply_audience_quarantined=1.
+
+    Covers the fix where the inverse detector also matches cover-style
+    conversational/resident replies that lack reply_to_message_id but carry
+    _resident_reply_covered_message_ids in their context.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "cover-quarantine-test")
+    await _create_cover_message(db_session, project_id, audience=STRATEGIST_INTERNAL)
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+    assert r.reply_audience_quarantined == 1, (
+        f"Expected reply_audience_quarantined=1 for cover message with "
+        f"STRATEGIST_INTERNAL audience, got {r.reply_audience_quarantined}"
+    )
+    assert r.status == "flagged", (
+        f"Project with quarantined cover message must be flagged, got {r.status!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_cover_message_quarantined_is_healed(db_session):
+    """A quarantined cover-style message is healed within the liveness tick:
+    its audience is re-stamped to an operator-visible value and delivered_at is set.
+
+    Covers the heal side of the fix: the fetch query that feeds
+    _heal_quarantined_replies must also match cover-style messages.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL, is_operator_visible
+    from app.models import ProjectMessage
+    from sqlmodel import select as _select
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "cover-heal-test")
+    msg_id = await _create_cover_message(db_session, project_id, audience=STRATEGIST_INTERNAL)
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+
+    # Heal count must be reported
+    assert r.reply_audience_healed >= 1, (
+        f"Expected reply_audience_healed >= 1 for quarantined cover message, "
+        f"got {r.reply_audience_healed}"
+    )
+
+    # The row must now have an operator-visible audience and delivered_at stamped.
+    msg = (
+        await db_session.execute(
+            _select(ProjectMessage).where(
+                ProjectMessage.id == _uuid.UUID(msg_id)
+            )
+        )
+    ).scalars().first()
+    assert msg is not None
+
+    healed_audience = (msg.context or {}).get("audience")
+    assert is_operator_visible(healed_audience), (
+        f"Healed cover message must have operator-visible audience, "
+        f"got {healed_audience!r}"
+    )
+    assert msg.delivered_at is not None, (
+        "Healed cover message must have delivered_at stamped as durable delivery receipt"
+    )
 
     _liveness_mod._reset_liveness_for_tests()
 
