@@ -1069,3 +1069,124 @@ class TestAutoArmConfigPlumbing:
                 {"usage_headroom_auto_arm_observation_minutes": 0}, None, {}
             )
         assert ei.value.status_code == 400
+
+
+# ── API-key account live-completion header capture ────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestApiKeyCompletionHeadersPopulateUsageMeter:
+    """API-key accounts should populate the usage meter via rate-limit headers
+    returned by a minimal messages.create call (probe_usage API_KEY path).
+
+    Named test: test_api_key_completion_headers_populate_usage_meter
+    """
+
+    async def test_api_key_completion_headers_populate_usage_meter(self, monkeypatch):
+        """Valid API-key account gets a known UsageSnapshot from live-completion headers."""
+        from app.providers.anthropic import AnthropicProvider
+        from app.models import LLMAuthMode
+
+        rate_limit_data = {
+            "source": "messages_api_header",
+            "updated_at": "2026-07-22T10:00:00+00:00",
+            "unified_5h": {
+                "remaining_tokens": 80000,
+                "limit_tokens": 100000,
+                "status": "live",
+                "resets_at": "2026-07-22T15:00:00Z",
+                "utilization": 20.0,
+            },
+        }
+
+        async def fake_call_direct_llm(api_key, *, messages, max_tokens, timeout, **kw):
+            assert api_key == "sk-ant-api-test-key"
+            assert max_tokens == 1
+            return ("1", rate_limit_data)
+
+        monkeypatch.setattr(
+            "app.direct_llm_client.call_direct_llm",
+            fake_call_direct_llm,
+        )
+
+        provider = AnthropicProvider()
+        snap = await provider.probe_usage("sk-ant-api-test-key", LLMAuthMode.API_KEY)
+
+        assert snap.known is True, "expected known snapshot from API-key headers"
+        assert "five_hour" in snap.window_utilizations
+        assert snap.window_utilizations["five_hour"] == 20.0
+        assert snap.resets_at.get("five_hour") == "2026-07-22T15:00:00Z"
+
+    async def test_api_key_no_secret_returns_unknown(self):
+        """No secret → unknown without calling messages.create."""
+        from app.providers.anthropic import AnthropicProvider
+        from app.models import LLMAuthMode
+
+        provider = AnthropicProvider()
+        snap = await provider.probe_usage(None, LLMAuthMode.API_KEY)
+
+        assert snap.known is False
+
+    async def test_api_key_call_error_returns_unknown(self, monkeypatch):
+        """call_direct_llm raising → unknown (never raises out of probe_usage)."""
+        from app.providers.anthropic import AnthropicProvider
+        from app.models import LLMAuthMode
+
+        async def fake_call_direct_llm(api_key, *, messages, max_tokens, timeout, **kw):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(
+            "app.direct_llm_client.call_direct_llm",
+            fake_call_direct_llm,
+        )
+
+        provider = AnthropicProvider()
+        snap = await provider.probe_usage("sk-ant-api-test-key", LLMAuthMode.API_KEY)
+
+        assert snap.known is False
+
+    async def test_api_key_no_unified_5h_data_returns_unknown(self, monkeypatch):
+        """Response with no unified_5h bucket → unknown snapshot."""
+        from app.providers.anthropic import AnthropicProvider
+        from app.models import LLMAuthMode
+
+        async def fake_call_direct_llm(api_key, *, messages, max_tokens, timeout, **kw):
+            return ("1", {"source": "messages_api_header", "updated_at": "2026-07-22T10:00:00Z"})
+
+        monkeypatch.setattr(
+            "app.direct_llm_client.call_direct_llm",
+            fake_call_direct_llm,
+        )
+
+        provider = AnthropicProvider()
+        snap = await provider.probe_usage("sk-ant-api-test-key", LLMAuthMode.API_KEY)
+
+        assert snap.known is False
+
+    async def test_api_key_account_eligible_with_runtime_secret(self):
+        """_account_meter_eligible returns True for API_KEY accounts with runtime_secret."""
+        from app.max_plan_pool import _account_meter_eligible
+
+        acct = {
+            "id": "api-key-acct",
+            "provider": "anthropic",
+            "auth_mode": "api_key",
+            "enabled": True,
+            "oauth_token": None,
+            "runtime_secret": "sk-ant-api-key-secret",
+        }
+        assert _account_meter_eligible(acct) is True
+
+    async def test_api_key_account_ineligible_without_runtime_secret(self):
+        """_account_meter_eligible returns False for API_KEY accounts without runtime_secret."""
+        from app.max_plan_pool import _account_meter_eligible
+
+        acct = {
+            "id": "api-key-acct",
+            "provider": "anthropic",
+            "auth_mode": "api_key",
+            "enabled": True,
+            "oauth_token": None,
+            "runtime_secret": None,
+        }
+        assert _account_meter_eligible(acct) is False

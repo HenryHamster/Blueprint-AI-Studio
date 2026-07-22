@@ -3145,19 +3145,22 @@ def _restore_usage_state(
 def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
     """True iff this account can produce a usage snapshot worth probing.
 
-    Only Anthropic OAuth accounts have a usage source today (every other
-    provider/auth combination resolves to ``UsageSnapshot.unknown()`` — see
-    the ``probe_usage`` implementations), so the meter loop skips the rest
-    rather than burning no-op probes.
+    Anthropic OAuth accounts probe the /api/oauth/usage endpoint.
+    Anthropic API-key accounts probe via a minimal messages.create call to
+    capture rate-limit headers.  Every other provider/auth combination
+    resolves to ``UsageSnapshot.unknown()`` so the meter loop skips them.
     """
     provider = _normalize_provider_name(acct.get("provider"))
     auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
-    return (
-        provider == LLMProviderName.ANTHROPIC.value
-        and auth_mode == LLMAuthMode.OAUTH.value
-        and bool(acct.get("enabled", True))
-        and bool(acct.get("oauth_token") or acct.get("runtime_secret"))
-    )
+    if provider != LLMProviderName.ANTHROPIC.value:
+        return False
+    if not bool(acct.get("enabled", True)):
+        return False
+    if auth_mode == LLMAuthMode.OAUTH.value:
+        return bool(acct.get("oauth_token") or acct.get("runtime_secret"))
+    if auth_mode == LLMAuthMode.API_KEY.value:
+        return bool(acct.get("runtime_secret"))
+    return False
 
 
 async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
@@ -3710,8 +3713,19 @@ def _usage_dark_reason(acct: Dict[str, Any]) -> str | None:
     - ``None``: meter is known (should not be called on known snapshots).
     """
     auth_mode = _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
+    provider = _normalize_provider_name(acct.get("provider"))
+    # Anthropic API-key accounts with a runtime_secret are now meter-eligible
+    # (they probe via messages.create headers).  All other non-OAuth modes are
+    # ineligible and classified as not_oauth.
     if auth_mode != LLMAuthMode.OAUTH.value:
-        return "not_oauth"
+        if (
+            auth_mode == LLMAuthMode.API_KEY.value
+            and provider == LLMProviderName.ANTHROPIC.value
+            and bool(acct.get("runtime_secret"))
+        ):
+            pass  # fall through to the eligible path below
+        else:
+            return "not_oauth"
     secret = acct.get("oauth_token") or acct.get("runtime_secret")
     if not secret:
         if acct.get("secret_fetch_failed"):

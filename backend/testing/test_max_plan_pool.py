@@ -3038,8 +3038,19 @@ class TestUsageDarkReason:
     """Each ineligible/failing dark-meter state has a distinct machine-readable reason."""
 
     def test_not_oauth_reason(self):
+        # API-key account without runtime_secret is still ineligible
         acct = _acct(auth_mode="api_key", oauth_token=None)
         assert _usage_dark_reason(acct) == "not_oauth"
+
+    def test_not_oauth_reason_with_runtime_secret_is_never_probed(self):
+        # Anthropic API-key account WITH runtime_secret is now meter-eligible → never_probed
+        acct = _acct(
+            provider="anthropic",
+            auth_mode="api_key",
+            oauth_token=None,
+            runtime_secret="sk-ant-api-key-test",
+        )
+        assert _usage_dark_reason(acct) == "never_probed"
 
     def test_no_secret_reason(self):
         acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
@@ -3933,7 +3944,7 @@ class TestDetectPersistentlyDarkMeters:
     async def test_non_eligible_account_excluded(self):
         now = _utcnow()
         threshold = 1800
-        # API key account — not OAuth, so not eligible
+        # API key account without runtime_secret is ineligible (no key to probe with)
         self._register(
             _acct(
                 id="api-key",

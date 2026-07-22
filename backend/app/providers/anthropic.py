@@ -28,6 +28,36 @@ _USAGE_PROBE_BETA_HEADER = "oauth-2025-04-20"
 _USAGE_PROBE_TIMEOUT_SECONDS = 5.0
 
 
+def _snapshot_from_rate_limit_data(
+    rate_limit_data: dict[str, Any], probed_at: str | None
+) -> UsageSnapshot:
+    """Convert a normalize_rate_limit_data() blob to a UsageSnapshot.
+
+    Maps the ``unified_5h`` bucket (utilization 0..100) to the ``five_hour``
+    window so the Messages-API header path produces the same window key used
+    by the OAuth probe path.  Returns unknown when the blob is missing or
+    lacks a numeric utilization.
+    """
+    if not isinstance(rate_limit_data, dict):
+        return UsageSnapshot.unknown(probed_at)
+    entry = rate_limit_data.get("unified_5h")
+    if not isinstance(entry, dict):
+        return UsageSnapshot.unknown(probed_at)
+    util = entry.get("utilization")
+    if isinstance(util, bool) or not isinstance(util, (int, float)):
+        return UsageSnapshot.unknown(probed_at)
+    resets: dict[str, str | None] = {}
+    reset = entry.get("resets_at")
+    if isinstance(reset, str) and reset:
+        resets["five_hour"] = reset
+    return UsageSnapshot(
+        known=True,
+        window_utilizations={"five_hour": float(util)},
+        resets_at=resets,
+        probed_at=probed_at,
+    )
+
+
 def _coerce_utilization(raw: Any) -> float | None:
     """Coerce a utilization field to a float, rejecting bools and non-numerics."""
     if isinstance(raw, bool):
@@ -257,21 +287,25 @@ class AnthropicProvider(LLMProvider):
         auth_mode: LLMAuthMode,
         provider_metadata: Mapping[str, Any] | None = None,
     ) -> UsageSnapshot:
-        """Probe the OAuth usage-headroom endpoint. Advisory; never raises.
+        """Probe for usage-headroom data. Advisory; never raises.
 
-        Only OAuth accounts have this source; API-key auth has no equivalent
-        usage endpoint, so it resolves to unknown. Any HTTP/auth/timeout error
-        or schema drift also resolves to unknown so a probe failure can never
+        OAuth accounts probe the /api/oauth/usage endpoint.
+        API-key accounts make a minimal messages.create call to capture
+        rate-limit headers from the response.  Any HTTP/auth/timeout error
+        or schema drift resolves to unknown so a probe failure can never
         block, delay, or fail a claim.
         """
         self.ensure_supported_auth_mode(auth_mode)
-        if auth_mode != LLMAuthMode.OAUTH or not secret:
+        if not secret:
             return UsageSnapshot.unknown()
-        # Stamp probed_at locally so the snapshot is timestamped even on the
-        # failure path (the cache uses its own wall-clock TTL separately).
         from app.time_utils import _utcnow
 
         probed_at = _utcnow().isoformat()
+        if auth_mode == LLMAuthMode.API_KEY:
+            return await self._probe_usage_api_key(secret, probed_at)
+        if auth_mode != LLMAuthMode.OAUTH:
+            return UsageSnapshot.unknown()
+        # Stamp probed_at already set above for API_KEY path; re-use here.
         try:
             import httpx
         except ImportError:
@@ -296,6 +330,34 @@ class AnthropicProvider(LLMProvider):
             )
             return UsageSnapshot.unknown(probed_at)
         return _normalize_anthropic_usage(data, probed_at)
+
+    async def _probe_usage_api_key(
+        self, api_key: str, probed_at: str
+    ) -> UsageSnapshot:
+        """Probe usage via a minimal messages.create call for API-key accounts.
+
+        Makes a 1-token completion solely to capture the rate-limit headers
+        returned by every Anthropic Messages API response. Advisory and
+        never-raises — any error resolves to unknown.
+        """
+        try:
+            from app.direct_llm_client import call_direct_llm
+        except ImportError:
+            logger.warning("[ANTHROPIC] direct_llm_client unavailable; skipping API-key usage probe")
+            return UsageSnapshot.unknown(probed_at)
+        try:
+            _text, rate_limit_data = await call_direct_llm(
+                api_key,
+                messages=[{"role": "user", "content": "1"}],
+                max_tokens=1,
+                timeout=_USAGE_PROBE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 — unknown is the contract
+            logger.info(
+                "[ANTHROPIC] API-key usage probe failed: %s (returning unknown)", exc
+            )
+            return UsageSnapshot.unknown(probed_at)
+        return _snapshot_from_rate_limit_data(rate_limit_data, probed_at)
 
     def settings_schema(self) -> dict[str, Any]:
         # Permission mode is intentionally NOT exposed: anything other than
