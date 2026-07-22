@@ -3950,7 +3950,8 @@ async def _handle_walkthrough_e2e_completion(
     ``"PASS"`` it calls :func:`app.acceptance_criteria.record_evidence` with
     ``source_kind="walkthrough_e2e"`` so the criterion gains a time-bounded,
     SHA-pinned ``'covered'`` tier (see
-    :func:`app.acceptance_criteria._evidence_is_walkthrough_e2e`).
+    :func:`app.acceptance_criteria._evidence_is_walkthrough_e2e_covered`, which
+    ``_evidence_proves_covered`` delegates to).
 
     Fail-open: any parse or DB error is logged and ignored — a broken ingestion
     must never strand the surrounding post-commit flow.  The completion handler

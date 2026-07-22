@@ -874,6 +874,81 @@ async function main() {
   console.log('='.repeat(70));
 
   writeReport(startTs, integrityResult);
+  writeJsonResult(startTs);
+}
+
+// ── JSON result writer (machine-readable) ────────────────────────────────────
+
+/**
+ * Write a machine-readable JSON result artifact so the walkthrough_e2e agent
+ * handler can parse per-criterion results and POST SHA-pinned evidence.
+ *
+ * Respects the WALKTHROUGH_RESULT_FILE env var; defaults to
+ * /tmp/walkthrough_result.json.
+ *
+ * The SHA integrity gate (git cat-file) is enforced: if the SHA isn't
+ * reachable, the JSON is written with passed=false for every criterion so a
+ * fabricated SHA can never produce covered evidence.
+ */
+function writeJsonResult(startTs) {
+  const resultFile = process.env.WALKTHROUGH_RESULT_FILE || '/tmp/walkthrough_result.json';
+  const shaValid = verifyShaExists(HEAD_SHA);
+
+  // Map step results to per-criterion pass/fail.
+  // Flow 1 → c-dfdc9d82 (Runner Enrollment)
+  const runnerReg = results.find(r => r.name.includes('1a.'));
+  const fleetVisible = results.find(r => r.name.includes('1b.'));
+  const runnerEnrollmentPassed = shaValid
+    && (runnerReg?.verdict === 'PASS')
+    && (fleetVisible?.verdict === 'PASS');
+  const runnerNotes = runnerEnrollmentPassed
+    ? 'Runner registration API succeeded and runner visible in fleet list'
+    : [
+        runnerReg?.verdict !== 'PASS' ? `runner registration: ${runnerReg?.verdict || 'NOT RUN'}` : '',
+        fleetVisible?.verdict !== 'PASS' ? `fleet visibility: ${fleetVisible?.verdict || 'NOT RUN'}` : '',
+        !shaValid ? 'SHA integrity check failed' : '',
+      ].filter(Boolean).join('; ') || 'Runner enrollment not evaluated';
+
+  // Flow 2 → c-f52fd975 (iframe subresource token)
+  const mintAuth = results.find(r => r.name.includes('2b.'));
+  const pathRoute = results.find(r => r.name.includes('2c.'));
+  const iframeTokenPassed = shaValid
+    && (mintAuth?.verdict === 'PASS')
+    && (pathRoute?.verdict === 'PASS');
+  const iframeNotes = iframeTokenPassed
+    ? 'Asset-token endpoint auth passes and path-embedded token route registered'
+    : [
+        mintAuth?.verdict !== 'PASS' ? `asset-token auth: ${mintAuth?.verdict || 'NOT RUN'}` : '',
+        pathRoute?.verdict !== 'PASS' ? `path-embedded route: ${pathRoute?.verdict || 'NOT RUN'}` : '',
+        !shaValid ? 'SHA integrity check failed' : '',
+      ].filter(Boolean).join('; ') || 'iframe subresource token check not evaluated';
+
+  // Walkthrough meta → c-5214996f
+  const passCount = results.filter(r => r.verdict === 'PASS').length;
+  const walkthroughMetaPassed = shaValid && passCount > 0;
+  const walkthroughNotes = walkthroughMetaPassed
+    ? `Live walkthrough completed against SHA ${HEAD_SHA} at ${startTs} with ${passCount} passing steps`
+    : shaValid
+      ? 'No steps passed — walkthrough did not complete successfully'
+      : 'SHA integrity check failed — walkthrough report not trustworthy';
+
+  const jsonResult = {
+    git_sha: HEAD_SHA,
+    run_timestamp: startTs,
+    results: [
+      { criterion_key: 'c-dfdc9d82', passed: runnerEnrollmentPassed, notes: runnerNotes },
+      { criterion_key: 'c-f52fd975', passed: iframeTokenPassed, notes: iframeNotes },
+      { criterion_key: 'c-5214996f', passed: walkthroughMetaPassed, notes: walkthroughNotes },
+    ],
+  };
+
+  try {
+    fs.mkdirSync(path.dirname(resultFile), { recursive: true });
+    fs.writeFileSync(resultFile, JSON.stringify(jsonResult, null, 2));
+    console.log(`\nJSON result → ${resultFile}`);
+  } catch (err) {
+    console.error(`\n[ERROR] Failed to write JSON result to ${resultFile}:`, err.message);
+  }
 }
 
 // ── Report writer ─────────────────────────────────────────────────────────────

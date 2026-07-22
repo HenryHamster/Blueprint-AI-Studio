@@ -68,6 +68,7 @@ const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'web_research',
   'design',
   'capability_proof_trial',
+  'walkthrough_e2e',
 ]);
 
 /** Build a complete, valid capability contract covering every agent task type. */

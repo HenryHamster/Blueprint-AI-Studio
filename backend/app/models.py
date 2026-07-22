@@ -307,6 +307,13 @@ class ArtifactType(str, Enum):
     # CriterionEvidence rows. ArtifactType is a plain String column so no
     # migration is needed.
     WALKTHROUGH_E2E_RESULT = "WALKTHROUGH_E2E_RESULT"
+    # Result of the AUTONOMOUS walkthrough_e2e evidence lane: the machine-readable
+    # {git_sha, run_timestamp, results:[{criterion_key, passed, notes}]} report the
+    # live-stack handler captured. Unlike WALKTHROUGH_E2E_RESULT this artifact is
+    # NOT re-ingested by the completion handler — the handler POSTs SHA-pinned
+    # CriterionEvidence directly to the ingestion endpoint. Plain String column so
+    # no migration is needed.
+    WALKTHROUGH_E2E_REPORT = "WALKTHROUGH_E2E_REPORT"
 
 
 class SourceKind(str, Enum):

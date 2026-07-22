@@ -162,7 +162,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         allowlist=(
             BranchLiteralAllowEntry(
                 path="prompts/review-prompt.ts",
-                line=341,
+                line=327,
                 pattern="fallback-main",
                 rationale=(
                     "buildRollupReviewGuidance is downstream of resolveBaseBranch; the "

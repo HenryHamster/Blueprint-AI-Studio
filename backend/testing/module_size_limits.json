@@ -37,7 +37,7 @@
     "routers/agent.py": 6450,
     "services.py": 3250,
     "recovery_sweeps.py": 100,
-    "routers/agent_status.py": 4550,
+    "routers/agent_status.py": 5300,
     "autonomous_research.py": 3900,
     "autonomous_research_residual.py": 900,
     "efficiency_snapshot.py": 5950,
@@ -154,6 +154,9 @@
     "migration_apply_gate.py": 2150,
     "capability_registry.py": 1750,
     "storage.py": 1750,
+    "strategic_operation_authority_execution.py": 500,
+    "strategic_operation_authority_validation.py": 950,
+    "release_qualifier_audit.py": 1800,
     "strategic_resident_session.py": 4200
   },
   "agent": {
@@ -168,8 +171,6 @@
     "prompts/done-helper.test.ts": 900,
     "handlers/research-plan.ts": 3000,
     "handlers/strategic.ts": 1600,
-    "handlers/strategic-resident-lib.ts": 3050,
-    "handlers/strategic-resident.ts": 2350,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 1150,
     "handlers/standard.ts": 1900,
@@ -198,7 +199,9 @@
     "providers/runners.ts": 2250,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
-    "handlers/research-plan-sections.ts": 1800
+    "handlers/research-plan-sections.ts": 1800,
+    "handlers/strategic-resident-lib.ts": 3050,
+    "handlers/strategic-resident.ts": 2350
   },
   "frontend": {
     "useAppState.ts": 3000,

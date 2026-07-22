@@ -764,6 +764,25 @@ class ReleaseMergeGradePayload(_SystemPopulated):
     prompt: str | None = None
 
 
+class WalkthroughE2EPayload(_SystemPopulated):
+    """Payload for the internal qualifier-spawned ``walkthrough_e2e`` task.
+
+    Mirrors the other qualifier-spawned verification types (release_audit /
+    release_merge_grade): the task scores ONE pinned candidate commit
+    (``candidate_sha``) by running the live-stack browser walkthrough against it
+    and posting SHA-pinned CriterionEvidence. Fields are optional because
+    ``_SystemPopulated`` / BasePayload are extra-field tolerant (``extra='allow'``)
+    and the backend populates them at spawn time; the ingestion endpoint — not
+    this schema — enforces the SHA-match safety gate before writing covered-tier
+    evidence, so validation only needs to accept the shape cleanly.
+    """
+
+    candidate_sha: str | None = None
+    qualification_attempt_id: str | None = None
+    release_version_id: str | None = None
+    project_id: str | None = None
+
+
 class QAPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     pass
 
@@ -778,17 +797,6 @@ class DocsPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
 
 class SmokestestPayload(_SystemPopulated):
     health_check_urls: list[str] | None = None
-
-
-class WalkthroughE2ePayload(_SystemPopulated):
-    """Payload for the qualifier-spawned ``walkthrough_e2e`` task.
-
-    Like ``SmokestestPayload``, the task carries the integration branch plus
-    the snapshotted ``candidate_sha`` so the handler can check out the exact
-    commit before running the live-stack walkthrough harness.
-    """
-
-    candidate_sha: str | None = None
 
 
 class VerifyTestsPayload(_SystemPopulated):
@@ -1260,6 +1268,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.web_research: WebResearchPayload,
     TaskType.design: DesignPayload,
     TaskType.repo_bootstrap: RepoBootstrapPayload,
+    TaskType.walkthrough_e2e: WalkthroughE2EPayload,
     TaskType.salvage_bundle: BasePayload,
     # capability_proof_trial carries a small free-form payload ({cap, test_refs,
     # head_sha, max_test_files, wall_clock_seconds}); the extra-field-tolerant
@@ -1267,7 +1276,6 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     # salvage_bundle). The bounded caps are enforced at enrollment + in the agent
     # handler, not by the schema.
     TaskType.capability_proof_trial: BasePayload,
-    TaskType.walkthrough_e2e: WalkthroughE2ePayload,
 }
 
 

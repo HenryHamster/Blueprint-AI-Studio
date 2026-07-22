@@ -165,6 +165,7 @@ from app.release_qualifier_audit import (
     _spawn_release_audit_challenge_task,
     _spawn_release_audit_task,
     _spawn_release_merge_grade_task,
+    _spawn_qualifier_walkthrough_task,
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
@@ -2899,6 +2900,17 @@ async def run_qualification(
             "smoketest_enabled", _runtime_config.get("smoketest_enabled")
         )
     )
+    # walkthrough_e2e_enabled gates the qualifier-spawned live-stack walkthrough
+    # evidence lane.  Resolved with the SAME source precedence as the smoketest
+    # gate — per-project build_config override, then the fleet runtime_config
+    # flag (default False: ships dark).  The spawned child produces SHA-pinned
+    # CriterionEvidence and NEVER cascades a fix on failure (evidence-only).
+    walkthrough_e2e_enabled = bool(
+        (project.build_config or {}).get(
+            "walkthrough_e2e_enabled",
+            _runtime_config.get("walkthrough_e2e_enabled"),
+        )
+    )
     # Slice 3 (design 245212a4): the DEPLOYED-side env-preflight judge ships
     # DARK — env_preflight_enabled defaults False.  Resolve with the same source
     # precedence as the promotion rubric: per-project build_config override, then
@@ -2922,6 +2934,7 @@ async def run_qualification(
     audit_challenge_spawn_error: str | None = None
     audit_challenge_spawn_pending = True
     smoketest_task_id: str | None = None
+    walkthrough_e2e_task_id: str | None = None
     merge_grade_task_id: str | None = None
     # Blind merge-grade gate (dir d-c0fe439f): grade the merged diffs against the
     # frozen goal.  The goal is the ONLY narrative the grader sees — the spawn
@@ -3220,6 +3233,9 @@ async def run_qualification(
     # design 245212a4).  Spawn it when EITHER subsystem is enabled so the
     # env-preflight gate is independently enforceable without smoketest.
     _smoketest_needed = (smoketest_enabled or env_preflight_enabled) and "smoketest" not in resolved_dims
+    # The walkthrough_e2e child is evidence-only (no scored dimension), so it is
+    # gated purely on the enablement flag.
+    _walkthrough_e2e_needed = walkthrough_e2e_enabled
     _merge_grade_needed = (
         _merge_grade_goal_usable and "merge_grade" not in resolved_dims
     )
@@ -3304,6 +3320,15 @@ async def run_qualification(
                 qualification_attempt_id=attempt_id,
             )
             smoketest_task_id = str(smoketest_task.id)
+        if _walkthrough_e2e_needed:
+            walkthrough_e2e_task = await _spawn_qualifier_walkthrough_task(
+                session,
+                project_id,
+                version_id=version.id,
+                candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
+            )
+            walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
         logger.warning(
             "[RELEASE_QUALIFIER] failed to spawn qualification children for "
@@ -3404,6 +3429,11 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
+        # Evidence-only walkthrough child (None when the lane is disabled).  Not
+        # a required child for the in-flight / finalize gate — it produces
+        # CriterionEvidence, not a scored qualification dimension.
+        "walkthrough_e2e_enabled": walkthrough_e2e_enabled,
+        "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
         "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
@@ -3474,6 +3504,8 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
+        "walkthrough_e2e_enabled": walkthrough_e2e_enabled,
+        "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
     }
 

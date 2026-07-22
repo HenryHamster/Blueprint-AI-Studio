@@ -649,6 +649,71 @@ def test_stale_machine_probe_falls_back_to_partial():
     assert ac.compute_criterion_coverage([fresh]) == "probed"
 
 
+def test_walkthrough_e2e_evidence_covers_only_when_fresh_and_sha_pinned():
+    """A ``walkthrough_e2e`` row is 'covered' ONLY when fresh AND SHA-pinned.
+
+    This is the whole point of the walkthrough_e2e evidence lane: an autonomous
+    live-stack browser run that actually exercised the criterion against a pinned
+    candidate commit earns genuine machine-verified ``covered`` coverage — but
+    stale or committed walk evidence (e.g. 123 commits old) must stop counting,
+    and a row with no pinned SHA must not forge coverage.
+
+      (a) fresh + SHA-pinned            => 'covered'
+      (b) stale (older than the window) => NOT covered (falls back to 'partial')
+      (c) missing candidate_sha         => NOT covered (falls back to 'partial')
+    """
+    sha = "a" * 40
+
+    # (a) fresh + SHA-pinned → covered. One day of slack keeps the predicate's
+    # slightly-later _utcnow() from tipping the exact-boundary comparison.
+    fresh_pinned = _make_evidence(
+        ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+        detail={"candidate_sha": sha, "evaluated_at": _utcnow().isoformat()},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e_covered(fresh_pinned) is True
+    assert ac._evidence_proves_covered(fresh_pinned) is True
+    assert ac.compute_criterion_coverage([fresh_pinned]) == "covered"
+    # covered maps onto the shared EvidenceStatus axis as full machine-proof.
+    assert ac.criterion_evidence_status([fresh_pinned]) == "proven"
+
+    # (b) stale but SHA-pinned → NOT covered; the only evidence present is
+    # non-covering, so coverage falls back to 'partial'.
+    stale_pinned = _make_evidence(
+        ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+        detail={"candidate_sha": sha},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e_covered(stale_pinned) is False
+    assert ac._evidence_proves_covered(stale_pinned) is False
+    assert ac.compute_criterion_coverage([stale_pinned]) == "partial"
+
+    # (c) fresh but missing candidate_sha → NOT covered → 'partial'. Cover the
+    # blank-string, absent-key, and non-dict-detail variants.
+    for bad_detail in ({"candidate_sha": ""}, {"flow": "runner_enroll"}, None):
+        fresh_unpinned = _make_evidence(
+            ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+            detail=bad_detail,
+            recorded_at=_utcnow() - timedelta(days=1),
+        )
+        assert ac._evidence_is_walkthrough_e2e_covered(fresh_unpinned) is False
+        assert ac.compute_criterion_coverage([fresh_unpinned]) == "partial"
+
+    # A row with no recorded_at at all cannot grant perpetual trust.
+    no_ts = _make_evidence(
+        ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+        detail={"candidate_sha": sha},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_walkthrough_e2e_covered(no_ts) is False
+    assert ac.compute_criterion_coverage([no_ts]) == "partial"
+
+    # Machine-verified fresh+pinned walkthrough evidence coexisting with a bare
+    # partial signal still resolves to 'covered' (covering wins).
+    partial_only = _make_evidence("operator")
+    assert ac.compute_criterion_coverage([partial_only, fresh_pinned]) == "covered"
+
+
 # ---------------------------------------------------------------------------
 # _evidence_is_walkthrough_e2e + walkthrough_e2e coverage tier
 # ---------------------------------------------------------------------------
@@ -10186,3 +10251,178 @@ async def test_coverage_summary_evidence_carries_tier_and_provenance(db_session)
     reachability_entry = next(e for e in evidence_list if e["source_kind"] == "reachability")
     assert reachability_entry["tier"] == "covered"
     assert reachability_entry["provenance"] is None
+
+
+# ---------------------------------------------------------------------------
+# walkthrough_e2e evidence ingestion (record_walkthrough_e2e_evidence + endpoint)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_writes_covered_when_sha_matches(
+    db_session,
+):
+    """A matching candidate_sha writes covered-tier evidence for passed criteria."""
+    project = await _make_project_with_member(db_session, name="Walk-Match")
+    sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    passed = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    failed = await ac.create_criterion(db_session, project.id, version.id, "Iframe token")
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": passed.criterion_key, "passed": True, "notes": "green"},
+            {"criterion_key": failed.criterion_key, "passed": False, "notes": "red"},
+        ],
+        qualification_attempt_id="attempt-1",
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["skipped_not_passed"] == 1
+    assert summary["unmatched_keys"] == []
+
+    # The passing criterion is now covered by a SHA-pinned walkthrough row.
+    passed_ev = await ac.get_evidence_for_criterion(db_session, passed.id)
+    assert len(passed_ev) == 1
+    assert passed_ev[0].source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND
+    assert passed_ev[0].detail["candidate_sha"] == sha
+    assert passed_ev[0].detail["passed"] is True
+    assert "evaluated_at" in passed_ev[0].detail
+    assert ac.compute_criterion_coverage(passed_ev) == "covered"
+
+    # The failing criterion earned nothing.
+    failed_ev = await ac.get_evidence_for_criterion(db_session, failed.id)
+    assert failed_ev == []
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_rejects_mismatched_sha(db_session):
+    """A candidate_sha that does not match the qualifying SHA writes NOTHING."""
+    project = await _make_project_with_member(db_session, name="Walk-Mismatch")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "c" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha="d" * 40,  # wrong commit
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "candidate_sha_mismatch"
+    assert summary["recorded"] == 0
+    # A run against the wrong commit forged no coverage.
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_rejects_missing_sha(db_session):
+    """An empty candidate_sha is rejected outright (cannot pin coverage)."""
+    project = await _make_project_with_member(db_session, name="Walk-MissingSha")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "e" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha="   ",
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "missing_candidate_sha"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_happy_path(client: AsyncClient, db_session):
+    """POST .../walkthrough-e2e-evidence writes covered evidence and coverage flips."""
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint")
+    sha = "f" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": sha,
+            "qualification_attempt_id": "attempt-9",
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["recorded"] == 1
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[crit.criterion_key]["coverage"] == "covered"
+    assert summary["covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_rejects_mismatched_sha(
+    client: AsyncClient, db_session
+):
+    """POST with a mismatched candidate_sha returns 409 and writes nothing."""
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint-Bad")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "1" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": "2" * 40,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    # The app reshapes HTTPException into {"error": {"code", "message": detail}}.
+    assert resp.json()["error"]["message"]["reason"] == "candidate_sha_mismatch"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []

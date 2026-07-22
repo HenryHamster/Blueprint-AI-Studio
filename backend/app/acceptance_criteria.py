@@ -259,6 +259,19 @@ METRICS_INTEGRITY_EVIDENCE_KIND = "metrics_integrity_sweep"
 #: Recognised as covering by :func:`_evidence_proves_covered`.
 UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND = "unverified_merge_backfill"
 
+#: ``source_kind`` for autonomous live-stack walkthrough evidence written by the
+#: qualifier-spawned ``walkthrough_e2e`` task (see
+#: :func:`record_walkthrough_e2e_evidence`). A walkthrough_e2e row earns genuine
+#: machine-verified ``covered`` coverage — but ONLY when it is BOTH SHA-pinned
+#: (``detail["candidate_sha"]`` is non-empty) AND fresh (recorded within
+#: :data:`WALKTHROUGH_E2E_WINDOW_DAYS`). A stale row, or one missing its pinned
+#: SHA, does NOT count as covering and falls back to the lower ``partial`` tier —
+#: this is the whole point of the walkthrough_e2e evidence lane: stale/committed
+#: walk evidence (e.g. 123 commits old) must stop counting as coverage.
+#: Recognised as covering by :func:`_evidence_proves_covered` via
+#: :func:`_evidence_is_walkthrough_e2e_covered`.
+WALKTHROUGH_E2E_EVIDENCE_KIND = "walkthrough_e2e"
+
 # Markers that identify a criterion (or the Direction it is mapped to) as tracking
 # the data-integrity / metrics-integrity-sweep signal. Kept as a tight, specific
 # set so sweep evidence is attached ONLY to criteria whose success condition
@@ -336,6 +349,40 @@ _MACHINE_PROBE_EVIDENCE_KINDS: frozenset[str] = frozenset(
 ATTESTATION_FUTURE_SKEW_SECONDS = 60
 
 
+def _evidence_is_walkthrough_e2e_covered(e: CriterionEvidence) -> bool:
+    """Whether a single ``walkthrough_e2e`` row is fresh AND SHA-pinned covering.
+
+    Returns ``True`` only for ``source_kind == WALKTHROUGH_E2E_EVIDENCE_KIND``
+    whose evidence is BOTH:
+
+      * **SHA-pinned** — ``detail`` is a dict carrying a non-empty
+        ``candidate_sha`` (the exact commit the walkthrough ran against). A row
+        with no ``detail``, a non-dict ``detail``, or a missing/blank
+        ``candidate_sha`` is NOT covering — it cannot prove which commit it
+        exercised, so it must not forge coverage.
+      * **fresh** — ``recorded_at`` is within :data:`WALKTHROUGH_E2E_WINDOW_DAYS`
+        of now (mirroring the machine-probe time-bounding). A stale row, or one
+        with no ``recorded_at`` at all, is NOT covering — a missing timestamp
+        cannot grant perpetual trust.
+
+    Either failure drops the row out of the ``covered`` tier; because no other
+    predicate recognises this ``source_kind`` it then classifies as ``partial``
+    (evidence exists but none is covering). This is the whole point of the
+    walkthrough_e2e lane: stale or unpinned walk evidence must stop counting.
+    """
+    if e.source_kind != WALKTHROUGH_E2E_EVIDENCE_KIND:
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    candidate_sha = detail.get("candidate_sha")
+    if not isinstance(candidate_sha, str) or not candidate_sha.strip():
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=WALKTHROUGH_E2E_WINDOW_DAYS
+    )
+
+
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     """Whether a single evidence record satisfies the machine-verified 'covered' condition.
 
@@ -343,6 +390,12 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     that says the merge really reached the integration branch.
     ``task_merge`` requires ``proven=True`` in ``detail`` — a bare merge badge
     without acceptance-proof is not sufficient to qualify the criterion.
+
+    ``walkthrough_e2e`` (autonomous live-stack browser walkthrough) is covering
+    ONLY when it is BOTH SHA-pinned (``detail["candidate_sha"]`` non-empty) AND
+    fresh (recorded within :data:`WALKTHROUGH_E2E_WINDOW_DAYS`) — see
+    :func:`_evidence_is_walkthrough_e2e_covered`. A stale or unpinned row is not
+    covering and falls back to ``partial``.
 
     ``acceptance_window_recompute`` and ``metrics_integrity_sweep`` are
     deliberately NOT covering here.  Both prove only that a standing MECHANISM
@@ -371,13 +424,15 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         # criterion is satisfied once the backfill writes the evidence row.
         return True
     if e.source_kind == "walkthrough_e2e":
-        # A live-stack walkthrough that ran against a specific candidate SHA and
-        # passed.  Covering iff: (a) the row is fresh within
-        # WALKTHROUGH_E2E_WINDOW_DAYS, (b) ``detail["candidate_sha"]`` is present
-        # (prevents a bare or malformed row from granting trust), and (c) the
-        # ``detail["verdict"]`` is ``"PASS"``.  A stale, SHA-less, or non-PASS
-        # row decays to the underlying (partial/uncovered) state — fail-closed.
-        return _evidence_is_walkthrough_e2e(e)
+        # A live-stack walkthrough that ran against a specific candidate SHA.
+        # Covering iff: (a) the row is fresh within WALKTHROUGH_E2E_WINDOW_DAYS
+        # and (b) ``detail["candidate_sha"]`` is present (prevents a bare or
+        # malformed row from granting trust).  The ingestion endpoint only ever
+        # writes a row for a criterion the walkthrough marked passing, so the
+        # covering predicate is SHA-pinned + fresh — no separate ``verdict``
+        # field is stored.  A stale or SHA-less row decays to the underlying
+        # (partial/uncovered) state — fail-closed.
+        return _evidence_is_walkthrough_e2e_covered(e)
     # Unverified-merge backfill evidence is deliberately NOT covering here.  The
     # evidence only proves that the declared named_test was in the PR's changed
     # files — i.e. the test shipped — not that the merge was CI-verified or that
@@ -525,8 +580,13 @@ def _evidence_is_walkthrough_e2e(e: CriterionEvidence) -> bool:
       evidence.  A row with no ``recorded_at`` cannot grant perpetual trust and
       returns ``False``.
 
-    This function is the single gating predicate for the ``walkthrough_e2e``
-    source_kind; :func:`_evidence_proves_covered` delegates here.
+    LEGACY predicate: it additionally requires ``detail["verdict"] == "PASS"``.
+    The autonomous evidence lane no longer stores a ``verdict`` field (the
+    ingestion endpoint only writes a row for a passing criterion), so
+    :func:`_evidence_proves_covered` now delegates to
+    :func:`_evidence_is_walkthrough_e2e_covered` (SHA-pinned + fresh) instead.
+    This function is retained for the verdict-format rows written by the legacy
+    ``WALKTHROUGH_E2E_RESULT`` artifact ingestion path.
     """
     if e.source_kind != "walkthrough_e2e":
         return False
@@ -1014,7 +1074,9 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     Returns:
       'covered'    — at least one record is machine-verified covering evidence
                      (``reachability``, ``audit_finding_backfill`` always;
-                     ``task_merge`` only with ``detail["proven"] is True``)
+                     ``task_merge`` only with ``detail["proven"] is True``;
+                     ``walkthrough_e2e`` only when SHA-pinned AND fresh — see
+                     :func:`_evidence_is_walkthrough_e2e_covered``)
       'attested'   — no machine-verified evidence, but a NON-EXPIRED operator
                      attestation is present (a lower-confidence, time-bounded
                      waiver — see :func:`_evidence_is_attested`)
@@ -2363,6 +2425,186 @@ async def _resolve_acceptance_window_criteria(
                 targets[crit.id] = crit
 
     return list(targets.values())
+
+
+def _version_qualifying_candidate_sha(version: Any) -> str:
+    """Return the candidate SHA under qualification for ``version``, or ``""``.
+
+    Sourced from ``ReleaseVersion.last_qualification["candidate_sha"]`` — the
+    exact commit the qualifier is (or last was) scoring. Read defensively so a
+    missing/malformed blob yields an empty string rather than raising.
+    """
+    last_qualification = getattr(version, "last_qualification", None)
+    if not isinstance(last_qualification, dict):
+        return ""
+    return str(last_qualification.get("candidate_sha") or "").strip()
+
+
+async def record_walkthrough_e2e_evidence(
+    session: AsyncSession,
+    version: Any,
+    candidate_sha: str,
+    results: list[dict[str, Any]],
+    qualification_attempt_id: str | None = None,
+) -> dict[str, Any]:
+    """Map per-criterion ``walkthrough_e2e`` results into covered-tier evidence.
+
+    Each entry in ``results`` is a ``{criterion_key, passed, notes}`` dict. For
+    every entry whose ``passed`` is truthy, this resolves ``criterion_key`` to an
+    ACTIVE criterion on ``version`` and writes one covering
+    :data:`WALKTHROUGH_E2E_EVIDENCE_KIND` :class:`CriterionEvidence` row with
+    ``detail = {candidate_sha, evaluated_at, criterion_key, passed[, notes,
+    qualification_attempt_id]}`` and a ``source_id`` keyed on the qualification
+    attempt + criterion (so a re-run against the same attempt is an idempotent
+    no-op via the dedup unique index).
+
+    **CRITICAL SAFETY** — covered-tier evidence is written ONLY when the posted
+    ``candidate_sha`` is non-empty AND matches the version's qualifying candidate
+    SHA (:func:`_version_qualifying_candidate_sha`). A missing or mismatched SHA
+    writes NOTHING and is reported as ``rejected`` — a walkthrough run against the
+    wrong commit (or with no pinned SHA) can never forge coverage. Only
+    ``passed=True`` results are written; failing/absent results are skipped.
+
+    Returns a summary dict::
+
+        {"status": "recorded" | "rejected",
+         "rejected_reason": str | None,  # only when status == "rejected"
+         "recorded": int,                # rows newly written
+         "skipped_not_passed": int,      # results with passed falsy
+         "unmatched_keys": list[str],    # keys not resolving to an active criterion
+         "candidate_sha": str}
+
+    Best-effort per-row: a failure recording one criterion's evidence is logged
+    and does not abort the others.
+    """
+    posted_sha = str(candidate_sha or "").strip()
+    qualifying_sha = _version_qualifying_candidate_sha(version)
+    if not posted_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: missing candidate_sha for version %s "
+            "— rejecting (no coverage written)",
+            getattr(version, "id", None),
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "missing_candidate_sha",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+    if not qualifying_sha or posted_sha != qualifying_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: posted candidate_sha %s does not "
+            "match version %s qualifying SHA %r — rejecting (no coverage written)",
+            posted_sha[:12],
+            getattr(version, "id", None),
+            qualifying_sha[:12] if qualifying_sha else qualifying_sha,
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "candidate_sha_mismatch",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    project_id = version.project_id
+    release_version_id = version.id
+
+    # Only passed=True results are eligible; collect their keys (preserving order,
+    # de-duplicating) so a single query resolves all criteria at once.
+    passed_keys: list[str] = []
+    skipped_not_passed = 0
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if not key:
+            continue
+        if entry.get("passed") is True:
+            if key not in passed_keys:
+                passed_keys.append(key)
+        else:
+            skipped_not_passed += 1
+
+    if not passed_keys:
+        return {
+            "status": "recorded",
+            "rejected_reason": None,
+            "recorded": 0,
+            "skipped_not_passed": skipped_not_passed,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    criteria = await get_criteria_by_keys(
+        session, project_id, passed_keys, release_version_id=release_version_id
+    )
+    active_by_key = {c.criterion_key: c for c in criteria if c.status == "active"}
+    unmatched_keys = [k for k in passed_keys if k not in active_by_key]
+
+    # Look up the notes for each passed key from the first matching result.
+    notes_by_key: dict[str, Any] = {}
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if key and entry.get("passed") is True and key not in notes_by_key:
+            notes_by_key[key] = entry.get("notes")
+
+    evaluated_at = _utcnow().isoformat()
+    attempt_token = str(qualification_attempt_id or "na").strip() or "na"
+    recorded = 0
+    for key, criterion in active_by_key.items():
+        detail: dict[str, Any] = {
+            "candidate_sha": posted_sha,
+            "evaluated_at": evaluated_at,
+            "criterion_key": key,
+            "passed": True,
+        }
+        notes = notes_by_key.get(key)
+        if notes:
+            detail["notes"] = notes
+        if qualification_attempt_id:
+            detail["qualification_attempt_id"] = str(qualification_attempt_id)
+        source_id = f"walkthrough_e2e:{attempt_token}:{key}"
+        try:
+            await record_evidence(
+                session,
+                criterion_id=criterion.id,
+                project_id=project_id,
+                source_kind=WALKTHROUGH_E2E_EVIDENCE_KIND,
+                source_id=source_id,
+                detail=detail,
+            )
+            recorded += 1
+        except Exception:
+            logger.exception(
+                "record_walkthrough_e2e_evidence: failed to record evidence for "
+                "criterion %s (version %s)",
+                key,
+                getattr(version, "id", None),
+            )
+
+    logger.info(
+        "record_walkthrough_e2e_evidence: version=%s candidate_sha=%s recorded=%d "
+        "skipped_not_passed=%d unmatched=%s",
+        getattr(version, "id", None),
+        posted_sha[:12],
+        recorded,
+        skipped_not_passed,
+        unmatched_keys,
+    )
+    return {
+        "status": "recorded",
+        "rejected_reason": None,
+        "recorded": recorded,
+        "skipped_not_passed": skipped_not_passed,
+        "unmatched_keys": unmatched_keys,
+        "candidate_sha": posted_sha,
+    }
 
 
 async def record_acceptance_window_coverage_evidence(

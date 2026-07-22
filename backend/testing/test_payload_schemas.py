@@ -410,6 +410,7 @@ def test_fix_passes():
         "release_merge_grade",
         "verify_tests",
         "compute_experiment",
+        "walkthrough_e2e",
     ],
 )
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
