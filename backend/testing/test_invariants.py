@@ -13101,3 +13101,106 @@ def test_no_set_derived_word_tokens_in_durable_writes():
         "use a different dedup approach that preserves insertion order.\n\n"
         "Offending files:\n" + "\n".join(violating_files)
     )
+
+
+def test_no_set_ordered_tokens_in_human_readable_text():
+    """No app/ file may serialize a bare set into human-readable text via join, str(), or f-strings.
+
+    Complements test_no_set_derived_word_tokens_in_durable_writes (which catches list(set(.split()...))).
+    This test catches the broader class of set→string conversions:
+
+      - <sep>.join(set(...))          — iteration order is non-deterministic; fix: <sep>.join(sorted(set(...)))
+      - str(set(...))                 — repr output order is non-deterministic
+      - f"...{set(...)}..."           — same repr issue as str(set(...))
+
+    The rev-1367 bug scrambled operator-visible text because tokens were stored from set iteration order.
+    Any of these patterns serialized into durable text (direction summaries, strategic memory notes,
+    design-doc/problem-model text) produces non-deterministic output.
+
+    Sites that use sorted(set(...)) inside join() are CORRECT and are NOT flagged.
+    """
+    app_dir = BACKEND_ROOT / "app"
+    violations: list[str] = []
+
+    def _is_set_call(node: ast.expr) -> bool:
+        """Return True if node is a bare set() call or set literal."""
+        if isinstance(node, ast.Call):
+            return isinstance(node.func, ast.Name) and node.func.id == "set"
+        return isinstance(node, ast.Set)
+
+    def _is_sorted_set(node: ast.expr) -> bool:
+        """Return True if node is sorted(set(...)) — the safe pattern."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "sorted"):
+            return False
+        if not node.args:
+            return False
+        inner = node.args[0]
+        # Allow sorted(set(...)) and sorted(set(...) - ...) etc.
+        if _is_set_call(inner):
+            return True
+        if isinstance(inner, ast.BinOp) and _is_set_call(inner.left):
+            return True
+        return False
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        source = py_file.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            # Pattern 1: <sep>.join(set(...)) — bare set, NOT wrapped in sorted()
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "join"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                arg = node.args[0]
+                if _is_set_call(arg) and not _is_sorted_set(arg):
+                    rel = py_file.relative_to(BACKEND_ROOT)
+                    violations.append(
+                        f"  {rel}:{node.lineno}: <sep>.join(set(...)) — wrap in sorted(set(...)) for deterministic order"
+                    )
+                    break  # one report per file
+
+            # Pattern 2: str(set(...))
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "str"
+                and len(node.args) == 1
+                and not node.keywords
+                and _is_set_call(node.args[0])
+            ):
+                rel = py_file.relative_to(BACKEND_ROOT)
+                violations.append(
+                    f"  {rel}:{node.lineno}: str(set(...)) — set repr order is non-deterministic; use sorted(set(...)) and join"
+                )
+                break
+
+        else:
+            # Check f-string interpolation of bare set() calls (not caught in inner loop above)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.JoinedStr):
+                    continue
+                for value in node.values:
+                    if not isinstance(value, ast.FormattedValue):
+                        continue
+                    if _is_set_call(value.value):
+                        rel = py_file.relative_to(BACKEND_ROOT)
+                        violations.append(
+                            f"  {rel}:{node.lineno}: f-string interpolates bare set(...) — set repr order is non-deterministic; use sorted(set(...))"
+                        )
+                        break
+
+    assert not violations, (
+        f"Found {len(violations)} bare set→string serialization(s) in app/ file(s).\n"
+        "Python set iteration order is non-deterministic — serializing a bare set into\n"
+        "human-readable text produces scrambled output across runs (the rev-1367 bug).\n"
+        "Fix: wrap the set in sorted(...) before joining, e.g. ', '.join(sorted(set(...))).\n\n"
+        "Offending sites:\n" + "\n".join(violations)
+    )

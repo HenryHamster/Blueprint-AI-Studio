@@ -1333,7 +1333,15 @@ async def test_finalize_persists_advisory_audit_challenge_synthesis(db_session, 
                 "test_count_delta": 0,
             },
         },
-        smoke_logs={"passed": True},
+        # A valid passing SMOKETEST_RESULT: _score_smoketest requires an
+        # executable ``tests`` list (a bare ``{"passed": True}`` scores None →
+        # smoketest_startup_failed hard blocker), so this test — which asserts a
+        # promotable dry_run — must supply the real passing shape.
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
     )
     await _attach_audit_challenge(
         db_session,

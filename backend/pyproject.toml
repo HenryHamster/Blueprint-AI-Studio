@@ -42,7 +42,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # line itself carries an inline `# noqa: F403`. The hub keeps imports/helpers
 # used only by tests now living in the buckets, so F401 (unused import) is
 # expected and intended there — the names are re-exports, not dead code.
+# The residual monolith now holds only the run_qualification walkthrough_e2e
+# slice and star-imports the same helper hub, so it needs the identical F405
+# exemption as the __<domain>.py buckets.
 "testing/test_release_qualifier__*.py" = ["F405"]
+"testing/test_release_qualifier.py" = ["F405"]
 "testing/_release_qualifier_testhelpers.py" = ["F401"]
 # main.py has many intentional except Exception blocks for background-task error handling
 # B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion
