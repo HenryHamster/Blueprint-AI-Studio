@@ -1649,9 +1649,47 @@ def test_alert_scan_mixed_gated_and_ungated():
 def _collect_alert_constructors_with_unregistered_event_type(
     source: str, *, filename: str, rel: str, registered: frozenset[str]
 ) -> list[str]:
-    """Return offender strings for Alert(...) calls whose event_type= literal is
-    not present in the audience registry."""
+    """Return offender strings for Alert(...) calls whose event_type= value is
+    either not present in the audience registry or not statically verifiable.
+
+    Handles three patterns:
+    - ``ast.Constant`` literals: checked directly against the registry.
+    - ``ast.IfExp`` (ternary): all string literal leaves are extracted and each
+      is verified against the registry.  A non-literal leaf that appears outside
+      ``create_project_alert_if_allowed`` is flagged as non-verifiable.
+    - All other non-literals: flagged as non-verifiable unless the enclosing
+      function is ``create_project_alert_if_allowed``, which validates the value
+      at runtime via ``should_emit_project_alert``.
+    """
     tree = ast.parse(source, filename=filename)
+    funcs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def _enclosing_func_name(lineno: int) -> str | None:
+        best = None
+        for fn in funcs:
+            if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno):
+                if best is None or fn.lineno > best.lineno:
+                    best = fn
+        return best.name if best is not None else None
+
+    def _extract_literal_strings(node: ast.expr) -> tuple[list[str], bool]:
+        """Recursively extract string literal leaves from a (possibly nested) ternary.
+
+        Returns ``(literals, all_literals)``; ``all_literals`` is ``True`` only
+        when every leaf is an ``ast.Constant`` str.
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value], True
+        if isinstance(node, ast.IfExp):
+            body_lits, body_all = _extract_literal_strings(node.body)
+            orelse_lits, orelse_all = _extract_literal_strings(node.orelse)
+            return body_lits + orelse_lits, body_all and orelse_all
+        return [], False
+
     offenders: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or _ast_called_name(node) != "Alert":
@@ -1659,16 +1697,149 @@ def _collect_alert_constructors_with_unregistered_event_type(
         for kw in node.keywords:
             if kw.arg != "event_type":
                 continue
-            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
-                continue
-            event_type = kw.value.value
-            if event_type not in registered:
-                offenders.append(
-                    f"  {rel}:{node.lineno} — Alert(event_type={event_type!r}) "
-                    "is not registered in _EVENT_AUDIENCE_REGISTRY; "
-                    "add it to backend/app/message_audience.py with its intended audience"
-                )
+            val = kw.value
+            if isinstance(val, ast.Constant):
+                # Literal string — check directly against the registry.
+                if isinstance(val.value, str) and val.value not in registered:
+                    offenders.append(
+                        f"  {rel}:{node.lineno} — Alert(event_type={val.value!r}) "
+                        "is not registered in _EVENT_AUDIENCE_REGISTRY; "
+                        "add it to backend/app/message_audience.py with its intended audience"
+                    )
+            elif isinstance(val, ast.IfExp):
+                # Ternary — extract all literal leaves and verify each.
+                literals, all_literals = _extract_literal_strings(val)
+                for event_type in literals:
+                    if event_type not in registered:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type={event_type!r} [ternary branch]) "
+                            "is not registered in _EVENT_AUDIENCE_REGISTRY; "
+                            "add it to backend/app/message_audience.py with its intended audience"
+                        )
+                if not all_literals:
+                    # Non-literal ternary branch — safe only inside the gate function.
+                    enclosing = _enclosing_func_name(node.lineno)
+                    if enclosing != _ALERT_GATE_CALL:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type=<non-verifiable ternary>) "
+                            "contains a non-literal branch that cannot be verified at scan time; "
+                            "use only literal string values or route through "
+                            "create_project_alert_if_allowed"
+                        )
+            else:
+                # Non-literal event_type — safe only inside the gate function, which
+                # validates the value at runtime via should_emit_project_alert.
+                enclosing = _enclosing_func_name(node.lineno)
+                if enclosing != _ALERT_GATE_CALL:
+                    offenders.append(
+                        f"  {rel}:{node.lineno} — Alert(event_type=<non-literal>) "
+                        "uses a dynamic value that cannot be verified at scan time; "
+                        "use a literal string or route through create_project_alert_if_allowed"
+                    )
     return offenders
+
+
+# ── Unit tests for the hardened Alert event_type scanner ────────────────
+
+
+def test_alert_scan_accepts_ternary_event_type_both_branches_registered():
+    """A ternary event_type where both branches are registered literals passes."""
+    source = dedent(
+        """
+        def emit_resume(session, project_id, flapping):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="resumed",
+                event_type="deployment.flapping_resume" if flapping else "deployment.auto_resume",
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "Both ternary branches are registered — expected no offenders, got: "
+        + "\n".join(offenders)
+    )
+
+
+def test_alert_scan_flags_ternary_with_unregistered_branch():
+    """A ternary event_type where one branch is NOT registered is flagged."""
+    source = dedent(
+        """
+        def emit_resume(session, project_id, flapping):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="resumed",
+                event_type="deployment.flapping_resume" if flapping else "unregistered.branch",
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.branch" in offenders[0]
+    assert "ternary branch" in offenders[0]
+
+
+def test_alert_scan_flags_dynamic_call_event_type_outside_gate():
+    """An Alert whose event_type comes from a dynamic call (e.g. dict.get) outside
+    create_project_alert_if_allowed is flagged as non-verifiable."""
+    source = dedent(
+        """
+        async def flush_pending(session, items):
+            for item in items:
+                alert = Alert(
+                    project_id=item["project_id"],
+                    severity="ERROR",
+                    title=item["title"],
+                    message=item.get("message") or "",
+                    event_type=item.get("event_type"),
+                )
+                session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "non-literal" in offenders[0]
+    assert "create_project_alert_if_allowed" in offenders[0]
+
+
+def test_alert_scan_exempts_attribute_event_type_inside_gate_function():
+    """An Alert whose event_type is a non-literal attribute access inside
+    create_project_alert_if_allowed is exempted — that function validates at runtime."""
+    source = dedent(
+        """
+        async def create_project_alert_if_allowed(session, *, project_id, event_type, decision):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                title="alert",
+                message="alert",
+                event_type=decision.event_type,
+            )
+            session.add(alert)
+            return alert
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "event_type=decision.event_type inside create_project_alert_if_allowed must be exempt; "
+        "got: " + "\n".join(offenders)
+    )
 
 
 def test_no_alert_constructor_uses_unregistered_event_type():

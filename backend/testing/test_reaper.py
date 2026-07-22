@@ -18684,6 +18684,87 @@ async def test_pending_confirmation_stale_decay_no_created_at(reaper_db):
 
 
 @pytest.mark.asyncio
+async def test_decay_sweep_lowers_operator_needs_action_count(db_session):
+    """E2E: the decay sweep removes stale pending_user_confirmation items and the
+    operator attention count drops accordingly.
+
+    Uses ``db_session`` (Postgres-backed in CI) because ``build_operator_attention``
+    uses JSONB operators (``->>``, ``->``) that SQLite cannot execute.
+    """
+    from app.problem_model import PENDING_CONFIRMATION_STALE_DECAY_DAYS
+    from app.operator_attention import build_operator_attention
+
+    _prev = _rs._last_stale_confirm_decay_sweep
+    _rs._last_stale_confirm_decay_sweep = None
+    try:
+        project = await _make_project(db_session)
+        old_ts = (
+            _utcnow() - timedelta(days=PENDING_CONFIRMATION_STALE_DECAY_DAYS + 1)
+        ).isoformat()
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-e2e-old-1",
+                    "type": "intent_change",
+                    "proposal": "Pivot the project.",
+                    "created_at": old_ts,
+                },
+                {
+                    "id": "p-e2e-old-2",
+                    "type": "major_decision",
+                    "proposal": "Adopt new infra.",
+                    "created_at": old_ts,
+                },
+            ]
+        }
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Baseline: operator attention includes the 2 pending confirmations.
+        attention_before = await build_operator_attention(
+            db_session, project, "user1"
+        )
+        confirm_before = attention_before["counts"]["pending_confirmations"]
+        needs_op_before = attention_before["counts"]["needs_operator"]
+        assert confirm_before >= 2, (
+            f"test invariant: project must have stale pending confirmations, "
+            f"got {confirm_before}"
+        )
+        assert needs_op_before >= confirm_before, (
+            f"needs_operator ({needs_op_before}) must be at least "
+            f"pending_confirmations ({confirm_before})"
+        )
+
+        # Sweep decays the stale items.
+        decayed = await _rs.sweep_decay_stale_pending_confirmations(
+            db_session, _utcnow()
+        )
+        assert decayed == 2
+
+        # Post-sweep: pending_confirmations is 0, needs_operator dropped
+        # by exactly the confirmation count.
+        await db_session.refresh(project)
+        attention_after = await build_operator_attention(
+            db_session, project, "user1"
+        )
+        confirm_after = attention_after["counts"]["pending_confirmations"]
+        needs_op_after = attention_after["counts"]["needs_operator"]
+
+        assert confirm_after == 0, (
+            f"pending_confirmations must drop from {confirm_before} to 0 "
+            f"after decay sweep — got {confirm_after}"
+        )
+        assert needs_op_before - needs_op_after == confirm_before, (
+            f"needs_operator must drop by {confirm_before} "
+            f"(from {needs_op_before} to {needs_op_before - confirm_before}) "
+            f"— got {needs_op_after} (delta={needs_op_before - needs_op_after})"
+        )
+    finally:
+        _rs._last_stale_confirm_decay_sweep = _prev
+
+
+@pytest.mark.asyncio
 async def test_proof_earn_loop_fires_without_demand_when_unproven_caps_exist(reaper_db, mocker):
     """Step 22b fires even with NO demand when unproven working capabilities exist.
 

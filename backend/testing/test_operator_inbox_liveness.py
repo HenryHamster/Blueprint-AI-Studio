@@ -1156,3 +1156,199 @@ async def test_needs_action_message_is_not_remediated(db_session):
     )
 
     _liveness_mod._reset_liveness_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Inverse detector: reply-audience quarantine tests
+# ---------------------------------------------------------------------------
+
+
+async def _create_reply_message(
+    session,
+    project_id: str,
+    *,
+    audience: str,
+    status: str = "open",
+    reply_to_id: str | None = None,
+) -> tuple:
+    """Create a ProjectMessage with reply_to_message_id set and the given audience.
+
+    Returns (msg_id, reply_to_id) — if reply_to_id is None a synthetic parent is
+    created so the FK constraint is satisfied.
+    """
+    from app.models import ProjectMessage
+
+    pid = _uuid.UUID(project_id)
+
+    if reply_to_id is None:
+        parent = ProjectMessage(
+            project_id=pid,
+            from_type="user",
+            message_type="NOTE",
+            status="open",
+            content="Parent operator message",
+            context={},
+        )
+        session.add(parent)
+        await session.flush()
+        reply_to_id = str(parent.id)
+
+    reply = ProjectMessage(
+        project_id=pid,
+        from_type="system",
+        message_type="NOTE",
+        status=status,
+        content="Reply with quarantined audience",
+        context={"audience": audience},
+        reply_to_message_id=_uuid.UUID(reply_to_id),
+    )
+    session.add(reply)
+    await session.flush()
+    return str(reply.id), reply_to_id
+
+
+@pytest.mark.asyncio
+async def test_reply_audience_quarantined_detected_for_strategist_internal_reply(db_session):
+    """A reply_to-bearing message with STRATEGIST_INTERNAL audience is flagged
+    with reply_audience_quarantined=1 by the liveness check.
+
+    This is the named acceptance test for the inverse-detector feature
+    (detector for reply-audience quarantine / invisible dropped replies).
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "quarantine-strategist-test")
+    await _create_reply_message(db_session, project_id, audience=STRATEGIST_INTERNAL)
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+    assert r.reply_audience_quarantined == 1, (
+        f"Expected reply_audience_quarantined=1 for STRATEGIST_INTERNAL reply, "
+        f"got {r.reply_audience_quarantined} (status={r.status!r})"
+    )
+    assert r.status == "flagged", (
+        f"Project with quarantined reply must be flagged, got {r.status!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_reply_audience_quarantined_detected_for_pipeline_log_reply(db_session):
+    """A reply_to-bearing message with PIPELINE_LOG audience is flagged
+    with reply_audience_quarantined=1 by the liveness check."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import PIPELINE_LOG
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "quarantine-pipeline-log-test")
+    await _create_reply_message(db_session, project_id, audience=PIPELINE_LOG)
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+    assert r.reply_audience_quarantined == 1, (
+        f"Expected reply_audience_quarantined=1 for PIPELINE_LOG reply, "
+        f"got {r.reply_audience_quarantined}"
+    )
+    assert r.status == "flagged"
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_reply_without_non_operator_audience_not_quarantined(db_session):
+    """A reply message with OPERATOR_ACTION_NEEDED audience produces
+    reply_audience_quarantined=0 — correctly routed replies are not flagged."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "quarantine-correct-audience-test")
+    await _create_reply_message(db_session, project_id, audience=OPERATOR_ACTION_NEEDED)
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+    assert r.reply_audience_quarantined == 0, (
+        f"OPERATOR_ACTION_NEEDED reply must not be quarantined, "
+        f"got reply_audience_quarantined={r.reply_audience_quarantined}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_message_without_reply_to_not_quarantined(db_session):
+    """A non-reply message with STRATEGIST_INTERNAL audience does NOT contribute
+    to reply_audience_quarantined — the inverse detector only targets replies."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL
+    from app.models import ProjectMessage
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "quarantine-no-reply-to-test")
+    pid = _uuid.UUID(project_id)
+
+    db_session.add(ProjectMessage(
+        project_id=pid,
+        from_type="system",
+        message_type="NOTE",
+        status="open",
+        content="Non-reply internal message",
+        context={"audience": STRATEGIST_INTERNAL},
+    ))
+    await db_session.flush()
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    if results is not None:
+        proj = [r for r in results if r.project_id == project_id]
+        if proj:
+            assert proj[0].reply_audience_quarantined == 0, (
+                f"Non-reply STRATEGIST_INTERNAL message must not be quarantined, "
+                f"got reply_audience_quarantined={proj[0].reply_audience_quarantined}"
+            )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+def test_liveness_observability_snapshot_includes_reply_audience_quarantined_key():
+    """get_operator_inbox_liveness_observability() contains total_reply_audience_quarantined."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+    snapshot = _liveness_mod.get_operator_inbox_liveness_observability()
+    assert "total_reply_audience_quarantined" in snapshot, (
+        "Observability snapshot must include total_reply_audience_quarantined"
+    )
+    assert snapshot["total_reply_audience_quarantined"] == 0
+
+    _liveness_mod._total_reply_audience_quarantined = 5
+    snapshot2 = _liveness_mod.get_operator_inbox_liveness_observability()
+    assert snapshot2["total_reply_audience_quarantined"] == 5
+
+    _liveness_mod._reset_liveness_for_tests()

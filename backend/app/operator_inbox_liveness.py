@@ -53,6 +53,7 @@ _total_forward_leaked: int = 0
 _total_badge_invisible: int = 0
 _total_info_alert_noise: int = 0
 _total_remediated: int = 0
+_total_reply_audience_quarantined: int = 0
 
 # ── Persistence / escalation constants ────────────────────────────────────
 
@@ -76,6 +77,7 @@ class LivenessResult(NamedTuple):
     info_alert_noise: int
     detail: str
     remediated_count: int = 0
+    reply_audience_quarantined: int = 0
 
 
 # ── Durable persistence helpers ────────────────────────────────────────────
@@ -348,6 +350,7 @@ async def run_operator_inbox_liveness_check(
     """
     global _last_liveness_check, _total_ticks
     global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
+    global _total_reply_audience_quarantined
 
     if now is None:
         now = _utcnow()
@@ -361,6 +364,7 @@ async def run_operator_inbox_liveness_check(
 
     from app.message_audience import (
         OPERATOR_FYI,
+        _NON_OPERATOR_AUDIENCES,
         operator_visible_alert_filter,
         operator_visible_audience_filter,
     )
@@ -408,7 +412,29 @@ async def run_operator_inbox_liveness_check(
             or 0
         )
 
-        if not messages and info_alert_count == 0:
+        # Inverse detector: reply-bearing messages quarantined in a non-operator
+        # audience (STRATEGIST_INTERNAL or PIPELINE_LOG).  These are operator-
+        # directed replies that silently resolve to the wrong audience and are
+        # never surfaced — the exact 'dropped operator replies' bug class.
+        quarantined_reply_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.reply_to_message_id.isnot(None),
+                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                        ProjectMessage.context["audience"].as_string().in_(
+                            _NON_OPERATOR_AUDIENCES
+                        ),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+        if not messages and info_alert_count == 0 and quarantined_reply_count == 0:
             results.append(
                 LivenessResult(
                     project_id=pid,
@@ -445,7 +471,7 @@ async def run_operator_inbox_liveness_check(
         # BLOCKER/QUESTION messages are correctly included in the count.
         n_forward = len(forward_leaked_msgs)
         n_badge = 0
-        delta = n_forward + n_badge + info_alert_count
+        delta = n_forward + n_badge + info_alert_count + quarantined_reply_count
 
         parts: List[str] = []
         if n_forward:
@@ -460,6 +486,11 @@ async def run_operator_inbox_liveness_check(
                 f"{info_alert_count} INFO alert(s) in operator-visible "
                 "alert channel (non-actionable alert noise)"
             )
+        if quarantined_reply_count:
+            parts.append(
+                f"{quarantined_reply_count} reply message(s) quarantined in "
+                "non-operator audience (reply-audience quarantine)"
+            )
 
         status = "flagged" if delta > 0 else "ok"
         detail = (
@@ -467,7 +498,8 @@ async def run_operator_inbox_liveness_check(
             if parts
             else (
                 f"all {len(messages)} open/linked operator-visible message(s) "
-                "correctly handled (no forward leaks, no INFO alert noise)"
+                "correctly handled (no forward leaks, no INFO alert noise, "
+                "no quarantined replies)"
             )
         )
         results.append(
@@ -479,6 +511,7 @@ async def run_operator_inbox_liveness_check(
                 info_alert_noise=info_alert_count,
                 detail=detail,
                 remediated_count=remediated,
+                reply_audience_quarantined=quarantined_reply_count,
             )
         )
 
@@ -486,12 +519,14 @@ async def run_operator_inbox_liveness_check(
         _total_badge_invisible += n_badge
         _total_info_alert_noise += info_alert_count
         _total_remediated += remediated
+        _total_reply_audience_quarantined += quarantined_reply_count
 
     _total_ticks += 1
     tick_forward = sum(r.forward_leaked for r in results)
     tick_badge = sum(r.badge_invisible for r in results)
     tick_alerts = sum(r.info_alert_noise for r in results)
     tick_remediated = sum(r.remediated_count for r in results)
+    tick_quarantined = sum(r.reply_audience_quarantined for r in results)
     flagged = [r for r in results if r.status == "flagged"]
     tick_summary: Dict[str, Any] = {
         "tick": _total_ticks,
@@ -501,6 +536,7 @@ async def run_operator_inbox_liveness_check(
         "badge_invisible": tick_badge,
         "info_alert_noise": tick_alerts,
         "remediated": tick_remediated,
+        "reply_audience_quarantined": tick_quarantined,
     }
     _observability_ring.append(tick_summary)
 
@@ -565,6 +601,7 @@ def get_operator_inbox_liveness_observability() -> Dict[str, Any]:
         "total_badge_invisible": _total_badge_invisible,
         "total_info_alert_noise": _total_info_alert_noise,
         "total_remediated": _total_remediated,
+        "total_reply_audience_quarantined": _total_reply_audience_quarantined,
         "recent_ticks": list(_observability_ring),
     }
 
@@ -573,10 +610,12 @@ def _reset_liveness_for_tests() -> None:
     """Test helper — clear process-local counters and cadence gate."""
     global _last_liveness_check, _total_ticks
     global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
+    global _total_reply_audience_quarantined
     _last_liveness_check = None
     _total_ticks = 0
     _total_forward_leaked = 0
     _total_badge_invisible = 0
     _total_info_alert_noise = 0
     _total_remediated = 0
+    _total_reply_audience_quarantined = 0
     _observability_ring.clear()
