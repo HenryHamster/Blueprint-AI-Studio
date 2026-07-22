@@ -50,6 +50,7 @@ async def test_liveness_observability_endpoint_returns_snapshot(
     assert "total_forward_leaked" in data
     assert "total_badge_invisible" in data
     assert "total_info_alert_noise" in data
+    assert "total_remediated" in data
     assert "recent_ticks" in data
 
     # With no ticks, all counters are 0 and recent_ticks is empty.
@@ -57,6 +58,7 @@ async def test_liveness_observability_endpoint_returns_snapshot(
     assert data["total_forward_leaked"] == 0
     assert data["total_badge_invisible"] == 0
     assert data["total_info_alert_noise"] == 0
+    assert data["total_remediated"] == 0
     assert data["recent_ticks"] == []
 
 
@@ -68,9 +70,10 @@ async def test_liveness_snapshot_reflects_accumulated_state(client: AsyncClient)
     _liveness_mod._total_forward_leaked = 7
     _liveness_mod._total_badge_invisible = 0
     _liveness_mod._total_info_alert_noise = 2
+    _liveness_mod._total_remediated = 5
     _liveness_mod._observability_ring.append(
         {"tick": 3, "projects": 2, "flagged": 1, "forward_leaked": 7,
-         "badge_invisible": 0, "info_alert_noise": 2}
+         "badge_invisible": 0, "info_alert_noise": 2, "remediated": 5}
     )
 
     response = await client.get("/api/admin/operator-inbox-liveness")
@@ -80,8 +83,10 @@ async def test_liveness_snapshot_reflects_accumulated_state(client: AsyncClient)
     assert data["total_ticks"] == 3
     assert data["total_forward_leaked"] == 7
     assert data["total_info_alert_noise"] == 2
+    assert data["total_remediated"] == 5
     assert len(data["recent_ticks"]) == 1
     assert data["recent_ticks"][0]["forward_leaked"] == 7
+    assert data["recent_ticks"][0]["remediated"] == 5
 
 
 @pytest.mark.asyncio
@@ -100,6 +105,7 @@ async def test_liveness_force_run_returns_run_results(
             badge_invisible=0,
             info_alert_noise=0,
             detail="all ok",
+            remediated_count=0,
         )
     ]
 
@@ -1077,6 +1083,76 @@ async def test_operator_fyi_message_is_not_remediated(db_session):
     assert audience_after == OPERATOR_FYI, (
         f"OPERATOR_FYI message audience must be unchanged after liveness run, "
         f"got {audience_after!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_needs_action_message_is_not_remediated(db_session):
+    """A legitimate needs-action message (BLOCKER with OPERATOR_ACTION_NEEDED) is
+    never remediated — its audience and status remain unchanged after a liveness run.
+
+    Guards against regression where the remediation path incorrectly re-stamps
+    genuinely actionable operator messages, which would silently make operator-
+    facing blockers and questions invisible.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+    from app.models import ProjectMessage, MessageType
+    from sqlmodel import select
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "needs-action-no-remediation-test")
+    pid = _uuid.UUID(project_id)
+
+    # Create a legitimate BLOCKER with OPERATOR_ACTION_NEEDED audience.
+    msg = ProjectMessage(
+        project_id=pid,
+        from_type="agent",
+        message_type=MessageType.BLOCKER,
+        status="open",
+        content="This is a genuine blocker that needs operator attention",
+        context={"audience": OPERATOR_ACTION_NEEDED},
+    )
+    db_session.add(msg)
+    await db_session.flush()
+    msg_id = str(msg.id)
+
+    # Run the liveness check — this BLOCKER must NOT be a forward leak.
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    if proj:
+        assert proj[0].forward_leaked == 0, (
+            f"A genuine BLOCKER must not be counted as a forward leak, "
+            f"got forward_leaked={proj[0].forward_leaked}"
+        )
+        assert proj[0].remediated_count == 0, (
+            f"A genuine BLOCKER must not be remediated, "
+            f"got remediated_count={proj[0].remediated_count}"
+        )
+
+    # The message's audience and status must be unchanged after the run.
+    db_session.expire_all()
+    msg_after = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == _uuid.UUID(msg_id))
+        )
+    ).scalars().first()
+    assert msg_after is not None
+    audience_after = (msg_after.context or {}).get("audience")
+    assert audience_after == OPERATOR_ACTION_NEEDED, (
+        f"BLOCKER audience must be OPERATOR_ACTION_NEEDED after liveness run, "
+        f"got {audience_after!r}"
+    )
+    assert msg_after.status == "open", (
+        f"BLOCKER status must still be 'open' after liveness run, "
+        f"got {msg_after.status!r}"
     )
 
     _liveness_mod._reset_liveness_for_tests()

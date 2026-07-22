@@ -52,6 +52,7 @@ _total_ticks: int = 0
 _total_forward_leaked: int = 0
 _total_badge_invisible: int = 0
 _total_info_alert_noise: int = 0
+_total_remediated: int = 0
 
 # ── Persistence / escalation constants ────────────────────────────────────
 
@@ -74,6 +75,7 @@ class LivenessResult(NamedTuple):
     badge_invisible: int
     info_alert_noise: int
     detail: str
+    remediated_count: int = 0
 
 
 # ── Durable persistence helpers ────────────────────────────────────────────
@@ -345,7 +347,7 @@ async def run_operator_inbox_liveness_check(
     so a genuinely new leak can escalate again.
     """
     global _last_liveness_check, _total_ticks
-    global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise
+    global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
 
     if now is None:
         now = _utcnow()
@@ -432,9 +434,11 @@ async def run_operator_inbox_liveness_check(
         # Immediately remediate detected leaks: re-stamp audience to the
         # canonical classification so the row is excluded from the operator
         # inbox on the next query cycle without waiting for the 14-day
-        # age-decay sweep.  The count below records pre-remediation detections.
+        # age-decay sweep.  The count below records pre-remediation detections;
+        # remediated_count records how many were successfully re-stamped.
+        remediated = 0
         if forward_leaked_msgs:
-            _remediate_forward_leaked_messages(session, forward_leaked_msgs)
+            remediated = _remediate_forward_leaked_messages(session, forward_leaked_msgs)
 
         # badge_invisible is always 0: the badge SQL now uses
         # status IN ('open', 'linked') for needs-action queries, so linked
@@ -449,6 +453,8 @@ async def run_operator_inbox_liveness_check(
                 f"{n_forward}/{len(messages)} non-fyi operator-visible "
                 "message(s) not genuinely needs-action (forward leak)"
             )
+            if remediated:
+                parts.append(f"{remediated} remediated")
         if info_alert_count:
             parts.append(
                 f"{info_alert_count} INFO alert(s) in operator-visible "
@@ -472,17 +478,20 @@ async def run_operator_inbox_liveness_check(
                 badge_invisible=n_badge,
                 info_alert_noise=info_alert_count,
                 detail=detail,
+                remediated_count=remediated,
             )
         )
 
         _total_forward_leaked += n_forward
         _total_badge_invisible += n_badge
         _total_info_alert_noise += info_alert_count
+        _total_remediated += remediated
 
     _total_ticks += 1
     tick_forward = sum(r.forward_leaked for r in results)
     tick_badge = sum(r.badge_invisible for r in results)
     tick_alerts = sum(r.info_alert_noise for r in results)
+    tick_remediated = sum(r.remediated_count for r in results)
     flagged = [r for r in results if r.status == "flagged"]
     tick_summary: Dict[str, Any] = {
         "tick": _total_ticks,
@@ -491,6 +500,7 @@ async def run_operator_inbox_liveness_check(
         "forward_leaked": tick_forward,
         "badge_invisible": tick_badge,
         "info_alert_noise": tick_alerts,
+        "remediated": tick_remediated,
     }
     _observability_ring.append(tick_summary)
 
@@ -554,6 +564,7 @@ def get_operator_inbox_liveness_observability() -> Dict[str, Any]:
         "total_forward_leaked": _total_forward_leaked,
         "total_badge_invisible": _total_badge_invisible,
         "total_info_alert_noise": _total_info_alert_noise,
+        "total_remediated": _total_remediated,
         "recent_ticks": list(_observability_ring),
     }
 
@@ -561,10 +572,11 @@ def get_operator_inbox_liveness_observability() -> Dict[str, Any]:
 def _reset_liveness_for_tests() -> None:
     """Test helper — clear process-local counters and cadence gate."""
     global _last_liveness_check, _total_ticks
-    global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise
+    global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
     _last_liveness_check = None
     _total_ticks = 0
     _total_forward_leaked = 0
     _total_badge_invisible = 0
     _total_info_alert_noise = 0
+    _total_remediated = 0
     _observability_ring.clear()
