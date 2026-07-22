@@ -17,6 +17,7 @@ import uuid
 import pytest
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -27,6 +28,13 @@ from app.monthly_budget_alerts import check_monthly_budget, check_daily_budget, 
 from app.models import Alert, AlertSeverity, Project
 
 
+class _BudgetSQLiteTypeCompiler(_SQLiteTypeCompiler):
+    """Compile PostgreSQL JSONB as JSON only for this fixture's SQLite engine."""
+
+    def visit_JSONB(self, type_, **kw):
+        return self.visit_JSON(type_, **kw)
+
+
 @pytest.fixture
 async def budget_db():
     """Isolated in-memory SQLite DB for check_monthly_budget tests."""
@@ -35,6 +43,13 @@ async def budget_db():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+    # This file is part of the qualifier's ``--noconftest`` regression batch,
+    # so it cannot rely on testing/conftest.py's JSONB compatibility hook.
+    # Keep the adapter engine-local to avoid changing later tests by import order.
+    dialect = _engine.sync_engine.dialect
+    type_compiler = _BudgetSQLiteTypeCompiler(dialect)
+    dialect.type_compiler = type_compiler
+    dialect.type_compiler_instance = type_compiler
     async with _engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
