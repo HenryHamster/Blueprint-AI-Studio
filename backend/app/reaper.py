@@ -87,12 +87,6 @@ from app.time_utils import (
 )
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 from app.reaper_post_orphan_sweep import run_post_orphan_sweep
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_failure_recovery import (
-#     reap_authoritative_resident_turn,
-# )
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_turns import STRATEGIC_RESIDENT_TURN_TASK_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -325,23 +319,6 @@ from app.reaper_sweeps import (
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_shadow import sweep_shadow_resident_turns
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_cleanup import sweep_resident_transition_cleanup
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_project_change_sweep import (
-#     sweep_durable_project_change_wakeups,
-# )
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_activation_sweep import (
-#     sweep_missing_background_activation_wakeups,
-# )
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_wakeups import (
-#     sweep_due_authoritative_resident_wakeups,
-#     sweep_pending_worker_proposal_wakeups,
-# )
 
 
 async def _mark_landed_parent_dependents(parent_id, session) -> None:
@@ -1071,17 +1048,6 @@ async def reaper_service():
                             _orphan_reap_crash_streaks.pop(str(task_id), None)
                             continue
                         task = fresh_task  # Use fresh data for all subsequent reads and writes
-                        resident_payload = (
-                            fresh_task.first_payload
-                            if isinstance(fresh_task.first_payload, dict)
-                            else {}
-                        )
-                        is_resident_reap = bool(
-                            fresh_task.status == TaskStatus.IN_PROGRESS
-                            and resident_payload.get("type")
-                            == STRATEGIC_RESIDENT_TURN_TASK_TYPE  # noqa: F821
-                            and resident_payload.get("shadow_only") is False
-                        )
 
                         # ── C2: per-orphan idempotency-key pre-query guard ──
                         # The reap below can flip this task to QUEUED (rate-limit /
@@ -1098,7 +1064,7 @@ async def reaper_service():
                         # the work, so reaping (which would requeue a redundant copy)
                         # is moot. Mirrors the proven pre-query guard in
                         # reaper_infra_recovery.py (~263-338).
-                        if task.idempotency_key and not is_resident_reap:
+                        if task.idempotency_key:
                             _dup_active = await session.scalar(
                                 select(Task.id).where(
                                     Task.idempotency_key == task.idempotency_key,
@@ -1265,31 +1231,6 @@ async def reaper_service():
                             fresh_task.vm_machine_type
                         ):
                             _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
-
-                        # Claimed authoritative Resident turns have a separate
-                        # authority and operation-receipt boundary. Route them
-                        # before generic task retry or any external VM/provider I/O.
-                        if is_resident_reap:
-                            resident_project_id = fresh_task.project_id
-                            # The canonical Resident helper reacquires locks in
-                            # Project -> Resident -> Task -> Receipt order.
-                            await session.rollback()
-                            session.expire_all()
-                            mutation = await reap_authoritative_resident_turn(  # noqa: F821
-                                session,
-                                project_id=resident_project_id,
-                                task_id=task_id,
-                                reap_reason=reap_reason,
-                                reap_reason_code=reap_reason_code,
-                            )
-                            logger.info(
-                                "[REAPER] Fenced Resident turn %s; promoted=%s unsettled=%d",
-                                task_id,
-                                mutation.promoted_task_id,
-                                len(mutation.unsettled_receipt_ids),
-                            )
-                            _orphan_reap_crash_streaks.pop(str(task_id), None)
-                            continue
 
                         # Read-only inputs to the I/O block + branch decisions below.
                         # No mutations happen until AFTER the relock further down.
@@ -2784,84 +2725,6 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Strategic-cycle starvation sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-
-                # Step 7a: project backend-only Resident shadow turns. This is a
-                # deterministic bounded projection with zero model calls.
-                try:
-                    await sweep_shadow_resident_turns(  # noqa: F821
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident shadow turn sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_resident_transition_cleanup(  # noqa: F821
-                        session_factory=AsyncSessionLocal,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident rollback cleanup sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_missing_background_activation_wakeups(  # noqa: F821
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident activation repair sweep error: {e}",
-                        exc_info=True,
-                    )
-                try:
-                    await sweep_due_authoritative_resident_wakeups(  # noqa: F821
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident due wakeup sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_pending_worker_proposal_wakeups(  # noqa: F821
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident worker-proposal wakeup sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_durable_project_change_wakeups(  # noqa: F821
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident durable project-change wakeup sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

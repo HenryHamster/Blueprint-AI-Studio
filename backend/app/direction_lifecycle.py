@@ -21,6 +21,7 @@ from app.shared_state import (
 from app.direction_refractory import get_direction_refractory_info, resolve_direction_refractory_minutes
 from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
+from app.strategic_authority_locks import commit_legacy_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -718,12 +719,7 @@ async def _process_direction_lifecycle(
             if expected_legacy_generation is None:
                 await session.commit()
             else:
-                # [RESIDENT-REMOVAL] removed with resident subsystem
-#                 from app.strategic_resident_transition_locks import (
-#                     commit_legacy_authorized,
-#                 )
-
-                await commit_legacy_authorized(  # noqa: F821
+                await commit_legacy_authorized(
                     session, project.id, expected_legacy_generation
                 )
         else:
@@ -2111,12 +2107,7 @@ async def _process_direction_lifecycle_locked(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            # [RESIDENT-REMOVAL] removed with resident subsystem
-#             from app.strategic_resident_transition_locks import (
-#                 commit_legacy_authorized,
-#             )
-
-            await commit_legacy_authorized(  # noqa: F821
+            await commit_legacy_authorized(
                 session, project.id, expected_legacy_generation
             )
     return active_directions

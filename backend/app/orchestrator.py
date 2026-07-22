@@ -36,7 +36,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
-from sqlalchemy import and_, func as _func, inspect as sa_inspect, or_
+from sqlalchemy import func as _func, inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -98,10 +98,6 @@ from app.stall_alert_diagnostics import (
     _compute_retry_after_escalation_action,
     _missing_runtime_credentials_stall_reason,
 )
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_saturated_dispatch import (
-#     dispatch_local_required_resident_turns_without_cloud_slots,
-# )
 from app.state_persistence import (
     _persist_circuit_breakers,  # noqa: F401 — re-exported; callers import via app.orchestrator
     _persist_zone_health,
@@ -135,16 +131,7 @@ def _agent_executed_task_type_filter():
     """Registry-owned dispatch fence for backend-managed control-plane Tasks."""
 
     task_type = Task.payloads[0]["type"].as_string()
-    generic_types = set(AGENT_EXECUTED_TASK_TYPES) - {"strategic_resident_turn"}
-    return or_(
-        task_type.in_(sorted(generic_types)),
-        and_(
-            task_type == "strategic_resident_turn",
-            Task.payloads[0]["shadow_only"].as_boolean().is_(False),
-            Task.context["_resident_mutation_authorized"].as_boolean().is_(True),
-            Task.context["_resident_input_frozen"].as_boolean().is_(True),
-        ),
-    )
+    return task_type.in_(sorted(set(AGENT_EXECUTED_TASK_TYPES)))
 
 
 def _dispatch_gate_metadata(row: tuple) -> dict:
@@ -997,20 +984,6 @@ async def _filter_project_resource_dispatch_eligible(
                 _project.paused = True
                 project_pause_mutated = True
                 session.add(_project)
-                # Project pause is the operator-visible source of truth.
-                # Keep an authoritative Resident's background policy in
-                # the same transaction so the spend guard cannot leave
-                # autonomous Resident wakeups running behind a paused UI.
-                # [RESIDENT-REMOVAL] removed with resident subsystem
-#                 from app.strategic_resident_wakeups import (
-#                     sync_resident_background_policy,
-#                 )
-
-                await sync_resident_background_policy(  # noqa: F821
-                    session,
-                    project_id=_project.id,
-                    paused=True,
-                )
                 logger.info(
                     "[ORCHESTRATOR] Hard-pausing project %s — "
                     "spend ceiling exceeded and pause_on_ceiling_exceeded is set",
@@ -1070,9 +1043,9 @@ async def _filter_project_resource_dispatch_eligible(
             )
     _shared_state.monthly_budget_deferred_project_ids = _current_monthly_deferred
 
-    # A SELECT in Resident policy sync can autoflush the Project UPDATE and
-    # empty session.dirty before this transaction boundary. Retain the explicit
-    # mutation bit so projects without a Resident are still durably paused.
+    # A prior SELECT can autoflush the Project UPDATE and empty session.dirty
+    # before this transaction boundary. Retain the explicit mutation bit so
+    # paused projects are still durably committed.
     if session.dirty or project_pause_mutated:
         await session.commit()
     return filtered
@@ -1234,8 +1207,6 @@ async def orchestrator_worker():
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_provider_policy import ResidentProviderPolicyHold
     from app.vm_lifecycle import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
@@ -1745,25 +1716,6 @@ async def orchestrator_worker():
                 )
                 _shared_state.tasks_active_gauge = active_count
                 if slots_available == 0:
-                    # Local runners do not consume GCP VM slots. Service the
-                    # bounded local-only Resident lane before the cloud-capacity
-                    # early exit so compatible idle capacity remains usable.
-                    (
-                        _resident_local_pinned,
-                        _resident_local_held,
-                    ) = await dispatch_local_required_resident_turns_without_cloud_slots(  # noqa: F821
-                        session,
-                        lock_dispatchable_task=_lock_dispatchable_task_for_mutation,
-                    )
-                    _cycle_dispatched += _resident_local_pinned
-                    if _resident_local_pinned or _resident_local_held:
-                        logger.info(
-                            "resident_local_dispatch_while_cloud_saturated",
-                            extra={
-                                "resident_tasks_pinned": _resident_local_pinned,
-                                "resident_tasks_held": _resident_local_held,
-                            },
-                        )
                     # Update queued gauge even when we skip dispatching
                     _shared_state.tasks_queued_gauge = (
                         await session.execute(
@@ -1806,7 +1758,7 @@ async def orchestrator_worker():
                             "cycle_duration_seconds": round(
                                 time.monotonic() - cycle_start, 3
                             ),
-                            "tasks_dispatched": _resident_local_pinned,
+                            "tasks_dispatched": 0,
                             # No slots ⇒ no window was scanned. Keeps the
                             # orchestrator_cycle_complete schema identical across both
                             # emit sites so consumers never see a missing key.
@@ -3747,27 +3699,17 @@ async def orchestrator_worker():
                         _effective_blacklist = (
                             list({*(_blacklist or []), *_sticky}) or None
                         )
-                        try:
-                            runtime_selection = await select_llm_runtime_for_task(
-                                user_id=dispatch_user_id,
-                                task=task,
-                                runtime_config=_runtime_config,
-                                blacklist=_effective_blacklist,
-                                project_id=(
-                                    str(task.project_id) if task.project_id else None
-                                ),
-                                # Cloud VMs have every supported provider CLI.
-                                runner_available_clis=None,
-                                raise_resident_policy_hold=True,
-                            )
-                        except ResidentProviderPolicyHold as exc:  # noqa: F821
-                            task.latest_status_message = (
-                                "Waiting for configured Resident provider policy — "
-                                f"{exc}"
-                            )
-                            session.add(task)
-                            await session.commit()
-                            continue
+                        runtime_selection = await select_llm_runtime_for_task(
+                            user_id=dispatch_user_id,
+                            task=task,
+                            runtime_config=_runtime_config,
+                            blacklist=_effective_blacklist,
+                            project_id=(
+                                str(task.project_id) if task.project_id else None
+                            ),
+                            # Cloud VMs have every supported provider CLI.
+                            runner_available_clis=None,
+                        )
                         # From here until ownership transfers, the containment
                         # handler owns releasing the slot this selection
                         # pre-incremented (select_max_plan_account).

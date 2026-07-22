@@ -27,12 +27,6 @@ from app.providers.openai import (
     codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
 )
 from app.providers.registry import get_provider
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_provider_policy import (
-#     ResidentProviderPolicyHold,
-#     resolve_resident_provider_routing,
-#     validate_resident_model_provider,
-# )
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -4231,7 +4225,6 @@ async def select_llm_runtime_for_task(
     project_id: str | None = None,
     runner_available_clis: dict[str, dict] | None = None,
     failure_reasons: List[str] | None = None,
-    raise_resident_policy_hold: bool = False,
 ) -> LLMSelectionResult | None:
     """Resolve the (provider, model, account) runtime for a task.
 
@@ -4301,19 +4294,6 @@ async def select_llm_runtime_for_task(
         explicit_model, runtime_config
     )
     routing_task_type = _task_type(task)
-    try:
-        resident_routing = resolve_resident_provider_routing(  # noqa: F821
-            task,
-            project_provider_preference=provider_preference,
-            allow_cross_provider_fallback=allow_fallback,
-        )
-        validate_resident_model_provider(resident_routing, lambda model: infer_provider_for_model(model, runtime_config))  # noqa: F821
-    except ResidentProviderPolicyHold as exc:  # noqa: F821
-        if failure_reasons is not None:
-            failure_reasons.append(str(exc))
-        if raise_resident_policy_hold:
-            raise
-        return None
     # Resolve project_id: explicit parameter takes precedence, then task attribute.
     _resolved_project_id = (
         project_id
@@ -4323,18 +4303,6 @@ async def select_llm_runtime_for_task(
     )
     _log_project_id = _resolved_project_id or "unknown"
     logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", _log_project_id, user_id, routing_task_type)
-
-    if resident_routing is not None:
-        provider_preference = list(resident_routing.provider_preference)
-        explicit_provider = resident_routing.primary_provider or None
-        explicit_model = (
-            resident_routing.primary_model if explicit_provider else None
-        )
-        # Resident failover is ordered, never load-balanced. Generic model
-        # preference order cannot put a compatible provider ahead of primary.
-        mode = "preferred"
-        allow_fallback = resident_routing.allow_fallback
-        model_preferences = []
 
     # If the inferred explicit_provider isn't allowed by the resolved
     # routing, drop the pin so category_routing wins. Catches:
@@ -4582,9 +4550,7 @@ async def select_llm_runtime_for_task(
         # admin UI / logs surface the downgrade explicitly — silently
         # running a different tier than the user asked for is a trust-losing
         # failure mode.
-        fallback = (
-            None if resident_routing is not None else provider.fallback_model(model)
-        )
+        fallback = provider.fallback_model(model)
         if fallback and fallback != model:
             sub_reasons = _sub_reasons()
             account = await select_max_plan_account(

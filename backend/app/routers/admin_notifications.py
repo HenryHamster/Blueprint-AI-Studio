@@ -945,7 +945,7 @@ async def resolve_message(
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
     # Verify user has write access to the project (member+; viewers are read-only)
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         msg.project_id, current_user["user_id"], session, "member"
     )
 
@@ -1025,11 +1025,6 @@ async def resolve_message(
             post_feedback_acknowledgment as _post_feedback_ack,
             post_question_answer as _post_qa,
         )
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_session import (
-#             read_resident_session,
-#             resident_session_is_active,
-#         )
 
         if message_type == MessageType.QUESTION:
             reply = await _post_qa(
@@ -1055,7 +1050,6 @@ async def resolve_message(
                 sequence=reply_sequence,
             )
         event_type = (reply.context or {}).get("event_type")
-        resident_active = resident_session_is_active(read_resident_session(project.vision))  # noqa: F821
         locked_vision = await session.scalar(
             select(Project.vision).where(Project.id == message_project_uuid)
         )
@@ -1066,7 +1060,6 @@ async def resolve_message(
             MessageType(reply.message_type),
             event_type=str(event_type) if event_type else None,
             message_content=answer,
-            resident_session_active=resident_active,
         )
         if not session.in_transaction():
             # Arming rolled back a poisoned transaction. Nothing in this

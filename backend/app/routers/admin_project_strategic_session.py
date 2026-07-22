@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -59,27 +59,6 @@ from app.models import (
 from app.auth import get_current_user
 from app.task_locking import lock_project_or_429
 from app.admin import _get_user_project_with_role
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_capabilities import capability_for
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_capability_invocation import (
-#     validated_capability_parameters,
-# )
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_operation_approval import (
-#     MAX_APPROVAL_TTL_SECONDS,
-#     OperatorApprovalRequired,
-#     capability_requires_operator_approval,
-#     derive_approval_key,
-#     grant_operation_approval,
-# )
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_ownership import (
-#     ResidentOwnershipTransition,
-#     ResidentOwnershipTransitionError,
-#     cutover_to_strategic_resident,
-#     rollback_to_legacy_resident,
-# )
 from app import strategic_cycle
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.operator_attention import build_operator_attention
@@ -139,9 +118,6 @@ from app.strategic_state_read_model import (
     _integrity_conflict_trend,
     _is_live_strategic_task,
     _problem_model_summary,
-    _resident_session_available,
-    _resident_session_availability,
-    _resident_session_summary,
     _running_update_summary,
     _strategic_refresh_summary,
     _task_summary,
@@ -155,7 +131,6 @@ from app.work_session_check_in import (
     _persist_strategic_check_in_marker,
 )
 from app.server_timing import async_timed
-from app.shared_state import runtime_config
 from app.storage import (
     ARTIFACT_BUCKET_NAME,
     GCP_PROJECT_ID,
@@ -165,25 +140,6 @@ from app.storage import (
     storage as gcs_storage,
 )
 from app.message_audience import stamp_message_audience
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_session import (
-#     STRATEGIC_SESSION_ENABLED_SETTING,
-#     build_resident_runner_options,
-#     start_resident_session,
-#     stop_resident_session,
-#     sync_resident_session_for_interaction_mode,
-# )
-
-# [RESIDENT-REMOVAL] stub placeholders for resident symbols used at module level
-MAX_APPROVAL_TTL_SECONDS = 86400
-
-
-class ResidentOwnershipTransition:
-    pass
-
-
-class ResidentOwnershipTransitionError(Exception):
-    pass
 
 router = APIRouter(
     prefix="/api/admin",
@@ -605,10 +561,6 @@ class StrategicSessionCheckInCreate(BaseModel):
 class StrategicSessionCommandExecute(BaseModel):
     idempotency_key: str
     observed_at: int | None = None
-
-
-class StrategicResidentSessionStart(BaseModel):
-    runner_id: str | None = None
 
 
 _ATTACHMENT_DEFAULT_CONTENT_TYPE = "application/octet-stream"
@@ -1557,7 +1509,6 @@ async def _build_strategic_session_response(
         "session": work_session,
         "workbench": state.get("workbench"),
         "strategic": state.get("strategic"),
-        "resident_session": state.get("resident_session"),
         "runtime": runtime,
         "context_package": context_package,
         "conversation": work_session["conversation"],
@@ -1775,7 +1726,7 @@ async def _compute_strategic_state_fingerprints(
     * ``workbench_updated_at`` — per-user workbench prefs row (MessagesNoisePrefs)
     * ``runner_count`` / ``runner_max_seen`` / ``live_runner_count`` — enrolled
       runners, latest heartbeat, and the count currently INSIDE the liveness
-      window (runtime local_runner + resident-session picker + availability).
+      window (runtime local_runner).
       ``live_runner_count`` is time-derived (mirrors ``_runner_health``'s
       ``is_live``) so a runner heartbeat going stale — which does NOT move
       ``runner_max_seen`` or ``runner_count`` — still flips the revision the
@@ -2043,7 +1994,7 @@ def _compute_strategic_state_etag(result: Dict[str, Any]) -> str:
 
     Hashes the ENTIRE assembled response body — so ANY change to a volatile
     field the narrow ``state_revision`` does not cover (runtime_summary,
-    resident_runner_options, workbench_state, work_session, model_integrity,
+    workbench_state, work_session, model_integrity,
     sha_freshness verdict, costs, counts, …) flips the token — with two
     deliberate exclusions:
 
@@ -2425,8 +2376,8 @@ async def get_project_strategic_state(
         # path on ?state_revision= and keeps its held ETag untouched on a 304.
         return Response(status_code=304)
 
-    # Fetch project runners once; pass to attention, runtime summary, and
-    # resident options so all three share one DB round-trip instead of three.
+    # Fetch project runners once; pass to attention and runtime summary so both
+    # share one DB round-trip instead of two.
     project_runners = await load_project_runners(session, project.id)
 
     # Attention uses bounded previews but still performs several queries.  The
@@ -2440,9 +2391,6 @@ async def get_project_strategic_state(
     # package. With the broad guard above, reaching here means a visible segment
     # changed, so the package's inputs are (re)assembled unconditionally.
     context_evidence = await load_strategic_context_evidence(session, project.id)
-    _turn_latency_summary = (
-        _resident_session_summary(project) or {}
-    ).get("turn_latency_summary")
     context_package = build_strategic_context_package_summary(
         project,
         active_cycle=active_cycle_summary,
@@ -2455,7 +2403,6 @@ async def get_project_strategic_state(
         task_counts=task_counts,
         attention=attention,
         evidence=context_evidence,
-        turn_latency_summary=_turn_latency_summary,
     )
     runtime_summary = await build_strategic_runtime_summary(
         session,
@@ -2465,14 +2412,6 @@ async def get_project_strategic_state(
         operator_user_id=current_user["user_id"],
         runner_rows=project_runners,
     )
-    # Multi-device resident-session picker: every enrolled runner with its
-    # online / agent-ready / eligible flags (for the auto-pick + override
-    # dropdown) and, via ``_resident_session_availability``, the block-on-offline
-    # verdict for a session pinned to a now-offline device.
-    async with async_timed(request, "runners"):
-        resident_runner_options = await build_resident_runner_options(  # noqa: F821
-            session, project.id, runner_rows=project_runners
-        )
     async with async_timed(request, "workbench"):
         workbench_state = await get_strategic_workbench_state(
             session,
@@ -2647,28 +2586,6 @@ async def get_project_strategic_state(
             "latest_cycle": latest_cycle_summary,
             "refresh": _strategic_refresh_summary(project.vision or {}),
         },
-        "resident_session": _resident_session_summary(project),
-        "resident_session_available": _resident_session_available(),
-        "resident_session_availability": _resident_session_availability(
-            project,
-            eligible_live_runner_count=(
-                int(
-                    (runtime_summary.get("local_runner") or {}).get(
-                        "eligible_live_count"
-                    )
-                    or 0
-                )
-                if isinstance(runtime_summary, dict)
-                and isinstance(runtime_summary.get("local_runner"), dict)
-                else None
-            ),
-            runner_options=resident_runner_options,
-        ),
-        # Multi-device picker options: every enrolled runner with online /
-        # agent-ready / eligible flags so the UI can render the auto-pick +
-        # override dropdown. The currently pinned device rides on
-        # ``resident_session.runner_id``.
-        "resident_session_runners": resident_runner_options,
         "running_update": running_update_summary,
         "problem_model": problem_model_summary,
         "directions": directions_summary,
@@ -2733,20 +2650,17 @@ async def get_project_strategic_liveness(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Lightweight mode + resident-session liveness probe for reload bootstrap.
+    """Lightweight interaction-mode probe for reload bootstrap.
 
     Returns ONLY the cheap fields the chat/workday shell needs to render the mode
-    indicator and the resident-session liveness chip immediately on reload:
-    ``interaction_mode`` (one indexed workbench row) plus ``resident_session`` /
-    ``resident_session_availability`` / ``resident_session_runners`` (an in-memory
-    read of ``Project.vision`` + one runner-picker query). It deliberately runs
-    NONE of the heavy ``strategic-state`` Phase-1/Phase-2 assembly — no task focus,
-    operator attention, cost aggregate, fingerprints, context package, runtime
-    summary, event/job feeds, SHA/GitHub freshness, or integrity checks — so it
-    resolves in a fraction of the time. The full read model still hydrates
-    afterward via ``strategic-state`` and takes over once it lands. Guarded with
-    the same ``member``-role project-access check the sibling strategic endpoints
-    use.
+    indicator immediately on reload: ``interaction_mode`` (one indexed workbench
+    row). It deliberately runs NONE of the heavy ``strategic-state``
+    Phase-1/Phase-2 assembly — no task focus, operator attention, cost aggregate,
+    fingerprints, context package, runtime summary, event/job feeds, SHA/GitHub
+    freshness, or integrity checks — so it resolves in a fraction of the time. The
+    full read model still hydrates afterward via ``strategic-state`` and takes over
+    once it lands. Guarded with the same ``member``-role project-access check the
+    sibling strategic endpoints use.
     """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
@@ -2757,24 +2671,9 @@ async def get_project_strategic_liveness(
         current_user["user_id"],
         project.id,
     )
-    # One runner-picker query; the eligible-live count is derived from its
-    # per-runner ``eligible`` flags so no heavy runtime summary is assembled.
-    resident_runner_options = await build_resident_runner_options(session, project.id)  # noqa: F821
-    eligible_live_runner_count = sum(
-        1 for option in resident_runner_options if option.get("eligible")
-    )
     return {
         "project_id": str(project.id),
         "interaction_mode": workbench_state.get("interaction_mode", "chat"),
-        # In-memory reads off Project.vision — no queries.
-        "resident_session": _resident_session_summary(project),
-        "resident_session_available": _resident_session_available(),
-        "resident_session_availability": _resident_session_availability(
-            project,
-            eligible_live_runner_count=eligible_live_runner_count,
-            runner_options=resident_runner_options,
-        ),
-        "resident_session_runners": resident_runner_options,
     }
 
 
@@ -2923,7 +2822,7 @@ async def upsert_project_strategic_session(
 ):
     """Create or resume a Strategic operator session for an existing project."""
 
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id,
         current_user["user_id"],
         session,
@@ -2941,19 +2840,6 @@ async def upsert_project_strategic_session(
         current_user["user_id"],
         project_id,
         workbench,
-    )
-
-    # Workday (continuous) is the resident-session on-switch: entering it
-    # auto-starts the resident session (flag on + a live local runner), leaving
-    # it auto-stops. Runs AFTER the mode itself is committed and is fully
-    # resilient — a blocked/failed auto-start records a surfaced reason and never
-    # breaks this mode-change request.
-    await sync_resident_session_for_interaction_mode(  # noqa: F821
-        session,
-        project,
-        operator_user_id=current_user["user_id"],
-        previous_mode=workbench_write.previous_state.get("interaction_mode"),
-        new_mode=workbench_write.state.get("interaction_mode"),
     )
 
     state_response = await get_project_strategic_state(
@@ -3613,207 +3499,3 @@ async def delete_message_attachment_upload(
         await session.delete(current)
         await session.commit()
     return {"status": "deleted", "deleted": True}
-
-
-@router.post("/projects/{project_id}/strategic-session/start")
-@limiter.limit("30/minute")
-async def start_project_strategic_resident_session(
-    request: Request,
-    project_id: uuid.UUID,
-    payload: StrategicResidentSessionStart | None = None,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-):
-    """Start (or adopt) a resident Strategic session on the operator's runner.
-
-    Gated on the ``strategic_session_enabled`` runtime setting (default off);
-    the resident session subsumes the legacy cadence for its project while live.
-    """
-    project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
-    )
-    if not runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False):  # noqa: F821
-        raise HTTPException(
-            status_code=403,
-            detail="Strategic resident sessions are disabled",
-        )
-    data = payload or StrategicResidentSessionStart()
-    snapshot = await start_resident_session(  # noqa: F821
-        session,
-        project,
-        operator_user_id=current_user["user_id"],
-        runner_id=data.runner_id,
-    )
-    return {"project_id": str(project_id), "enabled": True, "session": snapshot}
-
-
-class ResidentOperationApprovalGrant(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    capability: str = Field(min_length=3, max_length=120)
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    ttl_seconds: int = Field(default=3600, ge=1, le=MAX_APPROVAL_TTL_SECONDS)
-
-
-@router.post("/projects/{project_id}/resident-operation-approvals")
-@limiter.limit("30/minute")
-async def grant_resident_operation_approval(
-    request: Request,
-    project_id: uuid.UUID,
-    payload: ResidentOperationApprovalGrant,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-):
-    """Operator-grant an approval for one explicit-approval Resident operation.
-
-    The operator names the capability and its exact parameters (e.g. the PR
-    number + head sha for ``pr.merge``); the server derives the approval key from
-    them and records a single-use, time-bounded approval. Because the Resident's
-    invocation re-derives the same key from the operation it actually executes,
-    the approval authorises that operation and no other.
-    """
-
-    # Authorizing an autonomous trunk merge / deploy is at least as consequential
-    # as a human doing it, so require ``owner`` — matching admin_hotfix_promote and
-    # every other trunk-affecting operator action in this codebase.
-    project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "owner"
-    )
-    if not capability_requires_operator_approval(payload.capability):  # noqa: F821
-        raise HTTPException(
-            status_code=400,
-            detail="capability does not require an explicit operator approval",
-        )
-    try:
-        spec = capability_for(payload.capability)  # noqa: F821
-        parameters = validated_capability_parameters(spec, payload.parameters)  # noqa: F821
-    except (ValueError, OperatorApprovalRequired) as exc:  # noqa: F821
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    approval_key = derive_approval_key(payload.capability, parameters)  # noqa: F821
-    approval = await grant_operation_approval(  # noqa: F821
-        session,
-        project_id=project.id,
-        capability=payload.capability,
-        approval_key=approval_key,
-        granted_by=current_user["user_id"],
-        ttl_seconds=payload.ttl_seconds,
-    )
-    await session.commit()
-    return {
-        "project_id": str(project_id),
-        "capability": payload.capability,
-        "approval_id": str(approval.id),
-        "approval_key": approval_key,
-        "expires_at": approval.expires_at.isoformat(),
-    }
-
-
-def _resident_ownership_transition_response(
-    project_id: uuid.UUID, transition: ResidentOwnershipTransition
-) -> Dict[str, Any]:
-    """Serialize an ownership transition into the operator-facing switch result."""
-
-    return {
-        "project_id": str(project_id),
-        "previous_owner": transition.previous_owner,
-        "new_owner": transition.new_owner,
-        "previous_generation": transition.previous_generation,
-        "new_generation": transition.new_generation,
-        "checkpoint_id": str(transition.checkpoint_id),
-        "checkpoint_version": transition.checkpoint_version,
-        "checkpoint_hash": transition.checkpoint_hash,
-        "cancelled_task_ids": [str(task_id) for task_id in transition.cancelled_task_ids],
-        "already_owned": transition.already_owned,
-        "legacy_projection_applied": transition.legacy_projection_applied,
-    }
-
-
-@router.post("/projects/{project_id}/resident-engine/cutover")
-@limiter.limit("10/minute")
-async def cutover_project_resident_engine(
-    request: Request,
-    project_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-):
-    """Flip a project's strategy engine to the Strategic Resident (owner-gated).
-
-    This is the M5 per-project rollout switch. It atomically fences any legacy
-    shadow work at the current checkpoint boundary and grants the Resident engine
-    authority in one idempotent transition (a second call returns
-    ``already_owned=True`` without stranding shadow turns). The Resident row and
-    its v1 checkpoint are provisioned first if the project never had one, so the
-    flip is a clean one-shot on any project. Reversible via the rollback switch.
-
-    Handing an autonomous engine ownership of a project's strategy is at least as
-    consequential as any other trunk-affecting operator action, so it requires the
-    ``owner`` role — matching the operation-approval grant and hotfix-promote.
-    """
-
-    project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "owner"
-    )
-    # Provision the Resident + deterministic v1 checkpoint if this project never
-    # had one, so the switch works on any project. Idempotent (no-op when present);
-    # the helper takes the canonical Project row lock itself. Committed in its own
-    # transaction before the cutover, which re-locks under its own sessionmaker.
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-    await initialize_strategic_resident(session, project.id)  # noqa: F821
-    await session.commit()
-    try:
-        transition = await cutover_to_strategic_resident(AsyncSessionLocal, project_id)  # noqa: F821
-    except ResidentOwnershipTransitionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _resident_ownership_transition_response(project_id, transition)
-
-
-@router.post("/projects/{project_id}/resident-engine/rollback")
-@limiter.limit("10/minute")
-async def rollback_project_resident_engine(
-    request: Request,
-    project_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-):
-    """Roll a project's strategy engine back to the legacy cadence (owner-gated).
-
-    The reverse of the cutover switch: it fences the current Resident generation
-    and restores the bounded legacy strategic inputs in one idempotent transition
-    (a second call returns ``already_owned=True``). A project that was never cut
-    over has no Resident to roll back, which surfaces as a 409.
-    """
-
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "owner"
-    )
-    try:
-        transition = await rollback_to_legacy_resident(AsyncSessionLocal, project_id)  # noqa: F821
-    except ResidentOwnershipTransitionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _resident_ownership_transition_response(project_id, transition)
-
-
-@router.post("/projects/{project_id}/strategic-session/stop")
-@limiter.limit("30/minute")
-async def stop_project_strategic_resident_session(
-    request: Request,
-    project_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-):
-    """Stop the resident Strategic session and hand authority back to the cadence.
-
-    Not gated on the feature flag: an operator can always reclaim/stop a session
-    (instant manual reclaim), even after the flag is turned off.
-    """
-    project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
-    )
-    snapshot = await stop_resident_session(  # noqa: F821
-        session,
-        project,
-        operator_user_id=current_user["user_id"],
-    )
-    return {"project_id": str(project_id), "session": snapshot}

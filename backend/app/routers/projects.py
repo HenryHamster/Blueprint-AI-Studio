@@ -1,7 +1,6 @@
 """Project CRUD, deploy, WebSocket, and status endpoints."""
 
 import asyncio
-import hmac
 import json
 import logging
 import time
@@ -48,8 +47,6 @@ from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
 from app.strategic_events import emit_strategic_session_delta
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_agent_binding import RESIDENT_CLAIM_NONCE_CONTEXT_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -70,19 +67,7 @@ def _agent_ws_binding_invalid(task: Task | None, payload: dict) -> bool:
     if task is None or task.status in _AGENT_WS_TERMINAL_STATUSES:
         return True
     token_vm = payload.get("vm_instance_id")
-    if token_vm and task.vm_instance_id and task.vm_instance_id != token_vm:
-        return True
-    if payload.get("task_type") != "strategic_resident_turn":
-        return False
-    persisted_nonce = str(
-        (task.context or {}).get(RESIDENT_CLAIM_NONCE_CONTEXT_KEY) or ""  # noqa: F821
-    )
-    presented_nonce = str(payload.get("claim_nonce") or "")
-    return (
-        not persisted_nonce
-        or not presented_nonce
-        or not hmac.compare_digest(presented_nonce, persisted_nonce)
-    )
+    return bool(token_vm and task.vm_instance_id and task.vm_instance_id != token_vm)
 
 
 def _truncate_vm_instance_id(vm_instance_id: object) -> str:
@@ -758,28 +743,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             )
             await _safe_ws_close(websocket, code=1008, reason="VM instance mismatch")
             return
-        if payload.get("task_type") == "strategic_resident_turn":
-            task_context = task.context if isinstance(task.context, dict) else {}
-            persisted_nonce = str(
-                task_context.get(RESIDENT_CLAIM_NONCE_CONTEXT_KEY) or ""  # noqa: F821
-            )
-            presented_nonce = str(payload.get("claim_nonce") or "")
-            if (
-                not persisted_nonce
-                or not presented_nonce
-                or not hmac.compare_digest(presented_nonce, persisted_nonce)
-            ):
-                _log_agent_auth_reject(
-                    "ws_resident_claim_nonce_stale",
-                    path=path,
-                    task_id=task_id,
-                    token_vm_instance_id=token_vm,
-                    token_project_id=token_project,
-                )
-                await _safe_ws_close(
-                    websocket, code=1008, reason="Resident claim superseded"
-                )
-                return
 
         project_id = str(task.project_id)
 
@@ -876,17 +839,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 except json.JSONDecodeError:
                     receive_task = asyncio.create_task(websocket.receive_text())
                     continue
-                if (
-                    payload.get("task_type") == "strategic_resident_turn"
-                    and data.get("type") != "log"
-                ):
-                    await _safe_ws_close(
-                        websocket,
-                        code=1008,
-                        reason="Resident frame type is not authorized",
-                    )
-                    return
-
                 if data.get("type") == "log":
                     sanitized = _sanitize_log(data.get("content", ""))
                     await broadcast_to_project(
@@ -904,7 +856,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                     # Optionally handle status updates via WS too
                     pass
                 elif data.get("type") == "strategic_session":
-                    # Resident strategic-session live transcript delta. The
+                    # Strategic-session live transcript delta. The
                     # 100KB frame-size cap and the 20/sec rate-limit accounting
                     # above already applied to this frame exactly like the log
                     # path. emit_strategic_session_delta secret-sanitizes

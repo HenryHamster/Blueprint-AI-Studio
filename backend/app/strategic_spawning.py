@@ -125,6 +125,11 @@ from app.strategic_trigger import (
     strategic_refresh_excerpt,
     strategic_refresh_origin,
 )
+from app.strategic_authority_locks import (
+    LegacyEngineAuthorityExpired,
+    commit_legacy_authorized,
+    lock_and_validate_legacy_authority,
+)
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_evaluators import (
     CHALLENGE_AGREES,
@@ -2034,7 +2039,7 @@ _COMPACTION_HISTORY_ENTRY_THRESHOLD = 15
 def _build_compaction_hints(problem_model: dict | None) -> list[dict] | None:
     """Identify active gaps warranting ``_compactions`` watermark compaction.
 
-    Resident sessions accumulate problem-model gap history entries over time;
+    Strategic cycles accumulate problem-model gap history entries over time;
     this returns a list of hints — one per active gap whose combined history
     and past_moves entries exceed the threshold — so the strategist can apply
     targeted compaction without exhaustive manual inspection.
@@ -2422,10 +2427,6 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
     "held_directions": {"priority": "low", "exempt": True},
-    # Open FOUND leads from the resident exam ledger. Medium priority, exempt:
-    # bounded at build time (only open FOUND entries, compact shape). Absent
-    # when no resident session has run or no open leads exist.
-    "resident_exam_leads": {"priority": "medium", "exempt": True},
     # Aggregated missing-foundation demand (capability/foundation prerequisites
     # declared by dependents that no task provides). Medium priority, exempt:
     # bounded at build time by collect_missing_capability_demand.
@@ -2444,18 +2445,6 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # cloud GPU (or be held indefinitely when require_local_runner is set) and
     # to size experiments to the fleet's actual VRAM/device counts.
     "local_runner_status": {"priority": "medium", "exempt": True},
-    # Resident-session pacing knobs surfaced from _runtime_config onto the
-    # resident_minimal payload so the agent's residentConfig() reads live,
-    # operator-tunable values instead of falling back to hardcoded defaults.
-    # Critical tier, tiny scalars the packer ships verbatim (never trimmed) so
-    # pacing is never silently dropped under budget pressure. The agent reads
-    # each optionally and degrades to its own default when a key is absent.
-    "strategic_session_idle_tick_seconds": {"priority": "critical"},
-    "strategic_session_turn_timeout_seconds": {"priority": "critical"},
-    "strategic_session_message_poll_seconds": {"priority": "critical"},
-    "strategic_session_min_tick_seconds": {"priority": "critical"},
-    "strategic_session_max_ops_per_turn": {"priority": "critical"},
-    "strategic_session_autonomous_turn_timeout_seconds": {"priority": "critical"},
     # Persisted integrity-conflict trend over the last 10 completed cycles.
     # Three scalars (stamped_cycles, consecutive_clean_cycles) + last_counts
     # dict. Low priority, exempt: absent until the first stamped cycle lands and
@@ -4088,23 +4077,16 @@ async def _spawn_design_doc_update(
     Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_transition_locks import (
-#         commit_legacy_authorized,
-#         LegacyEngineAuthorityExpired,
-#         lock_and_validate_legacy_authority,
-#     )
 
     try:
         if expected_legacy_generation is None:
-            expected_legacy_generation = await lock_and_validate_legacy_authority(  # noqa: F821
+            expected_legacy_generation = await lock_and_validate_legacy_authority(
                 session, project.id
             )
             await session.commit()
-    except LegacyEngineAuthorityExpired:  # noqa: F821
+    except LegacyEngineAuthorityExpired:
         await session.rollback()
         return False
-
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -4271,12 +4253,12 @@ async def _spawn_design_doc_update(
         if steering_excerpt:
             task_context["steering_excerpt"] = steering_excerpt
     try:
-        await lock_and_validate_legacy_authority(  # noqa: F821
+        await lock_and_validate_legacy_authority(
             session,
             project.id,
             expected_generation=expected_legacy_generation,
         )
-    except LegacyEngineAuthorityExpired:  # noqa: F821
+    except LegacyEngineAuthorityExpired:
         await session.rollback()
         return False
     new_task = Task(
@@ -4307,33 +4289,7 @@ async def _spawn_design_doc_update(
         baseline_problem_model=project.problem_model or {},
         baseline_running_update=project.running_update,
     )
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_runtime import coalesce_resident_turn
-
-    # Snapshot IDs before the try block so they remain accessible after rollback.
-    _project_id = project.id
-    _new_task_id = new_task.id
-    try:
-        async with session.begin_nested():
-            await coalesce_resident_turn(  # noqa: F821
-                session,
-                project_id=_project_id,
-                lane="background",
-                trigger_kind="project_change",
-                project_change_cursor={
-                    "strategic_cycle_id": str(cycle_id),
-                    "phase1_task_id": str(_new_task_id),
-                },
-            )
-    except Exception:
-        logger.exception(
-            "[RESIDENT_SHADOW] Phase-1 background wake failed open for project %s "
-            "(cycle=%s task=%s)",
-            _project_id,
-            cycle_id,
-            _new_task_id,
-        )
-    await commit_legacy_authorized(  # noqa: F821
+    await commit_legacy_authorized(
         session, project.id, expected_legacy_generation
     )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
@@ -4877,10 +4833,8 @@ def _build_direction_stats(
     paused/proposed direction's research history + aggregate into lifetime merge,
     proof, failure, autonomy, cost, and outcome-progress signals. Returns
     ``(included_directions, direction_stats)`` — the cadence caller reuses
-    ``included_directions`` for its mode-hint lines. Shared verbatim by the
-    cadence ``_spawn_strategic_review`` payload build and the resident-minimal
-    spawn path, so the resident agent boots with the SAME direction grounding
-    (never an empty list) and never re-creates an already-active direction.
+    ``included_directions`` for its mode-hint lines. Used by the cadence
+    ``_spawn_strategic_review`` payload build.
     """
     # Include `active` + `paused` + `proposed`: paused entries are a strong user
     # signal the strategic agent should respect rather than re-propose; proposed
@@ -5186,9 +5140,9 @@ def _build_direction_counts(project: Project) -> dict[str, Any]:
     """Authoritative, trim-proof direction tally for the strategist payload.
 
     Pure over ``project.directions`` + runtime config (no DB / no network):
-    ``{active, paused, total, max_active, by_system}``. Shared by the cadence
-    payload build and the resident-minimal spawn path so both anchor on the true
-    active set even when ``directions_summary`` is trimmed.
+    ``{active, paused, total, max_active, by_system}``. Used by the cadence
+    payload build so it anchors on the true active set even when
+    ``directions_summary`` is trimmed.
     """
     _all_directions = project.directions or []
     _active_directions_count = sum(
@@ -5224,63 +5178,6 @@ def _build_direction_counts(project: Project) -> dict[str, Any]:
     }
 
 
-def _resident_open_found_leads(project: Project) -> list[dict[str, Any]] | None:
-    """Return compact open FOUND leads from the resident session's exam ledger.
-
-    Reads ``vision[RESIDENT_SESSION_KEY]["_exam_ledger"]``, deduplicates records
-    by ``surfaceKey`` keeping the latest by ``atTick``, then returns only those
-    whose final verdict is ``"found"`` as ``[{surfaceKey, note, at}]``.
-
-    Returns ``None`` when no ledger exists, the JSON is invalid, or no open
-    FOUND leads remain — so callers can skip injection on the common path.
-    """
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_session import RESIDENT_SESSION_KEY
-
-    vision = project.vision or {}
-    resident_blob = vision.get(RESIDENT_SESSION_KEY)  # noqa: F821
-    if not resident_blob or not isinstance(resident_blob, dict):
-        return None
-    raw_ledger = resident_blob.get("_exam_ledger")
-    if not raw_ledger or not isinstance(raw_ledger, str):
-        return None
-    try:
-        parsed = json.loads(raw_ledger)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    raw_records = parsed.get("records")
-    if not isinstance(raw_records, list):
-        return None
-
-    # Dedup by surfaceKey, keeping the record with the highest atTick.
-    latest: dict[str, dict] = {}
-    for rec in raw_records:
-        if not isinstance(rec, dict):
-            continue
-        surface_key = rec.get("surfaceKey")
-        if not isinstance(surface_key, str) or not surface_key:
-            continue
-        at_tick = rec.get("atTick")
-        at_tick = at_tick if isinstance(at_tick, (int, float)) else 0
-        prev = latest.get(surface_key)
-        prev_tick = prev.get("atTick", 0) if prev else -1
-        if at_tick >= prev_tick:
-            latest[surface_key] = rec
-
-    leads = [
-        {
-            "surfaceKey": r["surfaceKey"],
-            "note": str(r.get("note") or ""),
-            "at": str(r.get("at") or ""),
-        }
-        for r in latest.values()
-        if r.get("verdict") == "found"
-    ]
-    return leads if leads else None
-
-
 async def _finalize_strategic_review_spawn(
     session: AsyncSession,
     *,
@@ -5301,15 +5198,13 @@ async def _finalize_strategic_review_spawn(
     integrity_conflict_counts: dict[str, int] | None = None,
     expected_legacy_generation: int | None = None,
 ) -> bool:
-    """Guarded INSERT/commit tail shared by the cadence + resident spawn paths.
+    """Guarded INSERT/commit tail for the cadence spawn path.
 
     Re-arms the duplicate-spawn guards, creates the ``strategic_review`` task
     (born already carrying ``extra_context``), records the StrategicCycle row,
     commits, and emits the cycle-started event — the short, sub-second
-    transaction both callers finish on. The cadence path reaches here after its
-    ~30s payload build; the resident path reaches here with a minimal payload
-    and no preceding GitHub I/O (see ``_spawn_strategic_review``'s
-    ``resident_minimal`` branch).
+    transaction the caller finishes on. The cadence path reaches here after its
+    ~30s payload build.
 
     Re-arm the duplicate-spawn guards before the INSERT: the cadence payload
     build takes ~30s in prod and ``_build_recent_interventions`` COMMITS mid-way
@@ -5327,20 +5222,14 @@ async def _finalize_strategic_review_spawn(
     """
     from app.autonomous_research import _try_research_spawn_advisory_lock
     from app.task_lifecycle import _has_active_strategic_task
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_transition_locks import (
-#         commit_legacy_authorized,
-#         LegacyEngineAuthorityExpired,
-#         lock_and_validate_legacy_authority,
-#     )
 
     try:
-        await lock_and_validate_legacy_authority(  # noqa: F821
+        await lock_and_validate_legacy_authority(
             session,
             project_id,
             expected_generation=expected_legacy_generation,
         )
-    except LegacyEngineAuthorityExpired:  # noqa: F821
+    except LegacyEngineAuthorityExpired:
         await session.rollback()
         return False
 
@@ -5386,23 +5275,19 @@ async def _finalize_strategic_review_spawn(
     if extra_context:
         task_context.update(extra_context)
 
-    # Runner-pin AT BIRTH (resident-session spawn only; ``runner_pin_id`` is None
-    # for every cadence caller, leaving their QUEUED + fresh ``agent-vm`` id and
-    # normal VM-dispatch entry unchanged). A resident ``strategic_review`` must be
-    # born already PROVISIONING and pinned to the operator's local runner so
-    # ``POST /api/runner/next-task`` hands it straight to that runner — independent
-    # of the general VM-dispatch cycle (which may be paused, ``max_concurrent_vms=0``).
-    # This mirrors the orchestrator's own pin contract
-    # (``orchestrator._try_runner_dispatch``: ``vm_instance_id='runner:{id}'`` +
-    # ``context['runner_target_id']`` + PROVISIONING + ``vm_provisioned_at``) at the
-    # INSERT instead of a beat later. Without it the task is born QUEUED + VM-pinned
-    # (``agent-vm-…``), so ``next-task`` — which filters
-    # ``status==PROVISIONING AND vm_instance_id=='runner:{id}' AND
-    # context['runner_target_id']==id AND started_at IS NULL`` — never returns it and
-    # the resident agent never claims it. ``started_at`` stays NULL (the runner
-    # stamps it on pull), which also keeps the reaper carve-out
-    # (``reaper_orphan_classify._is_runner_pinned_awaiting_pull``) protecting it while
-    # the operator's runner is briefly offline.
+    # Runner-pin AT BIRTH (``runner_pin_id`` is None for every cadence caller,
+    # leaving their QUEUED + fresh ``agent-vm`` id and normal VM-dispatch entry
+    # unchanged). When set, the task is born already PROVISIONING and pinned to
+    # the operator's local runner so ``POST /api/runner/next-task`` hands it
+    # straight to that runner — independent of the general VM-dispatch cycle
+    # (which may be paused, ``max_concurrent_vms=0``). This mirrors the
+    # orchestrator's own pin contract (``orchestrator._try_runner_dispatch``:
+    # ``vm_instance_id='runner:{id}'`` + ``context['runner_target_id']`` +
+    # PROVISIONING + ``vm_provisioned_at``) at the INSERT instead of a beat later.
+    # ``started_at`` stays NULL (the runner stamps it on pull), which also keeps
+    # the reaper carve-out
+    # (``reaper_orphan_classify._is_runner_pinned_awaiting_pull``) protecting it
+    # while the operator's runner is briefly offline.
     if runner_pin_id:
         task_context["runner_target_id"] = str(runner_pin_id)
         born_vm_instance_id = f"runner:{runner_pin_id}"
@@ -5460,33 +5345,7 @@ async def _finalize_strategic_review_spawn(
     if _cycle_row is not None and integrity_conflict_counts is not None:
         strategic_cycle.record_integrity_conflict_counts(_cycle_row, integrity_conflict_counts)
         session.add(_cycle_row)
-    # Shadow only meaningful accepted cadence work. Unchanged cadence checks
-    # never reach this finalize transaction and therefore make zero Resident
-    # Tasks/model calls.
-    try:
-        async with session.begin_nested():
-            # [RESIDENT-REMOVAL] removed with resident subsystem
-#             from app.strategic_resident_runtime import coalesce_resident_turn
-
-            await coalesce_resident_turn(  # noqa: F821
-                session,
-                project_id=project_id,
-                lane="background",
-                trigger_kind="project_change",
-                project_change_cursor={
-                    "strategic_cycle_id": str(cycle_id),
-                    "phase2_task_id": str(new_task.id),
-                },
-            )
-    except Exception:
-        logger.exception(
-            "[RESIDENT_SHADOW] Background cycle wake failed open for project %s "
-            "(cycle=%s task=%s); legacy cycle remains authoritative",
-            project_id,
-            cycle_id,
-            new_task.id,
-        )
-    await commit_legacy_authorized(  # noqa: F821
+    await commit_legacy_authorized(
         session, project_id, expected_legacy_generation
     )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
@@ -5515,7 +5374,6 @@ async def _spawn_strategic_review(
     preferred_runner_target_id: str | None = None,
     local_runner_context: dict[str, Any] | None = None,
     extra_context: dict[str, Any] | None = None,
-    resident_minimal: bool = False,
     runner_pin_id: str | None = None,
     *,
     apply_spawn_budget_guard: bool = False,
@@ -5527,42 +5385,13 @@ async def _spawn_strategic_review(
     Uses type 'strategic_review' so it doesn't block tactical research.
     Returns True if a task was created, False if skipped.
 
-    ``resident_minimal`` (default ``False`` — every cadence caller is
-    unaffected) skips ONLY the slow, GitHub-fetching context builders — design-doc
-    grounding + capability backing-path verification (per-file ``contents`` /
-    ``git/trees`` fetches), recent-intervention ancestry, branch-verification
-    credential resolution, and the branch-SHA / version-phase / ci-compliance
-    lookups they feed — because those hold the request's DB connection open long
-    enough for asyncpg/Cloud SQL to idle-close it, so the finalize flush 500s
-    before ``task_id`` ever lands (~143s). It STILL ships the CHEAP grounding
-    (``vision`` / ``problem_model`` [unverified agent-view] / ``running_update`` /
-    ``directions_summary`` / ``direction_counts`` / ``open_messages`` — pure
-    in-memory ORM scalars + DB-only reads, no connection held across any network
-    call) so the resident agent is not context-blind: it must see current
-    directions (so it does not re-create one) and open operator messages (a
-    message older than the runner's ~2-minute first-poll cursor would otherwise
-    surface nowhere). Used only by the resident-session START path
-    (``_spawn_resident_strategic_task``), which runs SYNCHRONOUSLY inside an
-    operator HTTP request; the resident agent builds the REST of its context on
-    the runner via Claude Code. The duplicate-spawn guards, born-context/runner-
-    pin (via ``extra_context``), StrategicCycle recording, and commit are all
-    still applied — only the network-I/O context builders are elided.
-
     ``extra_context`` (default ``None`` — every cadence caller is unaffected)
     seeds additional keys into the created task's ``context`` in the SAME
     INSERT/commit that creates the task, so the committed task is BORN already
-    carrying them (it never exists in a committed state without them). The
-    resident-strategic-session start path uses this to make its spawned
-    ``strategic_review`` claimable ONLY with ``_resident_session`` already set:
-    handler dispatch (one-shot ``handleStrategic`` vs streaming
-    ``handleStrategicResident``) is decided at claim time from the context flag,
-    so a warm local runner that claims the task in the sub-millisecond window
-    before the session blob is finalized still reads the resident flag and routes
-    to the streaming handler — closing the SPAWN-path race a separate post-spawn
-    stamping transaction previously left open. Merged over the context this
-    function derives, so an explicit ``extra_context`` value wins on any key
-    collision (e.g. the local-runner pin), leaving runner-pin semantics identical
-    to stamping it a beat later.
+    carrying them (it never exists in a committed state without them). Merged
+    over the context this function derives, so an explicit ``extra_context``
+    value wins on any key collision (e.g. the local-runner pin), leaving
+    runner-pin semantics identical to stamping it a beat later.
 
     ``operator_steered`` carries the operator-origin signal forward when this
     spawn is the Phase 2 tail of an architecture cycle. On that path the
@@ -5582,14 +5411,14 @@ async def _spawn_strategic_review(
     volatile conversation-thread snapshot.
 
     ``runner_pin_id`` (default ``None`` — every cadence caller is unaffected, so
-    their task is born QUEUED + ``agent-vm`` and enters normal VM dispatch) is the
-    AUTHORITATIVE local-runner pin the resident-session START path supplies. When
-    set, the created ``strategic_review`` is born already PROVISIONING with
-    ``vm_instance_id='runner:{id}'`` + ``context['runner_target_id']`` (the exact
-    contract ``POST /api/runner/next-task`` filters on) so the operator's local
-    runner claims it directly, independent of the general VM-dispatch cycle (which
-    may be paused). Unlike ``preferred_runner_target_id`` (a non-authoritative
-    affinity hint dispatch may or may not honor), this is a hard birth pin.
+    their task is born QUEUED + ``agent-vm`` and enters normal VM dispatch) is an
+    AUTHORITATIVE local-runner pin. When set, the created ``strategic_review`` is
+    born already PROVISIONING with ``vm_instance_id='runner:{id}'`` +
+    ``context['runner_target_id']`` (the exact contract ``POST
+    /api/runner/next-task`` filters on) so the operator's local runner claims it
+    directly, independent of the general VM-dispatch cycle (which may be paused).
+    Unlike ``preferred_runner_target_id`` (a non-authoritative affinity hint
+    dispatch may or may not honor), this is a hard birth pin.
 
     ``preferred_runner_target_id`` is a non-authoritative local-runner affinity
     hint from the preceding architecture phase. Dispatch may honor it only if
@@ -5601,19 +5430,14 @@ async def _spawn_strategic_review(
     project ORM attributes in the post-build finalize path.
     """
     from app.task_lifecycle import _has_active_strategic_task
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_transition_locks import (
-#         LegacyEngineAuthorityExpired,
-#         lock_and_validate_legacy_authority,
-#     )
 
     try:
         if expected_legacy_generation is None:
-            expected_legacy_generation = await lock_and_validate_legacy_authority(  # noqa: F821
+            expected_legacy_generation = await lock_and_validate_legacy_authority(
                 session, project.id
             )
             await session.commit()
-    except LegacyEngineAuthorityExpired:  # noqa: F821
+    except LegacyEngineAuthorityExpired:
         await session.rollback()
         return False
 
@@ -5692,176 +5516,7 @@ async def _spawn_strategic_review(
             "strategic_review",
         )
 
-    if resident_minimal:
-        # A resident strategic session runs SYNCHRONOUSLY inside the operator's
-        # START request and then builds most of its own context on the runner via
-        # Claude Code. So skip ONLY the slow, GitHub-fetching context builders the
-        # cadence path runs below — ``ground_design_doc`` +
-        # ``_verify_capability_backing_paths`` (per-file ``contents``/``git/trees``
-        # fetches), ``_build_recent_interventions`` (ancestry fan-out), and
-        # ``resolve_branch_verification_context`` (credential resolve), plus the
-        # branch-SHA / version-phase / ci-compliance lookups they feed. Those hold
-        # the request's DB connection open long enough for asyncpg/Cloud SQL to
-        # idle-close it, so the finalize flush 500s before ``task_id`` ever lands
-        # (start_project_strategic_resident_session, ~143s).
-        #
-        # STILL include the CHEAP grounding — pure in-memory ORM scalars +
-        # DB-only reads, none of which hold a connection across a network call —
-        # so the resident agent is NOT context-blind at boot: without ``vision`` /
-        # ``problem_model`` / ``running_update`` / ``directions_summary`` /
-        # ``direction_counts`` / the retired/prior-decision context below it would
-        # re-derive (and risk re-creating) existing directions, and without
-        # ``open_messages`` an operator message older than the resident's
-        # ~2-minute first-poll cursor would surface NOWHERE (not in bootstrap,
-        # not in the first poll). ``problem_model`` is the UNVERIFIED agent-view
-        # (the backing-path verification is exactly the skipped GitHub I/O). The
-        # transaction stays short: cheap reads only, zero network.
-        review_model = (
-            _runtime_config.get("task_type_models", {}).get("strategic_review")
-            or _runtime_config.get("task_type_models", {}).get("research")
-            or None
-        )
-        review_effort = (
-            _runtime_config.get("task_type_efforts", {}).get("strategic_review")
-            or _runtime_config.get("task_type_efforts", {}).get("research")
-            or None
-        )
-        _res_direction_counts = _build_direction_counts(project)
-        _res_direction_stats = _build_direction_stats(project)[1]
-        from app.strategic_analysis import _build_retired_directions_summary
-
-        cycle_history = await strategic_cycle.recent_for_agent_context(
-            session,
-            project.id,
-            limit=20,
-        )
-        _res_retired_summary = _build_retired_directions_summary(project)
-        _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
-        _res_open_messages = await _fetch_open_messages(session, project.id)
-        # Recently-answered operator conversation tail — DB-only, bounded, and
-        # explicitly non-actionable. Surfaces a correction the operator just made
-        # (now marked handled/resolved, so gone from the open feed) so a restarted
-        # resident session does not re-propose what the operator already settled.
-        _res_recent_handled = await _fetch_recent_handled_conversation(
-            session, project.id
-        )
-        # Ship the resident-session pacing knobs from _runtime_config onto the
-        # payload so the agent's residentConfig() reads LIVE, operator-tunable
-        # values instead of falling back to hardcoded defaults. All six knobs are
-        # wired end-to-end: idle_tick, turn_timeout, and message_poll (existing);
-        # min_tick, max_ops_per_turn, and autonomous_turn_timeout (new).
-        # All are tiny critical-tier scalars (never trimmed).
-        _res_pacing_knobs = {
-            "strategic_session_idle_tick_seconds": int(
-                _runtime_config.get("strategic_session_idle_tick_seconds", 5)
-            ),
-            "strategic_session_turn_timeout_seconds": int(
-                _runtime_config.get("strategic_session_turn_timeout_seconds", 120)
-            ),
-            "strategic_session_message_poll_seconds": float(
-                _runtime_config.get("strategic_session_message_poll_seconds", 10)
-            ),
-            "strategic_session_min_tick_seconds": int(
-                _runtime_config.get("strategic_session_min_tick_seconds", 600)
-            ),
-            "strategic_session_max_ops_per_turn": int(
-                _runtime_config.get("strategic_session_max_ops_per_turn", 3)
-            ),
-            "strategic_session_autonomous_turn_timeout_seconds": int(
-                _runtime_config.get(
-                    "strategic_session_autonomous_turn_timeout_seconds", 300
-                )
-            ),
-        }
-        _res_exam_leads = _resident_open_found_leads(project)
-        minimal_payload = validate_internal_payload(
-            pack_under_budget(
-                {
-                    "type": "strategic_review",
-                    "research_mode": "strategic",
-                    "project_name": _project_name,
-                    "base_branch": get_project_integration_branch(project),
-                    # Cheap in-memory ORM scalars (no I/O).
-                    "vision": _agent_visible_vision(project.vision),
-                    "effective_purpose": resolve_project_purpose(project),
-                    "problem_model": _agent_view_problem_model(project.problem_model),
-                    "running_update": project.running_update or "",
-                    # Pure-computation direction grounding (no I/O).
-                    "directions_summary": _res_direction_stats,
-                    "direction_counts": _res_direction_counts,
-                    "max_active_directions": _res_direction_counts["max_active"],
-                    **(
-                        {"retired_directions_summary": _res_retired_summary}
-                        if _res_retired_summary
-                        else {}
-                    ),
-                    **(
-                        {"previous_decision_outcomes": _res_prev_outcomes}
-                        if _res_prev_outcomes
-                        else {}
-                    ),
-                    # DB-only open-operator-message feed (no network) — the
-                    # load-bearing key: surfaces messages older than the runner's
-                    # first-poll cursor that would otherwise be missed entirely.
-                    "open_message_count": len(_res_open_messages),
-                    "open_messages": _res_open_messages,
-                    **(
-                        {"recent_handled_conversation": _res_recent_handled}
-                        if _res_recent_handled
-                        else {}
-                    ),
-                    **({"model": review_model} if review_model else {}),
-                    **({"effort": review_effort} if review_effort else {}),
-                    # Live, operator-tunable resident-session pacing knobs.
-                    **_res_pacing_knobs,
-                    # Open FOUND leads from the resident exam ledger (pure
-                    # in-memory read — no I/O). Absent when no ledger or no leads.
-                    **(
-                        {"resident_exam_leads": _res_exam_leads}
-                        if _res_exam_leads
-                        else {}
-                    ),
-                    # Compact, durable behavioral memory notes written by the
-                    # set_memory strategic op. Already capped at 100 entries by the
-                    # handler, so budget-footprint is bounded.
-                    "strategic_memory_notes": project.strategic_memory_notes or [],
-                    # Gaps whose history entries warrant compaction — surfaced
-                    # directly in the payload so the strategist sees an automatic
-                    # signal without manual inspection. Pure in-memory computation.
-                    **(
-                        {"compaction_hints": _rm_compaction_hints}
-                        if (_rm_compaction_hints := _build_compaction_hints(project.problem_model))
-                        else {}
-                    ),
-                },
-                _STRATEGIC_REVIEW_SCHEMA,
-            ),
-            "autonomous_research:strategic_review",
-        )
-        return await _finalize_strategic_review_spawn(
-            session,
-            project_id=_project_id,
-            project_name=_project_name,
-            payload=minimal_payload,
-            cycle_id=cycle_id,
-            strategy_only=strategy_only,
-            base_vision=_base_vision,
-            base_problem_model=_base_problem_model,
-            base_running_update=_base_running_update,
-            local_runner_intent=local_runner_intent,
-            preferred_runner_target_id=preferred_runner_target_id,
-            extra_context=extra_context,
-            operator_steered=operator_steered,
-            steering_excerpt=steering_excerpt,
-            # Born PROVISIONING + pinned to the operator's runner (only the resident
-            # spawn path passes this; cadence spawns leave it None → QUEUED as before)
-            # so POST /api/runner/next-task claims it directly.
-            runner_pin_id=runner_pin_id,
-            expected_legacy_generation=expected_legacy_generation,
-        )
-
-    # Build direction stats with rich data (pure over ``project.directions``;
-    # shared verbatim with the resident-minimal spawn path via the helper).
+    # Build direction stats with rich data (pure over ``project.directions``).
     included_directions, direction_stats = _build_direction_stats(project)
 
     mode_hint_lines = []
@@ -7391,7 +7046,6 @@ async def _spawn_strategic_review(
     # gap flags can never be starved out by the same byte-budget pressure that
     # trims or drops the per-direction detail list. Shipped as a ``critical``
     # payload key (see _STRATEGIC_REVIEW_SCHEMA) so the packer never reduces them.
-    # Shared verbatim with the resident-minimal spawn path via the helper.
     _direction_counts = _build_direction_counts(project)
     _active_directions_count = _direction_counts["active"]
     _max_active_directions = _direction_counts["max_active"]
@@ -7616,7 +7270,6 @@ async def _spawn_strategic_review(
     _knowledge_by_direction = await fetch_direction_knowledge_index(
         session, project.id, _active_direction_ids
     )
-    _cadence_exam_leads = _resident_open_found_leads(project)
 
     payload: dict = pack_under_budget(
         {
@@ -7847,11 +7500,6 @@ async def _spawn_strategic_review(
                 if _sr_capability_trial_verdicts
                 else {}
             ),
-            **(
-                {"resident_exam_leads": _cadence_exam_leads}
-                if _cadence_exam_leads
-                else {}
-            ),
             "base_branch": get_project_integration_branch(project),
             **({"model": review_model} if review_model else {}),
             **({"effort": review_effort} if review_effort else {}),
@@ -7875,8 +7523,8 @@ async def _spawn_strategic_review(
     }
 
     # Re-arm the duplicate-spawn guards, create the task, record the cycle, and
-    # commit — the short finalize transaction shared with the resident-minimal
-    # path above (see ``_finalize_strategic_review_spawn``).
+    # commit — the short finalize transaction (see
+    # ``_finalize_strategic_review_spawn``).
     return await _finalize_strategic_review_spawn(
         session,
         project_id=_project_id,

@@ -59,72 +59,11 @@ from app.release_models import (  # noqa: F401
     ResidualVerdict,
     VersionAcceptanceCriterion,
 )
-# [RESIDENT-REMOVAL] removed with resident subsystem — stub classes preserve importability
-# until callers are de-wired (task a51f5f9a); tables are dropped in migration f0337222.
-# from app.strategic_resident_models import (  # noqa: F401, RUF100
-#     StrategicOperationApproval,
-#     StrategicOperationReceipt,
-#     StrategicResident,
-#     StrategicResidentCheckpoint,
-#     StrategicWorkerMemoryProposal,
-# )
-# from app.strategic_resident_sweep_models import (  # noqa: F401, RUF100
-#     StrategicResidentSweepState,
-# )
-# from app.strategic_resident_ordinary_task_events import (  # noqa: F401, RUF100
-#     StrategicResidentOrdinaryTaskTerminalEvent,
-#     register_sqlite_ordinary_task_terminal_listener,
-# )
-# from app.strategic_resident_task_terminal_events import (  # noqa: F401, RUF100
-#     StrategicResidentTaskTerminalEvent,
-#     register_sqlite_terminal_event_listener,
-# )
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
     get_vm_rate_per_second,
 )
-
-
-class StrategicOperationApproval:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    id = None
-
-
-class StrategicOperationReceipt:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    id = None
-
-
-class StrategicResident:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    project_id = None
-    authority_generation = 0
-
-
-class StrategicResidentCheckpoint:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    id = None
-
-
-class StrategicWorkerMemoryProposal:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    id = None
-
-
-class StrategicResidentSweepState:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    id = None
-
-
-class StrategicResidentOrdinaryTaskTerminalEvent:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    id = None
-
-
-class StrategicResidentTaskTerminalEvent:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
-    id = None
-
-
-def register_sqlite_ordinary_task_terminal_listener(*args, **kwargs):  # [RESIDENT-REMOVAL] stub
-    pass
-
-
-def register_sqlite_terminal_event_listener(*args, **kwargs):  # [RESIDENT-REMOVAL] stub
-    pass
 
 
 # ``NaiveUTCDateTime`` now lives in :mod:`app.models_base` (a dependency-free
@@ -2822,11 +2761,6 @@ class TaskHistory(SQLModel, table=True):
     __table_args__ = (
         Index("ix_taskhistory_task_id_timestamp_desc", "task_id", text("timestamp desc")),
     )
-
-
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# register_sqlite_terminal_event_listener(Task, StrategicOperationReceipt)
-# register_sqlite_ordinary_task_terminal_listener(Task)
 
 
 # Auto-append to status_log whenever latest_status_message is set

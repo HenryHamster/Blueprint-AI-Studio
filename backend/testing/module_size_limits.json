@@ -153,9 +153,7 @@
         "plan_completion.py": 1750,
         "migration_apply_gate.py": 2150,
         "capability_registry.py": 1750,
-        "storage.py": 1750,
-        "strategic_operation_authority_execution.py": 500,
-        "strategic_operation_authority_validation.py": 950
+        "storage.py": 1750
     },
     "agent": {
         "index.ts": 4600,

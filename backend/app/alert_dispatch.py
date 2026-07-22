@@ -38,6 +38,7 @@ from app.alert_policy import create_project_alert_if_allowed
 from app.notification import _send_webhook_notification
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
+from app.strategic_authority_locks import commit_legacy_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -761,10 +762,7 @@ async def _maybe_create_circuit_breaker_alert(
     )
     session.add(alert)
     if expected_legacy_generation is not None:
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_transition_locks import commit_legacy_authorized
-
-        await commit_legacy_authorized(  # noqa: F821
+        await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(
@@ -874,10 +872,7 @@ async def _maybe_create_spend_ceiling_alert(
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_transition_locks import commit_legacy_authorized
-
-        await commit_legacy_authorized(  # noqa: F821
+        await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(
@@ -937,10 +932,7 @@ async def _maybe_create_approaching_ceiling_alert(
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_transition_locks import commit_legacy_authorized
-
-        await commit_legacy_authorized(  # noqa: F821
+        await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(
@@ -2325,10 +2317,7 @@ async def _create_strategic_alert(
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_transition_locks import commit_legacy_authorized
-
-        await commit_legacy_authorized(  # noqa: F821
+        await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(

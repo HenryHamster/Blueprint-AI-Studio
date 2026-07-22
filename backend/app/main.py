@@ -49,8 +49,6 @@ from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_project_strategic_session import router as admin_project_strategic_session_router
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.routers.admin_resident_rollout import router as admin_resident_rollout_router
 from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_migration_exemptions import (
     router as admin_migration_exemptions_router,
@@ -69,8 +67,6 @@ from app.routers.agent_ci_compliance import router as agent_ci_compliance_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
 from app.routers.agent_strategic_messages import router as agent_strategic_messages_router
 from app.routers.agent_tasks import router as agent_tasks_router
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_session import router as strategic_resident_session_router
 from app.routers.agent_warm_continuity import router as agent_warm_continuity_router
 from app.efficiency_snapshot import agent_router as efficiency_snapshot_agent_router
 from app.routers.agent_credentials import router as agent_credentials_router
@@ -95,12 +91,6 @@ from app.routers.admin_orchestrator_errors import (
 )
 from app.routers.admin_scope_measurement import router as admin_scope_measurement_router
 from app.routers.agent_status import router as agent_status_router
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.routers.agent_resident_turn import router as agent_resident_turn_router
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.routers.agent_resident_artifacts import router as agent_resident_artifacts_router
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.routers.agent_resident_capabilities import router as agent_resident_capabilities_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_auth import router as admin_auth_router
@@ -957,8 +947,6 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(admin_projects_router)
 app.include_router(admin_project_strategic_session_router)
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# app.include_router(admin_resident_rollout_router)
 app.include_router(admin_settings_router)
 app.include_router(admin_migration_exemptions_router)
 app.include_router(admin_debug_router)
@@ -976,8 +964,6 @@ app.include_router(agent_ci_compliance_router)
 app.include_router(agent_strategic_fetch_router)
 app.include_router(agent_strategic_messages_router)
 app.include_router(agent_tasks_router)
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# app.include_router(strategic_resident_session_router)
 app.include_router(agent_warm_continuity_router)
 app.include_router(github_router)
 app.include_router(projects_router)
@@ -997,10 +983,6 @@ app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
 app.include_router(agent_status_router)
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# app.include_router(agent_resident_turn_router)
-# app.include_router(agent_resident_artifacts_router)
-# app.include_router(agent_resident_capabilities_router)
 app.include_router(agent_credentials_router)
 app.include_router(agent_compute_jobs_router)
 app.include_router(admin_compute_jobs_router)

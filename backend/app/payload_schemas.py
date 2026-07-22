@@ -1250,8 +1250,6 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.fix: FixPayload,
     TaskType.research: ResearchPayload,
     TaskType.strategic_review: StrategicReviewPayload,
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-    # TaskType.strategic_resident_turn: StrategicResidentTurnPayload,
     TaskType.design_doc_update: DesignDocUpdatePayload,
     TaskType.security_audit: SecurityAuditPayload,
     TaskType.qa: QAPayload,

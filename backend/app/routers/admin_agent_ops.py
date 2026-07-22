@@ -98,12 +98,6 @@ from app.strategic_completion import (
     spawn_budget_status,
     spawn_title_is_redundant,
 )
-# [RESIDENT-REMOVAL] removed with resident subsystem
-# from app.strategic_resident_session import (
-#     RESIDENT_SESSION_KEY as _RESIDENT_SESSION_KEY,
-#     read_resident_session as _read_resident_session,
-#     resident_session_is_active as _resident_session_is_active,
-# )
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -1017,7 +1011,7 @@ class StrategicOp(BaseModel):
     task_id: uuid.UUID
     # The accepted op vocabulary is the canonical registry mirrored in
     # app/strategic_ops_manifest.json (single source of truth for the ./strategic
-    # CLI, the resident prompt, and this dispatch chain). test_strategic_ops_registry.py
+    # CLI and this dispatch chain). test_strategic_ops_registry.py
     # asserts the dispatch below accepts EXACTLY the manifest's op names.
     op: str
     data: Any = {}
@@ -1070,12 +1064,9 @@ async def strategic_operation(
     # lock (canonical Project→Task order — see task_locking.lock_project_then_task).
     # ``task`` was loaded above WITHOUT a lock and BEFORE the project lock, so its
     # in-memory ``context`` can be stale relative to a concurrent whole-column
-    # writer — specifically the resident-session heartbeat mirror in
-    # ``strategic_resident_session.renew_resident_session_lease``, which stamps
-    # durable restart keys (``_exam_ledger`` / ``message_cursor``). Every
-    # ``task.context = {**ctx, ...}`` read-modify-write in this endpoint would
-    # otherwise overwrite the whole column from that stale read and drop the
-    # heartbeat's keys (lost update), and vice versa. Re-reading FOR UPDATE with
+    # writer. Every ``task.context = {**ctx, ...}`` read-modify-write in this
+    # endpoint would otherwise overwrite the whole column from that stale read and
+    # drop a concurrent writer's keys (lost update), and vice versa. Re-reading FOR UPDATE with
     # populate_existing refreshes the SHARED Task object with the current
     # committed context and holds the row until this request commits, so all
     # downstream context RMWs are serialized and race-free. Since we already hold
@@ -2866,10 +2857,6 @@ async def strategic_operation(
                         "message_id": str(existing.id),
                     }
                 )
-        # Stamp the resident reply with the live session id (NULL when none is
-        # active) so it is addressed to the same conversation as the operator
-        # messages it answers — matching the session-identity scoping used by the
-        # poll / unattended-cap / pacing queries.
         next_sequence = preallocated_message_sequence
         if next_sequence is None:
             raise HTTPException(status_code=500, detail="Message sequence was not allocated")
@@ -3319,16 +3306,7 @@ async def strategic_operation(
         # the project-wide spawns in the rolling window, then ask the pure policy
         # helper whether one more fits. When exhausted, stamp an observable flag
         # on the review, log, and refuse with 429 — never a silent swallow.
-        #
-        # Resident sessions use one long-lived task_id for their entire lifetime
-        # (hours), so the per-review cap would fire after legitimate operator work.
-        # Skip it for resident sessions; the rolling window cap still applies.
-        _is_resident = bool((task.context or {}).get("_resident_session"))
-        per_review_cap = (
-            0
-            if _is_resident
-            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
-        )
+        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
@@ -3647,16 +3625,7 @@ async def strategic_operation(
         # fix spawns in the rolling window, then ask the same pure policy helper
         # whether one more fits. When exhausted, stamp an observable flag, log,
         # and refuse with 429 — never a silent swallow.
-        #
-        # Resident sessions use one long-lived task_id for their entire lifetime
-        # (hours), so the per-review cap would fire after legitimate operator work.
-        # Skip it for resident sessions; the rolling window cap still applies.
-        _is_resident = bool((task.context or {}).get("_resident_session"))
-        per_review_cap = (
-            0
-            if _is_resident
-            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
-        )
+        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
@@ -3950,8 +3919,8 @@ async def strategic_operation(
         # Stash keys transiently so _handle_strategic_completion can still read
         # them if something prevents the synchronous apply below from running.
         # They are popped after the synchronous apply so the completion-time
-        # handler is a no-op (prevents double-application for non-resident tasks
-        # that complete normally after this call).
+        # handler is a no-op (prevents double-application for tasks that complete
+        # normally after this call).
         if version_phase_decision is not None:
             new_ctx[VERSION_PHASE_DECISION_CONTEXT_KEY] = version_phase_decision
         if qualify_request is not None:
@@ -3963,9 +3932,8 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
-        # Apply synchronously within this handler so resident sessions (where the
-        # task stays open for the entire conversation) get immediate effect rather
-        # than waiting for task completion. These apply helpers only call
+        # Apply synchronously within this handler so the decision takes immediate
+        # effect rather than waiting for task completion. These apply helpers only call
         # session.add(); the single commit below persists everything atomically.
         # qualify_request is the exception: it does minutes of GitHub I/O
         # (CI-compliance scan + run_qualification) and MUST NOT run under the
@@ -4179,7 +4147,7 @@ async def strategic_operation(
 
     elif payload.op == "set_memory":
         # Append a durable behavioral-memory note to project.strategic_memory_notes.
-        # The resident strategist uses this to persist lessons and operator
+        # The strategist uses this to persist lessons and operator
         # preferences across sessions. No challenge gate — personal memory op.
         if not isinstance(data, dict) or not isinstance(data.get("note"), str) or not data["note"].strip():
             raise HTTPException(
@@ -5321,22 +5289,6 @@ async def strategic_operation(
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)
-
-        # Also persist into the resident session blob so it survives a restart
-        # (a new task picks it up via start_resident_session's carry-forward).
-        # Uses with_vision_locked so the invariant test counts it as a locked
-        # write, consistent with the rest of the session-blob code.
-        _existing = _read_resident_session(project.vision)  # noqa: F821
-        if _existing is not None and _resident_session_is_active(_existing):  # noqa: F821
-
-            def _update_session_summary(vision: dict) -> None:
-                current = _read_resident_session(vision)  # noqa: F821
-                if current is not None and _resident_session_is_active(current):  # noqa: F821
-                    updated = dict(current)
-                    updated["_session_summary"] = summary
-                    vision[_RESIDENT_SESSION_KEY] = updated  # noqa: F821
-
-            await _with_vision_locked(session, project.id, _update_session_summary)
 
         await session.commit()
         return _resp({"status": "ok", "op": "set_session_summary"})

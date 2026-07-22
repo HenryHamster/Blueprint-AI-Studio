@@ -2,12 +2,10 @@
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
 import re
-import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -31,7 +29,6 @@ from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
 from app.landed_signal import is_merged_completion
 from app.models import (
     Project,
-    StrategicResident,
     Task,
     TaskStatus,
     TaskHistory,
@@ -335,22 +332,6 @@ _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset(
     }
 )
 
-_RESIDENT_AGENT_ALLOWED_PATHS = frozenset(
-    {
-        "/api/agent/claim",
-        "/api/agent/heartbeat",
-        "/api/agent/refresh-token",
-        "/api/agent/resident-turn/complete",
-        "/api/agent/resident-turn/context",
-        "/api/agent/resident-turn/artifact",
-        "/api/agent/resident-turn/capability",
-        "/api/agent/resident-turn/mutate",
-        "/api/agent/resident-turn/fail",
-        "/api/agent/task-capabilities",
-    }
-)
-
-
 async def verify_agent_token(
     request: Request,
     x_agent_token: str = Header(
@@ -375,16 +356,6 @@ async def verify_agent_token(
     """
     payload = verify_agent_jwt(x_agent_token)
     task_id = payload.get("sub")
-    is_resident_token = payload.get("task_type") == "strategic_resident_turn"
-    if is_resident_token and request.url.path not in _RESIDENT_AGENT_ALLOWED_PATHS:
-        _log_agent_auth_reject(
-            "resident_endpoint_not_allowed",
-            path=request.url.path,
-            task_id=task_id,
-            token_vm_instance_id=payload.get("vm_instance_id"),
-            token_project_id=payload.get("project_id"),
-        )
-        raise HTTPException(status_code=403, detail="resident_endpoint_not_allowed")
     # VM-scoped (taskless / warm-pool) token: a pool VM that has not yet claimed
     # any task. It carries no task ``sub`` — only ``vm_instance_id`` + project
     # scope, tagged ``token_scope == "vm"``. Accept it here (so the taskless
@@ -416,7 +387,6 @@ async def verify_agent_token(
         "/api/agent/credentials/rotate",
         "/api/agent/next-role",
         "/api/agent/vm-heartbeat",
-        "/api/agent/resident-turn/fail",
     ) or (
         # Self-merge: an automatic fresh-reviewer pass runs AFTER ./done has
         # already posted the task's terminal status, then persists its findings
@@ -544,46 +514,6 @@ async def verify_agent_token(
                     token_project_id=token_project,
                 )
                 raise HTTPException(status_code=403, detail="vm_instance_mismatch")
-            if is_resident_token and request.url.path not in (
-                "/api/agent/claim",
-                "/api/agent/task-capabilities",
-            ):
-                resident_context = task.context if isinstance(task.context, dict) else {}
-                persisted_nonce = str(
-                    resident_context.get("_strategic_resident_claim_nonce") or ""
-                )
-                presented_nonce = str(payload.get("claim_nonce") or "")
-                failure = resident_context.get("_resident_failure")
-                terminal_failure_replay = bool(
-                    request.url.path == "/api/agent/resident-turn/fail"
-                    and task.status == TaskStatus.FAILED
-                    and isinstance(failure, dict)
-                    and presented_nonce
-                    and secrets.compare_digest(
-                        hashlib.sha256(presented_nonce.encode()).hexdigest(),
-                        str(failure.get("claim_nonce_hash") or ""),
-                    )
-                )
-                if (
-                    not terminal_failure_replay
-                    and (
-                        not persisted_nonce
-                        or not presented_nonce
-                        or not secrets.compare_digest(
-                            presented_nonce, persisted_nonce
-                        )
-                    )
-                ):
-                    _log_agent_auth_reject(
-                        "resident_claim_nonce_stale",
-                        path=request.url.path,
-                        task_id=task_id,
-                        token_vm_instance_id=token_vm,
-                        token_project_id=token_project,
-                    )
-                    raise HTTPException(
-                        status_code=403, detail="resident_claim_nonce_stale"
-                    )
             if task.status in _AGENT_INACTIVE_TASK_STATUSES:
                 _terminated_task_ids[task_id] = time.time()
                 # Same-VM idempotent retry on terminal task is OK; different
@@ -696,51 +626,7 @@ async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:
     """
     task_id = token["sub"]
     vm_id = token["vm_instance_id"]
-    is_resident_turn = token.get("task_type") == "strategic_resident_turn"
-    project_id = None
-    if is_resident_turn:
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_agent_binding import (
-#             ResidentAgentAuthorityError,
-#             ResidentAgentBinding,
-#             ResidentAgentBindingError,
-#             ResidentAgentTaskNotFound,
-#             load_live_resident_agent_task_locked,
-#         )
-
-        try:
-            project_id = uuid.UUID(str(token.get("project_id")))
-            resident_binding = ResidentAgentBinding(  # noqa: F821
-                task_id=uuid.UUID(task_id),
-                project_id=project_id,
-                vm_instance_id=str(vm_id or ""),
-                task_type=str(token.get("task_type") or ""),
-                claim_nonce=str(token.get("claim_nonce") or ""),
-            )
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=403, detail="complete Resident task token required"
-            ) from None
-        try:
-            task = await load_live_resident_agent_task_locked(  # noqa: F821
-                session,
-                resident_binding,
-                allowed_statuses=frozenset(
-                    {
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.QUEUED,
-                    }
-                ),
-            )
-        except ResidentAgentTaskNotFound as exc:  # noqa: F821
-            raise HTTPException(status_code=404, detail="task_not_found") from exc
-        except ResidentAgentAuthorityError as exc:  # noqa: F821
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ResidentAgentBindingError as exc:  # noqa: F821
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-    else:
-        task = await session.get(Task, uuid.UUID(task_id))
+    task = await session.get(Task, uuid.UUID(task_id))
     if task is None:
         raise HTTPException(status_code=404, detail="task_not_found")
     if task.vm_instance_id != vm_id:
@@ -790,9 +676,6 @@ async def agent_refresh_token(
         vm_id,
         task_type=token.get("task_type", ""),
         project_id=token.get("project_id", "") or str(task.project_id),
-        claim_nonce=str(
-            (task.context or {}).get("_strategic_resident_claim_nonce") or ""
-        ),
     )
     expires_at = datetime.now(timezone.utc) + timedelta(hours=AGENT_TOKEN_TTL_HOURS)
     return {"token": new_token, "token_expires_at": expires_at.isoformat()}
@@ -807,9 +690,9 @@ async def agent_git_read_token(
 ):
     """Return a fresh GitHub App installation read token for the task's repo.
 
-    Called periodically by the strategic resident VM to keep its local
-    git remote credential fresh (resident needs `git fetch origin` for
-    automain verification; it never pushes — push credentials are per-task).
+    Called periodically by the agent VM to keep its local git remote
+    credential fresh (`git fetch origin` for automain verification; it never
+    pushes — push credentials are per-task).
 
     Uses `get_repo_installation_read_token` (contents:read scoped, cached 50 min
     per repo) so a warm cache costs zero GitHub API calls.
@@ -1008,33 +891,6 @@ async def claim_task(
         raise HTTPException(
             status_code=403, detail="task-scoped token required to claim"
         ) from None
-    is_resident_claim = token.get("task_type") == "strategic_resident_turn"
-    claim_project_id = None
-    claim_resident = None
-    if is_resident_claim:
-        try:
-            claim_project_id = uuid.UUID(str(token.get("project_id")))
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=403, detail="complete Resident task token required"
-            ) from None
-        claim_project = (
-            await session.execute(
-                select(Project)
-                .where(Project.id == claim_project_id)
-                .with_for_update(key_share=True)
-            )
-        ).scalar_one_or_none()
-        claim_resident = (
-            await session.execute(
-                select(StrategicResident)
-                .where(StrategicResident.project_id == claim_project_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-        if claim_project is None or claim_resident is None:
-            raise HTTPException(status_code=409, detail="Resident authority is stale")
     stmt = (
         select(Task)
         .where(
@@ -1117,90 +973,6 @@ async def claim_task(
             )
         idempotent_replay = True
 
-    first_payload = task.first_payload if isinstance(task.first_payload, dict) else {}
-    if first_payload.get("type") == "strategic_resident_turn":
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_runtime import is_authoritative_resident_turn
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_runner_policy import (
-#             resident_local_claim_route_matches,
-#         )
-
-        if not resident_local_claim_route_matches(task, vm_id):  # noqa: F821
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Local-only Resident turn was not claimed through its "
-                    "selected compatible runner"
-                ),
-            )
-
-        if not is_authoritative_resident_turn(  # noqa: F821
-            task,
-            project_id=task.project_id,
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Resident turn is shadow-only, mutable, stale, or lacks "
-                    "authoritative mutation scope"
-                ),
-            )
-        if (
-            not is_resident_claim
-            or task.project_id != claim_project_id
-            or claim_resident is None
-            or claim_resident.engine_owner != "strategic_resident"
-            or claim_resident.active_turn_task_id != task.id
-            or int(first_payload.get("authority_generation") or -1)
-            != int(claim_resident.authority_generation)
-        ):
-            raise HTTPException(status_code=409, detail="Resident authority is stale")
-
-    resident_claim_nonce = ""
-    if is_resident_claim:
-        task_context = dict(task.context or {})
-        incoming_attempt_jti = str(token.get("jti") or "")
-        if not incoming_attempt_jti:
-            raise HTTPException(
-                status_code=403, detail="Resident claim attempt identity required"
-            )
-        persisted_nonce = str(
-            task_context.get("_strategic_resident_claim_nonce") or ""
-        )
-        persisted_attempt_jti = str(
-            task_context.get("_strategic_resident_claim_attempt_jti") or ""
-        )
-        if idempotent_replay:
-            if (
-                not persisted_nonce
-                or not persisted_attempt_jti
-                or not secrets.compare_digest(
-                    incoming_attempt_jti, persisted_attempt_jti
-                )
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Resident claim attempt has been superseded",
-                )
-            resident_claim_nonce = persisted_nonce
-        else:
-            presented_nonce = str(token.get("claim_nonce") or "")
-            if persisted_nonce and (
-                not presented_nonce
-                or not secrets.compare_digest(presented_nonce, persisted_nonce)
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Resident claim predecessor has been superseded",
-                )
-            resident_claim_nonce = secrets.token_urlsafe(32)
-            task_context["_strategic_resident_claim_attempt_jti"] = (
-                incoming_attempt_jti
-            )
-        task_context["_strategic_resident_claim_nonce"] = resident_claim_nonce
-        task.context = task_context
-
     if not idempotent_replay:
         task.status = TaskStatus.IN_PROGRESS
         task.last_heartbeat = (
@@ -1253,8 +1025,6 @@ async def claim_task(
         for k, v in _claimed_context.items()
         if not k.startswith("max_plan_")
         and not k.startswith("llm_")
-        and k != "_strategic_resident_claim_nonce"
-        and k != "_strategic_resident_claim_attempt_jti"
     }
     # Resolve per-project branch metadata once so we can inject it into both
     # project_metadata and each payload entry the agent sees. Agent handlers
@@ -1271,20 +1041,12 @@ async def claim_task(
     )
 
     _claim_runtime_model = _claimed_context.get("llm_model")
-    _claim_runtime_provider = _claimed_context.get("llm_provider")
     _claim_runtime_execution_mode = _claimed_context.get("llm_execution_mode")
 
     response_payloads: list = []
     for entry in _claimed_payloads:
         if isinstance(entry, dict):
             patched = dict(entry)
-            patched.pop("_resident_expected_runtime_provider", None)
-            if patched.get("type") == "strategic_resident_turn" and isinstance(
-                _claim_runtime_provider, str
-            ) and _claim_runtime_provider.strip():
-                patched["_resident_expected_runtime_provider"] = (
-                    _claim_runtime_provider.strip().lower()
-                )
             if isinstance(_claim_runtime_model, str) and _claim_runtime_model.strip():
                 patched["model"] = _claim_runtime_model.strip()
             if (
@@ -1319,15 +1081,6 @@ async def claim_task(
             _project_verdicts, "related_tests", 0.0
         ),
     }
-    if resident_claim_nonce:
-        response["agent_token"] = create_agent_token(
-            str(_claimed_task_id),
-            str(vm_id or ""),
-            task_type="strategic_resident_turn",
-            project_id=str(_claimed_project_id),
-            claim_nonce=resident_claim_nonce,
-        )
-
     # Add project metadata so agents can adapt to different project structures
     if project:
         _build_cfg = project.build_config or {}
@@ -5131,37 +4884,6 @@ async def agent_heartbeat(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-    resident_task = None
-    if token.get("task_type") == "strategic_resident_turn":
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_agent_binding import (
-#             ResidentAgentAuthorityError,
-#             ResidentAgentBinding,
-#             ResidentAgentBindingError,
-#             ResidentAgentTaskNotFound,
-#             load_live_resident_agent_task_locked,
-#         )
-
-        try:
-            binding = ResidentAgentBinding(  # noqa: F821
-                task_id=uuid.UUID(str(token.get("sub"))),
-                project_id=uuid.UUID(str(token.get("project_id"))),
-                vm_instance_id=str(token.get("vm_instance_id") or ""),
-                task_type=str(token.get("task_type") or ""),
-                claim_nonce=str(token.get("claim_nonce") or ""),
-            )
-            resident_task = await load_live_resident_agent_task_locked(  # noqa: F821
-                session,
-                binding,
-                allowed_statuses=frozenset({TaskStatus.IN_PROGRESS}),
-            )
-        except ResidentAgentTaskNotFound as exc:  # noqa: F821
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ResidentAgentAuthorityError as exc:  # noqa: F821
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except (ResidentAgentBindingError, TypeError, ValueError) as exc:  # noqa: F821
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-
     # Phase 2c Race A mitigation: every backend contact from a VM is a
     # liveness signal. Without this, the orchestrator's skip-provision
     # branch could clear a freshly-written warm pin before the agent's
@@ -5193,10 +4915,9 @@ async def agent_heartbeat(
     # sibling reads as "progressing" forever. ``req.task_id`` is already proven
     # equal to the JWT ``sub`` above, so this key is as trusted as the vm id.
     _latest_tool_use_at = _parse_latest_tool_use_at(req.tool_trace)
-    if resident_task is None:
-        await _record_vm_contact(
-            token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
-        )
+    await _record_vm_contact(
+        token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
+    )
 
     # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
     # (processing completion/pipeline), skip instead of blocking.  Blocking
@@ -5228,22 +4949,16 @@ async def agent_heartbeat(
         Task.format_compliance_summary,
         raiseload=True,
     )
-    if resident_task is not None:
-        task = resident_task
-        await _record_vm_contact(
-            token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
+    stmt = (
+        select(Task)
+        .where(
+            Task.id == req.task_id,
+            Task.vm_instance_id == token.get("vm_instance_id"),
         )
-    else:
-        stmt = (
-            select(Task)
-            .where(
-                Task.id == req.task_id,
-                Task.vm_instance_id == token.get("vm_instance_id"),
-            )
-            .options(_hb_load_only)
-            .with_for_update(skip_locked=True)
-        )
-        task = (await session.execute(stmt)).scalars().first()
+        .options(_hb_load_only)
+        .with_for_update(skip_locked=True)
+    )
+    task = (await session.execute(stmt)).scalars().first()
 
     if not task:
         # Row is either locked (skip_locked skipped it) or vm_instance_id changed.

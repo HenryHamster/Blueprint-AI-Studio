@@ -3981,79 +3981,6 @@ async def _apply_qualify_request_post_commit(
         )
 
 
-async def _maybe_retry_workday_auto_start(
-    project_id: "uuid.UUID",
-    *,
-    session_factory=None,
-) -> None:
-    """Post-commit: retry Workday auto-start when a blocking strategic cycle finishes.
-
-    When the project is in Workday (continuous) mode, has no live resident session,
-    and its last recorded blocked reason is ``cycle_in_flight`` — meaning a batch
-    strategic cycle was in flight when the operator entered Workday — re-run the
-    Workday auto-start now that the blocking cycle has completed. Runs on a
-    dedicated fresh session; any failure is logged and swallowed so strategic
-    completion is never broken.
-    """
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     import app.strategic_resident_session as _srs
-    from app.database import AsyncSessionLocal
-    from app.workbench_state import get_strategic_workbench_state
-
-    factory = session_factory or AsyncSessionLocal
-    # Read current project state on a fresh session.
-    try:
-        async with factory() as fresh:
-            project = await fresh.get(Project, project_id)
-            if project is None:
-                return
-            # Only retry when no live resident session is running.
-            if _srs.resident_session_is_active(  # noqa: F821
-                _srs.read_resident_session(project.vision)  # noqa: F821
-            ):
-                return
-            # Only retry when the blocked reason is specifically cycle_in_flight.
-            raw_reason = (project.vision or {}).get(
-                _srs.RESIDENT_SESSION_REASON_KEY  # noqa: F821
-            ) or {}
-            if raw_reason.get("reason") != _srs.RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:  # noqa: F821
-                return
-            op_user_id = raw_reason.get("operator_user_id") or "system"
-            # Only retry when Workday mode is still active — read from the
-            # per-user prefs store (MessagesNoisePrefs) where workbench state
-            # is actually persisted, NOT from project.vision.
-            workbench = await get_strategic_workbench_state(fresh, op_user_id, project_id)
-            if workbench.get("interaction_mode") != "continuous":
-                return
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[STRATEGIC_COMPLETION] _maybe_retry_workday_auto_start: state read failed "
-            "for project %s",
-            project_id,
-            exc_info=True,
-        )
-        return
-    # Conditions met — re-run the auto-start on a separate fresh session.
-    try:
-        await _srs._auto_start_on_workday_entry(  # noqa: F821
-            project_id,
-            operator_user_id=op_user_id,
-            session_factory=factory,
-        )
-        logger.info(
-            "[STRATEGIC_COMPLETION] Workday auto-start retry triggered for project %s "
-            "(cycle_in_flight unblocked by strategic completion)",
-            project_id,
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[STRATEGIC_COMPLETION] _maybe_retry_workday_auto_start: auto-start retry "
-            "failed for project %s",
-            project_id,
-            exc_info=True,
-        )
-
-
 def _merge_rejected_proposals(vision: dict, batch: list) -> None:
     """Append batch entries to vision['rejected_proposals'], deduplicating by text.
 
@@ -4514,7 +4441,6 @@ async def _handle_strategic_completion(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
             f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
         )
-        await _maybe_retry_workday_auto_start(task.project_id)
         return
 
     # Fallback: try log-based parsing for backward compatibility
@@ -4588,7 +4514,6 @@ async def _handle_strategic_completion(
                 session,
                 f"Strategic review could not parse agent output (failure #{failure_num}, task {str(task.id)[:8]})",
             )
-        await _maybe_retry_workday_auto_start(task.project_id)
         return
 
     new_vision = parsed.get("vision")
@@ -6718,4 +6643,3 @@ async def _handle_strategic_completion(
     logger.info(
         f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved"
     )
-    await _maybe_retry_workday_auto_start(task.project_id)

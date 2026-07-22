@@ -35,7 +35,6 @@ from app.models import (
     Project,
     ReleaseVersion,
     StrategicCycle,
-    StrategicResident,
     Task,
     TaskStatus,
 )
@@ -3415,33 +3414,6 @@ async def test_step6_alert_broadcasts_after_commit(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_step6_agent_managed_resident_turn_triggers_queued_age_alert(reaper_db):
-    """An agent-managed (non-backend) resident turn queued beyond the alert
-    threshold fires a queued-age alert.  ``strategic_resident_turn`` has
-    ``execution_owner="agent"``, so it is NOT excluded by the
-    ``BACKEND_MANAGED_TASK_TYPES`` filter — the alert fires as expected."""
-    project = await _make_project(reaper_db)
-    reaper_db.add(
-        Task(
-            project_id=project.id,
-            title="Resident shadow",
-            payloads=[{"type": "strategic_resident_turn"}],
-            status=TaskStatus.QUEUED,
-            created_at=_utcnow() - timedelta(hours=24),
-            archived=True,
-        )
-    )
-    await reaper_db.commit()
-
-    alerted = await _rs.sweep_queued_age_alerts(
-        reaper_db,
-        _utcnow(),
-        runtime_config={"queued_age_alert_hours": 2},
-    )
-    assert alerted == 1
-
-
-@pytest.mark.asyncio
 async def test_queued_age_alert_suppressed_while_pipeline_paused(reaper_db):
     """PAUSE-AWARE queued-age alerts: while the pipeline is PAUSED nothing
     dequeues, so a QUEUED task's wall-clock age crosses the alert tiers even
@@ -3512,126 +3484,6 @@ async def test_queued_age_alert_fires_despite_brief_pause(reaper_db):
     assert alerted == 1
     await reaper_db.refresh(t)
     assert (t.context or {}).get("queued_age_alert_tier") == 1
-
-
-@pytest.mark.asyncio
-async def test_activation_repair_sqlite_server_filter_scans_past_valid_prefix(
-    reaper_db, mocker
-):
-    import app.strategic_resident_activation_sweep as activation_sweep
-
-    valid_ids = [_uuid_mod.UUID(int=index) for index in range(1, 41)]
-    repair_id = _uuid_mod.UUID(int=100)
-    for index, project_id in enumerate([*valid_ids, repair_id]):
-        reaper_db.add(
-            Project(
-                id=project_id,
-                name=f"activation-sqlite-{index}",
-                user_id="user1",
-            )
-        )
-        reaper_db.add(
-            StrategicResident(
-                project_id=project_id,
-                engine_owner="strategic_resident",
-                background_policy="active",
-                scheduling_state=(
-                    {"background_activation_sequence": 1}
-                    if project_id != repair_id
-                    else {}
-                ),
-            )
-        )
-    await reaper_db.commit()
-
-    Session = sessionmaker(
-        bind=reaper_db.bind,
-        class_=AsyncSession,
-        autocommit=False,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-    mocker.patch.object(activation_sweep, "_empty_scan_not_before", None)
-    sync_policy = mocker.patch.object(
-        activation_sweep,
-        "sync_resident_background_policy",
-        new_callable=AsyncMock,
-    )
-    sync_policy.return_value = mocker.Mock(task_id=_uuid_mod.uuid4())
-
-    queued = await activation_sweep.sweep_missing_background_activation_wakeups(
-        session_factory=Session,
-        now=_utcnow(),
-        batch_size=1,
-        empty_scan_cooldown=timedelta(0),
-    )
-
-    assert queued == 1
-    sync_policy.assert_awaited_once()
-    assert sync_policy.await_args.kwargs["project_id"] == repair_id
-
-
-@pytest.mark.parametrize(
-    ("marker", "expected_queued"),
-    [
-        pytest.param(True, 1, id="boolean"),
-        pytest.param(0, 1, id="zero"),
-        pytest.param(None, 1, id="explicit-null"),
-        pytest.param([1], 1, id="array"),
-        pytest.param({"nested": 1}, 1, id="object"),
-        pytest.param(3, 0, id="positive-integer"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_activation_repair_sqlite_marker_type_contract(
-    reaper_db, mocker, marker, expected_queued
-):
-    import app.strategic_resident_activation_sweep as activation_sweep
-
-    project = await _make_project(reaper_db)
-    reaper_db.add(
-        StrategicResident(
-            project_id=project.id,
-            engine_owner="strategic_resident",
-            background_policy="active",
-            scheduling_state={"background_activation_sequence": marker},
-        )
-    )
-    await reaper_db.commit()
-
-    Session = sessionmaker(
-        bind=reaper_db.bind,
-        class_=AsyncSession,
-        autocommit=False,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-    mocker.patch.object(activation_sweep, "_empty_scan_not_before", None)
-    mocker.patch.object(
-        activation_sweep,
-        "resolve_dialect_name",
-        return_value="sqlite",
-    )
-    sync_policy = mocker.patch.object(
-        activation_sweep,
-        "sync_resident_background_policy",
-        new_callable=AsyncMock,
-    )
-    sync_policy.return_value = mocker.Mock(task_id=_uuid_mod.uuid4())
-
-    queued = await activation_sweep.sweep_missing_background_activation_wakeups(
-        session_factory=Session,
-        now=_utcnow(),
-        batch_size=1,
-        empty_scan_cooldown=timedelta(0),
-    )
-
-    assert queued == expected_queued
-    if expected_queued:
-        sync_policy.assert_awaited_once()
-        assert sync_policy.await_args.kwargs["project_id"] == project.id
-    else:
-        sync_policy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -6396,70 +6248,6 @@ async def test_step7_stalled_cycle_skips_strategic_local_runner_hold(reaper_db):
     assert cycle.outcome == "phase2_running"
 
 
-@pytest.mark.asyncio
-async def test_step7_stalled_cycle_revalidates_legacy_authority_after_discovery(
-    reaper_db, mocker
-):
-    project = await _make_project(reaper_db)
-    task = Task(
-        project_id=project.id,
-        title="strategic-phase1-before-cutover",
-        payloads=[{"type": "design_doc_update", "scope": "medium"}],
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=_utcnow() - timedelta(hours=1),
-    )
-    reaper_db.add(task)
-    await reaper_db.flush()
-    cycle = StrategicCycle(
-        id=_make_cycle_id(),
-        project_id=project.id,
-        outcome="phase1_running",
-        phase1_task_id=task.id,
-        phase1_started_at=_utcnow() - timedelta(hours=4),
-    )
-    reaper_db.add(cycle)
-    await reaper_db.commit()
-
-    from app import strategic_cycle as strategic_cycle_module
-
-    real_find_stalled = strategic_cycle_module.find_stalled
-
-    async def _cutover_after_discovery(session, *, deploy_state=None):
-        candidates = await real_find_stalled(session, deploy_state=deploy_state)
-        session.add(
-            StrategicResident(
-                project_id=project.id,
-                engine_owner="strategic_resident",
-                engine_version="strategic-resident-v1",
-                authority_generation=2,
-            )
-        )
-        await session.flush()
-        return candidates
-
-    mocker.patch(
-        "app.strategic_cycle.find_stalled",
-        side_effect=_cutover_after_discovery,
-    )
-
-    stalled = await _rs.sweep_stalled_strategic_cycles(
-        reaper_db,
-        _utcnow(),
-        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
-    )
-    assert not reaper_db.in_transaction()
-
-    await reaper_db.refresh(task)
-    await reaper_db.refresh(cycle)
-    assert stalled == 0
-    assert task.status == TaskStatus.IN_PROGRESS
-    assert cycle.outcome == "phase1_running"
-    alerts = (
-        await reaper_db.execute(select(Alert).where(Alert.project_id == project.id))
-    ).scalars()
-    assert list(alerts) == []
-
-
 # ── Orphan reap crash isolation & quarantine ─────────────────────────────
 
 
@@ -7735,8 +7523,8 @@ def test_classify_orphan_degenerate_in_progress_catch_all():
 
 
 def test_classify_orphan_non_resident_strategic_review_still_reaped():
-    """The carve-out is opt-in: a normal (non-resident) strategic_review that
-    blows the 1500s thinking-heavy budget is still reaped as before."""
+    """A strategic_review that blows the 1500s thinking-heavy progress budget
+    (fresh heartbeat, zero tool calls) is reaped as a stalled orphan."""
     now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
@@ -8508,102 +8296,6 @@ def test_zero_tool_stall_branch_is_also_task_scoped():
             task_tool_use_lookup={},
         )
         is True
-    )
-
-
-def test_resident_session_hung_on_shared_runner_is_reaped():
-    """N1: the resident session is reapable when ITS OWN contact stamp goes stale,
-    even though a working sibling keeps the SHARED vmcontact row fresh.
-
-    The Workday resident session is pinned to a fleet runner
-    (strategic_resident_session.py: vm_instance_id = f"runner:{id}") that also
-    claims ordinary tasks. If the session wedges on an LLM call and stops
-    heartbeating, it stays in the runner's active_task_ids (the process is alive),
-    so runner_excluded is False by construction — #14549's fix cannot see it. The
-    sibling's heartbeats then kept the shared row fresh and suppressed the reap
-    past the resident window FOREVER. Because start_resident_session returns the
-    existing session while its task row lives, that zombie meant Workday could
-    NEVER respawn.
-
-    No runner_report_lookup is passed, so _runner_report_excludes_task is False —
-    that is the precondition, not an oversight."""
-    now = _utcnow()
-    t = _FakeClassifyTask(
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=now - timedelta(minutes=40),  # past the 25-min window
-        started_at=now - timedelta(hours=3),
-        vm_instance_id=_RUNNER_VM,
-        context={"_resident_session": True},
-    )
-    reap = _classify_orphan(
-        t,
-        now,
-        has_open_pr=False,
-        # A live sibling on the SAME runner keeps the shared row warm.
-        vm_contact_lookup={_RUNNER_VM: now - timedelta(seconds=30)},
-        # THIS session's own row is stale — it stopped heartbeating 40min ago.
-        task_contact_lookup={str(t.id): now - timedelta(minutes=40)},
-        task_tool_use_lookup={},
-    )
-    assert reap is True, (
-        "a resident session whose OWN task-scoped contact is stale must be reaped "
-        "even while a sibling keeps the shared vmcontact row fresh — otherwise the "
-        "Workday session is unreclaimable and can never respawn"
-    )
-
-
-def test_resident_session_with_fresh_task_scoped_contact_is_not_reaped():
-    """The must-not-break direction: a resident session that IS alive (its own
-    task-scoped contact is fresh) must never be reaped, even though its
-    last_heartbeat is stale — that is the lock-starved-heartbeat case the contact
-    override exists for. Guards against the fix over-reaping live Workday
-    sessions."""
-    now = _utcnow()
-    t = _FakeClassifyTask(
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=now - timedelta(minutes=40),
-        started_at=now - timedelta(hours=3),
-        vm_instance_id=_RUNNER_VM,
-        context={"_resident_session": True},
-    )
-    reap = _classify_orphan(
-        t,
-        now,
-        has_open_pr=False,
-        vm_contact_lookup={_RUNNER_VM: now - timedelta(seconds=30)},
-        task_contact_lookup={str(t.id): now - timedelta(seconds=20)},  # ALIVE
-        task_tool_use_lookup={},
-    )
-    assert reap is False, (
-        "a resident session with a FRESH task-scoped contact is alive (its "
-        "last_heartbeat write was lock-starved) and must not be reaped"
-    )
-
-
-def test_resident_session_absent_task_scoped_row_falls_back_to_shared():
-    """Rollout safety for the resident branch: with NO task-scoped row (pre-deploy,
-    or not yet heartbeated under the new handler) the classification falls back to
-    the shared vmcontact row — today's behaviour. Absence is never evidence of
-    death, so deploying this cannot false-reap a live Workday session."""
-    now = _utcnow()
-    t = _FakeClassifyTask(
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=now - timedelta(minutes=40),
-        started_at=now - timedelta(hours=3),
-        vm_instance_id=_RUNNER_VM,
-        context={"_resident_session": True},
-    )
-    reap = _classify_orphan(
-        t,
-        now,
-        has_open_pr=False,
-        vm_contact_lookup={_RUNNER_VM: now - timedelta(seconds=30)},  # fresh shared
-        task_contact_lookup={},  # no row for this task
-        task_tool_use_lookup={},
-    )
-    assert reap is False, (
-        "absent task-scoped row must fall back to the shared vmcontact row "
-        "(fresh -> no reap), preserving today's behaviour for pre-rollout sessions"
     )
 
 
