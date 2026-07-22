@@ -13320,8 +13320,8 @@ class TestProblemModelWritePathInvariants:
             "and added to TestProblemModelWritePathInvariants._SAFE_SITES.\n\n"
             "Unlisted sites:\n"
             + "\n".join(
-                f"  {rel}:{ln} ({desc})"
-                for (rel, ln), desc in sorted(missing.items())
+                f"  {rel}:{ln} ({discovered.get((rel, ln), '?')})"
+                for (rel, ln) in sorted(missing)
             )
         )
 
@@ -13332,3 +13332,165 @@ class TestProblemModelWritePathInvariants:
             "Remove or update these stale allowlist entries:\n"
             + "\n".join(f"  {rel}:{ln}" for (rel, ln) in sorted(stale))
         )
+
+
+# ---------------------------------------------------------------------------
+# DesignDocSizeLimitExceeded handler invariant — every handler must log
+# ---------------------------------------------------------------------------
+
+
+def _collect_design_doc_except_handlers(source: str, filename: str) -> list[tuple[int, ast.ExceptHandler]]:
+    """Return (lineno, handler) pairs where DesignDocSizeLimitExceeded is caught."""
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+    results: list[tuple[int, ast.ExceptHandler]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        if node.type is None:
+            continue
+        # Match: except DesignDocSizeLimitExceeded  (Name)
+        if isinstance(node.type, ast.Name) and node.type.id == "DesignDocSizeLimitExceeded":
+            results.append((node.lineno, node))
+            continue
+        # Match: except DesignDocSizeLimitExceeded as exc:  (Name aliased)
+        if isinstance(node.type, ast.Tuple):
+            for elt in node.type.elts:
+                if isinstance(elt, ast.Name) and elt.id == "DesignDocSizeLimitExceeded":
+                    results.append((node.lineno, node))
+                    break
+    return results
+
+
+def _handler_body_has_logger_call(handler: ast.ExceptHandler) -> bool:
+    """Return True if the handler body contains any logger.warning/error/exception call."""
+    for stmt in handler.body:
+        for subnode in ast.walk(stmt):
+            if isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Attribute):
+                # Look for logger.warning(…), logger.error(…), logger.exception(…)
+                if subnode.func.attr in {"warning", "error", "exception", "critical", "info"}:
+                    # Check that the receiver has "logger" in its name chain
+                    receiver = subnode.func.value
+                    if isinstance(receiver, ast.Name) and "logger" in receiver.id.lower():
+                        return True
+                    if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Attribute):
+                        # logging.getLogger(__name__).warning(...)
+                        if receiver.func.attr == "getLogger":
+                            return True
+                    # Also catch _log_zero.getLogger(__name__).warning(...)
+                    if isinstance(receiver, ast.Attribute) and receiver.attr == "getLogger":
+                        return True
+    return False
+
+
+def test_design_doc_size_limit_catches_are_loud():
+    """Every ``except DesignDocSizeLimitExceeded`` handler must emit a logger call.
+
+    A silent catch site is the exact failure class that produced the rev-1367
+    problem-model wipe: the caller believes a write persisted when it was silently
+    dropped. Every handler body must contain at least one ``logger.warning`` /
+    ``logger.error`` / ``logger.exception`` call so the drop is attributable.
+    """
+    app_dir = BACKEND_ROOT / "app"
+    silent_handlers: list[str] = []
+    for py_file in sorted(app_dir.rglob("*.py")):
+        if py_file.name == "__init__.py":
+            continue
+        source = py_file.read_text(encoding="utf-8")
+        rel = str(py_file.relative_to(BACKEND_ROOT))
+        handlers = _collect_design_doc_except_handlers(source, filename=str(py_file))
+        for lineno, handler in handlers:
+            if not _handler_body_has_logger_call(handler):
+                silent_handlers.append(f"  {rel}:{lineno} — handler body has no logger call")
+
+    assert not silent_handlers, (
+        "The following `except DesignDocSizeLimitExceeded` handler(s) have NO logger "
+        "call in their body. A silent catch site allows size-cap drops to pass "
+        "unnoticed — the exact failure class that produced the rev-1367 problem-model "
+        "wipe. Add a ``logger.warning`` (with project_id + exception detail) to each "
+        "handler before its fallthrough logic.\n\n"
+        + "\n".join(silent_handlers)
+    )
+
+
+def test_no_callers_pass_raise_on_size_limit_false():
+    """No production caller may pass ``raise_on_size_limit=False`` to
+    ``with_design_doc_locked`` or its aliases.
+
+    The default is ``raise_on_size_limit=True``, which is the intended behavior
+    per this direction's goal ('writes fail loudly instead of truncating'). A
+    caller that passes ``False`` opts back into the legacy silent-truncation
+    behavior. If a legitimate caller needs this, add it to the allowlist below
+    with a documented rationale.
+    """
+    # Allowlist: (rel_path, lineno, rationale). Keep empty — no caller should
+    # silence the size-cap guard.
+    _ALLOWLIST: frozenset[tuple[str, int, str]] = frozenset()
+    app_dir = BACKEND_ROOT / "app"
+    # Known aliases for with_design_doc_locked in production code
+    _ALIASES: frozenset[str] = frozenset({
+        "with_design_doc_locked",
+        # Aliased import in admin_agent_ops.py
+    })
+    offenders: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        if py_file.name == "__init__.py":
+            continue
+        source = py_file.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+        rel = str(py_file.relative_to(BACKEND_ROOT))
+
+        # Collect local aliases via imports (e.g. "from ... import with_design_doc_locked as _with_design_doc_locked")
+        local_aliases: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "with_design_doc_locked":
+                        local_aliases.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "with_design_doc_locked":
+                        local_aliases.add(alias.asname or alias.name)
+
+        all_names = _ALIASES | local_aliases
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func_name = None
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+
+            if func_name not in all_names:
+                continue
+
+            # Check keyword arguments for raise_on_size_limit=False
+            for kw in node.keywords:
+                if kw.arg == "raise_on_size_limit":
+                    if isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                        allowlisted = any(
+                            a[0] == rel and a[1] == node.lineno
+                            for a in _ALLOWLIST
+                        )
+                        if not allowlisted:
+                            offenders.append(
+                                f"  {rel}:{node.lineno}: passes raise_on_size_limit=False to {func_name}"
+                            )
+
+    assert not offenders, (
+        "The following call site(s) pass ``raise_on_size_limit=False`` to "
+        "``with_design_doc_locked`` (or an alias), opting into the legacy "
+        "silent-truncation behavior. Per this direction's goal, all design_doc "
+        "writes must fail loudly. Remove the argument (the default is True) or "
+        "add the call site to the allowlist in this test with a reviewed "
+        "rationale.\n\n"
+        + "\n".join(offenders)
+    )

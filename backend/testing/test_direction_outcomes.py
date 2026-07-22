@@ -10195,3 +10195,71 @@ async def test_non_genuine_cancels_excluded_from_generalized_health_rate(
         f"expected health_rate {expected_health_rate}, "
         f"got {entry['generalized_health_rate']}"
     )
+
+
+@pytest.mark.asyncio
+async def test_cochange_design_doc_size_limit_logs_warning(
+    db_session: AsyncSession, caplog: pytest.LogCaptureFixture
+):
+    """When _update_direction_research_outcomes hits a DesignDocSizeLimitExceeded
+    on the cochange-index design_doc write, a warning is logged and the function
+    still completes (the directions mutation already succeeded)."""
+    import logging
+    from unittest.mock import patch
+
+    from app.task_locking import DesignDocSizeLimitExceeded
+
+    direction_id = "d-cochange-cap"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
+    await db_session.flush()
+
+    # Create a merged child with _pr_changed_files so the cochange path is reached
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "_pr_changed_files": ["file1.py", "file2.py"],
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+        title="merged-child",
+    )
+
+    with patch(
+        "app.direction_outcomes.with_design_doc_locked",
+        side_effect=DesignDocSizeLimitExceeded(
+            project_id=project.id,
+            old_size=400_000,
+            new_size=500_100,
+            ceiling=500_000,
+        ),
+    ):
+        with caplog.at_level(logging.WARNING, logger="app.direction_outcomes"):
+            await _update_direction_research_outcomes(
+                project_id=project.id,
+                direction_id=direction_id,
+                research_task_id=research_task_id,
+                session=db_session,
+            )
+
+    await db_session.refresh(project)
+
+    # Warning was emitted with attributable context
+    assert any(
+        "design_doc size limit exceeded" in rec.message
+        and str(project.id) in rec.message
+        for rec in caplog.records
+    ), (
+        "Expected a logger.warning with project_id and 'design_doc size limit exceeded' "
+        f"in caplog records: {[r.message for r in caplog.records]}"
+    )

@@ -366,7 +366,13 @@ async def _maybe_auto_playbook(
 
     try:
         await with_design_doc_locked(session, task.project_id, _mutate_design_doc)
-    except DesignDocSizeLimitExceeded:
+    except DesignDocSizeLimitExceeded as exc:
+        logger.warning(
+            "[AUTO_PLAYBOOK] design_doc size limit exceeded for project %s — "
+            "playbook entry skipped: %s",
+            task.project_id,
+            exc,
+        )
         return None
 
     if not entry_created:

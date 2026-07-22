@@ -2719,10 +2719,17 @@ async def _update_direction_research_outcomes(
             await with_design_doc_locked(
                 session, project_id, _apply_and_capture
             )
-        except DesignDocSizeLimitExceeded:
+        except DesignDocSizeLimitExceeded as exc:
             # Cap hit — design_doc write skipped, but the directions mutation
             # above still succeeded. Skip the cochange telemetry dual-write
             # (same semantic as the old applied=False guard) and commit.
+            import logging  # noqa: PLC0415 — lazy import matches file convention
+            logging.getLogger(__name__).warning(
+                "[DIRECTION_OUTCOMES] design_doc size limit exceeded "
+                "for project %s — cochange telemetry write skipped: %s",
+                project_id,
+                exc,
+            )
             pass
         else:
             if cochange_capture:
