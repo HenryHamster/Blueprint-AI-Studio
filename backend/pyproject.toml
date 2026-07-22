@@ -34,6 +34,16 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # Test files use convenience patterns (broad except, etc.)
 # DTZ intentionally NOT suppressed — tests must use _utcnow(), not datetime.utcnow().
 "testing/*" = ["BLE", "B"]
+# Domain-split mega test files (refactor: split 13 mega backend test files).
+# Each test_<name>__<domain>.py bucket star-imports its shared helper hub
+# `_<name>_testhelpers.py`, which re-exports the complete original module
+# namespace via __all__. F405 (name may be defined from star import) is
+# unavoidable and intended for every helper reference in a bucket; the star
+# line itself carries an inline `# noqa: F403`. The hub keeps imports/helpers
+# used only by tests now living in the buckets, so F401 (unused import) is
+# expected and intended there — the names are re-exports, not dead code.
+"testing/test_release_qualifier__*.py" = ["F405"]
+"testing/_release_qualifier_testhelpers.py" = ["F401"]
 # main.py has many intentional except Exception blocks for background-task error handling
 # B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion
 # E402: Deferred imports for circular dependency / module load order (lines 113, 202, 2035, 2042, 2174)

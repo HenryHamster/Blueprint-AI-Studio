@@ -254,7 +254,6 @@
     "strategicStateApi.ts": 1850
   },
   "testing": {
-    "test_release_qualifier.py": 52300,
     "test_admin_routers.py": 38150,
     "test_agent.py": 31750,
     "test_compute.py": 30250,
@@ -356,6 +355,14 @@
     "test_anomaly_actions.py": 1800,
     "test_failure_residual.py": 1750,
     "test_artifact_refs.py": 1750,
-    "test_api.py": 1750
+    "test_api.py": 1750,
+    "test_release_qualifier__classify_check_runs.py": 8850,
+    "test_release_qualifier__finalize_qualification_2.py": 8800,
+    "test_release_qualifier__ci_unresolved_blocker.py": 7650,
+    "test_release_qualifier__finalize_qualification.py": 7050,
+    "test_release_qualifier__compute_composite.py": 6900,
+    "test_release_qualifier__sweep_stuck_qualifications.py": 6100,
+    "test_release_qualifier__site_b_lock_window_fix.py": 4950,
+    "_release_qualifier_testhelpers.py": 2350
   }
 }
