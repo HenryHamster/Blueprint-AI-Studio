@@ -4539,9 +4539,11 @@ async def strategic_operation(
         _MAX_MEMORY_NOTE_BYTES = 10_000
         body_bytes = raw_body.strip().encode("utf-8")
         if len(body_bytes) > _MAX_MEMORY_NOTE_BYTES:
-            fact_body = body_bytes[:_MAX_MEMORY_NOTE_BYTES].decode("utf-8", errors="replace")
-        else:
-            fact_body = raw_body.strip()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Memory note too large ({len(body_bytes)} bytes, max {_MAX_MEMORY_NOTE_BYTES})",
+            )
+        fact_body = raw_body.strip()
 
         # Title: agent-supplied short descriptor, else derived from the body's
         # first line (≤120 chars) so every row is recognizable in the index.
@@ -5767,7 +5769,10 @@ async def strategic_operation(
         _MAX_SUMMARY_BYTES = 10_000
         summary_bytes = summary.encode("utf-8")
         if len(summary_bytes) > _MAX_SUMMARY_BYTES:
-            summary = summary_bytes[:_MAX_SUMMARY_BYTES].decode("utf-8", errors="replace")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Session summary too large ({len(summary_bytes)} bytes, max {_MAX_SUMMARY_BYTES})",
+            )
 
         # Write to task context so the running agent reads it on bootstrap
         ctx = dict(task.context or {})

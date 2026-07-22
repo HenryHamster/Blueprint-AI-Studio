@@ -9200,3 +9200,101 @@ async def test_strategic_state_live_message_preview_interleaved_statuses(db_sess
         *(f"linked msg {i}" for i in range(7)),
         *(f"open msg {i}" for i in range(2, 7)),
     }
+
+
+@pytest.mark.asyncio
+async def test_set_memory_rejects_oversize_note(db_session):
+    """set_memory returns 400 when the note body exceeds 10 KB instead of truncating."""
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(name="P-oversize-memory", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            oversized_note = "x" * 10_001
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_memory", "task_id": task_id, "data": {"note": oversized_note}},
+            )
+        assert resp.status_code == 400, resp.text
+        assert "too large" in resp.json()["detail"].lower()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_set_session_summary_rejects_oversize_summary(db_session):
+    """set_session_summary returns 400 when summary exceeds 10 KB instead of truncating."""
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(name="P-oversize-summary", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            oversized_summary = "y" * 10_001
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_session_summary", "task_id": task_id, "data": {"summary": oversized_summary}},
+            )
+        assert resp.status_code == 400, resp.text
+        assert "too large" in resp.json()["detail"].lower()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
