@@ -4684,6 +4684,7 @@ async def strategic_operation(
             PENDING_USER_CONFIRMATION_MAX,
             PendingConfirmation,
             parse_problem_model,
+            sanitize_problem_model_raw,
         )
 
         if not isinstance(data, dict):
@@ -4702,7 +4703,14 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail=f"Invalid pending_confirmation: {ve}"
             ) from None
-        current_model = parse_problem_model(project.problem_model)
+        try:
+            current_model = parse_problem_model(
+                sanitize_problem_model_raw(project.problem_model or {})
+            )
+        except _PcValidationError as ve:
+            raise HTTPException(
+                status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+            ) from None
         # Idempotent: same caller-supplied id on a retry is a no-op.
         if any(
             p.id == pending.id
@@ -4764,7 +4772,9 @@ async def strategic_operation(
         # sibling of the create-only ``pending_confirm`` op — the strategist no
         # longer has to wait for the operator to hand-dismiss a bookkeeping ask.
         # Operator dismiss/accept remains the fallback.
-        from app.problem_model import parse_problem_model
+        from pydantic import ValidationError as _RpcVE
+
+        from app.problem_model import parse_problem_model, sanitize_problem_model_raw
 
         target_id = ""
         if isinstance(data, dict):
@@ -4776,7 +4786,14 @@ async def strategic_operation(
                 status_code=400,
                 detail="resolve_pending_confirm requires an 'id' of the pending confirmation to clear",
             )
-        current_model = parse_problem_model(project.problem_model)
+        try:
+            current_model = parse_problem_model(
+                sanitize_problem_model_raw(project.problem_model or {})
+            )
+        except _RpcVE as ve:
+            raise HTTPException(
+                status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+            ) from None
         before = list(current_model.pending_user_confirmation)
         remaining = [p for p in before if p.id != target_id]
         removed = len(before) - len(remaining)

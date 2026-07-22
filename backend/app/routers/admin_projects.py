@@ -690,7 +690,11 @@ async def update_project(
         # so the agent can distinguish user edits during its next cycle.
         from pydantic import ValidationError as _PmValidationError
 
-        from app.problem_model import apply_user_intent_patch, parse_problem_model
+        from app.problem_model import (
+            apply_user_intent_patch,
+            parse_problem_model,
+            sanitize_problem_model_raw,
+        )
 
         # Stale-write guard runs first so a concurrent writer is reported as a
         # 409 before we attempt the merge. The editable-subset validation and
@@ -698,7 +702,14 @@ async def update_project(
         # so onboarding and this editor save share one correct path (the inline
         # shallow merge used to drop intent.source, silently un-protecting an
         # operator-edited purpose against the next strategic cycle).
-        current = parse_problem_model(project.problem_model)
+        try:
+            current = parse_problem_model(
+                sanitize_problem_model_raw(project.problem_model or {})
+            )
+        except _PmValidationError as ve:
+            raise HTTPException(
+                status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+            ) from None
         if (
             payload.problem_model_base_revision is not None
             and payload.problem_model_base_revision != current.revision
@@ -713,7 +724,7 @@ async def update_project(
             )
         try:
             validated = apply_user_intent_patch(
-                project.problem_model,
+                sanitize_problem_model_raw(project.problem_model or {}),
                 payload.problem_model_patch,
                 _utcnow().isoformat(),
             )
@@ -1082,7 +1093,9 @@ async def dismiss_pending_confirmation(
     An optional ``note`` in the request body is recorded in the revision log
     so the strategist can see the operator's response on its next cycle.
     """
-    from app.problem_model import append_revision_log, parse_problem_model
+    from pydantic import ValidationError as _DismissVE
+
+    from app.problem_model import append_revision_log, parse_problem_model, sanitize_problem_model_raw
     from app.time_utils import _utcnow
 
     project = await _get_user_project_with_role(
@@ -1090,7 +1103,14 @@ async def dismiss_pending_confirmation(
     )
     project = await lock_project_or_429(session, project.id)
     await session.refresh(project, attribute_names=["problem_model"])
-    current_model = parse_problem_model(project.problem_model)
+    try:
+        current_model = parse_problem_model(
+            sanitize_problem_model_raw(project.problem_model or {})
+        )
+    except _DismissVE as ve:
+        raise HTTPException(
+            status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+        ) from None
     matched = next(
         (p for p in current_model.pending_user_confirmation if p.id == pending_id),
         None,
@@ -1139,10 +1159,13 @@ async def accept_pending_confirmation(
     - major_decision: records the operator's answer in the revision log and clears the item.
     - credentials_needed / access_needed: signals provided and clears the item.
     """
+    from pydantic import ValidationError as _AcceptVE
+
     from app.problem_model import (
         apply_user_intent_patch,
         append_revision_log,
         parse_problem_model,
+        sanitize_problem_model_raw,
     )
     from app.time_utils import _utcnow
 
@@ -1151,7 +1174,14 @@ async def accept_pending_confirmation(
     )
     project = await lock_project_or_429(session, project.id)
     await session.refresh(project, attribute_names=["problem_model"])
-    current_model = parse_problem_model(project.problem_model)
+    try:
+        current_model = parse_problem_model(
+            sanitize_problem_model_raw(project.problem_model or {})
+        )
+    except _AcceptVE as ve:
+        raise HTTPException(
+            status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+        ) from None
 
     matched = next(
         (p for p in current_model.pending_user_confirmation if p.id == pending_id),
@@ -1167,7 +1197,7 @@ async def accept_pending_confirmation(
     if matched.type == "intent_change":
         # Apply the proposed text as the new operator-set intent.purpose.
         current_model = apply_user_intent_patch(
-            project.problem_model,
+            sanitize_problem_model_raw(project.problem_model or {}),
             {"intent": {"purpose": matched.proposal}},
             now,
         )

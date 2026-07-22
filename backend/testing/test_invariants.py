@@ -13204,3 +13204,130 @@ def test_no_set_ordered_tokens_in_human_readable_text():
         "Fix: wrap the set in sorted(...) before joining, e.g. ', '.join(sorted(set(...))).\n\n"
         "Offending sites:\n" + "\n".join(violations)
     )
+
+
+# ---------------------------------------------------------------------------
+# Problem-model write-path invariant — every project.problem_model = <expr>
+# must be provably sanitized against packer-marker pollution
+# ---------------------------------------------------------------------------
+
+
+class TestProblemModelWritePathInvariants:
+    """Structural invariant: every ``project.problem_model = <expr>`` assignment
+    in production code must trace to a provably sanitizing write path.
+
+    The test uses AST scanning to discover ALL assignment sites and then checks
+    each against a manually-reviewed allowlist of safe sites. A new write site
+    that is not in the allowlist triggers a test failure, requiring explicit
+    review. This makes the allowlist a living inventory that must be updated
+    whenever a write path is added or modified.
+    """
+
+    # Manual allowlist of safe write sites.
+    # Key: (rel_path_from_app, lineno). Each entry is the reviewed safety
+    # rationale — the scanner does NOT classify; it only discovers.
+    # When changing a file, update these line numbers.
+    _SAFE_SITES: dict[tuple[str, int], str] = {
+        # lifecycle.py: sanitize_problem_model_raw caller
+        ("lifecycle.py", 369): "sanitize_problem_model_raw(dict(project.problem_model))",
+        # task_locking.py: sanitize_problem_model_raw inside with_problem_model_locked
+        ("task_locking.py", 1021): "sanitize_problem_model_raw(…) upstream, variable assigned to .problem_model",
+        # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
+        ("direction_lifecycle.py", 812): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
+        ("direction_lifecycle.py", 840): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
+        # strategic_completion.py: apply_agent_update (write-back)
+        ("strategic_completion.py", 4792): "apply_agent_update inline-sanitizes both current and proposed",
+        # strategic_completion.py: apply_agent_update (re-normalized)
+        ("strategic_completion.py", 4840): "apply_agent_update result, then _normalize_active_moves_writeback",
+        # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
+        ("strategic_completion.py", 6171): "parse_problem_model(…) validated pydantic model_dump",
+        # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
+        ("reaper_sweeps.py", 997): "parse_problem_model(…) validated pydantic model_dump",
+        # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
+        ("reaper_sweeps.py", 1106): "parse_problem_model(…) validated pydantic model_dump",
+        # admin_projects.py: validated.model_dump()
+        ("routers/admin_projects.py", 737): "validated pydantic model_dump",
+        # admin_projects.py: current_model.model_dump()
+        ("routers/admin_projects.py", 1134): "current_model pydantic model_dump",
+        # admin_projects.py: current_model.model_dump()
+        ("routers/admin_projects.py", 1230): "current_model pydantic model_dump",
+        # admin_onboard.py: pm.model_dump() from parsed ProblemModel
+        ("routers/admin_onboard.py", 959): "pm parsed from ProblemModel, model_dump",
+        # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (6 sites)
+        ("routers/admin_agent_ops.py", 1659): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2006): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2436): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2549): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2804): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
+        ("routers/admin_agent_ops.py", 4211): "apply_agent_update result",
+        # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
+        ("routers/admin_agent_ops.py", 4244): "apply_agent_update result, then _normalize_active_moves_writeback",
+        # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
+        ("routers/admin_agent_ops.py", 4750): "validated current_model pydantic model_dump",
+        # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
+        ("routers/admin_agent_ops.py", 4817): "validated current_model pydantic model_dump",
+    }
+
+    def test_all_problem_model_write_paths_are_sanitized(self):
+        """Every ``project.problem_model = <expr>`` in ``backend/app/`` must
+        be in the reviewed allowlist of safe sanitized write paths."""
+        app_dir = BACKEND_ROOT / "app"
+        discovered: dict[tuple[str, int], str] = {}
+        # (rel_path, lineno) -> friendly description of the RHS
+
+        for py_file in sorted(app_dir.rglob("*.py")):
+            source = py_file.read_text(encoding="utf-8")
+            rel = py_file.relative_to(BACKEND_ROOT / "app")
+            try:
+                tree = ast.parse(source, filename=str(py_file))
+            except SyntaxError:
+                continue
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Attribute) and tgt.attr == "problem_model":
+                        lineno = node.lineno
+                        key = (str(rel), lineno)
+                        if isinstance(node.value, ast.Call) and isinstance(
+                            node.value.func, ast.Attribute
+                        ):
+                            desc = f"{node.value.func.attr}() call"
+                        elif isinstance(node.value, ast.Call) and isinstance(
+                            node.value.func, ast.Name
+                        ):
+                            desc = f"{node.value.func.id}(...) call"
+                        elif isinstance(node.value, ast.Name):
+                            desc = f"variable `{node.value.id}`"
+                        elif isinstance(node.value, ast.Subscript):
+                            desc = "subscript expression"
+                        elif isinstance(node.value, ast.Dict):
+                            desc = "dict literal"
+                        else:
+                            desc = type(node.value).__name__
+                        discovered[key] = desc
+
+        # Everything discovered must be in the allowlist
+        missing = set(discovered) - set(self._SAFE_SITES)
+        assert not missing, (
+            f"{len(missing)} project.problem_model = <expr> site(s) found "
+            "that are NOT in the reviewed SAFE_SITES allowlist.\n"
+            "Each new write path must be reviewed for packer-marker sanitization "
+            "and added to TestProblemModelWritePathInvariants._SAFE_SITES.\n\n"
+            "Unlisted sites:\n"
+            + "\n".join(
+                f"  {rel}:{ln} ({desc})"
+                for (rel, ln), desc in sorted(missing.items())
+            )
+        )
+
+        # Warn about stale allowlist entries (sites that no longer exist)
+        stale = set(self._SAFE_SITES) - set(discovered)
+        assert not stale, (
+            f"{len(stale)} SAFE_SITES entry/entries no longer found in the codebase. "
+            "Remove or update these stale allowlist entries:\n"
+            + "\n".join(f"  {rel}:{ln}" for (rel, ln) in sorted(stale))
+        )

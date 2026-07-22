@@ -910,6 +910,7 @@ def _seed_strategic_intent(
     from app.problem_model import (
         apply_user_intent_patch,
         parse_problem_model,
+        sanitize_problem_model_raw,
         Source,
     )
 
@@ -924,7 +925,14 @@ def _seed_strategic_intent(
         content=goal,
     )
 
-    pm = parse_problem_model(project.problem_model)
+    try:
+        pm = parse_problem_model(
+            sanitize_problem_model_raw(project.problem_model or {})
+        )
+    except ValidationError as ve:
+        raise HTTPException(
+            status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+        ) from None
     pm.intent.purpose = goal
     pm.intent.current_focus = goal
     pm.intent.source = Source(

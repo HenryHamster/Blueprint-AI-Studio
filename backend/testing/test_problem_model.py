@@ -17,6 +17,7 @@ from app.problem_model import (
     CAPABILITIES_DURABLE_MAX,
     DEFERRAL_STALE_GRACE_DAYS,
     FRICTION_DURABLE_MAX,
+    PACKER_MARKER_KEYS,
     PROBLEM_MODEL_BYTE_BUDGET,
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
@@ -6355,6 +6356,57 @@ def test_sanitize_problem_model_raw_output_is_pydantic_parseable():
     model = parse_problem_model(sanitized)
     assert model.revision == 2
     assert model.intent.purpose == "test purpose"
+
+
+# ---------------------------------------------------------------------------
+# PACKER_MARKER_KEYS coverage — every known marker must be stripped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("marker_key", sorted(PACKER_MARKER_KEYS))
+def test_sanitize_problem_model_raw_covers_all_known_markers(marker_key: str):
+    """Every key in PACKER_MARKER_KEYS is stripped by sanitize_problem_model_raw.
+
+    Adding a new packer marker to the constant automatically expands this
+    parameterized test's coverage — a new marker that is NOT stripped by
+    sanitize_problem_model_raw will fail here."""
+    raw = {
+        "revision": 1,
+        "intent": {"purpose": "test", "current_focus": ""},
+        marker_key: "some_value",
+    }
+    result = sanitize_problem_model_raw(raw)
+    assert marker_key not in result, (
+        f"PACKER_MARKER_KEYS includes '{marker_key}' but "
+        f"sanitize_problem_model_raw did not strip it"
+    )
+    # Known fields preserved
+    assert result["revision"] == 1
+    assert result["intent"] == {"purpose": "test", "current_focus": ""}
+
+
+@pytest.mark.parametrize("marker_key", sorted(PACKER_MARKER_KEYS))
+def test_apply_agent_update_strips_all_known_markers_from_both_inputs(marker_key: str):
+    """Every key in PACKER_MARKER_KEYS is stripped from both current_raw and
+    proposed_raw by apply_agent_update."""
+    marker_value: object = True  # All known markers accept a bool or str truthy value
+    current = {
+        "revision": 3,
+        "intent": {"purpose": "Current.", "current_focus": ""},
+        marker_key: marker_value,
+    }
+    proposed = {
+        "intent": {"purpose": "Updated.", "current_focus": ""},
+        marker_key: marker_value,
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-07-22T10:00:00")
+    assert marker_key not in new_raw, (
+        f"PACKER_MARKER_KEYS includes '{marker_key}' but "
+        f"apply_agent_update did not strip it from the output"
+    )
+    # Write succeeded and the update went through
+    assert new_raw["revision"] == 4
+    assert new_raw["intent"]["purpose"] == "Updated."
 
 
 # ---------------------------------------------------------------------------

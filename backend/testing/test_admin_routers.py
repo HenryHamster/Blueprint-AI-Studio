@@ -12322,6 +12322,33 @@ class TestPatchProblemModel:
         assert pm["intent"]["purpose"] == "Writer A."
         assert pm["revision"] == 2
 
+    @pytest.mark.asyncio
+    async def test_patch_with_poisoned_problem_model_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH /projects/{id} with a packer-marker key in the stored problem_model
+        succeeds — sanitize_problem_model_raw strips unknown keys before parsing."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Old.", "current_focus": ""},
+            "revision": 1,
+            "truncated": True,  # packer marker that should be rejected by pydantic extra=forbid
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"problem_model_patch": {"intent": {"purpose": "New."}}},
+        )
+        # sanitize_problem_model_raw strips "truncated" so parse_problem_model succeeds
+        assert resp.status_code == 200, (
+            f"Expected 200 after sanitization, got {resp.status_code}: {resp.text}"
+        )
+
 
 class TestAcknowledgeRunningUpdate:
     """Acknowledge endpoint stamps running_update_acknowledged_at. The
@@ -12671,6 +12698,39 @@ class TestDismissPendingConfirmation:
         )
         assert resp.status_code == 422
 
+    @pytest.mark.asyncio
+    async def test_dismiss_with_poisoned_problem_model_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """Dismiss endpoint strips packer-marker keys before parsing so a poisoned
+        row succeeds after sanitize_problem_model_raw strips unknown keys."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-poison-dismiss",
+                    "type": "major_decision",
+                    "proposal": "Migrate?",
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ],
+            "truncated": True,  # packer marker
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-poison-dismiss/dismiss"
+        )
+        # sanitize_problem_model_raw strips "truncated" so parse_problem_model succeeds
+        assert resp.status_code == 200, (
+            f"Expected 200 after sanitization, got {resp.status_code}: {resp.text}"
+        )
+
 
 class TestAcceptPendingConfirmation:
     """POST /pending-confirm/{id}/accept applies type-specific action and clears the item."""
@@ -12876,6 +12936,40 @@ class TestAcceptPendingConfirmation:
             json={"answer": "y" * 5001},
         )
         assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_accept_with_poisoned_problem_model_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """Accept endpoint strips packer-marker keys before parsing so a poisoned
+        row succeeds — sanitize_problem_model_raw removes unknown keys first."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 2,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-poison-accept",
+                    "type": "major_decision",
+                    "proposal": "Go with option A?",
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ],
+            "truncated": True,  # packer marker
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-poison-accept/accept",
+            json={"answer": "confirmed"},
+        )
+        # sanitize_problem_model_raw strips "truncated" so parse_problem_model succeeds
+        assert resp.status_code == 200, (
+            f"Expected 200 after sanitization, got {resp.status_code}: {resp.text}"
+        )
 
 
 class TestPendingConfirmationLockedRMW:
@@ -30812,6 +30906,88 @@ class TestStrategicPendingConfirmDedup:
         )
         assert pm.get("context", {}).get("notes") == "operator-set context that must survive"
         assert pm.get("revision", 0) == 8, "revision must still be bumped"
+
+    @pytest.mark.asyncio
+    async def test_pending_confirm_with_poisoned_problem_model_succeeds(self, db_session):
+        """pending_confirm op strips packer-marker keys before parsing so a poisoned
+        problem_model row succeeds (sanitize strips unknown keys, not a 500 crash)."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "truncated": True,  # packer marker
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-poison-op",
+                        "type": "credentials_needed",
+                        "proposal": "Need API key.",
+                    },
+                },
+            )
+        # sanitize_problem_model_raw strips "truncated" so parse_problem_model succeeds
+        assert resp.status_code == 200, (
+            f"Expected 200 after sanitization, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_with_poisoned_problem_model_succeeds(
+        self, db_session
+    ):
+        """resolve_pending_confirm op strips packer-marker keys before parsing so
+        a poisoned problem_model row succeeds (sanitize strips unknown keys, not a 500 crash)."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-poison-resolve",
+                    "type": "credentials_needed",
+                    "proposal": "Need a token.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ],
+            "truncated": True,  # packer marker
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-poison-resolve"},
+                },
+            )
+        # sanitize_problem_model_raw strips "truncated" so parse_problem_model succeeds
+        assert resp.status_code == 200, (
+            f"Expected 200 after sanitization, got {resp.status_code}: {resp.text}"
+        )
+        assert resp.json()["removed"] is True
 
 
 class TestRecordFindingResolutionViaStrategicOp:

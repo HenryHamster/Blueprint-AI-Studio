@@ -636,7 +636,7 @@ def capability_evidence_status(cap: Capability) -> EvidenceStatus:
 
 
 
-_PACKER_MARKER_KEYS: frozenset[str] = frozenset(
+PACKER_MARKER_KEYS: frozenset[str] = frozenset(
     {"truncated", "_agent_view_floor_applied", "_gap_memory_trimmed"}
 )
 
@@ -645,10 +645,10 @@ def sanitize_problem_model_raw(raw: dict) -> dict:
     """Strip packer markers and unknown keys from a raw problem_model dict.
 
     Removes any top-level key that is not a declared ``ProblemModel`` field —
-    including packer-injected markers (``truncated``, ``_agent_view_floor_applied``,
-    ``_gap_memory_trimmed``) and any future unknowns. Safe to call on the dict
-    before persisting it so a packer-truncated view can never be written back
-    with its poison markers intact.
+    including packer-injected markers (see :data:`PACKER_MARKER_KEYS`) and any
+    future unknowns. Safe to call on the dict before persisting it so a
+    packer-truncated view can never be written back with its poison markers
+    intact.
 
     This is the canonical pre-write sanitizer for all non-agent write paths
     (``with_problem_model_locked``, ``_reconcile_retired_gap``, etc.).
