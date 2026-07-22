@@ -109,11 +109,6 @@ function setInputValue(el: HTMLInputElement, value: string) {
   el.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-function setSelectValue(el: HTMLSelectElement, value: string) {
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
-  setter?.call(el, value);
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-}
 
 describe('ProjectToolHost — configure / rename / role gating', () => {
   beforeEach(() => {
@@ -171,21 +166,17 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
       'proj-a',
       'tool-1',
-      expect.objectContaining({ title: 'Renamed Widget', placement: 'project_section' }),
+      { title: 'Renamed Widget', config: {} },
     );
   });
 
-  test('configure sends placement + coerced schema config', async () => {
+  test('configure sends coerced schema config', async () => {
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Configure').click(); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
-    // Placement select + one schema field (threshold:integer) are rendered.
-    const select = h().querySelector('select') as HTMLSelectElement;
-    expect(Array.from(select.options).map(o => o.value)).toEqual([
-      'project_section', 'toolbar', 'sidebar',
-    ]);
-    await act(async () => { setSelectValue(select, 'sidebar'); });
-    // The second text input is the `threshold` config field.
+    // No placement select: the Placement dropdown was removed (#15978).
+    expect(h().querySelector('select')).toBeNull();
+    // The title input is first; the `threshold` config field is second.
     const inputs = h().querySelectorAll('input[type="text"]');
     const thresholdInput = inputs[1] as HTMLInputElement;
     await act(async () => { setInputValue(thresholdInput, '42'); });
@@ -193,7 +184,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
       'proj-a',
       'tool-1',
-      { title: 'My Widget', placement: 'sidebar', config: { threshold: 42 } },
+      { title: 'My Widget', config: { threshold: 42 } },
     );
   });
 
