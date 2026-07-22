@@ -3554,6 +3554,195 @@ async def test_process_post_commit_locks_project_before_task_for_nonstrategic(
     assert calls["skip_locked"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lock_result", "expected_scope"),
+    [("project_busy", "project"), ("task_busy", "task")],
+)
+async def test_process_post_commit_attributes_pair_lock_contention(
+    tl_db, mocker, lock_result, expected_scope
+):
+    """The recovery ledger gets the actual contended half of the lock pair."""
+    from app.task_lifecycle import PostCommitLocked
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="plan", status=TaskStatus.EVALUATING
+    )
+
+    @contextlib.asynccontextmanager
+    async def _contended_pair(*args, **kwargs):
+        if lock_result == "project_busy":
+            yield (None, None)
+        else:
+            yield (project, None)
+
+    mocker.patch("app.task_locking.lock_project_then_task", _contended_pair)
+    mocker.patch("asyncio.sleep", new=AsyncMock())
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+
+    with pytest.raises(PostCommitLocked) as exc_info:
+        await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert exc_info.value.lock_scope == expected_scope
+    expected_id = project.id if expected_scope == "project" else task.id
+    assert exc_info.value.resource_id == expected_id
+
+
+@pytest.mark.asyncio
+async def test_childless_recovery_claim_cannot_revive_cancelled_plan(tl_db, mocker):
+    """Cancellation between claim and processing wins under the lifecycle lock."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    claim_token = "claim-before-cancel"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 1,
+                "claim_token": claim_token,
+            }
+        },
+    )
+    task.plan_output = {"subtasks": [{"type": "create", "prompt": "do x"}]}
+    await session.commit()
+
+    # This is the state change that raced after the recovery claim committed.
+    task.status = TaskStatus.CANCELLED
+    await session.commit()
+    handle_plan = mocker.patch(
+        "app.task_completion._handle_plan_completion", new=AsyncMock()
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps(task.plan_output),
+    )
+
+    result = await _process_post_commit(
+        task.id,
+        payload,
+        _session_factory=factory,
+        _expected_childless_recovery_token=claim_token,
+    )
+
+    assert result == {"status": "accepted", "recovery_skipped": True}
+    handle_plan.assert_not_awaited()
+    await session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    child_ids = (
+        await session.execute(select(Task.id).where(Task.parent_task_id == task.id))
+    ).scalars().all()
+    assert child_ids == []
+
+
+@pytest.mark.asyncio
+async def test_childless_recovery_preserves_cancel_during_handler(tl_db, mocker):
+    """Cancellation during the handler's unlocked window wins over recovery."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    claim_token = "claim-before-handler"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 1,
+                "claim_token": claim_token,
+            }
+        },
+    )
+    task.plan_output = {"subtasks": [{"type": "create", "prompt": "do x"}]}
+    await session.commit()
+
+    async def _cancel_in_unlocked_window(task_arg, logs, handler_session):
+        # Mirrors _ensure_branch's intentional mid-handler commit/release.
+        await handler_session.commit()
+        async with factory() as cancel_session:
+            cancelled = await cancel_session.get(Task, task.id)
+            cancelled.status = TaskStatus.CANCELLED
+            cancel_session.add(cancelled)
+            await cancel_session.commit()
+        raise RuntimeError("snapshot changed after cancellation")
+
+    handle_plan = mocker.patch(
+        "app.task_completion._handle_plan_completion",
+        new=AsyncMock(side_effect=_cancel_in_unlocked_window),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps(task.plan_output),
+    )
+
+    result = await _process_post_commit(
+        task.id,
+        payload,
+        _session_factory=factory,
+        _expected_childless_recovery_token=claim_token,
+    )
+
+    assert result == {"status": "accepted", "recovery_skipped": True}
+    handle_plan.assert_awaited_once()
+    await session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    child_ids = (
+        await session.execute(select(Task.id).where(Task.parent_task_id == task.id))
+    ).scalars().all()
+    assert child_ids == []
+
+
+@pytest.mark.asyncio
+async def test_childless_recovery_current_handler_failure_propagates(tl_db, mocker):
+    """The recovery ledger, not generic handler recovery, owns its retries."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    claim_token = "current-claim"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 1,
+                "claim_token": claim_token,
+            }
+        },
+    )
+    task.plan_output = {"subtasks": [{"type": "create", "prompt": "do x"}]}
+    await session.commit()
+    mocker.patch(
+        "app.task_completion._handle_plan_completion",
+        new=AsyncMock(side_effect=RuntimeError("branch creation failed")),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps(task.plan_output),
+    )
+
+    with pytest.raises(RuntimeError, match="branch creation failed"):
+        await _process_post_commit(
+            task.id,
+            payload,
+            _session_factory=factory,
+            _expected_childless_recovery_token=claim_token,
+        )
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert (task.context or {})["_childless_post_commit_recovery"][
+        "claim_token"
+    ] == claim_token
+
+
 def test_strategic_completion_reserves_message_block_before_authority_locks():
     source = inspect.getsource(_process_post_commit)
     reserve_at = source.index("await reserve_project_message_sequences(")

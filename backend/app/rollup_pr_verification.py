@@ -19,6 +19,7 @@ import uuid
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
@@ -261,6 +262,55 @@ def _record_rollup_failure_signals(task: Task, failure_class: str) -> None:
         )
 
 
+async def _hold_childless_plan_for_post_commit(
+    task: Task, session: AsyncSession
+) -> bool:
+    """Return True when a persisted plan still needs to spawn its children.
+
+    This check must run before the cached ``pr_merged`` fast path. Older
+    rollup passes may already have stamped ``rollup_no_pr_artifact`` while the
+    plan was transiently COMPLETED, before post-commit moved it to EVALUATING
+    and spawned children. Overriding that stale credit lets recovery own the row
+    instead of allowing the ancestor rollup to converge on work never spawned.
+    """
+    plan_output = task.plan_output
+    if not (
+        (task.first_payload or {}).get("type") == "plan"
+        and isinstance(plan_output, dict)
+        and isinstance(plan_output.get("subtasks"), list)
+        and plan_output.get("subtasks")
+    ):
+        return False
+
+    child_exists = (
+        await session.execute(
+            select(Task.id).where(Task.parent_task_id == task.id).limit(1)
+        )
+    ).first()
+    if child_exists is not None:
+        return False
+
+    # Downstream rollup classification still reads the cached context directly.
+    # Override stale merge credit on this identity without marking it dirty:
+    # the caller released child locks before verification, so an autoflush of a
+    # copied context could overwrite a concurrent writer. ``set_committed_value``
+    # changes only the in-session view used by this rollup pass and emits no DB
+    # UPDATE; a later refresh recovers the authoritative persisted context.
+    ctx = dict(task.context or {})
+    ctx.pop("pr_merged", None)
+    if ctx.get("_non_merge_unblock_reason") == "rollup_no_pr_artifact":
+        ctx.pop("_non_merge_unblock_reason", None)
+    set_committed_value(task, "context", ctx)
+
+    _pr_merge_negative_cache[task.id] = time.time()
+    logger.warning(
+        "[PR_VERIFY] Plan %s has persisted subtasks but zero spawned children; "
+        "holding merge credit for post-commit recovery",
+        str(task.id)[:8],
+    )
+    return True
+
+
 async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     """Check if a create task's PR is merged. Uses context cache, falls back to GitHub API.
 
@@ -271,6 +321,8 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     from app.routers.agent import get_github_token_for_task
     from app.github import get_pull_request
 
+    if await _hold_childless_plan_for_post_commit(task, session):
+        return False
     if (task.context or {}).get("pr_merged"):
         return True
 

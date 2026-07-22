@@ -211,10 +211,12 @@ def _resolve_fallback_verdict(verdict_text: str) -> str | None:
 
 
 class PostCommitLocked(Exception):
-    """Raised when _process_post_commit can't acquire the task row within the
-    retry budget. Distinct from DBAPIError so the caller in agent_status.py
-    can treat "row still held by peer" as a retryable pending, not an error.
-    """
+    """Raised when post-commit cannot acquire its project/task lock pair."""
+
+    def __init__(self, message: str, *, lock_scope: str = "unknown", resource_id=None):
+        super().__init__(message)
+        self.lock_scope = lock_scope
+        self.resource_id = resource_id
 
 
 class PostCommitFinalCommitFailed(Exception):
@@ -1028,6 +1030,7 @@ async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
     _session_factory=None,
+    _expected_childless_recovery_token: str | None = None,
 ) -> dict:
     """Post-commit processing: review pipeline, completion handlers, rollup, aggregation.
 
@@ -1146,6 +1149,7 @@ async def _process_post_commit(
         # they skip their own (legacy) re-acquisition; non-strategic handlers
         # ignore it and re-lock the same row re-entrantly under the held lock.
         locked_project: Project | None = None
+        blocked_lock_scope = "task"
         from app.task_locking import lock_project_then_task
 
         for _attempt in range(3):
@@ -1169,6 +1173,7 @@ async def _process_post_commit(
                         task = _t
                         locked_project = _p
                         break
+                    blocked_lock_scope = "project" if _p is None else "task"
                     # Half-pair acquired (project but not task) or no pair
                     # (project also held). Release any held lock before
                     # retrying so we don't accumulate session-level locks
@@ -1201,7 +1206,51 @@ async def _process_post_commit(
                 return {"status": "accepted"}
             await asyncio.sleep(2)
         if task is None:
-            raise PostCommitLocked(f"task {task_id} row held by peer after 3 retries")
+            blocked_id = _peek_project_id if blocked_lock_scope == "project" else task_id
+            raise PostCommitLocked(
+                f"{blocked_lock_scope} {blocked_id} row held by peer after 3 retries "
+                f"while processing task {task_id}",
+                lock_scope=blocked_lock_scope,
+                resource_id=blocked_id,
+            )
+
+        # A marker-less recovery claim is only a lease, not authority to revive
+        # a task forever. Revalidate it while holding the canonical Project ->
+        # Task lifecycle locks, immediately before any completion handler can
+        # mutate state or spawn children. This closes the claim-to-dispatch race
+        # with cancel, archive, requeue, and a peer spawn.
+        if _expected_childless_recovery_token is not None:
+            recovery_meta = dict(
+                (task.context or {}).get("_childless_post_commit_recovery") or {}
+            )
+            plan_output = task.plan_output
+            claim_is_current = (
+                recovery_meta.get("claim_token")
+                == _expected_childless_recovery_token
+                and task.status == TaskStatus.EVALUATING
+                and not task.archived
+                and not task.post_commit_pending
+                and (task.first_payload or {}).get("type") == "plan"
+                and isinstance(plan_output, dict)
+                and isinstance(plan_output.get("subtasks"), list)
+                and bool(plan_output.get("subtasks"))
+            )
+            if claim_is_current:
+                child_id = (
+                    await session.execute(
+                        select(Task.id)
+                        .where(Task.parent_task_id == task_id)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                claim_is_current = child_id is None
+            if not claim_is_current:
+                logger.info(
+                    "[POST_COMMIT SWEEP] Skipping stale marker-less recovery "
+                    "claim for task %s after lifecycle-lock revalidation",
+                    str(task_id)[:8],
+                )
+                return {"status": "accepted", "recovery_skipped": True}
 
         async def _rollback_and_refetch_task() -> Task | None:
             """Recover the shared session after a failed post-commit section.
@@ -5393,6 +5442,36 @@ async def _process_post_commit(
                     )
                     return {"status": "accepted"}
                 task = _recovered_task
+                if _expected_childless_recovery_token is not None:
+                    recovery_meta = dict(
+                        (task.context or {}).get(
+                            "_childless_post_commit_recovery"
+                        )
+                        or {}
+                    )
+                    claim_is_current = (
+                        task.status == TaskStatus.EVALUATING
+                        and not task.archived
+                        and not task.post_commit_pending
+                        and recovery_meta.get("claim_token")
+                        == _expected_childless_recovery_token
+                    )
+                    if not claim_is_current:
+                        logger.info(
+                            "[POST_COMMIT SWEEP] Recovery claim for task %s "
+                            "lost authority during completion handler; preserving "
+                            "the newer lifecycle state",
+                            str(task_id)[:8],
+                        )
+                        return {
+                            "status": "accepted",
+                            "recovery_skipped": True,
+                        }
+                    # The outer marker-less recovery loop owns retry accounting
+                    # and terminalization. Preserve EVALUATING and propagate the
+                    # handler error so that loop can record this exact claim's
+                    # failure without re-running the agent or failing early.
+                    raise
                 # Detect transient errors (GitHub API, DB, network) and requeue instead of FAILED
                 err_str = str(handler_exc).lower()
                 is_transient = any(
