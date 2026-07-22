@@ -1051,6 +1051,101 @@ async function main() {
           ? '✓ Message handoff observable: at least one strategic/system message present after teardown'
           : '⚠️ No strategic/system handoff message observed (DEAD_END sub-note; no session messages existed to hand off)',
       ]);
+
+      // 5f. UI click-to-talk: navigate to the Chat tab, click the Workday mode toggle,
+      // click the Start Workday session button, and assert strategic-liveness reflects
+      // the session started from that UI click — not from a prior API call.
+      // This is the operator's actual click-to-talk affordance. The daemon is still alive
+      // (killed only in the finally block), so an eligible runner is present if 5a passed.
+      console.log('\n[FLOW 5f] UI click-to-talk: Workday toggle → Start → liveness confirms session...');
+      let clickToTalkNavError = null;
+      let workdayToggleClicked = false;
+      let startButtonClickedFromUI = false;
+      let livenessStateAfterUIStart = null;
+      let uiStartedSessionId = null;
+      try {
+        // Navigate to the Chat tab where StrategicSessionControl is mounted.
+        await selectWalkthroughProject(page);
+        await navigateToWorkdayControl(page);
+        // Give React pollers time to reflect the post-5e stopped state.
+        await page.waitForTimeout(3000);
+
+        // The control may be in either mode after 5e. Check whether the Workday
+        // toggle is already selected (aria-pressed="true") or needs to be clicked.
+        const workdayToggleLocator = page.locator(
+          '[data-testid="strategic-session-control"] button[aria-label="Switch Strategic mode to Workday"]'
+        );
+        const toggleCount = await workdayToggleLocator.count().catch(() => 0);
+        const toggleAriaPressed = toggleCount > 0
+          ? await workdayToggleLocator.getAttribute('aria-pressed').catch(() => 'false')
+          : 'false';
+
+        if (toggleCount > 0 && toggleAriaPressed !== 'true') {
+          // Workday toggle is present but not selected — click it to enter continuous mode.
+          await workdayToggleLocator.click();
+          workdayToggleClicked = true;
+          // Wait for the mode update to propagate through the workbench-state API.
+          await page.waitForTimeout(3000);
+        }
+
+        // The Start Workday session button should now be present (continuous mode, no session).
+        const startBtnLocator = page.locator(
+          '[data-testid="strategic-session-control"] button[title="Start Workday session"]'
+        );
+        let startBtnCount = await startBtnLocator.count().catch(() => 0);
+
+        if (startBtnCount === 0) {
+          // Allow one more poll cycle for liveness/state to catch up.
+          await page.waitForTimeout(3000);
+          startBtnCount = await startBtnLocator.count().catch(() => 0);
+        }
+
+        if (startBtnCount > 0) {
+          const startBtnDisabled = await startBtnLocator.getAttribute('disabled').catch(() => null);
+          if (startBtnDisabled === null) {
+            // Click Start — this fires onStartSession which calls POST strategic-session/start.
+            await startBtnLocator.click();
+            startButtonClickedFromUI = true;
+
+            // Poll strategic-liveness to assert the session reflects this UI-initiated start.
+            for (let i = 0; i < 7 && livenessStateAfterUIStart === null; i++) {
+              await new Promise(r => setTimeout(r, 2500));
+              const lv = await apiGet(`/api/admin/projects/${PROJECT_ID}/strategic-liveness`);
+              const state = lv.body?.resident_session_availability?.state ?? null;
+              const snap = lv.body?.resident_session ?? null;
+              if (['starting', 'active', 'waiting'].includes(state ?? '')) {
+                livenessStateAfterUIStart = state;
+                uiStartedSessionId = snap?.session_id ?? null;
+              }
+            }
+          }
+        }
+      } catch (navErr) {
+        clickToTalkNavError = String(navErr);
+        console.log(`   [WARN] Click-to-talk navigation error: ${clickToTalkNavError}`);
+      }
+
+      const flow5fPass = startButtonClickedFromUI && livenessStateAfterUIStart !== null;
+      const flow5fScreenshot = await takeScreenshot(page, 'flow5f-ui-click-to-talk-start');
+      step('5f. UI click-to-talk: Workday toggle → Start → strategic-liveness reflects session', flow5fPass ? 'PASS' : 'DEAD_END', [
+        flow5fPass
+          ? `✓ UI click-to-talk confirmed: Workday toggle clicked (${workdayToggleClicked}) → Start button clicked → liveness state=${livenessStateAfterUIStart} (session_id=${uiStartedSessionId})`
+          : '⚠ UI click-to-talk not confirmed via strategic-liveness — see details below',
+        clickToTalkNavError ? `Navigation error: ${clickToTalkNavError}` : 'Navigation completed without error',
+        `Workday mode toggle clicked (was not already selected): ${workdayToggleClicked}`,
+        `Start Workday session button clicked from UI: ${startButtonClickedFromUI}`,
+        `Strategic-liveness state observed after UI Start click: ${livenessStateAfterUIStart ?? 'n/a (not observed within 17.5s)'}`,
+        `Session ID from liveness after UI Start: ${uiStartedSessionId ?? 'n/a'}`,
+        !startButtonClickedFromUI && !clickToTalkNavError
+          ? '⚠ Start button not found or was disabled — session may already be active, or mode did not switch to continuous'
+          : '',
+        livenessStateAfterUIStart === null && startButtonClickedFromUI
+          ? '⚠ Strategic-liveness did not reflect starting/active/waiting within 17.5s — runner ineligible or no streaming agent on this VM (DEAD_END, not a code defect)'
+          : '',
+        'Proof: this step exercises the operator click-to-talk affordance (Workday toggle + Start button) directly in the browser, not via an API-started session.',
+        'Component: admin-ui/src/components/StrategicSessionControl.tsx — Workday toggle (aria-label) + Start button (title="Start Workday session")',
+        'Unit coverage: admin-ui/src/components/StrategicSessionControl.test.tsx — "full click-to-talk sequence" test',
+      ], flow5fScreenshot);
     } catch (flow5Err) {
       step('5. Workday session lifecycle (flow error)', 'DEAD_END', [
         String(flow5Err),
@@ -1437,25 +1532,30 @@ function writeJsonResult(startTs) {
       ].filter(Boolean).join('; ') || 'iframe subresource token check not evaluated';
 
   // Flow 5 → c-workday-session-lifecycle (Workday resident session lifecycle)
-  // PASS requires the operator-driven session to be created, reflected by the
-  // liveness probe, rendered as a Stop control in the UI, and cleanly stopped.
+  // PASS requires: session created + liveness reflects it + Stop control in UI +
+  // clean stop + UI click-to-talk (Workday toggle → Start button → liveness confirms).
   // Genuine streaming 'active' is intentionally NOT required (environment-gated).
+  // Step 5f (UI click-to-talk) is the evidence that the actual operator affordance
+  // — clicking the Workday toggle then Start — starts a session that liveness reflects.
   const workdayStart = results.find(r => r.name.includes('5b.'));
   const workdayLiveness = results.find(r => r.name.includes('5c.'));
   const workdayControl = results.find(r => r.name.includes('5d.'));
   const workdayStop = results.find(r => r.name.includes('5e.'));
+  const workdayUIClick = results.find(r => r.name.includes('5f.'));
   const workdaySessionPassed = shaValid
     && workdayStart?.verdict === 'PASS'
     && workdayLiveness?.verdict === 'PASS'
     && workdayControl?.verdict === 'PASS'
-    && workdayStop?.verdict === 'PASS';
+    && workdayStop?.verdict === 'PASS'
+    && workdayUIClick?.verdict === 'PASS';
   const workdayNotes = workdaySessionPassed
-    ? 'Workday resident session created, reflected by strategic-liveness, rendered a Stop control in the UI, and stopped cleanly with handoff'
+    ? 'Workday resident session created, reflected by strategic-liveness, rendered a Stop control in the UI, stopped cleanly with handoff, AND UI click-to-talk (Workday toggle → Start → liveness confirms) exercised'
     : [
         workdayStart?.verdict !== 'PASS' ? `start: ${workdayStart?.verdict || 'NOT RUN'}` : '',
         workdayLiveness?.verdict !== 'PASS' ? `liveness: ${workdayLiveness?.verdict || 'NOT RUN'}` : '',
         workdayControl?.verdict !== 'PASS' ? `ui stop control: ${workdayControl?.verdict || 'NOT RUN'}` : '',
         workdayStop?.verdict !== 'PASS' ? `stop: ${workdayStop?.verdict || 'NOT RUN'}` : '',
+        workdayUIClick?.verdict !== 'PASS' ? `ui click-to-talk: ${workdayUIClick?.verdict || 'NOT RUN'}` : '',
         !shaValid ? 'SHA integrity check failed' : '',
       ].filter(Boolean).join('; ') || 'Workday session lifecycle not evaluated';
 
@@ -1662,13 +1762,15 @@ function writeReport(startTs, integrityResult) {
   const step5c = results.find(r => r.name.includes('5c.'));
   const step5d = results.find(r => r.name.includes('5d.'));
   const step5e = results.find(r => r.name.includes('5e.'));
+  const step5f = results.find(r => r.name.includes('5f.'));
   const verdict5 = (s) => s?.verdict === 'PASS' ? '✅ CONFIRMED' : s ? `⚠️ ${s.verdict}` : '⚠️ NOT RUN';
   lines.push(`- Eligible live runner enrolled for the resident (\`POST /runners/register\` + local_runner daemon) ${verdict5(step5a)}`);
   lines.push(`- \`POST /api/admin/projects/{id}/strategic-session/start\` creates/adopts the resident (ensure_outcome + session snapshot) ${verdict5(step5b)}`);
   lines.push(`- \`GET /api/admin/projects/{id}/strategic-liveness\` reflects the resident session (state advances beyond ready; snapshot populated) ${verdict5(step5c)}`);
   lines.push(`- StrategicSessionControl renders a Stop control on the Chat tab in Workday/continuous mode ${verdict5(step5d)}`);
   lines.push(`- \`POST /api/admin/projects/{id}/strategic-session/stop\` tears down cleanly (liveness returns to ready/idle; message handoff) ${verdict5(step5e)}`);
-  lines.push('- Acceptance evidence: session created + liveness reflects the session + UI Stop control renders + clean stop. Genuine streaming state=active is environment-gated (requires a streaming resident agent on this VM) and recorded as a DEAD_END sub-assertion rather than a faked PASS.');
+  lines.push(`- **UI click-to-talk (5f)**: Workday mode toggle clicked → Start Workday session button clicked in browser → strategic-liveness reflects the session started from that UI click ${verdict5(step5f)}`);
+  lines.push('- Acceptance evidence: session created + liveness reflects the session + Stop control in UI + clean stop + UI click-to-talk (Workday toggle → Start → liveness). Genuine streaming state=active is environment-gated (requires a streaming resident agent on this VM) and recorded as a DEAD_END sub-assertion rather than a faked PASS.');
   lines.push('');
   lines.push('### c-5214996f — Real walkthrough criterion');
   lines.push('> This document IS the real walkthrough. Execution evidence:');
