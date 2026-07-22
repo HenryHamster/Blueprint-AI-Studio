@@ -460,6 +460,16 @@ Findings covered here (7-finding creation-path fail-closed/attention/lifecycle s
   b78-7 — feat(ui): converge operator notifications on attention model (toast uses attention, not effectiveSignal)
            → already pinned by MessagesPanel.test.tsx::fires toast for needs_operator message (m-7; fb-7; d-7)
 
+Findings covered here (5-finding creation-path fail-closed/attention/lifecycle salvage bundle, task 68c17e56, 2026-07-22):
+  68-1 — design: creation-path fail-closed audience contract → already pinned by test_m1_* + test_m2_* (m-1/m-2; fb-1; d-1; b78-1)
+  68-2 — fix: fail-closed audience at Alert/message creation → already pinned by test_m2_* + test_no_alert_constructor_bypasses_event_type_gate (m-2; fb-2; d-2; b78-2)
+  68-3 — feat: operator inbox consumes server attention/lifecycle model (operator_action hint, Ack button)
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel attention model lifecycle field consumption (m-3; fb-3; d-3; b78-3)
+  68-4 — feat(ui): make operator inbox attention-driven, retire dual effectiveSignal classification
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel needs-action filter (m-4; fb-4; d-4; b78-4)
+  68-5 — fix(chat): make confirmation chips actionable (accept/dismiss in needs-action strip)
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel confirmation chip actionability (m-5; fb-5; d-5; b78-5)
+
 Findings covered here (18-finding release-qualification salvage bundle, task 8d2616a1, 2026-07-21):
   8d-1  — env-preflight fail-closed wedges promotion for repos with no manifest → already pinned by test_f20_10_*
            (env_preflight_evidence.py returns empty required_env for absent manifest, scoring 1.0 / vacuously satisfied)
