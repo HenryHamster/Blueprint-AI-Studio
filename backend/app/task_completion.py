@@ -3938,33 +3938,30 @@ async def _handle_capability_proof_trial_completion(
 async def _handle_walkthrough_e2e_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:
-    """Ingest a ``walkthrough_e2e`` task's per-flow verdicts as CriterionEvidence rows.
+    """Ingest a ``walkthrough_e2e`` task's per-criterion results as CriterionEvidence rows.
 
     The agent handler runs the live-stack walkthrough harness and writes a
     ``WALKTHROUGH_E2E_RESULT`` artifact: a JSON object with
-    ``{"flows": [{"flow": <criterion_key>, "verdict": "PASS"|"FAIL"|"DEAD_END",
-    "candidate_sha": <sha>, "screenshot_md5": [...], "heartbeat_confirmed": <bool>,
-    "ran_at": <iso>}]}``.
+    ``{"git_sha": <sha>, "run_timestamp": <iso>,
+    "results": [{"criterion_key": <key>, "passed": <bool>, "notes": <str|null>}]}``.
 
-    This handler is the INGESTION half: for each flow whose ``verdict`` is
-    ``"PASS"`` it calls :func:`app.acceptance_criteria.record_evidence` with
-    ``source_kind="walkthrough_e2e"`` so the criterion gains a time-bounded,
-    SHA-pinned ``'covered'`` tier (see
-    :func:`app.acceptance_criteria._evidence_is_walkthrough_e2e_covered`, which
-    ``_evidence_proves_covered`` delegates to).
+    This handler delegates to
+    :func:`app.acceptance_criteria.record_walkthrough_e2e_evidence`, which
+    enforces SHA-match safety (posted ``git_sha`` must equal the version's
+    qualifying candidate SHA) and writes ``'covered'``-tier evidence for each
+    passing criterion.
 
     Fail-open: any parse or DB error is logged and ignored — a broken ingestion
     must never strand the surrounding post-commit flow.  The completion handler
     never raises.
     """
     try:
-        from app.acceptance_criteria import record_evidence
+        from app.acceptance_criteria import record_walkthrough_e2e_evidence
+        from app.release_version import current_open_version
 
         result: dict | None = None
-        try:
+        with contextlib.suppress(TypeError, ValueError):
             result = json.loads(logs)
-        except (TypeError, ValueError):
-            pass
         if not isinstance(result, dict):
             logger.info(
                 "[WALKTHROUGH_E2E] artifact not parseable for task %s — skipping evidence ingestion",
@@ -3972,79 +3969,54 @@ async def _handle_walkthrough_e2e_completion(
             )
             return
 
-        flows = result.get("flows")
-        if not isinstance(flows, list):
+        # Reject legacy {flows:[...]} schema artifacts — they predate the current
+        # harness format and would silently no-op if passed to record_walkthrough_e2e_evidence.
+        if "flows" in result and "results" not in result:
             logger.info(
-                "[WALKTHROUGH_E2E] no 'flows' list in artifact for task %s — skipping",
+                "[WALKTHROUGH_E2E] artifact for task %s uses legacy 'flows' schema — skipping",
+                task.id,
+            )
+            return
+
+        results = result.get("results")
+        if not isinstance(results, list):
+            logger.info(
+                "[WALKTHROUGH_E2E] no 'results' list in artifact for task %s — skipping",
+                task.id,
+            )
+            return
+
+        candidate_sha = str(result.get("git_sha") or "").strip()
+        if not candidate_sha:
+            logger.info(
+                "[WALKTHROUGH_E2E] missing 'git_sha' in artifact for task %s — skipping",
                 task.id,
             )
             return
 
         project_id = task.project_id
-        task_id_str = str(task.id)
+        open_version = await current_open_version(session, project_id)
+        if open_version is None:
+            logger.info(
+                "[WALKTHROUGH_E2E] no open release version for project %s (task %s) — skipping",
+                project_id,
+                task.id,
+            )
+            return
 
-        for flow_entry in flows:
-            if not isinstance(flow_entry, dict):
-                continue
-            flow_key = flow_entry.get("flow")
-            verdict = flow_entry.get("verdict")
-            candidate_sha = flow_entry.get("candidate_sha")
-            if not flow_key or verdict != "PASS" or not candidate_sha:
-                continue
-
-            # Look up the criterion by key within this project's active criteria.
-            from sqlmodel import select as _select
-            from app.models import VersionAcceptanceCriterion
-
-            crit_rows = (
-                await session.execute(
-                    _select(VersionAcceptanceCriterion).where(
-                        VersionAcceptanceCriterion.criterion_key == flow_key,
-                        VersionAcceptanceCriterion.project_id == project_id,
-                        VersionAcceptanceCriterion.status == "active",
-                    )
-                )
-            ).scalars().all()
-
-            if not crit_rows:
-                logger.info(
-                    "[WALKTHROUGH_E2E] no active criterion with key %s for project %s "
-                    "(task %s) — skipping evidence row",
-                    flow_key,
-                    project_id,
-                    task_id_str,
-                )
-                continue
-
-            detail: dict = {
-                "candidate_sha": candidate_sha,
-                "harness": "v26-live-walkthrough",
-                "flow": flow_key,
-                "verdict": "PASS",
-                "walkthrough_e2e_task_id": task_id_str,
-            }
-            for k in ("screenshot_md5", "heartbeat_confirmed", "ran_at"):
-                if k in flow_entry:
-                    detail[k] = flow_entry[k]
-
-            source_id = f"{candidate_sha}:{flow_key}"
-            for crit in crit_rows:
-                await record_evidence(
-                    session,
-                    crit.id,
-                    project_id,
-                    source_kind="walkthrough_e2e",
-                    source_id=source_id,
-                    detail=detail,
-                )
-                logger.info(
-                    "[WALKTHROUGH_E2E] recorded evidence for criterion %s (key=%s) "
-                    "candidate=%s task=%s",
-                    crit.id,
-                    flow_key,
-                    candidate_sha[:8],
-                    task_id_str,
-                )
+        summary = await record_walkthrough_e2e_evidence(
+            session,
+            version=open_version,
+            candidate_sha=candidate_sha,
+            results=results,
+            qualification_attempt_id=None,
+        )
+        logger.info(
+            "[WALKTHROUGH_E2E] ingestion for task %s: status=%s recorded=%s",
+            task.id,
+            summary.get("status"),
+            summary.get("recorded"),
+        )
     except Exception:  # noqa: BLE001 — ingestion must fail open, never raise
         logger.warning(
             "[WALKTHROUGH_E2E] ingestion failed for task %s (fail-open)",

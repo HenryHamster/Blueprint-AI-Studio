@@ -4330,3 +4330,112 @@ class TestHandlePerfCompletion:
         assert perf_task.status == TaskStatus.EVALUATING, (
             f"Expected parent EVALUATING after replay, got {perf_task.status}"
         )
+
+
+# ── _handle_walkthrough_e2e_completion ──────────────────────────────────────
+
+
+class TestWalkthroughE2ECompletionIngestsOrRemoved:
+    """Regression tests for _handle_walkthrough_e2e_completion.
+
+    The named test required by acceptance evidence:
+        test_walkthrough_e2e_completion_ingests_or_removed
+    """
+
+    async def _run(self, db_session, task, logs):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+
+        await _handle_walkthrough_e2e_completion(task, logs, db_session)
+
+    @pytest.mark.asyncio
+    async def test_walkthrough_e2e_completion_ingests_or_removed(self, db_session):
+        """_handle_walkthrough_e2e_completion ingests {git_sha,results} artifacts.
+
+        With a matching candidate_sha the handler delegates to
+        record_walkthrough_e2e_evidence, which writes covered-tier evidence for
+        each criterion whose passed=True.  A mismatched SHA writes nothing
+        (SHA-match safety enforcement).  The legacy {flows:[...]} schema is
+        skipped gracefully (no exception, no evidence).
+        """
+        import app.acceptance_criteria as ac
+        from app.models import ReleaseVersion
+
+        project = make_project(name="WalkthroughE2ETest")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sha = "a" * 40
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            status="open",
+            last_qualification={"status": "scoring", "candidate_sha": sha},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Create two active criteria for the project/version.
+        crit_a = await ac.create_criterion(
+            db_session, project.id, version.id, "Runner enroll flow"
+        )
+        crit_b = await ac.create_criterion(
+            db_session, project.id, version.id, "Iframe token flow"
+        )
+
+        # Build a well-formed artifact in the correct schema.
+        artifact = json.dumps(
+            {
+                "git_sha": sha,
+                "run_timestamp": "2026-01-01T00:00:00Z",
+                "results": [
+                    {"criterion_key": crit_a.criterion_key, "passed": True, "notes": "ok"},
+                    {"criterion_key": crit_b.criterion_key, "passed": False, "notes": "fail"},
+                ],
+            }
+        )
+
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Happy-path: matching SHA → evidence written for crit_a only.
+        await self._run(db_session, task, artifact)
+
+        ev_a = await ac.get_evidence_for_criterion(db_session, crit_a.id)
+        assert len(ev_a) == 1, "Expected one evidence row for the passing criterion"
+        assert ev_a[0].source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND
+        assert ev_a[0].detail["candidate_sha"] == sha
+        assert ev_a[0].detail["passed"] is True
+        assert ac.compute_criterion_coverage(ev_a) == "covered"
+
+        ev_b = await ac.get_evidence_for_criterion(db_session, crit_b.id)
+        assert ev_b == [], "Failed criterion must not gain evidence"
+
+        # SHA mismatch: writes nothing (SHA-match safety).
+        mismatched_artifact = json.dumps(
+            {
+                "git_sha": "b" * 40,
+                "run_timestamp": "2026-01-01T00:00:00Z",
+                "results": [
+                    {"criterion_key": crit_b.criterion_key, "passed": True, "notes": "ok"},
+                ],
+            }
+        )
+        await self._run(db_session, task, mismatched_artifact)
+        ev_b_after = await ac.get_evidence_for_criterion(db_session, crit_b.id)
+        assert ev_b_after == [], "Mismatched SHA must not write evidence"
+
+        # Legacy {flows:[...]} schema: skipped gracefully, no exception, no extra evidence.
+        legacy_artifact = json.dumps(
+            {
+                "flows": [
+                    {"flow": crit_a.criterion_key, "verdict": "PASS", "candidate_sha": sha},
+                ]
+            }
+        )
+        await self._run(db_session, task, legacy_artifact)
+        ev_a_after = await ac.get_evidence_for_criterion(db_session, crit_a.id)
+        assert len(ev_a_after) == 1, "Legacy schema must not write additional evidence"
