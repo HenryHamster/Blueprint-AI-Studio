@@ -5640,9 +5640,10 @@ async def _spawn_strategic_review(
                     # Live, operator-tunable resident-session pacing knobs.
                     **_res_pacing_knobs,
                     # Compact, durable behavioral memory notes written by the
-                    # set_memory strategic op. Already capped at 100 entries by the
-                    # handler, so budget-footprint is bounded.
-                    "strategic_memory_notes": project.strategic_memory_notes or [],
+                    # set_memory strategic op. Delivered as the KnowledgeDocument
+                    # index (newest 25, body-omitted) so the resident agent gets
+                    # the same format as spawned agents.
+                    "strategic_memory_notes": await build_strategic_memory_index(session, project.id),
                     # Gaps whose history entries warrant compaction — surfaced
                     # directly in the payload so the strategist sees an automatic
                     # signal without manual inspection. Pure in-memory computation.

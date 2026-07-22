@@ -413,28 +413,43 @@ def is_operator_visible(audience: str) -> bool:
 
 
 def operator_visible_audience_filter(context: Any) -> Any:
-    """Return the shared SQL filter for legacy and operator-visible rows.
+    """Return the shared SQL filter for Task rows and other legacy/NULL-retaining paths.
 
-    Both message and task projections retain untagged legacy rows, while rows
-    explicitly marked strategist-internal or pipeline-log never contribute to
-    an operator-facing count, preview, or badge.
+    Task rows carry a NULL audience by design (tasks are never audience-stamped),
+    so this filter retains NULL rows alongside explicitly operator-visible rows.
+    Use ONLY for ``Task.context`` call sites — for ``ProjectMessage.context`` use
+    :func:`operator_visible_message_audience_filter` (fail-closed, no NULL pass-through).
     """
     audience = context["audience"].as_string()
     return or_(audience.is_(None), audience.notin_(_NON_OPERATOR_AUDIENCES))
 
 
+def operator_visible_message_audience_filter(context: Any) -> Any:
+    """Return the fail-closed SQL filter for all ``ProjectMessage.context`` query paths.
+
+    Uses an explicit IN-allowlist of operator audiences — no NULL pass-through.
+    NULL-audience messages (legacy un-stamped rows) are treated as non-operator,
+    consistent with the emitter-side fail-closed default via :func:`route_event`.
+
+    All open NULL-audience messages are drained by the proactive backfill sweep
+    (``reaper_sweeps.stamp_all_null_audience_messages``), and every message emitter
+    stamps a canonical audience at construction, so no legitimate operator message
+    is NULL after the drain.
+
+    Use this for every ``ProjectMessage.context`` query path.  For ``Task.context``
+    (tasks are never audience-stamped), use :func:`operator_visible_audience_filter`.
+    """
+    audience = context["audience"].as_string()
+    return audience.in_(list(_AUDIENCES_THAT_REACH_OPERATOR))
+
+
 def operator_visible_nonactionable_message_filter(context: Any) -> Any:
     """Return the strict SQL filter for non-actionable (NOTE/FEEDBACK) messages.
 
-    Unlike :func:`operator_visible_audience_filter`, this does NOT retain
-    NULL-audience rows.  Use for query paths already restricted to
-    non-BLOCKER/QUESTION/BUG_REPORT message types, where a NULL audience means
-    the row was never properly stamped and must be treated as non-operator
-    (fail-closed, same as the emitter-side default via :func:`route_event`).
-
-    A NULL-audience NOTE is a pre-registry or improperly-constructed row that
-    would otherwise fail-open to the operator inbox — this filter quarantines
-    those rows by requiring an explicit operator audience stamp.
+    Identical semantics to :func:`operator_visible_message_audience_filter` —
+    fail-closed IN-allowlist, no NULL pass-through.  Kept as a named alias for
+    query paths that are already restricted to non-BLOCKER/QUESTION/BUG_REPORT
+    message types (e.g. high-signal NOTE counts in operator_attention.py).
     """
     audience = context["audience"].as_string()
     return audience.in_(list(_AUDIENCES_THAT_REACH_OPERATOR))

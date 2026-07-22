@@ -713,6 +713,97 @@ async def sweep_operator_inbox_liveness(session, now=None) -> list | None:
     return await run_operator_inbox_liveness_check(session, now)
 
 
+# Cadence gate for the proactive NULL-audience backfill sweep (Step 16e).
+# Hourly, on an INDEPENDENT timer.  Step 16d (sweep_operator_inbox_liveness)
+# stamps its own cadence global earlier in the same reaper cycle, so a shared
+# timer would report this sweep as "not due" every cycle and gate it out
+# permanently — see the Step 22/22b split note below for the same pattern.
+_BACKFILL_NULL_AUDIENCE_INTERVAL_SECONDS = 3600
+_last_backfill_null_audience_sweep: datetime | None = None
+
+
+async def sweep_backfill_null_audience_messages(
+    session, now=None, *, batch_size: int = 500
+) -> int:
+    """Step 16e: Proactively drain open/linked NULL-audience ProjectMessage rows.
+
+    The operator-inbox audience routing retains legacy rows whose
+    ``context['audience']`` is NULL — ``operator_visible_audience_filter`` fails
+    OPEN on them for backward compatibility — so an un-stamped legacy message
+    reaches the operator inbox until it is stamped.  The hourly
+    ``sweep_operator_inbox_liveness`` (Step 16d) only re-stamps the NARROW
+    'forward-leaked' subset (open/linked non-fyi messages that also fail
+    ``derive_needs_action``); it never drains the full open NULL-audience
+    population, so genuinely-actionable NULL-audience rows (a BLOCKER/QUESTION
+    that DOES satisfy ``derive_needs_action``) are never re-stamped.
+
+    This sweep finds ALL open/linked, non-user ProjectMessage rows whose
+    ``context->>'audience'`` is NULL and re-stamps each with its canonical
+    audience via the shared
+    :func:`app.operator_inbox_liveness._remediate_forward_leaked_messages`
+    helper (which routes through ``stamp_message_audience`` / ``route_event``).
+    A NULL-audience BLOCKER/QUESTION/BUG_REPORT resolves to
+    OPERATOR_ACTION_NEEDED via the ``message_type`` fallback in ``route_event``
+    — so genuinely operator-facing rows stay visible — while
+    unregistered/absent event_types fail closed to STRATEGIST_INTERNAL.  This is
+    purely additive drain-side work: no read-model filter changes, so nothing
+    that is currently operator-visible disappears as a result of the stamp.
+
+    Idempotent: once stamped, a row no longer matches the NULL-audience
+    predicate, so re-running drains the remaining population each tick and
+    converges to zero.  Bounded to *batch_size* rows per tick.  Hourly
+    cadence-gated on an INDEPENDENT timer.  Per-row error isolation lives in the
+    reused helper (a single malformed row never aborts the sweep); the whole
+    sweep is additionally wrapped by the reaper so it can never crash the cycle.
+    Returns the number of rows re-stamped this tick.
+    """
+    global _last_backfill_null_audience_sweep
+    from app.message_convergence import LINKED_STATUS, OPEN_STATUS
+    from app.models import ProjectMessage
+    from app.operator_inbox_liveness import _remediate_forward_leaked_messages
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_backfill_null_audience_sweep,
+        _BACKFILL_NULL_AUDIENCE_INTERVAL_SECONDS,
+        _now,
+    ):
+        return 0
+    _last_backfill_null_audience_sweep = _now
+
+    # NULL-audience predicate: a fully-NULL context column or an empty/keyless
+    # context both yield NULL for ``context->>'audience'`` in Postgres, so
+    # ``.is_(None)`` catches every un-stamped row.  Bounded per tick; the sweep
+    # re-runs each cadence window until the population is drained.
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                    ProjectMessage.from_type != "user",
+                    ProjectMessage.context["audience"].as_string().is_(None),
+                )
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    stamped = _remediate_forward_leaked_messages(session, rows)
+    if stamped:
+        await session.commit()
+        logger.info(
+            "[REAPER] Step 16e: backfilled canonical audience on %d "
+            "NULL-audience message(s)",
+            stamped,
+        )
+    return stamped
+
+
 # Cadence gate for the capability backing-proof sweep. Hourly to bound overall
 # reaper cycle time — the sweep iterates projects and verifies file paths via
 # git ls-files, so a slow project or deep file tree should not run every tick.

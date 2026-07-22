@@ -19683,3 +19683,61 @@ async def test_fetch_recent_handled_conversation_bounds_and_order(db_session):
 
     # Excerpt cap enforced on the long message.
     assert len(tail[-1]["content"]) == _RECENT_HANDLED_EXCERPT_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_resident_minimal_spawn_payload_ships_knowledge_index(db_session):
+    """resident_minimal spawn payload ships the KnowledgeDocument index, not raw JSONB notes.
+
+    Mocks build_strategic_memory_index to return a synthetic KnowledgeDoc entry
+    and verifies:
+    - the mock is called (i.e. the resident_minimal path invokes the index builder)
+    - the stored task payload contains the index entry (id/title keys present)
+    - the raw JSONB note shape ({note, set_at}) is NOT present in the result
+    """
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    fake_doc_id = str(uuid.uuid4())
+    fake_index = [
+        {
+            "id": fake_doc_id,
+            "title": "Keep scope tight",
+            "topic": "dev-workflow",
+            "summary": "Avoid touching unrelated files.",
+            "tags": [],
+            "created_at": "2024-01-01T00:00:00",
+        }
+    ]
+
+    with patch(
+        "app.strategic_spawning.build_strategic_memory_index",
+        new=AsyncMock(return_value=fake_index),
+    ) as mock_bsmi:
+        spawned = await _spawn_strategic_review(project, db_session, resident_minimal=True)
+        assert spawned is True
+        # The index builder must be called at least once (for the resident_minimal path).
+        assert mock_bsmi.called, "build_strategic_memory_index was not called"
+
+    result = await db_session.execute(_select_agent_tasks(project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    notes = payload.get("strategic_memory_notes", [])
+    assert isinstance(notes, list)
+
+    # The synthetic KnowledgeDocument entry must be in the payload.
+    ids = [n.get("id") for n in notes]
+    assert fake_doc_id in ids, f"KnowledgeDoc {fake_doc_id} not found in payload notes: {notes}"
+
+    entry = next(n for n in notes if n.get("id") == fake_doc_id)
+    assert entry.get("title") == "Keep scope tight"
+
+    # Raw JSONB note shape ({note, set_at}) must NOT appear.
+    for n in notes:
+        assert "note" not in n, f"Raw JSONB note shape leaked into spawn payload: {n}"

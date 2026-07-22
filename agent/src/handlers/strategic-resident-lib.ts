@@ -378,21 +378,36 @@ export function formatDirectionGroundingText(
 }
 
 /**
- * Format strategic memory notes for the bootstrap / checkpoint prompt. Each
- * entry is `{note, set_at}`; render as `- [set_at] note` so the timestamp
- * provides ordering context. Absent, non-array, or empty degrades to an empty
- * string. Shared by the session-start bootstrap and the compaction refresh so
- * both paths format identically. Pure — safe to unit-test.
+ * Format strategic memory notes for the bootstrap / checkpoint prompt.
+ *
+ * Handles two shapes backward-compatibly:
+ * - Legacy `{note, set_at}` entries: rendered as `- [set_at] note`.
+ * - KnowledgeDocument index `{title, summary, topic, created_at, ...}` entries:
+ *   rendered as `- [created_at] title — summary` (gracefully omits absent fields).
+ *
+ * Absent, non-array, or empty input degrades to an empty string without throwing.
+ * Shared by the session-start bootstrap and the compaction refresh so both paths
+ * format identically. Pure — safe to unit-test.
  */
 export function formatStrategicMemoryNotes(raw: unknown): string {
   if (!Array.isArray(raw) || raw.length === 0) return '';
   return raw
     .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
     .map((e) => {
-      const note = typeof e.note === 'string' ? e.note.trim() : '';
-      const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
-      if (!note) return '';
-      return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+      // Legacy shape: {note, set_at}
+      if (typeof e.note === 'string') {
+        const note = e.note.trim();
+        const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
+        if (!note) return '';
+        return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+      }
+      // KnowledgeDocument index shape: {title, summary, topic, created_at, ...}
+      const title = typeof e.title === 'string' ? e.title.trim() : '';
+      const summary = typeof e.summary === 'string' ? e.summary.trim() : '';
+      const createdAt = typeof e.created_at === 'string' ? e.created_at.trim() : '';
+      const text = title && summary ? `${title} — ${summary}` : title || summary;
+      if (!text) return '';
+      return createdAt ? `- [${createdAt}] ${text}` : `- ${text}`;
     })
     .filter(Boolean)
     .join('\n');

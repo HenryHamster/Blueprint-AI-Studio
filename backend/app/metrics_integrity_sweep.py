@@ -5794,7 +5794,7 @@ async def check_operator_inbox_needs_action_liveness(
     from app.message_audience import (
         OPERATOR_FYI,
         operator_visible_alert_filter,
-        operator_visible_audience_filter,
+        operator_visible_message_audience_filter,
     )
     from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action
     from app.models import Alert, AlertSeverity, Project, ProjectMessage
@@ -5825,7 +5825,7 @@ async def check_operator_inbox_needs_action_liveness(
                     ProjectMessage.project_id == project_id,
                     ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
                     ProjectMessage.from_type != "user",
-                    operator_visible_audience_filter(ProjectMessage.context),
+                    operator_visible_message_audience_filter(ProjectMessage.context),
                 )
                 .order_by(ProjectMessage.created_at.desc())
                 .limit(ctx.sample_limit)

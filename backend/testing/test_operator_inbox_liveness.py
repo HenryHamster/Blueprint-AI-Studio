@@ -1659,4 +1659,86 @@ async def test_nonzero_reply_quarantine_alerts_operator_and_blocks_clean_tick(db
         f"Unexpected resolution text: {alert.resolution!r}"
     )
 
+
+# ---------------------------------------------------------------------------
+# Proactive NULL-audience backfill sweep (reaper_sweeps.sweep_backfill_null_audience_messages)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_null_audience_sweep_stamps_and_is_idempotent(db_session):
+    """The proactive backfill sweep re-stamps ALL open NULL-audience non-user
+    messages with their canonical audience.
+
+    Asserts the drain-side contract for
+    ``reaper_sweeps.sweep_backfill_null_audience_messages``:
+
+    * an operator-facing NULL-audience BLOCKER/QUESTION becomes
+      OPERATOR_ACTION_NEEDED (via the ``message_type`` fallback in
+      ``route_event``) — genuinely operator-facing rows stay visible;
+    * an unregistered-event NULL-audience NOTE fails closed to
+      STRATEGIST_INTERNAL;
+    * a ``from_type='user'`` NULL-audience row is left untouched (the drain
+      only re-stamps non-user rows);
+    * a second run stamps ZERO — the drain is idempotent because stamped rows
+      no longer match the NULL-audience predicate (not merely cadence-gated).
+    """
+    from datetime import timedelta
+
+    import app.reaper_sweeps as _sweeps
+    from app.message_audience import OPERATOR_ACTION_NEEDED, STRATEGIST_INTERNAL
+    from app.models import ProjectMessage
+    from app.time_utils import _utcnow
+
+    # The sweep's cadence timer is a module-level global that persists across
+    # tests; clear it so the first tick this test fires is genuinely "due".
+    _sweeps._last_backfill_null_audience_sweep = None
+
+    project_id = await _create_test_project(db_session, "null-audience-backfill")
+
+    # NULL-audience rows (context has no "audience" key) that today fall through
+    # operator_visible_audience_filter's NULL pass-through.
+    blocker_id = await _create_forward_leaked_message(
+        db_session, project_id, message_type="BLOCKER", from_type="system"
+    )
+    question_id = await _create_forward_leaked_message(
+        db_session, project_id, message_type="QUESTION", from_type="agent"
+    )
+    note_id = await _create_forward_leaked_message(
+        db_session, project_id, message_type="NOTE", from_type="system"
+    )
+    # A user-authored NULL-audience row: the drain must not touch it.
+    user_id = await _create_forward_leaked_message(
+        db_session, project_id, message_type="NOTE", from_type="user"
+    )
+
+    t0 = _utcnow()
+    stamped = await _sweeps.sweep_backfill_null_audience_messages(db_session, t0)
+    assert stamped == 3, (
+        f"expected 3 non-user NULL-audience rows stamped, got {stamped}"
+    )
+
+    async def _audience(mid: str):
+        msg = await db_session.get(ProjectMessage, _uuid.UUID(mid))
+        await db_session.refresh(msg)
+        return (msg.context or {}).get("audience")
+
+    # Operator-facing message types resolve to OPERATOR_ACTION_NEEDED so they
+    # stay visible in the operator inbox.
+    assert await _audience(blocker_id) == OPERATOR_ACTION_NEEDED
+    assert await _audience(question_id) == OPERATOR_ACTION_NEEDED
+    # An unregistered-event NOTE fails closed to strategist-internal.
+    assert await _audience(note_id) == STRATEGIST_INTERNAL
+    # The user row is never stamped by the drain — still NULL.
+    assert await _audience(user_id) is None
+
+    # Idempotent: advance past the cadence window so the sweep fires again; with
+    # every non-user row already stamped it must drain zero (not cadence-gated).
+    stamped2 = await _sweeps.sweep_backfill_null_audience_messages(
+        db_session, t0 + timedelta(hours=2)
+    )
+    assert stamped2 == 0, f"second run must stamp zero (drained), got {stamped2}"
+
+    _liveness_mod._reset_liveness_for_tests()
+
     _liveness_mod._reset_liveness_for_tests()

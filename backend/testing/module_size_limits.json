@@ -338,7 +338,7 @@
     "test_deploy_health.py": 2550,
     "test_health_zone_pool.py": 2500,
     "test_generated_shell.py": 2400,
-    "test_message_audience.py": 2350,
+    "test_message_audience.py": 2750,
     "test_alerts.py": 2300,
     "test_strategic_context_package.py": 2250,
     "test_task_locking.py": 2250,

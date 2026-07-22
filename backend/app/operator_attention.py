@@ -50,6 +50,7 @@ from app.message_audience import (
     OPERATOR_ACTION_NEEDED,
     operator_visible_alert_filter,
     operator_visible_audience_filter,
+    operator_visible_message_audience_filter,
     operator_visible_nonactionable_message_filter,
 )
 from app.reaper_orphan_classify import _classify_orphan
@@ -1857,7 +1858,7 @@ async def get_operator_message_counts(
     _base_message_filters = [
         ProjectMessage.project_id == project_id,
         ProjectMessage.from_type != "user",
-        operator_visible_audience_filter(ProjectMessage.context),
+        operator_visible_message_audience_filter(ProjectMessage.context),
     ]
     # Needs-action types (BLOCKER, QUESTION) include LINKED: a linked BLOCKER/QUESTION
     # remains actionable until resolved, so the badge must count it.
@@ -2036,7 +2037,7 @@ async def build_operator_attention(
     _base_filters = [
         ProjectMessage.project_id == project.id,
         ProjectMessage.from_type != "user",
-        operator_visible_audience_filter(ProjectMessage.context),
+        operator_visible_message_audience_filter(ProjectMessage.context),
     ]
     # Needs-action types (BLOCKER, QUESTION, operator-action-needed) include LINKED:
     # a linked BLOCKER/QUESTION remains actionable until resolved.

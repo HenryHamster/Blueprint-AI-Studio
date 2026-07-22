@@ -46,6 +46,7 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal, get_session
 from app.failure_classification import ADMIN_CANCEL
+from app.knowledge_query import build_strategic_memory_index
 from app.models import (
     Direction,
     Project,
@@ -3581,7 +3582,7 @@ async def agent_fetch_checkpoint_state(
 
     return {
         "problem_model": _agent_view_problem_model(project.problem_model),
-        "strategic_memory_notes": project.strategic_memory_notes or [],
+        "strategic_memory_notes": await build_strategic_memory_index(session, project.id),
         "running_update": project.running_update or "",
         "vision": _agent_visible_vision(project.vision),
         "open_messages": open_messages,

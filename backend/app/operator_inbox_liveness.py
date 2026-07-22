@@ -430,8 +430,8 @@ def _remediate_forward_leaked_messages(session: Any, msgs: list) -> int:
     returned by ``stamp_message_audience``.  For NULL-audience or mis-stamped
     rows the canonical value is STRATEGIST_INTERNAL (fail-closed for
     unregistered types) or OPERATOR_FYI — either way the row is excluded from
-    future ``operator_visible_audience_filter`` queries without waiting for the
-    14-day age-decay sweep.
+    future ``operator_visible_message_audience_filter`` queries (fail-closed,
+    no NULL pass-through) without waiting for the 14-day age-decay sweep.
 
     Returns the number of messages successfully remediated.
     Error-isolated per-message so a single malformed row never aborts the tick.
@@ -531,7 +531,7 @@ async def run_operator_inbox_liveness_check(
         OPERATOR_FYI,
         _NON_OPERATOR_AUDIENCES,
         operator_visible_alert_filter,
-        operator_visible_audience_filter,
+        operator_visible_message_audience_filter,
     )
     from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action
     from app.models import Alert, AlertSeverity, Project, ProjectMessage
@@ -554,7 +554,7 @@ async def run_operator_inbox_liveness_check(
                     ProjectMessage.project_id == project_id,
                     ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
                     ProjectMessage.from_type != "user",
-                    operator_visible_audience_filter(ProjectMessage.context),
+                    operator_visible_message_audience_filter(ProjectMessage.context),
                 )
                 .order_by(ProjectMessage.created_at.desc())
                 .limit(sample_limit)

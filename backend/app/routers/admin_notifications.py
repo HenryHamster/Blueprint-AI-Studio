@@ -42,7 +42,7 @@ from app.admin import (
 )
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
-from app.message_audience import operator_visible_alert_filter, operator_visible_audience_filter
+from app.message_audience import operator_visible_alert_filter, operator_visible_message_audience_filter
 from app.project_message_creation import (
     create_operator_project_message,
     lock_project_and_next_message_sequence,
@@ -278,14 +278,13 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
 
 
 def _operator_visible_audience():
-    """SQLAlchemy predicate excluding rows tagged with a non-operator audience.
+    """SQLAlchemy predicate for operator-visible ``ProjectMessage`` rows.
 
-    Rows with no ``audience`` key in context (legacy rows written before the
-    registry existed, and all user-authored / BLOCKER / FEEDBACK messages)
-    resolve to NULL and are KEPT — the filter only drops rows that explicitly
-    carry a strategist-internal / pipeline-log audience tag.
+    Fail-closed: uses an explicit IN-allowlist of operator audiences with no
+    NULL pass-through.  NULL-audience rows (legacy un-stamped messages) are
+    treated as non-operator, consistent with the emitter-side fail-closed default.
     """
-    return operator_visible_audience_filter(ProjectMessage.context)
+    return operator_visible_message_audience_filter(ProjectMessage.context)
 
 
 def _operator_signal_predicate():

@@ -9298,3 +9298,91 @@ async def test_set_session_summary_rejects_oversize_summary(db_session):
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_state_returns_knowledge_index(db_session):
+    """checkpoint-state returns KnowledgeDocument-index entries (not raw JSONB notes).
+
+    Inserts a KnowledgeDocument with source_kind=strategic_memory and
+    lifecycle_status=consumed, plus a legacy JSONB note on the project.
+    Asserts the response contains the KnowledgeDoc entry by id/title and
+    does NOT contain the raw JSONB note shape ({note, set_at}).
+    """
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(
+        name="P-checkpoint-knowledgedoc",
+        user_id="u1",
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    mem_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Prefer compact PRs",
+        summary="Keep PRs under 200 lines for faster review.",
+        body="Keep PRs under 200 lines for faster review.",
+        topic="development-practices",
+        tags=["praxis"],
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True},
+    )
+    db_session.add(mem_doc)
+    await db_session.commit()
+    await db_session.refresh(mem_doc)
+    mem_doc_id = str(mem_doc.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            resp = await ac.get(
+                f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state"
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        notes = data["strategic_memory_notes"]
+        assert isinstance(notes, list)
+        # Must contain the KnowledgeDocument entry.
+        ids = [n.get("id") for n in notes]
+        assert mem_doc_id in ids, f"KnowledgeDoc {mem_doc_id} not found in {notes}"
+        # Entries must have KnowledgeDoc-index shape (id, title), not raw JSONB shape.
+        entry = next(n for n in notes if n.get("id") == mem_doc_id)
+        assert entry.get("title") == "Prefer compact PRs"
+        # Must NOT contain raw JSONB note dicts ({note, set_at}).
+        for n in notes:
+            assert "note" not in n, f"Raw JSONB note shape leaked into response: {n}"
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)

@@ -2807,6 +2807,58 @@ describe('formatStrategicMemoryNotes', () => {
     expect(formatStrategicMemoryNotes(undefined)).toBe('');
     expect(formatStrategicMemoryNotes('nope')).toBe('');
   });
+
+  it('renders KnowledgeDocument index entries as "- [created_at] title — summary"', () => {
+    const out = formatStrategicMemoryNotes([
+      { id: 'kd-1', title: 'Prefer concrete action', summary: 'act rather than deliberate', topic: 'behavior', created_at: '2026-07-01T00:00:00Z' },
+      { id: 'kd-2', title: 'Verify before escalating', summary: 'confirm root cause first', topic: 'process', created_at: '2026-07-02T00:00:00Z' },
+    ]);
+    expect(out).toBe(
+      '- [2026-07-01T00:00:00Z] Prefer concrete action — act rather than deliberate\n' +
+      '- [2026-07-02T00:00:00Z] Verify before escalating — confirm root cause first',
+    );
+  });
+
+  it('renders index entry with title only when summary is absent', () => {
+    expect(formatStrategicMemoryNotes([
+      { id: 'kd-3', title: 'Title only', created_at: '2026-07-03T00:00:00Z' },
+    ])).toBe('- [2026-07-03T00:00:00Z] Title only');
+  });
+
+  it('renders index entry with summary only when title is absent', () => {
+    expect(formatStrategicMemoryNotes([
+      { id: 'kd-4', summary: 'Summary only', created_at: '2026-07-04T00:00:00Z' },
+    ])).toBe('- [2026-07-04T00:00:00Z] Summary only');
+  });
+
+  it('renders index entry without timestamp when created_at is absent', () => {
+    expect(formatStrategicMemoryNotes([
+      { id: 'kd-5', title: 'No date', summary: 'no created_at field' },
+    ])).toBe('- No date — no created_at field');
+  });
+
+  it('skips index entries with no usable text (no note, title, or summary)', () => {
+    const out = formatStrategicMemoryNotes([
+      { id: 'kd-empty', topic: 'behavior', created_at: '2026-07-01T00:00:00Z' },
+      { id: 'kd-good', title: 'Kept', summary: 'has text', created_at: '2026-07-01T00:00:00Z' },
+    ]);
+    expect(out).toBe('- [2026-07-01T00:00:00Z] Kept — has text');
+  });
+
+  it('handles a mixed array of legacy and index entries without throwing', () => {
+    const out = formatStrategicMemoryNotes([
+      { note: 'legacy lesson', set_at: '2026-06-01T00:00:00Z' },
+      { id: 'kd-1', title: 'Index lesson', summary: 'from knowledge doc', created_at: '2026-07-01T00:00:00Z' },
+      'garbage',
+      null,
+      { note: 'another legacy', set_at: '2026-06-15T00:00:00Z' },
+    ]);
+    expect(out).toBe(
+      '- [2026-06-01T00:00:00Z] legacy lesson\n' +
+      '- [2026-07-01T00:00:00Z] Index lesson — from knowledge doc\n' +
+      '- [2026-06-15T00:00:00Z] another legacy',
+    );
+  });
 });
 
 describe('formatCheckpointState', () => {

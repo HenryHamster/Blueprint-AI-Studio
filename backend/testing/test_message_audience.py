@@ -31,6 +31,7 @@ from app.message_audience import (
     is_operator_visible,
     operator_visible_alert_filter,
     operator_visible_audience_filter,
+    operator_visible_message_audience_filter,
     operator_visible_nonactionable_message_filter,
     route_event,
     route_external_webhook_event,
@@ -2221,6 +2222,131 @@ async def test_resolve_usage_meter_dark_alert_no_op_when_none_open():
 
     await _resolve_usage_meter_dark_alert(mock_session)
     mock_session.add.assert_not_called()
+
+
+# ── Fail-closed message-path filter (operator_visible_message_audience_filter) ──
+
+
+def test_operator_visible_message_audience_filter_is_fail_closed():
+    """operator_visible_message_audience_filter is fail-closed: uses an IN-allowlist
+    with no IS NULL pass-through so NULL-audience messages are excluded, not leaked.
+
+    This is the correct filter for all ProjectMessage.context query paths.
+    """
+    from sqlalchemy.dialects import postgresql
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    sql = _compile(operator_visible_message_audience_filter(ProjectMessage.context))
+
+    # Must NOT retain NULL-audience rows.
+    assert "IS NULL" not in sql, (
+        "operator_visible_message_audience_filter must NOT retain NULL-audience rows; "
+        "NULL means un-stamped (fail-closed: treat as strategist-internal)"
+    )
+    # Uses an explicit IN allowlist, not a NOT IN denylist.
+    assert "NOT IN" not in sql, (
+        "operator_visible_message_audience_filter must use IN (explicit allowlist), "
+        "not NOT IN (exclusion denylist), so NULL-audience rows are not implicitly retained"
+    )
+    assert "IN" in sql
+    # Operator-visible audiences are in the allowlist.
+    assert "operator-action-needed" in sql
+    assert "operator-fyi" in sql
+    # Uses ->> scalar extraction so the expression index is hit.
+    assert "->>" in sql and "audience" in sql
+
+
+def test_operator_visible_message_audience_filter_excludes_null_audience():
+    """SQL shape: operator_visible_message_audience_filter excludes NULL-audience
+    rows while operator_visible_audience_filter (Task path) retains them.
+
+    This is the structural proof that the message path is fail-closed while the
+    Task path (which can never be audience-stamped) keeps the NULL pass-through.
+    """
+    from sqlalchemy.dialects import postgresql
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    message_sql = _compile(operator_visible_message_audience_filter(ProjectMessage.context))
+    task_sql = _compile(operator_visible_audience_filter(ProjectMessage.context))
+
+    # Message path: no NULL pass-through (fail-closed).
+    assert "IS NULL" not in message_sql, (
+        "operator_visible_message_audience_filter must exclude NULL-audience rows"
+    )
+    # Task path: retains NULL because tasks are never audience-stamped.
+    assert "IS NULL" in task_sql, (
+        "operator_visible_audience_filter must retain NULL-audience rows for Task.context"
+    )
+
+
+def test_operator_visible_message_audience_filter_call_sites_updated():
+    """Structural guard: operator_visible_audience_filter must NOT appear in ProjectMessage
+    query paths in operator_attention.py, operator_inbox_liveness.py,
+    admin_notifications.py, or metrics_integrity_sweep.py.
+
+    These files previously used the NULL-retaining legacy filter for ProjectMessage
+    queries; the correct filter for the message path is operator_visible_message_audience_filter.
+    This AST check enforces the call-site swap so a future refactor cannot silently
+    reintroduce the NULL pass-through on the message path.
+    """
+    import ast
+
+    app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+    files_to_check = [
+        (os.path.join(app_dir, "operator_attention.py"), "operator_attention.py"),
+        (os.path.join(app_dir, "operator_inbox_liveness.py"), "operator_inbox_liveness.py"),
+        (os.path.join(app_dir, "routers", "admin_notifications.py"), "admin_notifications.py"),
+        (os.path.join(app_dir, "metrics_integrity_sweep.py"), "metrics_integrity_sweep.py"),
+    ]
+
+    offenders: list[str] = []
+
+    for fpath, label in files_to_check:
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=fpath)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            callee = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+            if callee != "operator_visible_audience_filter":
+                continue
+            # Look for ProjectMessage.context as the argument.
+            for arg in node.args:
+                if (
+                    isinstance(arg, ast.Attribute)
+                    and arg.attr == "context"
+                    and isinstance(arg.value, ast.Name)
+                    and arg.value.id == "ProjectMessage"
+                ):
+                    offenders.append(
+                        f"  {label}:{node.lineno} — operator_visible_audience_filter(ProjectMessage.context) "
+                        "found; use operator_visible_message_audience_filter instead"
+                    )
+
+    assert not offenders, (
+        "ProjectMessage.context query paths must use operator_visible_message_audience_filter "
+        "(fail-closed, no NULL pass-through), not operator_visible_audience_filter "
+        "(which retains NULL for Task.context):\n"
+        + "\n".join(offenders)
+    )
 
 
 def test_operator_visible_audience_filter_uses_jsonb_scalar_expression():

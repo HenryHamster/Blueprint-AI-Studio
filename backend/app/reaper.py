@@ -305,6 +305,7 @@ from app.reaper_sweeps import (
     sweep_orphaned_cross_base_children,
     sweep_metrics_integrity,
     sweep_operator_inbox_liveness,
+    sweep_backfill_null_audience_messages,
     sweep_capability_backing_proofs,
     sweep_auto_clear_moot_pending_confirmations,
     sweep_decay_stale_pending_confirmations,
@@ -3074,6 +3075,23 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Operator-inbox liveness sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16e: Proactive NULL-audience backfill — drain the FULL
+                # population of open/linked non-user messages whose audience was
+                # never stamped (legacy pre-registry rows) by re-stamping each
+                # with its canonical audience. Complements Step 16d, which only
+                # re-stamps the narrow forward-leaked subset. Independent hourly
+                # cadence; idempotent (stamped rows stop matching); error-isolated.
+                _mark_reaper_progress()
+                try:
+                    await sweep_backfill_null_audience_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] NULL-audience backfill sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
