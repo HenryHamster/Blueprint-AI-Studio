@@ -639,8 +639,8 @@ across a lab server, a DGX, and a developer PC. Each is a separate enrollment.
 
 **Via the admin UI (recommended):**
 1. Open **Fleet** in the admin sidebar.
-2. Click **Enroll runner** (standard) or **Strategic runner** (for a
-   resident-session/strategic-research-only runner with `max_concurrent=1`).
+2. Click **Enroll runner** (standard) or **Strategic runner** (strategic
+   task types only, `max_concurrent=1`).
 3. Copy the token and follow the per-shape steps above.
 4. Repeat for each machine.
 
@@ -659,7 +659,7 @@ curl -X POST \
 Preset options (`preset` field):
 - `"default"` — all task types, `max_concurrent=2`
 - `"strategic_local"` / `"strategic"` — strategic task types only, `max_concurrent=1`,
-  intended for a resident strategic session
+  used for the strategist session runner (`strategic_review` and `design_doc_update`)
 
 For custom capability overrides (e.g. GPU-only, specific task types), pass
 `capabilities`:
