@@ -166,16 +166,17 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
       'proj-a',
       'tool-1',
-      { title: 'Renamed Widget', config: {} },
+      { title: 'Renamed Widget', placement: 'project_section', config: {} },
     );
   });
 
-  test('configure sends coerced schema config', async () => {
+  test('configure shows placement dropdown and sends coerced schema config', async () => {
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Configure').click(); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
-    // No placement select: the Placement dropdown was removed (#15978).
-    expect(h().querySelector('select')).toBeNull();
+    // Placement dropdown is present so changing placement has an observable effect.
+    expect(h().querySelector('select')).toBeTruthy();
+    expect(h().querySelector('select')!.value).toBe('project_section');
     // The title input is first; the `threshold` config field is second.
     const inputs = h().querySelectorAll('input[type="text"]');
     const thresholdInput = inputs[1] as HTMLInputElement;
@@ -184,7 +185,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
       'proj-a',
       'tool-1',
-      { title: 'My Widget', config: { threshold: 42 } },
+      { title: 'My Widget', placement: 'project_section', config: { threshold: 42 } },
     );
   });
 
