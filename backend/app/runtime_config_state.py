@@ -1137,12 +1137,12 @@ runtime_config: Dict = {
     "promotion_enabled": False,
     "smoketest_enabled": True,
     # walkthrough_e2e_enabled gates the qualifier-spawned ``walkthrough_e2e``
-    # child task (the live-stack Playwright walkthrough evidence lane).  Ships
-    # DARK by default: the lane is a new, expensive live-backend browser
-    # walkthrough whose failure is evidence-only (never cascades a fix), so it
-    # is armed per-fleet or per-project via build_config once proven.  Operator-
-    # tunable via runtime_config_json; persisted across restarts.
-    "walkthrough_e2e_enabled": False,
+    # child task (the live-stack Playwright walkthrough evidence lane).
+    # Defaults True: the walkthrough_e2e lane is armed fleet-wide, producing
+    # SHA-pinned CriterionEvidence for the click-to-talk acceptance criterion.
+    # Failure is evidence-only (never cascades a fix).  Operator-tunable via
+    # runtime_config_json; persisted across restarts.
+    "walkthrough_e2e_enabled": True,
     # env_preflight_enabled gates the boot-prerequisite hard gate (Slice 3).
     # Armed True: a new candidate must declare its required boot-time env vars;
     # missing or absent declarations block promotion.  This gate was built to

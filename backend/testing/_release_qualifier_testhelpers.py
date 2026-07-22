@@ -409,6 +409,29 @@ def _qualifier_ci_resolves_green(mocker, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_walkthrough_e2e_disabled():
+    """Force ``walkthrough_e2e_enabled=False`` as the per-test default for every
+    release-qualifier slice that imports this preamble.
+
+    ``walkthrough_e2e_enabled`` defaults to ``True`` in the production
+    ``runtime_config_state.py`` (the lane is armed fleet-wide), so
+    ``run_qualification`` would otherwise spawn an extra ``walkthrough_e2e``
+    evidence child during every qualification run.  The overwhelming majority of
+    qualifier tests assert on the exact set of spawned children
+    (e.g. ``["release_audit", "smoketest"]``) and do not exercise the
+    walkthrough lane, so an unexpected walkthrough child breaks them.  Forcing
+    the flag ``False`` module-wide keeps those assertions stable; the two tests
+    that DO exercise the walkthrough lane set ``walkthrough_e2e_enabled = True``
+    in their own body, which overrides this default (fixture setup runs before
+    the test body).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["walkthrough_e2e_enabled"] = False
+    yield
+
+
 # ===========================================================================
 # run_qualification — qualify-on-synced gate (LTS split)
 # ===========================================================================
@@ -1966,6 +1989,7 @@ __all__ = [
     '_create_branch_mock',
     '_patch_promote_github_defaults',
     '_qualifier_ci_resolves_green',
+    '_default_walkthrough_e2e_disabled',
     '_audit_tasks',
     '_promotion_failed_record',
     '_seed_qualification_children',

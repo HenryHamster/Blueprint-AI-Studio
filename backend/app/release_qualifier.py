@@ -2903,7 +2903,7 @@ async def run_qualification(
     # walkthrough_e2e_enabled gates the qualifier-spawned live-stack walkthrough
     # evidence lane.  Resolved with the SAME source precedence as the smoketest
     # gate — per-project build_config override, then the fleet runtime_config
-    # flag (default False: ships dark).  The spawned child produces SHA-pinned
+    # flag (default True).  The spawned child produces SHA-pinned
     # CriterionEvidence and NEVER cascades a fix on failure (evidence-only).
     walkthrough_e2e_enabled = bool(
         (project.build_config or {}).get(

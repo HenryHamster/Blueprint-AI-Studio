@@ -13,7 +13,7 @@
 Split from test_release_qualifier.py. Covers run_qualification's optional
 walkthrough_e2e child: exactly one QUEUED evidence-only child pinned to the
 candidate SHA + attempt id when walkthrough_e2e_enabled, and no child at all
-when it is False (the ships-dark default)."""
+when it is False."""
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 
@@ -99,9 +99,8 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
 async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
     db_session, mocker
 ):
-    """With walkthrough_e2e_enabled=False (the ships-dark default), no
-    walkthrough_e2e child is spawned and last_qualification records a None
-    walkthrough_e2e_task_id."""
+    """With walkthrough_e2e_enabled=False, no walkthrough_e2e child is spawned
+    and last_qualification records a None walkthrough_e2e_task_id."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = False
