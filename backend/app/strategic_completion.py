@@ -3364,9 +3364,9 @@ def record_retired_direction_memory(
     existing callers that omit it keep the previous entry shape unchanged.
     """
     text = direction.get("text") or ""
-    tokens = list(
-        set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
-    )[:_RETIRED_TEXT_TOKEN_CAP]
+    tokens = [
+        w for w in text.lower().split() if w not in _DIRECTION_DEDUP_STOPWORDS
+    ][:_RETIRED_TEXT_TOKEN_CAP]
 
     metrics = _retired_direction_outcome_metrics(direction)
     classification = classify_retired_direction_outcome(

@@ -11,6 +11,7 @@ from app.strategic_analysis import (
     _RETIRED_MAX_COUNT,
     _RETIRED_PER_ENTRY_CHAR_CAP,
 )
+from app.strategic_completion import record_retired_direction_memory
 from app.direction_metrics import (
     _compute_difficulty_index,
     _compute_lifetime_generalized_outcome_state,
@@ -3819,3 +3820,57 @@ def test_success_rate_same_population_denominator():
     assert result["overall"]["merged"] == 3
     assert result["overall"]["failed"] == 3  # raw count includes all tasks
     assert result["overall"]["success_rate"] == 1.0  # only counts PR-eligible failures
+
+
+# ---------------------------------------------------------------------------
+# Word-order preservation in retired_directions_summary
+# ---------------------------------------------------------------------------
+
+
+def test_retired_directions_summary_preserves_text_order():
+    """Text reconstructed from text_tokens must preserve original word order,
+    not scramble it as set() iteration would."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-order",
+                    # Tokens stored in a specific order that differs from
+                    # alphabetical and reverse-alphabetical, so any set-based
+                    # reconstruction will reliably produce a different order.
+                    "text_tokens": ["zebra", "mango", "apple", "kite"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    text = result[0]["text"]
+    # Exact left-to-right token order must be preserved
+    assert text == "zebra mango apple kite", (
+        f"Expected 'zebra mango apple kite', got {text!r} — "
+        "set() may have scrambled word order"
+    )
+
+
+def test_record_retired_direction_memory_text_tokens_ordered():
+    """record_retired_direction_memory must store text_tokens in the same
+    left-to-right order as the source direction text (excluding stopwords)."""
+    vision: dict = {}
+    direction = {
+        "id": "d-tok-order",
+        # "improve" and "auth" are content words; "the" and "for" are stopwords
+        "text": "improve the authentication flow for users",
+    }
+    record_retired_direction_memory(vision, direction, reason="saturation")
+
+    entries = vision.get("_recently_retired_directions") or []
+    assert len(entries) == 1
+    tokens = entries[0]["text_tokens"]
+    # Stopwords "the", "for" removed; remaining words in original order
+    assert tokens == ["improve", "authentication", "flow", "users"], (
+        f"Expected ordered tokens, got {tokens!r}"
+    )
