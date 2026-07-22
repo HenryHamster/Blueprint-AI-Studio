@@ -127,12 +127,12 @@ def test_no_protect_path_is_also_safe_to_cut():
 
 
 def test_all_protect_test_ids_exist_in_their_files():
-    """Every test_id listed in a protect entry must exist as a real function.
+    """Every test_id listed in a protect entry must exist in its test file.
 
-    A test can be deleted or renamed with the path guard still green — this
-    check closes that gap by scanning the file for a matching def/async-def
-    line. If a protected test is removed, this fails before CI can proceed
-    without coverage for that seam.
+    For Python files: scans for a matching def/async-def line (exact function
+    name). For TypeScript/TSX files: scans for the test_id as a quoted literal
+    (the it()/test()/describe() label string). A test can be deleted or renamed
+    with the path guard still green — this check closes that gap.
     """
     import re
 
@@ -143,35 +143,39 @@ def test_all_protect_test_ids_exist_in_their_files():
         if not full_path.exists():
             # test_all_protect_paths_exist already covers this; skip here
             continue
-        # Only validate test_ids for Python files — TypeScript/TSX test suites
-        # use describe/it/test() patterns, not def, so the ids in those entries
-        # are descriptive labels rather than function names.
-        if not entry["path"].endswith(".py"):
-            continue
         source = full_path.read_text(encoding="utf-8")
-        for test_id in entry["test_ids"]:
-            pattern = re.compile(
-                r"^\s*(?:async\s+)?def\s+" + re.escape(test_id) + r"\s*\(",
-                re.MULTILINE,
-            )
-            if not pattern.search(source):
-                missing.append(f"{entry['path']}::{test_id}")
+        if entry["path"].endswith(".py"):
+            for test_id in entry["test_ids"]:
+                pattern = re.compile(
+                    r"^\s*(?:async\s+)?def\s+" + re.escape(test_id) + r"\s*\(",
+                    re.MULTILINE,
+                )
+                if not pattern.search(source):
+                    missing.append(f"{entry['path']}::{test_id}")
+        elif entry["path"].endswith((".ts", ".tsx")):
+            # TypeScript test suites use describe()/it()/test() with string
+            # labels. Validate each test_id by searching for it as a quoted
+            # string literal anywhere in the file.
+            for test_id in entry["test_ids"]:
+                # Match the label inside single or double quotes
+                pattern = re.compile(re.escape(test_id))
+                if not pattern.search(source):
+                    missing.append(f"{entry['path']}::{test_id}")
 
     assert not missing, (
-        "The following PROTECT-listed test_ids no longer exist as function "
-        "definitions in their files. Either restore the test or update the "
-        "manifest (with operator sign-off):\n"
+        "The following PROTECT-listed test_ids no longer exist in their files. "
+        "Either restore the test or update the manifest (with operator sign-off):\n"
         + "\n".join(f"  - {m}" for m in missing)
     )
 
 
 def test_removed_backend_resident_seams_are_absent():
-    """Deleted shadow-turn ORM classes must not reappear in models.py.
+    """Deleted shadow-turn ORM classes must not reappear in any backend module.
 
     Migration 0657 dropped the eight strategic-resident tables. If a bad
-    restore reintroduces any of these as a SQLModel class definition, this
-    test fails immediately — before any migration chain is run and before
-    any CI job proceeds.
+    restore reintroduces any of these as a class definition in any backend/app
+    Python module (not only models.py), this test fails immediately — before
+    any migration chain is run and before any CI job proceeds.
     """
     import re
 
@@ -188,9 +192,10 @@ def test_removed_backend_resident_seams_are_absent():
         "StrategicResidentOrdinaryTaskTerminalEvent",
     )
 
-    models_path = REPO_ROOT / "backend" / "app" / "models.py"
-    assert models_path.exists(), f"models.py not found at {models_path}"
-    source = models_path.read_text(encoding="utf-8")
+    backend_app_dir = REPO_ROOT / "backend" / "app"
+    assert backend_app_dir.is_dir(), f"backend/app/ not found at {backend_app_dir}"
+    py_files = list(backend_app_dir.rglob("*.py"))
+    assert py_files, f"No .py files found under {backend_app_dir}"
 
     reintroduced = []
     for class_name in DELETED_RESIDENT_CLASSES:
@@ -201,15 +206,67 @@ def test_removed_backend_resident_seams_are_absent():
             r"^\s*class\s+" + re.escape(class_name) + r"\s*[\(:]",
             re.MULTILINE,
         )
-        if pattern.search(source):
-            reintroduced.append(class_name)
+        for py_file in py_files:
+            source = py_file.read_text(encoding="utf-8")
+            if pattern.search(source):
+                rel = py_file.relative_to(REPO_ROOT)
+                reintroduced.append(f"{class_name} in {rel}")
 
     assert not reintroduced, (
-        "The following shadow-turn ORM classes were reintroduced into "
-        "backend/app/models.py. These belong to the autonomous resident "
-        "control plane that was permanently removed in migration 0657. "
-        "Remove the class definitions or revert the restore:\n"
+        "The following shadow-turn ORM classes were reintroduced into backend "
+        "source files. These belong to the autonomous resident control plane "
+        "that was permanently removed in migration 0657. Remove the class "
+        "definitions or revert the restore:\n"
         + "\n".join(f"  - {c}" for c in reintroduced)
+    )
+
+
+def test_agent_dispatch_gate_is_guarded():
+    """The agent-side dispatch gate symbols must remain defined in handlers/index.ts.
+
+    isResidentSessionTask guards the entry point that routes a marked
+    strategic_review task into the conversational Workday session handler.
+    dispatchStrategic is the internal handler that calls isResidentSessionTask
+    and branches to handleStrategicResident vs. handleStrategic. If either
+    symbol is removed, the resident session path silently falls back to
+    one-shot strategic for all Workday conversations.
+    """
+    import re
+
+    handler_index = REPO_ROOT / "agent" / "src" / "handlers" / "index.ts"
+    assert handler_index.exists(), (
+        f"agent/src/handlers/index.ts not found at {handler_index}. "
+        "This file is the dispatch gate for the conversational Workday session."
+    )
+    source = handler_index.read_text(encoding="utf-8")
+
+    # isResidentSessionTask must be exported as a named function
+    assert re.search(
+        r"export\s+function\s+isResidentSessionTask\s*\(",
+        source,
+        re.MULTILINE,
+    ), (
+        "isResidentSessionTask is no longer exported from agent/src/handlers/index.ts. "
+        "This function guards the entry point for the conversational Workday session — "
+        "restore it or update this guard with operator sign-off."
+    )
+
+    # dispatchStrategic must be defined as the internal handler variable
+    assert re.search(
+        r"(?:const|function)\s+dispatchStrategic\s*[=:(]",
+        source,
+        re.MULTILINE,
+    ), (
+        "dispatchStrategic is no longer defined in agent/src/handlers/index.ts. "
+        "This handler calls isResidentSessionTask to route Workday conversations — "
+        "restore it or update this guard with operator sign-off."
+    )
+
+    # handleStrategicResident must be imported so the resident path can be reached
+    assert "handleStrategicResident" in source, (
+        "handleStrategicResident is no longer referenced in agent/src/handlers/index.ts. "
+        "The conversational Workday dispatch gate requires this import to route "
+        "marked strategic_review tasks to the persistent session handler."
     )
 
 

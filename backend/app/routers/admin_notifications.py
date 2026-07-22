@@ -1362,7 +1362,7 @@ async def put_messages_workbench_state(
     # breaker-bypassing, cooldown-bypassing strategic refresh with
     # origin=ORIGIN_OPERATOR, persisting an operator-supplied steering excerpt.
     # Without the member+ floor a viewer can steer the autonomous strategist.
-    await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
 
     if workbench_state_size_bytes(payload.workbench) > WORKBENCH_STATE_MAX_BYTES:
         raise HTTPException(
@@ -1370,11 +1370,19 @@ async def put_messages_workbench_state(
             detail="Workbench state too large (max 50KB)",
         )
 
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_session_is_active,
+    )
+    resident_active = resident_session_is_active(
+        read_resident_session(project.vision if project else None)
+    )
     result = await persist_strategic_workbench_update(
         session,
         current_user["user_id"],
         pid,
         payload.workbench,
+        resident_session_active=resident_active,
     )
     await emit_workbench_refetch(
         pid,

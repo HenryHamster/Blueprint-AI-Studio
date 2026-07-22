@@ -103,31 +103,31 @@
       "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
       "reason": "Covers the StrategicSessionControl component — the operator UI for the conversational Workday session lifecycle. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
-        "StrategicSessionControl_lifecycle_authority_keeps_legacy_fallback"
+        "keeps the legacy active fallback when lifecycle state is absent"
       ]
     },
     {
       "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
       "reason": "Viewport snapshot test for StrategicSessionControl. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
-        "StrategicSessionControl_viewport_375px",
-        "StrategicSessionControl_viewport_768px"
+        "Workday controls remain contained at 375px",
+        "active Workday controls remain contained at 768px"
       ]
     },
     {
       "path": "admin-ui/src/hooks/useStrategicSession.test.tsx",
       "reason": "Covers the useStrategicSession hook — primary React hook for conversational Workday session state. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
-        "useStrategicSession_liveness_fallback_resolves_mode_and_session_fields",
-        "useStrategicSession_liveness_fallback_heavy_model_takes_precedence"
+        "resolves mode + session fields from the liveness probe before the read model lands",
+        "lets the heavy read model take precedence once it hydrates"
       ]
     },
     {
       "path": "admin-ui/src/utils/strategicSessionLive.test.ts",
       "reason": "Covers strategicSessionLive streaming utility — live-streaming helpers for the conversational Workday session. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
-        "strategicSessionLive_isStrategicReplyDelta_reply_vs_activity",
-        "strategicSessionLive_computeStrategicStreamingTurn_builds_from_reply_deltas"
+        "treats message / reasoning / kind-less as reply, activity kinds as not",
+        "builds the bubble from reply-kind deltas only (activity noise excluded)"
       ]
     },
     {
@@ -137,6 +137,31 @@
         "restores exact bytes only for the actor, project, and send key",
         "cleans every blob in a completed send without touching another send",
         "persists attachment bytes through IndexedDB across a module reload"
+      ]
+    },
+    {
+      "path": "agent/src/handlers/index.test.ts",
+      "reason": "Covers the strategic dispatch gate (isResidentSessionTask / dispatchStrategic) — the agent-side entry seam that routes marked strategic_review tasks to the conversational Workday session handler vs. one-shot strategic. Removing or neutering these tests leaves the dispatch gate unguarded.",
+      "test_ids": [
+        "handlers.strategic_review writes the strategic helper to the workspace",
+        "handlers.research with research_mode=\"strategic\" routes to handleStrategic (writes strategic helper)"
+      ]
+    },
+    {
+      "path": "agent/src/providers/resident-session.test.ts",
+      "reason": "Covers startResidentClaudeSession — the long-running process that drives the conversational Workday session loop (stdin/stdout NDJSON protocol, turn lifecycle, rate-limit classification). Removing these tests leaves the session provider contract unguarded.",
+      "test_ids": [
+        "appends --input-format stream-json and keeps stdin piped",
+        "sendTurn writes a user NDJSON line and resolves on the top-level result",
+        "classifies provider rate limits from bounded stderr evidence"
+      ]
+    },
+    {
+      "path": "agent/src/providers/resident-stream.test.ts",
+      "reason": "Covers the stream utility functions (isStrategicMutation, isMessageSend) that classify events during a conversational Workday session turn. Removing these tests leaves the event classification contract unguarded.",
+      "test_ids": [
+        "detects mutating ./strategic verbs",
+        "detects ./messages send in various shells"
       ]
     }
   ],

@@ -33,11 +33,12 @@ from app.strategic_resident_session import (
     reconcile_terminal_resident_worker,
     start_resident_session,
 )
-from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY, persist_strategic_workbench_update
 from app.strategic_trigger import (
     ARMING_RESIDENT_SESSION,
     maybe_arm_operator_refresh,
 )
+from app.work_session_command_execution import _request_arming_after_receipt
 
 
 def test_workday_availability_does_not_consult_removed_global_gate():
@@ -617,3 +618,54 @@ async def test_active_one_shot_records_cycle_reason_then_completion_retries(
         operator_user_id="operator",
         session_factory=factory,
     )
+
+
+@pytest.mark.asyncio
+async def test_workbench_and_work_session_arming_suppressed_during_resident_session(
+    db_session, mocker
+):
+    """Both operator-arming paths must return ARMING_RESIDENT_SESSION when a
+    resident session is live, and must NOT call request_strategic_refresh."""
+    refresh = mocker.patch(
+        "app.workbench_state.request_strategic_refresh",
+        new_callable=mocker.AsyncMock,
+    )
+    refresh2 = mocker.patch(
+        "app.work_session_command_execution.request_strategic_refresh",
+        new_callable=mocker.AsyncMock,
+    )
+
+    # ── path 1: direct workbench update (admin_notifications.py endpoint) ──
+    project = Project(name="Resident arming guard", user_id="operator", vision={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Arm into continuous mode first so should_arm=True
+    initial_state = {"interaction_mode": "continuous"}
+    result = await persist_strategic_workbench_update(
+        db_session,
+        "operator",
+        project.id,
+        initial_state,
+        resident_session_active=True,
+    )
+    assert result.arming == ARMING_RESIDENT_SESSION, (
+        f"workbench update with active resident returned {result.arming!r}, "
+        "expected ARMING_RESIDENT_SESSION"
+    )
+    refresh.assert_not_awaited()
+
+    # ── path 2: work-session command receipt path ──
+    mock_session = mocker.AsyncMock()
+    arming = await _request_arming_after_receipt(
+        mock_session,
+        project_id=project.id,
+        state={"interaction_mode": "continuous"},
+        resident_session_active=True,
+    )
+    assert arming == ARMING_RESIDENT_SESSION, (
+        f"_request_arming_after_receipt with active resident returned {arming!r}, "
+        "expected ARMING_RESIDENT_SESSION"
+    )
+    refresh2.assert_not_awaited()

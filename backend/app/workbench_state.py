@@ -26,6 +26,7 @@ from app.runner_project_binding import runner_allowed_for_project
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
     ARMING_PASSIVE_NOTE,
+    ARMING_RESIDENT_SESSION,
     ARMING_STEERING,
     ORIGIN_OPERATOR,
     request_strategic_refresh,
@@ -1018,6 +1019,7 @@ async def persist_strategic_workbench_update(
     *,
     sync_local_continuation_marker: bool = True,
     arm_interaction_mode: bool = True,
+    resident_session_active: bool = False,
     commit: bool = True,
 ) -> StrategicWorkbenchWriteResult:
     """Persist operator workbench state and run canonical side effects."""
@@ -1053,6 +1055,14 @@ async def persist_strategic_workbench_update(
         arm_interaction_mode
         and workbench_mode_should_arm_strategic_refresh(previous_state, state)
     )
+    if should_arm and resident_session_active:
+        if commit:
+            await session.commit()
+        return StrategicWorkbenchWriteResult(
+            previous_state=previous_state,
+            state=state,
+            arming=ARMING_RESIDENT_SESSION,
+        )
     if commit:
         await session.commit()
     if should_arm:

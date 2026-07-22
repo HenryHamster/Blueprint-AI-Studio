@@ -20,10 +20,11 @@ from app.messages_last_seen import (
 )
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
 from app.message_audience import stamp_message_audience
-from app.models import Alert, MESSAGE_CONTENT_MAX, MessageType, ProjectMessage, _utcnow
+from app.models import Alert, MESSAGE_CONTENT_MAX, MessageType, Project, ProjectMessage, _utcnow
 from app.project_message_creation import build_project_message
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
+    ARMING_RESIDENT_SESSION,
     ARMING_STEERING,
     ORIGIN_OPERATOR,
     request_strategic_refresh,
@@ -289,12 +290,27 @@ async def _execute_strategic_workbench_command(
         write.previous_state,
         write.state,
     )
+    resident_active = False
+    if should_arm:
+        from app.strategic_resident_session import (  # local import avoids cycle
+            read_resident_session,
+            resident_session_is_active,
+        )
+        project = await session.get(Project, project_id)
+        resident_active = resident_session_is_active(
+            read_resident_session(project.vision if project else None)
+        )
     return {
         "kind": "workbench_update",
         "workbench_keys": sorted(str(key) for key in workbench.keys())[:12],
-        "arming": ARMING_NOT_ARMED if should_arm else write.arming,
-        "_arm_after_receipt": should_arm,
-        "_arm_state": write.state if should_arm else None,
+        "arming": (
+            ARMING_RESIDENT_SESSION
+            if (should_arm and resident_active)
+            else (ARMING_NOT_ARMED if should_arm else write.arming)
+        ),
+        "_arm_after_receipt": should_arm and not resident_active,
+        "_arm_state": write.state if (should_arm and not resident_active) else None,
+        "_arm_resident_active": should_arm and resident_active,
     }
 
 
@@ -389,7 +405,10 @@ async def _request_arming_after_receipt(
     *,
     project_id: uuid.UUID,
     state: dict[str, Any],
+    resident_session_active: bool = False,
 ) -> str:
+    if resident_session_active:
+        return ARMING_RESIDENT_SESSION
     try:
         armed = await request_strategic_refresh(
             session,
