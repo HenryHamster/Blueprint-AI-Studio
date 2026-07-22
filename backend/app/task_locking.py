@@ -810,6 +810,7 @@ async def with_vision_locked(
     *,
     skip_locked: bool = False,
     timeout: float = 30.0,
+    _locked_project: Project | None = None,
 ) -> bool:
     """Atomic read-modify-write of project.vision under a project row lock.
 
@@ -831,6 +832,25 @@ async def with_vision_locked(
     same lost-update class already eliminated for ``design_doc`` and
     ``directions``.
     """
+
+    # _locked_project is the narrow re-entrant bridge for code that already
+    # holds the canonical Project row lock while also holding a dependent Task
+    # lock. It prevents a second Project acquire and the resulting self-deadlock
+    # while keeping every vision assignment centralized in this helper. Callers
+    # must only pass the exact project row yielded by project_lock.
+    def _apply(project: Project) -> None:
+        vision = dict(project.vision or {})
+        mutate_fn(vision)
+        project.vision = vision
+        flag_modified(project, "vision")
+        session.add(project)
+
+    if _locked_project is not None:
+        if str(_locked_project.id) != str(project_id):
+            raise ValueError("_locked_project does not match project_id")
+        _apply(_locked_project)
+        return True
+
     async with project_lock(
         session,
         project_id,
@@ -840,11 +860,7 @@ async def with_vision_locked(
     ) as project:
         if project is None:
             return False
-        vision = dict(project.vision or {})
-        mutate_fn(vision)
-        project.vision = vision
-        flag_modified(project, "vision")
-        session.add(project)
+        _apply(project)
     return True
 
 

@@ -48,7 +48,7 @@ describe('StrategicLiveTurn — viewport regression', () => {
             <StrategicActivityStrip
               latestLifecycle="working"
               items={[{
-                id: 'activity-1',
+                id: 1,
                 kind: 'command',
                 text: 'Inspecting resident session continuity and queued messages',
                 inFlight: false,

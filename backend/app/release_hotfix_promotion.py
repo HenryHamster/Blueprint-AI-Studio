@@ -13,13 +13,20 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-import app.release_qualifier as _rq  # module-level ref — breaks circular import
 from app import github, hotfix_policy, release_version
 from app.database import AsyncSessionLocal
 from app.models import Project
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+def _release_qualifier():
+    """Resolve the qualification engine only after both modules initialize."""
+    from app import release_qualifier
+
+    return release_qualifier
+
 
 # ── Operator hotfix-deploy channel (design d-ae60ffe3, knowledge f69ffbff) ────
 # A NARROW, OWNER-approved, fail-closed sibling of force-promote: it fast-tracks
@@ -84,6 +91,7 @@ async def _hotfix_promote_locked(
         return {"status": "not_open", "version_status": version.status}
     from app.qualification_state_resolver import resolve_newest_qualification_verdict
     _latest_verdict = await resolve_newest_qualification_verdict(session, version)
+    _rq = _release_qualifier()
     _promo = _rq._promotion_in_flight_result(version, latest_verdict=_latest_verdict)
     if _promo is not None:
         return _promo
@@ -173,6 +181,7 @@ async def _hotfix_promote_in_dedicated_session(
                 )
             raise
 
+    _rq = _release_qualifier()
     if result.get("status") not in _rq._FORCE_PROMOTE_NOOP_STATUSES:
         await _rq._maybe_reconcile_after_promotion_conflict(
             version_id, result, session_factory=session_factory
@@ -318,6 +327,7 @@ async def hotfix_promote_current_version(
     project = await session.get(Project, project_id)
     if project is None:
         return {"status": "project_not_found"}
+    _rq = _release_qualifier()
     resolved = await _rq._resolve_github_with_session(session, project)
     if resolved is None:
         return {"status": "no_credentials"}
@@ -466,6 +476,7 @@ async def check_hotfix_scope_preview(
     project = await session.get(Project, project_id)
     if project is None:
         return {"status": "no_open_version"}
+    _rq = _release_qualifier()
     resolved = await _rq._resolve_github_with_session(session, project)
     if resolved is None:
         return {"status": "no_credentials"}

@@ -301,6 +301,12 @@ def new_session_id() -> str:
     return f"ss-{uuid.uuid4().hex[:16]}"
 
 
+def _replace_vision(target: dict[str, Any], replacement: dict[str, Any]) -> None:
+    """Replace one already-locked vision snapshot without an ORM write here."""
+    target.clear()
+    target.update(replacement)
+
+
 def read_resident_session(vision: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the raw session-state blob from ``Project.vision`` (or None)."""
     blob = (vision or {}).get(RESIDENT_SESSION_KEY)
@@ -697,7 +703,6 @@ async def sync_resident_worker_retry_wait(
                             retry_until = retry_until.astimezone(timezone.utc).replace(
                                 tzinfo=None
                             )
-                        vision = dict(project.vision or {})
                         updated = dict(current or {})
                         if retry_until is not None and retry_until > now:
                             updated["worker_state"] = "retry_wait"
@@ -714,10 +719,16 @@ async def sync_resident_worker_retry_wait(
                             updated = {}
                         if updated:
                             updated["updated_at"] = now.isoformat()
-                            vision[RESIDENT_SESSION_KEY] = updated
-                            project.vision = vision
-                            flag_modified(project, "vision")
-                            session.add(project)
+
+                            def _store_retry_wait(vision: dict[str, Any]) -> None:
+                                vision[RESIDENT_SESSION_KEY] = updated
+
+                            await with_vision_locked(
+                                session,
+                                project_id,
+                                _store_retry_wait,
+                                _locked_project=project,
+                            )
                             changed = True
     await session.commit()
     return changed
@@ -761,16 +772,21 @@ async def clear_resident_worker_retry_wait(
                         and task_generation == worker_generation
                         and (current or {}).get("worker_state") == "retry_wait"
                     ):
-                        vision = dict(project.vision or {})
                         updated = dict(current or {})
                         updated["worker_state"] = "ready"
                         updated.pop("worker_retry_until", None)
                         updated.pop("worker_retry_reason", None)
                         updated["updated_at"] = now_iso
-                        vision[RESIDENT_SESSION_KEY] = updated
-                        project.vision = vision
-                        flag_modified(project, "vision")
-                        session.add(project)
+
+                        def _clear_retry_wait(vision: dict[str, Any]) -> None:
+                            vision[RESIDENT_SESSION_KEY] = updated
+
+                        await with_vision_locked(
+                            session,
+                            project_id,
+                            _clear_retry_wait,
+                            _locked_project=project,
+                        )
                         changed = True
     await session.commit()
     return changed
@@ -2012,9 +2028,12 @@ async def start_resident_session(
                 vision[RESIDENT_SESSION_KEY]["_decisions_reg"] = (
                     carried_decisions_register
                 )
-            locked_project.vision = vision
-            flag_modified(locked_project, "vision")
-            session.add(locked_project)
+            await with_vision_locked(
+                session,
+                project.id,
+                lambda current: _replace_vision(current, vision),
+                _locked_project=locked_project,
+            )
             decision["session_id"] = session_id
             decision["worker_generation"] = worker_generation
             decision["mode"] = "adopt" if adopt_task is not None else "spawn"
@@ -2136,9 +2155,12 @@ async def start_resident_session(
                                 status_code=409,
                                 detail="Resident start claim superseded by a newer worker generation",
                             )
-                        locked_project.vision = vision
-                        flag_modified(locked_project, "vision")
-                        session.add(locked_project)
+                        await with_vision_locked(
+                            session,
+                            project.id,
+                            lambda current: _replace_vision(current, vision),
+                            _locked_project=locked_project,
+                        )
                         task_id_str = str(task.id)
                         adopted = True
             if adopted:
@@ -2828,9 +2850,12 @@ async def _mark_terminal_recovery_failed(
                     )[:200],
                     "recorded_at": now_iso,
                 }
-                locked.vision = vision
-                flag_modified(locked, "vision")
-                session.add(locked)
+                await with_vision_locked(
+                    session,
+                    project_id,
+                    lambda current: _replace_vision(current, vision),
+                    _locked_project=locked,
+                )
             await session.commit()
     except Exception:
         logger.warning(

@@ -619,6 +619,11 @@ async def create_operator_project_message(
     # Fence cadence arming and resident message association on the same locked
     # Project snapshot. A live Workday resident consumes the durable message
     # directly, so it suppresses the one-shot strategic refresh marker.
+    # Keep the low-level message creation module importable without pulling in
+    # the resident runtime (and, through it, the admin/release router graph).
+    # This import is intentionally local to the Workday-only association path.
+    from app.strategic_resident_session import resident_session_snapshot  # noqa: PLC0415
+
     locked_project = await session.scalar(
         select(Project)
         .where(Project.id == project_id)
@@ -626,7 +631,6 @@ async def create_operator_project_message(
         .execution_options(populate_existing=True)
     )
     locked_vision = locked_project.vision if locked_project is not None else None
-    from app.strategic_resident_session import resident_session_snapshot  # noqa: PLC0415
     resident_snapshot = resident_session_snapshot(locked_vision)
     resident_active = bool(
         resident_snapshot
@@ -667,7 +671,6 @@ async def create_operator_project_message(
             .execution_options(populate_existing=True)
         )
         locked_vision = locked_project.vision if locked_project is not None else None
-        from app.strategic_resident_session import resident_session_snapshot  # noqa: PLC0415
         resident_snapshot = resident_session_snapshot(locked_vision)
         resident_active = bool(
             resident_snapshot

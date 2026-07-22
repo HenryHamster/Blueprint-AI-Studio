@@ -106,7 +106,7 @@ import { writeStrategicHelpers } from './strategic-helpers.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
-  ResidentSession, ResidentSessionEvent, ResidentTurnResult,
+  ResidentSessionEvent, ResidentTurnResult,
 } from '../providers/resident-session.js';
 
 // The coalescing drain emits at most one frame per this window (see
@@ -241,15 +241,11 @@ function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult 
   };
 }
 
-interface MockSession extends ResidentSession {
-  _emit: (ev: ResidentSessionEvent) => void;
-}
-
 /** Build a mock ResidentSession whose sendTurn is fully scripted. */
 function makeSession(
   sendTurn: (text: string | Array<Record<string, unknown>>) => Promise<ResidentTurnResult>,
   alive: () => boolean,
-): MockSession {
+) {
   let cb: ((ev: ResidentSessionEvent) => void) | null = null;
   return {
     sendTurn: vi.fn(sendTurn),
@@ -261,9 +257,11 @@ function makeSession(
     sessionId: vi.fn(() => 'cli-sess'),
     isAlive: vi.fn(alive),
     exitCode: vi.fn(() => 0),
-    _emit: (ev) => { if (cb) cb(ev); },
+    _emit: (ev: ResidentSessionEvent) => { if (cb) cb(ev); },
   };
 }
+
+type MockSession = ReturnType<typeof makeSession>;
 
 describe('handleStrategicResident — operator-turn compaction includes settled decision and drops answered message', () => {
   beforeEach(() => {
@@ -727,10 +725,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // subprocess restarted: startResidentClaudeSession called once at startup + once for recovery
     expect(mockStartSession).toHaveBeenCalledTimes(2);
     // old subprocess was closed before the new one was started
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session1.close).toHaveBeenCalled();
     // recovery session received the prime (compaction checkpoint)
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
     // helpers were re-provisioned into the recreated checkout (startup + recovery = 2 calls each)
     expect(mockWritePlaybookHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
@@ -770,7 +766,6 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     )).resolves.toBeUndefined();
 
     // The prime was the only turn on session2 — no operator/autonomous turns followed.
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
   });
 
@@ -1019,7 +1014,6 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     );
 
     // The recovery subprocess received a prime with the checkpoint.
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
     // The checkpoint must carry the operator purpose / constraints.
     expect(capturedCheckpoint).toContain('Operator Purpose: autonomous research.');
@@ -1250,7 +1244,7 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
     );
 
     const heartbeatCalls = mockApiPost.mock.calls.filter(([url]) =>
-      String(url).includes('heartbeat'));
+      url.includes('heartbeat'));
     expect(heartbeatCalls.length).toBeGreaterThan(0);
     expect(heartbeatCalls.every(([, body]) =>
       !body || !('handled_message_ids' in body))).toBe(true);
@@ -2040,7 +2034,8 @@ describe('handleStrategicResident — early operator-turn acknowledgment', () =>
       // Ack post fails — must be non-fatal
       if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
         const data = body.data as Record<string, unknown> | undefined;
-        if (String(data?.idempotency_key ?? '').startsWith('resident-ack-')) {
+        if (typeof data?.idempotency_key === 'string'
+          && data.idempotency_key.startsWith('resident-ack-')) {
           return Promise.reject(new Error('ack post failed'));
         }
         return Promise.resolve({});
@@ -2209,11 +2204,14 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     const installedReceipts: Array<{ idempotency_key: string; covered_message_ids: string[] }> = [];
     const heartbeatBodies: Array<Record<string, unknown>> = [];
     vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data) => {
+      const written = typeof data === 'string'
+        ? data
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString();
       if (String(file).endsWith('.resident-reply-idempotency-key')) {
-        installedKeys.push(String(data));
+        installedKeys.push(written);
       }
       if (String(file).endsWith('.resident-reply-receipt.json')) {
-        installedReceipts.push(JSON.parse(String(data)));
+        installedReceipts.push(JSON.parse(written));
       }
     });
 
@@ -2615,7 +2613,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(JSON.stringify(freshTurn)).toContain('Session checkpoint');
     expect(JSON.stringify(freshTurn)).toContain('Answer after prompt exit');
     const create = mockApiPost.mock.calls.find(([, body]) => body?.op === 'create_message');
-    expect((create?.[1]?.data as Record<string, unknown>)?.covered_message_ids).toEqual(['msg-prompt-exit']);
+    expect((create?.[1]?.data as Record<string, unknown> | undefined)?.covered_message_ids).toEqual(['msg-prompt-exit']);
   });
 
   it.each(['rate_limited', 'dead_auth'] as const)(

@@ -289,6 +289,7 @@ _CROSS_CUTTING_TEST_FILES: frozenset[str] = frozenset({
     "backend/testing/test_c5_approval_gate_invariant.py",
     "backend/testing/test_event_type_invariants.py",
     "backend/testing/test_schema_invariants.py",
+    "backend/testing/test_workday_resident_invariants.py",
     # Validates the CI-compliance fetch/gate + cap-bump remediation flow, which
     # spans ci_compliance, strategic_spawning, strategic_completion,
     # release_version and models — no single ``ci_compliance_gate.py`` module

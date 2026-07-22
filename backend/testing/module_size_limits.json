@@ -37,7 +37,7 @@
     "routers/agent.py": 6450,
     "services.py": 3250,
     "recovery_sweeps.py": 100,
-    "routers/agent_status.py": 5300,
+    "routers/agent_status.py": 4550,
     "autonomous_research.py": 3900,
     "autonomous_research_residual.py": 900,
     "efficiency_snapshot.py": 5950,

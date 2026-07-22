@@ -90,7 +90,7 @@ export function readResidentStagedReplyAtPath(
   try {
     const before = fs.lstatSync(stagedReplyPath);
     if (!before.isFile()) throw new Error('staged Resident reply is not a regular file');
-    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    const noFollow = (fs.constants as Partial<typeof fs.constants>).O_NOFOLLOW ?? 0;
     fd = fs.openSync(stagedReplyPath, fs.constants.O_RDONLY | noFollow);
     const opened = fs.fstatSync(fd);
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
@@ -115,7 +115,11 @@ export function readResidentStagedReplyAtPath(
   } finally {
     if (fd !== null) fs.closeSync(fd);
   }
-  const parsed = JSON.parse(raw) as Partial<ResidentStagedReply>;
+  const decoded: unknown = JSON.parse(raw);
+  if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new Error('staged Resident reply must be a JSON object');
+  }
+  const parsed = decoded as Record<string, unknown>;
   const expectedIds = [...receipt.covered_message_ids].sort();
   const rawActualIds = parsed.covered_message_ids;
   const actualIds = Array.isArray(rawActualIds)
@@ -140,7 +144,7 @@ export function readResidentStagedReplyAtPath(
     content: parsed.content.trim(),
     idempotency_key: parsed.idempotency_key,
     covered_message_ids: [...receipt.covered_message_ids],
-    ...(parsed.context === undefined ? {} : { context: parsed.context }),
+    ...(parsed.context === undefined ? {} : { context: parsed.context as Record<string, unknown> }),
   };
 }
 
@@ -180,12 +184,12 @@ export function removeResidentReplyArtifactsAtPaths(
   replyKeyPath: string,
   replyReceiptPath: string,
 ): void {
-  let firstError: unknown = null;
+  let firstError: Error | null = null;
   for (const artifactPath of [replyKeyPath, replyReceiptPath]) {
     try {
       removeResidentReplyKeyAtPath(artifactPath);
     } catch (e) {
-      firstError ??= e;
+      firstError ??= e instanceof Error ? e : new Error(String(e));
     }
   }
   if (firstError !== null) throw firstError;
@@ -887,7 +891,7 @@ export async function handleStrategicResident(
 
   let firstTurnSent = false;
   let stopReason = 'stop_requested';
-  let terminalProviderFailure: 'rate_limited' | 'dead_auth' | null = null;
+  const terminalProviderFailure: { value: 'rate_limited' | 'dead_auth' | null } = { value: null };
   let pendingRestartCheckpoint: string | null = null;
   // Consecutive turns whose per-turn stall watchdog fired. N in a row ⇒ the
   // session is wedged (not merely slow) ⇒ fail it rather than spin forever.
@@ -990,7 +994,7 @@ export async function handleStrategicResident(
     // Treat either signal as canonical so prompt-exit preemption never restarts
     // and masks a rate-limit/dead-auth failure as a benign SIGINT boundary.
     if (!r.providerFailed && r.failureCategory === null) return false;
-    terminalProviderFailure = r.failureCategory;
+    terminalProviderFailure.value = r.failureCategory;
     stopReason = r.failureCategory === 'rate_limited'
       ? 'provider_rate_limited'
       : r.failureCategory === 'dead_auth'
@@ -1583,12 +1587,11 @@ export async function handleStrategicResident(
       sendLog(ws, '[resident] post-reply heartbeat failed; stopping on a fresh worker boundary\n');
       return 'stop';
     }
-    if (hb?.stop_requested) return 'stop';
+    if (hb.stop_requested) return 'stop';
     if (cleanupError !== null) {
       stopReason = 'operator_reply_receipt_cleanup_failed';
       return 'stop';
     }
-    if (r.processGone) { stopReason = 'session_process_exited'; return 'stop'; }
     // Compaction runs ONLY after the reply is streamed and the handled-marking
     // heartbeat has landed — so a compaction on this turn primes the fresh session
     // WITH the settled decision and WITHOUT the just-answered message, and the
@@ -1768,7 +1771,7 @@ export async function handleStrategicResident(
         session.interrupt();
         const settledBeforeDeadline = await Promise.race([
           turnPromise.then(() => true),
-          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), OPERATOR_PREEMPT_DEADLINE_MS)),
+          new Promise<boolean>((resolve) => setTimeout(() => { resolve(false); }, OPERATOR_PREEMPT_DEADLINE_MS)),
         ]);
         if (!settledBeforeDeadline) {
           invalidateSessionEvents();
@@ -1947,7 +1950,6 @@ export async function handleStrategicResident(
       // the loop's own applied ops (self-echo).
       lastAutonomousWorkStateRev = currentWorkStateRev;
       if (hb?.stop_requested || watch.kind === 'stop') break;
-      if (r.processGone) { stopReason = 'session_process_exited'; break; }
 
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
       if (watch.kind === 'suspend') continue;
@@ -2008,7 +2010,7 @@ export async function handleStrategicResident(
   const { status, failureCategory } = resolveTerminalStatus(
     stopReason,
     session.exitCode(),
-    terminalProviderFailure ?? session.failureCategory?.() ?? null,
+    terminalProviderFailure.value ?? session.failureCategory?.() ?? null,
   );
   try {
     await persistAndPostStatus(taskId, {

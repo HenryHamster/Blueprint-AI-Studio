@@ -553,6 +553,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const triageOffsetRef = useRef(0);
   const [expandedConfirmationItemId, setExpandedConfirmationItemId] = useState<string | null>(null);
   const [resolvedConfirmationIds, setResolvedConfirmationIds] = useState<Set<string>>(() => new Set());
+  const visibleAttentionNeedsActionItems = useMemo(
+    () => attentionNeedsActionItems.filter(item => !resolvedConfirmationIds.has(item.id)),
+    [attentionNeedsActionItems, resolvedConfirmationIds],
+  );
   const [chatChromeExpanded, persistChatChrome] = useChatChrome();
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
   const [newType, setNewType] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.type ?? 'FEEDBACK');
@@ -2687,7 +2691,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         <ConversationUtilityBar
           expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
           searchQuery={searchQuery} onSearchChange={setSearchQuery}
-          needsActionCount={usesStrategicReadModel ? attentionNeedsActionItems.length : 0} alertCount={alerts?.length ?? 0}
+          needsActionCount={usesStrategicReadModel ? visibleAttentionNeedsActionItems.length : 0} alertCount={alerts?.length ?? 0}
         />
       )}
 
@@ -2810,15 +2814,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       {/* Needs-action strip — derived from the canonical attention model when the
           strategic read model is available. Shows needs_operator items at the top
           with lifecycle.clears_when so the operator sees they will self-clear. */}
-      {(!conversationMode || chatChromeExpanded) && usesStrategicReadModel && attentionNeedsActionItems.length > 0 && (
+      {(!conversationMode || chatChromeExpanded) && usesStrategicReadModel && visibleAttentionNeedsActionItems.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border bg-amber-950/20 px-3 py-2 md:px-4" data-testid="needs-action-strip">
           <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-col gap-1.5">
             <div className="flex items-center gap-2">
               <span className="text-xs font-semibold text-amber-200">Needs your action</span>
-              <span className="shrink-0 rounded-full bg-amber-800/60 px-1.5 text-ui-sm font-semibold text-amber-200">{attentionNeedsActionItems.length}</span>
+              <span className="shrink-0 rounded-full bg-amber-800/60 px-1.5 text-ui-sm font-semibold text-amber-200">{visibleAttentionNeedsActionItems.length}</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {attentionNeedsActionItems.slice(0, 6).filter(item => !resolvedConfirmationIds.has(item.id)).map(item => {
+              {visibleAttentionNeedsActionItems.slice(0, 6).map(item => {
                 const isMessage = item.kind === 'message';
                 const isConfirmation = item.kind === 'confirmation';
                 const messageId = isMessage ? item.ref?.id : null;

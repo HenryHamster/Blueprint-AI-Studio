@@ -869,6 +869,38 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
 
     return violations
 
+
+def _duplicate_index_epoch_violations(
+    index_creates: dict[str, list[tuple[str, bool]]],
+    drop_revisions: dict[str, set[str]],
+    exemptions: set[tuple[str, str]],
+) -> list[str]:
+    """Return unguarded creates that repeat an index in the same live epoch."""
+    violations: list[str] = []
+    for name, creates in index_creates.items():
+        if len(creates) < 2:
+            continue
+        ordered_creates = sorted(creates)
+        prior_live_revision: str | None = None
+        for revision, guarded in ordered_creates:
+            was_dropped = prior_live_revision is not None and any(
+                prior_live_revision < drop_revision < revision
+                for drop_revision in drop_revisions.get(name, set())
+            )
+            is_reassertion = prior_live_revision is not None and not was_dropped
+            if (
+                is_reassertion
+                and not guarded
+                and (revision, name) not in exemptions
+            ):
+                violations.append(
+                    f"{revision}: creates '{name}' without IF NOT EXISTS guard "
+                    f"(still live from: {prior_live_revision})"
+                )
+            prior_live_revision = revision
+    return violations
+
+
 class TestSchemaRevisionSync:
     def test_expected_revision_matches_latest_migration(self):
         """EXPECTED_SCHEMA_REVISION must match the structural head of the alembic chain.
@@ -2353,6 +2385,13 @@ class TestSchemaRevisionSync:
             re.IGNORECASE,
         )
 
+        op_drop_re = re.compile(
+            r'op\.drop_index\(\s*[\'"](?P<name>ix_\w+)[\'"]'
+        )
+        raw_drop_re = re.compile(
+            r"DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(?P<name>ix_\w+)",
+            re.IGNORECASE,
+        )
         # Accumulate worst-case guardedness per (revision, index_name).
         # A migration that uses both Postgres raw-SQL (guarded) and a SQLite
         # op.create_index branch (unguarded) for the same index is unguarded on
@@ -2360,6 +2399,7 @@ class TestSchemaRevisionSync:
         # {(revision, name): all_creates_guarded}
         per_rev_name: dict[tuple[str, str], bool] = {}
 
+        drop_revisions: dict[str, set[str]] = {}
         for path in files:
             revision = os.path.basename(path).split("_")[0]
             with open(path) as f:
@@ -2382,23 +2422,22 @@ class TestSchemaRevisionSync:
                 key = (revision, name)
                 per_rev_name[key] = per_rev_name.get(key, True) and guarded
 
+            for m in op_drop_re.finditer(upgrade_body):
+                drop_revisions.setdefault(m.group("name"), set()).add(revision)
+
+            for m in raw_drop_re.finditer(upgrade_body):
+                drop_revisions.setdefault(m.group("name"), set()).add(revision)
+
         # Group by index name across revisions.
         index_creates: dict[str, list[tuple[str, bool]]] = {}
         for (revision, name), all_guarded in per_rev_name.items():
             index_creates.setdefault(name, []).append((revision, all_guarded))
 
-        violations: list[str] = []
-        for name, creates in index_creates.items():
-            if len(creates) < 2:
-                continue
-            other_revs = sorted(r for r, _ in creates)
-            for revision, guarded in creates:
-                if not guarded and (revision, name) not in _KNOWN_UNGUARDED_DUPLICATES:
-                    others = ", ".join(r for r in other_revs if r != revision)
-                    violations.append(
-                        f"{revision}: creates '{name}' without IF NOT EXISTS guard "
-                        f"(also created by: {others})"
-                    )
+        violations = _duplicate_index_epoch_violations(
+            index_creates,
+            drop_revisions,
+            _KNOWN_UNGUARDED_DUPLICATES,
+        )
 
         assert not violations, (
             "Duplicate index name(s) created without IF NOT EXISTS guard "
@@ -2408,6 +2447,51 @@ class TestSchemaRevisionSync:
             "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
             "an index name an earlier migration already created."
         )
+
+    def test_duplicate_index_epoch_ordering(self):
+        name = "ix_example"
+        exemptions: set[tuple[str, str]] = set()
+
+        create_create_drop = _duplicate_index_epoch_violations(
+            {name: [("0001", False), ("0002", False)]},
+            {name: {"0003"}},
+            exemptions,
+        )
+        assert create_create_drop == [
+            "0002: creates 'ix_example' without IF NOT EXISTS guard "
+            "(still live from: 0001)"
+        ]
+
+        create_drop_create = _duplicate_index_epoch_violations(
+            {name: [("0001", False), ("0003", False)]},
+            {name: {"0002"}},
+            exemptions,
+        )
+        assert create_drop_create == []
+
+        create_drop_create_create = _duplicate_index_epoch_violations(
+            {
+                name: [
+                    ("0001", False),
+                    ("0003", False),
+                    ("0004", False),
+                ]
+            },
+            {name: {"0002"}},
+            exemptions,
+        )
+        assert create_drop_create_create == [
+            "0004: creates 'ix_example' without IF NOT EXISTS guard "
+            "(still live from: 0003)"
+        ]
+
+    def test_duplicate_index_scan_ignores_downgrade_drops(self):
+        source = (
+            "def upgrade():\n    op.create_index('ix_example', 'example', ['id'])\n"
+            "def downgrade():\n    op.drop_index('ix_example')\n"
+        )
+        upgrade_body = source.split("def downgrade", 1)[0].split("def upgrade", 1)[1]
+        assert "drop_index" not in upgrade_body
 
     def test_concurrently_index_migrations_escape_transaction(self):
         """Any migration issuing CREATE/DROP INDEX CONCURRENTLY (or

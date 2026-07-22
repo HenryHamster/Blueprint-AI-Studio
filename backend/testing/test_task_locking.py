@@ -1023,6 +1023,51 @@ async def test_with_vision_locked_applies_mutation(db_session):
     assert project.vision == {"existing": "kept", "added": "yes"}
 
 
+@pytest.mark.asyncio
+async def test_with_vision_locked_reuses_caller_owned_project_lock(db_session):
+    project = Project(name="vision-reentrant-lock", user_id="user")
+    project.vision = {"existing": "kept"}
+    db_session.add(project)
+    await db_session.commit()
+
+    async with project_lock(
+        db_session, project.id, skip_locked=False
+    ) as locked_project:
+        assert locked_project is not None
+        applied = await with_vision_locked(
+            db_session,
+            project.id,
+            lambda vision: vision.update({"resident": "active"}),
+            _locked_project=locked_project,
+        )
+        assert applied is True
+
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert project.vision == {"existing": "kept", "resident": "active"}
+
+
+@pytest.mark.asyncio
+async def test_with_vision_locked_rejects_mismatched_owned_project(db_session):
+    first = Project(name="vision-reentrant-first", user_id="user")
+    second = Project(name="vision-reentrant-second", user_id="user")
+    db_session.add(first)
+    db_session.add(second)
+    await db_session.commit()
+
+    async with project_lock(
+        db_session, first.id, skip_locked=False
+    ) as locked_project:
+        assert locked_project is not None
+        with pytest.raises(ValueError, match="does not match project_id"):
+            await with_vision_locked(
+                db_session,
+                second.id,
+                lambda vision: vision.update({"wrong": True}),
+                _locked_project=locked_project,
+            )
+
+
 @pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
 @pytest.mark.asyncio
 async def test_concurrent_research_outcomes_preserve_both_directions(db_session):
