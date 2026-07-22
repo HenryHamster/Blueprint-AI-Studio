@@ -513,6 +513,7 @@ async def get_project_compute_jobs(
             "outcome_breakdown": {},
             "criterion_met": 0,
             "criterion_measured": 0,
+            "honest_succeeded": 0,
         }
     else:
         agg_summary = await aggregate_compute_jobs_summary(
@@ -531,6 +532,7 @@ async def get_project_compute_jobs(
             **agg_summary,
             "criterion_met": criterion_stats["criterion_met"],
             "criterion_measured": criterion_stats["criterion_measured"],
+            "honest_succeeded": criterion_stats["honest_succeeded"],
         }
     return {
         "compute_jobs": built_payload,

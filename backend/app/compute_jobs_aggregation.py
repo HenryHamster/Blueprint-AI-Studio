@@ -163,7 +163,27 @@ async def aggregate_criterion_summary(
 
     criterion_measured = sum(1 for row in rows if row.met_value is not None)
     criterion_met = sum(1 for row in rows if _criterion_is_met(row.met_value))
-    return {"criterion_measured": criterion_measured, "criterion_met": criterion_met}
+
+    # Count SUCCEEDED jobs whose criterion was measured AND met — this is the
+    # only population that constitutes a clean success at the ledger level.
+    # A SUCCEEDED job with met=False or no measured criterion must not appear
+    # here, so this query intentionally does NOT share the GROUP BY of the
+    # task-level criterion_measured/criterion_met counts above.
+    honest_rows = (
+        await session.execute(
+            select(_criterion_met_expr(session))
+            .select_from(ComputeJob)
+            .join(Task, ComputeJob.task_id == Task.id)
+            .where(*window_filter, ComputeJob.status == ComputeJobStatus.SUCCEEDED)
+        )
+    ).all()
+    honest_succeeded = sum(1 for row in honest_rows if _criterion_is_met(row.met_value))
+
+    return {
+        "criterion_measured": criterion_measured,
+        "criterion_met": criterion_met,
+        "honest_succeeded": honest_succeeded,
+    }
 
 
 async def aggregate_all_compute_jobs_summary(
@@ -238,6 +258,24 @@ async def aggregate_all_compute_jobs_summary(
         1 for row in criterion_rows if _criterion_is_met(row.met_value)
     )
 
+    # Count SUCCEEDED jobs whose criterion was measured AND met — only this
+    # population constitutes a clean success at the ledger level.  A SUCCEEDED
+    # job with met=False or no measured criterion must not appear here.
+    honest_rows = (
+        await session.execute(
+            select(_criterion_met_expr(session))
+            .select_from(ComputeJob)
+            .join(Task, ComputeJob.task_id == Task.id)
+            .where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.task_id.is_not(None),
+                ComputeJob.status == ComputeJobStatus.SUCCEEDED,
+                *([ComputeJob.created_at >= since] if since is not None else []),
+            )
+        )
+    ).all()
+    honest_succeeded = sum(1 for row in honest_rows if _criterion_is_met(row.met_value))
+
     result: dict = {
         "total_jobs": total,
         "active_jobs": active_count,
@@ -246,6 +284,7 @@ async def aggregate_all_compute_jobs_summary(
         "outcome_breakdown": outcome_breakdown,
         "criterion_measured": criterion_measured,
         "criterion_met": criterion_met,
+        "honest_succeeded": honest_succeeded,
     }
 
     if since is not None:

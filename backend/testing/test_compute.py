@@ -26290,3 +26290,207 @@ def test_remote_build_and_push_unchanged_hash_avoids_submission(tmp_path, monkey
     assert result.built is False
     # No build submission occurred — fast path.
     assert not any("builds submit" in c for c in run_calls)
+
+
+# ── Honest-success ledger (criterion c-dd715326) ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_aggregate_succeeded_criterion_unmet_not_counted_as_clean_success():
+    """A SUCCEEDED job with a measured-but-unmet criterion must NOT appear in
+    honest_succeeded.  The operator ledger must never report a clean success
+    for a run whose declared success criterion was missed or never measured."""
+    from app.compute_jobs_aggregation import aggregate_criterion_summary
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        project = Project(name="Honest Ledger Test", user_id="user-1")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        # Case 1: SUCCEEDED but criterion measured and NOT met (the core bug scenario).
+        task_unmet = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "acc", "operator": ">=", "threshold": 0.9}}],
+            status=TaskStatus.COMPLETED,
+            plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": False, "measurable": True, "value": 0.7}}},
+        )
+        session.add(task_unmet)
+        await session.commit()
+        await session.refresh(task_unmet)
+
+        job_succeeded_unmet = ComputeJob(
+            task_id=task_unmet.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            machine_type="e2-standard-2",
+            spend_cap_usd=5.0,
+            completed_at=_utcnow(),
+        )
+        session.add(job_succeeded_unmet)
+
+        # Case 2: SUCCEEDED but criterion never measured — met key absent.
+        # A real unmeasured run stores no met value in the criterion block.
+        task_unmeasured = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.COMPLETED,
+            plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"measurable": False}}},
+        )
+        session.add(task_unmeasured)
+        await session.commit()
+        await session.refresh(task_unmeasured)
+
+        job_succeeded_unmeasured = ComputeJob(
+            task_id=task_unmeasured.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            machine_type="e2-standard-2",
+            spend_cap_usd=5.0,
+            completed_at=_utcnow(),
+        )
+        session.add(job_succeeded_unmeasured)
+
+        # Case 3: SUCCEEDED with criterion met — this SHOULD count.
+        task_met = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.COMPLETED,
+            plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": True, "measurable": True, "value": 0.95}}},
+        )
+        session.add(task_met)
+        await session.commit()
+        await session.refresh(task_met)
+
+        job_succeeded_met = ComputeJob(
+            task_id=task_met.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            machine_type="e2-standard-2",
+            spend_cap_usd=5.0,
+            completed_at=_utcnow(),
+        )
+        session.add(job_succeeded_met)
+        await session.commit()
+
+        result = await aggregate_criterion_summary(
+            session, project_id=project.id, all_terminal=True
+        )
+
+    # Only the genuinely-met SUCCEEDED job counts as honest.
+    assert result["honest_succeeded"] == 1, (
+        f"Expected 1 honest_succeeded (met=True), got {result['honest_succeeded']}. "
+        "SUCCEEDED jobs with unmet or unmeasured criteria must not be counted."
+    )
+    # Both measured jobs have a non-None criterion row.
+    assert result["criterion_measured"] == 2
+    # Only one criterion was actually met.
+    assert result["criterion_met"] == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_all_summary_honest_succeeded_excludes_unmet_and_unmeasured():
+    """aggregate_all_compute_jobs_summary must exclude SUCCEEDED jobs with unmet
+    or unmeasured criteria from honest_succeeded, mirroring the contract of
+    aggregate_criterion_summary."""
+    from app.compute_jobs_aggregation import aggregate_all_compute_jobs_summary
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        project = Project(name="All Summary Honest Ledger Test", user_id="user-1")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        # SUCCEEDED but criterion measured and NOT met.
+        task_unmet = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.COMPLETED,
+            plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": False, "measurable": True, "value": 0.7}}},
+        )
+        session.add(task_unmet)
+        await session.commit()
+        await session.refresh(task_unmet)
+        session.add(ComputeJob(
+            task_id=task_unmet.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            machine_type="e2-standard-2",
+            spend_cap_usd=5.0,
+            completed_at=_utcnow(),
+        ))
+
+        # SUCCEEDED but criterion never measured (measurable=False, no met key).
+        task_unmeasured = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.COMPLETED,
+            plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"measurable": False}}},
+        )
+        session.add(task_unmeasured)
+        await session.commit()
+        await session.refresh(task_unmeasured)
+        session.add(ComputeJob(
+            task_id=task_unmeasured.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            machine_type="e2-standard-2",
+            spend_cap_usd=5.0,
+            completed_at=_utcnow(),
+        ))
+
+        # SUCCEEDED with criterion met — the only honest success.
+        task_met = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.COMPLETED,
+            plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": True, "measurable": True, "value": 0.95}}},
+        )
+        session.add(task_met)
+        await session.commit()
+        await session.refresh(task_met)
+        session.add(ComputeJob(
+            task_id=task_met.id,
+            project_id=project.id,
+            backend="local-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            machine_type="e2-standard-2",
+            spend_cap_usd=5.0,
+            completed_at=_utcnow(),
+        ))
+        await session.commit()
+
+        result = await aggregate_all_compute_jobs_summary(session, project_id=project.id, since=None)
+
+    assert result["honest_succeeded"] == 1, (
+        f"Expected 1 honest_succeeded (met=True only), got {result['honest_succeeded']}. "
+        "SUCCEEDED jobs with unmet or unmeasured criteria must not be counted."
+    )
+    assert result["criterion_measured"] == 2
+    assert result["criterion_met"] == 1
+
+    await engine.dispose()

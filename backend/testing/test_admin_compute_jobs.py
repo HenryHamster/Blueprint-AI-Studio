@@ -1399,6 +1399,8 @@ async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_sessio
     assert breakdown[ComputeJobStatus.SUCCEEDED.value] == 1
     assert breakdown[ComputeJobStatus.FAILED.value] == 1
     assert breakdown[ComputeJobStatus.RUNNING.value] == 1
+    # job1 is SUCCEEDED with criterion met; job2 is FAILED (excluded); job3 is RUNNING.
+    assert summary["honest_succeeded"] == 1
 
 
 @pytest.mark.asyncio
@@ -3206,3 +3208,97 @@ def test_viewable_artifacts_descriptor_preserves_pdf_and_svg_kinds():
     assert by_name["diagram.svg"]["content_type"] == "image/svg+xml"
     # A truly unrecognised kind is coerced to None fail-closed.
     assert by_name["unknown.xyz"]["kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_ledger_distinguishes_succeeded_criterion_unmet_from_clean_success(
+    client: AsyncClient, db_session
+):
+    """The compute-job summary ledger must count only SUCCEEDED jobs with a
+    measured-and-met criterion as honest_succeeded.  SUCCEEDED runs whose
+    declared criterion was not met or was never measured must be excluded."""
+    project = await _make_project(db_session, name="Honest-Success Ledger Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Job A: SUCCEEDED, criterion measured but NOT met — must NOT appear in honest_succeeded.
+    task_a = Task(
+        project_id=project.id,
+        title="unmet criterion task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "acc", "operator": ">=", "threshold": 0.9}}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": False, "measurable": True, "value": 0.70}}},
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    db_session.add(ComputeJob(
+        task_id=task_a.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        final_cost_usd=1.0,
+        completed_at=_utcnow(),
+    ))
+    await db_session.commit()
+
+    # Job B: SUCCEEDED, criterion unmeasured — must NOT appear in honest_succeeded.
+    task_b = Task(
+        project_id=project.id,
+        title="unmeasured criterion task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"measurable": False}}},
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_b)
+    db_session.add(ComputeJob(
+        task_id=task_b.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        final_cost_usd=1.0,
+        completed_at=_utcnow(),
+    ))
+    await db_session.commit()
+
+    # Job C: SUCCEEDED, criterion met — MUST appear in honest_succeeded.
+    task_c = Task(
+        project_id=project.id,
+        title="met criterion task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": True, "measurable": True, "value": 0.95}}},
+    )
+    db_session.add(task_c)
+    await db_session.commit()
+    await db_session.refresh(task_c)
+    db_session.add(ComputeJob(
+        task_id=task_c.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        final_cost_usd=1.0,
+        completed_at=_utcnow(),
+    ))
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs",
+        params={"all_terminal": "true"},
+    )
+    assert resp.status_code == 200
+    summary = resp.json()["summary"]
+
+    assert summary["honest_succeeded"] == 1, (
+        f"Expected 1 honest_succeeded (only met criterion), got {summary['honest_succeeded']}. "
+        "SUCCEEDED jobs with unmet or unmeasured criteria must not be counted as honest successes."
+    )
+    assert summary["criterion_measured"] == 2
+    assert summary["criterion_met"] == 1
