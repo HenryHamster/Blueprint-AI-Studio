@@ -6,7 +6,7 @@ import {
   ConflictError,
   type ToolContent,
 } from '../api/projectTools';
-import MarkdownContentInner from './MarkdownContentInner';
+import { MarkdownContent } from './MarkdownContent';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -351,7 +351,7 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
           data-viewport-allow-overflow
         >
           {text ? (
-            <MarkdownContentInner content={text} />
+            <MarkdownContent content={text} />
           ) : (
             <p className="text-sm italic text-neutral-500">Nothing to preview yet.</p>
           )}

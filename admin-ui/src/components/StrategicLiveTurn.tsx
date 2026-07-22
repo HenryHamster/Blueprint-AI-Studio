@@ -59,6 +59,11 @@ export function StrategicStreamingBubble({ segments }: { segments: StrategicTurn
             </div>
           )}
           {replyText && (
+            // Intentionally raw (plain text, not MarkdownContent) while streaming:
+            // the fragment arrives in chunks that may split mid-delimiter, so passing
+            // a partial string through remark-math would yield broken KaTeX renders.
+            // The completed turn is re-rendered via MessageBubble → MarkdownContent
+            // once the stream ends and the message is persisted.
             <div
               data-testid="strategic-streaming-reply"
               className="whitespace-pre-wrap break-words min-w-0 text-sm leading-relaxed text-neutral-100"

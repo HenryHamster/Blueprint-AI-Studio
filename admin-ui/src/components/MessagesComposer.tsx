@@ -5,7 +5,8 @@ import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 import { AttachmentPreviewModal } from './AttachmentPreviewModal';
-import MarkdownContentInner from './MarkdownContentInner';
+import { MarkdownContent } from './MarkdownContent';
+import { hasMathDelimiters } from '../utils/mathContent';
 import type { MessageAttachment } from '../types/messages';
 import { MESSAGE_CONTENT_MAX } from '../api';
 
@@ -164,11 +165,8 @@ export const MessagesComposer = memo(function MessagesComposer({
   ];
   const hasAttachments = (pendingAttachments?.length ?? 0) > 0 || retainedAttachmentCount > 0;
 
-  // Show a live draft preview when the content contains paired math delimiters.
-  // Matches: $...$, $$...$$, \(...\), \[...\]
-  const hasMathInDraft = newContent.length > 0 && (
-    /\$\$[\s\S]*?\$\$|\$[^$\s][^$]*?\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]/.test(newContent)
-  );
+  // Show a live draft preview when the content contains math delimiters.
+  const hasMathInDraft = newContent.length > 0 && hasMathDelimiters(newContent);
 
   // The pending attachment whose full-size preview is open (if any). If it was
   // removed while open, this resolves to undefined and the modal unmounts.
@@ -407,7 +405,7 @@ export const MessagesComposer = memo(function MessagesComposer({
           aria-label="Math preview"
           className={`${minimal ? minimalColumnClass : ''} mb-1.5 max-h-28 overflow-y-auto rounded border border-neutral-800/60 bg-neutral-900/40 px-3 py-2 text-sm`}
         >
-          <MarkdownContentInner content={newContent} />
+          <MarkdownContent content={newContent} />
         </div>
       )}
 

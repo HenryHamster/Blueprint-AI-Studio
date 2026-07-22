@@ -3,6 +3,7 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import type { Components } from 'react-markdown';
+import { hasMathDelimiters, normalizeMathDelimiters } from '../utils/mathContent';
 
 // Lazy KaTeX CSS: only import when content contains math delimiters.
 // KaTeX CSS is ~30KB; eagerly loading it on every view inflates the initial
@@ -12,15 +13,6 @@ function ensureKaTexCss(): void {
   if (_katexCssLoaded) return;
   _katexCssLoaded = true;
   import('katex/dist/katex.min.css').catch(() => { /* CSS import failure is non-fatal */ });
-}
-
-// Normalize LaTeX-style delimiters to the remark-math dollar syntax:
-//   \(...\)  →  $...$   (inline)
-//   \[...\]  →  $$...$$ (block)
-function normalizeMathDelimiters(content: string): string {
-  let out = content.replace(/\\\(([\s\S]+?)\\\)/g, (_, m) => `$${m}$`);
-  out = out.replace(/\\\[([\s\S]+?)\\\]/g, (_, m) => `$$${m}$$`);
-  return out;
 }
 
 const mdComponents: Components = {
@@ -47,10 +39,7 @@ const mdComponents: Components = {
 };
 
 export default function MarkdownContentInner({ content }: { content: string }) {
-  // Detect any math delimiter form: $/$$ or the backslash variants \(...\)/\[...\].
-  const hasMath = typeof content === 'string' && (
-    /(?<!\$)\${1,2}(?!\$)/.test(content) || /\\\(|\\\[/.test(content)
-  );
+  const hasMath = hasMathDelimiters(content);
   if (hasMath) ensureKaTexCss();
 
   const normalized = hasMath ? normalizeMathDelimiters(content) : content;
