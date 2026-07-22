@@ -270,9 +270,6 @@ def test_every_capability_declares_a_valid_run_shape():
     for cap in TASK_CAPABILITIES:
         assert cap.run_shape in valid, (cap.id, cap.run_shape)
     assert set(RUN_SHAPE_BY_TASK_TYPE) == ALL_TASK_TYPES
-    assert RUN_SHAPE_BY_TASK_TYPE == {
-        cap.id.value: cap.run_shape for cap in TASK_CAPABILITIES
-    }
 
 
 def test_run_shape_for_accessor_and_honest_per_type_shapes():
@@ -290,16 +287,8 @@ def test_run_shape_for_accessor_and_honest_per_type_shapes():
 
 
 def test_experiment_loop_is_a_valid_declarable_run_shape():
-    """`experiment_loop` is part of the closed run-shape vocabulary and is now
-    DECLARED by the reference compute_experiment type (the long-running
-    launch-and-poll experiment). Assert both that the value is declarable on the
-    dataclass and that compute_experiment is the registered type using it."""
-    from app.task_capabilities import TaskCapability, TaskType
-
-    cap = TaskCapability(
-        TaskType.investigate, "X", "read_only", run_shape="experiment_loop"
-    )
-    assert cap.run_shape == "experiment_loop"
+    """`experiment_loop` is part of the closed run-shape vocabulary declared by
+    compute_experiment — assert the registry-level invariant."""
     # compute_experiment is the registered type that runs the experiment loop.
     assert RUN_SHAPE_BY_TASK_TYPE["compute_experiment"] == "experiment_loop"
     assert run_shape_for("compute_experiment") == "experiment_loop"

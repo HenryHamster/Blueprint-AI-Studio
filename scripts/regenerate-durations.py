@@ -79,16 +79,28 @@ def get_coverage():
 
     return len(files), len(merged), files
 
+OUTLIER_CAP = 60.0  # seconds; above this is Docker Postgres cold-start, not real test cost
+
+
 def write_merged():
-    """Merge all partial files into .test_durations."""
+    """Merge all partial files into .test_durations, dropping outliers > OUTLIER_CAP."""
     merged = {}
+    outlier_count = 0
     for p in sorted(glob.glob(".durations_partial_*.json")):
         with open(p) as f:
-            merged.update(json.load(f))
+            data = json.load(f)
+        for k, v in data.items():
+            if v > OUTLIER_CAP:
+                outlier_count += 1
+            else:
+                merged[k] = v
 
     if not merged:
         print("  No partial data to merge")
         return 0
+
+    if outlier_count:
+        print(f"  Dropped {outlier_count} outlier(s) > {OUTLIER_CAP}s (fixture-setup misattribution)")
 
     td = ".test_durations"
     with open(td, "w") as f:

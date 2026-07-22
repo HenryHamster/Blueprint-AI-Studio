@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { CompactJobsTable } from './ComputeJobsPanel';
@@ -116,7 +116,6 @@ describe('CompactJobsTable — viewport at 1280px (acceptance capture)', () => {
       if (!host.textContent?.includes('Attested')) {
         throw new Error('expected the cloud run to render the Attested badge');
       }
-      expect(true).toBe(true);
     });
   });
 });

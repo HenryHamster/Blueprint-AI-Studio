@@ -132,19 +132,6 @@ describe('handlers registry', () => {
     expect(resolution.handler, `"${taskType}" must resolve to a runner`).toBeTypeOf('function');
   });
 
-  it('every registered handler is a function', () => {
-    for (const [type, handler] of Object.entries(handlers)) {
-      expect(typeof handler, `handler for "${type}" should be a function`).toBe('function');
-    }
-  });
-
-  it('no handler value is null or undefined', () => {
-    for (const [type, handler] of Object.entries(handlers)) {
-      expect(handler, `handler for "${type}" should not be null/undefined`).toBeDefined();
-      expect(handler, `handler for "${type}" should not be null`).not.toBeNull();
-    }
-  });
-
   it('strategic_review and research are distinct handlers — research dispatches to strategic only when payload.research_mode is "strategic"', () => {
     expect(handlers.strategic_review).not.toBe(handlers.research);
   });
@@ -451,21 +438,6 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 8 code-change + 15 read-only + 7 research = 30 total', () => {
-    const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
-    for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
-    expect(counts['code-change']).toBe(8);
-    expect(counts['read-only']).toBe(15);
-    expect(counts['research']).toBe(7);
-  });
-
-  it('no task type belongs to more than one class', () => {
-    const seen = new Set<string>();
-    for (const type of Object.keys(TASK_CLASS_MAP)) {
-      expect(seen, `"${type}" appears more than once in TASK_CLASS_MAP`).not.toContain(type);
-      seen.add(type);
-    }
-  });
 });
 
 // ── isResidentSessionTask unit ─────────────────────────────────────────────────

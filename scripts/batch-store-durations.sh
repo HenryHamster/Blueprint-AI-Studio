@@ -185,14 +185,23 @@ python3 -c "
 import json, glob, os, statistics
 
 merge_dir = '$SRUN_DIR'
+OUTLIER_CAP = 60.0  # seconds; above this is Docker Postgres cold-start, not real test cost
 merged = {}
+outlier_count = 0
 for path in sorted(glob.glob(os.path.join(merge_dir, '*/*.json'))):
     with open(path) as f:
         data = json.load(f)
-        pre = len(merged)
-        merged.update(data)
-        added = len(merged) - pre
-        print(f'  {os.path.relpath(path, merge_dir)}: {len(data)} entries ({added} new)')
+    pre = len(merged)
+    for k, v in data.items():
+        if v > OUTLIER_CAP:
+            outlier_count += 1
+            print(f'  SKIP outlier {v:.1f}s: {k}')
+        else:
+            merged[k] = v
+    added = len(merged) - pre
+    print(f'  {os.path.relpath(path, merge_dir)}: {len(data)} entries ({added} new)')
+if outlier_count:
+    print(f'  Dropped {outlier_count} outlier(s) > {OUTLIER_CAP}s (fixture-setup misattribution)')
 
 output = '$PWD/.test_durations'
 with open(output, 'w') as f:

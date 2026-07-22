@@ -145,14 +145,19 @@ def test_durations_coverage_fraction_within_threshold() -> None:
 
 
 # Ratchet floor: how many *distinct* duration values the committed file must have.
-# TODAY: floor=2 matches the known synthetic placeholder (exactly 2 values: 0.1 and 0.5).
-# After committing a real measured baseline (scripts/store-backend-durations.sh), bump
-# this to ≥50 to hard-block any future regression back to synthetic/degenerate values.
-_DISTINCT_VALUE_FLOOR = 2
+# Real measured baselines have thousands of distinct values; 50 is a permanent
+# hard floor that blocks regression back to synthetic/degenerate (2-value) data.
+_DISTINCT_VALUE_FLOOR = 50
 
 # Warn threshold: ≤ this many distinct values triggers a loud regeneration notice.
 # The warning surfaces in pytest's warnings summary without failing the blocking suite.
 _DEGENERATE_WARN_THRESHOLD = 5
+
+# Cap above which a duration is considered a fixture-setup artifact, not a real test
+# duration. Docker Postgres cold-start is charged to the first test in a batch and
+# can produce 400-600s entries. 60s is well above any legitimate single-test cost in
+# this suite (next-longest real test is ~27s) and well below the fixture-attribution range.
+_IMPLAUSIBLE_OUTLIER_CAP = 60.0
 
 
 def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
@@ -161,16 +166,12 @@ def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
 
     Two-tier response:
     1. WARN loudly when distinct_count <= _DEGENERATE_WARN_THRESHOLD — visible in
-       pytest's warnings summary right now, but does NOT fail the blocking CI gate
-       while the file is a known placeholder.
-    2. HARD-FAIL when distinct_count < _DISTINCT_VALUE_FLOOR — today floor=2 so the
-       synthetic file passes (2 >= 2).  Once a real measured baseline is committed,
-       bump _DISTINCT_VALUE_FLOOR to >=50 to block future regressions.
+       pytest's warnings summary right now, but does NOT fail the blocking CI gate.
+    2. HARD-FAIL when distinct_count < _DISTINCT_VALUE_FLOOR (floor=50).
 
     Regenerating a real baseline:
         bash scripts/store-backend-durations.sh   # ~15-20 min, requires Docker+Postgres
         git add backend/.test_durations && git commit
-    Then bump _DISTINCT_VALUE_FLOOR in this file to >=50 to activate the hard gate.
     """
     data = _load_durations()
     if not data:
@@ -197,4 +198,32 @@ def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
         f"only {distinct_count} distinct duration value(s) across {len(data)} entries "
         f"(floor={_DISTINCT_VALUE_FLOOR}). "
         f"Regenerate via: bash scripts/store-backend-durations.sh"
+    )
+
+
+def test_durations_no_implausible_outliers() -> None:
+    """
+    Reject fixture-setup cost misattributed to individual tests.
+
+    When pytest-split runs tests in batches with Docker+Postgres, Postgres cold-start
+    time (~400-600s) is charged to the first test in the batch.  These outlier values
+    corrupt shard balancing: the affected test looks 30-100× more expensive than it is,
+    causing CI to under-fill the shard that contains it.
+
+    Any duration above _IMPLAUSIBLE_OUTLIER_CAP (60s) is a misattribution artifact.
+    Strip them before committing via scripts/batch-store-durations.sh or
+    scripts/regenerate-durations.py (both enforce this cap during the merge step).
+    """
+    data = _load_durations()
+    if not data:
+        return
+
+    outliers = {k: v for k, v in data.items() if v > _IMPLAUSIBLE_OUTLIER_CAP}
+    assert not outliers, (
+        f"backend/.test_durations contains {len(outliers)} implausibly long duration(s) "
+        f"(> {_IMPLAUSIBLE_OUTLIER_CAP}s) — likely Docker Postgres cold-start attributed "
+        f"to the first test in a batch rather than real test cost.\n"
+        f"Offending entries: {dict(list(outliers.items())[:5])}\n"
+        f"Fix: strip entries > {_IMPLAUSIBLE_OUTLIER_CAP}s then recommit, or regenerate "
+        f"via scripts/batch-store-durations.sh (which caps automatically)."
     )

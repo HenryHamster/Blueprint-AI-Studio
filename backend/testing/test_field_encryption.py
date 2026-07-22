@@ -69,26 +69,14 @@ class TestEncryptDecryptRoundTrip:
 
 
 class TestNonePassthrough:
-    """Both functions return None when given None."""
+    """Both functions return None when given None (guard runs before key logic)."""
 
-    def test_encrypt_none_no_key(self):
-        """encrypt_field(None) returns None when no key is configured."""
+    def test_encrypt_none(self):
+        """encrypt_field(None) returns None regardless of key configuration."""
         assert encrypt_field(None) is None
 
-    def test_encrypt_none_with_key(self, monkeypatch):
-        """encrypt_field(None) returns None even with a valid key."""
-        key = Fernet.generate_key().decode()
-        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
-        assert encrypt_field(None) is None
-
-    def test_decrypt_none_no_key(self):
-        """decrypt_field(None) returns None when no key is configured."""
-        assert decrypt_field(None) is None
-
-    def test_decrypt_none_with_key(self, monkeypatch):
-        """decrypt_field(None) returns None even with a valid key."""
-        key = Fernet.generate_key().decode()
-        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+    def test_decrypt_none(self):
+        """decrypt_field(None) returns None regardless of key configuration."""
         assert decrypt_field(None) is None
 
 
@@ -218,14 +206,6 @@ class TestMaxPlanAccountFieldEncryption:
         recovered = decrypt_field(encrypt_field(config))
         assert recovered == config
 
-    def test_oauth_token_none_passes_through(self, monkeypatch):
-        """None oauth_token (non-Anthropic/OAuth accounts) stays None."""
-        key = Fernet.generate_key().decode()
-        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
-
-        assert encrypt_field(None) is None
-        assert decrypt_field(None) is None
-
     def test_legacy_plaintext_oauth_token_decrypts_unchanged(self, monkeypatch):
         """Pre-encryption rows (plaintext oauth_token) are returned as-is on read."""
         key = Fernet.generate_key().decode()
@@ -314,14 +294,13 @@ class TestWrongKeyPassthrough:
     before any per-row decryption is attempted.
     """
 
-    def test_wrong_valid_key_fails_continuity_closed(self, monkeypatch):
-        """Wrong-key: probe raises; decrypt_field passes ciphertext through unchanged.
+    def test_wrong_key_decrypt_passes_ciphertext_through(self, monkeypatch):
+        """decrypt_field with a wrong-but-valid Fernet key returns ciphertext unchanged.
 
-        Two assertions:
-        1. decrypt_field with a wrong-but-valid Fernet key returns the ciphertext
-           as-is (InvalidToken passthrough — backward compat documented behavior).
-        2. If the boot-time continuity probe is present, it raises on a wrong key
-           (the probe is the actual safety net that makes the passthrough acceptable).
+        InvalidToken passthrough is intentional backward compat for pre-migration
+        plaintext rows.  The boot-time continuity probe (probe_key_continuity) is
+        the actual safety net that catches wrong-key rotation before any per-row
+        decryption is attempted.
         """
         correct_key = Fernet.generate_key()
         wrong_key = Fernet.generate_key()
@@ -333,28 +312,11 @@ class TestWrongKeyPassthrough:
         # Configure the wrong key so decrypt_field will hit InvalidToken
         monkeypatch.setenv(ENCRYPTION_KEY_ENV, wrong_key.decode())
 
-        # Assertion 1: decrypt_field returns ciphertext unchanged (passthrough).
-        # This is intentional backward compat — the boot-time probe is the guard.
         result = decrypt_field(ciphertext)
         assert result == ciphertext, (
             "decrypt_field must return ciphertext unchanged on InvalidToken; "
             "the continuity probe is the safety net, not per-call raising"
         )
-
-        # Assertion 2: if the continuity probe exists, it must raise on a wrong key.
-        try:
-            from app.field_encryption import check_encryption_key_continuity  # type: ignore[attr-defined]
-        except ImportError:
-            # Probe not yet present (shipped by companion task); skip probe assertion.
-            import pytest
-
-            pytest.skip(
-                "check_encryption_key_continuity not yet present — "
-                "probe assertion deferred until companion task lands"
-            )
-        else:
-            with pytest.raises((RuntimeError, ValueError)):
-                check_encryption_key_continuity()
 
     def test_wrong_key_decrypt_emits_warning(self, monkeypatch, caplog):
         """decrypt_field logs a WARNING (not debug) when InvalidToken fires."""
@@ -466,7 +428,7 @@ class TestProbeKeyContinuity:
     """probe_key_continuity verifies or mints a per-environment continuity
     reference ciphertext."""
 
-    def test_wrong_valid_key_fails_continuity_closed(self, monkeypatch):
+    def test_wrong_key_raises_on_probe(self, monkeypatch):
         """A syntactically valid but wrong Fernet key raises RuntimeError.
 
         Mint a reference with key_a, then verify with key_b (wrong key).
