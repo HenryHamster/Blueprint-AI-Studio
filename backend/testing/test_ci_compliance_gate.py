@@ -1218,3 +1218,48 @@ def test_cap_bump_resolves_metrics_integrity_sweep_breach():
         "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
         "the updated module_size_limits.json."
     )
+
+
+def test_test_files_within_size_limits():
+    """Prove that the ``testing`` section of module_size_limits.json exists and
+    is non-empty, and that every test file listed there is actually within its
+    cap on disk.
+
+    This gate exercises the seam between the new ``testing`` section in
+    module_size_limits.json, the ``resolve_section_root`` branch for
+    ``"testing"`` in check_size_limits.py, and the per-file cap enforcement in
+    TestTestingSizeGuardrails (test_invariants.py). A non-empty testing section
+    with at least one file within its cap means all three components are wired up
+    correctly.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    testing_caps = data.get("testing", {})
+
+    assert testing_caps, (
+        "module_size_limits.json must define a non-empty 'testing' section. "
+        "Run `python3 backend/testing/check_size_limits.py --fix --sections testing` "
+        "and commit the updated JSON."
+    )
+
+    testing_root = os.path.normpath(os.path.dirname(__file__))
+    assert os.path.isdir(testing_root), "backend/testing/ must exist"
+
+    breaches = []
+    for rel, cap in testing_caps.items():
+        path = os.path.join(testing_root, rel)
+        if not os.path.isfile(path):
+            continue
+        count = csl.count_lines(path)
+        result = csl.classify_size_record(rel, count, cap, "testing", with_verdict=False)
+        if result["breach"]:
+            breaches.append((rel, count, cap))
+
+    assert not breaches, (
+        f"{len(breaches)} test file(s) exceed their cap in module_size_limits.json:\n"
+        + "\n".join(
+            f"  {rel}: {count} lines (cap: {cap})" for rel, count, cap in breaches
+        )
+        + "\nRun `python3 backend/testing/check_size_limits.py --fix --sections testing` "
+        "and commit the updated module_size_limits.json."
+    )

@@ -5812,6 +5812,7 @@ class TestAgentModuleSizeGuardrails:
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
 FRONTEND_SIZE_LIMITS = _SIZE_LIMITS["frontend"]
+TESTING_SIZE_LIMITS = _SIZE_LIMITS.get("testing", {})
 
 def _resolve_admin_ui_src_root() -> str | None:
     """Locate ``admin-ui/src`` across local + Docker test environments.
@@ -6028,6 +6029,38 @@ class TestSizeGuardrailCoverage:
             _AGENT_SRC_ROOT, AGENT_SIZE_LIMITS, (".ts",), _is_agent_excluded
         )
         assert not offenders, _missing_cap_message(offenders, "agent")
+
+    def test_testing_no_uncapped_large_file(self):
+        testing_root = os.path.normpath(os.path.dirname(__file__))
+        offenders = _scan_uncapped(
+            testing_root, TESTING_SIZE_LIMITS, (".py",), lambda _rel: False
+        )
+        assert not offenders, _missing_cap_message(offenders, "testing")
+
+class TestTestingSizeGuardrails:
+    """Loose upper bounds to catch runaway test file growth.
+
+    Test files are excluded from the backend section (which only covers
+    ``backend/app``). This class enforces the caps declared under the
+    ``testing`` section of module_size_limits.json so mega test files like
+    test_release_qualifier.py (45K lines) cannot grow without limit.
+    """
+
+    def _check_test_file(self, relative_path: str) -> None:
+        max_lines = TESTING_SIZE_LIMITS[relative_path]
+        path = os.path.join(os.path.dirname(__file__), relative_path)
+        with open(path, encoding="utf-8") as f:
+            count = len(f.readlines())
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "testing"
+        )
+
+    @pytest.mark.parametrize("relative_path", sorted(TESTING_SIZE_LIMITS))
+    def test_test_files_within_size_limits(self, relative_path):
+        """Every key in the ``testing`` section of module_size_limits.json is
+        enforced automatically — adding a key to the JSON is sufficient to
+        enforce its cap."""
+        self._check_test_file(relative_path)
 
 # ── LLM Token Pricing Coverage ──────────────────────────────────────────────
 
