@@ -288,6 +288,38 @@ async def _resolve_open_escalation(
         )
 
 
+# ── Remediation helper ────────────────────────────────────────────────────
+
+
+def _remediate_forward_leaked_messages(session: Any, msgs: list) -> int:
+    """Re-stamp forward-leaked messages with their canonical audience.
+
+    Iterates *msgs* (messages already detected as forward leaks) and updates
+    each message's ``context["audience"]`` to the canonical classification
+    returned by ``stamp_message_audience``.  For NULL-audience or mis-stamped
+    rows the canonical value is STRATEGIST_INTERNAL (fail-closed for
+    unregistered types) or OPERATOR_FYI — either way the row is excluded from
+    future ``operator_visible_audience_filter`` queries without waiting for the
+    14-day age-decay sweep.
+
+    Returns the number of messages successfully remediated.
+    Error-isolated per-message so a single malformed row never aborts the tick.
+    """
+    from app.message_audience import stamp_message_audience
+
+    count = 0
+    for msg in msgs:
+        with contextlib.suppress(Exception):
+            ctx = dict(msg.context or {})
+            event_type = ctx.get("event_type") or ""
+            msg_type = getattr(msg, "message_type", None)
+            new_ctx = stamp_message_audience(ctx, event_type, message_type=msg_type)
+            msg.context = new_ctx
+            session.add(msg)
+            count += 1
+    return count
+
+
 # ── Main liveness check ────────────────────────────────────────────────────
 
 
@@ -396,6 +428,13 @@ async def run_operator_inbox_liveness_check(
             m for m in messages
             if not derive_needs_action(m) and _audience_str(m) != OPERATOR_FYI
         ]
+
+        # Immediately remediate detected leaks: re-stamp audience to the
+        # canonical classification so the row is excluded from the operator
+        # inbox on the next query cycle without waiting for the 14-day
+        # age-decay sweep.  The count below records pre-remediation detections.
+        if forward_leaked_msgs:
+            _remediate_forward_leaked_messages(session, forward_leaked_msgs)
 
         # badge_invisible is always 0: the badge SQL now uses
         # status IN ('open', 'linked') for needs-action queries, so linked

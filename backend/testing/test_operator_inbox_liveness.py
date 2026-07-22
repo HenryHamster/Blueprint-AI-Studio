@@ -524,7 +524,6 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     """
     import app.operator_inbox_liveness as _liveness_mod
     from app.message_audience import STRATEGIST_INTERNAL
-    from sqlmodel import select
 
     _liveness_mod._reset_liveness_for_tests()
 
@@ -549,7 +548,9 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     escalations_1 = await _get_escalation_messages(db_session, project_id)
     assert len(escalations_1) == 0, "Should not escalate before persistence threshold"
 
-    # Tick 2 — second flagged tick (still not persistent)
+    # Tick 2 — second flagged tick (still not persistent).
+    # Tick 1 remediated the previous message; create a fresh leaked one.
+    await _create_forward_leaked_message(db_session, project_id)
     results_2 = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
     )
@@ -561,7 +562,8 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     escalations_2 = await _get_escalation_messages(db_session, project_id)
     assert len(escalations_2) == 0, "Should not escalate at only 2 ticks"
 
-    # Tick 3 — third flagged tick (NOW persistent: >= 3 consecutive)
+    # Tick 3 — third flagged tick (NOW persistent: >= 3 consecutive).
+    await _create_forward_leaked_message(db_session, project_id)
     results_3 = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
     )
@@ -589,7 +591,8 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     # Verify the escalation content references the leak
     assert "persistent" in (escalation.content or "").lower()
 
-    # Tick 4 — fourth flagged tick (already escalated, should be idempotent)
+    # Tick 4 — fourth flagged tick (already escalated, should be idempotent).
+    await _create_forward_leaked_message(db_session, project_id)
     results_4 = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
     )
@@ -607,35 +610,17 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
         f"(total messages with dedupe_key: {len(escalations_4)})"
     )
 
-    # Now clean up: remove the forward-leaked message so the project is clean.
-    # Tick 5 — clean tick (no forward-leaked messages → status "ok")
-    from app.models import ProjectMessage
-    leak_msgs = (
-        await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.project_id == _uuid.UUID(project_id),
-                ProjectMessage.message_type == "NOTE",
-                ProjectMessage.from_type == "system",
-            )
-        )
-    ).scalars().all()
-    for m in leak_msgs:
-        if (m.context or {}).get("audience") is None and m.status == "open":
-            m.status = "resolved"
-            m.resolution = "test-cleanup"
-            db_session.add(m)
-    await db_session.flush()
-
-    # Tick 5 — should now be "ok" (no forward leaks)
+    # Tick 5 — clean tick: all prior leaked messages were remediated (re-stamped
+    # to STRATEGIST_INTERNAL) by the liveness check, so no new message is needed
+    # for this tick to be clean.
     results_5 = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
     )
     assert results_5 is not None
     proj_5 = [r for r in results_5 if r.project_id == project_id]
-    # After resolving the leak message, we expect status "ok"
     if proj_5:
         assert proj_5[0].status in ("ok", "skipped"), (
-            f"Expected ok/skipped after cleanup, got {proj_5[0].status}"
+            f"Expected ok/skipped after remediation cleared all leaks, got {proj_5[0].status}"
         )
 
     # The escalation should now be resolved
@@ -659,6 +644,7 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     )
 
     # Tick 7 — 2nd flagged tick (still below persistence threshold of 3)
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
     escalations_7 = await _get_escalation_messages(db_session, project_id)
     open_7 = [e for e in escalations_7 if e.status == "open"]
@@ -668,6 +654,7 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     )
 
     # Tick 8 — 3rd flagged tick, persistence threshold reached again
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
 
     # A NEW escalation should exist (the old one is resolved, so a fresh open one)
@@ -729,16 +716,17 @@ async def test_no_escalation_below_persistence_threshold(db_session):
 async def test_clean_tick_resolves_open_escalation(db_session):
     """A clean tick (no forward leaks) resolves an existing open escalation."""
     import app.operator_inbox_liveness as _liveness_mod
-    from app.models import ProjectMessage
-    from sqlmodel import select
 
     _liveness_mod._reset_liveness_for_tests()
     project_id = await _create_test_project(db_session, "clean-resolve-test")
-    await _create_forward_leaked_message(db_session, project_id)
 
-    # Three ticks to trigger persistence and escalation
+    # Three ticks to trigger persistence and escalation.  Each tick creates a
+    # fresh leaked message because remediation re-stamps the previous one.
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
 
     # Escalation should exist and be open
@@ -746,22 +734,9 @@ async def test_clean_tick_resolves_open_escalation(db_session):
     assert len(escalations) == 1
     assert escalations[0].status == "open"
 
-    # Resolve the forward-leaked message to make the project clean
-    leak_msgs = (
-        await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.project_id == _uuid.UUID(project_id),
-                ProjectMessage.message_type == "NOTE",
-                ProjectMessage.from_type == "system",
-            )
-        )
-    ).scalars().all()
-    for m in leak_msgs:
-        if (m.context or {}).get("audience") is None and m.status == "open":
-            m.status = "resolved"
-            m.resolution = "test-cleanup"
-            db_session.add(m)
-    await db_session.flush()
+    # All prior leaked messages were remediated (re-stamped to STRATEGIST_INTERNAL)
+    # by the three liveness runs — no manual cleanup required.  The project is
+    # naturally clean for the next tick.
 
     # Clean tick — should resolve the escalation
     results = await _liveness_mod.run_operator_inbox_liveness_check(
@@ -811,11 +786,15 @@ async def test_observability_endpoint_includes_durable_data(
 
     _liveness_mod._reset_liveness_for_tests()
     project_id = await _create_test_project(db_session, "endpoint-durable-test")
-    await _create_forward_leaked_message(db_session, project_id)
 
-    # Run enough ticks to trigger escalation so there's an open episode
+    # Run enough ticks to trigger escalation so there's an open episode.
+    # Each tick creates a fresh leaked message because remediation re-stamps
+    # the previous one on each run.
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _create_forward_leaked_message(db_session, project_id)
     await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
 
     response = await client.get("/api/admin/operator-inbox-liveness")
@@ -842,5 +821,172 @@ async def test_observability_endpoint_includes_durable_data(
     assert any(
         ep.get("project_id") == project_id for ep in data["open_episodes"]
     ), f"No open episode found for {project_id}"
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Remediation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_forward_leaked_message_is_remediated_on_run(db_session):
+    """A forward-leaked message has its audience re-stamped on the first
+    liveness run, so it no longer appears in the operator inbox on the next run.
+
+    This is the acceptance test for the remediation feature: the liveness check
+    must not merely DETECT leaks but also FIX them in-place.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import is_operator_visible
+    from app.models import ProjectMessage
+    from sqlmodel import select
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "remediation-test")
+    msg_id = await _create_forward_leaked_message(db_session, project_id)
+
+    # Tick 1 — should detect and remediate the leaked message.
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+    flagged = [r for r in results if r.project_id == project_id and r.status == "flagged"]
+    assert len(flagged) == 1, "Expected 1 flagged result on tick 1"
+    assert flagged[0].forward_leaked == 1, "Expected 1 forward-leaked message detected"
+
+    # After remediation the message's audience must be re-stamped to a non-operator value.
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.id == _uuid.UUID(msg_id)
+            )
+        )
+    ).scalars().first()
+    assert msg is not None
+    remediated_audience = (msg.context or {}).get("audience")
+    assert remediated_audience is not None, (
+        "Remediation must stamp a canonical audience — NULL means the message "
+        "will still pass operator_visible_audience_filter on the next tick"
+    )
+    assert not is_operator_visible(remediated_audience), (
+        f"Remediated audience must NOT be operator-visible, got {remediated_audience!r}"
+    )
+
+    # Tick 2 — with the message remediated, the project should be clean.
+    results_2 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_2 is not None
+    proj_2 = [r for r in results_2 if r.project_id == project_id]
+    if proj_2:
+        assert proj_2[0].status in ("ok", "skipped"), (
+            f"Expected ok/skipped on tick 2 (message was remediated on tick 1), "
+            f"got {proj_2[0].status!r} with forward_leaked={proj_2[0].forward_leaked}"
+        )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_forward_leak_converges_to_zero_after_remediation(db_session):
+    """After one remediation tick, forward_leaked converges to exactly 0 on the
+    next tick — pinning the direction's ongoing-path success criterion.
+
+    Guards against regression where a new emitter re-introduces leaks and the
+    liveness check still reports a non-zero forward_leaked count after running,
+    meaning self-healing did not actually fix the offending rows.
+
+    Tick 1: creates one forward-leaked message (NULL-audience NOTE), runs the
+            liveness check, asserts forward_leaked >= 1 for the project.
+    Tick 2: runs the liveness check again WITHOUT injecting a new leaked message;
+            the first message was re-stamped to a non-operator audience by
+            remediation, so asserts forward_leaked == 0 (exact numeric convergence).
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "convergence-test")
+    await _create_forward_leaked_message(db_session, project_id)
+
+    # Tick 1 — detect the leak; remediation re-stamps the message in-place.
+    results_1 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_1 is not None
+    proj_1 = [r for r in results_1 if r.project_id == project_id]
+    assert proj_1, f"No result returned for project {project_id} on tick 1"
+    assert proj_1[0].forward_leaked >= 1, (
+        f"Expected at least 1 forward-leaked message on tick 1, "
+        f"got forward_leaked={proj_1[0].forward_leaked}"
+    )
+
+    # Tick 2 — no new leaked message created; remediation on tick 1 must have
+    # re-stamped the offending row so it no longer passes operator_visible_audience_filter.
+    results_2 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_2 is not None
+    proj_2 = [r for r in results_2 if r.project_id == project_id]
+    # If the project has zero leaks the check may return "ok" with no entry, or
+    # "skipped" — both mean forward_leaked is 0.
+    if proj_2:
+        assert proj_2[0].forward_leaked == 0, (
+            f"forward_leaked must converge to 0 after one remediation tick, "
+            f"got forward_leaked={proj_2[0].forward_leaked} (status={proj_2[0].status!r}); "
+            f"remediation did not re-stamp all offending rows"
+        )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_operator_fyi_message_is_not_remediated(db_session):
+    """An OPERATOR_FYI message is explicitly excluded from the forward-leak
+    predicate and must never be remediated.
+
+    The liveness check short-circuits on '_audience_str(m) != OPERATOR_FYI',
+    so FYI messages never enter the remediation path.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import OPERATOR_FYI
+    from app.models import ProjectMessage
+    from sqlmodel import select
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "fyi-no-remediation-test")
+    # Create a message explicitly stamped as OPERATOR_FYI.
+    msg_id = await _create_forward_leaked_message(
+        db_session, project_id, audience=OPERATOR_FYI, message_type="NOTE"
+    )
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    # The FYI message must NOT appear in forward_leaked.
+    proj = [r for r in results if r.project_id == project_id]
+    if proj:
+        assert proj[0].forward_leaked == 0, (
+            "OPERATOR_FYI messages must never be counted as forward leaks"
+        )
+
+    # The message's audience must still be OPERATOR_FYI after the run.
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == _uuid.UUID(msg_id))
+        )
+    ).scalars().first()
+    assert msg is not None
+    audience_after = (msg.context or {}).get("audience")
+    assert audience_after == OPERATOR_FYI, (
+        f"OPERATOR_FYI message audience must be unchanged after liveness run, "
+        f"got {audience_after!r}"
+    )
 
     _liveness_mod._reset_liveness_for_tests()
