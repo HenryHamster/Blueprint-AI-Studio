@@ -5245,6 +5245,7 @@
     "strategic_v1_helper": 21,
     "transport": 5,
     "workbench_v1_emitter": 1,
-    "workbench_v1_helper": 14
+    "workbench_v1_helper": 14,
+    "total_emitters": 327
   }
 }

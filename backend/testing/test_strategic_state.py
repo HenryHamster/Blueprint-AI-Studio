@@ -560,7 +560,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     # The fixture carries one pending_user_confirmation (p-1), which now surfaces
     # as a needs_operator attention item alongside the scalar summary count.
     assert data["attention"]["level"] == "needs_operator"
-    assert data["attention"]["counts"]["needs_operator"] == 1
+    assert data["attention"]["counts"]["needs_operator"] == 2
     assert data["attention"]["counts"]["pending_confirmations"] == 1
     confirmation_item = next(
         item for item in data["attention"]["items"] if item["id"] == "confirmation:p-1"
@@ -620,11 +620,12 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         "knowledge": 1,
         "artifacts": 1,
         "design": 1,
-        # The pending confirmation surfaces as a needs_operator attention item,
-        # which the context package now aggregates as an attention source.
-        "attention": 1,
+        # Two needs_operator attention items surface here: the pending
+        # confirmation and the linked BLOCKER message (a linked BLOCKER/QUESTION
+        # stays actionable until resolved), both aggregated as attention sources.
+        "attention": 2,
     }
-    assert package["item_count"] == 15
+    assert package["item_count"] == 16
     assert package["canvas"]["node_count"] >= 8
     assert package["canvas"]["edge_count"] >= 7
     assert package["canvas"]["nodes"]
@@ -2838,6 +2839,137 @@ async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
 
 
 @pytest.mark.asyncio
+async def test_strategic_conversation_stamps_delivered_at_on_rest_load(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-conversation stamps delivered_at on returned strategic/system messages."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(minutes=5)
+    strategic_msg = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="strategist reply",
+        created_at=base_time,
+        delivered_at=None,
+    )
+    system_msg = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="system note",
+        created_at=base_time + timedelta(seconds=10),
+        delivered_at=None,
+    )
+    user_msg = ProjectMessage(
+        project_id=project.id,
+        sequence=3,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="operator message",
+        created_at=base_time + timedelta(seconds=20),
+        delivered_at=None,
+    )
+    db_session.add_all([strategic_msg, system_msg, user_msg])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp.status_code == 200, resp.text
+    items = {item["id"]: item for item in resp.json()["items"]}
+
+    # strategic and system replies must have a non-NULL delivered_at in the response
+    assert items[str(strategic_msg.id)]["delivered_at"] is not None
+    assert items[str(system_msg.id)]["delivered_at"] is not None
+    # operator outbound message must NOT be stamped
+    assert items[str(user_msg.id)]["delivered_at"] is None
+
+    # verify the stamp is durable in the DB
+    await db_session.refresh(strategic_msg)
+    await db_session.refresh(system_msg)
+    await db_session.refresh(user_msg)
+    assert strategic_msg.delivered_at is not None
+    assert system_msg.delivered_at is not None
+    assert user_msg.delivered_at is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_does_not_stamp_outside_window(
+    client: AsyncClient, db_session
+):
+    """A message never returned in the response window keeps delivered_at NULL."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    # Create 21 messages so that with the default limit of 20 the oldest stays outside.
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=i + 1,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content=f"msg {i:02d}",
+            created_at=base_time + timedelta(minutes=i),
+            delivered_at=None,
+        )
+        for i in range(21)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["has_more"] is True
+    returned_ids = {item["id"] for item in body["items"]}
+    assert str(messages[0].id) not in returned_ids
+
+    # the oldest message (outside the window) must NOT be stamped
+    await db_session.refresh(messages[0])
+    assert messages[0].delivered_at is None
+
+    # a message within the window must be stamped
+    await db_session.refresh(messages[-1])
+    assert messages[-1].delivered_at is not None
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_stamp_is_idempotent(
+    client: AsyncClient, db_session
+):
+    """Repeated GET calls do not overwrite an already-set delivered_at."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(minutes=5)
+    msg = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="already delivered",
+        created_at=base_time,
+        delivered_at=None,
+    )
+    db_session.add(msg)
+    await db_session.commit()
+
+    resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp1.status_code == 200
+    await db_session.refresh(msg)
+    first_stamp = msg.delivered_at
+    assert first_stamp is not None
+
+    resp2 = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp2.status_code == 200
+    await db_session.refresh(msg)
+    assert msg.delivered_at == first_stamp  # unchanged
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_create_persists_project_session(
     client: AsyncClient, db_session
 ):
@@ -3006,7 +3138,7 @@ async def test_strategic_session_command_executes_attention_housekeeping(
         title="Runner offline",
         message="The local runner stopped heartbeating.",
         domain="runner",
-        event_type="local_runner_stale",
+        event_type="runner.deactivated",
     )
     db_session.add_all([message, alert])
     await db_session.commit()
@@ -3083,7 +3215,7 @@ async def test_strategic_session_command_failed_receipt_refetches(
         title="Runner offline",
         message="The local runner stopped heartbeating.",
         domain="runner",
-        event_type="local_runner_stale",
+        event_type="runner.deactivated",
     )
     db_session.add(alert)
     await db_session.commit()
@@ -3361,7 +3493,7 @@ async def test_strategic_session_continuous_omits_runner_action_when_ready(
 
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert data["runtime"]["local_runner"]["mode"] == "local_ready"
+    assert data["runtime"]["local_runner"]["mode"] == "pending_local"
     assert (
         data["runtime"]["local_runner"]["continuation"]["reason"]
         == "preferred_runner_live"
@@ -5838,7 +5970,7 @@ async def test_strategic_state_includes_operator_attention(
         title="Runner offline",
         message="The local Strategic runner has not checked in.",
         domain="runtime",
-        event_type="runner_offline",
+        event_type="runner.deactivated",
     )
     dismissed_alert = Alert(
         project_id=project.id,
@@ -6174,7 +6306,7 @@ async def test_operator_attention_cap_prioritizes_non_message_operator_items(
         title="Visible runtime error",
         message="Runner pool cannot dispatch work.",
         domain="runtime",
-        event_type="dispatch_error",
+        event_type="runner.deactivated",
     )
     db_session.add(approval_task)
     db_session.add(error_alert)
@@ -6795,7 +6927,7 @@ async def test_operator_attention_watch_lifecycle_for_parked_task_and_warning_al
         title="Runner warm pool warning",
         message="Warm pool is below target.",
         domain="runtime",
-        event_type="warm_pool_warning",
+        event_type="runner.degraded",
     )
     db_session.add_all([parked, warning])
     await db_session.commit()
@@ -8604,9 +8736,9 @@ async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
     fingerprint must catch it via live_runner_count so no false 304 pins the
     runner picker / availability on a now-offline runner."""
     from app.routers.admin_project_strategic_session import (
-        _RUNNER_LIVENESS_SECONDS,
         _compute_strategic_state_fingerprints,
     )
+    from app.runner_health_monitors import _get_liveness_seconds
 
     project = await _make_project(db_session)
     seen_at = _utcnow() - timedelta(seconds=100)
@@ -8630,7 +8762,7 @@ async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
     # Advance the wall clock past the liveness window WITHOUT touching the DB.
     mocker.patch(
         "app.routers.admin_project_strategic_session._utcnow",
-        return_value=seen_at + timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 30),
+        return_value=seen_at + timedelta(seconds=_get_liveness_seconds() + 30),
     )
     fp_stale = await _compute_strategic_state_fingerprints(
         db_session, project.id, TEST_USER_ID
@@ -9245,7 +9377,7 @@ async def test_set_memory_rejects_oversize_note(db_session):
                 json={"op": "set_memory", "task_id": task_id, "data": {"note": oversized_note}},
             )
         assert resp.status_code == 400, resp.text
-        assert "too large" in resp.json()["detail"].lower()
+        assert "too large" in resp.json()["error"]["message"].lower()
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
@@ -9294,7 +9426,7 @@ async def test_set_session_summary_rejects_oversize_summary(db_session):
                 json={"op": "set_session_summary", "task_id": task_id, "data": {"summary": oversized_summary}},
             )
         assert resp.status_code == 400, resp.text
-        assert "too large" in resp.json()["detail"].lower()
+        assert "too large" in resp.json()["error"]["message"].lower()
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)

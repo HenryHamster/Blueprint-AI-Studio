@@ -490,6 +490,7 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
         "status",
         "resolution",
         "resolved_at",
+        "delivered_at",
         "created_at",
         "updated_at",
     }

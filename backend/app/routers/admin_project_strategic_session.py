@@ -67,6 +67,7 @@ from app.project_message_creation import (
     create_operator_project_message,
     lock_project_and_next_message_sequence,
     parse_operator_message_type,
+    stored_wakeup_state,
 )
 from app.project_message_projection import (
     MESSAGE_EVENT_REFETCH_SURFACES,
@@ -1293,6 +1294,7 @@ async def _recent_session_conversation(
     after_sequence: int | None = None,
     limit: int = _SESSION_CONVERSATION_LIMIT,
     search: str | None = None,
+    stamp_delivery: bool = False,
 ) -> Dict[str, Any]:
     base_conditions: list[Any] = [
         ProjectMessage.project_id == project_id,
@@ -1388,6 +1390,18 @@ async def _recent_session_conversation(
         ).scalars().all()
         has_more = len(rows) > limit
         visible_rows = list(reversed(rows[:limit]))
+
+    if stamp_delivery:
+        _now = _utcnow()
+        for _row in visible_rows:
+            if _row.from_type in ("strategic", "system") and _row.delivered_at is None:
+                _row.delivered_at = _now
+                # Set updated_at explicitly so the ORM attribute matches the DB
+                # value after flush (prevents onupdate from producing a divergent
+                # timestamp that would destabilize the ETag on repeat reads).
+                _row.updated_at = _now
+                session.add(_row)
+        await session.flush()
 
     selected_ref_descriptors = await resolve_selected_ref_descriptors(
         session,
@@ -2829,11 +2843,18 @@ async def get_project_strategic_conversation(
             after_sequence=after_sequence,
             limit=limit,
             search=search,
+            stamp_delivery=True,
         )
+        await session.commit()
     result = {
         **conversation,
         "matched_message": (
             _message_preview(matched_message, content_max_chars=None)
+            if matched_message is not None
+            else None
+        ),
+        "wakeup_state": (
+            stored_wakeup_state(matched_message)
             if matched_message is not None
             else None
         ),

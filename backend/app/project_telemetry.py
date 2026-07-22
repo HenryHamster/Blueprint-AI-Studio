@@ -378,7 +378,7 @@ async def read_version_lane_baseline(
 ) -> Dict[str, Any] | None:
     """Return the lane-baseline blob for (project_id, version_number), or None."""
     result = await session.execute(
-        select(ProjectLaneBaseline.blob).where(
+        select(ProjectLaneBaseline.data).where(
             ProjectLaneBaseline.project_id == project_id,
             ProjectLaneBaseline.version_number == version_number,
         )
@@ -400,6 +400,6 @@ async def read_all_lane_baselines(
     result = await session.execute(
         select(ProjectLaneBaseline)
         .where(ProjectLaneBaseline.project_id == project_id)
-        .order_by(ProjectLaneBaseline.version_number.desc())
+        .order_by(ProjectLaneBaseline.updated_at.desc())
     )
     return list(result.scalars().all())

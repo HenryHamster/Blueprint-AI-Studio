@@ -33,7 +33,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List, NamedTuple
 
 from sqlalchemy import func, or_
@@ -55,6 +55,8 @@ _total_info_alert_noise: int = 0
 _total_remediated: int = 0
 _total_reply_audience_quarantined: int = 0
 _total_reply_audience_healed: int = 0
+_total_undelivered_strategist_replies: int = 0
+_undelivered_oldest_age_seconds: int = 0
 
 # ── Persistence / escalation constants ────────────────────────────────────
 
@@ -73,6 +75,15 @@ _QUARANTINE_ALERT_DEDUPE_PREFIX = "reply_quarantine_unhealed:"
 _QUARANTINE_ALERT_EVENT_TYPE = "delivery.reply_quarantine_unhealed"
 """Event type registered as OPERATOR_ACTION_NEEDED — surfaces in the operator channel."""
 
+_UNDELIVERED_ALERT_DEDUPE_PREFIX = "undelivered_strategist_reply:"
+"""Stable dedupe-key prefix for once-per-episode operator-visible undelivered-reply alert."""
+
+_UNDELIVERED_ALERT_EVENT_TYPE = "delivery.undelivered_strategist_reply"
+"""Event type registered as OPERATOR_ACTION_NEEDED — surfaces in the operator channel."""
+
+_UNDELIVERED_STALENESS_MINUTES = 15
+"""Minutes after which an undelivered operator-directed reply is considered stale."""
+
 
 class LivenessResult(NamedTuple):
     """One per-project result from a liveness check run."""
@@ -86,6 +97,7 @@ class LivenessResult(NamedTuple):
     remediated_count: int = 0
     reply_audience_quarantined: int = 0
     reply_audience_healed: int = 0
+    undelivered_strategist_replies: int = 0
 
 
 # ── Durable persistence helpers ────────────────────────────────────────────
@@ -419,6 +431,122 @@ async def _resolve_reply_quarantine_alert(
         )
 
 
+# ── Undelivered-reply alert helpers ───────────────────────────────────────
+
+
+async def _find_open_undelivered_alert(
+    session: Any,
+    project_id: str,
+) -> Any:
+    """Return the open operator-visible undelivered-reply alert for *project_id*, or None."""
+    try:
+        from app.models import ProjectMessage
+
+        dedupe_key = f"{_UNDELIVERED_ALERT_DEDUPE_PREFIX}{project_id}"
+        result = await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.status == "open",
+                ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
+            )
+            .limit(1)
+        )
+        return result.scalars().first()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Undelivered alert dedup lookup failed for %s",
+            project_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _escalate_undelivered_alert(
+    session: Any,
+    result: LivenessResult,
+) -> None:
+    """Create or update an OPERATOR_ACTION_NEEDED alert for undelivered strategist replies.
+
+    Follows the same pattern as ``_escalate_reply_quarantine_alert``: fires on the
+    FIRST tick a non-zero undelivered-reply count is detected and routes to
+    OPERATOR_ACTION_NEEDED.  A stable dedupe_key prevents duplicate alerts within
+    a single episode; subsequent ticks update the existing open alert in place.
+    Auto-resolved by ``_resolve_undelivered_alert`` when the undelivered count
+    reaches zero on a clean tick.
+    """
+    try:
+        import uuid as _uuid
+
+        existing = await _find_open_undelivered_alert(session, result.project_id)
+        if existing is not None:
+            ctx = dict(existing.context or {})
+            ctx["undelivered_strategist_replies"] = result.undelivered_strategist_replies
+            ctx["tick_number"] = _total_ticks
+            existing.content = (
+                f"[OPERATOR_INBOX_LIVENESS] Undelivered strategist reply(ies) detected "
+                f"for project {result.project_id}: "
+                f"{result.undelivered_strategist_replies} operator-directed strategist "
+                f"reply/replies never delivered (delivered_at IS NULL). "
+                f"Re-check if this alert persists."
+            )
+            existing.context = ctx
+            session.add(existing)
+            return
+
+        from app.notification_dispatch import post_event_message
+
+        dedupe_key = f"{_UNDELIVERED_ALERT_DEDUPE_PREFIX}{result.project_id}"
+        summary = (
+            f"Strategist reply(ies) never delivered (no delivery receipt) "
+            f"for project {result.project_id}: "
+            f"{result.undelivered_strategist_replies} operator-directed strategist "
+            f"reply/replies have delivered_at=NULL past the "
+            f"{_UNDELIVERED_STALENESS_MINUTES}-minute staleness threshold. "
+            f"These messages were routed with an operator-visible audience but "
+            f"never received a delivery ack — reply was possibly lost in transit. "
+            f"Detail: {result.detail[:400]}"
+        )
+        ctx = {
+            "undelivered_strategist_replies": result.undelivered_strategist_replies,
+            "tick_number": _total_ticks,
+            "dedupe_key": dedupe_key,
+        }
+        await post_event_message(
+            session,
+            project_id=_uuid.UUID(result.project_id),
+            event_type=_UNDELIVERED_ALERT_EVENT_TYPE,
+            summary=summary,
+            context=ctx,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to create undelivered alert for %s",
+            result.project_id,
+            exc_info=True,
+        )
+
+
+async def _resolve_undelivered_alert(
+    session: Any,
+    project_id: str,
+) -> None:
+    """Resolve any open undelivered-reply alert for *project_id* on a clean tick."""
+    try:
+        existing = await _find_open_undelivered_alert(session, project_id)
+        if existing is None:
+            return
+        existing.status = "resolved"
+        existing.resolution = "auto-resolved (zero undelivered strategist replies)"
+        session.add(existing)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to resolve undelivered alert for %s",
+            project_id,
+            exc_info=True,
+        )
+
+
 # ── Remediation helper ────────────────────────────────────────────────────
 
 
@@ -516,6 +644,7 @@ async def run_operator_inbox_liveness_check(
     global _last_liveness_check, _total_ticks
     global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
     global _total_reply_audience_quarantined, _total_reply_audience_healed
+    global _total_undelivered_strategist_replies, _undelivered_oldest_age_seconds
 
     if now is None:
         now = _utcnow()
@@ -604,7 +733,33 @@ async def run_operator_inbox_liveness_check(
             or 0
         )
 
-        if not messages and info_alert_count == 0 and quarantined_reply_count == 0:
+        # Undelivered strategist-reply detector: operator-visible strategist replies
+        # that were created but never delivered (delivered_at IS NULL) past the
+        # staleness threshold.  These are messages that SHOULD have been delivered
+        # but the transport ack was never received — a provable delivery gap.
+        staleness_cutoff = now - timedelta(minutes=_UNDELIVERED_STALENESS_MINUTES)
+        undelivered_reply_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.from_type != "user",
+                        ProjectMessage.delivered_at.is_(None),
+                        ProjectMessage.created_at < staleness_cutoff,
+                        or_(
+                            ProjectMessage.reply_to_message_id.isnot(None),
+                            ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
+                        ),
+                        operator_visible_audience_filter(ProjectMessage.context),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+        if not messages and info_alert_count == 0 and quarantined_reply_count == 0 and undelivered_reply_count == 0:
             results.append(
                 LivenessResult(
                     project_id=pid,
@@ -614,6 +769,7 @@ async def run_operator_inbox_liveness_check(
                     info_alert_noise=0,
                     detail="no open/linked operator-visible messages or INFO alerts",
                     reply_audience_quarantined=quarantined_reply_count,
+                    undelivered_strategist_replies=undelivered_reply_count,
                 )
             )
             continue
@@ -642,7 +798,7 @@ async def run_operator_inbox_liveness_check(
         # BLOCKER/QUESTION messages are correctly included in the count.
         n_forward = len(forward_leaked_msgs)
         n_badge = 0
-        delta = n_forward + n_badge + info_alert_count + quarantined_reply_count
+        delta = n_forward + n_badge + info_alert_count + quarantined_reply_count + undelivered_reply_count
 
         parts: List[str] = []
         if n_forward:
@@ -691,6 +847,12 @@ async def run_operator_inbox_liveness_check(
                 f"non-operator audience (reply-audience quarantine{heal_note})"
             )
 
+        if undelivered_reply_count:
+            parts.append(
+                f"{undelivered_reply_count} operator-directed strategist reply(ies) "
+                f"undelivered past {_UNDELIVERED_STALENESS_MINUTES} min (delivery gap)"
+            )
+
         status = "flagged" if delta > 0 else "ok"
         detail = (
             "; ".join(parts)
@@ -712,6 +874,7 @@ async def run_operator_inbox_liveness_check(
                 remediated_count=remediated,
                 reply_audience_quarantined=quarantined_reply_count,
                 reply_audience_healed=healed_count,
+                undelivered_strategist_replies=undelivered_reply_count,
             )
         )
 
@@ -721,8 +884,11 @@ async def run_operator_inbox_liveness_check(
         _total_remediated += remediated
         _total_reply_audience_quarantined += quarantined_reply_count
         _total_reply_audience_healed += healed_count
+        _total_undelivered_strategist_replies += undelivered_reply_count
 
     _total_ticks += 1
+    tick_undelivered = sum(r.undelivered_strategist_replies for r in results)
+    _undelivered_oldest_age_seconds = 1 if tick_undelivered > 0 else 0
     tick_forward = sum(r.forward_leaked for r in results)
     tick_badge = sum(r.badge_invisible for r in results)
     tick_alerts = sum(r.info_alert_noise for r in results)
@@ -740,6 +906,7 @@ async def run_operator_inbox_liveness_check(
         "remediated": tick_remediated,
         "reply_audience_quarantined": tick_quarantined,
         "reply_audience_healed": tick_healed,
+        "undelivered_strategist_replies": tick_undelivered,
     }
     _observability_ring.append(tick_summary)
 
@@ -777,6 +944,18 @@ async def run_operator_inbox_liveness_check(
         elif result.status in ("ok", "skipped"):
             with contextlib.suppress(Exception):
                 await _resolve_reply_quarantine_alert(session, result.project_id)
+
+    # ── Undelivered-reply operator alert ────────────────────────────────────
+    # Fire an OPERATOR_ACTION_NEEDED alert on first detection of undelivered
+    # strategist replies; resolve it when the count reaches zero.  Same immediate-
+    # fire pattern as the quarantine alert (no persistence threshold).
+    for result in results:
+        if result.undelivered_strategist_replies > 0:
+            with contextlib.suppress(Exception):
+                await _escalate_undelivered_alert(session, result)
+        elif result.status in ("ok", "skipped"):
+            with contextlib.suppress(Exception):
+                await _resolve_undelivered_alert(session, result.project_id)
 
     for result in flagged:
         with contextlib.suppress(Exception):
@@ -819,6 +998,8 @@ def get_operator_inbox_liveness_observability() -> Dict[str, Any]:
         "total_remediated": _total_remediated,
         "total_reply_audience_quarantined": _total_reply_audience_quarantined,
         "total_reply_audience_healed": _total_reply_audience_healed,
+        "total_undelivered_strategist_replies": _total_undelivered_strategist_replies,
+        "undelivered_oldest_age_seconds": _undelivered_oldest_age_seconds,
         "recent_ticks": list(_observability_ring),
     }
 
@@ -828,6 +1009,7 @@ def _reset_liveness_for_tests() -> None:
     global _last_liveness_check, _total_ticks
     global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
     global _total_reply_audience_quarantined, _total_reply_audience_healed
+    global _total_undelivered_strategist_replies, _undelivered_oldest_age_seconds
     _last_liveness_check = None
     _total_ticks = 0
     _total_forward_leaked = 0
@@ -836,4 +1018,117 @@ def _reset_liveness_for_tests() -> None:
     _total_remediated = 0
     _total_reply_audience_quarantined = 0
     _total_reply_audience_healed = 0
+    _total_undelivered_strategist_replies = 0
+    _undelivered_oldest_age_seconds = 0
     _observability_ring.clear()
+
+
+async def compute_undelivered_strategist_replies(
+    session: Any,
+    *,
+    staleness_minutes: int = _UNDELIVERED_STALENESS_MINUTES,
+    max_projects: int = 50,
+) -> dict:
+    """Compute undelivered strategist reply aggregates across known projects.
+
+    Returns a dict with fleet-wide aggregate counts:
+    - ``total_count``: int — total undelivered operator-directed strategist replies
+      past the staleness threshold across all projects.
+    - ``total_projects_affected``: int — number of projects with at least one
+      undelivered reply.
+    - ``oldest_age_seconds``: float | None — age in seconds of the oldest
+      undelivered reply (None when total_count is 0).
+    - ``by_project``: list[dict] — per-project breakdown with ``project_id``,
+      ``count``, and ``oldest_age_seconds``.
+
+    Error-isolated: returns zero-valued dict on any query failure so a transient
+    DB error never crashes the caller or degrades a metrics scrape.
+    """
+    try:
+        from app.models import ProjectMessage
+        from app.message_audience import operator_visible_audience_filter
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
+        staleness_cutoff = now - timedelta(minutes=staleness_minutes)
+
+        # Fleet-wide aggregate: total count and oldest created_at
+        agg = (
+            await session.execute(
+                select(
+                    func.count(),
+                    func.min(ProjectMessage.created_at),
+                ).where(
+                    ProjectMessage.from_type != "user",
+                    ProjectMessage.delivered_at.is_(None),
+                    ProjectMessage.created_at < staleness_cutoff,
+                    or_(
+                        ProjectMessage.reply_to_message_id.isnot(None),
+                        ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
+                    ),
+                    operator_visible_audience_filter(ProjectMessage.context),
+                )
+            )
+        ).one_or_none()
+
+        total_count = int(agg[0]) if agg else 0
+        oldest_created_at = agg[1] if agg else None
+        oldest_age_seconds = (
+            (now - oldest_created_at).total_seconds()
+            if oldest_created_at is not None and total_count > 0
+            else None
+        )
+
+        # Per-project breakdown
+        by_project_rows = (
+            await session.execute(
+                select(
+                    ProjectMessage.project_id,
+                    func.count(),
+                    func.min(ProjectMessage.created_at),
+                )
+                .where(
+                    ProjectMessage.from_type != "user",
+                    ProjectMessage.delivered_at.is_(None),
+                    ProjectMessage.created_at < staleness_cutoff,
+                    or_(
+                        ProjectMessage.reply_to_message_id.isnot(None),
+                        ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
+                    ),
+                    operator_visible_audience_filter(ProjectMessage.context),
+                )
+                .group_by(ProjectMessage.project_id)
+                .limit(max_projects)
+            )
+        ).all()
+
+        by_project = []
+        for row in by_project_rows:
+            pid, cnt, oldest = row
+            by_project.append({
+                "project_id": str(pid),
+                "count": int(cnt),
+                "oldest_age_seconds": (
+                    (now - oldest).total_seconds()
+                    if oldest is not None
+                    else None
+                ),
+            })
+
+        return {
+            "total_count": total_count,
+            "total_projects_affected": len(by_project),
+            "oldest_age_seconds": oldest_age_seconds,
+            "by_project": by_project,
+        }
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to compute undelivered strategist replies",
+            exc_info=True,
+        )
+        return {
+            "total_count": 0,
+            "total_projects_affected": 0,
+            "oldest_age_seconds": None,
+            "by_project": [],
+        }

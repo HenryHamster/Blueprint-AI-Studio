@@ -10,7 +10,7 @@ import os
 import uuid
 import asyncio
 import logging
-from typing import Optional, Dict, List, TypedDict
+from typing import Dict, List, TypedDict
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -111,7 +111,7 @@ class _StuckTaskInfo(TypedDict):
     stuck_reason: str
     stuck_for_seconds: int
     attempt_count: int
-    failure_class: Optional[str]
+    failure_class: str | None
     unresolvable_deps: List[str]
     remediation_hint: str
 
@@ -120,10 +120,10 @@ class _CircuitBreakerInfo(TypedDict):
     state: str
     failure_count: int
     infra_failure_count: int
-    open_reason: Optional[str]
+    open_reason: str | None
     cooldown_seconds: int
-    cooldown_remaining_seconds: Optional[int]
-    opened_at: Optional[str]
+    cooldown_remaining_seconds: int | None
+    opened_at: str | None
 
 
 class _ProjectSummary(TypedDict):
@@ -140,15 +140,15 @@ class _DirectionRemediationInfo(TypedDict):
     direction_text: str
     status: str
     auto_paused: bool
-    paused_reason: Optional[str]
-    paused_at: Optional[str]
+    paused_reason: str | None
+    paused_at: str | None
     auto_pause_count: int
     remediation_attempts: int
-    last_remediation_result: Optional[str]
-    last_remediation_at: Optional[str]
-    error_fingerprint: Optional[str]
+    last_remediation_result: str | None
+    last_remediation_at: str | None
+    error_fingerprint: str | None
     remediation_monitor_active: bool
-    remediation_monitor_started_at: Optional[str]
+    remediation_monitor_started_at: str | None
     remediation_regression_signal: bool
     remediation_regression_count: int
     needs_manual_intervention: bool
@@ -239,7 +239,7 @@ def _build_direction_portfolio_summary(project: Project) -> List[dict]:
     return results
 
 
-def _classify_stuck_failure(task: Task) -> Optional[str]:
+def _classify_stuck_failure(task: Task) -> str | None:
     """Classify stuck tasks using the canonical classifier.
 
     Stuck tasks have not actually failed yet, so misleading classifications are
@@ -249,10 +249,10 @@ def _classify_stuck_failure(task: Task) -> Optional[str]:
     that just hasn't emitted a status yet) both return None so the UI shows
     'unclassified' instead.
     """
-    from sqlalchemy import inspect as _sa_inspect  # noqa: PLC0415
-    from sqlalchemy.exc import NoInspectionAvailable  # noqa: PLC0415
+    from sqlalchemy import inspect as _sa_inspect
+    from sqlalchemy.exc import NoInspectionAvailable
 
-    from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.failure_classification import classify_failure
 
     # classify_failure reads the heavy JSONB columns (context, payloads,
     # api_call_summary). QUEUED rows arrive from the health-overview scan via
@@ -302,7 +302,7 @@ async def _build_stuck_tasks(
     session: AsyncSession,
 ) -> List[_StuckTaskInfo]:
     """Detect stuck tasks and build the diagnostics list."""
-    from app.compute import get_zone_health  # noqa: PLC0415
+    from app.compute import get_zone_health
 
     stuck: List[_StuckTaskInfo] = []
     # Align with reaper's pre-claim threshold (6 min) so diagnostics don't flag a
@@ -565,7 +565,7 @@ def _format_circuit_breaker(cb: dict) -> _CircuitBreakerInfo:
     }
 
 
-def _build_problem_model_trim_verdict(payload: dict) -> Optional[dict]:
+def _build_problem_model_trim_verdict(payload: dict) -> dict | None:
     """Summarize how read-time packing treated the problem_model in a strategic payload.
 
     Operators already see when a strategic cycle was *skipped* because the assembled
@@ -1059,8 +1059,8 @@ async def get_strategic_debug(
         )
         .limit(1)
     )
-    active_strategic_task: Optional[Task] = None
-    active_phase: Optional[str] = None
+    active_strategic_task: Task | None = None
+    active_phase: str | None = None
     result = (await session.execute(active_stmt)).scalars().first()
     if result is not None:
         active_strategic_task = result
@@ -1086,7 +1086,7 @@ async def get_strategic_debug(
         .scalars()
         .first()
     )
-    problem_model_trim: Optional[dict] = None
+    problem_model_trim: dict | None = None
     if latest_strategic is not None:
         problem_model_trim = _build_problem_model_trim_verdict(
             latest_strategic.first_payload
@@ -1130,7 +1130,7 @@ async def get_strategic_debug(
     # Strategic failure state (auto-decays after 48h)
     strategic_failures = vision.get("_strategic_failures", 0) or 0
     failures_at_iso = vision.get("_strategic_failures_at")
-    failures_decay_at_iso: Optional[str] = None
+    failures_decay_at_iso: str | None = None
     if failures_at_iso:
         try:
             last_failure = datetime.fromisoformat(
@@ -1723,7 +1723,7 @@ async def get_task_fix_loop_history(
     project drilldown pattern: load the task, then verify the caller has
     access to its project.
     """
-    from app.fix_loop_telemetry import summarize_fix_loop_history  # noqa: PLC0415
+    from app.fix_loop_telemetry import summarize_fix_loop_history
 
     task = (
         (await session.execute(select(Task).where(Task.id == task_id)))
@@ -1936,6 +1936,7 @@ async def get_operator_inbox_liveness(
     persistent-leak episodes (``open_episodes``) from the durable table.
     """
     from app.operator_inbox_liveness import (
+        compute_undelivered_strategist_replies,
         get_operator_inbox_liveness_observability,
         run_operator_inbox_liveness_check,
     )
@@ -1953,6 +1954,71 @@ async def get_operator_inbox_liveness(
         )
         snapshot = get_operator_inbox_liveness_observability()
         snapshot["run_results"] = [r._asdict() for r in (run_results or [])]
+
+    # ── Undelivered strategist-reply aggregate ───────────────────────────────
+    # Compute fleet-wide aggregates and per-project breakdown.  Error-isolated
+    # inside compute_undelivered_strategist_replies; returned dict is always safe.
+    try:
+        undelivered_data = await compute_undelivered_strategist_replies(session)
+        snapshot["undelivered_strategist_replies"] = undelivered_data
+    except Exception:  # noqa: BLE001
+        snapshot["undelivered_strategist_replies"] = {
+            "total_count": 0,
+            "total_projects_affected": 0,
+            "oldest_age_seconds": None,
+            "by_project": [],
+        }
+
+    # ── Undelivered-reply detail rows (force-run only) ───────────────────────
+    if force_run:
+        try:
+            staleness_cutoff = _ts() - timedelta(minutes=15)
+            from app.message_audience import operator_visible_audience_filter
+            from sqlalchemy import or_ as _or
+
+            detail_rows = (
+                await session.execute(
+                    select(
+                        ProjectMessage.id,
+                        ProjectMessage.project_id,
+                        ProjectMessage.created_at,
+                        ProjectMessage.reply_to_message_id,
+                        ProjectMessage.context["_resident_reply_covered_message_ids"].as_string(),
+                    )
+                    .where(
+                        ProjectMessage.from_type != "user",
+                        ProjectMessage.delivered_at.is_(None),
+                        ProjectMessage.created_at < staleness_cutoff,
+                        _or(
+                            ProjectMessage.reply_to_message_id.isnot(None),
+                            ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
+                        ),
+                        operator_visible_audience_filter(ProjectMessage.context),
+                    )
+                    .order_by(ProjectMessage.created_at.asc())
+                    .limit(200)
+                )
+            ).all()
+            now = _ts()
+            snapshot["undelivered_replies_detail"] = [
+                {
+                    "id": str(r.id),
+                    "project_id": str(r.project_id),
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "age_seconds": int((now - r.created_at).total_seconds())
+                    if r.created_at
+                    else None,
+                    "reply_to_message_id": str(r.reply_to_message_id)
+                    if r.reply_to_message_id
+                    else None,
+                    "covered_message_ids": (
+                        r[4] if r[4] else None
+                    ),
+                }
+                for r in detail_rows
+            ]
+        except Exception:  # noqa: BLE001
+            snapshot["undelivered_replies_detail"] = []
 
     # ── Durable observation history (most recent N rows across all projects) ─
     try:

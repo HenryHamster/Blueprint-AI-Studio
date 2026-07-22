@@ -341,6 +341,15 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # OPERATOR_ACTION_NEEDED so the operator sees that their reply was dropped and
     # a heal was attempted.  Auto-resolves when the quarantine count reaches zero.
     "delivery.reply_quarantine_unhealed": OPERATOR_ACTION_NEEDED,
+    # delivery.undelivered_strategist_reply: an operator-directed strategist reply
+    # has an operator-visible audience but was never delivered (delivered_at IS NULL)
+    # past the staleness threshold (~15 min).  Fires once per episode when the
+    # liveness checker detects such replies; OPERATOR_ACTION_NEEDED so the operator
+    # sees that their answer was lost.  Auto-resolves on a clean tick (zero
+    # undelivered replies).  Distinguished from delivery.reply_quarantine_unhealed
+    # because the audience IS operator-visible — the message was routed correctly
+    # but the delivery receipt itself is missing, indicating a transport-level loss.
+    "delivery.undelivered_strategist_reply": OPERATOR_ACTION_NEEDED,
 }
 
 # Set of audiences that reach the operator through normal channels.

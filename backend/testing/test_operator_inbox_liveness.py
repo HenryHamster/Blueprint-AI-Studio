@@ -11,6 +11,7 @@ Covers:
 
 import types
 import uuid as _uuid
+from datetime import timedelta
 
 import pytest
 
@@ -1742,3 +1743,527 @@ async def test_backfill_null_audience_sweep_stamps_and_is_idempotent(db_session)
     _liveness_mod._reset_liveness_for_tests()
 
     _liveness_mod._reset_liveness_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Undelivered strategist-reply detector tests
+# ---------------------------------------------------------------------------
+
+
+async def _create_undelivered_reply_message(
+    session,
+    project_id: str,
+    *,
+    from_type: str = "strategic",
+    audience: str = "operator-fyi",
+    delivered_at=None,
+    reply_to_id: str | None = None,
+    covered_message_ids: list[str] | None = None,
+    age_minutes: int = 20,
+    status: str = "open",
+) -> str:
+    """Create a ProjectMessage that will be detected as an undelivered strategist reply.
+
+    Creates a message with from_type != 'user', an operator-visible audience,
+    no delivered_at (unless explicitly set), and created_at in the past (beyond
+    the staleness threshold).
+    """
+    from app.models import ProjectMessage
+    from app.time_utils import _utcnow
+
+    pid = _uuid.UUID(project_id)
+
+    if reply_to_id is None and covered_message_ids is None:
+        # Default: create a synthetic parent and thread reply_to.
+        parent = ProjectMessage(
+            project_id=pid,
+            from_type="user",
+            message_type="NOTE",
+            status="open",
+            content="Parent operator message",
+            context={},
+        )
+        session.add(parent)
+        await session.flush()
+        reply_to_id = str(parent.id)
+
+    ctx: dict = {"audience": audience}
+    if covered_message_ids is not None:
+        ctx["_resident_reply_covered_message_ids"] = covered_message_ids
+
+    old_created = _utcnow() - timedelta(minutes=age_minutes)
+    msg = ProjectMessage(
+        project_id=pid,
+        from_type=from_type,
+        message_type="NOTE",
+        status=status,
+        content="Undelivered strategist reply for testing",
+        context=ctx,
+        reply_to_message_id=_uuid.UUID(reply_to_id) if reply_to_id else None,
+        delivered_at=delivered_at,
+        created_at=old_created,
+    )
+    session.add(msg)
+    await session.flush()
+    return str(msg.id)
+
+
+async def _get_undelivered_alert_messages(session, project_id: str) -> list:
+    """Return ProjectMessages carrying the undelivered-reply alert dedupe_key."""
+    from app.models import ProjectMessage
+    from sqlmodel import select
+
+    from app.operator_inbox_liveness import _UNDELIVERED_ALERT_DEDUPE_PREFIX
+
+    dedupe_key = f"{_UNDELIVERED_ALERT_DEDUPE_PREFIX}{project_id}"
+    result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == _uuid.UUID(project_id),
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
+        )
+    )
+    return list(result.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_count(db_session):
+    """A stale undelivered operator-visible strategist reply is detected and
+    counted by the liveness check.  A recently-created undelivered reply (within
+    the staleness window) is NOT counted.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "undelivered-count-test")
+
+    # Stale undelivered reply: created 20 min ago, operator-visible audience,
+    # no delivered_at → should be counted.
+    await _create_undelivered_reply_message(
+        db_session, project_id, age_minutes=20
+    )
+
+    # Fresh undelivered reply: created 2 min ago, within staleness window → NOT counted.
+    await _create_undelivered_reply_message(
+        db_session, project_id, age_minutes=2
+    )
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+    assert r.undelivered_strategist_replies == 1, (
+        f"Expected undelivered_strategist_replies=1 (only the stale one), "
+        f"got {r.undelivered_strategist_replies}"
+    )
+    # The project must be flagged because of the undelivered reply.
+    assert r.status == "flagged", (
+        f"Project with undelivered reply must be flagged, got {r.status!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_zero_when_all_delivered(db_session):
+    """All strategist replies have delivered_at set → count is 0."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.time_utils import _utcnow
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "delivered-all-test")
+
+    await _create_undelivered_reply_message(
+        db_session, project_id, delivered_at=_utcnow(), age_minutes=20
+    )
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    if proj:
+        assert proj[0].undelivered_strategist_replies == 0, (
+            "When delivered_at is set, undelivered count must be 0"
+        )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_excludes_user_messages(db_session):
+    """User messages (from_type='user') with delivered_at=NULL are not counted
+    as undelivered strategist replies."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.time_utils import _utcnow
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "undelivered-user-test")
+    pid = _uuid.UUID(project_id)
+
+    # Create a user message that is operator-visible but undelivered.
+    old_created = _utcnow() - timedelta(minutes=20)
+    from app.models import ProjectMessage
+
+    parent = ProjectMessage(
+        project_id=pid, from_type="user", message_type="NOTE",
+        status="open", content="Parent", context={},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    user_msg = ProjectMessage(
+        project_id=pid,
+        from_type="user",
+        message_type="NOTE",
+        status="open",
+        content="User message undelivered",
+        context={"audience": "operator-fyi"},
+        reply_to_message_id=parent.id,
+        created_at=old_created,
+    )
+    db_session.add(user_msg)
+    await db_session.flush()
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    if proj:
+        assert proj[0].undelivered_strategist_replies == 0, (
+            "User messages must not be counted as undelivered strategist replies"
+        )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_excludes_non_operator_audience(
+    db_session,
+):
+    """Strategist-internal audience replies with delivered_at=NULL are not counted."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "undelivered-nonop-test")
+
+    await _create_undelivered_reply_message(
+        db_session, project_id, audience=STRATEGIST_INTERNAL, age_minutes=20
+    )
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    if proj:
+        assert proj[0].undelivered_strategist_replies == 0, (
+            "STRATEGIST_INTERNAL audience must not be counted as undelivered"
+        )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_covered_messages(db_session):
+    """Strategist replies with context['_resident_reply_covered_message_ids']
+    but no reply_to_message_id are counted as undelivered."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "undelivered-covered-test")
+
+    # No reply_to_id, but has covered_message_ids in context.
+    await _create_undelivered_reply_message(
+        db_session,
+        project_id,
+        reply_to_id=None,
+        covered_message_ids=["m1", "m2"],
+        age_minutes=20,
+    )
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+    assert r.undelivered_strategist_replies == 1, (
+        f"Reply with covered_message_ids must be counted as undelivered, "
+        f"got {r.undelivered_strategist_replies}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_standalone_compute(db_session):
+    """The standalone compute_undelivered_strategist_replies function returns
+    correct fleet-wide aggregates."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_a = await _create_test_project(db_session, "undelivered-compute-a")
+    project_b = await _create_test_project(db_session, "undelivered-compute-b")
+
+    # Project A: 1 stale undelivered reply.
+    await _create_undelivered_reply_message(
+        db_session, project_a, age_minutes=20
+    )
+
+    # Project B: 2 stale undelivered replies.
+    await _create_undelivered_reply_message(
+        db_session, project_b, age_minutes=30
+    )
+    await _create_undelivered_reply_message(
+        db_session, project_b, age_minutes=25
+    )
+
+    result = await _liveness_mod.compute_undelivered_strategist_replies(
+        db_session
+    )
+
+    # Project-specific assertions (DB may have data from prior tests).
+    by_pid = {item["project_id"]: item["count"] for item in result["by_project"]}
+    assert by_pid.get(project_a) == 1, (
+        f"Expected project_a count=1, got {by_pid.get(project_a)}"
+    )
+    assert by_pid.get(project_b) == 2, (
+        f"Expected project_b count=2, got {by_pid.get(project_b)}"
+    )
+    assert result["total_projects_affected"] >= 2, (
+        f"Expected at least 2 projects affected, got {result['total_projects_affected']}"
+    )
+    assert result["oldest_age_seconds"] is not None, (
+        "oldest_age_seconds must not be None when undelivered replies exist"
+    )
+    # At least 20 min old (our youngest created_at is 20 min old).
+    assert result["oldest_age_seconds"] >= 1200, (
+        f"Expected oldest_age_seconds >= 1200 (20+ min), "
+        f"got {result['oldest_age_seconds']}"
+    )
+
+    assert len(result["by_project"]) >= 2
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_compute_zero_when_none(db_session):
+    """compute_undelivered_strategist_replies returns correctly when there are
+    no undelivered replies for specific projects.  Relies on by_project
+    filtering rather than global total (which may include data from prior tests)."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    # Create a project with NO undelivered messages — it must not appear in by_project.
+    clean_project = await _create_test_project(db_session, "undelivered-clean-test")
+
+    result = await _liveness_mod.compute_undelivered_strategist_replies(
+        db_session
+    )
+
+    # Our clean project must not appear in by_project.
+    clean_projects = [
+        item for item in result["by_project"]
+        if item["project_id"] == clean_project
+    ]
+    assert len(clean_projects) == 0, (
+        f"Project with no undelivered replies must not appear in by_project, "
+        f"got {clean_projects}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_alert_created_on_detection(
+    db_session,
+):
+    """An OPERATOR_ACTION_NEEDED alert is created when undelivered replies are
+    detected, and auto-resolves on a clean tick."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import is_operator_visible
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "undelivered-alert-test")
+
+    # Tick 1: undelivered reply detected → alert fires.
+    await _create_undelivered_reply_message(
+        db_session, project_id, age_minutes=20
+    )
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+    assert r.undelivered_strategist_replies >= 1, (
+        f"Expected undelivered_strategist_replies >= 1, got {r.undelivered_strategist_replies}"
+    )
+    assert r.status == "flagged"
+
+    # Operator-visible alert must exist.
+    alert_msgs = await _get_undelivered_alert_messages(db_session, project_id)
+    assert len(alert_msgs) >= 1, (
+        "An operator-visible undelivered-reply alert must be created on first detection"
+    )
+    alert = next(m for m in alert_msgs if m.status == "open")
+    alert_audience = (alert.context or {}).get("audience")
+    assert is_operator_visible(alert_audience), (
+        f"Undelivered-reply alert must have operator-visible audience, "
+        f"got {alert_audience!r}"
+    )
+
+    # Tick 2: verify the alert is auto-resolved by calling the resolution helper
+    # directly.  The resolution fires when the liveness check encounters a
+    # project with zero undelivered replies and status in ("ok", "skipped").
+    await _liveness_mod._resolve_undelivered_alert(db_session, project_id)
+    # _resolve_undelivered_alert modifies the alert in-place via the identity
+    # map (same db_session), so the local `alert` variable reflects the change
+    # without needing a refresh.
+    assert alert.status == "resolved", (
+        f"Undelivered-reply alert must be auto-resolved after resolution call, "
+        f"got status={alert.status!r}"
+    )
+    assert alert.resolution == "auto-resolved (zero undelivered strategist replies)", (
+        f"Unexpected resolution text: {alert.resolution!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_observability_snapshot(
+    client: AsyncClient,
+):
+    """The observability snapshot includes total_undelivered_strategist_replies
+    and undelivered_oldest_age_seconds keys."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    response = await client.get("/api/admin/operator-inbox-liveness")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert "total_undelivered_strategist_replies" in data, (
+        "Observability snapshot must include total_undelivered_strategist_replies"
+    )
+    assert "undelivered_oldest_age_seconds" in data, (
+        "Observability snapshot must include undelivered_oldest_age_seconds"
+    )
+    assert data["total_undelivered_strategist_replies"] == 0
+    assert data["undelivered_oldest_age_seconds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_endpoint_detail(
+    client: AsyncClient, db_session
+):
+    """The liveness endpoint with ?force_run=true returns undelivered replies
+    detail when undelivered strategist replies exist."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.models import ProjectMessage
+    from app.time_utils import _utcnow
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "undelivered-endpoint-test")
+    pid = _uuid.UUID(project_id)
+
+    # Create a stale undelivered reply so there is detail to return.
+    old_created = _utcnow() - timedelta(minutes=20)
+    parent = ProjectMessage(
+        project_id=pid, from_type="user", message_type="NOTE",
+        status="open", content="Parent", context={},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    reply = ProjectMessage(
+        project_id=pid,
+        from_type="strategic",
+        message_type="NOTE",
+        status="open",
+        content="Undelivered strategist reply",
+        context={"audience": "operator-fyi"},
+        reply_to_message_id=parent.id,
+        created_at=old_created,
+    )
+    db_session.add(reply)
+    await db_session.flush()
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/operator-inbox-liveness?force_run=true"
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    # The snapshot must contain the aggregate key.
+    assert "undelivered_strategist_replies" in data, (
+        "Response must include undelivered_strategist_replies aggregate"
+    )
+    assert data["undelivered_strategist_replies"]["total_count"] > 0, (
+        "Aggregate must show > 0 undelivered replies"
+    )
+
+    # The detail rows must be present (force_run was set).
+    assert "undelivered_replies_detail" in data, (
+        "Response must include undelivered_replies_detail when force_run=true"
+    )
+    assert len(data["undelivered_replies_detail"]) > 0, (
+        "Expected at least one undelivered reply detail row"
+    )
+
+    # Our project's detail must be present among the rows.
+    project_details = [
+        d for d in data["undelivered_replies_detail"]
+        if d.get("project_id") == project_id
+    ]
+    assert len(project_details) >= 1, (
+        f"No undelivered reply detail found for project {project_id}"
+    )
+    detail = project_details[0]
+    assert "id" in detail
+    assert "created_at" in detail
+    assert "age_seconds" in detail
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_strategist_replies_event_type_registered():
+    """The delivery.undelivered_strategist_reply event type is registered as
+    OPERATOR_ACTION_NEEDED."""
+    from app.message_audience import (
+        OPERATOR_ACTION_NEEDED,
+        is_operator_visible,
+        route_event,
+    )
+
+    audience = route_event("delivery.undelivered_strategist_reply")
+    assert audience == OPERATOR_ACTION_NEEDED, (
+        f"Expected OPERATOR_ACTION_NEEDED, got {audience!r}"
+    )
+    assert is_operator_visible(audience), (
+        "Undelivered-reply event must be operator-visible"
+    )

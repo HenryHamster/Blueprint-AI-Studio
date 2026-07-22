@@ -1938,6 +1938,25 @@ async def prometheus_metrics(request: Request):
             1 if _pw.get("delivery_stalled") else 0,
         )
 
+    # Undelivered strategist replies — fleet-wide count and oldest age.
+    # Uses the same error-isolated async pattern as park/wake health above
+    # so a transient DB error degrades the scrape gracefully.
+    with contextlib.suppress(Exception):
+        from app.operator_inbox_liveness import compute_undelivered_strategist_replies
+
+        async with AsyncSessionLocal() as _ur_session:
+            _ur = await compute_undelivered_strategist_replies(_ur_session)
+        gauge(
+            "blueprint_undelivered_strategist_replies_total",
+            "Total count of undelivered operator-directed strategist replies past the staleness threshold",
+            _ur.get("total_count", 0),
+        )
+        gauge(
+            "blueprint_undelivered_strategist_replies_oldest_age_seconds",
+            "Age in seconds of the oldest undelivered strategist reply (-1 if none)",
+            _ur.get("oldest_age_seconds") or -1,
+        )
+
     body = "\n".join(lines) + "\n"
     from fastapi.responses import PlainTextResponse
 

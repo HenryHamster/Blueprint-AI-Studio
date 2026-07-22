@@ -787,6 +787,7 @@ async def list_messages(
         ProjectMessage.status,
         ProjectMessage.resolution,
         ProjectMessage.resolved_at,
+        ProjectMessage.delivered_at,
         ProjectMessage.created_at,
         ProjectMessage.updated_at,
         raiseload=True,
