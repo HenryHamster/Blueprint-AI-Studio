@@ -639,19 +639,24 @@ describe('ProjectToolHost — delete confirmation gate', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Operator-tools walkthrough: acceptance criterion c-5214996f
-// "Tool placement control must actually move the tool (no phantom control)"
+// Placement surface routing: acceptance criterion c-5214996f
+// "Tool placement control must actually move the tool"
 //
-// The placement dropdown was removed from the Configure dialog in #15978.
-// These tests are the machine-readable re-walk: they verify that the Configure
-// dialog does NOT expose any placement control, and that the PATCH call emitted
-// on Save does NOT include a placement field (so backend placement changes must
-// be made outside the per-tool Configure panel — via a future explicit control).
+// The Configure dialog exposes a placement <select> (TOOL_PLACEMENTS).
+// Changing placement and saving calls updateProjectTool with the new value.
+// The rendered tool list routes project_section tools to the main grid and
+// toolbar/sidebar tools to the "Other surfaces" section.
 // ---------------------------------------------------------------------------
 
-describe('ProjectToolHost — no phantom placement control (c-5214996f re-walk)', () => {
+describe('ProjectToolHost — placement routes tool to correct surface (c-5214996f)', () => {
+  const TOOLBAR_TOOL: ProjectTool = {
+    ...TOOL,
+    id: 'tool-toolbar',
+    title: 'Toolbar Widget',
+    placement: 'toolbar',
+  };
+
   beforeEach(() => {
-    vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
     vi.mocked(updateProjectTool).mockResolvedValue({ ...TOOL });
@@ -666,54 +671,51 @@ describe('ProjectToolHost — no phantom placement control (c-5214996f re-walk)'
     vi.clearAllMocks();
   });
 
-  test('Configure dialog exposes no placement select or input', async () => {
+  test('tool with placement project_section renders in main grid, not Other surfaces', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
-    await act(async () => { requireButton('Configure').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
-
-    // No select elements at all — placement dropdown was removed (#15978).
-    expect(h().querySelectorAll('select').length).toBe(0);
-
-    // No input or select element whose name or data-attribute signals placement.
-    const placementControls = Array.from(
-      h().querySelectorAll<HTMLElement>('input, select')
-    ).filter(
-      el =>
-        el.getAttribute('name') === 'placement' ||
-        el.getAttribute('data-field') === 'placement' ||
-        el.getAttribute('aria-label')?.toLowerCase().includes('placement'),
-    );
-    expect(placementControls.length).toBe(0);
+    // Main grid shows the tool content
+    expect(h().textContent).toContain('My Widget content');
+    // "Other surfaces" heading is absent when no non-project_section tools exist
+    expect(h().textContent).not.toContain('Other surfaces');
   });
 
-  test('Save in Configure dialog does not include placement in the PATCH call', async () => {
+  test('tool with placement toolbar renders under Other surfaces heading, not main grid', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [TOOLBAR_TOOL],
+      total_count: 1,
+      next_offset: null,
+    });
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    // "Other surfaces" section is present
+    expect(h().textContent).toContain('Other surfaces');
+    // The tool's content is visible (it has a registered kind)
+    expect(h().textContent).toContain('Toolbar Widget content');
+  });
+
+  test('Configure dialog placement dropdown change persists new placement via updateProjectTool', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
+    vi.mocked(updateProjectTool).mockResolvedValue({ ...TOOL, placement: 'toolbar' });
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Configure').click(); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    // Placement <select> is present and starts at project_section
+    const sel = h().querySelector('select') as HTMLSelectElement;
+    expect(sel).toBeTruthy();
+    expect(sel.value).toBe('project_section');
+
+    // Change placement to toolbar
+    const selectSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
+    selectSetter?.call(sel, 'toolbar');
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+
     await act(async () => { requireButton('Save').click(); });
-
-    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledTimes(1);
-    const [, , patch] = vi.mocked(updateProjectTool).mock.calls[0];
-    expect('placement' in (patch as Record<string, unknown>)).toBe(false);
-  });
-
-  test('owner can Configure a tool without exposure to a phantom placement dropdown', async () => {
-    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
-    // Configure button is present and opens a panel.
-    expect(findButton('Configure')).toBeTruthy();
-    await act(async () => { requireButton('Configure').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
-
-    // Panel is open (Save button visible).
-    expect(findButton('Save')).toBeTruthy();
-
-    // No phantom placement selector anywhere in the open panel.
-    expect(h().querySelector('select')).toBeNull();
-
-    // The title field is editable (non-phantom configure control).
-    const titleInput = h().querySelector('input[type="text"]') as HTMLInputElement;
-    expect(titleInput).toBeTruthy();
-    expect(titleInput.value).toBe('My Widget');
+    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
+      'proj-a',
+      'tool-1',
+      { title: 'My Widget', placement: 'toolbar', config: {} },
+    );
   });
 });
 

@@ -2830,4 +2830,58 @@ describe('FleetRunnersPanel — behavioral', () => {
       vi.useRealTimers();
     }
   });
+
+  // ── Enroll UI two-button contract ────────────────────────────────────────────
+
+  test('enroll UI presents exactly two preset buttons — Strategic runner and Enroll runner — with no post-click chooser', async () => {
+    const el = await mount();
+
+    const allButtons = [...el.querySelectorAll('button')];
+    const strategicBtn = allButtons.find(b => b.textContent?.trim() === 'Strategic runner') as HTMLButtonElement | undefined;
+    const enrollBtn = allButtons.find(b => b.textContent?.trim() === 'Enroll runner') as HTMLButtonElement | undefined;
+
+    // Both preset buttons must be present
+    expect(strategicBtn).not.toBeUndefined();
+    expect(enrollBtn).not.toBeUndefined();
+
+    // No intermediate chooser dialog should appear before clicking
+    expect(el.textContent).not.toContain('Choose a preset');
+    expect(el.textContent).not.toContain('strategic_local');
+
+    // Clicking "Enroll runner" opens the token dialog immediately — no chooser step
+    await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+    expect(el.textContent).toContain('Runner enrolled');
+    expect(el.textContent).not.toContain('Choose a preset');
+
+    // Dismiss and reset
+    const dismissBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes("I've copied the token"));
+    await act(async () => { (dismissBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // Clicking "Strategic runner" also opens the token dialog immediately
+    await act(async () => { (strategicBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+    expect(el.textContent).toContain('Strategic runner enrolled');
+    expect(el.textContent).not.toContain('Choose a preset');
+  });
+
+  test('enroll 422 bad-capabilities detail renders in the error banner', async () => {
+    const badCapMsg = 'unknown task type for runner capability: bad_type';
+    vi.mocked(registerFleetRunner).mockRejectedValueOnce(new Error(badCapMsg));
+    const el = await mount();
+
+    const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Enroll runner') as HTMLButtonElement;
+    await act(async () => { enrollBtn.click(); });
+    await act(async () => {});
+
+    // Error detail from the 422 must appear in the red banner
+    const banner = el.querySelector('.text-red-300');
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent).toContain(badCapMsg);
+
+    // No token dialog should appear on error
+    expect(el.textContent).not.toContain('Runner enrolled');
+    expect(el.textContent).not.toContain('tok-secret-xyz');
+  });
 });
