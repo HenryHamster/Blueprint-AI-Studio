@@ -411,6 +411,27 @@ def reset_rate_limiter():
     yield
 
 
+@pytest.fixture(autouse=False)
+def clean_zone_health():
+    """Reset zone health and quota state before and after each test."""
+    from app import compute, provision_error_scope
+
+    def _reset():
+        compute._zone_health.clear()
+        compute._zone_failures.clear()
+        provision_error_scope._global_quota_state.clear()
+        provision_error_scope._region_quota_state.clear()
+        compute._zone_suspect_events.clear()
+        compute._gpu_zone_health.clear()
+        compute._gpu_zone_failures.clear()
+        provision_error_scope._gpu_global_quota_state.clear()
+        provision_error_scope._gpu_region_quota_state.clear()
+
+    _reset()
+    yield
+    _reset()
+
+
 _TEST_CSRF_TOKEN = "test-csrf-token-for-client-fixture"
 
 
