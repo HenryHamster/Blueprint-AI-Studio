@@ -180,51 +180,9 @@ wait
 echo "All workers completed"
 
 # --- Merge all duration files ---
+# Delegates to scripts/merge_durations.py (shared outlier cap + quality guards from
+# scripts/durations_quality.py) so the merge logic lives in one lintable, testable place.
 echo ""; echo "=== Merging ==="
-python3 -c "
-import json, glob, os, statistics
-
-merge_dir = '$SRUN_DIR'
-OUTLIER_CAP = 60.0  # seconds; above this is Docker Postgres cold-start, not real test cost
-merged = {}
-outlier_count = 0
-for path in sorted(glob.glob(os.path.join(merge_dir, '*/*.json'))):
-    with open(path) as f:
-        data = json.load(f)
-    pre = len(merged)
-    for k, v in data.items():
-        if v > OUTLIER_CAP:
-            outlier_count += 1
-            print(f'  SKIP outlier {v:.1f}s: {k}')
-        else:
-            merged[k] = v
-    added = len(merged) - pre
-    print(f'  {os.path.relpath(path, merge_dir)}: {len(data)} entries ({added} new)')
-if outlier_count:
-    print(f'  Dropped {outlier_count} outlier(s) > {OUTLIER_CAP}s (fixture-setup misattribution)')
-
-output = '$PWD/.test_durations'
-with open(output, 'w') as f:
-    json.dump(merged, f, indent=2, sort_keys=True)
-    f.write('\n')
-
-vs = list(merged.values())
-n, uv = len(vs), len(set(vs))
-avg = statistics.mean(vs)
-sd = statistics.stdev(vs) if n > 1 else 0
-cv = sd / avg if avg > 0 else 0
-print()
-print(f'Total entries: {n}')
-print(f'Unique values: {uv}')
-print(f'Mean: {avg:.4f}s | SD: {sd:.4f}s | CV: {cv:.4f}')
-print(f'Min: {min(vs):.4f}s | Max: {max(vs):.4f}s')
-ok = 'PASS' if n >= 5000 and uv >= 100 and cv > 1.0 else 'FAIL'
-print(f'Guard check: {ok} (needs n>=5000, uv>=100, CV>1.0)')
-print()
-if ok == 'FAIL':
-    for check, val, needed in [('entries', n, 5000), ('unique values', uv, 100), ('CV > 1.0', cv, 1.0)]:
-        if (check == 'entries' and val < 5000) or (check == 'unique values' and val < 100) or (check == 'CV > 1.0' and cv <= 1.0):
-            print(f'  FAIL: {check}: {val} < {needed}')
-"
+python3 "$SCRIPT_DIR/merge_durations.py" "$SRUN_DIR" "$PWD/.test_durations"
 
 echo "=== Done ==="

@@ -10,6 +10,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from durations_quality import MIN_ENTRIES, MIN_UNIQUE, MIN_CV, OUTLIER_CAP, quality_ok
+
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 os.chdir(BACKEND)
 
@@ -79,8 +82,6 @@ def get_coverage():
 
     return len(files), len(merged), files
 
-OUTLIER_CAP = 60.0  # seconds; above this is Docker Postgres cold-start, not real test cost
-
 
 def write_merged():
     """Merge all partial files into .test_durations, dropping outliers > OUTLIER_CAP."""
@@ -147,13 +148,8 @@ def main():
     batch_num = 0
     start_time = time.time()
 
-    # Relative guard targets (matching batch-store-durations.sh):
-    #   entries >= 5000, unique values >= 100, CV > 1.0
-    # Absolute file-coverage target: cover every known test_*.py file.
-    MIN_ENTRIES = 5000
-    MIN_UNIQUE = 100
-    MIN_CV = 1.0
-
+    # Relative guard targets come from durations_quality (MIN_ENTRIES/MIN_UNIQUE/MIN_CV);
+    # absolute file-coverage target: cover every known test_*.py file.
     while True:
         covered_count, entry_count, covered_set = get_coverage()
         elapsed = time.time() - start_time
@@ -178,7 +174,7 @@ def main():
         n, uv = len(vs), len(set(vs))
         cv = statistics.stdev(vs) / statistics.mean(vs) if statistics.mean(vs) > 0 else 0
 
-        ok = covered_count >= total_files and entry_count >= MIN_ENTRIES and uv >= MIN_UNIQUE and cv > MIN_CV
+        ok = covered_count >= total_files and quality_ok(entry_count, uv, cv)
         if ok:
             print(f"✓ All targets met! (n={n}, uv={uv}, CV={cv:.2f})")
             break
@@ -248,10 +244,9 @@ def main():
     cv = statistics.stdev(vs) / statistics.mean(vs) if statistics.mean(vs) > 0 else 0
     print(f"Final: {n} entries, {uv} unique values, CV={cv:.2f}")
 
-    # Relative guards (matching batch-store-durations.sh):
-    # entries >= 5000, unique values >= 100, CV > 1.0
-    ok = n >= 5000 and uv >= 100 and cv > 1.0
-    print(f"Guard: {'PASS' if ok else 'FAIL'} (needs n>=5000, uv>=100, CV>1.0)")
+    # Relative guards come from durations_quality (shared with batch-store-durations.sh).
+    ok = quality_ok(n, uv, cv)
+    print(f"Guard: {'PASS' if ok else 'FAIL'} (needs n>={MIN_ENTRIES}, uv>={MIN_UNIQUE}, CV>{MIN_CV})")
     return 0 if ok else 1
 
 if __name__ == "__main__":
