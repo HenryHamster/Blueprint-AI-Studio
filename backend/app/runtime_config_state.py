@@ -1991,11 +1991,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "compute_experiment_spend_threshold_usd",
                         float(config_json["compute_experiment_spend_threshold_usd"]),
                     )
-                if "strategic_session_enabled" in config_json:
-                    _set(
-                        "strategic_session_enabled",
-                        bool(config_json["strategic_session_enabled"]),
-                    )
                 for _int_key in (
                     "strategic_continuation_ttl_seconds",
                     "strategic_local_hold_timeout_seconds",

@@ -811,8 +811,12 @@ async def get_strategic_workbench_state(
     session: AsyncSession,
     user_id: str,
     project_id: uuid.UUID,
+    *,
+    populate_existing: bool = False,
 ) -> dict[str, Any]:
-    row = await get_messages_noise_prefs_row(session, user_id, project_id)
+    row = await get_messages_noise_prefs_row(
+        session, user_id, project_id, populate_existing=populate_existing
+    )
     return workbench_state_from_prefs(row.prefs if row else None)
 
 

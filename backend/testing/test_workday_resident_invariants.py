@@ -1,0 +1,619 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
+import uuid
+import inspect
+
+from unittest.mock import AsyncMock
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import select
+
+import pytest
+
+import app.routers.agent_status as agent_status_module
+import app.routers.admin_project_strategic_session as strategic_session_router
+from app.database import resolve_async_engine
+from app.models import MessageSurface, MessageType, Project, Task, TaskStatus
+from app.project_message_creation import create_operator_project_message
+from app.routers.admin_agent_ops import _enforce_resident_mutation_fence
+from app.routers.agent_status import (
+    _restore_resident_retry_binding,
+    _sync_resident_retry_wait_after_commit,
+)
+from app.task_blocked import reset_task_for_fresh_attempt
+from app.strategic_state_read_model import (
+    _resident_session_availability,
+)
+from app.strategic_completion import _maybe_retry_workday_auto_start
+from app.strategic_resident_session import (
+    RESIDENT_SESSION_KEY,
+    RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+    RESIDENT_SESSION_REASON_KEY,
+    authoritative_resident_session_snapshot,
+    reconcile_terminal_resident_worker,
+    start_resident_session,
+)
+from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+from app.strategic_trigger import (
+    ARMING_RESIDENT_SESSION,
+    maybe_arm_operator_refresh,
+)
+
+
+def test_workday_availability_does_not_consult_removed_global_gate():
+    project = Project(name="Workday", user_id="operator", vision={})
+
+    assert _resident_session_availability(
+        project,
+        eligible_live_runner_count=1,
+        runner_options=[],
+    ) == {"available": True, "state": "ready", "reason": None}
+
+
+def test_workday_active_session_reports_active_on_its_pinned_runner():
+    session_id = str(uuid.uuid4())
+    runner_id = str(uuid.uuid4())
+    project = Project(
+        name="Workday",
+        user_id="operator",
+        vision={
+            "_resident_strategic_session": {
+                "session_id": session_id,
+                "runner_id": runner_id,
+                "status": "active",
+                "stop_requested": False,
+                "started_at": "2026-07-22T12:00:00+00:00",
+                "last_progress_at": "2026-07-22T12:00:05+00:00",
+            }
+        },
+    )
+
+    assert _resident_session_availability(
+        project,
+        eligible_live_runner_count=1,
+        runner_options=[{"id": runner_id, "online": True, "eligible": True}],
+    ) == {"available": True, "state": "active", "reason": None}
+
+
+def test_workday_retry_wait_is_legible_in_cheap_availability():
+    runner_id = str(uuid.uuid4())
+    project = Project(
+        name="Workday",
+        user_id="operator",
+        vision={
+            RESIDENT_SESSION_KEY: {
+                "session_id": str(uuid.uuid4()),
+                "task_id": str(uuid.uuid4()),
+                "runner_id": runner_id,
+                "status": "active",
+                "stop_requested": False,
+                "worker_state": "retry_wait",
+                "worker_retry_until": (
+                    datetime.utcnow() + timedelta(minutes=10)
+                ).isoformat(),
+                "worker_retry_reason": "Rate limited; waiting for recovery",
+            }
+        },
+    )
+
+    assert _resident_session_availability(
+        project,
+        eligible_live_runner_count=1,
+        runner_options=[{"id": runner_id, "online": True, "eligible": True}],
+    ) == {
+        "available": True,
+        "state": "waiting",
+        "reason": "Rate limited; waiting for recovery",
+    }
+
+
+@pytest.mark.asyncio
+async def test_active_workday_message_never_arms_one_shot_cadence(mocker):
+    refresh = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new_callable=mocker.AsyncMock,
+    )
+
+    outcome = await maybe_arm_operator_refresh(
+        mocker.Mock(),
+        uuid.uuid4(),
+        MessageType.QUESTION,
+        message_content="keep talking",
+        resident_session_active=True,
+    )
+
+    assert outcome == ARMING_RESIDENT_SESSION
+    refresh.assert_not_awaited()
+
+
+def _test_session_factory(session):
+    return async_sessionmaker(
+        resolve_async_engine(session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+
+async def _make_resident_record(
+    session,
+    *,
+    task_status=TaskStatus.FAILED,
+    blob_generation=1,
+    stop_requested=False,
+):
+    project = Project(name="Resident continuity", user_id="operator", vision={})
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    session_id = str(uuid.uuid4())
+    runner_id = str(uuid.uuid4())
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "resident"}],
+        status=task_status,
+        created_by="ORCHESTRATOR",
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": 1,
+        },
+        depends_on=[],
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "version": 2,
+            "session_id": session_id,
+            "task_id": str(task.id),
+            "worker_generation": blob_generation,
+            "worker_state": "ready",
+            "runner_id": runner_id,
+            "operator_user_id": "operator",
+            "status": "active",
+            "stop_requested": stop_requested,
+        }
+    }
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    return project, task, runner_id
+
+@pytest.mark.asyncio
+async def test_resident_fresh_attempt_restores_actual_runner_columns(db_session):
+    project, task, runner_id = await _make_resident_record(
+        db_session, task_status=TaskStatus.FAILED
+    )
+    prior_context = dict(task.context or {})
+    reset_task_for_fresh_attempt(task)
+    task.status = TaskStatus.QUEUED
+    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+    task.vm_provisioned_at = None
+
+    before = datetime.utcnow()
+    assert await _restore_resident_retry_binding(
+        task, db_session, prior_context
+    ) is True
+    await db_session.commit()
+
+    factory = _test_session_factory(db_session)
+    async with factory() as verify:
+        fresh = await verify.get(Task, task.id)
+        assert fresh.status == TaskStatus.PROVISIONING
+        assert fresh.vm_instance_id == f"runner:{runner_id}"
+        assert fresh.vm_provisioned_at is not None
+        assert fresh.vm_provisioned_at >= before
+        assert fresh.context["runner_target_id"] == runner_id
+        assert fresh.context["preferred_runner_target_id"] == runner_id
+        assert fresh.context["_resident_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_retry_wait_projection_failure_keeps_durable_retry(
+    db_session, monkeypatch
+):
+    project, task, runner_id = await _make_resident_record(
+        db_session, task_status=TaskStatus.FAILED
+    )
+    prior_context = dict(task.context or {})
+    reset_task_for_fresh_attempt(task)
+    task.retry_after_until = datetime.utcnow() + timedelta(minutes=10)
+    task.latest_status_message = "Rate limited; deliberate retry wait"
+    assert await _restore_resident_retry_binding(
+        task, db_session, prior_context
+    ) is True
+    await db_session.commit()
+
+    failed_projection = AsyncMock(side_effect=RuntimeError("projection unavailable"))
+    monkeypatch.setattr(
+        "app.strategic_resident_session.sync_resident_worker_retry_wait",
+        failed_projection,
+    )
+    assert await _sync_resident_retry_wait_after_commit(
+        task, db_session, prior_context
+    ) is False
+
+    factory = _test_session_factory(db_session)
+    async with factory() as verify:
+        fresh_project = await verify.get(Project, project.id)
+        fresh = await verify.get(Task, task.id)
+        assert fresh.status == TaskStatus.PROVISIONING
+        assert fresh.vm_instance_id == f"runner:{runner_id}"
+        assert fresh.retry_after_until is not None
+        assert fresh.retry_after_until > datetime.utcnow()
+        assert fresh.context["_resident_session"] is True
+        # The durable Task is authoritative even when the best-effort Project
+        # projection failed: cheap/full reads must still report a healthy wait.
+        snapshot = await authoritative_resident_session_snapshot(
+            verify, fresh_project
+        )
+        assert snapshot["worker_state"] == "retry_wait"
+        assert snapshot["worker_retry_until"] == fresh.retry_after_until.isoformat()
+        assert snapshot["worker_retry_reason"] == task.latest_status_message
+        assert _resident_session_availability(
+            fresh_project,
+            eligible_live_runner_count=1,
+            runner_options=[
+                {"id": runner_id, "online": True, "eligible": True}
+            ],
+            snapshot=snapshot,
+        ) == {
+            "available": True,
+            "state": "waiting",
+            "reason": "Rate limited; deliberate retry wait",
+        }
+
+
+
+def test_cheap_and_full_resident_reads_use_authoritative_snapshot():
+    """Both API read surfaces must expose the Task-derived retry projection."""
+    for endpoint in (
+        strategic_session_router.get_project_strategic_liveness,
+        strategic_session_router.get_project_strategic_state,
+    ):
+        source = inspect.getsource(endpoint)
+        assert (
+            "resident_snapshot = await authoritative_resident_session_snapshot("
+            in source
+        )
+        assert '"resident_session": resident_snapshot' in source
+        assert "snapshot=resident_snapshot" in source
+
+
+def test_all_three_fresh_attempt_paths_reapply_resident_binding():
+    source = inspect.getsource(agent_status_module)
+    reset_marker = "reset_task_for_fresh_attempt(task)"
+    segments = source.split(reset_marker)
+    assert len(segments) == 4, "expected rate-limit, dead-auth, and general resets"
+    expected_path_evidence = (
+        "external_retry_delay_minutes",
+        "_dead_auth_blacklist",
+        "_prior_retry_ctx",
+    )
+    for evidence, post_reset in zip(expected_path_evidence, segments[1:]):
+        window = post_reset[:6000]
+        assert evidence in window
+        assert "await _restore_resident_retry_binding(" in window
+    assert source.count(
+        "await _sync_resident_retry_wait_after_commit("
+    ) == 3
+
+
+@pytest.mark.asyncio
+async def test_resident_retry_reloads_live_project_before_repinning(db_session):
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.FAILED
+    )
+    prior_context = dict(task.context or {})
+    factory = _test_session_factory(db_session)
+    # Keep the active Project instance in db_session's identity map, then end
+    # it independently. The retry helper must populate_existing from the DB.
+    assert project.vision[RESIDENT_SESSION_KEY]["status"] == "active"
+    async with factory() as writer:
+        fresh_project = await writer.get(Project, project.id)
+        vision = dict(fresh_project.vision or {})
+        blob = dict(vision[RESIDENT_SESSION_KEY])
+        blob["status"] = "ended"
+        blob["stop_requested"] = True
+        vision[RESIDENT_SESSION_KEY] = blob
+        fresh_project.vision = vision
+        writer.add(fresh_project)
+        await writer.commit()
+
+    reset_task_for_fresh_attempt(task)
+    assert await _restore_resident_retry_binding(
+        task, db_session, prior_context
+    ) is False
+    assert task.status != TaskStatus.PROVISIONING
+    assert not str(task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["start", "stop"])
+async def test_operator_send_serializes_with_resident_transition(
+    db_session, transition
+):
+    project = Project(name="Message fence", user_id="operator", vision={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    factory = _test_session_factory(db_session)
+
+    async with factory() as sender, factory() as controller:
+        stale_project = await sender.get(Project, project.id)
+        locked = await controller.scalar(
+            select(Project).where(Project.id == project.id).with_for_update()
+        )
+        session_id = str(uuid.uuid4())
+        locked.vision = {
+            RESIDENT_SESSION_KEY: {
+                "session_id": session_id,
+                "status": "active" if transition == "start" else "ended",
+                "stop_requested": transition == "stop",
+            }
+        }
+        await controller.flush()
+        send = asyncio.create_task(
+            create_operator_project_message(
+                sender,
+                project=stale_project,
+                user_id="operator",
+                message_type=MessageType.NOTE,
+                content=f"during {transition}",
+                context={},
+                workbench_context=None,
+                idempotency_key=str(uuid.uuid4()),
+                surface=MessageSurface.CONVERSATION,
+                include_strategic_session_snapshot=False,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not send.done()
+        await controller.commit()
+        result = await asyncio.wait_for(send, timeout=5)
+        expected = session_id if transition == "start" else None
+        actual = (
+            str(result.message.resident_session_id)
+            if result.message.resident_session_id
+            else None
+        )
+        assert actual == expected
+
+def _continuation_marker(*, fresh: bool) -> dict:
+    seen = datetime.now(timezone.utc)
+    if not fresh:
+        seen = seen - timedelta(hours=2)
+    stamp = seen.isoformat()
+    return {
+        "version": 1,
+        "active": True,
+        "operator_user_id": "operator",
+        "updated_at": stamp,
+        "last_seen_at": stamp,
+    }
+
+
+@pytest.mark.asyncio
+async def test_resident_mutations_reject_expired_continuation_but_messages_pass(
+    db_session,
+):
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    vision = dict(project.vision or {})
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = _continuation_marker(fresh=False)
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as expired:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    assert expired.value.status_code == 409
+    assert "expired" in str(expired.value.detail).lower()
+
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "create_message"
+    )
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "resolve_message"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resident_mutations_reject_overlapping_one_shot_but_messages_pass(
+    db_session,
+):
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    vision = dict(project.vision or {})
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = _continuation_marker(fresh=True)
+    project.vision = vision
+    one_shot = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "superseding one-shot"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        context={},
+        depends_on=[],
+    )
+    db_session.add_all([project, one_shot])
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as overlap:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    assert overlap.value.status_code == 409
+    assert "lane" in str(overlap.value.detail).lower()
+
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "create_message"
+    )
+
+
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciler_ignores_requeued_worker(db_session, mocker):
+    _, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.QUEUED
+    )
+    factory = _test_session_factory(db_session)
+    start = mocker.patch(
+        "app.strategic_resident_session.start_resident_session",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert await reconcile_terminal_resident_worker(
+        task.id, session_factory=factory
+    ) is False
+    start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciler_replaces_exact_continuous_generation(
+    db_session, mocker
+):
+    _, task, runner_id = await _make_resident_record(db_session)
+    factory = _test_session_factory(db_session)
+    mocker.patch(
+        "app.strategic_resident_session.get_strategic_workbench_state",
+        new=mocker.AsyncMock(return_value={"interaction_mode": "continuous"}),
+    )
+    start = mocker.patch(
+        "app.strategic_resident_session.start_resident_session",
+        new=mocker.AsyncMock(return_value={"worker_generation": 2}),
+    )
+
+    assert await reconcile_terminal_resident_worker(
+        task.id, session_factory=factory
+    ) is True
+    assert start.await_args.kwargs["runner_id"] == runner_id
+    assert start.await_args.kwargs["operator_user_id"] == "operator"
+    assert start.await_args.kwargs["expected_recovery_identity"][1] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciler_exposes_start_after_replacement_failure(
+    db_session, mocker
+):
+    project, task, _ = await _make_resident_record(db_session)
+    factory = _test_session_factory(db_session)
+    mocker.patch(
+        "app.strategic_resident_session.get_strategic_workbench_state",
+        new=mocker.AsyncMock(return_value={"interaction_mode": "continuous"}),
+    )
+    mocker.patch(
+        "app.strategic_resident_session.start_resident_session",
+        new=mocker.AsyncMock(
+            side_effect=HTTPException(status_code=409, detail="runner unavailable")
+        ),
+    )
+
+    assert await reconcile_terminal_resident_worker(
+        task.id, session_factory=factory
+    ) is False
+    async with factory() as verify:
+        fresh = await verify.get(Project, project.id)
+        blob = fresh.vision[RESIDENT_SESSION_KEY]
+        reason = fresh.vision[RESIDENT_SESSION_REASON_KEY]["reason"]
+    assert blob["status"] == "ended"
+    assert blob["worker_state"] == "restart_failed"
+    assert reason.startswith("start_failed: runner unavailable")
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciler_never_restarts_superseded_or_stopped_worker(
+    db_session, mocker
+):
+    _, superseded, _ = await _make_resident_record(
+        db_session, blob_generation=2
+    )
+    _, stopped, _ = await _make_resident_record(
+        db_session, stop_requested=True
+    )
+    factory = _test_session_factory(db_session)
+    start = mocker.patch(
+        "app.strategic_resident_session.start_resident_session",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert await reconcile_terminal_resident_worker(
+        superseded.id, session_factory=factory
+    ) is False
+    assert await reconcile_terminal_resident_worker(
+        stopped.id, session_factory=factory
+    ) is False
+    start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_active_one_shot_records_cycle_reason_then_completion_retries(
+    db_session, mocker
+):
+    project = Project(name="Single writer", user_id="operator", vision={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    one_shot = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "one shot"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        context={},
+        depends_on=[],
+    )
+    db_session.add(one_shot)
+    await db_session.commit()
+    await db_session.refresh(one_shot)
+    factory = _test_session_factory(db_session)
+    project_id = project.id
+    one_shot_id = one_shot.id
+    mocker.patch(
+        "app.strategic_resident_session._auto_select_local_runner",
+        new=mocker.AsyncMock(return_value=str(uuid.uuid4())),
+    )
+    mocker.patch(
+        "app.strategic_resident_session._spawn_resident_strategic_task",
+        new=mocker.AsyncMock(return_value=None),
+    )
+
+    with pytest.raises(HTTPException) as blocked:
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id="operator",
+            session_factory=factory,
+        )
+    assert blocked.value.status_code == 409
+    async with factory() as verify:
+        fresh = await verify.get(Project, project_id)
+        reason = fresh.vision[RESIDENT_SESSION_REASON_KEY]
+    assert reason["reason"] == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT
+    assert reason["operator_user_id"] == "operator"
+
+    one_shot.status = TaskStatus.COMPLETED
+    one_shot = await db_session.get(Task, one_shot_id)
+    db_session.add(one_shot)
+    await db_session.commit()
+    mocker.patch(
+        "app.workbench_state.get_strategic_workbench_state",
+        new=mocker.AsyncMock(return_value={"interaction_mode": "continuous"}),
+    )
+    retry = mocker.patch(
+        "app.strategic_resident_session._auto_start_on_workday_entry",
+        new_callable=mocker.AsyncMock,
+    )
+    await _maybe_retry_workday_auto_start(project_id, session_factory=factory)
+    retry.assert_awaited_once_with(
+        project_id,
+        operator_user_id="operator",
+        session_factory=factory,
+    )

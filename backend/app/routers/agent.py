@@ -14,7 +14,7 @@ from typing import Dict, Literal
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import Uuid, and_, bindparam, func, or_, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -1007,6 +1007,43 @@ async def claim_task(
     _claimed_context = dict(task.context or {})
     _claimed_payloads = list(task.payloads or [])
     _claimed_first_payload = task.first_payload
+    # An idempotent replay still owns the IN_PROGRESS Task row lock. Skip the
+    # Project -> Task clear there to avoid lock-order inversion; the original
+    # successful claim or first resident heartbeat performs the same clear.
+    if not idempotent_replay and _claimed_context.get("_resident_session") is True:
+        try:
+            from app.strategic_resident_session import (
+                clear_resident_worker_retry_wait,
+            )
+
+            if session.bind is None:
+                raise RuntimeError("Claim session has no bind for projection clear")
+            projection_factory = async_sessionmaker(
+                bind=session.bind,
+                expire_on_commit=False,
+            )
+            async with projection_factory() as projection_session:
+                await clear_resident_worker_retry_wait(
+                    projection_session,
+                    project_id=_claimed_project_id,
+                    task_id=_claimed_task_id,
+                    session_id=str(
+                        _claimed_context.get("strategic_session_id") or ""
+                    ),
+                    worker_generation=int(
+                        _claimed_context.get("_resident_worker_generation") or 1
+                    ),
+                )
+        except Exception:
+            # Claim is already durable. A projection clear must never turn that
+            # success into a PRE_CLAIM_FAILED response. The isolated session is
+            # closed/rolled back here while the main claim session stays usable;
+            # the first exact-generation heartbeat performs the same safe clear.
+            logger.warning(
+                "[RESIDENT_SESSION] claim retry-wait clear failed for task %s",
+                _claimed_task_id,
+                exc_info=True,
+            )
     # Record liveness only after the durable claim/JTI/predecessor boundary
     # has succeeded. Rejected stale tokens must not keep a VM pin alive.
     _shared_state.record_vm_heartbeat(vm_id)

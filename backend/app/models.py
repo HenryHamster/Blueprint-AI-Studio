@@ -3611,6 +3611,12 @@ class ProjectMessage(SQLModel, table=True):
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
+    # Stable identity of the persistent conversational Workday session this
+    # message belongs to. NULL preserves visibility for pre-migration and
+    # out-of-session messages.
+    resident_session_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
     resolved_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -3717,6 +3723,12 @@ class ProjectMessage(SQLModel, table=True):
             "ix_projectmessage_project_message_created",
             "project_id",
             "message_type",
+            "created_at",
+        ),
+        Index(
+            "ix_projectmessage_project_session_created",
+            "project_id",
+            "resident_session_id",
             "created_at",
         ),
     )

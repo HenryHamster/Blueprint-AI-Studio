@@ -5224,15 +5224,16 @@ async def _finalize_strategic_review_spawn(
     from app.autonomous_research import _try_research_spawn_advisory_lock
     from app.task_lifecycle import _has_active_strategic_task
 
-    try:
-        await lock_and_validate_legacy_authority(
-            session,
-            project_id,
-            expected_generation=expected_legacy_generation,
-        )
-    except LegacyEngineAuthorityExpired:
-        await session.rollback()
-        return False
+    if expected_legacy_generation is not None:
+        try:
+            await lock_and_validate_legacy_authority(
+                session,
+                project_id,
+                expected_generation=expected_legacy_generation,
+            )
+        except LegacyEngineAuthorityExpired:
+            await session.rollback()
+            return False
 
     # ``project_id`` was captured at the caller's function entry (before any
     # payload build), so the rollback-expiry MissingGreenlet (BUG_REPORT
@@ -5375,6 +5376,7 @@ async def _spawn_strategic_review(
     preferred_runner_target_id: str | None = None,
     local_runner_context: dict[str, Any] | None = None,
     extra_context: dict[str, Any] | None = None,
+    resident_minimal: bool = False,
     runner_pin_id: str | None = None,
     *,
     apply_spawn_budget_guard: bool = False,
@@ -5433,7 +5435,7 @@ async def _spawn_strategic_review(
     from app.task_lifecycle import _has_active_strategic_task
 
     try:
-        if expected_legacy_generation is None:
+        if expected_legacy_generation is None and not resident_minimal:
             expected_legacy_generation = await lock_and_validate_legacy_authority(
                 session, project.id
             )
@@ -5515,6 +5517,165 @@ async def _spawn_strategic_review(
             session,
             _project_id,
             "strategic_review",
+        )
+
+    if resident_minimal:
+        # A resident strategic session runs SYNCHRONOUSLY inside the operator's
+        # START request and then builds most of its own context on the runner via
+        # Claude Code. So skip ONLY the slow, GitHub-fetching context builders the
+        # cadence path runs below — ``ground_design_doc`` +
+        # ``_verify_capability_backing_paths`` (per-file ``contents``/``git/trees``
+        # fetches), ``_build_recent_interventions`` (ancestry fan-out), and
+        # ``resolve_branch_verification_context`` (credential resolve), plus the
+        # branch-SHA / version-phase / ci-compliance lookups they feed. Those hold
+        # the request's DB connection open long enough for asyncpg/Cloud SQL to
+        # idle-close it, so the finalize flush 500s before ``task_id`` ever lands
+        # (start_project_strategic_resident_session, ~143s).
+        #
+        # STILL include the CHEAP grounding — pure in-memory ORM scalars +
+        # DB-only reads, none of which hold a connection across a network call —
+        # so the resident agent is NOT context-blind at boot: without ``vision`` /
+        # ``problem_model`` / ``running_update`` / ``directions_summary`` /
+        # ``direction_counts`` / the retired/prior-decision context below it would
+        # re-derive (and risk re-creating) existing directions, and without
+        # ``open_messages`` an operator message older than the resident's
+        # ~2-minute first-poll cursor would surface NOWHERE (not in bootstrap,
+        # not in the first poll). ``problem_model`` is the UNVERIFIED agent-view
+        # (the backing-path verification is exactly the skipped GitHub I/O). The
+        # transaction stays short: cheap reads only, zero network.
+        review_model = (
+            _runtime_config.get("task_type_models", {}).get("strategic_review")
+            or _runtime_config.get("task_type_models", {}).get("research")
+            or None
+        )
+        review_effort = (
+            _runtime_config.get("task_type_efforts", {}).get("strategic_review")
+            or _runtime_config.get("task_type_efforts", {}).get("research")
+            or None
+        )
+        _res_direction_counts = _build_direction_counts(project)
+        _res_direction_stats = _build_direction_stats(project)[1]
+        from app.strategic_analysis import _build_retired_directions_summary
+
+        cycle_history = await strategic_cycle.recent_for_agent_context(
+            session,
+            project.id,
+            limit=20,
+        )
+        _res_retired_summary = _build_retired_directions_summary(project)
+        _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
+        _res_open_messages = await _fetch_open_messages(session, project.id)
+        # Recently-answered operator conversation tail — DB-only, bounded, and
+        # explicitly non-actionable. Surfaces a correction the operator just made
+        # (now marked handled/resolved, so gone from the open feed) so a restarted
+        # resident session does not re-propose what the operator already settled.
+        _res_recent_handled = await _fetch_recent_handled_conversation(
+            session, project.id
+        )
+        # Ship the resident-session pacing knobs from _runtime_config onto the
+        # payload so the agent's residentConfig() reads LIVE, operator-tunable
+        # values instead of falling back to hardcoded defaults. All six knobs are
+        # wired end-to-end: idle_tick, turn_timeout, and message_poll (existing);
+        # min_tick, max_ops_per_turn, and autonomous_turn_timeout (new).
+        # All are tiny critical-tier scalars (never trimmed).
+        _res_pacing_knobs = {
+            "strategic_session_idle_tick_seconds": int(
+                _runtime_config.get("strategic_session_idle_tick_seconds", 5)
+            ),
+            "strategic_session_turn_timeout_seconds": int(
+                _runtime_config.get("strategic_session_turn_timeout_seconds", 120)
+            ),
+            "strategic_session_message_poll_seconds": float(
+                _runtime_config.get("strategic_session_message_poll_seconds", 1.5)
+            ),
+            "strategic_session_min_tick_seconds": int(
+                _runtime_config.get("strategic_session_min_tick_seconds", 600)
+            ),
+            "strategic_session_max_ops_per_turn": int(
+                _runtime_config.get("strategic_session_max_ops_per_turn", 3)
+            ),
+            "strategic_session_autonomous_turn_timeout_seconds": int(
+                _runtime_config.get(
+                    "strategic_session_autonomous_turn_timeout_seconds", 300
+                )
+            ),
+        }
+        minimal_payload = validate_internal_payload(
+            pack_under_budget(
+                {
+                    "type": "strategic_review",
+                    "research_mode": "strategic",
+                    "project_name": _project_name,
+                    "base_branch": get_project_integration_branch(project),
+                    # Cheap in-memory ORM scalars (no I/O).
+                    "vision": _agent_visible_vision(project.vision),
+                    "problem_model": _agent_view_problem_model(project.problem_model),
+                    "running_update": project.running_update or "",
+                    # Pure-computation direction grounding (no I/O).
+                    "directions_summary": _res_direction_stats,
+                    "direction_counts": _res_direction_counts,
+                    "max_active_directions": _res_direction_counts["max_active"],
+                    **(
+                        {"retired_directions_summary": _res_retired_summary}
+                        if _res_retired_summary
+                        else {}
+                    ),
+                    **(
+                        {"previous_decision_outcomes": _res_prev_outcomes}
+                        if _res_prev_outcomes
+                        else {}
+                    ),
+                    # DB-only open-operator-message feed (no network) — the
+                    # load-bearing key: surfaces messages older than the runner's
+                    # first-poll cursor that would otherwise be missed entirely.
+                    "open_message_count": len(_res_open_messages),
+                    "open_messages": _res_open_messages,
+                    **(
+                        {"recent_handled_conversation": _res_recent_handled}
+                        if _res_recent_handled
+                        else {}
+                    ),
+                    **({"model": review_model} if review_model else {}),
+                    **({"effort": review_effort} if review_effort else {}),
+                    # Live, operator-tunable resident-session pacing knobs.
+                    **_res_pacing_knobs,
+                    # Compact, durable behavioral memory notes written by the
+                    # set_memory strategic op. Already capped at 100 entries by the
+                    # handler, so budget-footprint is bounded.
+                    "strategic_memory_notes": project.strategic_memory_notes or [],
+                    # Gaps whose history entries warrant compaction — surfaced
+                    # directly in the payload so the strategist sees an automatic
+                    # signal without manual inspection. Pure in-memory computation.
+                    **(
+                        {"compaction_hints": _rm_compaction_hints}
+                        if (_rm_compaction_hints := _build_compaction_hints(project.problem_model))
+                        else {}
+                    ),
+                },
+                _STRATEGIC_REVIEW_SCHEMA,
+            ),
+            "autonomous_research:strategic_review",
+        )
+        return await _finalize_strategic_review_spawn(
+            session,
+            project_id=_project_id,
+            project_name=_project_name,
+            payload=minimal_payload,
+            cycle_id=cycle_id,
+            strategy_only=strategy_only,
+            base_vision=_base_vision,
+            base_problem_model=_base_problem_model,
+            base_running_update=_base_running_update,
+            local_runner_intent=local_runner_intent,
+            preferred_runner_target_id=preferred_runner_target_id,
+            extra_context=extra_context,
+            operator_steered=operator_steered,
+            steering_excerpt=steering_excerpt,
+            # Born PROVISIONING + pinned to the operator's runner (only the resident
+            # spawn path passes this; cadence spawns leave it None → QUEUED as before)
+            # so POST /api/runner/next-task claims it directly.
+            runner_pin_id=runner_pin_id,
+            expected_legacy_generation=expected_legacy_generation,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``).

@@ -106,6 +106,101 @@ from app.cost_ceiling import check_daily_cost_ceiling as _check_daily_cost_ceili
 
 logger = logging.getLogger(__name__)
 
+async def _restore_resident_retry_binding(
+    task: Task,
+    session: AsyncSession,
+    prior_context: dict,
+) -> bool:
+    """Restore the live Workday worker's hard runner pin after an attempt reset."""
+    if prior_context.get("_resident_session") is not True:
+        return False
+    project = await session.scalar(
+        select(Project)
+        .where(Project.id == task.project_id)
+        .execution_options(populate_existing=True)
+    )
+    if project is None:
+        return False
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_session_is_active,
+    )
+
+    blob = read_resident_session(project.vision)
+    try:
+        task_generation = int(prior_context.get("_resident_worker_generation") or 1)
+        current_generation = int((blob or {}).get("worker_generation") or 1)
+    except (TypeError, ValueError):
+        return False
+    runner_id = str((blob or {}).get("runner_id") or "").strip()
+    if (
+        not resident_session_is_active(blob)
+        or bool((blob or {}).get("stop_requested"))
+        or str((blob or {}).get("task_id")) != str(task.id)
+        or str((blob or {}).get("session_id"))
+        != str(prior_context.get("strategic_session_id"))
+        or current_generation != task_generation
+        or not runner_id
+    ):
+        return False
+
+    next_context = dict(task.context or {})
+    for key, value in prior_context.items():
+        if key.startswith("_resident_") or key == "strategic_session_id":
+            next_context[key] = value
+    next_context["runner_target_id"] = runner_id
+    next_context["preferred_runner_target_id"] = runner_id
+    task.context = next_context
+    task.status = TaskStatus.PROVISIONING
+    task.vm_instance_id = f"runner:{runner_id}"
+    task.vm_provisioned_at = _utcnow()
+    return True
+
+
+async def _sync_resident_retry_wait_after_commit(
+    task: Task,
+    session: AsyncSession,
+    prior_context: dict,
+) -> bool:
+    """Best-effort projection sync after the durable retry transition commits."""
+    if prior_context.get("_resident_session") is not True:
+        return False
+    session_id = str(prior_context.get("strategic_session_id") or "")
+    try:
+        worker_generation = int(
+            prior_context.get("_resident_worker_generation") or 1
+        )
+    except (TypeError, ValueError):
+        return False
+    if not session_id or session.bind is None:
+        return False
+    project_id = task.project_id
+    task_id = task.id
+    from app.strategic_resident_session import sync_resident_worker_retry_wait
+
+    # The Task retry is already committed. Isolate this operator-facing mirror
+    # so a lock timeout/transient DB error cannot re-enter status processing or
+    # turn a successful retry into a 500. The authoritative Task deadline still
+    # protects start/ensure idempotency if this projection temporarily lags.
+    factory = async_sessionmaker(bind=session.bind, expire_on_commit=False)
+    try:
+        async with factory() as mirror_session:
+            return await sync_resident_worker_retry_wait(
+                mirror_session,
+                project_id=project_id,
+                task_id=task_id,
+                session_id=session_id,
+                worker_generation=worker_generation,
+            )
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] retry-wait projection sync failed for task %s",
+            task_id,
+            exc_info=True,
+        )
+        return False
+
+
 router = APIRouter()
 
 
@@ -2486,8 +2581,15 @@ async def update_agent_status(
                         _retry_context = {
                             key: ctx[key] for key in _retry_context_keys if key in ctx
                         }
+                        _prior_resident_ctx = dict(ctx)
                         reset_task_for_fresh_attempt(task)
                         ctx = {**(task.context or {}), **_retry_context}
+                        _resident_retry = await _restore_resident_retry_binding(
+                            task,
+                            session,
+                            _prior_resident_ctx,
+                        )
+                        ctx = dict(task.context or {})
                         task.context = ctx
                         if external_retry_delay_minutes is not None:
                             set_retry_after(task, external_retry_delay_minutes)
@@ -2513,6 +2615,7 @@ async def update_agent_status(
                             and _runtime_config.get("warm_continuity_enabled", False)
                             and _runtime_config.get("warm_retarget_enabled", False)
                             and old_vm_id_rl
+                            and not _resident_retry
                         )
                         park_blacklisted = list(ctx.get("blacklisted_accounts") or [])
                         if (
@@ -2675,13 +2778,21 @@ async def update_agent_status(
                         ctx.pop("warm_target_vm_id", None)
                         ctx.pop("warm_handoff_deadline", None)
                         ctx.pop("warm_target_pr", None)
+                        await _restore_resident_retry_binding(
+                            task,
+                            session,
+                            _prior_resident_ctx,
+                        )
                         task.context = ctx
                         session.add(task)
                         await session.commit()
+                        await _sync_resident_retry_wait_after_commit(
+                            task, session, _prior_resident_ctx
+                        )
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
-                            {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                            {"task_id": str(task.id), "status": task.status},
                         )
                         logger.info(
                             f"[AGENT STATUS] Task {task.id} {failure_class} — requeued without burning retry"
@@ -2762,6 +2873,7 @@ async def update_agent_status(
                         ctx["blacklisted_accounts"] = blacklisted
 
                     old_vm_id_da = task.vm_instance_id
+                    _prior_resident_ctx = dict(ctx)
                     now_da = _utcnow()
                     bank_task_current_attempt(task, stopped_at=now_da)
                     ctx = with_task_attempt_banking(task, ctx)
@@ -2783,15 +2895,23 @@ async def update_agent_status(
                     task.latest_status_message = (
                         "Dead auth session — requeued onto different account"
                     )
+                    await _restore_resident_retry_binding(
+                        task,
+                        session,
+                        _prior_resident_ctx,
+                    )
                     from app.routers.agent import _terminated_task_ids
 
                     _terminated_task_ids.pop(str(task.id), None)
                     session.add(task)
                     await session.commit()
+                    await _sync_resident_retry_wait_after_commit(
+                        task, session, _prior_resident_ctx
+                    )
                     await broadcast_to_project(
                         str(task.project_id),
                         "task_updated",
-                        {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                        {"task_id": str(task.id), "status": task.status},
                     )
                     logger.info(
                         "[AGENT STATUS] Task %s DEAD_AUTH — requeued without burning retry",
@@ -3498,6 +3618,12 @@ async def update_agent_status(
                         "[ORCHESTRATOR] Failed to escalate effort for task %s",
                         task.id,
                     )
+            await _restore_resident_retry_binding(
+                task,
+                session,
+                _prior_retry_ctx,
+            )
+            ctx = dict(task.context or {})
             task.context = ctx
             session.add(task)
 
@@ -3516,13 +3642,16 @@ async def update_agent_status(
                 session.add(task)
 
             await session.commit()
+            await _sync_resident_retry_wait_after_commit(
+                task, session, _prior_retry_ctx
+            )
 
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",
                 {
                     "task_id": str(task.id),
-                    "status": TaskStatus.QUEUED,
+                    "status": task.status,
                     "attempt_count": task.attempt_count,
                 },
             )
@@ -4301,6 +4430,29 @@ async def update_agent_status(
             logger.debug(
                 f"[PIPELINE] Early session close failed (non-fatal): {_close_exc}"
             )
+        # A resident agent can legitimately reach a terminal state after retries
+        # are exhausted. Reconcile that exact committed generation before the
+        # slower post-commit pipeline: requeues are left alone, continuous
+        # Workday gets a replacement, and a failed replacement is surfaced as
+        # ended/blocked instead of leaving the UI stuck on a false Active state.
+        if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            try:
+                from app.strategic_resident_session import (
+                    reconcile_terminal_resident_worker,
+                )
+
+                await reconcile_terminal_resident_worker(
+                    _task_id_str,
+                    session_factory=_factory,
+                )
+            except Exception:
+                logger.warning(
+                    "[RESIDENT_SESSION] terminal reconciliation failed after commit "
+                    "for task %s; continuing normal post-commit processing",
+                    _task_id_str,
+                    exc_info=True,
+                )
+
         # Cloud Run's default request timeout is 300s. Post-commit makes
         # multiple GitHub calls (review posting, check-run update, PR state
         # check, merge attempts) that each retry with up to 3x120s backoff on

@@ -837,6 +837,44 @@ export interface StrategicConversationQuery {
   search?: string | null;
 }
 
+/**
+ * Bounded projection of the resident Strategic session state returned by the
+ * start/stop endpoints (mirrors `resident_session_snapshot` in
+ * `strategic_resident_session.py`). Null when no resident session exists.
+ */
+export interface StrategicResidentSessionSnapshot {
+  session_id?: string | null;
+  task_id?: string | null;
+  worker_generation?: number | null;
+  worker_state?: 'starting' | 'ready' | 'retry_wait' | 'restart_failed' | string | null;
+  worker_retry_until?: string | null;
+  worker_retry_reason?: string | null;
+  runner_id?: string | null;
+  status?: string | null;
+  stop_requested?: boolean;
+  started_at?: string | null;
+  updated_at?: string | null;
+  ended_at?: string | null;
+  last_progress_at?: string | null;
+  last_operator_interaction_at?: string | null;
+  compaction_count?: number | null;
+  last_compaction_at?: string | null;
+}
+
+/** Cheap, operator-legible availability for the persistent Workday session. */
+export interface StrategicResidentSessionAvailability {
+  available: boolean;
+  state: 'off' | 'ready' | 'starting' | 'active' | 'blocked' | 'error' | string;
+  reason?: string | null;
+}
+
+/**
+ * One device-picker option for the resident (Workday) session (mirrors an entry
+ * of `build_resident_runner_options` in `strategic_resident_session.py`).
+ * `online` = active + recent heartbeat; `agent_ready` = the agent can run;
+ * `eligible` = online + agent-ready + can handle strategic work (the full
+ * auto-pick gate). The pinned device rides on `resident_session.runner_id`.
+ */
 export interface StrategicMemoryNote {
   note: string;
   set_at: string;
@@ -854,6 +892,31 @@ export interface StrategicAccountSpendStatus {
   cumulativeCostUsd?: number | null;
   trackedSpendUsd?: number | null;
   dailyCostCeilingUsd?: number | null;
+}
+
+export interface StrategicResidentRunnerOption {
+  id: string;
+  name: string;
+  hostname?: string | null;
+  online: boolean;
+  agent_ready: boolean;
+  eligible: boolean;
+}
+
+export interface StrategicSessionStartRequest {
+  runner_id?: string | null;
+  expected_interaction_mode?: 'continuous';
+}
+
+export interface StrategicSessionStartResponse {
+  project_id: string;
+  session: StrategicResidentSessionSnapshot | null;
+  ensure_outcome?: 'ensured' | 'mode_changed';
+}
+
+export interface StrategicSessionStopResponse {
+  project_id: string;
+  session: StrategicResidentSessionSnapshot | null;
 }
 
 export interface StrategicWorkbenchStateResponse {
@@ -913,6 +976,21 @@ export interface StrategicStateResponse {
       last_fired_origin?: string | null;
     };
   };
+  resident_session?: StrategicResidentSessionSnapshot | null;
+  /**
+   * Legible Workday resident-session state + the reason it isn't running
+   * (mirrors `_resident_session_availability`). Workday is the on-switch:
+   * entering `continuous` auto-starts the session, so the UI reads this to show
+   * dark / ready / active / blocked / error instead of relying on a Start click.
+   */
+  resident_session_availability?: StrategicResidentSessionAvailability | null;
+  /**
+   * Device-picker options for the resident (Workday) session: every enrolled
+   * runner with online / agent-ready / eligible flags so the UI can render the
+   * auto-pick + override dropdown. The currently pinned device is
+   * `resident_session.runner_id`.
+   */
+  resident_session_runners?: StrategicResidentRunnerOption[] | null;
   running_update: {
     excerpt: string | null;
     char_count: number;
@@ -1068,23 +1146,21 @@ export interface StrategicStateResponse {
     };
   } | null;
   /** Durable behavioral lessons and operator preferences accumulated by the
-   *  Strategic session. Each entry is a {note, set_at} pair.
+   *  resident Strategic session. Each entry is a {note, set_at} pair.
    *  Written by the set_memory strategic op. */
   strategic_memory_notes?: StrategicMemoryNote[];
 }
 
 /**
- * Lightweight mode probe (mirrors the backend
- * `GET /projects/{id}/strategic-liveness` endpoint). Carries ONLY the cheap
- * fields the chat/workday shell needs to render the mode indicator immediately
- * on reload, computed without any of the heavy `strategic-state`
- * Phase-1/Phase-2 assembly. The full read model
- * ({@link fetchStrategicState}) still hydrates the complete state afterward and
- * takes over once it lands.
+ * Lightweight mode and Workday-session liveness probe. Carries only the cheap
+ * fields needed before the full Strategic read model hydrates.
  */
 export interface StrategicLivenessResponse {
   project_id: string;
   interaction_mode: StrategicWorkbenchState['interaction_mode'];
+  resident_session?: StrategicResidentSessionSnapshot | null;
+  resident_session_availability?: StrategicResidentSessionAvailability | null;
+  resident_session_runners?: StrategicResidentRunnerOption[] | null;
 }
 
 export async function fetchStrategicLiveness(
@@ -1381,6 +1457,49 @@ export async function executeStrategicWorkSessionCommand(
     throw new Error('Failed to execute Strategic session command: missing command receipt');
   }
   return data;
+}
+
+export async function startStrategicSession(
+  projectId: string,
+  payload: StrategicSessionStartRequest = {},
+): Promise<StrategicSessionStartResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session/start`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!res.ok) {
+    const detail = await strategicSessionErrorMessage(
+      res,
+      `Failed to start Strategic session: ${res.status}`,
+    );
+    throw new Error(detail);
+  }
+  return res.json() as Promise<StrategicSessionStartResponse>;
+}
+
+export async function stopStrategicSession(
+  projectId: string,
+): Promise<StrategicSessionStopResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session/stop`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    },
+  );
+  if (!res.ok) {
+    const detail = await strategicSessionErrorMessage(
+      res,
+      `Failed to stop Strategic session: ${res.status}`,
+    );
+    throw new Error(detail);
+  }
+  return res.json() as Promise<StrategicSessionStopResponse>;
 }
 
 export interface MessageAttachmentUploadUrlResponse {

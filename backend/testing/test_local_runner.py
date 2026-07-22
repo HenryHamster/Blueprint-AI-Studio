@@ -2501,6 +2501,161 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
+    async def test_next_task_retry_hold_survives_repoll_and_next_candidate_claims(
+        self, client: AsyncClient, db_session
+    ):
+        """A delayed pinned Resident sleeps without poisoning the runner queue.
+
+        The first poll simulates retry backoff becoming durable after the unlocked
+        candidate read but before the winner lock. The locked recheck must reject
+        that Resident and continue to an eligible task. Later polls must filter the
+        delayed Resident before credential resolution, leaving its hard pin intact.
+        """
+        from app.routers import runner as runner_router
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        future_retry = _utcnow() + timedelta(minutes=10)
+        resident = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.PROVISIONING,
+            priority=100,
+            vm_instance_id=f"runner:{runner.id}",
+            context={
+                "runner_target_id": str(runner.id),
+                "_resident_session": True,
+                "strategic_session_id": str(uuid.uuid4()),
+                "_resident_worker_generation": 1,
+            },
+        )
+        alternative = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "eligible fallback"}],
+            status=TaskStatus.PROVISIONING,
+            priority=1,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add_all([resident, alternative])
+        await db_session.commit()
+
+        resolved_task_ids: list[uuid.UUID] = []
+
+        async def _resolve_and_delay_resident(candidate, session, _runner):
+            resolved_task_ids.append(candidate.id)
+            if candidate.id == resident.id:
+                candidate.retry_after_until = future_retry
+                session.add(candidate)
+                await session.flush()
+            return True, runner_router._ResolvedDispatch(None), None, None
+
+        resolver = AsyncMock(side_effect=_resolve_and_delay_resident)
+        with patch(
+            "app.routers.runner._resolve_pool_credentials_for_dispatch",
+            new=resolver,
+        ):
+            first = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert first.status_code == 200
+            assert first.json()["task_id"] == str(alternative.id)
+
+            for _ in range(2):
+                repeated = await client.post(
+                    "/api/runner/next-task",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert repeated.status_code == 204
+
+        assert resolved_task_ids == [resident.id, alternative.id]
+        await db_session.refresh(resident)
+        assert resident.status == TaskStatus.PROVISIONING
+        assert resident.vm_instance_id == f"runner:{runner.id}"
+        assert resident.context["runner_target_id"] == str(runner.id)
+        assert resident.context["_resident_session"] is True
+        assert "runner_pull_skip" not in resident.context
+        assert resident.started_at is None
+        assert resident.retry_after_until == future_retry
+
+    @pytest.mark.asyncio
+    async def test_resident_claim_clears_expired_retry_wait_before_first_turn(
+        self, client: AsyncClient, db_session
+    ):
+        from app.strategic_resident_session import (
+            RESIDENT_SESSION_KEY,
+            resident_session_snapshot,
+        )
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        session_id = str(uuid.uuid4())
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            retry_after_until=_utcnow() - timedelta(seconds=1),
+            context={
+                "runner_target_id": str(runner.id),
+                "_resident_session": True,
+                "strategic_session_id": session_id,
+                "_resident_worker_generation": 1,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        project.vision = {
+            RESIDENT_SESSION_KEY: {
+                "version": 2,
+                "session_id": session_id,
+                "task_id": str(task.id),
+                "worker_generation": 1,
+                "worker_state": "retry_wait",
+                "worker_retry_until": (
+                    _utcnow() + timedelta(minutes=10)
+                ).isoformat(),
+                "worker_retry_reason": "prior rate limit",
+                "runner_id": str(runner.id),
+                "operator_user_id": TEST_USER_ID,
+                "status": "active",
+                "stop_requested": False,
+                "started_at": (_utcnow() - timedelta(minutes=5)).isoformat(),
+                "updated_at": _utcnow().isoformat(),
+            }
+        }
+        flag_modified(project, "vision")
+        db_session.add(project)
+        await db_session.commit()
+
+        _seed_pool_account(TEST_USER_ID)
+        try:
+            pulled = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert pulled.status_code == 200
+            assert pulled.json()["task_id"] == str(task.id)
+
+            claimed = await client.post(
+                "/api/agent/claim",
+                headers={"x-agent-token": pulled.json()["agent_token"]},
+            )
+            assert claimed.status_code == 200
+        finally:
+            _clear_pool()
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.IN_PROGRESS
+        db_session.expunge(project)
+        project = await db_session.get(Project, project.id)
+        snapshot = resident_session_snapshot(project.vision)
+        assert snapshot["worker_state"] == "ready"
+        assert snapshot["worker_retry_until"] is None
+        assert snapshot["worker_retry_reason"] is None
+
+    @pytest.mark.asyncio
     async def test_draining_runner_does_not_pull_new_task(
         self, client: AsyncClient, db_session
     ):

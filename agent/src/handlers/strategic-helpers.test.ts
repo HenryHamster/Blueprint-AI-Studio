@@ -85,6 +85,230 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('reject-direction');
   });
 
+  it('stages the canonical Resident receipt from a subdirectory strategic call', () => {
+    writeStrategicHelpers('task-ambient-key', 'project-ambient-key', testWorkspace);
+    fs.writeFileSync(
+      path.join(testWorkspace, '.resident-reply-receipt.json'),
+      JSON.stringify({
+        idempotency_key: 'resident-reply-stable-anchor',
+        covered_message_ids: ['message-m1'],
+      }),
+    );
+    const nestedDir = path.join(testWorkspace, 'nested');
+    fs.mkdirSync(nestedDir, { recursive: true });
+    const bashEnv = path.join(testWorkspace, 'bash-env');
+    fs.writeFileSync(
+      bashEnv,
+      `curl() {\n  local body\n  body=$(cat)\n  printf '%s\\n200\\n' "$body"\n}\n`,
+    );
+    const bashPath = (value: string): string => value
+      .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+      .replace(/\\/g, '/');
+    const bashExecutable = process.platform === 'win32'
+      ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+      : 'bash';
+    const executionPath = process.platform === 'win32'
+      ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+      : process.env.PATH ?? '';
+
+    const stdout = execFileSync(
+      bashExecutable,
+      [
+        bashPath(path.join(testWorkspace, 'strategic')),
+        'create-message',
+        JSON.stringify({ type: 'NOTE', content: 'operator reply' }),
+      ],
+      {
+        cwd: nestedDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+          AGENT_API_TOKEN: 'test-token',
+          BASH_ENV: bashPath(bashEnv),
+          NODE_BINARY: bashPath(process.execPath),
+          PATH: executionPath,
+        },
+      },
+    );
+
+    expect(JSON.parse(stdout.trim())).toEqual({ status: 'staged', op: 'create_message' });
+    const staged = JSON.parse(fs.readFileSync(
+      path.join(testWorkspace, '.resident-reply-staged-message.json'), 'utf8',
+    )) as Record<string, unknown>;
+    expect(staged).toMatchObject({
+      type: 'NOTE',
+      content: 'operator reply',
+      idempotency_key: 'resident-reply-stable-anchor',
+      covered_message_ids: ['message-m1'],
+    });
+  });
+
+  it('stages the canonical Resident receipt from a subdirectory messages send', () => {
+    writeMessagesHelper('task-ambient-messages', testWorkspace);
+    fs.writeFileSync(
+      path.join(testWorkspace, '.resident-reply-receipt.json'),
+      JSON.stringify({
+        idempotency_key: 'resident-messages-stable-anchor',
+        covered_message_ids: ['message-m2'],
+      }),
+    );
+    const nestedDir = path.join(testWorkspace, 'nested-messages');
+    fs.mkdirSync(nestedDir, { recursive: true });
+    const bashEnv = path.join(testWorkspace, 'bash-env-messages');
+    fs.writeFileSync(
+      bashEnv,
+      `curl() {\n  local body\n  body=$(cat)\n  printf '%s\\n200\\n' "$body"\n}\n`,
+    );
+    const bashPath = (value: string): string => value
+      .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+      .replace(/\\/g, '/');
+    const bashExecutable = process.platform === 'win32'
+      ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+      : 'bash';
+    const executionPath = process.platform === 'win32'
+      ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+      : process.env.PATH ?? '';
+
+    const stdout = execFileSync(
+      bashExecutable,
+      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'operator reply'],
+      {
+        cwd: nestedDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+          AGENT_API_TOKEN: 'test-token',
+          BASH_ENV: bashPath(bashEnv),
+          NODE_BINARY: bashPath(process.execPath),
+          PATH: executionPath,
+        },
+      },
+    );
+    expect(JSON.parse(stdout.trim())).toEqual({ status: 'staged', op: 'create_message' });
+    const staged = JSON.parse(fs.readFileSync(
+      path.join(testWorkspace, '.resident-reply-staged-message.json'), 'utf8',
+    )) as Record<string, unknown>;
+    expect(staged).toMatchObject({
+      type: 'NOTE',
+      content: 'operator reply',
+      idempotency_key: 'resident-messages-stable-anchor',
+      covered_message_ids: ['message-m2'],
+    });
+    expect(() => execFileSync(
+      bashExecutable,
+      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'second reply must not win'],
+      {
+        cwd: nestedDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+          AGENT_API_TOKEN: 'test-token',
+          BASH_ENV: bashPath(bashEnv),
+          NODE_BINARY: bashPath(process.execPath),
+          PATH: executionPath,
+        },
+        stdio: 'pipe',
+      },
+    )).toThrow();
+    expect(JSON.parse(fs.readFileSync(
+      path.join(testWorkspace, '.resident-reply-staged-message.json'), 'utf8',
+    ))).toMatchObject({ content: 'operator reply' });
+  }, 15_000);
+
+  it('fails closed on symlinked or oversized ambient receipt/key files before either helper posts', () => {
+    writeMessagesHelper('task-safe-ambient-read', testWorkspace);
+    writeStrategicHelpers('task-safe-ambient-read', 'project-safe-ambient-read', testWorkspace);
+    const nestedDir = path.join(testWorkspace, 'nested-safe-ambient');
+    fs.mkdirSync(nestedDir, { recursive: true });
+    const marker = path.join(testWorkspace, 'curl-was-called');
+    const bashEnv = path.join(testWorkspace, 'bash-env-safe-ambient');
+    fs.writeFileSync(bashEnv, `curl() { printf called > '${marker.replace(/\\/g, '/')}'; return 1; }\n`);
+    const bashPath = (value: string): string => value
+      .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+      .replace(/\\/g, '/');
+    const bashExecutable = process.platform === 'win32'
+      ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+      : 'bash';
+    const executionPath = process.platform === 'win32'
+      ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+      : process.env.PATH ?? '';
+    const options = {
+      cwd: nestedDir,
+      encoding: 'utf8' as const,
+      env: {
+        ...process.env,
+        ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+        AGENT_API_TOKEN: 'test-token',
+        BASH_ENV: bashPath(bashEnv),
+        NODE_BINARY: bashPath(process.execPath),
+        PATH: executionPath,
+      },
+      stdio: 'pipe' as const,
+    };
+    const receiptPath = path.join(testWorkspace, '.resident-reply-receipt.json');
+    const receiptTarget = path.join(testWorkspace, 'receipt-target.json');
+    const danglingTarget = path.join(testWorkspace, 'missing-receipt-target.json');
+    fs.symlinkSync(danglingTarget, receiptPath, 'file');
+    expect(() => execFileSync(
+      bashExecutable,
+      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'must not post'],
+      options,
+    )).toThrow();
+    expect(() => execFileSync(
+      bashExecutable,
+      [
+        bashPath(path.join(testWorkspace, 'strategic')),
+        'create-message',
+        JSON.stringify({ type: 'NOTE', content: 'must not post' }),
+      ],
+      options,
+    )).toThrow();
+    fs.unlinkSync(receiptPath);
+    fs.writeFileSync(receiptTarget, JSON.stringify({
+      idempotency_key: 'safe-key', covered_message_ids: ['m1'],
+    }));
+    fs.symlinkSync(receiptTarget, receiptPath, 'file');
+    expect(() => execFileSync(
+      bashExecutable,
+      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'must not post'],
+      options,
+    )).toThrow();
+    expect(() => execFileSync(
+      bashExecutable,
+      [
+        bashPath(path.join(testWorkspace, 'strategic')),
+        'create-message',
+        JSON.stringify({ type: 'NOTE', content: 'must not post' }),
+      ],
+      options,
+    )).toThrow();
+    fs.unlinkSync(receiptPath);
+    fs.writeFileSync(receiptPath, 'x'.repeat(16_385));
+    expect(() => execFileSync(
+      bashExecutable,
+      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'must not post'],
+      options,
+    )).toThrow();
+    fs.unlinkSync(receiptPath);
+    const keyPath = path.join(testWorkspace, '.resident-reply-idempotency-key');
+    const keyTarget = path.join(testWorkspace, 'key-target');
+    fs.writeFileSync(keyTarget, 'safe-key');
+    fs.symlinkSync(keyTarget, keyPath, 'file');
+    expect(() => execFileSync(
+      bashExecutable,
+      [
+        bashPath(path.join(testWorkspace, 'strategic')),
+        'create-message',
+        JSON.stringify({ type: 'NOTE', content: 'must not post' }),
+      ],
+      options,
+    )).toThrow();
+    expect(fs.existsSync(marker)).toBe(false);
+  }, 20_000);
+
   it('routes the spawn-fix op to the spawn_fix backend operation', () => {
     const taskId = 'test-task-123';
     const projectId = 'test-project-456';

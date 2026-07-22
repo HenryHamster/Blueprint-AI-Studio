@@ -2182,6 +2182,8 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // File-tree cache in discovery.ts — buildFileTree result is stale when the
   // workspace changes between roles.
   clearFileTreeCache();
+  // Per-task Workday Resident turn-latency telemetry.
+  resetResidentTurnLatencyTelemetry();
   // Per-task operator-decision capture telemetry.
   resetOperatorDecisionCaptureTelemetry();
   // Disk-metric cache — clear so the first heartbeat of each task gets a fresh
@@ -3286,6 +3288,9 @@ import {
   getFormatComplianceTelemetry,
   resetFormatComplianceTelemetry,
   estimateTokensFromChars,
+  recordResidentTurnLatency,
+  getResidentTurnLatencyTelemetry,
+  resetResidentTurnLatencyTelemetry,
   recordOperatorDecisionCapture,
   getOperatorDecisionCaptureTelemetry,
   resetOperatorDecisionCaptureTelemetry,
@@ -3308,6 +3313,9 @@ export {
   getFormatComplianceTelemetry,
   resetFormatComplianceTelemetry,
   estimateTokensFromChars,
+  recordResidentTurnLatency,
+  getResidentTurnLatencyTelemetry,
+  resetResidentTurnLatencyTelemetry,
   recordOperatorDecisionCapture,
   getOperatorDecisionCaptureTelemetry,
   resetOperatorDecisionCaptureTelemetry,

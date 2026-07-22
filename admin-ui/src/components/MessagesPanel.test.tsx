@@ -93,6 +93,17 @@ function _setupApiFetchMock(opts: {
         }),
       }), { status: 200 });
     }
+    if (/\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr) && method === 'GET') {
+      const msgs = queue
+        ? queue[Math.min(qIdx, queue.length - 1)]
+        : defaultMessages;
+      if (queue) qIdx += 1;
+      return new Response(JSON.stringify({
+        items: msgs,
+        has_more: false,
+        next_before_sequence: null,
+      }), { status: 200 });
+    }
     if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
       const msgs = queue
         ? queue[Math.min(qIdx, queue.length - 1)]

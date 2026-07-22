@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { WORKSPACE } from './index.js';
@@ -129,6 +130,21 @@ export function configureAgentPermissions(taskType: string): string[] {
     } catch { /* nothing to clear / hooks dir absent */ }
   }
   return [];
+}
+
+/**
+ * Configure the Workday Resident's explicit read-only posture.
+ *
+ * The session uses a live credential helper to keep `git fetch origin`
+ * working, so only the inner-agent write blockers and commit/push hooks are
+ * installed here. The remote URL itself stays untouched.
+ */
+export function configureResidentAgentPermissions(taskType: string): string[] {
+  if (!isReadOnlyTaskType(taskType)) {
+    throw new Error(`resident permissions require a read-only task type, got "${taskType}"`);
+  }
+  installReadOnlyBlockHooks(`${WORKSPACE}/.git/hooks`);
+  return ['Write', 'Edit', 'NotebookEdit'];
 }
 
 export function strVal(v: unknown, fallback = ''): string {
@@ -699,6 +715,14 @@ _post_with_retry() {
 }`;
 }
 
+/** Bash helper that reads only a stable regular file, never a symlink/FIFO, within a byte cap. */
+export function boundedRegularReadShellFn(): string {
+  return `
+_read_regular_bounded() {
+  "$NODE_BIN" -e 'const fs=require("fs"),p=process.argv[1],max=Number(process.argv[2]); let fd=null,ok=false; try { const before=fs.lstatSync(p); if(!before.isFile()) throw 0; fd=fs.openSync(p,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0)); const opened=fs.fstatSync(fd); if(!opened.isFile()||opened.dev!==before.dev||opened.ino!==before.ino||opened.size>max) throw 0; const b=Buffer.alloc(opened.size+1); let n=0; while(n<b.length){const r=fs.readSync(fd,b,n,b.length-n,null);if(r===0)break;n+=r;} const after=fs.fstatSync(fd); if(n!==opened.size||after.size!==opened.size) throw 0; process.stdout.write(b.subarray(0,n)); ok=true; } catch {} finally { if(fd!==null){try{fs.closeSync(fd)}catch{ok=false}} } if(!ok)process.exit(2);' "$1" "$2"
+}`;
+}
+
 export function writePlaybookHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
@@ -757,6 +781,15 @@ exit $rc
 
 export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
+  const replyKeyPath = shellEscapeDoubleQuoted(
+    path.resolve(workspace, '.resident-reply-idempotency-key').replace(/\\/g, '/'),
+  );
+  const replyReceiptPath = shellEscapeDoubleQuoted(
+    path.resolve(workspace, '.resident-reply-receipt.json').replace(/\\/g, '/'),
+  );
+  const stagedReplyPath = shellEscapeDoubleQuoted(
+    path.resolve(workspace, '.resident-reply-staged-message.json').replace(/\\/g, '/'),
+  );
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
@@ -776,6 +809,11 @@ ${agentTokenShellFn()}
 ${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
+REPLY_KEY_PATH="${replyKeyPath}"
+REPLY_RECEIPT_PATH="${replyReceiptPath}"
+STAGED_REPLY_PATH="${stagedReplyPath}"
+NODE_BIN="\${NODE_BINARY:-node}"
+${boundedRegularReadShellFn()}
 ${retryPostShellFn()}
 if [ "$OP" = "send" ]; then
   if [ "\${2:-}" = "--stdin" ]; then
@@ -786,9 +824,41 @@ if [ "$OP" = "send" ]; then
     MSG_TYPE="\${3:-NOTE}"
   fi
   [ -n "$CONTENT" ] || { echo "Error: send requires message content" >&2; exit 1; }
-  IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
-  PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s}}' \\
-    "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")") || {
+  IDEM_KEY=""
+  COVERED_IDS=""
+  if [ -e "$REPLY_RECEIPT_PATH" ] || [ -L "$REPLY_RECEIPT_PATH" ]; then
+    RECEIPT=$(_read_regular_bounded "$REPLY_RECEIPT_PATH" 16384) || {
+      echo "[ERROR] send: ambient Resident reply receipt is not a safe regular file" >&2; exit 1
+    }
+    RECEIPT_FIELDS=$("$NODE_BIN" -e 'const r=JSON.parse(process.argv[1]); if(!r || typeof r.idempotency_key!=="string" || !r.idempotency_key || !Array.isArray(r.covered_message_ids) || r.covered_message_ids.length===0 || r.covered_message_ids.some(x=>typeof x!=="string" || !x)) process.exit(2); process.stdout.write(r.idempotency_key+"\\n"+JSON.stringify(r.covered_message_ids))' "$RECEIPT") || {
+      echo "[ERROR] send: ambient Resident reply receipt is invalid" >&2; exit 1
+    }
+    IDEM_KEY=$(printf '%s' "$RECEIPT_FIELDS" | head -n1)
+    COVERED_IDS=$(printf '%s' "$RECEIPT_FIELDS" | tail -n +2)
+  elif [ -e "$REPLY_KEY_PATH" ] || [ -L "$REPLY_KEY_PATH" ]; then
+    echo "[ERROR] send: ambient Resident reply key exists without its receipt" >&2
+    exit 1
+  fi
+  if [ -z "$IDEM_KEY" ]; then
+    IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
+  fi
+  if [ -n "$COVERED_IDS" ]; then
+    PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s,"covered_message_ids":%s}}' \\
+      "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")" "$COVERED_IDS")
+    STAGED_DATA=$(printf '{"type":%s,"content":%s,"idempotency_key":%s,"covered_message_ids":%s}' \\
+      "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")" "$COVERED_IDS")
+    [ -n "$STAGED_DATA" ] || { echo "[ERROR] send: failed to serialize staged Resident reply" >&2; exit 1; }
+    "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const d=JSON.parse(process.argv[2]); const t=p+".tmp."+process.pid; try { fs.writeFileSync(t,JSON.stringify(d),{encoding:"utf8",flag:"wx",mode:0o600}); fs.linkSync(t,p); } finally { try { fs.unlinkSync(t); } catch {} }' "$STAGED_REPLY_PATH" "$STAGED_DATA" || {
+      echo "[ERROR] send: failed to stage Resident reply" >&2; exit 1
+    }
+    printf '{"status":"staged","op":"create_message"}'
+    echo ""
+    exit 0
+  else
+    PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s}}' \\
+      "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")")
+  fi
+  [ -n "$PAYLOAD" ] || {
     echo "[ERROR] send: failed to serialize message payload" >&2; exit 1
   }
   printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"

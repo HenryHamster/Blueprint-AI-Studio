@@ -59,6 +59,9 @@ const RuntimeWorkspace = lazy(() => import('./components/RuntimeWorkspace').then
 const PipelineWorkspace = lazy(() => import('./components/PipelineWorkspace').then(m => ({ default: m.PipelineWorkspace })));
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
+import { useStrategicLiveness } from './hooks/useStrategicLiveness';
+import { useStrategicSession } from './hooks/useStrategicSession';
+import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
@@ -489,6 +492,20 @@ export default function App() {
   const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
 
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
+  const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
+  const {
+    strategicWorkbenchState, strategicInteractionMode, strategicSessionActive,
+    strategicSessionStatus, strategicSessionState, strategicSessionReason,
+    residentStrategicSessionRunners, strategicSessionSelectedRunnerId,
+    savingStrategicWorkbench, strategicSessionBusy, persistStrategicWorkbench,
+    handleSelectStrategicRunner, handleStartStrategicSession, handleStopStrategicSession,
+  } = useStrategicSession({
+    selectedProjectId, addToast: s.addToast, strategicReadModel,
+    strategicLiveness: strategicLiveness.data,
+  });
+  const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
+    persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
+  }, [persistStrategicWorkbench]);
   // Monotonic epoch that advances each time the strategic-state poll delivers
   // new data. Threaded into MessagesPanel → useConversation so the
   // conversation refresh piggybacks on the strategic-state poll cadence instead
@@ -1262,6 +1279,22 @@ export default function App() {
           showTitle={false}
           actions={(
             <>
+              <StrategicSessionControl
+                currentMode={strategicInteractionMode === 'continuous' ? 'continuous' : 'chat'}
+                saving={savingStrategicWorkbench}
+                sessionActive={strategicSessionActive}
+                sessionStatus={strategicSessionStatus}
+                sessionState={strategicSessionState}
+                sessionReason={strategicSessionReason}
+                sessionBusy={strategicSessionBusy}
+                sessionRunners={residentStrategicSessionRunners}
+                sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+                onSelectRunner={handleSelectStrategicRunner}
+                onStartSession={handleStartStrategicSession}
+                onStopSession={handleStopStrategicSession}
+                onModeChange={setStrategicInteractionMode}
+                density="compact"
+              />
               <button
                   type="button"
                   onClick={openStrategicContextWorkspace}
@@ -1317,6 +1350,9 @@ export default function App() {
                 strategicPollEpoch={strategicPollEpoch}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
                 strategicState={strategicReadModel.data ?? null}
+                strategicWorkbenchState={strategicWorkbenchState}
+                strategicSessionTranscript={s.strategicSessionTranscript}
+                onStrategicInteraction={() => { persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onOpenCommandPalette={openCommandPalette}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}

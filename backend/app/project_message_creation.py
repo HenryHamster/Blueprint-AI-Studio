@@ -34,10 +34,12 @@ from app.project_message_projection import (
 )
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
+    ARMING_RESIDENT_SESSION,
     ARMING_STEERING,
     maybe_arm_operator_refresh,
     strategic_refresh_pending,
 )
+from app.strategic_resident_session import resident_session_snapshot
 from app.workbench_state import (
     build_message_strategic_session_snapshot,
     persist_strategic_workbench_update,
@@ -381,6 +383,8 @@ def wakeup_state_for_arming(
     *,
     refresh_was_pending: bool,
 ) -> str:
+    if arming == ARMING_RESIDENT_SESSION:
+        return "queued"
     if arming == ARMING_STEERING:
         return "coalesced" if refresh_was_pending else "queued"
     if arming == ARMING_NOT_ARMED:
@@ -613,12 +617,26 @@ async def create_operator_project_message(
             }
     _ensure_context_size(message_context, compact=compact_context_size)
 
-    # Fence the arming decision on the locked Project so send vs
-    # rollback/cutover observe a consistent refresh state.
-    locked_vision = await session.scalar(
-        select(Project.vision)
+    # Fence cadence arming and resident message association on the same locked
+    # Project snapshot. A live Workday resident consumes the durable message
+    # directly, so it suppresses the one-shot strategic refresh marker.
+    locked_project = await session.scalar(
+        select(Project)
         .where(Project.id == project_id)
-        .with_for_update(read=True, key_share=True)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    locked_vision = locked_project.vision if locked_project is not None else None
+    resident_snapshot = resident_session_snapshot(locked_vision)
+    resident_active = bool(
+        resident_snapshot
+        and resident_snapshot.get("status") == "active"
+        and not resident_snapshot.get("stop_requested")
+    )
+    resident_session_id = (
+        str(resident_snapshot.get("session_id"))
+        if resident_active and resident_snapshot.get("session_id")
+        else None
     )
     refresh_was_pending = strategic_refresh_pending(locked_vision)
     arming = await maybe_arm_operator_refresh(
@@ -626,6 +644,7 @@ async def create_operator_project_message(
         project_id,
         message_type,
         message_content=trimmed_content,
+        resident_session_active=resident_active,
     )
     if not session.in_transaction():
         # A failed wake releases every lock. Restore the canonical
@@ -641,12 +660,27 @@ async def create_operator_project_message(
                 commit=False,
             )
             await session.flush()
-        locked_vision = await session.scalar(
-            select(Project.vision)
+        locked_project = await session.scalar(
+            select(Project)
             .where(Project.id == project_id)
-            .with_for_update(read=True, key_share=True)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        locked_vision = locked_project.vision if locked_project is not None else None
+        resident_snapshot = resident_session_snapshot(locked_vision)
+        resident_active = bool(
+            resident_snapshot
+            and resident_snapshot.get("status") == "active"
+            and not resident_snapshot.get("stop_requested")
+        )
+        resident_session_id = (
+            str(resident_snapshot.get("session_id"))
+            if resident_active and resident_snapshot.get("session_id")
+            else None
         )
         refresh_was_pending = strategic_refresh_pending(locked_vision)
+        if resident_active:
+            arming = ARMING_RESIDENT_SESSION
 
     if idem_key:
         # Same-identity retries serialize before reply/source/attachment
@@ -781,6 +815,7 @@ async def create_operator_project_message(
         content=trimmed_content,
         context=message_context,
         idempotency_key=idem_key,
+        resident_session_id=resident_session_id,
     )
     session.add(msg)
     try:

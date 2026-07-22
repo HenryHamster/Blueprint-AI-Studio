@@ -17,6 +17,8 @@ vi.mock('../strategicStateApi', async () => {
   fetchStrategicWorkbenchState: vi.fn(),
   updateStrategicWorkbenchState: vi.fn(),
   fetchStrategicSession: vi.fn(),
+  startStrategicSession: vi.fn(),
+  stopStrategicSession: vi.fn(),
   fetchStrategicConversation: vi.fn(),
   createStrategicSessionMessage: vi.fn(),
   checkInStrategicSession: vi.fn(),

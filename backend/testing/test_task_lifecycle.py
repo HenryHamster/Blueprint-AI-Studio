@@ -1255,6 +1255,40 @@ async def test_fresh_attempt_payload_model_restore_survives_flush_and_expire(tl_
     assert "llm_model" not in task.context
 
 
+def test_fresh_attempt_preserves_resident_dispatch_identity():
+    """Rate/dead-auth retries must remain the same persistent Workday session."""
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "strategic_review", "research_mode": "strategic"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "session-123",
+            "_resident_worker_generation": 7,
+            "preferred_runner_target_id": "runner-preferred",
+            "strategic_local_runner_required": True,
+            "strategic_local_runner_reason": "workbench_continuous",
+            "llm_provider": "anthropic",
+            "llm_account_id": "acct-exhausted",
+            "agent_error_report": {"exit_code": 1},
+            "_previous_failure_class": "RATE_LIMIT",
+        },
+    )
+
+    reset_task_for_fresh_attempt(task)
+
+    assert task.context["_resident_session"] is True
+    assert task.context["strategic_session_id"] == "session-123"
+    assert task.context["_resident_worker_generation"] == 7
+    assert task.context["preferred_runner_target_id"] == "runner-preferred"
+    assert task.context["strategic_local_runner_required"] is True
+    assert task.context["strategic_local_runner_reason"] == "workbench_continuous"
+    assert "llm_provider" not in task.context
+    assert "llm_account_id" not in task.context
+    assert "agent_error_report" not in task.context
+
 def test_clear_blocker_metadata_allows_clean_reescalation():
     from app.task_blocked import (
         clear_blocker_metadata,

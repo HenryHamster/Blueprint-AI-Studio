@@ -21,6 +21,13 @@ from app.models import (
 )
 from app import strategic_cycle
 from app.strategic_constants import STATUS_LATEST_MESSAGE_MAX
+from app.strategic_resident_session import (
+    RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+    RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
+    RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
+    read_resident_session_blocked_reason,
+    resident_session_snapshot,
+)
 from app.task_movement import build_task_movement_explanation
 
 TASK_FOCUS_BUCKET_LIMIT = 8
@@ -549,6 +556,95 @@ def _strategic_refresh_summary(vision: Dict[str, Any] | None) -> Dict[str, Any]:
         ),
     }
 
+
+def _resident_session_has_begun_streaming(snapshot: Dict[str, Any] | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    if snapshot.get("last_progress_at"):
+        return True
+    started = snapshot.get("started_at")
+    last_operator = snapshot.get("last_operator_interaction_at")
+    return bool(last_operator and started and last_operator != started)
+
+
+def _resident_selected_runner_offline(
+    snapshot: Dict[str, Any] | None,
+    runner_options: list[Dict[str, Any]] | None,
+) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    runner_id = snapshot.get("runner_id")
+    if not isinstance(runner_id, str) or not runner_id.strip():
+        return False
+    selected = runner_id.strip()
+    match = next(
+        (
+            option
+            for option in (runner_options or [])
+            if isinstance(option, dict) and str(option.get("id")) == selected
+        ),
+        None,
+    )
+    return match is None or not bool(match.get("online"))
+
+
+def _resident_session_availability(
+    project: Project,
+    *,
+    eligible_live_runner_count: int | None = None,
+    runner_options: list[Dict[str, Any]] | None = None,
+    snapshot: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Return the legible lifecycle state for the persistent Workday resident."""
+    if snapshot is None:
+        snapshot = resident_session_snapshot(project.vision)
+    active = bool(
+        isinstance(snapshot, dict)
+        and snapshot.get("status") == "active"
+        and not snapshot.get("stop_requested")
+    )
+    recorded_reason = read_resident_session_blocked_reason(project.vision)
+    recorded_start_failed = bool(
+        recorded_reason
+        and recorded_reason.startswith(RESIDENT_SESSION_REASON_START_FAILED_PREFIX)
+    )
+    has_live_runner = (
+        eligible_live_runner_count is not None and eligible_live_runner_count > 0
+    )
+
+    reason: str | None = None
+    if recorded_start_failed:
+        state = "error"
+        reason = recorded_reason
+    elif active:
+        if _resident_selected_runner_offline(snapshot, runner_options):
+            state = "blocked"
+            reason = RESIDENT_SESSION_REASON_RUNNER_OFFLINE
+        elif snapshot.get("worker_state") == "retry_wait":
+            state = "waiting"
+            reason = str(
+                snapshot.get("worker_retry_reason") or "resident_retry_wait"
+            )
+        else:
+            state = (
+                "active"
+                if _resident_session_has_begun_streaming(snapshot)
+                else "starting"
+            )
+    elif recorded_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:
+        state = "blocked"
+        reason = recorded_reason
+    elif has_live_runner:
+        state = "ready"
+    elif recorded_reason:
+        state = "blocked"
+        reason = recorded_reason
+    elif eligible_live_runner_count is not None and eligible_live_runner_count <= 0:
+        state = "blocked"
+        reason = "no_runner"
+    else:
+        state = "ready"
+    return {"available": True, "state": state, "reason": reason}
 
 # Concise, operator-facing recovery hints keyed by conflict class. Kept short
 # so both the admin workspace panel and the agent section renderer can surface

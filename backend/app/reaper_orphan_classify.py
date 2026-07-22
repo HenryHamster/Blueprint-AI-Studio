@@ -181,7 +181,7 @@ def _vm_contact_within_cutoff(
     for keeps working exactly as before.
 
     ``task_contact_lookup`` defaults to ``None`` so callers that have not been
-    migrated keep the previous behaviour.
+    migrated (and ``_classify_resident_session``) keep the previous behaviour.
     """
     vm_id = getattr(task, "vm_instance_id", None)
     if not vm_id:
@@ -223,7 +223,7 @@ def _vm_tool_use_within_cutoff(
     A fleet runner multiplexes many tasks onto one ``runner:<id>`` vm id, and the
     heartbeat handler advances the shared ``vmcontact.last_tool_use_at`` with
     ``GREATEST(...)`` from ANY of them — so a hung-but-heartbeating agent (wedged
-    LLM call / spin loop) co-located with ANY actively working sibling read as
+    LLM call / spin loop) co-resident with ANY actively working sibling read as
     "progressing" forever and was NEVER stall-reaped. It could not be rescued by
     the runner self-report (#14413) either: a hung-but-alive process is still in
     the runner's ``active_task_ids``. With no absolute IN_PROGRESS ceiling
@@ -481,6 +481,24 @@ def _classify_orphan(
         task, hb_cutoff, runner_report_lookup
     )
 
+    # Resident strategic session carve-out: an IN_PROGRESS task pinned for the
+    # life of an operator session (context["_resident_session"] == True). It is
+    # EXEMPT from the progress-staleness (thinking-heavy 1500s) budget — being
+    # warm-but-idle between operator turns / autonomous chunks means long
+    # tool-call gaps are normal, not a stall. It is reaped only when the runner
+    # itself has gone silent beyond the resident heartbeat window (see
+    # _classify_resident_session). A resident session still PROVISIONING is a
+    # runner pin awaiting pull (started_at IS NULL), already protected by
+    # _is_runner_pinned_awaiting_pull, so this carve-out is scoped to IN_PROGRESS.
+    if task.status == TaskStatus.IN_PROGRESS and _is_resident_session(task):
+        return _classify_resident_session(
+            task,
+            now,
+            vm_contact_lookup,
+            runner_excluded=runner_excluded,
+            task_contact_lookup=task_contact_lookup,
+        )
+
     if task.status == TaskStatus.PROVISIONING:
         if task.started_at and task.started_at < fifteen_minutes_ago:
             return True  # absolute provisioning ceiling
@@ -678,6 +696,126 @@ _THINKING_HEAVY_TASK_TYPES = frozenset(
     }
 )
 _THINKING_HEAVY_PROGRESS_STALE_SECONDS = 1500  # 25 min
+
+# Resident strategic session (context["_resident_session"] == True): a
+# long-lived strategic_review task that stays IN_PROGRESS for the whole operator
+# session, pinned to one runner. It is warm-but-idle between operator turns and
+# autonomous chunks, so it legitimately makes NO tool calls for long stretches —
+# the progress-staleness (thinking-heavy 1500s) budget would wrongly reap it.
+# It is EXEMPT from progress-staleness and reaped only when the runner itself has
+# gone silent (last_heartbeat / started_at) beyond this resident heartbeat window.
+# Longer than the normal scope/effort heartbeat cutoffs so a briefly-asleep laptop
+# or a transient network gap does not tear down the warm session; a genuinely dead
+# runner is still reclaimed. Overridable via runtime_config.
+_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS = 1500  # 25 min
+
+
+def _is_resident_session(task) -> bool:
+    """True iff *task* is a resident strategic session (opts into the carve-out).
+
+    Keyed on the ``context["_resident_session"] == True`` flag the session
+    start path stamps (shared identifier per the resident-agent build contract).
+    """
+    return (getattr(task, "context", None) or {}).get("_resident_session") is True
+
+
+def _resident_session_heartbeat_stale_cutoff(task, now: datetime) -> datetime:
+    """Return the runner-silence cutoff for a resident strategic session.
+
+    Independent of the scope/effort heartbeat cutoffs: a resident session is
+    warm-but-idle between turns, so it gets a single generous window keyed only
+    on runner liveness. Reads ``resident_session_heartbeat_stale_seconds`` from
+    runtime_config, defaulting to ``_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS``.
+    """
+    seconds = _runtime_config.get(
+        "resident_session_heartbeat_stale_seconds",
+        _RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS,
+    )
+    return now - timedelta(seconds=seconds)
+
+
+def _classify_resident_session(
+    task,
+    now: datetime,
+    vm_contact_lookup: dict | None,
+    *,
+    runner_excluded: bool = False,
+    task_contact_lookup: dict | None = None,
+) -> bool:
+    """Reap decision for an IN_PROGRESS resident strategic session.
+
+    EXEMPT from progress-staleness (no reap on stale ``last_tool_use_at`` —
+    long idle-but-warm stretches are expected). Reaped ONLY when the runner has
+    gone silent beyond the resident heartbeat window: a ``last_heartbeat`` older
+    than the resident cutoff (runner dead / laptop closed), or, if no heartbeat
+    was ever recorded, a ``started_at`` older than the same window. If BOTH
+    ``last_heartbeat`` and ``started_at`` are absent (a degenerate / corrupt
+    row), fall back to ``created_at`` against the same window so the carve-out
+    can never pin such a row forever. In every case a fresh off-row VM contact
+    within the window (lock-starved heartbeat write) overrides the reap,
+    mirroring the other heartbeat-stale branches. The window itself comes from
+    ``runtime_config['resident_session_heartbeat_stale_seconds']`` (see
+    ``_resident_session_heartbeat_stale_cutoff``), not a hardcoded constant.
+
+    ``runner_excluded`` (computed by the caller via
+    ``_runner_report_excludes_task`` against the normal heartbeat cutoff)
+    OVERRIDES the ``_vm_contact_within_cutoff`` suppression on all three reap
+    paths, exactly as it does on the other heartbeat-stale branches. Without it
+    the resident session was UNRECLAIMABLE on a shared fleet runner: the session
+    is pinned to the operator's box, every task there shares
+    ``vm_instance_id='runner:<id>'`` and thus ONE ``vmcontact`` row, so a single
+    live sibling agent kept ``last_contact_at`` fresh and suppressed the reap
+    past the window forever — and no other reclaim path exists
+    (``_start_claim_is_stale`` covers only provisional spawn claims, and
+    ``start_resident_session`` returns the existing session while a live task
+    exists), so the zombie permanently blocked respawn of the Workday session.
+    The runner's ``active_task_ids`` self-report is per-TASK ground truth and it
+    lists a resident session for its whole life (the runner tracks the spawned
+    agent process in ``active_tasks`` until it exits), so a report that OMITS it
+    means the session process is gone. NOTE this only defeats the shared-contact
+    suppression — the 25-min resident window itself still has to elapse, and the
+    progress-staleness exemption above is untouched (a warm-idle session making
+    no tool calls is still never reaped for that).
+
+    ``runner_excluded`` alone is NOT sufficient, which is why this function also
+    takes ``task_contact_lookup``. It closes only the *process-gone* half: the
+    runner's report has to OMIT the task. The other half — the session process is
+    **hung but alive** (wedged LLM call), has stopped heartbeating, and is
+    therefore STILL listed in ``active_task_ids`` — makes ``runner_excluded``
+    ``False`` by construction, and the shared-row read below then suppressed the
+    reap forever off a sibling's heartbeat. That is the exact case this table
+    exists to close. The resident session is pinned to a fleet runner
+    (``strategic_resident_session.py`` sets ``vm_instance_id = f"runner:{id}"``)
+    that also claims ordinary tasks, so a co-resident sibling is the normal case,
+    not an edge case — and because ``start_resident_session`` returns the existing
+    (dead) session while its task row is alive, an unreapable session means the
+    Workday session can NEVER respawn. Reading the TASK-scoped row instead makes
+    the reap depend on THIS session's own liveness. GCE and pre-rollout rows fall
+    back to the shared row exactly as before (see ``_vm_contact_within_cutoff``).
+    """
+    resident_cutoff = _resident_session_heartbeat_stale_cutoff(task, now)
+    if task.last_heartbeat is not None:
+        if task.last_heartbeat < resident_cutoff:
+            return runner_excluded or not _vm_contact_within_cutoff(
+                task, resident_cutoff, vm_contact_lookup, task_contact_lookup
+            )
+        return False
+    if task.started_at is not None:
+        if task.started_at < resident_cutoff:
+            return runner_excluded or not _vm_contact_within_cutoff(
+                task, resident_cutoff, vm_contact_lookup, task_contact_lookup
+            )
+        return False
+    # Degenerate row: neither a heartbeat nor a started_at was ever recorded.
+    # Without this branch the carve-out returns False unconditionally and never
+    # reaps a corrupt resident row. Reap it on the same created_at-based window
+    # (fresh off-row VM contact still overrides, like every other branch).
+    created_at = getattr(task, "created_at", None)
+    if created_at is not None and created_at < resident_cutoff:
+        return runner_excluded or not _vm_contact_within_cutoff(
+            task, resident_cutoff, vm_contact_lookup, task_contact_lookup
+        )
+    return False
 
 
 def _progress_stale_cutoff(task, now: datetime) -> datetime:

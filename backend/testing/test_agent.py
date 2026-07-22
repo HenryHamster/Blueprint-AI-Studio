@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from datetime import datetime, timedelta
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from app.database import get_session
 from app.main import app
 from testing.conftest import USE_POSTGRES
@@ -1615,6 +1615,59 @@ async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
     resp2 = await client.post("/api/agent/claim", headers=headers)
     assert resp2.status_code == 200
     assert resp2.json()["task_id"] == resp1.json()["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_resident_claim_survives_aborted_retry_projection_session(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    project = Project(name="Resident claim projection failure", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    session_id = f"ss-{uuid.uuid4()}"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-resident-projection-failure",
+        status=TaskStatus.PROVISIONING,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": 1,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    async def abort_projection_transaction(projection_session, **_kwargs):
+        # This is a real PostgreSQL transaction abort, not merely a mocked
+        # exception. If claim used its main session here, later response-building
+        # reads would raise PendingRollbackError and turn a durable claim into 500.
+        await projection_session.execute(
+            text("SELECT * FROM deliberately_missing_retry_projection_table")
+        )
+
+    monkeypatch.setattr(
+        "app.strategic_resident_session.clear_resident_worker_retry_wait",
+        abort_projection_transaction,
+    )
+    token = create_agent_token(
+        str(task.id), "agent-vm-resident-projection-failure"
+    )
+    response = await client.post(
+        "/api/agent/claim",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task_id"] == str(task.id)
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
 
 
 @pytest.mark.asyncio

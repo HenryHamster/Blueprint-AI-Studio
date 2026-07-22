@@ -5,6 +5,7 @@ size cap. All HTTP routes, request/response schemas, and authentication rules
 are unchanged.
 """
 
+import hashlib
 import asyncio
 import json
 import logging
@@ -53,6 +54,7 @@ from app.models import (
     Project,
     ProjectMessage,
     Task,
+    TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
 )
 from app.message_audience import stamp_message_audience
@@ -98,6 +100,13 @@ from app.strategic_completion import (
     spawn_budget_status,
     spawn_title_is_redundant,
 )
+from app.strategic_resident_session import (
+    read_resident_session as _read_resident_session,
+    resident_session_is_active as _resident_session_is_active,
+)
+from app.workbench_state import (
+    strategic_local_continuation_status_from_vision,
+)
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -138,6 +147,7 @@ logger = logging.getLogger(__name__)
 # auth scan as the admin routes.
 ADMIN_AGENT_OPS_MODULE = __name__
 STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
+RESIDENT_REPLY_COVERED_MESSAGE_MAX = 20
 
 # Canonical set of strategic ops the agent script advertises and dispatches.
 # Derived from the same inventory as the agent-side STRATEGIC_OP_INVENTORY
@@ -1005,6 +1015,61 @@ async def _maybe_link_task_to_debt(
         return None
 
 
+async def _enforce_resident_mutation_fence(
+    session: AsyncSession,
+    project: Project,
+    task: Task,
+    op: str,
+) -> None:
+    """Require fresh continuation and sole Strategic-lane ownership for mutations."""
+    if op in ("create_message", "resolve_message"):
+        return
+    resident_blob = _read_resident_session(project.vision)
+    operator_user_id = str(
+        (resident_blob or {}).get("operator_user_id") or ""
+    ).strip()
+    continuation = strategic_local_continuation_status_from_vision(
+        project.vision,
+        operator_user_id=operator_user_id or None,
+    )
+    if (
+        not operator_user_id
+        or not continuation.get("enabled")
+        or not continuation.get("fresh")
+        or not continuation.get("owned_by_current_operator")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident continuation expired or ownership changed",
+        )
+
+    active_candidates = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_(
+                    (
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    )
+                ),
+            )
+        )
+    ).scalars()
+    if any(
+        (candidate.first_payload or {}).get("type") in STRATEGIC_TASK_TYPES
+        for candidate in active_candidates
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident no longer owns the Strategic mutation lane",
+        )
+
+
+
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
@@ -1083,6 +1148,36 @@ async def strategic_operation(
             )
         task = _locked_task
 
+    # A stopped or replaced Resident's still-valid JWT must not be able to
+    # commit one last reply. Validate task/session/generation from the fresh,
+    # locked Project + Task rows before staging any mutation.
+    resident_ctx = task.context or {}
+    if resident_ctx.get("_resident_session") is True:
+        resident_blob = _read_resident_session(project.vision)
+        try:
+            task_generation = int(
+                resident_ctx.get("_resident_worker_generation") or 1
+            )
+            current_generation = int(
+                (resident_blob or {}).get("worker_generation") or 1
+            )
+        except (TypeError, ValueError):
+            task_generation = current_generation = -1
+        if (
+            not _resident_session_is_active(resident_blob)
+            or bool((resident_blob or {}).get("stop_requested"))
+            or str((resident_blob or {}).get("session_id"))
+            != str(resident_ctx.get("strategic_session_id"))
+            or str((resident_blob or {}).get("task_id")) != str(task.id)
+            or current_generation != task_generation
+            or task.status in TASK_OUTCOME_TERMINAL_STATUSES
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident worker generation superseded",
+            )
+
+        await _enforce_resident_mutation_fence(session, project, task, payload.op)
     data = payload.data
     warnings: List[str] = []
 
@@ -2795,6 +2890,56 @@ async def strategic_operation(
                 detail="idempotency_key exceeds 255 characters",
             )
         idem_key: str | None = raw_idem or None
+        covered_context_key = "_resident_reply_covered_message_ids"
+        turn_state_context_key = "_resident_reply_turn_state_sha256"
+        msg_ctx.pop(covered_context_key, None)
+        msg_ctx.pop(turn_state_context_key, None)
+        raw_covered_ids = data.get("covered_message_ids")
+        covered_message_ids: list[uuid.UUID] | None = None
+        covered_message_id_strings: list[str] | None = None
+        if raw_covered_ids is not None:
+            if not isinstance(raw_covered_ids, list) or not raw_covered_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="covered_message_ids must be a non-empty array",
+                )
+            if len(raw_covered_ids) > RESIDENT_REPLY_COVERED_MESSAGE_MAX:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "covered_message_ids exceeds "
+                        f"{RESIDENT_REPLY_COVERED_MESSAGE_MAX} entries"
+                    ),
+                )
+            if not idem_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail="covered_message_ids requires idempotency_key",
+                )
+            if resident_ctx.get("_resident_session") is not True:
+                raise HTTPException(
+                    status_code=409,
+                    detail="covered_message_ids requires an active Resident session",
+                )
+            parsed_covered: list[uuid.UUID] = []
+            for raw_covered_id in raw_covered_ids:
+                if not isinstance(raw_covered_id, str) or not raw_covered_id.strip():
+                    raise HTTPException(
+                        status_code=400, detail="Invalid covered message id"
+                    )
+                try:
+                    parsed_covered.append(uuid.UUID(raw_covered_id.strip()))
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid covered message id"
+                    ) from None
+            if len(set(parsed_covered)) != len(parsed_covered):
+                raise HTTPException(
+                    status_code=400,
+                    detail="covered_message_ids contains duplicates",
+                )
+            covered_message_ids = parsed_covered
+            covered_message_id_strings = sorted(str(value) for value in parsed_covered)
         from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
 
         event_type = str(msg_ctx.get("event_type") or "").strip() or None
@@ -2809,6 +2954,87 @@ async def strategic_operation(
         )
         msg_ctx = stamp_message_audience(msg_ctx, event_type or _default_event_type, message_type=msg_type.value)
         is_routine = event_type in ROUTINE_EVENT_TYPES
+        if covered_message_ids is not None and is_routine:
+            raise HTTPException(
+                status_code=409,
+                detail="Resident replies cannot cover messages from the activity surface",
+            )
+        if covered_message_id_strings is not None:
+            msg_ctx[covered_context_key] = covered_message_id_strings
+        raw_turn_state = data.get("resident_turn_state")
+        resident_turn_state: dict[str, Any] | None = None
+        resident_turn_state_sha256: str | None = None
+        if raw_turn_state is not None:
+            if covered_message_ids is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state requires covered_message_ids",
+                )
+            if not isinstance(raw_turn_state, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state must be an object",
+                )
+            unknown_state_keys = set(raw_turn_state) - {
+                "exam_ledger",
+                "decisions_reg",
+                "message_cursor",
+                "operator_decision_summary",
+            }
+            if unknown_state_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state contains unknown fields",
+                )
+            exam_ledger = raw_turn_state.get("exam_ledger")
+            decisions_reg = raw_turn_state.get("decisions_reg")
+            message_cursor = raw_turn_state.get("message_cursor")
+            decision_summary = raw_turn_state.get("operator_decision_summary")
+            if (
+                not isinstance(exam_ledger, str)
+                or not exam_ledger
+                or len(exam_ledger.encode("utf-8")) > 20_000
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.exam_ledger is invalid",
+                )
+            if decisions_reg is not None and (
+                not isinstance(decisions_reg, str)
+                or len(decisions_reg.encode("utf-8")) > 32_000
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.decisions_reg is invalid",
+                )
+            if message_cursor is not None and (
+                not isinstance(message_cursor, str) or len(message_cursor) > 128
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.message_cursor is invalid",
+                )
+            if decision_summary is not None and not isinstance(decision_summary, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.operator_decision_summary is invalid",
+                )
+            canonical_turn_state = json.dumps(
+                raw_turn_state,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            if len(canonical_turn_state.encode("utf-8")) > 55_000:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state is too large",
+                )
+            resident_turn_state = dict(raw_turn_state)
+            resident_turn_state_sha256 = hashlib.sha256(
+                canonical_turn_state.encode("utf-8")
+            ).hexdigest()
+            msg_ctx[turn_state_context_key] = resident_turn_state_sha256
         reply_to_message_id: uuid.UUID | None = None
         raw_reply_to = msg_ctx.get("reply_to")
         if raw_reply_to is not None:
@@ -2832,6 +3058,94 @@ async def strategic_operation(
             reply_target.handled_by_task_id = task.id
             reply_target.updated_at = _utcnow()
             session.add(reply_target)
+        # Rollback expires ORM instances even when expire_on_commit=False. Keep
+        # identities as plain UUID/string values for replay paths.
+        _task_id = task.id
+        _project_id = project.id
+        current_resident_session_id = str(
+            resident_ctx.get("strategic_session_id") or ""
+        )
+
+        async def _same_message_producer(candidate: ProjectMessage) -> bool:
+            if candidate.from_task_id == _task_id:
+                return True
+            if (
+                resident_ctx.get("_resident_session") is not True
+                or not current_resident_session_id
+                or str(candidate.resident_session_id or "")
+                != current_resident_session_id
+                or candidate.from_task_id is None
+            ):
+                return False
+            prior_task = await session.get(Task, candidate.from_task_id)
+            prior_ctx = prior_task.context if prior_task is not None else {}
+            return bool(
+                prior_ctx
+                and prior_ctx.get("_resident_session") is True
+                and str(prior_ctx.get("strategic_session_id") or "")
+                == current_resident_session_id
+            )
+
+        async def _apply_covered_messages() -> None:
+            if covered_message_ids is None:
+                return
+            rows = (
+                (
+                    await session.execute(
+                        select(ProjectMessage)
+                        .where(
+                            ProjectMessage.project_id == _project_id,
+                            ProjectMessage.id.in_(covered_message_ids),
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            by_id = {row.id: row for row in rows}
+            if len(by_id) != len(covered_message_ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail="covered_message_ids contains an unavailable message",
+                )
+            for covered_id in covered_message_ids:
+                inbound = by_id[covered_id]
+                if inbound.from_type != "user" or (
+                    inbound.resident_session_id is not None
+                    and str(inbound.resident_session_id)
+                    != current_resident_session_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="covered_message_ids is outside this Resident session",
+                    )
+                if inbound.status != "open":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="covered_message_ids contains a non-open message",
+                    )
+                inbound.status = "handled"
+                session.add(inbound)
+
+        def _apply_resident_turn_state() -> None:
+            if resident_turn_state is None:
+                return
+            next_context = dict(task.context or {})
+            next_context["_exam_ledger"] = resident_turn_state["exam_ledger"]
+            decisions_reg = resident_turn_state.get("decisions_reg")
+            if isinstance(decisions_reg, str) and decisions_reg:
+                next_context["_decisions_reg"] = decisions_reg
+            message_cursor = resident_turn_state.get("message_cursor")
+            if isinstance(message_cursor, str) and message_cursor:
+                next_context["message_cursor"] = message_cursor
+            decision_summary = resident_turn_state.get("operator_decision_summary")
+            if isinstance(decision_summary, dict):
+                next_context["_operator_decision_summary"] = decision_summary
+            task.context = next_context
+            flag_modified(task, "context")
+            session.add(task)
+
         if idem_key:
             existing = (
                 await session.execute(
@@ -2844,9 +3158,13 @@ async def strategic_operation(
             if existing is not None:
                 if not (
                     existing.from_type == "strategic"
-                    and existing.from_task_id == task.id
+                    and await _same_message_producer(existing)
                     and existing.message_type == msg_type
                     and existing.content == content
+                    and (existing.context or {}).get(covered_context_key)
+                    == covered_message_id_strings
+                    and (existing.context or {}).get(turn_state_context_key)
+                    == resident_turn_state_sha256
                     and existing.reply_to_message_id == reply_to_message_id
                     and existing.surface
                     == (
@@ -2859,13 +3177,24 @@ async def strategic_operation(
                         status_code=409,
                         detail="idempotency_key already belongs to a different message",
                     )
+                existing_message_id = str(existing.id)
+                # Sequence allocation and reply-target bookkeeping preceded the
+                # replay lookup. Exact replay is read-only.
+                await session.rollback()
                 return _resp(
                     {
                         "status": "ok",
                         "op": "create_message",
-                        "message_id": str(existing.id),
+                        "message_id": existing_message_id,
                     }
                 )
+        resident_blob = _read_resident_session(project.vision)
+        resident_session_id = (
+            resident_blob.get("session_id")
+            if isinstance(resident_blob, dict)
+            and _resident_session_is_active(resident_blob)
+            else None
+        )
         next_sequence = preallocated_message_sequence
         if next_sequence is None:
             raise HTTPException(status_code=500, detail="Message sequence was not allocated")
@@ -2883,22 +3212,26 @@ async def strategic_operation(
                 if is_routine
                 else MessageHandlingState.RESPONDED
             ),
-            handled_by_task_id=task.id if not is_routine else None,
+            handled_by_task_id=_task_id if not is_routine else None,
             reply_to_message_id=reply_to_message_id,
             message_type=msg_type,
             from_type="strategic",
-            from_task_id=task.id,
+            from_task_id=_task_id,
             content=content,
             context=msg_ctx,
             idempotency_key=idem_key,
+            resident_session_id=resident_session_id,
         )
         session.add(new_msg)
+        # Reply, immutable receipt, handled inbound rows, and restart state are
+        # committed together; a crash cannot split acknowledgement from reply.
+        await _apply_covered_messages()
+        _apply_resident_turn_state()
         # Snapshot project.id before commit: the IntegrityError rollback below
         # expires `project` (rollback expires regardless of expire_on_commit), so
         # evaluating ProjectMessage.project_id == project.id in the coalesce
         # re-query would fire a sync lazy-load -> MissingGreenlet, 500-ing the
         # idempotency-coalesce path instead of returning the existing message.
-        _project_id = project.id
         try:
             await session.commit()
         except IntegrityError:
@@ -2915,9 +3248,13 @@ async def strategic_operation(
                 if existing is not None:
                     if not (
                         existing.from_type == "strategic"
-                        and existing.from_task_id == task.id
+                        and await _same_message_producer(existing)
                         and existing.message_type == msg_type
                         and existing.content == content
+                        and (existing.context or {}).get(covered_context_key)
+                        == covered_message_id_strings
+                        and (existing.context or {}).get(turn_state_context_key)
+                        == resident_turn_state_sha256
                         and existing.reply_to_message_id == reply_to_message_id
                         and existing.surface
                         == (
@@ -2930,11 +3267,15 @@ async def strategic_operation(
                             status_code=409,
                             detail="idempotency_key already belongs to a different message",
                         )
+                    # The winning transaction already committed the exact
+                    # receipt. Never reapply covered-row writes after rollback.
+                    existing_message_id = str(existing.id)
+                    await session.rollback()
                     return _resp(
                         {
                             "status": "ok",
                             "op": "create_message",
-                            "message_id": str(existing.id),
+                            "message_id": existing_message_id,
                         }
                     )
             raise

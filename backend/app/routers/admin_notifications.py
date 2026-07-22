@@ -946,7 +946,7 @@ async def resolve_message(
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
     # Verify user has write access to the project (member+; viewers are read-only)
-    await _get_user_project_with_role(
+    project = await _get_user_project_with_role(
         msg.project_id, current_user["user_id"], session, "member"
     )
 
@@ -987,6 +987,7 @@ async def resolve_message(
             .where(Project.id == message_project_uuid)
             .with_for_update()
         )
+        await session.refresh(project, attribute_names=["vision"])
         reply_sequence = await lock_project_and_next_message_sequence(
             session,
             message_project_uuid,
@@ -1026,6 +1027,18 @@ async def resolve_message(
             post_feedback_acknowledgment as _post_feedback_ack,
             post_question_answer as _post_qa,
         )
+        from app.strategic_resident_session import (
+            read_resident_session,
+            resident_session_is_active,
+        )
+
+        resident_blob = read_resident_session(project.vision)
+        resident_active = resident_session_is_active(resident_blob)
+        resident_session_id = (
+            str(resident_blob.get("session_id"))
+            if resident_active and resident_blob.get("session_id")
+            else None
+        )
 
         if message_type == MessageType.QUESTION:
             reply = await _post_qa(
@@ -1050,6 +1063,7 @@ async def resolve_message(
                 content_override=answer,
                 sequence=reply_sequence,
             )
+        reply.resident_session_id = resident_session_id
         event_type = (reply.context or {}).get("event_type")
         locked_vision = await session.scalar(
             select(Project.vision).where(Project.id == message_project_uuid)
@@ -1061,6 +1075,7 @@ async def resolve_message(
             MessageType(reply.message_type),
             event_type=str(event_type) if event_type else None,
             message_content=answer,
+            resident_session_active=resident_active,
         )
         if not session.in_transaction():
             # Arming rolled back a poisoned transaction. Nothing in this

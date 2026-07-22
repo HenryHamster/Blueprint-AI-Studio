@@ -21,6 +21,7 @@ import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA, handleS
 import { handleReview, handleFix } from './review-fix.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
+import { handleStrategicResident } from './strategic-resident.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
 import { handleReleaseMergeGrade } from './merge-grade.js';
@@ -51,9 +52,25 @@ export type Handler = (
   model?: string, effort?: string
 ) => Promise<void>;
 
-// strategic_review (and research_mode === 'strategic') dispatch: routes to the
-// one-shot handleStrategic behavior.
+// Workday's conversational Resident is deliberately a narrow strategic_review
+// mode, not a task type or autonomous shadow-turn lane. Only an explicitly
+// marked strategic_review claim may enter the persistent session handler.
+export function isResidentSessionTask(
+  task: Record<string, unknown>, payload: Record<string, unknown>,
+): boolean {
+  if (payload.type !== 'strategic_review') return false;
+  if (payload.resident_session === true) return true;
+  const ctx = task.context;
+  return !!ctx && typeof ctx === 'object' && !Array.isArray(ctx)
+    && (ctx as Record<string, unknown>)._resident_session === true;
+}
+
+// strategic_review dispatch preserves one-shot Strategic by default. The
+// explicitly marked Workday conversation is the sole Resident entrypoint.
 const dispatchStrategic: Handler = (taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort) => {
+  if (isResidentSessionTask(task, payload)) {
+    return handleStrategicResident(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+  }
   return handleStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
 };
 

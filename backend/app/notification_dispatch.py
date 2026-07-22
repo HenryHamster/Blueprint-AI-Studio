@@ -2458,6 +2458,7 @@ async def post_feedback_acknowledgment(
     task_id: Optional[uuid.UUID] = None,
     *,
     from_type: str = "strategic",
+    resident_session_id: Optional[str] = None,
     actor_user_id: Optional[str] = None,
     event_type: str = "feedback_acknowledgment",
     content_override: str | None = None,
@@ -2501,6 +2502,7 @@ async def post_question_answer(
     answer: str,
     task_id: Optional[uuid.UUID] = None,
     from_type: str = "strategic",
+    resident_session_id: Optional[str] = None,
     actor_user_id: Optional[str] = None,
     content_override: str | None = None,
     sequence: int | None = None,
@@ -2542,6 +2544,7 @@ async def post_question_answer(
         from_task_id=task_id,
         content=content_override if content_override is not None else f"Answer: {answer}",
         context=context,
+        resident_session_id=resident_session_id,
     )
     session.add(msg)
     return msg

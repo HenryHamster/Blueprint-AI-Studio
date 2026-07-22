@@ -20,13 +20,17 @@ async def get_messages_noise_prefs_row(
     project_id: uuid.UUID,
     *,
     for_update: bool = False,
+    populate_existing: bool = False,
 ) -> MessagesNoisePrefs | None:
     stmt = select(MessagesNoisePrefs).where(
         MessagesNoisePrefs.user_id == user_id,
         MessagesNoisePrefs.project_id == project_id,
     )
     if for_update:
-        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        stmt = stmt.with_for_update()
+        populate_existing = True
+    if populate_existing:
+        stmt = stmt.execution_options(populate_existing=True)
     return (await session.execute(stmt)).scalar_one_or_none()
 
 

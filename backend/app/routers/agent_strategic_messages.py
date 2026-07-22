@@ -40,11 +40,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import ProjectMessage
+from app.models import Project, ProjectMessage, Task
 from app.project_message_projection import project_message_base
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
@@ -54,8 +55,42 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 logger = logging.getLogger(__name__)
 
-_MESSAGES_POLL_DEFAULT_LIMIT = 50
-_MESSAGES_POLL_MAX_LIMIT = 200
+_MESSAGES_POLL_DEFAULT_LIMIT = 20
+_MESSAGES_POLL_MAX_LIMIT = 20
+
+
+def _parse_persisted_worker_generation(value: Any) -> int | None:
+    """Parse persisted Resident authority, defaulting only missing state to 1."""
+    if value is None:
+        return 1
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        generation = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            generation = int(raw)
+        except ValueError:
+            return None
+    else:
+        return None
+    return generation if generation >= 1 else None
+
+
+async def _lock_resident_poll_project(
+    session: AsyncSession, project_id: uuid.UUID
+) -> Project | None:
+    """Freshen and share-lock canonical Resident authority through the poll."""
+    result = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
 
 
 def _parse_since(value: str | None) -> datetime | None:
@@ -112,6 +147,7 @@ async def agent_poll_messages(
     from_type: str = Query(default="user"),
     status: str = Query(default="open"),
     session_id: str | None = Query(default=None),
+    worker_generation: int | None = Query(default=None, ge=1),
     limit: int = Query(
         default=_MESSAGES_POLL_DEFAULT_LIMIT,
         ge=1,
@@ -136,7 +172,69 @@ async def agent_poll_messages(
     Cross-project access returns 404 via ``_resolve_agent_project`` (probing
     can't enumerate other projects' ids).
     """
-    await _resolve_agent_project(project_id, token, session)
+    project = await _resolve_agent_project(project_id, token, session)
+    authenticated_task_id = uuid.UUID(str(token.get("sub")))
+    authenticated_task = await session.get(Task, authenticated_task_id)
+    task_context = (
+        authenticated_task.context if authenticated_task is not None else {}
+    )
+    if task_context and task_context.get("_resident_session") is True:
+        # Resident replacement takes the Project row exclusively. Hold a fresh
+        # shared lock through this poll so validation and message selection are
+        # one authority boundary, never validate-gen1/read-after-gen2.
+        project = await _lock_resident_poll_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        authenticated_task = await session.get(
+            Task, authenticated_task_id, populate_existing=True
+        )
+        task_context = (
+            authenticated_task.context if authenticated_task is not None else {}
+        )
+        authenticated_session_id = str(
+            task_context.get("strategic_session_id") or ""
+        )
+        authenticated_generation = _parse_persisted_worker_generation(
+            task_context.get("_resident_worker_generation")
+        )
+        if (
+            task_context.get("_resident_session") is not True
+            or not authenticated_session_id
+            or authenticated_generation is None
+            or (session_id is not None and session_id != authenticated_session_id)
+            or (
+                worker_generation is not None
+                and worker_generation != authenticated_generation
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident worker identity mismatch",
+            )
+
+        resident_blob = (
+            (project.vision or {}).get("_resident_strategic_session") or {}
+        )
+        current_generation = _parse_persisted_worker_generation(
+            resident_blob.get("worker_generation")
+        )
+        if (
+            resident_blob.get("status") != "active"
+            or bool(resident_blob.get("stop_requested"))
+            or str(resident_blob.get("session_id") or "")
+            != authenticated_session_id
+            or str(resident_blob.get("task_id") or "")
+            != str(authenticated_task_id)
+            or current_generation is None
+            or current_generation != authenticated_generation
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident worker generation superseded or inactive",
+            )
+        # Caller-supplied scope is advisory only; authenticated task authority
+        # always selects the current Resident conversation.
+        session_id = authenticated_session_id
     server_time = datetime.now(timezone.utc)
     since_dt = _parse_since(since)
 
@@ -151,9 +249,15 @@ async def agent_poll_messages(
         # instant closes both the >limit truncation skip and the commit-race
         # skip a strict > would open (see module docstring).
         conditions.append(ProjectMessage.created_at >= since_dt)
-    # ``session_id`` is accepted for backward compatibility with older agents but
-    # no longer scopes the poll: messages are returned project-wide (per-session
-    # scoping was retired), so every agent sees the full project message stream.
+    if session_id:
+        # Include legacy NULL-session backlog, but never leak a different
+        # Workday session into this resident's conversation.
+        conditions.append(
+            or_(
+                ProjectMessage.resident_session_id == session_id,
+                ProjectMessage.resident_session_id.is_(None),
+            )
+        )
 
     rows = (
         (

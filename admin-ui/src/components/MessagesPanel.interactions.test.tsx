@@ -139,13 +139,6 @@ function _messagesGetCalls(): unknown[][] {
     return /\/api\/admin\/messages(\?|$)/.test(url) && (!init?.method || init.method === 'GET');
   });
 }
-function _strategicSessionGetCalls(): unknown[][] {
-  return vi.mocked(apiFetch).mock.calls.filter((c) => {
-    const url = String(c[0]);
-    const init = c[1] as RequestInit | undefined;
-    return /\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(url) && (!init?.method || init.method === 'GET');
-  });
-}
 function _strategicSessionMessagePostCalls(): unknown[][] {
   return vi.mocked(apiFetch).mock.calls.filter((c) => {
     const url = String(c[0]);
@@ -720,12 +713,13 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     return host as HTMLDivElement;
   }
 
-  test('shows pending badge with origin + age when marker is present', async () => {
+  test('shows the compact pending receipt when a marker is present', async () => {
     const el = await renderPanel({
       _strategic_refresh: { requested_at: new Date(Date.now() - 60_000).toISOString(), origin: 'steering', reason: 'op', count: 1 },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('steering');
+    expect(el.textContent).toContain('Cancel');
+    expect(el.textContent).not.toContain('steering');
   });
 
   test('hides pending badge when no marker is present', async () => {
@@ -733,7 +727,7 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(el.textContent).not.toContain('Strategic cycle pending');
   });
 
-  test('falls back to legacy project vision while Strategic read model is loading', async () => {
+  test('falls back to legacy project vision while keeping the pending receipt compact', async () => {
     const el = await renderPanel(
       {
         _strategic_refresh: {
@@ -746,10 +740,11 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     );
 
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('operator');
+    expect(el.textContent).toContain('Cancel');
+    expect(el.textContent).not.toContain('operator');
   });
 
-  test('shows pending badge from populated Strategic read model', async () => {
+  test('shows a compact pending receipt from the populated Strategic read model', async () => {
     const state = makeStrategicState({
       strategic: {
         ...makeStrategicState().strategic,
@@ -768,8 +763,9 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     const el = await renderPanel({}, false, { strategicState: state });
 
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('Refresh from Strategic read model');
-    expect(el.textContent).toContain('+1 steer coalesced');
+    expect(el.textContent).toContain('Cancel');
+    expect(el.textContent).not.toContain('Refresh from Strategic read model');
+    expect(el.textContent).not.toContain('coalesced');
   });
 
   test('hides pending badge once the cycle is running (strategistActive)', async () => {
@@ -810,7 +806,7 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(cancelBtn).toBeFalsy();
   });
 
-  test('displays the directive excerpt when present', async () => {
+  test('does not leak a pending directive into the compact conversation chrome', async () => {
     const el = await renderPanel({
       _strategic_refresh: {
         requested_at: new Date(Date.now() - 60_000).toISOString(),
@@ -820,10 +816,10 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('Fix the flaky test in the auth module by adding proper setup/teardown');
+    expect(el.textContent).not.toContain('Fix the flaky test in the auth module by adding proper setup/teardown');
   });
 
-  test('truncates long directives with ellipsis', async () => {
+  test('keeps long pending directives out of the compact conversation chrome', async () => {
     const longExcerpt = 'This is a very long directive text that should be truncated with ellipsis because it exceeds the maximum display length and we want to keep the UI compact and readable for the operator'.repeat(2);
     const el = await renderPanel({
       _strategic_refresh: {
@@ -834,12 +830,10 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
-    // Should contain first 120 chars of the excerpt
-    expect(el.textContent).toContain(longExcerpt.slice(0, 120));
-    expect(el.textContent).toContain('…');
+    expect(el.textContent).not.toContain(longExcerpt.slice(0, 120));
   });
 
-  test('displays coalesce count when operator_count > 1 (operator-origin steers only)', async () => {
+  test('coalesced steers keep a single compact pending receipt', async () => {
     const el = await renderPanel({
       _strategic_refresh: {
         requested_at: new Date(Date.now() - 60_000).toISOString(),
@@ -850,7 +844,10 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('+2 steers coalesced');
+    expect(el.textContent).not.toContain('coalesced');
+    const cancelButtons = Array.from(el.querySelectorAll('button'))
+      .filter(button => button.textContent === 'Cancel');
+    expect(cancelButtons).toHaveLength(1);
   });
 
   test('does not display coalesce count for qualification-origin markers (automated refreshes excluded)', async () => {
@@ -883,7 +880,7 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(el.textContent).not.toContain('coalesced');
   });
 
-  test('displays multiple pending details together', async () => {
+  test('multiple pending steers remain one compact receipt without verbose details', async () => {
     const el = await renderPanel({
       _strategic_refresh: {
         requested_at: new Date(Date.now() - 120_000).toISOString(),
@@ -894,9 +891,9 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('Investigate the performance regression in the query handler');
-    expect(el.textContent).toContain('+4 steers coalesced');
-    expect(el.textContent).toContain('armed 2m ago');
+    expect(el.textContent).not.toContain('Investigate the performance regression in the query handler');
+    expect(el.textContent).not.toContain('coalesced');
+    expect(el.textContent).not.toContain('armed 2m ago');
   });
 
   test('does not show receipt when last_fired_at is older than 2 hours', async () => {
@@ -1261,7 +1258,9 @@ describe('MessagesPanel composer draft persistence', () => {
         }}
       />,
     );
-    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
+    // A supplied Strategic read model deliberately skips the conversation GET.
+    // The mounted composer is the readiness signal for this direct-send path.
+    await waitFor(() => expect(container.querySelector('textarea')).toBeTruthy());
 
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(textarea.value).toBe('');
@@ -1405,15 +1404,15 @@ describe('MessagesPanel strategic cycle progress indicators', () => {
     expect(el.textContent).toContain('Focus on backend reliability');
   });
 
-  test('truncates steering excerpt longer than 100 chars', async () => {
+  test('truncates steering excerpt longer than 60 chars', async () => {
     const longExcerpt = 'A'.repeat(120);
     const el = await renderPanel({
       strategistActive: true,
       cycleProgress: { task_id: 't1', steering_excerpt: longExcerpt },
     });
-    // First 100 chars + ellipsis — not the full 120 chars
-    expect(el.textContent).toContain('A'.repeat(100) + '…');
-    expect(el.textContent).not.toContain('A'.repeat(101));
+    // StrategistStatusChip intentionally keeps this conversational status compact.
+    expect(el.textContent).toContain('A'.repeat(60) + '…');
+    expect(el.textContent).not.toContain('A'.repeat(61));
   });
 
   test('does not show progress indicator when strategistActive is false', async () => {

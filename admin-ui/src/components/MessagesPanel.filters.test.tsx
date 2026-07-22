@@ -211,6 +211,8 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
     expect(routineToggle).toBeTruthy();
     await act(async () => { (routineToggle as HTMLButtonElement).click(); });
 
+    await waitFor(() => expect(el.textContent).toContain('We added a new validation step'));
+
     const text = el.textContent ?? '';
     // Reply context label should appear
     expect(text).toContain('In reply to your feedback:');

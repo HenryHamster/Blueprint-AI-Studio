@@ -172,6 +172,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     strategistActive,
     cycleProgress,
     lastCycleCompletion,
+    strategicSessionTranscript,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({
     fetchTasksRef,
@@ -649,7 +650,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects, projectsLoaded,
     // Log viewer
-    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
+    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer, strategicSessionTranscript,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,

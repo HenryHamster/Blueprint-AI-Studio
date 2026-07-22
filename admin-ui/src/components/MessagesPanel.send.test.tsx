@@ -36,13 +36,31 @@ vi.mock('../uiLoadTiming', () => ({
 // (and any future export) silently `undefined`; preserving the real module via
 // importOriginal keeps every transitively-needed name resolving while we still
 // stub the network call. Override only `apiFetch`.
-vi.mock('../utils/pendingAttachmentStore', () => ({
-  putPendingAttachment: vi.fn(),
-  deletePendingAttachment: vi.fn(),
-  clearPendingAttachments: vi.fn(),
-  listPendingAttachments: vi.fn(),
-  getPendingAttachment: vi.fn(),
-}));
+vi.mock('../utils/pendingAttachmentStore', () => {
+  type Stored = { id: string; file: File; mime_type: string; name: string; size_bytes: number };
+  const records = new Map<string, Stored>();
+  const prefix = (actor: string, project: string, send: string) => `${actor}:${project}:${send}:`;
+  const key = (actor: string, project: string, send: string, id: string) => `${prefix(actor, project, send)}${id}`;
+  return {
+    putPendingAttachment: vi.fn(async (actor: string, project: string, send: string, item: Stored) => {
+      records.set(key(actor, project, send, item.id), item);
+    }),
+    deletePendingAttachment: vi.fn(async (actor: string, project: string, send: string, id: string) => {
+      records.delete(key(actor, project, send, id));
+    }),
+    clearPendingAttachments: vi.fn(async (actor: string, project: string, send: string) => {
+      for (const recordKey of records.keys()) {
+        if (recordKey.startsWith(prefix(actor, project, send))) records.delete(recordKey);
+      }
+    }),
+    listPendingAttachments: vi.fn(async (actor: string, project: string, send: string) =>
+      [...records.entries()]
+        .filter(([recordKey]) => recordKey.startsWith(prefix(actor, project, send)))
+        .map(([, item]) => item)),
+    retryPendingAttachmentCleanups: vi.fn(async () => undefined),
+    resetPendingAttachmentMemoryStoreForTests: vi.fn(() => records.clear()),
+  };
+});
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
@@ -211,7 +229,10 @@ describe('MessagesPanel send arming receipt', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
-  beforeEach(() => { localStorage.clear(); });
+  beforeEach(() => {
+    localStorage.clear();
+    pendingAttachmentStore.resetPendingAttachmentMemoryStoreForTests();
+  });
 
   afterEach(() => {
     const r = root;
@@ -389,7 +410,7 @@ describe('MessagesPanel send arming receipt', () => {
     await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
     expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('please prioritize the migration work');
+    expect(el.textContent).not.toContain('please prioritize the migration work');
   });
 
   test('fresh optimistic steering badge survives a stale read-model response', async () => {
@@ -418,7 +439,7 @@ describe('MessagesPanel send arming receipt', () => {
     });
 
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('please prioritize the migration work');
+    expect(el.textContent).not.toContain('please prioritize the migration work');
   });
 
   test('fresh optimistic steering badge survives an older read-model marker', async () => {
@@ -432,7 +453,7 @@ describe('MessagesPanel send arming receipt', () => {
     });
 
     await typeAndSend(el, 'please prioritize the migration work');
-    await waitFor(() => expect(el.textContent).toContain('please prioritize the migration work'));
+    await waitFor(() => expect(el.textContent).toContain('Strategic cycle pending'));
 
     await act(async () => {
       root!.render(
@@ -462,7 +483,8 @@ describe('MessagesPanel send arming receipt', () => {
     });
 
     expect(el.textContent).toContain('Strategic cycle pending');
-    expect(el.textContent).toContain('please prioritize the migration work');
+    expect(el.textContent).not.toContain('please prioritize the migration work');
+    expect(el.textContent).not.toContain('older pre-send marker');
     expect(el.textContent).not.toContain('older pre-send marker');
   });
 
@@ -1045,6 +1067,7 @@ describe('MessagesPanel attachment integration', () => {
   beforeEach(async () => {
     localStorage.clear();
     sessionStorage.clear();
+    pendingAttachmentStore.resetPendingAttachmentMemoryStoreForTests();
     originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
       if (String(url) === 'https://storage.googleapis.com/signed-upload') {
@@ -1177,6 +1200,127 @@ describe('MessagesPanel attachment integration', () => {
       });
     } finally {
       putSpy.mockRestore();
+    }
+  });
+
+  test('attachment additions stay locked until the durable restore snapshot settles', async () => {
+    localStorage.setItem('messages_composer_draft:test-user@example.com:proj-1', JSON.stringify({
+      version: 2,
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-1',
+      type: 'FEEDBACK',
+      content: '',
+      reply_to: null,
+      source_refs: [],
+      artifact_refs: [],
+      attachment_send_key: 'stale-restore-race',
+    }));
+    _setupAttachmentMock([]);
+    let resolveRestore!: (items: never[]) => void;
+    const staleRestore = new Promise<never[]>(resolve => { resolveRestore = resolve; });
+    const listSpy = vi.spyOn(pendingAttachmentStore, 'listPendingAttachments').mockReturnValue(staleRestore);
+    try {
+      const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+      await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+      const attach = el.querySelector<HTMLButtonElement>('button[aria-label="Attach file"]')!;
+      expect(attach.disabled).toBe(true);
+
+      resolveRestore([]);
+      await act(async () => { await staleRestore; });
+      await waitFor(() => expect(attach.disabled).toBe(false));
+
+      const input = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(['new durable bytes'], 'new-durable.txt', { type: 'text/plain' }));
+      Object.defineProperty(input, 'files', { value: transfer.files, configurable: true });
+      fireEvent.change(input);
+      await waitFor(() => expect(el.textContent).toContain('new-durable.txt'));
+    } finally {
+      listSpy.mockRestore();
+    }
+  });
+
+  test('send stays locked until durable draft attachments finish restoring', async () => {
+    localStorage.setItem('messages_composer_draft:test-user@example.com:proj-1', JSON.stringify({
+      version: 2,
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-1',
+      type: 'FEEDBACK',
+      content: 'Send with the restored file',
+      reply_to: null,
+      source_refs: [],
+      artifact_refs: [],
+      attachment_send_key: 'restore-before-send',
+    }));
+    _setupAttachmentMock([]);
+    type StoredAttachment = { id: string; file: File; mime_type: string; name: string; size_bytes: number };
+    let resolveRestore!: (items: StoredAttachment[]) => void;
+    const deferredRestore = new Promise<StoredAttachment[]>(resolve => { resolveRestore = resolve; });
+    const listSpy = vi.spyOn(pendingAttachmentStore, 'listPendingAttachments').mockReturnValue(deferredRestore);
+    try {
+      const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+      await waitFor(() => expect(listSpy).toHaveBeenCalled());
+      const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!;
+      expect(send.disabled).toBe(true);
+
+      fireEvent.click(send);
+      expect(vi.mocked(apiFetch).mock.calls.filter(call => (
+        String(call[0]).includes('/strategic-session/messages')
+        && (call[1] as RequestInit | undefined)?.method === 'POST'
+      ))).toHaveLength(0);
+
+      resolveRestore([{
+        id: 'restored-file',
+        file: new File(['restored bytes'], 'restored.txt', { type: 'text/plain' }),
+        mime_type: 'text/plain',
+        name: 'restored.txt',
+        size_bytes: 14,
+      }]);
+      await waitFor(() => expect(el.textContent).toContain('restored.txt'));
+      await waitFor(() => expect(send.disabled).toBe(false));
+    } finally {
+      listSpy.mockRestore();
+    }
+  });
+
+  test('failed durable attachment restore keeps send locked while automatic retry recovers it', async () => {
+    localStorage.setItem('messages_composer_draft:test-user@example.com:proj-1', JSON.stringify({
+      version: 2,
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-1',
+      type: 'FEEDBACK',
+      content: 'Do not send without the restored file',
+      reply_to: null,
+      source_refs: [],
+      artifact_refs: [],
+      attachment_send_key: 'retry-restore-before-send',
+    }));
+    _setupAttachmentMock([]);
+    const addToast = vi.fn();
+    const listSpy = vi.spyOn(pendingAttachmentStore, 'listPendingAttachments')
+      .mockRejectedValueOnce(new Error('temporary IndexedDB failure'))
+      .mockResolvedValue([{
+        id: 'retried-file',
+        file: new File(['retried bytes'], 'retried.txt', { type: 'text/plain' }),
+        mime_type: 'text/plain',
+        name: 'retried.txt',
+        size_bytes: 13,
+      }]);
+    try {
+      const el = await renderPanel(addToast, { filterChrome: 'minimal' });
+      await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+      const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!;
+      expect(send.disabled).toBe(true);
+      expect(addToast).toHaveBeenCalledWith(
+        'Could not restore pending attachments; retrying automatically',
+        'error',
+      );
+
+      await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(el.textContent).toContain('retried.txt'));
+      await waitFor(() => expect(send.disabled).toBe(false));
+    } finally {
+      listSpy.mockRestore();
     }
   });
 
@@ -1346,6 +1490,7 @@ describe('MessagesPanel attachment integration', () => {
     let finishReplace!: () => void;
     const replacement = new Promise<void>(resolve => { finishReplace = resolve; });
     const putSpy = vi.spyOn(pendingAttachmentStore, 'putPendingAttachment').mockReturnValue(replacement);
+    putSpy.mockClear();
     const deleteSpy = vi.spyOn(pendingAttachmentStore, 'deletePendingAttachment').mockResolvedValue();
     try {
       fireEvent.click(el.querySelector('button[aria-label="Open replace-race.png preview"]')!);
@@ -1398,6 +1543,7 @@ describe('MessagesPanel attachment integration', () => {
     let finishReplace!: () => void;
     const replacement = new Promise<void>(resolve => { finishReplace = resolve; });
     const putSpy = vi.spyOn(pendingAttachmentStore, 'putPendingAttachment').mockReturnValue(replacement);
+    putSpy.mockClear();
     try {
       fireEvent.change(el.querySelector('textarea')!, { target: { value: 'Send replacement only' } });
       fireEvent.click(el.querySelector('button[aria-label="Open replace-send.png preview"]')!);

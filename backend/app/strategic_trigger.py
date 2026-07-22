@@ -89,6 +89,16 @@ ARMING_STEERING = "steering"
 ARMING_PASSIVE_NOTE = "passive_note"
 ARMING_ROUTINE_EVENT = "routine_event"
 ARMING_NOT_ARMED = "not_armed"
+#   * ``resident_session`` — a live resident Workday session owns the project, so
+#                            the operator message is handled DIRECTLY by the
+#                            standing agent (which polls the message and replies
+#                            live). The legacy cadence steering-refresh marker is
+#                            deliberately NOT armed and no ``strategic_steering_acted``
+#                            confirmation is fired: waking a second (cadence)
+#                            writer would race the resident agent, and the "steer
+#                            picked up" receipt is meaningless when the resident
+#                            session, not a spawned cycle, acts on the message.
+ARMING_RESIDENT_SESSION = "resident_session"
 
 
 def classify_operator_arming(
@@ -288,6 +298,7 @@ async def maybe_arm_operator_refresh(
     *,
     event_type: str | None = None,
     message_content: str | None = None,
+    resident_session_active: bool = False,
 ) -> str:
     """Shared 'should this operator message wake the strategist, and arm it' gate.
 
@@ -326,10 +337,24 @@ async def maybe_arm_operator_refresh(
     refresh marker (as the steering excerpt) so the steering directive survives
     the operator message aging out of the volatile recent-messages snapshot
     before the deferred strategic cycle reaches its review phase.
+
+    ``resident_session_active`` short-circuits ALL cadence arming: when a live
+    resident Workday session owns the project the standing agent handles the
+    operator message directly (it polls the durable thread and replies live), so
+    arming the cadence refresh marker would only spawn a competing second writer
+    and post a meaningless "steer picked up" receipt. A genuine steering message
+    in that state returns ``ARMING_RESIDENT_SESSION`` (handled live) without
+    writing any marker; passive/routine messages keep their own outcome (they
+    never armed anything anyway).
     """
     outcome = classify_operator_arming(message_type, event_type=event_type)
     if outcome != ARMING_STEERING:
         return outcome
+    if resident_session_active:
+        # The resident agent owns the reply; do NOT arm the cadence marker (and
+        # therefore never fire ``post_strategic_steering_acted_message``, which
+        # only runs when the loop CONSUMES an operator-origin marker).
+        return ARMING_RESIDENT_SESSION
     persisted = await request_strategic_refresh(
         session,
         project_id,

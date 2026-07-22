@@ -14,6 +14,8 @@ export function createStrategicStateApiMock(overrides: Record<string, unknown> =
     fetchStrategicWorkbenchState: vi.fn(),
     updateStrategicWorkbenchState: vi.fn(),
     fetchStrategicSession: vi.fn(),
+    startStrategicSession: vi.fn(),
+    stopStrategicSession: vi.fn(),
     fetchStrategicConversation: vi.fn(),
     findStrategicMessageByClientIdentity: vi.fn(),
     createStrategicSessionMessage: vi.fn(),

@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from sqlalchemy import func, or_, and_, union_all
-from typing import Dict, Any
+from typing import Any, Dict, Literal
 import uuid
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -118,6 +118,7 @@ from app.strategic_state_read_model import (
     _integrity_conflict_trend,
     _is_live_strategic_task,
     _problem_model_summary,
+    _resident_session_availability,
     _running_update_summary,
     _strategic_refresh_summary,
     _task_summary,
@@ -140,6 +141,14 @@ from app.storage import (
     storage as gcs_storage,
 )
 from app.message_audience import stamp_message_audience
+from app.strategic_resident_session import (
+    _ResidentEnsureModeChanged,
+    authoritative_resident_session_snapshot,
+    build_resident_runner_options,
+    start_resident_session,
+    stop_resident_session,
+    sync_resident_session_for_interaction_mode,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -561,6 +570,11 @@ class StrategicSessionCheckInCreate(BaseModel):
 class StrategicSessionCommandExecute(BaseModel):
     idempotency_key: str
     observed_at: int | None = None
+
+
+class StrategicResidentSessionStart(BaseModel):
+    runner_id: str | None = None
+    expected_interaction_mode: Literal["continuous"] | None = None
 
 
 _ATTACHMENT_DEFAULT_CONTENT_TYPE = "application/octet-stream"
@@ -1509,6 +1523,7 @@ async def _build_strategic_session_response(
         "session": work_session,
         "workbench": state.get("workbench"),
         "strategic": state.get("strategic"),
+        "resident_session": state.get("resident_session"),
         "runtime": runtime,
         "context_package": context_package,
         "conversation": work_session["conversation"],
@@ -2412,6 +2427,11 @@ async def get_project_strategic_state(
         operator_user_id=current_user["user_id"],
         runner_rows=project_runners,
     )
+    async with async_timed(request, "runners"):
+        resident_runner_options = await build_resident_runner_options(
+            session, project.id, runner_rows=project_runners
+        )
+
     async with async_timed(request, "workbench"):
         workbench_state = await get_strategic_workbench_state(
             session,
@@ -2577,6 +2597,9 @@ async def get_project_strategic_state(
     )
     integrity_trend = await _integrity_conflict_trend(session, project.id)
 
+    resident_snapshot = await authoritative_resident_session_snapshot(
+        session, project
+    )
     result: Dict[str, Any] = {
         "project_id": str(project.id),
         "strategic": {
@@ -2586,6 +2609,16 @@ async def get_project_strategic_state(
             "latest_cycle": latest_cycle_summary,
             "refresh": _strategic_refresh_summary(project.vision or {}),
         },
+        "resident_session": resident_snapshot,
+        "resident_session_availability": _resident_session_availability(
+            project,
+            eligible_live_runner_count=sum(
+                1 for option in resident_runner_options if option.get("eligible")
+            ),
+            runner_options=resident_runner_options,
+            snapshot=resident_snapshot,
+        ),
+        "resident_session_runners": resident_runner_options,
         "running_update": running_update_summary,
         "problem_model": problem_model_summary,
         "directions": directions_summary,
@@ -2671,11 +2704,25 @@ async def get_project_strategic_liveness(
         current_user["user_id"],
         project.id,
     )
+    resident_runner_options = await build_resident_runner_options(session, project.id)
+    eligible_live_runner_count = sum(
+        1 for option in resident_runner_options if option.get("eligible")
+    )
+    resident_snapshot = await authoritative_resident_session_snapshot(
+        session, project
+    )
     return {
         "project_id": str(project.id),
         "interaction_mode": workbench_state.get("interaction_mode", "chat"),
+        "resident_session": resident_snapshot,
+        "resident_session_availability": _resident_session_availability(
+            project,
+            eligible_live_runner_count=eligible_live_runner_count,
+            runner_options=resident_runner_options,
+            snapshot=resident_snapshot,
+        ),
+        "resident_session_runners": resident_runner_options,
     }
-
 
 @router.get("/projects/{project_id}/strategic-session")
 @limiter.limit("30/minute")
@@ -2817,7 +2864,7 @@ async def upsert_project_strategic_session(
 ):
     """Create or resume a Strategic operator session for an existing project."""
 
-    await _get_user_project_with_role(
+    project = await _get_user_project_with_role(
         project_id,
         current_user["user_id"],
         session,
@@ -2835,6 +2882,13 @@ async def upsert_project_strategic_session(
         current_user["user_id"],
         project_id,
         workbench,
+    )
+    await sync_resident_session_for_interaction_mode(
+        session,
+        project,
+        operator_user_id=current_user["user_id"],
+        previous_mode=workbench_write.previous_state.get("interaction_mode"),
+        new_mode=workbench_write.state.get("interaction_mode"),
     )
 
     state_response = await get_project_strategic_state(
@@ -3494,3 +3548,57 @@ async def delete_message_attachment_upload(
         await session.delete(current)
         await session.commit()
     return {"status": "deleted", "deleted": True}
+@router.post("/projects/{project_id}/strategic-session/start")
+@limiter.limit("30/minute")
+async def start_project_strategic_resident_session(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicResidentSessionStart | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Start or adopt the persistent Workday resident on a selected runner."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    data = payload or StrategicResidentSessionStart()
+    try:
+        snapshot = await start_resident_session(
+            session,
+            project,
+            operator_user_id=current_user["user_id"],
+            runner_id=data.runner_id,
+            expected_interaction_mode=data.expected_interaction_mode,
+        )
+    except _ResidentEnsureModeChanged:
+        snapshot = await authoritative_resident_session_snapshot(session, project)
+        return {
+            "project_id": str(project_id),
+            "session": snapshot,
+            "ensure_outcome": "mode_changed",
+        }
+    return {
+        "project_id": str(project_id),
+        "session": snapshot,
+        "ensure_outcome": "ensured",
+    }
+
+
+@router.post("/projects/{project_id}/strategic-session/stop")
+@limiter.limit("30/minute")
+async def stop_project_strategic_resident_session(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Stop Workday and release authority back to the one-shot cadence."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    snapshot = await stop_resident_session(
+        session,
+        project,
+        operator_user_id=current_user["user_id"],
+    )
+    return {"project_id": str(project_id), "session": snapshot}

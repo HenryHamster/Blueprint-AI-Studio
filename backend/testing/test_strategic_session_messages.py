@@ -387,45 +387,139 @@ async def test_poll_max_created_at_cursor_redelivers_boundary(
 
 
 @pytest.mark.asyncio
-async def test_poll_session_id_is_accepted_but_no_longer_scopes(
+async def test_poll_session_id_scopes_to_session_plus_legacy_rows(
     client: AsyncClient, db_session
 ):
-    """``session_id`` is retained on the poll endpoint for backward compatibility
-    with older agents, but per-session scoping has been retired: the poll now
-    returns the project's messages project-wide whether or not a ``session_id`` is
-    supplied. This guards against a regression where passing ``session_id`` would
-    hide messages (the old per-session scoping behaviour, since retired)."""
+    """Session A sees its rows and legacy NULL rows, never session B's rows."""
     project, task = await _make_project_task(db_session)
-
-    msg_1 = await _add_message(
+    own = await _add_message(
         db_session, project, from_type="user", status="open",
-        message_type=MessageType.NOTE, content="first msg",
+        message_type=MessageType.NOTE, content="session A",
+        resident_session_id="session-a",
         created_at=_BASE,
     )
-    msg_2 = await _add_message(
+    legacy = await _add_message(
         db_session, project, from_type="user", status="open",
-        message_type=MessageType.NOTE, content="second msg",
+        message_type=MessageType.NOTE, content="legacy",
         created_at=_BASE + timedelta(minutes=1),
     )
-    await db_session.commit()
-
-    # Poll WITH an arbitrary session_id — all project messages are still returned
-    # (session_id no longer filters anything).
+    other = await _add_message(
+        db_session, project, from_type="user", status="open",
+        message_type=MessageType.NOTE, content="session B",
+        resident_session_id="session-b",
+        created_at=_BASE + timedelta(minutes=2),
+    )
     res = await client.get(
         f"/api/agent/projects/{project.id}/messages",
-        params={"session_id": "any-session-token"},
+        params={"session_id": "session-a"},
         headers=_headers(task),
     )
     assert res.status_code == 200, res.text
     ids = [m["id"] for m in res.json()["messages"]]
-    assert str(msg_1.id) in ids
-    assert str(msg_2.id) in ids
+    assert ids == [str(own.id), str(legacy.id)]
+    assert str(other.id) not in ids
 
-    # Poll WITHOUT session_id — identical project-wide result.
-    res_wide = await client.get(
-        f"/api/agent/projects/{project.id}/messages",
-        headers=_headers(task),
+
+async def _make_resident_poll_worker(
+    db_session, *, generation: int = 2, session_id: str = "resident-session"
+):
+    project, task = await _make_project_task(db_session, vm="agent-vm-resident-poll")
+    task.context = {
+        "_resident_session": True,
+        "strategic_session_id": session_id,
+        "_resident_worker_generation": generation,
+    }
+    project.vision = {
+        "_resident_strategic_session": {
+            "session_id": session_id,
+            "task_id": str(task.id),
+            "worker_generation": generation,
+            "status": "active",
+        }
+    }
+    db_session.add_all([project, task])
+    await db_session.commit()
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_uses_authenticated_session_scope(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    own = await _add_message(
+        db_session, project, from_type="user", status="open",
+        message_type=MessageType.NOTE, content="current session",
+        resident_session_id="resident-session", created_at=_BASE,
     )
-    assert res_wide.status_code == 200, res_wide.text
-    ids_wide = [m["id"] for m in res_wide.json()["messages"]]
-    assert ids_wide == ids
+    await _add_message(
+        db_session, project, from_type="user", status="open",
+        message_type=MessageType.NOTE, content="wrong session",
+        resident_session_id="other-session",
+        created_at=_BASE + timedelta(minutes=1),
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 200, response.text
+    assert [row["id"] for row in response.json()["messages"]] == [str(own.id)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"session_id": "spoofed-session", "worker_generation": 2},
+        {"session_id": "resident-session", "worker_generation": 3},
+    ],
+)
+async def test_resident_poll_rejects_query_identity_spoof(
+    client: AsyncClient, db_session, params
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        params=params,
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 409
+    assert "identity mismatch" in response.text
+
+
+@pytest.mark.asyncio
+async def test_stale_resident_poll_is_rejected_without_generation_query(
+    client: AsyncClient, db_session
+):
+    project, stale_task = await _make_resident_poll_worker(db_session, generation=1)
+    current_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-current-resident",
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "resident-session",
+            "_resident_worker_generation": 2,
+        },
+    )
+    db_session.add(current_task)
+    await db_session.commit()
+    await db_session.refresh(current_task)
+    project.vision = {
+        "_resident_strategic_session": {
+            "session_id": "resident-session",
+            "task_id": str(current_task.id),
+            "worker_generation": 2,
+            "status": "active",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        headers=_headers(stale_task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 409
+    assert "superseded" in response.text

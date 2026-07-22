@@ -195,7 +195,6 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
         # Strategic session cadence and safety knobs.
-        "strategic_session_enabled",
         "strategic_continuation_ttl_seconds",
         "strategic_local_hold_timeout_seconds",
         "strategic_session_idle_tick_seconds",
@@ -770,9 +769,6 @@ async def get_settings(
         ),
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
-        ),
-        "strategic_session_enabled": bool(
-            _runtime_config.get("strategic_session_enabled", False)
         ),
         "strategic_continuation_ttl_seconds": _runtime_config.get(
             "strategic_continuation_ttl_seconds", 1500
@@ -1731,16 +1727,6 @@ async def _apply_settings(
                 detail="spend_approval_timeout_hours must be between 1 and 168",
             )
         _runtime_config["spend_approval_timeout_hours"] = val
-    if "strategic_session_enabled" in payload:
-        val = payload["strategic_session_enabled"]
-        if not isinstance(val, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="strategic_session_enabled must be a boolean",
-            )
-        _runtime_config["strategic_session_enabled"] = val
-        if val:
-            _debt_keys_to_resolve.append("dormant_knob:strategic_session_enabled")
     # Strategic-session integer knobs. Each is clamped to a sane range:
     # the continuation TTL and local-hold timeout are the safety windows (min 60s
     # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
@@ -3895,15 +3881,9 @@ async def _apply_settings(
                     "cloud_run_task_type_allowlist": sorted(
                         _runtime_config.get("cloud_run_task_type_allowlist") or []
                     ),
-                    # Persist the strategic-session settings so an operator
-                    # enable/tune survives a Cloud Run restart and propagates to the
-                    # leader across instances. runtime_config_state.sync_* reads these
-                    # keys back on boot / every sync cycle; without them an enable
-                    # reverts to the env default on restart and a multi-instance PATCH
-                    # never reaches the leader that owns the session.
-                    "strategic_session_enabled": bool(
-                        _runtime_config.get("strategic_session_enabled", False)
-                    ),
+                    # Persist Workday cadence and safety tuning so it survives a
+                    # Cloud Run restart and propagates to the leader across instances.
+                    # Workday mode itself is the on-switch; these are pacing knobs only.
                     "strategic_continuation_ttl_seconds": int(
                         _runtime_config.get("strategic_continuation_ttl_seconds", 1500)
                     ),

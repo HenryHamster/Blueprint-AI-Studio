@@ -23082,6 +23082,156 @@ async def test_agent_create_message_idempotency_dedupes(
     assert collision.status_code == 409
 
 
+async def _make_resident_message_worker(
+    db_session,
+    *,
+    session_id: str = "resident-receipt-session",
+    generation: int = 1,
+):
+    project = Project(name="Resident Receipt", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-resident-receipt",
+        payloads=[{"type": "strategic_review", "prompt": "reply"}],
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": generation,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    project.vision = {
+        "_resident_strategic_session": {
+            "session_id": session_id,
+            "task_id": str(task.id),
+            "worker_generation": generation,
+            "status": "active",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_resident_reply_receipt_is_atomic_and_idempotent(
+    client: AsyncClient, db_session
+):
+    """A retry after the receipt committed returns the same reply, read-only."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    inbound = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Please account for this.",
+        resident_session_id="resident-receipt-session",
+    )
+    db_session.add(inbound)
+    await db_session.commit()
+    await db_session.refresh(inbound)
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+    body = {
+        "task_id": str(task.id),
+        "op": "create_message",
+        "data": {
+            "type": "NOTE",
+            "content": "I accounted for it.",
+            "idempotency_key": "resident-receipt-idempotent",
+            "covered_message_ids": [str(inbound.id)],
+            "resident_turn_state": {
+                "exam_ledger": '{"v":3}',
+                "decisions_reg": "[]",
+                "message_cursor": "2026-07-22T12:00:00Z",
+                "operator_decision_summary": {"total": 1, "captured": 1},
+            },
+        },
+    }
+    headers = {"x-agent-token": token}
+
+    first = await client.post("/api/agent/strategic", headers=headers, json=body)
+    assert first.status_code == 200, first.text
+    await db_session.refresh(inbound)
+    await db_session.refresh(task)
+    assert inbound.status == "handled"
+    assert task.context["_exam_ledger"] == '{"v":3}'
+    reply = await db_session.get(
+        ProjectMessage, uuid.UUID(first.json()["message_id"])
+    )
+    assert reply is not None
+    assert reply.resident_session_id == "resident-receipt-session"
+    assert reply.context["_resident_reply_covered_message_ids"] == [str(inbound.id)]
+
+    replay = await client.post("/api/agent/strategic", headers=headers, json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["message_id"] == first.json()["message_id"]
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "vision_update",
+    [
+        {"session_id": "different-session"},
+        {"worker_generation": 2},
+    ],
+)
+async def test_resident_message_write_rejects_wrong_session_or_generation(
+    client: AsyncClient, db_session, vision_update
+):
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident.update(vision_update)
+    project.vision = {"_resident_strategic_session": resident}
+    db_session.add(project)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "This stale worker must not write.",
+                "idempotency_key": "resident-stale-write",
+            },
+        },
+    )
+    assert response.status_code == 409
+    assert "superseded" in response.text
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert rows == []
+
+
 @pytest.mark.asyncio
 async def test_agent_create_message_separates_routine_activity_and_promotes_reply(
     client: AsyncClient, db_session

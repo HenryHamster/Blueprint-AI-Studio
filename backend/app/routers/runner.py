@@ -38,7 +38,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool, StrictStr
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -1043,6 +1043,7 @@ async def next_task(
     # what THIS one can run (a task unpinned from A and re-pinned to B must not
     # inherit A's "unroutable" and be refused by B, which could run it fine).
     runner_id = str(runner.id)
+    pull_now = _utcnow()
     # A runner claims work for ANY project on its allow-list (enrollment project
     # UNIONed with its explicit bindings), not only its enrollment project — so one
     # daemon serves N projects. Membership is the server-side authorization boundary:
@@ -1059,6 +1060,11 @@ async def next_task(
         # a re-poll while the agent is booting and calling /api/agent/claim
         # skips this task instead of returning it again (dispatch-storm guard).
         Task.started_at.is_(None),
+        # A retry hold means this exact pinned attempt is intentionally asleep.
+        # Filter it before credential resolution so polling cannot stamp a skip
+        # marker or eventually unpin it, and repeat this predicate in the locked
+        # winner query through the shared claim_guard below.
+        or_(Task.retry_after_until.is_(None), Task.retry_after_until <= pull_now),
     )
 
     # ── Phase 1: read candidates, NO row lock ────────────────────────────────

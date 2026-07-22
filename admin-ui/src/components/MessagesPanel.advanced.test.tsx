@@ -702,7 +702,7 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     if (!input) return;
     fireEvent.change(input, { target: { value: 'deployment decision' } });
     await waitFor(() => expect(_strategicSessionGetCalls().some(call => (
-      String(call[0]).includes('search=deployment+decision')
+      new URL(String(call[0]), 'http://test').searchParams.get('search') === 'deployment decision'
     ))).toBe(true), { timeout: 1000 });
   });
 
@@ -855,7 +855,9 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     fireEvent.change(fileInput);
     await waitFor(() => expect(el.textContent).toContain('recovery.txt'));
     fireEvent.change(el.querySelector('textarea')!, { target: { value: 'recover this upload' } });
-    fireEvent.click(el.querySelector('button[aria-label="Send message"]')!);
+    const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!;
+    await waitFor(() => expect(send.disabled).toBe(false));
+    fireEvent.click(send);
     await waitFor(() => expect(el.querySelector('button[aria-label="Retry message"]')).toBeTruthy());
     fireEvent.click(el.querySelector('button[aria-label="Retry message"]')!);
     await waitFor(() => expect(messageBodies).toHaveLength(3), { timeout: 5000 });
