@@ -1,4 +1,4 @@
-"""Monthly budget target enforcement — operator-configurable cost alerting.
+"""Monthly and daily budget target enforcement — operator-configurable cost alerting.
 
 Replaces reliance on the Terraform-hardcoded GCP billing budget as the
 primary cost-signal path.  The GCP-native ``google_billing_budget`` resource
@@ -10,6 +10,11 @@ live from the admin UI, no deploy required).  On every call to
 off-VM compute spend, warm-pool idle cost) is summed month-to-date across all
 projects and compared against the target.  Alerts fire at 50%, 90%, and 100%
 of the target, mirroring the GCP budget's own threshold shape.
+
+:func:`check_daily_budget` enforces the complementary ``daily_spend_budget_usd``
+key: same attribution source, same fail-closed semantics, but windowed to the
+current UTC calendar day.  A single alert fires when today's spend reaches 100%
+of the daily target.  Unset key = gate disabled (no behaviour change).
 
 Design follows the existing ``cost_ceiling.check_daily_cost_ceiling`` pattern.
 Deduplication is per-threshold-level so the operator is not spammed on every
@@ -141,6 +146,104 @@ async def check_monthly_budget(
         )
 
     return usage_ratio >= 1.0, usage_ratio
+
+
+async def check_daily_budget(
+    session: AsyncSession,
+) -> tuple[bool, float | None]:
+    """Compute fleet-wide today-to-date spend and fire an alert when the daily budget is reached.
+
+    Reads ``daily_spend_budget_usd`` from runtime config.  When the key is
+    absent or ``<= 0`` the check is a no-op (gate disabled — no behaviour change).
+
+    Uses the same cost attribution source as :func:`check_monthly_budget` but
+    with a window starting at today's UTC midnight.  A single alert fires when
+    today's spend reaches 100% of the daily target; deduplication is by the
+    same (project_id, dedupe_key) pattern so the operator is not re-alerted on
+    every periodic tick.
+
+    Returns ``(exhausted, usage_ratio)`` where ``exhausted`` is True when
+    today-to-date spend has reached or exceeded the daily target, and
+    ``usage_ratio`` is the ratio of spend to target (or None when the check
+    is disabled / there is no spend to compare).
+    """
+    target = float(_runtime_config.get("daily_spend_budget_usd", 0))
+    if target <= 0:
+        return False, None
+
+    now = _utcnow()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Reuse the month-to-date spend computation with day_start as the window.
+    day_total, top_project_id, project_spend_map = (
+        await _compute_month_to_date_spend(session, day_start)
+    )
+
+    if day_total <= 0:
+        return False, None
+
+    usage_ratio = day_total / target
+    if usage_ratio < 1.0 or not top_project_id:
+        return False, usage_ratio
+
+    dedupe_key = "daily_budget_100pct"
+
+    # Dedup by calendar day: include the date in the key so the gate resets
+    # each midnight without requiring the operator to dismiss the previous alert.
+    dedupe_key = f"daily_budget_100pct_{now.strftime('%Y%m%d')}"
+
+    existing = (
+        await session.execute(
+            select(Alert).where(
+                Alert.dedupe_key == dedupe_key,
+                Alert.project_id == top_project_id,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().first()
+
+    if existing is None:
+        total_by_project_lines = "\n".join(
+            sorted(
+                f"  project={pid}: ${cost:.2f}"
+                for pid, cost in project_spend_map.items()
+            )
+        ) if project_spend_map else "  (no per-project breakdown available)"
+
+        alert = Alert(
+            project_id=top_project_id,
+            severity=AlertSeverity.ERROR,
+            title="Daily spend budget reached",
+            message=(
+                f"Today's total spend ${day_total:.2f} "
+                f"has reached 100% of the daily budget ${target:.2f}.\n"
+                f"Per-project spend:\n{total_by_project_lines}"
+            ),
+            dedupe_key=dedupe_key,
+            domain="billing",
+            event_type="DAILY_BUDGET_ALERT",
+            source="monthly_budget_alerts",
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(top_project_id),
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": AlertSeverity.ERROR.value,
+                "title": alert.title,
+            },
+        )
+        logger.warning(
+            "[BUDGET] Daily budget reached — $%.2f of $%.2f daily target. "
+            "Top-spending project %s. Alert %s created.",
+            day_total,
+            target,
+            top_project_id,
+            alert.id,
+        )
+
+    return True, usage_ratio
 
 
 async def _compute_month_to_date_spend(

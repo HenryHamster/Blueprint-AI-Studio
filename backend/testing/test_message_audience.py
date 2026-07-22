@@ -425,6 +425,7 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
         "strategic_check_in",
         "agent_annotation",
         "MONTHLY_BUDGET_ALERT",
+        "DAILY_BUDGET_ALERT",
     })
 
     registered = get_registered_event_types()

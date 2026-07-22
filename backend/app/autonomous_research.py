@@ -899,6 +899,29 @@ async def _spawn_research_task_inner(
         )
         return
 
+    # Daily budget gate: same fail-closed semantics alongside the monthly gate.
+    try:
+        from app.monthly_budget_alerts import check_daily_budget  # noqa: PLC0415, RUF100
+
+        daily_budget_exhausted, _daily_ratio = await check_daily_budget(session)
+    except Exception:
+        daily_budget_exhausted = False
+        logger.exception(
+            "[AUTONOMOUS] Daily budget check failed — treating as not exhausted"
+        )
+    if daily_budget_exhausted:
+        logger.info(
+            "[AUTONOMOUS] Skipping research spawn for project %s — daily budget exhausted",
+            project.id,
+        )
+        await _maybe_notify_operator_refresh_deferred(
+            project,
+            session,
+            "paused while the daily spend budget is exhausted",
+            expected_legacy_generation=legacy_generation,
+        )
+        return
+
     spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
         project,
         session,
@@ -3468,6 +3491,14 @@ async def _run_idle_research_for_project(
     if _shared_state.monthly_budget_gate_engaged:
         logger.info(
             "[AUTONOMOUS] Skipping idle research for project %s — monthly budget exhausted",
+            project.id,
+        )
+        return
+
+    # Daily budget gate: same shared-state fast path as the monthly gate.
+    if _shared_state.daily_budget_gate_engaged:
+        logger.info(
+            "[AUTONOMOUS] Skipping idle research for project %s — daily budget exhausted",
             project.id,
         )
         return

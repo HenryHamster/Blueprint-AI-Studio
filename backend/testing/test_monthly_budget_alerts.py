@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 import app.shared_state as _shared_state
-from app.monthly_budget_alerts import check_monthly_budget, _BUDGET_THRESHOLDS
+from app.monthly_budget_alerts import check_monthly_budget, check_daily_budget, _BUDGET_THRESHOLDS
 from app.models import Alert, AlertSeverity, Project
 
 
@@ -89,13 +89,12 @@ async def test_monthly_budget_disabled_produces_no_alert(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": 0},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(500.0, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(500.0, pid_str),
-        ):
-            await check_monthly_budget(budget_db)
+        await check_monthly_budget(budget_db)
 
     alerts = (
         (await budget_db.execute(select(Alert).where(Alert.project_id == project_with_id)))
@@ -117,13 +116,12 @@ async def test_monthly_budget_50pct_alert_created(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            await check_monthly_budget(budget_db)
+        await check_monthly_budget(budget_db)
 
     await budget_db.flush()
     alerts = (
@@ -151,13 +149,12 @@ async def test_monthly_budget_90pct_alert_created(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            await check_monthly_budget(budget_db)
+        await check_monthly_budget(budget_db)
 
     await budget_db.flush()
     alerts = (
@@ -188,13 +185,12 @@ async def test_monthly_budget_100pct_alert_created(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            await check_monthly_budget(budget_db)
+        await check_monthly_budget(budget_db)
 
     await budget_db.flush()
     alerts = (
@@ -226,26 +222,24 @@ async def test_monthly_budget_deduplicates_per_threshold(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            await check_monthly_budget(budget_db)  # first call — creates alert
+        await check_monthly_budget(budget_db)  # first call — creates alert
 
     await budget_db.flush()
 
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            await check_monthly_budget(budget_db)  # second call — should dedupe
+        await check_monthly_budget(budget_db)  # second call — should dedupe
 
     await budget_db.flush()
     alerts = (
@@ -283,13 +277,12 @@ async def test_monthly_budget_scoped_to_top_spending_project(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=(total, top_pid, project_spend_map),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=(total, top_pid, project_spend_map),
-        ):
-            await check_monthly_budget(budget_db)
+        await check_monthly_budget(budget_db)
 
     await budget_db.flush()
     # Alert should be on project_b (top spender)
@@ -322,13 +315,12 @@ async def test_monthly_budget_below_50pct_no_alert(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            await check_monthly_budget(budget_db)
+        await check_monthly_budget(budget_db)
 
     alerts = (
         (await budget_db.execute(select(Alert).where(Alert.project_id == project_with_id)))
@@ -350,13 +342,12 @@ async def test_monthly_budget_zero_spend_no_alert(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            await check_monthly_budget(budget_db)
+        await check_monthly_budget(budget_db)
 
     alerts = (
         (await budget_db.execute(select(Alert).where(Alert.project_id == project_with_id)))
@@ -389,13 +380,12 @@ async def test_check_monthly_budget_returns_exhausted_true_at_100pct(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            exhausted, ratio = await check_monthly_budget(budget_db)
+        exhausted, ratio = await check_monthly_budget(budget_db)
 
     assert exhausted is True
     assert ratio == 1.0
@@ -413,13 +403,12 @@ async def test_check_monthly_budget_returns_exhausted_false_below_100pct(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            exhausted, ratio = await check_monthly_budget(budget_db)
+        exhausted, ratio = await check_monthly_budget(budget_db)
 
     assert exhausted is False
     assert ratio == 0.5
@@ -434,13 +423,12 @@ async def test_check_monthly_budget_returns_none_when_disabled(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": 0},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(500.0, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(500.0, pid_str),
-        ):
-            exhausted, ratio = await check_monthly_budget(budget_db)
+        exhausted, ratio = await check_monthly_budget(budget_db)
 
     assert exhausted is False
     assert ratio is None
@@ -458,13 +446,184 @@ async def test_check_monthly_budget_returns_none_when_zero_spend(
     with patch.dict(
         _shared_state.runtime_config,
         {"monthly_budget_target_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
     ):
-        with patch(
-            "app.monthly_budget_alerts._compute_month_to_date_spend",
-            new_callable=AsyncMock,
-            return_value=_mock_spend(spend, pid_str),
-        ):
-            exhausted, ratio = await check_monthly_budget(budget_db)
+        exhausted, ratio = await check_monthly_budget(budget_db)
 
     assert exhausted is False
     assert ratio is None
+
+
+# ---------------------------------------------------------------------------
+# check_daily_budget tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_daily_budget_disabled_when_key_unset(
+    budget_db, project_with_id
+):
+    """When daily_spend_budget_usd is absent/0, gate is disabled — no alert, returns (False, None)."""
+    pid_str = str(project_with_id)
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"daily_spend_budget_usd": 0},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(999.0, pid_str),
+    ):
+        exhausted, ratio = await check_daily_budget(budget_db)
+
+    assert exhausted is False
+    assert ratio is None
+    alerts = (
+        (await budget_db.execute(select(Alert).where(Alert.project_id == project_with_id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_budget_blocks_when_spend_reaches_target(
+    budget_db, project_with_id
+):
+    """When today's spend >= daily_spend_budget_usd, gate fires alert and returns (True, ratio)."""
+    pid_str = str(project_with_id)
+    target = 50.0
+    spend = 50.0  # exactly 100%
+
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"daily_spend_budget_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
+    ):
+        exhausted, ratio = await check_daily_budget(budget_db)
+
+    assert exhausted is True
+    assert ratio == 1.0
+
+    await budget_db.flush()
+    alerts = (
+        (await budget_db.execute(
+            select(Alert).where(
+                Alert.project_id == project_with_id,
+                Alert.event_type == "DAILY_BUDGET_ALERT",
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert "daily" in alerts[0].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_daily_budget_inactive_when_spend_below_target(
+    budget_db, project_with_id
+):
+    """When today's spend < daily_spend_budget_usd, gate is inactive (False, ratio < 1.0)."""
+    pid_str = str(project_with_id)
+    target = 100.0
+    spend = 40.0  # 40%
+
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"daily_spend_budget_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
+    ):
+        exhausted, ratio = await check_daily_budget(budget_db)
+
+    assert exhausted is False
+    assert ratio == 0.4
+
+    alerts = (
+        (await budget_db.execute(select(Alert).where(Alert.project_id == project_with_id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_budget_deduplicates_alert(
+    budget_db, project_with_id
+):
+    """Calling check_daily_budget twice at 100% only creates one alert (dedup by dedupe_key)."""
+    pid_str = str(project_with_id)
+    target = 50.0
+    spend = 60.0  # over 100%
+
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"daily_spend_budget_usd": target},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(spend, pid_str),
+    ):
+        await check_daily_budget(budget_db)
+        await budget_db.flush()
+        await check_daily_budget(budget_db)
+
+    await budget_db.flush()
+    alerts = (
+        (await budget_db.execute(
+            select(Alert).where(
+                Alert.project_id == project_with_id,
+                Alert.event_type == "DAILY_BUDGET_ALERT",
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_monthly_and_daily_compose_either_blocks(
+    budget_db, project_with_id
+):
+    """Monthly exhausted -> gate active; daily exhausted -> gate active; both compose correctly."""
+    pid_str = str(project_with_id)
+
+    # Case 1: monthly exhausted, daily disabled (key=0)
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"monthly_budget_target_usd": 100.0, "daily_spend_budget_usd": 0},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(100.0, pid_str),
+    ):
+        monthly_exhausted, _ = await check_monthly_budget(budget_db)
+        daily_exhausted, _ = await check_daily_budget(budget_db)
+
+    assert monthly_exhausted is True
+    assert daily_exhausted is False
+
+    # Case 2: daily exhausted, monthly disabled (key=0)
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"monthly_budget_target_usd": 0, "daily_spend_budget_usd": 10.0},
+    ), patch(
+        "app.monthly_budget_alerts._compute_month_to_date_spend",
+        new_callable=AsyncMock,
+        return_value=_mock_spend(15.0, pid_str),
+    ):
+        monthly_exhausted2, _ = await check_monthly_budget(budget_db)
+        daily_exhausted2, _ = await check_daily_budget(budget_db)
+
+    assert monthly_exhausted2 is False
+    assert daily_exhausted2 is True

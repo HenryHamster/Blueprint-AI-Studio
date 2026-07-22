@@ -108,7 +108,7 @@ from app.state_persistence import (
     _persist_self_healing_state_bundle,
 )
 from app.storage import upload_json_payload  # noqa: F401 — app.orchestrator patch surface
-from app.monthly_budget_alerts import check_monthly_budget  # noqa: F401, RUF100
+from app.monthly_budget_alerts import check_monthly_budget, check_daily_budget  # noqa: F401, RUF100
 import app.shared_state as _shared_state
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -557,6 +557,7 @@ _last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
 _last_budget_gate_log: datetime | None = None
+_last_daily_budget_gate_log: datetime | None = None
 _last_concurrency_broadcast: datetime | None = None
 _last_type_throttle_broadcast: dict[str, datetime | None] = {}
 _last_type_unthrottle_broadcast: dict[str, datetime | None] = {}
@@ -1292,7 +1293,8 @@ async def orchestrator_worker():
         _last_runner_degraded_sweep, \
         _last_runner_escalation_sweep, \
         _last_local_runner_hold_sweep, \
-        _last_budget_gate_log
+        _last_budget_gate_log, \
+        _last_daily_budget_gate_log
     while True:
         queued_tasks = []
         # Reset at the very top of the loop body (before the try) — REQUIRED for
@@ -2869,13 +2871,22 @@ async def orchestrator_worker():
                         "[ORCHESTRATOR] Monthly budget check failed — treating as not exhausted"
                     )
 
+                # Daily budget gate: same fail-open pattern alongside monthly.
+                try:
+                    daily_budget_exhausted, daily_usage_ratio = await check_daily_budget(session)
+                except Exception:
+                    daily_budget_exhausted = False
+                    logger.exception(
+                        "[ORCHESTRATOR] Daily budget check failed — treating as not exhausted"
+                    )
+
                 eligible_ids = await _filter_project_resource_dispatch_eligible(
                     session,
                     eligible_ids,
                     candidate_tasks,
                     project_active_counts,
                     broadcast_to_project,
-                    budget_exhausted=budget_exhausted,
+                    budget_exhausted=budget_exhausted or daily_budget_exhausted,
                 )
 
                 # Fleet-wide monthly-budget informational broadcast (follows
@@ -2904,6 +2915,30 @@ async def orchestrator_worker():
                             )
                 elif not budget_exhausted:
                     _shared_state.monthly_budget_gate_engaged = False
+
+                # Fleet-wide daily-budget informational broadcast.
+                if daily_budget_exhausted:
+                    _shared_state.daily_budget_gate_engaged = True
+                    if _is_cadence_due(_last_daily_budget_gate_log, 60, _utcnow()):
+                        _last_daily_budget_gate_log = _utcnow()
+                        logger.info(
+                            "[ORCHESTRATOR] Daily budget exhausted (%.1f%% of target) — deferring eligible tasks",
+                            daily_usage_ratio * 100 if daily_usage_ratio else 100.0,
+                        )
+                        try:
+                            await ws_manager.broadcast_to_all(
+                                "pipeline_throttle",
+                                {
+                                    "reason": "daily_budget",
+                                    "detail": "Daily spend budget reached",
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[ORCHESTRATOR] Failed to broadcast daily_budget throttle"
+                            )
+                else:
+                    _shared_state.daily_budget_gate_engaged = False
 
                 # Respect the slot limit after conflict filtering — but scan PAST it so
                 # candidates that turn out to be non-dispatchable this cycle (held /

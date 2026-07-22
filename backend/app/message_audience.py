@@ -277,6 +277,8 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # === Billing / budget alerts ============================================
     # Monthly budget threshold alert — operator should review spend and act.
     "MONTHLY_BUDGET_ALERT": OPERATOR_ACTION_NEEDED,
+    # Daily spend budget reached — autonomous spawning is paused for the day.
+    "DAILY_BUDGET_ALERT": OPERATOR_ACTION_NEEDED,
     # === SR quality metrics (strategist-internal, acted on autonomously) ====
     "sr.precision_recall_degraded": STRATEGIST_INTERNAL,
     "sr.engagement_thinning": STRATEGIST_INTERNAL,

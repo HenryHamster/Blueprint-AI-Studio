@@ -205,6 +205,12 @@ from app.pipeline_health_state import (  # noqa: F401
 # autonomous research spawn) check this before starting new work.
 monthly_budget_gate_engaged: bool = False
 
+# --- Daily budget gate ---
+# Set to True by the orchestrator when today-to-date spend reaches 100%
+# of daily_spend_budget_usd. Cleared when spend drops below 100%
+# (day rollover or target raised). Consumers check this before starting new work.
+daily_budget_gate_engaged: bool = False
+
 # --- Per-project spend-ceiling deferred state ---
 # Set of project IDs (as strings) whose per-project spend ceiling has been
 # exceeded. Updated every orchestrator cycle in
