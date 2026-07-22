@@ -4439,3 +4439,83 @@ class TestWalkthroughE2ECompletionIngestsOrRemoved:
         await self._run(db_session, task, legacy_artifact)
         ev_a_after = await ac.get_evidence_for_criterion(db_session, crit_a.id)
         assert len(ev_a_after) == 1, "Legacy schema must not write additional evidence"
+
+
+class TestHandleWalkthroughE2eCompletionStandalone:
+    """Standalone (no-DB) tests for _handle_walkthrough_e2e_completion guard paths.
+
+    Covers edge cases (missing git_sha, missing results list, no open version)
+    not exercised by the DB-backed integration test above.
+    """
+
+    def _make_task(self, project_id=None):
+        import uuid
+        task = MagicMock()
+        task.id = uuid.uuid4()
+        task.project_id = project_id or uuid.uuid4()
+        return task
+
+    def _make_session(self):
+        session = MagicMock()
+        session.rollback = AsyncMock()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_unparseable_artifact_is_noop(self):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        await _handle_walkthrough_e2e_completion(task, "not json", session)
+        session.rollback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_results_list_is_noop(self):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        artifact = json.dumps({"git_sha": "abc123", "run_timestamp": "2026-01-01T00:00:00Z"})
+        with patch("app.acceptance_criteria.record_walkthrough_e2e_evidence") as mock_rwe, \
+             patch("app.release_version.current_open_version", new=AsyncMock(return_value=MagicMock())):
+            await _handle_walkthrough_e2e_completion(task, artifact, session)
+            mock_rwe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_open_version_is_noop(self):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        artifact = json.dumps({
+            "git_sha": "abc123",
+            "run_timestamp": "2026-01-01T00:00:00Z",
+            "results": [{"criterion_key": "c-abc", "passed": True}],
+        })
+        with patch("app.acceptance_criteria.record_walkthrough_e2e_evidence") as mock_rwe, \
+             patch("app.release_version.current_open_version", new=AsyncMock(return_value=None)):
+            await _handle_walkthrough_e2e_completion(task, artifact, session)
+            mock_rwe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_artifact_calls_record_walkthrough_e2e_evidence(self):
+        """The handler delegates to record_walkthrough_e2e_evidence with correct kwargs."""
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        sha = "deadbeef1234567890abcdef"
+        results = [
+            {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "step 1 ok"},
+            {"criterion_key": "c-f52fd975", "passed": False, "notes": None},
+        ]
+        artifact = json.dumps({
+            "git_sha": sha,
+            "run_timestamp": "2026-01-01T00:00:00Z",
+            "results": results,
+        })
+        mock_version = MagicMock()
+        summary = {"status": "recorded", "recorded": 1, "skipped_not_passed": 1, "unmatched_keys": []}
+        with patch("app.acceptance_criteria.record_walkthrough_e2e_evidence", new=AsyncMock(return_value=summary)) as mock_rwe, \
+             patch("app.release_version.current_open_version", new=AsyncMock(return_value=mock_version)):
+            await _handle_walkthrough_e2e_completion(task, artifact, session)
+            mock_rwe.assert_awaited_once()
+            call_kwargs = mock_rwe.call_args.kwargs
+            assert call_kwargs["candidate_sha"] == sha, "candidate_sha must match artifact git_sha"
+            assert call_kwargs["results"] == results, "results list must be passed through"
