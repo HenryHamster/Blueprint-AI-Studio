@@ -146,7 +146,7 @@
     },
     {
       "path": "backend/testing/test_workday_resident_invariants.py",
-      "reason": "Primary protection for conversational Workday seams — 18 invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
+      "reason": "Primary protection for conversational Workday seams — invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Exact test list is machine-enforced by test_workday_invariant_suite_is_protected_with_all_tests; silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
       "test_ids": [
         "test_workday_availability_does_not_consult_removed_global_gate",
         "test_workday_active_session_reports_active_on_its_pinned_runner",

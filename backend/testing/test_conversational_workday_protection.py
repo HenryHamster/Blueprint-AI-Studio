@@ -270,6 +270,106 @@ def test_agent_dispatch_gate_is_guarded():
     )
 
 
+def test_agent_session_provider_is_guarded():
+    """The session provider symbols must remain defined in providers/resident-session.ts.
+
+    startResidentClaudeSession is the factory that spawns and holds the long-lived
+    warm Claude process across many operator turns. ResidentSession is the interface
+    that the handler uses to send turns, handle interrupts, and check liveness. If
+    either is removed, the persistent conversational session degrades silently to
+    one-shot behaviour (every turn spawns a cold process, losing context).
+    """
+    import re
+
+    provider_path = REPO_ROOT / "agent" / "src" / "providers" / "resident-session.ts"
+    assert provider_path.exists(), (
+        f"agent/src/providers/resident-session.ts not found at {provider_path}. "
+        "This file is the session provider for the conversational Workday session."
+    )
+    source = provider_path.read_text(encoding="utf-8")
+
+    # startResidentClaudeSession must be exported as the session factory
+    assert re.search(
+        r"export\s+(?:async\s+)?function\s+startResidentClaudeSession\s*\(",
+        source,
+        re.MULTILINE,
+    ), (
+        "startResidentClaudeSession is no longer exported from "
+        "agent/src/providers/resident-session.ts. This factory creates the long-lived "
+        "warm Claude process that holds conversation context across turns — "
+        "restore it or update this guard with operator sign-off."
+    )
+
+    # ResidentSession interface must be exported (the handler depends on it)
+    assert re.search(
+        r"export\s+interface\s+ResidentSession\s*\{",
+        source,
+        re.MULTILINE,
+    ), (
+        "ResidentSession interface is no longer exported from "
+        "agent/src/providers/resident-session.ts. This interface is the contract "
+        "between the session provider and the handler (sendTurn, interrupt, close, "
+        "isAlive) — restore it or update this guard with operator sign-off."
+    )
+
+
+def test_agent_stream_provider_is_guarded():
+    """The stream provider symbols must remain defined in providers/resident-stream.ts.
+
+    isStrategicMutation and isMessageSend classify NDJSON tool-use lines during a
+    resident turn — they set the lease-renewing appliedStrategicOp flag and the
+    durable-reply sentOperatorMessage flag respectively. parseResidentLine is the
+    primary parser that converts raw stdout into typed ResidentStreamEvents. If any
+    of these is removed, the session either fails to renew its lease on strategic
+    mutations or loses the reply-detection that triggers durable ProjectMessage
+    creation.
+    """
+    import re
+
+    provider_path = REPO_ROOT / "agent" / "src" / "providers" / "resident-stream.ts"
+    assert provider_path.exists(), (
+        f"agent/src/providers/resident-stream.ts not found at {provider_path}. "
+        "This file is the stream parser/classifier for the conversational Workday session."
+    )
+    source = provider_path.read_text(encoding="utf-8")
+
+    # isStrategicMutation must be exported — gates the lease-renewing op flag
+    assert re.search(
+        r"export\s+function\s+isStrategicMutation\s*\(",
+        source,
+        re.MULTILINE,
+    ), (
+        "isStrategicMutation is no longer exported from "
+        "agent/src/providers/resident-stream.ts. This classifier sets the "
+        "appliedStrategicOp flag that renews the session lease on strategic mutations — "
+        "restore it or update this guard with operator sign-off."
+    )
+
+    # isMessageSend must be exported — gates durable ProjectMessage creation
+    assert re.search(
+        r"export\s+function\s+isMessageSend\s*\(",
+        source,
+        re.MULTILINE,
+    ), (
+        "isMessageSend is no longer exported from "
+        "agent/src/providers/resident-stream.ts. This classifier gates the "
+        "sentOperatorMessage flag that triggers durable ProjectMessage creation — "
+        "restore it or update this guard with operator sign-off."
+    )
+
+    # parseResidentLine must be exported — primary stdout-to-event parser
+    assert re.search(
+        r"export\s+function\s+parseResidentLine\s*\(",
+        source,
+        re.MULTILINE,
+    ), (
+        "parseResidentLine is no longer exported from "
+        "agent/src/providers/resident-stream.ts. This function is the primary "
+        "parser that converts raw Claude stdout lines into typed ResidentStreamEvents — "
+        "restore it or update this guard with operator sign-off."
+    )
+
+
 def test_deleted_frontend_paths_are_absent():
     """Files deleted as part of the resident removal must NOT exist in the tree.
 
