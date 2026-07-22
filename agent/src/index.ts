@@ -3979,6 +3979,11 @@ export async function continueWarmContinuation(
   return { action: 'continue' };
 }
 
+/** Claim the assigned role with the shared auth-refresh/transient retry policy. */
+export async function claimTask(): Promise<Record<string, unknown>> {
+  return await apiPost('/api/agent/claim') as Record<string, unknown>;
+}
+
 async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult> {
   const { reportPreClaimFailure } = opts;
   const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
@@ -3988,9 +3993,11 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   }
   let task: Record<string, unknown>;
   try {
-    // A timed-out claim may keep building its response server-side. Do not fan
-    // one claim into the generic five overlapping request attempts.
-    task = await apiPost('/api/agent/claim', {}, 1) as Record<string, unknown>;
+    // Claim is explicitly idempotent server-side for five minutes. Keep the
+    // normal retry budget so a 401 can refresh the task-scoped JWT and retry,
+    // and transient 429/5xx/network failures do not kill the role before it
+    // starts. A response lost after the server commits is replayed by /claim.
+    task = await claimTask();
   } catch (claimErr) {
     const errMsg = claimErr instanceof Error ? `${claimErr.message}${claimErr.stack ? '\n' + claimErr.stack : ''}` : String(claimErr);
     reportPreClaimFailure(`claim failed: ${errMsg}`);

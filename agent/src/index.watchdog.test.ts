@@ -90,6 +90,7 @@ import {
   _buildHeartbeatStatusForTesting,
   apiPost,
   apiRequest,
+  claimTask,
   getAgentToken,
   ClaudeTimeoutError,
   fetchVmImageIdentity,
@@ -2045,6 +2046,92 @@ describe('apiRequest body-read timeout', () => {
     expect(result).toEqual({ status: 'ok' });
     // No dangling abort timer should fire after a clean read.
     await vi.advanceTimersByTimeAsync(10_000);
+  });
+});
+
+describe('claimTask retry contract', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+    _setAgentTokenForTesting('');
+  });
+
+  it('refreshes an expired task token and retries the claim with the new token', async () => {
+    _setAgentTokenForTesting('stale-task-token');
+    const claimTokens: string[] = [];
+    let claimCalls = 0;
+    const fetchMock = makeFetchMock().mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/claim')) {
+        claimCalls += 1;
+        const headers = init?.headers as Record<string, string> | undefined;
+        claimTokens.push(headers?.['X-Agent-Token'] ?? '');
+        if (claimCalls === 1) {
+          return Promise.resolve({
+            ok: false,
+            status: 401,
+            text: () => Promise.resolve('expired task token'),
+            json: () => Promise.resolve({}),
+            headers: { get: () => null },
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ task_id: 'task-1' }),
+          text: () => Promise.resolve(''),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/refresh-token')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ token: 'fresh-task-token' }),
+          text: () => Promise.resolve(''),
+          headers: { get: () => null },
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(claimTask()).resolves.toEqual({ task_id: 'task-1' });
+    expect(claimTokens).toEqual(['stale-task-token', 'fresh-task-token']);
+    expect(getAgentToken()).toBe('fresh-task-token');
+  });
+
+  it('retries a transient claim failure instead of killing the role', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    let claimCalls = 0;
+    const fetchMock = makeFetchMock().mockImplementation(() => {
+      claimCalls += 1;
+      if (claimCalls === 1) {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          text: () => Promise.resolve('temporarily unavailable'),
+          json: () => Promise.resolve({}),
+          headers: { get: () => null },
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ task_id: 'task-2' }),
+        text: () => Promise.resolve(''),
+        headers: { get: () => null },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pending = claimTask();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(pending).resolves.toEqual({ task_id: 'task-2' });
+    expect(claimCalls).toBe(2);
   });
 });
 

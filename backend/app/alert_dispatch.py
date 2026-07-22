@@ -773,61 +773,6 @@ async def _maybe_create_circuit_breaker_alert(
     await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
 
 
-_ADVERSARIAL_GATE_FAIL_OPEN_TITLE = (
-    "Adversarial gate failed open: second-opinion model unavailable"
-)
-
-
-async def _maybe_create_adversarial_gate_fail_open_alert(
-    review: "Task",
-    challenger: "Task",
-    session: AsyncSession,
-) -> None:
-    """Create a deduplicated WARNING alert when the adversarial review gate degrades.
-
-    When the panel-review challenger model is unavailable (provider model-config
-    rejection), the gate falls back to the primary verdict and auto-merges trunk
-    APPROVEs — a fail-open. Previously this emitted only a logger.warning; this
-    surfaces it in the Alerts banner so operators can investigate.
-
-    Deduplicates on ``(review.id, title)`` so a single fail-open event raises
-    exactly one alert even if the resolution path is re-entered.
-    """
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.task_id == review.id,
-            Alert.dismissed_at.is_(None),
-            Alert.title == _ADVERSARIAL_GATE_FAIL_OPEN_TITLE,
-        )
-    )
-    if existing.scalars().first() is not None:
-        return
-    alert = Alert(
-        project_id=review.project_id,
-        severity=AlertSeverity.WARNING,
-        title=_ADVERSARIAL_GATE_FAIL_OPEN_TITLE,
-        message=(
-            f"The second-opinion panel model (challenger task {str(challenger.id)[:8]}) "
-            f"was unavailable due to a provider model-config rejection. "
-            f"The review gate degraded gracefully: the primary verdict was preserved "
-            f"and the merge proceeded without adversarial verification. "
-            f"Review task: {str(review.id)[:8]}."
-        ),
-        task_id=review.id,
-        event_type="review.fail_open",
-    )
-    session.add(alert)
-    await broadcast_to_project(
-        str(review.project_id),
-        "alert_created",
-        {
-            "alert_id": str(alert.id),
-            "severity": AlertSeverity.WARNING.value,
-            "title": alert.title,
-        },
-    )
-
-
 _SPEND_CEILING_ALERT_TITLE = "Spend ceiling reached: autonomous spawning paused"
 
 

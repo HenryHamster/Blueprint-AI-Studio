@@ -67,6 +67,7 @@ export const TMP_OUTPUT_NAMES = [
   'release_audit_report',
   'release_audit_challenge',
   'release_merge_grade',
+  'walkthrough_e2e_result',
   'self_audit_findings',
   'self_review',
   'symbols',

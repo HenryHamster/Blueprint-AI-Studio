@@ -1674,22 +1674,20 @@ async def test_resident_claim_survives_aborted_retry_projection_session(
 async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_session):
     """
     Idempotent replay only fires within 5 min of the original claim. Beyond
-    that window a stray claim from the same VM is a real anomaly. The task
-    exists (IN_PROGRESS) but is no longer claimable — this returns 409 (task
-    exists but not claimable), not 404 (task not found / not pinned here).
+    that window a stray claim from the same VM is a real anomaly even when the
+    legitimate worker has heartbeated recently. Mutable heartbeat liveness must
+    never extend the immutable replay window.
     """
     project = Project(name="Claim Replay Expiry", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    stale_heartbeat = _utcnow() - timedelta(minutes=10)
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "run"}],
         vm_instance_id="agent-vm-stale-replay",
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=stale_heartbeat,
+        status=TaskStatus.PROVISIONING,
     )
     db_session.add(task)
     await db_session.commit()
@@ -1697,8 +1695,54 @@ async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_ses
 
     token = create_agent_token(str(task.id), "agent-vm-stale-replay")
     headers = {"x-agent-token": token}
-    resp = await client.post("/api/agent/claim", headers=headers)
-    assert resp.status_code == 409
+    first = await client.post("/api/agent/claim", headers=headers)
+    assert first.status_code == 200
+
+    await db_session.refresh(task)
+    context = dict(task.context or {})
+    replay_record = dict(context["_agent_claim_replay"])
+    replay_record["claimed_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    context["_agent_claim_replay"] = replay_record
+    task.context = context
+    task.last_heartbeat = _utcnow()
+    db_session.add(task)
+    await db_session.commit()
+
+    replay = await client.post("/api/agent/claim", headers=headers)
+    assert replay.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_replay_rejects_different_token(
+    client: AsyncClient, db_session
+):
+    """A newly minted token cannot join a task inside another token's window."""
+    project = Project(name="Claim Replay Token Binding", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-token-bound-replay",
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    original_token = create_agent_token(str(task.id), task.vm_instance_id)
+    first = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": original_token}
+    )
+    assert first.status_code == 200
+
+    different_token = create_agent_token(str(task.id), task.vm_instance_id)
+    replay = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": different_token}
+    )
+    assert replay.status_code == 409
 
 
 @pytest.mark.asyncio

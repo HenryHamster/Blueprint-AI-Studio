@@ -1155,6 +1155,7 @@ describe('TMP_OUTPUT_NAMES (scratch-file cleanup list)', () => {
     'web_research_document',
     'release_audit_report',
     'release_audit_challenge',
+    'walkthrough_e2e_result',
     'self_audit_findings',
     'self_review',
   ];

@@ -102,6 +102,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 _COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")
+_CLAIM_REPLAY_CONTEXT_KEY = "_agent_claim_replay"
+_CLAIM_REPLAY_WINDOW = timedelta(minutes=5)
+
+
+def _claim_replay_is_valid(
+    task: Task,
+    token: dict,
+    *,
+    now: datetime,
+) -> bool:
+    """Return whether this exact token may replay the task's bounded claim."""
+    record = (task.context or {}).get(_CLAIM_REPLAY_CONTEXT_KEY)
+    if not isinstance(record, dict):
+        return False
+    token_jti = str(token.get("jti") or "")
+    if not token_jti or record.get("token_jti") != token_jti:
+        return False
+    claimed_at_raw = record.get("claimed_at")
+    if not isinstance(claimed_at_raw, str):
+        return False
+    try:
+        claimed_at = _to_naive_utc(
+            datetime.fromisoformat(claimed_at_raw.replace("Z", "+00:00"))
+        )
+    except (TypeError, ValueError):
+        return False
+    return now - _CLAIM_REPLAY_WINDOW <= claimed_at <= now
 
 
 def _truncate_vm_instance_id(vm_instance_id: object) -> str:
@@ -872,7 +899,9 @@ async def claim_task(
         401: Invalid or expired token
 
     Rate limit: 200 requests/minute.
-    Idempotency: Replays last successful claim within 5 minutes if present.
+    Idempotency: Replays the last successful claim for the same token within
+    5 minutes. The immutable persisted claim record, not mutable heartbeat
+    liveness, bounds this recovery window.
     """
     claim_timing = ClaimResponseTiming()
     vm_id = token.get("vm_instance_id")
@@ -927,24 +956,28 @@ async def claim_task(
         # IN_PROGRESS server-side before the response was lost. Without this
         # replay, the retry hits the QUEUED/PROVISIONING filter, returns 404,
         # and the agent dies with PRE_CLAIM_FAILED on a task that was actually
-        # claimed successfully. Match this VM's just-claimed task (last heartbeat
-        # within 5 min — covers slow GCP provisioning and the agent's worst-case
-        # retry window of API_TIMEOUT * API_MAX_RETRIES with backoff) and replay
-        # the same response. Same sub-scoping so a retry replays only the token's
-        # own task, not a sibling's.
-        replay_cutoff = _utcnow() - timedelta(minutes=5)
+        # claimed successfully. Replay only when the original claim's persisted,
+        # immutable timestamp is within 5 minutes AND its token JTI matches this
+        # request. Heartbeats must not extend the window, and a separately minted
+        # token/process must not join an already-running task.
         replay_stmt = (
             select(Task)
             .where(
                 Task.id == token_task_uuid,
                 Task.vm_instance_id == vm_id,
                 Task.status == TaskStatus.IN_PROGRESS,
-                Task.last_heartbeat >= replay_cutoff,
             )
             .with_for_update(skip_locked=True)
             .execution_options(populate_existing=True)
         )
-        task = (await session.execute(replay_stmt)).scalars().first()
+        replay_candidate = (await session.execute(replay_stmt)).scalars().first()
+        replay_now = _utcnow()
+        task = (
+            replay_candidate
+            if replay_candidate
+            and _claim_replay_is_valid(replay_candidate, token, now=replay_now)
+            else None
+        )
         if not task:
             # Distinguish "task gone / not pinned here" (404) from "task exists
             # but is terminal / reaped / doomed" (409). A 409 tells the agent to
@@ -974,11 +1007,17 @@ async def claim_task(
         idempotent_replay = True
 
     if not idempotent_replay:
+        claim_started_at = _utcnow()
         task.status = TaskStatus.IN_PROGRESS
-        task.last_heartbeat = (
-            _utcnow()
-        )  # Immediate heartbeat — don't wait 30s for agent interval
-        stamp_cold_claim_timing(task)
+        task.last_heartbeat = claim_started_at
+        claim_context = dict(task.context or {})
+        claim_context[_CLAIM_REPLAY_CONTEXT_KEY] = {
+            "claimed_at": claim_started_at.isoformat(),
+            "token_jti": str(token.get("jti") or ""),
+        }
+        task.context = claim_context
+        # Immediate heartbeat — don't wait 30s for agent interval.
+        stamp_cold_claim_timing(task, claimed_at=claim_started_at)
         session.add(task)
         await session.commit()
         await session.refresh(task)

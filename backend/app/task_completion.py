@@ -4495,7 +4495,7 @@ async def _handle_compute_experiment_completion(
 # ---------------------------------------------------------------------------
 
 # Context key on the REVIEW task holding the durable reconciliation record of a
-# primary verdict against its independent panel-review challenge. Exactly one of
+# primary verdict against its independent challenge. Exactly one of
 # four states:
 #   unchallenged          gate off / not high-stakes (recorded inline, never here)
 #   challenged_confirmed  challenge upholds the verdict AND the surviving issues
