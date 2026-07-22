@@ -11,7 +11,18 @@ import json
 import warnings
 from pathlib import Path
 
-WORKSPACE_ROOT = Path(__file__).parents[2]
+def _resolve_workspace_root() -> Path:
+    candidates = (Path(__file__).resolve().parents[2], Path("/repo"))
+    for candidate in candidates:
+        if (
+            (candidate / "agent" / ".test_durations.json").is_file()
+            and (candidate / "admin-ui" / ".test_durations.json").is_file()
+        ):
+            return candidate
+    return candidates[0]
+
+
+WORKSPACE_ROOT = _resolve_workspace_root()
 AGENT_DURATIONS = WORKSPACE_ROOT / "agent" / ".test_durations.json"
 ADMINUI_DURATIONS = WORKSPACE_ROOT / "admin-ui" / ".test_durations.json"
 

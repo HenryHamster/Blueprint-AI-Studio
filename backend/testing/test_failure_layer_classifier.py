@@ -473,8 +473,16 @@ class TestParseViewportRegressionClass:
 # Contract / drift guard: viewport helper names must match their source of truth
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).parents[2]
-_VIEWPORT_TS = _REPO_ROOT / "admin-ui" / "src" / "test" / "viewport.ts"
+def _resolve_viewport_ts() -> Path:
+    candidates = (
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "test" / "viewport.ts",
+        Path("/repo/admin-ui/src/test/viewport.ts"),
+        Path("/admin-ui/src/test/viewport.ts"),
+    )
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+_VIEWPORT_TS = _resolve_viewport_ts()
 
 
 class TestViewportClassifierSourceContract:

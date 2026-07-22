@@ -551,6 +551,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // Triage pagination: small initial page (~30) with load-older-on-demand
   const loadingOlderTriageRef = useRef(false);
   const triageOffsetRef = useRef(0);
+  const [hasOlderTriageMessages, setHasOlderTriageMessages] = useState(false);
+  const [loadingOlderTriageMessages, setLoadingOlderTriageMessages] = useState(false);
   const [expandedConfirmationItemId, setExpandedConfirmationItemId] = useState<string | null>(null);
   const [resolvedConfirmationIds, setResolvedConfirmationIds] = useState<Set<string>>(() => new Set());
   const visibleAttentionNeedsActionItems = useMemo(
@@ -950,6 +952,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // Reset triage pagination when switching projects
     loadingOlderTriageRef.current = false;
     triageOffsetRef.current = 0;
+    setHasOlderTriageMessages(false);
+    setLoadingOlderTriageMessages(false);
     const lastSeen = loadLastSeen(currentActorUserId, selectedProjectId);
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
@@ -1026,6 +1030,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       prevSearchQueryRef.current = searchQuery;
       triageOffsetRef.current = 0;
       loadingOlderTriageRef.current = false;
+      setHasOlderTriageMessages(false);
+      setLoadingOlderTriageMessages(false);
     }
   }, [searchQuery]);
   // Memoized message-list derivation: open/resolved split, high-signal vs routine,
@@ -1414,8 +1420,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         }
         return;
       }
-      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: String(TRIAGE_PAGE_SIZE) });
-      if (triageOffsetRef.current > 0) params.set('offset', String(triageOffsetRef.current));
+      const loadingOlderTriage = loadingOlderTriageRef.current;
+      const requestOffset = loadingOlderTriage
+        ? triageOffsetRef.current + TRIAGE_PAGE_SIZE
+        : 0;
+      const requestLimit = loadingOlderTriage
+        ? TRIAGE_PAGE_SIZE
+        : Math.min(200, TRIAGE_PAGE_SIZE + triageOffsetRef.current);
+      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: String(requestLimit) });
+      if (requestOffset > 0) params.set('offset', String(requestOffset));
       if (searchQuery.trim()) params.set('q', searchQuery.trim());
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1449,9 +1462,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       msgs.forEach(m => seenMessageIdsRef.current.add(m.id));
       hasInitiallyLoadedRef.current = true;
       // Merge or replace messages depending on load mode
-      if (loadingOlderTriageRef.current) {
-        // Load-older: merge with existing, update in place for same IDs
-        loadingOlderTriageRef.current = false;
+      if (loadingOlderTriage || triageOffsetRef.current > 0) {
+        // Load-older and subsequent live refreshes merge into the expanded
+        // window so polling the newest page never discards history the operator
+        // explicitly loaded. The admin endpoint caps a single page at 200.
+        if (loadingOlderTriage) triageOffsetRef.current = requestOffset;
         setMessages(prev => {
           const merged = new Map(prev.map(m => [m.id, m]));
           let changed = false;
@@ -1475,13 +1490,28 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           return msgs;
         });
       }
+      // The endpoint prepends up to 100 guaranteed high-signal rows to the
+      // requested page, so response length is not a pagination signal. Use
+      // the filtered total and actual page window instead. Once an expanded
+      // window reaches its terminal load-older page, normal newest-window
+      // polls must not re-enable the button merely because their single
+      // request is capped at 200 rows.
+      const responseTotal = Number(data.total);
+      const loadedWindow = (loadingOlderTriage ? requestOffset : triageOffsetRef.current) + TRIAGE_PAGE_SIZE;
+      setHasOlderTriageMessages(Number.isFinite(responseTotal) && loadedWindow < responseTotal);
       if (!usesStrategicReadModelRef.current) {
         onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
       }
     } catch {
       if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
     } finally {
-      if (isCurrentRequest()) setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+        if (loadingOlderTriageRef.current) {
+          loadingOlderTriageRef.current = false;
+          setLoadingOlderTriageMessages(false);
+        }
+      }
     }
     // Secondary fetches off the critical path — fire without awaiting so the
     // loading flag clears as soon as the primary messages fetch resolves,
@@ -1528,6 +1558,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       }
     }
   }, [conversationMode, selectedProjectId, onMessageCountChange, refreshConversation, searchQuery, usesStrategicReadModel]);
+  const loadOlderTriageMessages = useCallback(() => {
+    if (conversationMode || loadingOlderTriageRef.current || !hasOlderTriageMessages) return;
+    loadingOlderTriageRef.current = true;
+    setLoadingOlderTriageMessages(true);
+    void fetchMessages();
+  }, [conversationMode, fetchMessages, hasOlderTriageMessages]);
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
   useEffect(() => {
     if (conversationMode || !realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
@@ -2993,6 +3029,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         hasOlderConversationMessages={conversationMode && conversationHasMore}
         loadingOlderConversationMessages={loadingOlderConversation}
         onLoadOlderConversationMessages={() => loadOlderConversation()}
+        hasOlderTriageMessages={!conversationMode && hasOlderTriageMessages}
+        loadingOlderTriageMessages={loadingOlderTriageMessages}
+        onLoadOlderTriageMessages={loadOlderTriageMessages}
         conversationListRef={conversationListRef}
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
         scrollRef={scrollRef}

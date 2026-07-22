@@ -567,6 +567,72 @@ describe('sendAck callback', () => {
     expect(sendAck).toHaveBeenCalledWith(msg.id);
   });
 
+  test('acknowledges the same realtime message only once when callback identity changes', () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const firstSendAck = vi.fn();
+    const replacementSendAck = vi.fn();
+    const msg = message(5);
+    const { rerender } = renderHook(
+      ({ realtimeMessage, sendAck }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        sendAck,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null, sendAck: firstSendAck } },
+    );
+
+    rerender({ realtimeMessage: msg, sendAck: firstSendAck });
+    rerender({ realtimeMessage: msg, sendAck: replacementSendAck });
+
+    expect(firstSendAck).toHaveBeenCalledOnce();
+    expect(replacementSendAck).not.toHaveBeenCalled();
+  });
+  test('keeps acknowledgement dedup across include-target and search navigation', () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const sendAck = vi.fn();
+    const msg = message(8);
+    const { rerender } = renderHook(
+      ({ realtimeMessage, includeMessageId, searchQuery }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId,
+        searchQuery,
+        realtimeMessage,
+        sendAck,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: {
+        realtimeMessage: null as ProjectMessage | null,
+        includeMessageId: null as string | null,
+        searchQuery: '',
+      } },
+    );
+
+    rerender({ realtimeMessage: msg, includeMessageId: null, searchQuery: '' });
+    rerender({ realtimeMessage: msg, includeMessageId: msg.id, searchQuery: '' });
+    rerender({ realtimeMessage: msg, includeMessageId: msg.id, searchQuery: 'needle' });
+
+    expect(sendAck).toHaveBeenCalledOnce();
+    expect(sendAck).toHaveBeenCalledWith(msg.id);
+  });
+
   test('does not call sendAck for non-conversation surface messages', () => {
     let messages: ProjectMessage[] = [];
     const setMessages = vi.fn(update => {

@@ -101,6 +101,15 @@
         "strategicSessionLive_isStrategicReplyDelta_reply_vs_activity",
         "strategicSessionLive_computeStrategicStreamingTurn_builds_from_reply_deltas"
       ]
+    },
+    {
+      "path": "admin-ui/src/utils/pendingAttachmentStore.test.ts",
+      "reason": "Covers durable pending attachment storage for conversational Workday sends, including IndexedDB persistence across a module reload.",
+      "test_ids": [
+        "restores exact bytes only for the actor, project, and send key",
+        "cleans every blob in a completed send without touching another send",
+        "persists attachment bytes through IndexedDB across a module reload"
+      ]
     }
   ],
 

@@ -123,6 +123,7 @@ export function useConversation({
   const gapContinuationRef = useRef<() => void>(() => {});
   const refreshAbortRef = useRef<AbortController | null>(null);
   const olderAbortRef = useRef<AbortController | null>(null);
+  const ackedRealtimeMessageIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     activeScopeRef.current = `${actorUserId ?? ''}:${projectId ?? ''}:${normalizedSearch}`;
@@ -137,6 +138,14 @@ export function useConversation({
     setNextBeforeSequence(null);
     setLoadingOlder(false);
   }, [actorUserId, projectId, includeMessageId, normalizedSearch]);
+
+  // Delivery acknowledgements belong to the actor/project connection scope,
+  // not to local navigation or search state. Resetting this set when a target
+  // message or search changes causes the same realtime frame to be acked
+  // repeatedly as the operator moves around the conversation.
+  useEffect(() => {
+    ackedRealtimeMessageIdsRef.current = new Set();
+  }, [actorUserId, projectId]);
 
   const refresh = useCallback(async (fillSequenceGap = false, explicitForwardFrom?: number | null) => {
     if (!enabled || !projectId || !actorUserId) return;
@@ -305,7 +314,10 @@ export function useConversation({
 
   useEffect(() => {
     if (!enabled || !projectId || !realtimeMessage || realtimeMessage.project_id !== projectId || realtimeMessage.surface !== 'conversation') return;
-    sendAck?.(realtimeMessage.id);
+    if (sendAck && !ackedRealtimeMessageIdsRef.current.has(realtimeMessage.id)) {
+      ackedRealtimeMessageIdsRef.current.add(realtimeMessage.id);
+      sendAck(realtimeMessage.id);
+    }
     if (normalizedSearch) {
       const timer = window.setTimeout(() => { void refresh(false); }, 100);
       return () => window.clearTimeout(timer);

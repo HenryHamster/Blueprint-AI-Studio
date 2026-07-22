@@ -2596,7 +2596,15 @@ class TestPersistFailureCategoryExternalApiSubtype:
 # Cross-language contract / drift tests
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).parents[2]
+def _resolve_repo_root() -> Path:
+    candidates = (Path(__file__).resolve().parents[2], Path("/repo"))
+    return next(
+        (path for path in candidates if (path / "agent" / "src").is_dir()),
+        candidates[0],
+    )
+
+
+_REPO_ROOT = _resolve_repo_root()
 _VIEWPORT_TS = _REPO_ROOT / "admin-ui" / "src" / "test" / "viewport.ts"
 
 

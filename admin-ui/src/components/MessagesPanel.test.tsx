@@ -62,11 +62,15 @@ if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
 type _MockMsg = ReturnType<typeof makeMsg>;
 function _setupApiFetchMock(opts: {
   messagesQueue?: _MockMsg[][];
+  messageTotalsQueue?: number[];
   defaultMessages?: _MockMsg[];
+  defaultTotal?: number;
   lastSeenAt?: number | null;
 }): void {
   const queue = opts.messagesQueue;
+  const totalsQueue = opts.messageTotalsQueue;
   const defaultMessages = opts.defaultMessages ?? [];
+  const defaultTotal = opts.defaultTotal ?? defaultMessages.length;
   const lastSeenAt = opts.lastSeenAt === undefined ? null : opts.lastSeenAt;
   let qIdx = 0;
   (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
@@ -105,11 +109,13 @@ function _setupApiFetchMock(opts: {
       }), { status: 200 });
     }
     if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+      const responseIndex = qIdx;
       const msgs = queue
-        ? queue[Math.min(qIdx, queue.length - 1)]
+        ? queue[Math.min(responseIndex, queue.length - 1)]
         : defaultMessages;
       if (queue) qIdx += 1;
-      return new Response(JSON.stringify({ messages: msgs }), { status: 200 });
+      const total = totalsQueue?.[Math.min(responseIndex, totalsQueue.length - 1)] ?? defaultTotal;
+      return new Response(JSON.stringify({ messages: msgs, total }), { status: 200 });
     }
     // Server-side sync endpoints: GETs are 404'd so the panel falls back to its
     // localStorage state (returning 200/{} would let an empty server response
@@ -1366,6 +1372,91 @@ describe('MessagesPanel chrome modes', () => {
   test('does not render alerts banner when alerts prop is not provided', async () => {
     const el = await renderPanel({});
     expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+  });
+
+  test('loads the next triage page from the reachable load-older control', async () => {
+    const newest = Array.from({ length: 30 }, (_, index) => makeMsg({
+      id: `newest-${index}`,
+      content: `newest message ${index}`,
+    }));
+    const older = [makeMsg({
+      id: 'older-1',
+      message_type: 'BLOCKER',
+      from_type: 'agent',
+      content: 'older retained message',
+    })];
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _setupApiFetchMock({ messagesQueue: [newest, older], messageTotalsQueue: [31, 31] });
+    const el = await mountPanel();
+
+    const loadOlder = await waitFor(() => {
+      const button = [...el.querySelectorAll('button')]
+        .find(candidate => candidate.textContent === 'Load older messages');
+      expect(button).toBeDefined();
+      return button as HTMLButtonElement;
+    });
+    await act(async () => { loadOlder.click(); });
+
+    await waitFor(() => {
+      const urls = _messagesGetCalls().map(call => String(call[0]));
+      expect(urls.some(url => url.includes('offset=30') && url.includes('limit=30'))).toBe(true);
+      expect(el.textContent).toContain('older retained message');
+      expect([...el.querySelectorAll('button')]
+        .some(candidate => candidate.textContent === 'Load older messages')).toBe(false);
+    });
+  });
+  test('uses server total when guaranteed high-signal rows make the response longer than the requested page', async () => {
+    const requestedPagePlusGuaranteed = Array.from({ length: 31 }, (_, index) => makeMsg({
+      id: `guaranteed-aware-${index}`,
+      content: `guaranteed-aware message ${index}`,
+    }));
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _setupApiFetchMock({ defaultMessages: requestedPagePlusGuaranteed, defaultTotal: 90 });
+    const el = await mountPanel();
+
+    await waitFor(() => {
+      expect([...el.querySelectorAll('button')]
+        .some(candidate => candidate.textContent === 'Load older messages')).toBe(true);
+    });
+  });
+
+  test('keeps a terminal expanded window terminal when the capped newest-window poll runs', async () => {
+    const page = (prefix: string, length = 30) => Array.from({ length }, (_, index) => makeMsg({
+      id: `${prefix}-${index}`,
+      content: `${prefix} message ${index}`,
+    }));
+    const pages = [
+      page('page-0'), page('page-30'), page('page-60'), page('page-90'),
+      page('page-120'), page('page-150'), page('page-180-terminal', 25), page('capped-poll'),
+    ];
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _setupApiFetchMock({ messagesQueue: pages, messageTotalsQueue: pages.map(() => 205) });
+    const el = await mountPanel();
+
+    for (let pageIndex = 0; pageIndex < 6; pageIndex += 1) {
+      const button = await waitFor(() => {
+        const candidate = [...el.querySelectorAll('button')]
+          .find(item => item.textContent === 'Load older messages');
+        expect(candidate).toBeDefined();
+        return candidate as HTMLButtonElement;
+      });
+      await act(async () => { button.click(); });
+    }
+
+    await waitFor(() => {
+      expect(_messagesGetCalls().map(call => String(call[0]))
+        .some(url => url.includes('offset=180') && url.includes('limit=30'))).toBe(true);
+      expect([...el.querySelectorAll('button')]
+        .some(candidate => candidate.textContent === 'Load older messages')).toBe(false);
+    });
+
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+    await waitFor(() => {
+      expect(_messagesGetCalls().map(call => String(call[0]))
+        .some(url => url.includes('limit=200') && !url.includes('offset='))).toBe(true);
+      expect([...el.querySelectorAll('button')]
+        .some(candidate => candidate.textContent === 'Load older messages')).toBe(false);
+    });
   });
 });
 

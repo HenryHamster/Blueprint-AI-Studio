@@ -17,8 +17,18 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = Path(__file__).resolve().parent / "conversational_workday_manifest.json"
+
+
+def _resolve_repo_root() -> Path:
+    candidates = (Path(__file__).resolve().parents[2], Path("/repo"))
+    for candidate in candidates:
+        if (candidate / "backend" / "testing" / MANIFEST_PATH.name).is_file():
+            return candidate
+    return candidates[0]
+
+
+REPO_ROOT = _resolve_repo_root()
 
 
 # ---------------------------------------------------------------------------
