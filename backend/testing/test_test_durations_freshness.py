@@ -4,6 +4,7 @@ with the current test collection so CI shard time-balancing can't silently rot.
 
 Runs under --noconftest (no DB, no conftest fixtures).
 """
+import ast
 import glob
 import json
 import re
@@ -226,4 +227,93 @@ def test_durations_no_implausible_outliers() -> None:
         f"Offending entries: {dict(list(outliers.items())[:5])}\n"
         f"Fix: strip entries > {_IMPLAUSIBLE_OUTLIER_CAP}s then recommit, or regenerate "
         f"via scripts/batch-store-durations.sh (which caps automatically)."
+    )
+
+
+def _extract_valid_test_ids(filepath: Path) -> set:
+    """
+    Return the set of valid pytest node IDs for a test file, using AST.
+
+    Recognises two forms:
+    - Top-level async/sync functions named test_* → bare function name
+    - Methods named test_* inside a class named Test* → "ClassName::method"
+
+    Only looks one level deep (module body → class body), matching pytest's
+    default collection behaviour.  Does not expand @pytest.mark.parametrize
+    variants — callers must strip the "[param]" suffix before lookup.
+    """
+    try:
+        tree = ast.parse(filepath.read_text())
+    except (SyntaxError, OSError):
+        return set()
+
+    valid_ids: set = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for item in node.body:
+                if (
+                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name.startswith("test_")
+                ):
+                    valid_ids.add(f"{node.name}::{item.name}")
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        ):
+            valid_ids.add(node.name)
+
+    return valid_ids
+
+
+def test_durations_no_stale_entries() -> None:
+    """
+    Every duration entry whose test file exists on disk must reference a real
+    test ID in that file.
+
+    When a test file is split or renamed, its old entries remain in
+    .test_durations and inflate shard-balancing estimates for tests that no
+    longer exist — causing CI to under-fill the shard that previously held
+    them. This guard catches that class of regression without requiring a
+    live pytest run.
+
+    Parametrized variants (e.g. "test_foo[param1]") are checked by stripping
+    the "[...]" suffix and verifying the base function/method exists.
+    Files that no longer exist on disk are ignored here (the coverage-fraction
+    test flags those separately).
+    """
+    data = _load_durations()
+
+    # Cache file → set of valid test IDs (parsed once per file)
+    _valid_cache: dict = {}
+
+    stale: list = []
+    for key in data:
+        parts = key.split("::", 1)
+        if len(parts) != 2:
+            continue
+        file_key, raw_node_id = parts
+
+        abs_path = BACKEND_ROOT / file_key
+        if not abs_path.exists():
+            # Coverage-fraction test handles missing files; skip here.
+            continue
+
+        if file_key not in _valid_cache:
+            _valid_cache[file_key] = _extract_valid_test_ids(abs_path)
+
+        # Strip parametrize suffix before lookup
+        base_node_id = raw_node_id.split("[")[0]
+
+        if base_node_id not in _valid_cache[file_key]:
+            stale.append(key)
+
+    assert not stale, (
+        f"backend/.test_durations contains {len(stale)} stale entry(ies) for "
+        f"test IDs that no longer exist in their file. These phantom entries "
+        f"inflate CI shard-balancing estimates for tests that were moved or "
+        f"removed.\n"
+        f"Stale entries ({min(len(stale), 10)} of {len(stale)} shown): "
+        f"{stale[:10]}\n"
+        f"Fix: remove these entries from backend/.test_durations, or regenerate "
+        f"via scripts/store-backend-durations.sh."
     )
