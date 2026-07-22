@@ -3257,6 +3257,35 @@ async def test_walkthrough_disable_enable_chain(client: AsyncClient, db_session)
     )
     assert "Walkthrough" in agent_tools_on["notes"]["text"]
 
+    # Step 7: permanently remove tool1 — DELETE wipes the row and its authored content.
+    # After delete the tool must not appear in the admin list or agent fetch.
+    del_resp = await client.delete(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}"
+    )
+    assert del_resp.status_code == 200, del_resp.text
+    assert del_resp.json()["status"] == "deleted"
+
+    list_after_delete = (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]
+    assert not any(t["id"] == tool1_id for t in list_after_delete), (
+        "deleted tool must not appear in the admin list"
+    )
+
+    agent_resp_after_delete = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": agent_token},
+    )
+    assert agent_resp_after_delete.status_code == 200
+    agent_slugs_after_delete = [t["slug"] for t in agent_resp_after_delete.json()["tools"]]
+    assert "notes" not in agent_slugs_after_delete, (
+        "deleted tool must not appear in agent-facing content fetch"
+    )
+
+    # A second DELETE on the same id returns 404 (idempotent-safe guard).
+    del_again = await client.delete(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}"
+    )
+    assert del_again.status_code == 404
+
 
 # ===========================================================================
 # Path-embedded token: subresource authentication fix (finding 37bc0b9c)

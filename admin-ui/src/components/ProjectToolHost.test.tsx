@@ -493,6 +493,16 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
   });
 
   test('owner walks the full project-tools flow without a dead end', async () => {
+    vi.mocked(deleteProjectTool).mockImplementation(() => Promise.resolve());
+    // fetchProjectTools call sequence:
+    //   1. initial mount       → full list (enabled + disabled)
+    //   2. refresh after Enable → full list (Configure/Remove still visible)
+    //   3. refresh after delete → enabled tool gone, disabled remains
+    vi.mocked(fetchProjectTools)
+      .mockResolvedValueOnce(WALKTHROUGH_TOOLS)
+      .mockResolvedValueOnce(WALKTHROUGH_TOOLS)
+      .mockResolvedValue({ tools: [WALKTHROUGH_DISABLED], total_count: 1, next_offset: null });
+
     await mount(<ProjectToolHost projectId="proj-walkthrough" myRole="owner" />);
 
     // Step 1: disabled tool is visible with an Enable control — not silently hidden
@@ -531,6 +541,22 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     await act(async () => { showHiddenBtn.click(); });
     expect(findButton('Hide')).toBeTruthy();
     expect(loadHiddenManifestSlugs('proj-walkthrough').size).toBe(0);
+
+    // Step 8: Remove on an enabled tool shows confirmation — does NOT immediately delete.
+    // This proves permanent deletion is protected: the affordance names the tool and
+    // explains that authored content will be lost; cancellation is side-effect-free.
+    await act(async () => { requireButton('Remove').click(); });
+    expect(findButton('Permanently remove')).toBeTruthy();
+    expect(h().textContent).toContain('My Enabled Widget');
+    expect(h().textContent).toContain('permanently delete its content');
+    expect(vi.mocked(deleteProjectTool)).not.toHaveBeenCalled();
+
+    // Step 9: confirm deletion → deleteProjectTool fires exactly once, list refreshes
+    await act(async () => { requireButton('Permanently remove').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    expect(vi.mocked(deleteProjectTool)).toHaveBeenCalledWith('proj-walkthrough', 'tool-enabled');
+    // 3 fetches total: initial mount, post-Enable refresh, post-delete refresh.
+    expect(vi.mocked(fetchProjectTools)).toHaveBeenCalledTimes(3);
   });
 });
 

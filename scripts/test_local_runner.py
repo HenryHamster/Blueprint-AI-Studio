@@ -1429,24 +1429,28 @@ class TestLiveRunnerConfig(unittest.TestCase):
 
     def test_rejected_generation_mutates_no_recognized_field(self):
         # A rejected block (mix of known + unrecognized fields) must leave EVERY
-        # recognized field at its prior value — max_concurrent, task_types, and
-        # both GPU-scheduling settings — so the 'rejected' verdict is honest.
+        # recognized field at its prior value — max_concurrent, max_concurrent_compute,
+        # task_types, and both GPU-scheduling settings — so the 'rejected' verdict
+        # is honest and partial state never leaks to the scheduler.
         holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
-        # Establish a known-good baseline generation first.
+        # Establish a known-good baseline generation (all five live-safe fields).
         self.assertTrue(holder.apply({
             "max_concurrent": 5,
+            "max_concurrent_compute": 3,
             "task_types": ["fix"],
             "gpu_indices_allowed": [0, 1],
             "gpus_per_job": 2,
             "config_generation": "base",
         }))
         self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(holder.max_concurrent_compute(), 3)
         self.assertEqual(gpu_state["allowed"], [0, 1])
         self.assertEqual(gpu_state["per_job"], 2)
         # A later block flips every recognized field BUT carries an unrecognized
         # one, so it must be rejected atomically — none of the flips take effect.
         self.assertFalse(holder.apply({
             "max_concurrent": 9,
+            "max_concurrent_compute": 8,
             "task_types": ["create"],
             "gpu_indices_allowed": [2, 3],
             "gpus_per_job": 4,
@@ -1454,6 +1458,7 @@ class TestLiveRunnerConfig(unittest.TestCase):
             "config_generation": "reject",
         }))
         self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(holder.max_concurrent_compute(), 3)
         self.assertEqual(holder.report()["applied_task_types"], ["fix"])
         self.assertEqual(gpu_state["allowed"], [0, 1])
         self.assertEqual(gpu_state["per_job"], 2)
