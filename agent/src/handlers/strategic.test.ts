@@ -588,6 +588,7 @@ vi.mock('../telemetry.js', () => ({
 
 import {
   renderStrategicPromptSuffix,
+  resolveStrategicPurpose,
   buildStagedDirectionsSection,
   renderDesignDocIndexOverview,
   handleStrategic,
@@ -753,6 +754,17 @@ describe('renderStrategicPromptSuffix', () => {
 // (Anthropic prefix-cache reads bill at ~10% of base input). It now renders
 // relative to a caller-supplied deterministic reference epoch (the backend-baked
 // payload timestamp), so two builds of an identical payload are byte-identical.
+describe('resolveStrategicPurpose', () => {
+  it('prefers the backend value and retains bounded legacy fallbacks', () => {
+    const problemModel = { intent: { purpose: '...', user_purpose: ' durable operator purpose ' } };
+
+    expect(resolveStrategicPurpose({ effective_purpose: ' canonical purpose ' }, problemModel)).toBe('canonical purpose');
+    expect(resolveStrategicPurpose({}, problemModel)).toBe('durable operator purpose');
+    expect(resolveStrategicPurpose({ vision: { purpose: 'legacy purpose' } }, {})).toBe('legacy purpose');
+    expect(resolveStrategicPurpose({}, { intent: { purpose: '<from analysis>' } })).toBeUndefined();
+  });
+});
+
 describe('formatRelativeDays', () => {
   const iso = '2026-01-01T00:00:00Z';
   const isoMs = Date.parse(iso);

@@ -8236,25 +8236,43 @@ async def test_strategic_failures_auto_decay_persists_cleared_counter(db_session
 
 def test_project_has_purpose_resolves_problem_model_then_vision():
     """problem_model.intent.purpose is canonical; vision.purpose is the legacy fallback."""
-    from app.problem_model import project_has_purpose
+    from app.problem_model import project_has_purpose, resolve_project_purpose
 
     project = Project(name="Purpose Resolution", user_id="test-user-123")
 
     project.problem_model = {"intent": {"purpose": "build a bot"}}
     project.vision = {}
     assert project_has_purpose(project) is True
+    assert resolve_project_purpose(project) == "build a bot"
+
+    project.problem_model = {
+        "intent": {"purpose": "agent rewrite", "user_purpose": "operator purpose"}
+    }
+    assert project_has_purpose(project) is True
+    assert resolve_project_purpose(project) == "operator purpose"
+
+    project.problem_model = {
+        "intent": {
+            "purpose": "<from analysis>",
+            "user_purpose": "operator fallback",
+        }
+    }
+    assert resolve_project_purpose(project) == "operator fallback"
 
     project.problem_model = {}
     project.vision = {"purpose": "legacy purpose"}
     assert project_has_purpose(project) is True
+    assert resolve_project_purpose(project) == "legacy purpose"
 
     project.problem_model = {"intent": {"purpose": "   "}}
     project.vision = {"purpose": ""}
     assert project_has_purpose(project) is False
+    assert resolve_project_purpose(project) == ""
 
     project.problem_model = None
     project.vision = None
     assert project_has_purpose(project) is False
+    assert resolve_project_purpose(project) == ""
 
 
 @pytest.mark.asyncio

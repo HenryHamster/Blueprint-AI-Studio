@@ -347,6 +347,7 @@ ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   await runCodeChangeTask({
     taskId,
     prompt: finalMigratePrompt,
+    taskPrompt: migratePrompt,
     ws,
     statusRef,
     workBranch,
@@ -485,7 +486,9 @@ Follow these steps:
 
 Set top-level "passed" to true only if ALL suites passed and there are no guardrail violations.
 
-IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
+Use status "error" for collection, setup, environment, or command-execution failures. Use status "skip" only when a test is intentionally inapplicable, never when the test could not run. If no tests can execute, include at least one "error" test, set top-level "passed" to false, and explain the blocker in its message.
+
+IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE}, including when tests cannot run. Never leave the file unwritten.`;
   const smoketestFetchBlock = `
 
 ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
@@ -508,7 +511,12 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   const { exitCode, allOutput } = await runClaudeCode(smoketestFullPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Read result file written by Claude
-  const smoketestResult = readHandlerOutput(taskId, 'smoketest_result', ws) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null;
+  const rawSmoketestResult = readHandlerOutput(taskId, 'smoketest_result', ws) as Record<string, unknown> | null;
+  const smoketestResult = rawSmoketestResult
+    && typeof rawSmoketestResult.passed === 'boolean'
+    && Array.isArray(rawSmoketestResult.tests)
+    ? rawSmoketestResult as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> }
+    : null;
 
   if (exitCode === 0 && smoketestResult) {
     // Live endpoint checks
@@ -545,8 +553,9 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
         }
         smoketestResult.tests.push({ name: `HTTP GET ${url}`, status: curlStatus, message: curlMessage });
       }
-      // Recompute passed: true only if all tests pass or skip
-      smoketestResult.passed = smoketestResult.tests.every(t => t.status === 'pass' || t.status === 'skip');
+      // Health checks may turn a pass into a failure, but never erase an
+      // earlier suite/test failure from the parseable result.
+      smoketestResult.passed = smoketestResult.passed && smoketestResult.tests.every(t => t.status === 'pass' || t.status === 'skip');
     }
 
     // Candidate-side env-preflight evidence (Slice 2, design 245212a4). Run the
@@ -572,14 +581,17 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     const passCount = smoketestResult.tests.filter(t => t.status === 'pass').length;
     const summary = `Smoke tests ${passed ? 'PASSED' : 'FAILED'}: ${passCount}/${smoketestResult.tests.length} passed`;
     sendLog(ws, `\n${summary}\n`);
-    // Always post COMPLETED when Claude ran and produced a parseable result —
-    // the quality verdict lives in the SMOKETEST_RESULT artifact (passed: true/false),
-    // not in the task status.  Posting FAILED here caused the qualifier to route
-    // genuine test failures through _handle_infra_failure instead of _score_smoketest,
-    // which silently stalled promotion forever instead of producing a quality verdict.
+    const taskContext = task.context && typeof task.context === 'object'
+      ? task.context as Record<string, unknown>
+      : {};
+    const qualifierSmoketest = taskContext.qualifier_smoketest === true;
+    // Qualifier smoketests remain COMPLETED so their artifact feeds the release
+    // score. Ordinary smoketest failures use the existing FAILED path, which
+    // stores the same artifact and triggers the established repair-task flow.
+    const terminalStatus = passed || qualifierSmoketest ? 'COMPLETED' : 'FAILED';
     await persistAndPostStatus(taskId, {
       task_id: taskId,
-      status: 'COMPLETED',
+      status: terminalStatus,
       artifact_type: 'SMOKETEST_RESULT',
       logs: JSON.stringify(smoketestResult),
       repo_url: `https://github.com/${owner}/${repo}`,

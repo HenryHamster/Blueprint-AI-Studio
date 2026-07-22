@@ -782,14 +782,14 @@ describe('github/token fetch: infra category and long timeout', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const p = apiGet('/api/agent/github/token?task_id=test-123', 1, 180_000);
-    const rejection = expect(p).rejects.toThrow(/aborted/);
+    const rejection = expect(p).rejects.toThrow(/timed out during headers phase/);
 
     // Default timeout (API_TIMEOUT = 30s) passes — should NOT have aborted yet.
     await vi.advanceTimersByTimeAsync(30_000);
     // Still pending — the 180s timeout has not fired yet.
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    // Advance past the 180s body-phase timer — NOW it aborts.
+    // Advance past the 180s header-phase timer — NOW it aborts.
     await vi.advanceTimersByTimeAsync(180_000);
     await rejection;
   });
@@ -4146,21 +4146,20 @@ describe('park directives and warm continuation', () => {
 // ── pollForNextRole ──────────────────────────────────────────────────────────
 describe('pollForNextRole', () => {
   let fetchMock: FetchMock;
-  // Spy on the global clearInterval; widening to any is the simplest path
-  // around vi.spyOn's strict object/keyof typing for ambient globals.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let clearIntervalSpy: ReturnType<typeof vi.spyOn<any, any>>;
+  let clearIntervalSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    clearIntervalSpy = vi.spyOn(globalThis as any, 'clearInterval');
+    const originalClearInterval = globalThis.clearInterval;
+    clearIntervalSpy = vi.fn((...args: Parameters<typeof clearInterval>) => {
+      originalClearInterval(...args);
+    });
+    vi.stubGlobal('clearInterval', clearIntervalSpy);
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    clearIntervalSpy.mockRestore();
   });
 
   it('returns exit with poll_timeout when 204 forever', async () => {
@@ -5573,6 +5572,7 @@ describe('main non-pool startup OAuth rotation', () => {
   });
 
   afterEach(() => {
+    _stopHeartbeatForTesting();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     vi.mocked(fs.existsSync).mockReset();
@@ -5625,6 +5625,16 @@ describe('main non-pool startup OAuth rotation', () => {
 
     fetchMock.mockImplementation((input: unknown, init?: RequestInit) => {
       const url = String(input);
+      if (url.endsWith('/api/agent/heartbeat')) {
+        events.push('cold-heartbeat');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ status: 'ok' }),
+          headers: { get: () => null },
+        });
+      }
       if (url.endsWith('/api/agent/credentials/rotate')) {
         events.push('rotate');
         rotateBody = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as Record<string, unknown>;
@@ -5655,9 +5665,10 @@ describe('main non-pool startup OAuth rotation', () => {
 
     await expect(main()).rejects.toThrow('POST /api/agent/claim failed (400): claim stopped test');
 
-    expect(events).toEqual(expect.arrayContaining(['provider-validation', 'rotate', 'claim']));
+    expect(events).toEqual(expect.arrayContaining(['provider-validation', 'cold-heartbeat', 'rotate', 'claim']));
     expect(events.indexOf('provider-validation')).toBeLessThan(events.indexOf('rotate'));
     expect(events.indexOf('rotate')).toBeLessThan(events.indexOf('claim'));
+    expect(events.indexOf('cold-heartbeat')).toBeLessThan(events.indexOf('claim'));
     expect(rotateBody).toEqual({
       secret: '{"refresh_token":"new"}',
       task_id: 'cold-preclaim-task',
@@ -7431,6 +7442,7 @@ describe('readAgentSourceSha', () => {
 describe('apiRequest body-read timeout', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
@@ -7458,12 +7470,65 @@ describe('apiRequest body-read timeout', () => {
 
     // retries=1 (single attempt), timeout=5s.
     const p = apiRequest('POST', '/api/agent/heartbeat', () => ({ method: 'POST' }), 1, 5_000);
-    const settled = expect(p).rejects.toThrow(/aborted/);
+    const settled = expect(p).rejects.toThrow('POST /api/agent/heartbeat timed out during body phase on attempt 1/1 after 5000ms');
     // Without the body-phase timer this advance would not settle the promise.
     await vi.advanceTimersByTimeAsync(5_000);
     await settled;
   });
 
+  it('identifies a header-phase timeout with request and attempt context', async () => {
+    vi.useFakeTimers();
+    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
+      const signal = init?.signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(new Error('The operation was aborted'));
+        });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const p = apiRequest('GET', '/api/agent/claim', () => ({ method: 'GET' }), 1, 2_000);
+    const settled = expect(p).rejects.toThrow('GET /api/agent/claim timed out during headers phase on attempt 1/1 after 2000ms');
+    await vi.advanceTimersByTimeAsync(2_000);
+    await settled;
+  });
+
+  it('logs an intermediate timeout before a later attempt succeeds', async () => {
+    vi.useFakeTimers();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    let attempt = 0;
+    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
+      attempt += 1;
+      if (attempt === 1) {
+        const signal = init?.signal;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            reject(new Error('The operation was aborted'));
+          });
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ status: 'ok' }),
+        text: () => Promise.resolve(''),
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pending = apiRequest('GET', '/api/agent/status', () => ({ method: 'GET' }), 2, 1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(pending).resolves.toEqual({ status: 'ok' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(logSpy.mock.calls.flat().join('\n')).toContain(
+      '[API_TIMEOUT] GET /api/agent/status timed out during headers phase on attempt 1/2 after 1000ms; retrying',
+    );
+
+  });
   it('does not abort a body that arrives within the timeout', async () => {
     vi.useFakeTimers();
     const fetchMock = makeFetchMock().mockResolvedValue({

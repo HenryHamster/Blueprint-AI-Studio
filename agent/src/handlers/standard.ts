@@ -1043,6 +1043,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   await runCodeChangeTask({
     taskId,
     prompt: finalPromptWithTree,
+    taskPrompt: rawPrompt,
     ws,
     statusRef,
     workBranch,

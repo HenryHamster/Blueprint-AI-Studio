@@ -77,7 +77,7 @@ from app.github import (
     get_pull_request,
 )
 from app.broadcast import broadcast_to_project
-from app.claim_analytics import stamp_cold_claim_timing
+from app.claim_analytics import ClaimResponseTiming, stamp_cold_claim_timing
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_themes,
     aggregate_sr_co_failure_pairs,
@@ -991,6 +991,7 @@ async def claim_task(
     Rate limit: 200 requests/minute.
     Idempotency: Replays last successful claim within 5 minutes if present.
     """
+    claim_timing = ClaimResponseTiming()
     vm_id = token.get("vm_instance_id")
     # Scope the claim to the JWT's task, never "any task pinned to this VM".
     # Persistent runners pin MANY tasks to one shared vm_instance_id
@@ -1237,6 +1238,7 @@ async def claim_task(
     # Record liveness only after the durable claim/JTI/predecessor boundary
     # has succeeded. Rejected stale tokens must not keep a VM pin alive.
     _shared_state.record_vm_heartbeat(vm_id)
+    claim_timing.mark("claim_transition")
 
     # Broadcast status change to frontend
     await broadcast_to_project(
@@ -1452,6 +1454,7 @@ async def claim_task(
                 _migration_reservation.provisional_down_revision
             ),
         }
+    claim_timing.mark("execution_contract")
     if (
         task_type in ("research", "plan", "create", "fix", "refactor", "review")
         or task_type in _PEER_CODE_ANALYSIS_TYPES
@@ -2386,6 +2389,8 @@ async def claim_task(
         "debug",
         "docs",
     }
+
+    claim_timing.mark("project_history")
 
     # Inject playbook for ALL task types (outside the project_context gate).
     # First, recover the shared session once, centrally. The best-effort
@@ -4153,6 +4158,8 @@ async def claim_task(
                 "[AGENT] Failed to inject rejection_patterns (non-critical)"
             )
 
+    claim_timing.mark("task_guidance")
+
     # Inject project-declared skills from .blueprint/tools.json manifest.
     # Skills are shell-command procedures the project's agent can invoke.
     # Fetched for the same task types that receive playbook entries.
@@ -4442,6 +4449,22 @@ async def claim_task(
             _bg_tasks.add(_check_run_fut)
             _check_run_fut.add_done_callback(_bg_tasks.discard)
 
+    claim_timing.mark("skills_and_intent")
+    _claim_metrics = claim_timing.finish(response)
+    logger.info(
+        "[CLAIM_TIMING] task=%s type=%s vm=%s replay=%s total_ms=%s "
+        "response_bytes_approx=%s size_measurement_ms=%s phase_ms=%s",
+        _claimed_task_id,
+        task_type or "unknown",
+        _truncate_vm_instance_id(vm_id),
+        idempotent_replay,
+        _claim_metrics["total_ms"],
+        _claim_metrics["response_bytes_approx"],
+        _claim_metrics["size_measurement_ms"],
+        json.dumps(
+            _claim_metrics["phase_ms"], sort_keys=True, separators=(",", ":")
+        ),
+    )
     return response
 
 

@@ -924,6 +924,8 @@ export async function apiRequest(
 ): Promise<unknown> {
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
+    const startedAt = Date.now();
+    let phase: 'headers' | 'body' = 'headers';
     // The abort timer must cover the response BODY read, not just the headers.
     // Clearing it the instant `fetch()` resolves (the prior behaviour) left
     // `await res.json()/res.text()` UNBOUNDED by our timeout: a server that
@@ -939,6 +941,7 @@ export async function apiRequest(
     let timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
     try {
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { ...init(), signal: controller.signal });
+      phase = 'body';
       clearTimeout(timeout);
       timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
       if (res.ok) return await res.json() as unknown;
@@ -1008,10 +1011,14 @@ export async function apiRequest(
         throw new Error(`${method} ${path} failed (${res.status}): ${text}`);
       }
     } catch (e) {
+      const caught = controller.signal.aborted ? new Error(`${method} ${path} timed out during ${phase} phase on attempt ${attempt + 1}/${retries} after ${Date.now() - startedAt}ms`) : e;
+      if (controller.signal.aborted && attempt < retries - 1) {
+        log(`[API_TIMEOUT] ${caught instanceof Error ? caught.message : String(caught)}; retrying`);
+      }
       // Re-throw 4xx errors and final-attempt errors immediately. 429 is
       // intentionally excluded from the 4xx bail-out via the explicit check
       // above, which uses `continue` before this catch runs.
-      if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
+      if (attempt === retries - 1 || (caught instanceof Error && /failed \(4\d{2}\)/.test(caught.message))) throw caught;
     } finally {
       // Clear whichever timer is currently armed (header- or body-phase) on
       // every exit: return, throw, 401/429 `continue`, or 5xx fall-through.
@@ -3702,8 +3709,17 @@ export async function main() {
         throw startupErr;
       }
     } else {
-      await completeStartup(getProviderRunner(), reportPreClaimFailure, PRE_CLAIM_TASK_ID);
-      captureBootCredentialSnapshot();
+      const startupStatusRef = { value: 'Completing cold startup before claim' };
+      if (PRE_CLAIM_TASK_ID) {
+        startHeartbeat(PRE_CLAIM_TASK_ID, () => startupStatusRef.value);
+      }
+      try {
+        await completeStartup(getProviderRunner(), reportPreClaimFailure, PRE_CLAIM_TASK_ID, startupStatusRef);
+        captureBootCredentialSnapshot();
+      } catch (startupErr) {
+        stopHeartbeat();
+        throw startupErr;
+      }
     }
     let firstRole = true;
     for (;;) {
@@ -3786,6 +3802,7 @@ export async function main() {
       if (warmContinuation.action === 'exit') break;
     }
   } finally {
+    stopHeartbeat();
     // Workspace teardown happens once at process exit, not per-role —
     // warm continuity DEPENDS on the workspace surviving across roles.
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
@@ -3963,7 +3980,9 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   }
   let task: Record<string, unknown>;
   try {
-    task = await apiPost('/api/agent/claim') as Record<string, unknown>;
+    // A timed-out claim may keep building its response server-side. Do not fan
+    // one claim into the generic five overlapping request attempts.
+    task = await apiPost('/api/agent/claim', {}, 1) as Record<string, unknown>;
   } catch (claimErr) {
     const errMsg = claimErr instanceof Error ? `${claimErr.message}${claimErr.stack ? '\n' + claimErr.stack : ''}` : String(claimErr);
     reportPreClaimFailure(`claim failed: ${errMsg}`);

@@ -15029,6 +15029,7 @@ async def test_seeded_goal_reaches_strategic_review_payload(db_session):
 
     # Channel 1: intent/purpose
     assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    assert payload["effective_purpose"] == _ONBOARD_GOAL
     # Channel 2: user-message conversation history
     thread_contents = [m["content"] for m in payload["conversation_thread"]]
     assert _ONBOARD_GOAL in thread_contents
@@ -15058,6 +15059,7 @@ async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
     payload = result.scalars().all()[0].payloads[0]
 
     assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    assert payload["effective_purpose"] == _ONBOARD_GOAL
     open_contents = [m["content"] for m in payload["open_messages"]]
     assert _ONBOARD_GOAL in open_contents
 

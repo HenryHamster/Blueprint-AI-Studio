@@ -2088,26 +2088,33 @@ def _diff_summary(diff: dict[str, Any]) -> str:
 # in :func:`apply_agent_update`.
 
 
-def project_has_purpose(project) -> bool:
-    """True when the project has an established purpose.
+def resolve_project_purpose(project) -> str:
+    """Return one normalized, non-placeholder project purpose.
 
-    Canonical source is ``problem_model.intent.purpose`` (seeded at onboarding
-    by ``admin_onboard._seed_strategic_intent``); the deprecated
-    ``vision.purpose`` is honored as a legacy fallback for projects that
-    pre-date the problem model. Both the strategic force-trigger
-    (``autonomous_research``) and the autonomy-debug endpoint resolve purpose
-    through this helper so trigger behavior and "why" reporting cannot drift.
-    Reading only ``vision.purpose`` made every problem-model project look
-    purposeless — ``force_strategic`` fired on every tick and strategic
-    cycles spawned back-to-back at the cooldown rate (stsbot2, 2026-06-07:
-    6 cycles in ~3h against a frequency of 6 spawns/cycle).
+    Operator-owned ``intent.user_purpose`` wins, followed by the current
+    problem-model purpose and the two legacy vision fields.
     """
     pm = getattr(project, "problem_model", None) or {}
     intent = pm.get("intent") or {}
-    if (intent.get("purpose") or "").strip():
-        return True
     vision = getattr(project, "vision", None) or {}
-    return bool((vision.get("purpose") or "").strip())
+
+    for candidate in (
+        intent.get("user_purpose"),
+        intent.get("purpose"),
+        vision.get("user_purpose"),
+        vision.get("purpose"),
+    ):
+        if not isinstance(candidate, str):
+            continue
+        normalized = candidate.strip()
+        if not _is_placeholder_purpose(normalized):
+            return normalized
+    return ""
+
+
+def project_has_purpose(project) -> bool:
+    """True when the canonical resolver finds an established purpose."""
+    return bool(resolve_project_purpose(project))
 
 
 # ---------------------------------------------------------------------------
