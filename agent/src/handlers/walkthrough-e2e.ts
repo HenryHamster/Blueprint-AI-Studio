@@ -13,6 +13,8 @@
  */
 
 import { execFileSync } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
+import * as path from 'path';
 import type WebSocket from 'ws';
 import {
   WORKSPACE,
@@ -58,6 +60,139 @@ function isValidWalkthroughResult(value: unknown): value is {
   return typeof v.git_sha === 'string'
     && typeof v.run_timestamp === 'string'
     && Array.isArray(v.results);
+}
+
+/** True iff `bwrap --version` runs (the binary is present and executable). */
+function probeBwrap(): boolean {
+  try {
+    execFileSync('bwrap', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True iff a usable docker daemon is present — `docker info` must actually
+ * SUCCEED (mirrors runner_isolation.probe_container_runtime_usable: installed
+ * but socket-denied reads as unusable).
+ */
+function probeDockerUsable(): boolean {
+  try {
+    execFileSync('docker', ['info'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True iff unprivileged user namespaces can be created — mirrors
+ * runner_isolation.probe_userns: honor the `unprivileged_userns_clone` sysctl
+ * ("1" → yes, "0" → no); when the knob is absent (many kernels removed it and
+ * default-enable userns) fall back to a functional `unshare` probe.
+ */
+function probeUserns(): boolean {
+  try {
+    const raw = readFileSync('/proc/sys/kernel/unprivileged_userns_clone', 'ascii').trim();
+    if (raw === '1') return true;
+    if (raw === '0') return false;
+  } catch {
+    // sysctl absent — fall through to the functional probe below.
+  }
+  try {
+    execFileSync('unshare', ['--user', '--map-root-user', 'true'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Best-effort preparation of the walkthrough VM so the spawned local_runner can
+ * advertise `agent_available: true` and satisfy FLOW 5's eligible-runner poll.
+ *
+ * This mirrors the capability decision `runner_isolation.decide_agent_backend`
+ * makes at runtime: the default (imageless) agent backend needs a rootless
+ * bwrap sandbox — the `bwrap` binary AND unprivileged user namespaces — plus a
+ * runner-resolvable agent entry point; alternatively a usable docker daemon
+ * lets the runner ride the container backend.
+ *
+ * Every step is wrapped so a probe or install failure only logs a warning and
+ * CONTINUES: an inability to prepare isolation must NEVER throw or fail the
+ * walkthrough task. When it succeeds the walkthrough runs with an eligible
+ * runner; when it fails the harness transparently falls back to the backend
+ * allow_no_runner path. The result is log-only — the caller does not gate on it.
+ */
+export function prepareRunnerIsolation(
+  ws: WebSocket | null,
+): Promise<{ isolationOk: boolean; detail: string }> {
+  const agentDir = path.join(WORKSPACE, 'agent');
+
+  // 1. Build the agent binary so a host entry point exists for the runner's
+  //    `_locate_agent_binary`. `npm run build` is `tsc --noEmit` on this repo
+  //    (it emits no dist), so "built" is judged by whether a runner-resolvable
+  //    entry point exists — a compiled `dist/index.js` OR the tsx fallback
+  //    (`src/index.ts` + `node_modules/.bin/tsx`) — not by the build exit code.
+  try {
+    execFileSync('npm', ['run', 'build'], {
+      cwd: agentDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 240_000,
+    });
+  } catch (e) {
+    sendLog(ws, `[WARN] agent build step failed (continuing): ${sanitizeError(e)}\n`);
+  }
+  const agentBuilt =
+    existsSync(path.join(agentDir, 'dist', 'index.js')) ||
+    (existsSync(path.join(agentDir, 'src', 'index.ts')) &&
+      existsSync(path.join(agentDir, 'node_modules', '.bin', 'tsx')));
+
+  // 2. Probe bwrap; best-effort install bubblewrap if the binary is absent.
+  let bwrapOk = probeBwrap();
+  if (!bwrapOk) {
+    try {
+      sendLog(ws, 'bwrap not found — attempting best-effort install of bubblewrap...\n');
+      execFileSync('apt-get', ['install', '-y', 'bubblewrap'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 120_000,
+      });
+    } catch (e) {
+      sendLog(ws, `[WARN] bubblewrap install failed (continuing): ${sanitizeError(e)}\n`);
+    }
+    bwrapOk = probeBwrap();
+  }
+
+  // 3. Unprivileged user namespaces; best-effort enable if the sysctl reads '0'.
+  //    Kernel-level restrictions may make this impossible — treat as best-effort.
+  let usernsOk = probeUserns();
+  if (!usernsOk) {
+    try {
+      sendLog(ws, 'unprivileged userns disabled — attempting best-effort enable...\n');
+      execFileSync('sysctl', ['-w', 'kernel.unprivileged_userns_clone=1'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 15_000,
+      });
+    } catch (e) {
+      sendLog(ws, `[WARN] userns enable failed (kernel restriction?): ${sanitizeError(e)}\n`);
+    }
+    usernsOk = probeUserns();
+  }
+
+  // 4. Docker daemon usable? (An explicit agent_image container backend route.)
+  const dockerUsable = probeDockerUsable();
+
+  // A rootless bwrap agent sandbox needs bwrap + userns + a resolvable agent
+  // entry; alternatively a usable docker daemon supplies the container backend.
+  const isolationOk = (bwrapOk && usernsOk && agentBuilt) || dockerUsable;
+  const detail = `bwrap:${bwrapOk} docker:${dockerUsable} agent:${agentBuilt} userns:${usernsOk}`;
+  sendLog(ws, `Runner isolation prepared: isolationOk=${isolationOk} (${detail})\n`);
+  // Synchronous body (every probe uses execFileSync), but the result is a
+  // Promise so callers can `await` it uniformly alongside the async boot/harness.
+  return Promise.resolve({ isolationOk, detail });
 }
 
 export async function handleWalkthroughE2e(
@@ -170,6 +305,15 @@ export async function handleWalkthroughE2e(
   }
 
   try {
+    // ── Prepare runner isolation (best-effort, NEVER fatal) ──────────────────
+    // Layer 1 of the FLOW 5 deadlock fix (design f24b31f2): make the walkthrough
+    // VM genuinely capable of hosting an agent-ready runner so FLOW 5's
+    // eligible-runner poll can succeed. This runs AFTER the candidate stack
+    // boots and BEFORE the harness. It never throws — when it degrades the
+    // harness transparently falls back to the backend allow_no_runner path.
+    statusRef.value = 'Preparing runner isolation...';
+    await prepareRunnerIsolation(ws);
+
     // ── Run the walkthrough harness against the CANDIDATE stack ──────────────
     statusRef.value = 'Running live-stack walkthrough...';
     sendLog(ws, `Running live-stack walkthrough harness against ${stack.backendUrl}...\n`);

@@ -1686,6 +1686,40 @@ def _arm_and_finalize_vision(
     return True
 
 
+def _arm_and_finalize_vision_no_runner(
+    vision: dict[str, Any],
+    *,
+    session_id: str,
+    worker_generation: int,
+    workbench_state: dict[str, Any],
+    operator_user_id: str,
+) -> bool:
+    """Arm the continuation lease without a backing task (``allow_no_runner``).
+
+    Same identity gate as :func:`_arm_and_finalize_vision` but does NOT set
+    ``task_id`` (remains None) or advance ``worker_state`` past ``"starting"``
+    — the session is live but has no backing agent process to stream.
+    """
+    current = read_resident_session(vision)
+    if (
+        not isinstance(current, dict)
+        or str(current.get("session_id")) != str(session_id)
+        or int(current.get("worker_generation") or 1) != worker_generation
+    ):
+        return False
+    apply_strategic_local_continuation_marker(
+        vision,
+        workbench_state,
+        operator_user_id=str(operator_user_id),
+        preferred_runner_id=None,
+        renewal_reason="operator_interaction",
+    )
+    finalized = dict(current)
+    finalized["updated_at"] = _utcnow().isoformat()
+    vision[RESIDENT_SESSION_KEY] = finalized
+    return True
+
+
 async def _repair_stale_message_handoffs_after_ensure(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1727,6 +1761,7 @@ async def start_resident_session(
     session_factory=None,
     expected_recovery_identity: tuple[str, str, int] | None = None,
     expected_interaction_mode: str | None = None,
+    allow_no_runner: bool = False,
 ) -> dict[str, Any]:
     """Start (or return the already-running) resident strategic session.
 
@@ -1881,7 +1916,7 @@ async def start_resident_session(
             effective_runner_id = str(override.id)
     else:
         effective_runner_id = await _auto_select_local_runner(session, project.id)
-        if effective_runner_id is None:
+        if effective_runner_id is None and not allow_no_runner:
             runner_block = HTTPException(
                 status_code=409,
                 detail="No device available — enroll a runner to run Workday",
@@ -2078,7 +2113,10 @@ async def start_resident_session(
             )
             decision["session_id"] = session_id
             decision["worker_generation"] = worker_generation
-            decision["mode"] = "adopt" if adopt_task is not None else "spawn"
+            if effective_runner_id is None and allow_no_runner:
+                decision["mode"] = "no_runner"
+            else:
+                decision["mode"] = "adopt" if adopt_task is not None else "spawn"
     await session.commit()
     await session.refresh(project)
 
@@ -2110,6 +2148,84 @@ async def start_resident_session(
         await _run_resident_completion_on_stop(
             superseded_task_id, session_factory=session_factory
         )
+
+    # ── No-runner fallback ──────────────────────────────────────────────────
+    # When ``allow_no_runner`` is True and no eligible runner exists, arm the
+    # continuous-mode workbench lease and finalize the session blob WITHOUT a
+    # backing task. The session remains in ``"starting"`` worker state — it is
+    # live but has no agent process to stream. This lets the real session
+    # lifecycle (start→heartbeat→stop→handoff) be exercised through production
+    # code paths on a VM that cannot host a runner (no bwrap/userns/Docker).
+    if decision["mode"] == "no_runner":
+        project_id_for_comp = None
+        try:
+            workbench_state = (
+                await persist_strategic_workbench_update(
+                    session,
+                    operator_user_id,
+                    project.id,
+                    {"interaction_mode": "continuous"},
+                    sync_local_continuation_marker=False,
+                    arm_interaction_mode=False,
+                    commit=False,
+                )
+            ).state
+
+            finalize_holder = {"owned": False}
+
+            def _arm_no_runner(vision: dict[str, Any]) -> None:
+                finalize_holder["owned"] = _arm_and_finalize_vision_no_runner(
+                    vision,
+                    session_id=session_id,
+                    worker_generation=worker_generation,
+                    workbench_state=workbench_state,
+                    operator_user_id=operator_user_id,
+                )
+
+            await with_vision_locked(
+                session, project.id, _arm_no_runner, skip_locked=False
+            )
+            if not finalize_holder["owned"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Resident start claim superseded by a newer worker generation",
+                )
+            await session.commit()
+        except Exception:
+            project_id_for_comp = project.id
+            logger.exception(
+                "[RESIDENT_SESSION] no-runner start failed for project %s "
+                "(session %s); compensating on a fresh session",
+                project_id_for_comp,
+                session_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.warning(
+                    "[RESIDENT_SESSION] caller-session rollback failed during "
+                    "no-runner start compensation for project %s",
+                    project_id_for_comp,
+                    exc_info=True,
+                )
+            await _release_start_claim(
+                project_id_for_comp,
+                session_id,
+                None,  # spawned_task_id — no task was spawned
+                worker_generation=worker_generation,
+                session_factory=session_factory,
+            )
+            raise
+
+        await session.refresh(project)
+        logger.info(
+            "[RESIDENT_SESSION] started no-runner session %s for project %s",
+            session_id,
+            project.id,
+        )
+        snapshot = resident_session_snapshot(project.vision) or {}
+        await _repair_stale_message_handoffs_after_ensure(session, project.id)
+        return snapshot
 
     # We own ``session_id``. Materialize the task (adopt or spawn), stamp the
     # resident context flags, arm the continuation lease, and finalize the blob.

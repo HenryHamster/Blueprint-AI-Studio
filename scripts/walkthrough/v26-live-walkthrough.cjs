@@ -971,23 +971,64 @@ async function main() {
         ]);
       }
 
-      // 5b. POST strategic-session/start — assert a non-error, non-blocked outcome
-      // (ensure_outcome present; session snapshot returned). A 409 means the runner
-      // was ineligible on this VM (no_runner) — recorded DEAD_END, not FAIL.
-      const startResp = await apiPost(`/api/admin/projects/${PROJECT_ID}/strategic-session/start`, {});
+      // 5b. POST strategic-session/start — try normal start first; if no eligible
+      // runner from 5a OR the normal start returns 409 BLOCKED, retry ONCE with
+      // allow_no_runner:true so the session lifecycle (5c–5f) can still run.
+      // Try the start at most twice total (normal → allow_no_runner fallback).
+      let startResp;
+      let usedAllowNoRunner = false;
+      let fallbackReason = '';
+
+      if (runnerEligible) {
+        // 5a reported an eligible runner — try the normal empty-body start.
+        startResp = await apiPost(`/api/admin/projects/${PROJECT_ID}/strategic-session/start`, {});
+        if (startResp.status === 409) {
+          // Normal start BLOCKED despite 5a eligibility — retry with allow_no_runner.
+          fallbackReason = 'runner_eligible_in_poll_but_start_blocked';
+          usedAllowNoRunner = true;
+          startResp = await apiPost(`/api/admin/projects/${PROJECT_ID}/strategic-session/start`, { allow_no_runner: true });
+        }
+      } else {
+        // 5a polling found no eligible runner — skip normal start, go directly to
+        // allow_no_runner fallback so the session lifecycle can still be exercised.
+        fallbackReason = 'no_eligible_runner_from_5a_poll';
+        usedAllowNoRunner = true;
+        startResp = await apiPost(`/api/admin/projects/${PROJECT_ID}/strategic-session/start`, { allow_no_runner: true });
+      }
+
       const startSession = startResp.body?.session ?? null;
       const ensureOutcome = startResp.body?.ensure_outcome ?? null;
       const startOk = startResp.status === 200 && startSession !== null && ensureOutcome != null;
       const startBlocked = startResp.status === 409;
-      step('5b. strategic-session/start creates/adopts resident', startOk ? 'PASS' : startBlocked ? 'DEAD_END' : 'FAIL', [
+
+      // Build evidence notes: record whether fallback path was used and why.
+      const step5bNotes = [
         `POST /api/admin/projects/${PROJECT_ID}/strategic-session/start → ${startResp.status}`,
-        startOk
-          ? `✓ ensure_outcome="${ensureOutcome}"; session snapshot returned (session_id=${startSession?.session_id}, status=${startSession?.status})`
-          : startBlocked
-            ? `⚠️ 409 BLOCKED: ${JSON.stringify(startResp.body).slice(0, 200)} — no eligible runner on this VM (DEAD_END, environment)`
-            : `✗ Unexpected response: ${JSON.stringify(startResp.body).slice(0, 200)}`,
-        startSession ? `runner_id: ${startSession.runner_id}, worker_generation: ${startSession.worker_generation}` : '',
-      ]);
+      ];
+      if (usedAllowNoRunner) {
+        step5bNotes.push(
+          `⚠️ Fallback path used: allow_no_runner=true (reason: ${fallbackReason})`,
+          'The session lifecycle (5c–5f) runs against a no-runner session (stays in "starting" state — no backing task)',
+        );
+      }
+      if (startOk) {
+        step5bNotes.push(
+          `✓ ensure_outcome="${ensureOutcome}"; session snapshot returned (session_id=${startSession?.session_id}, status=${startSession?.status})`,
+        );
+        if (startSession) {
+          step5bNotes.push(`runner_id: ${startSession.runner_id}, worker_generation: ${startSession.worker_generation}`);
+        }
+      } else if (startBlocked) {
+        step5bNotes.push(
+          `⚠️ 409 BLOCKED on final attempt: ${JSON.stringify(startResp.body).slice(0, 200)} — no eligible runner on this VM (DEAD_END, environment)`,
+        );
+      } else {
+        step5bNotes.push(
+          `✗ Unexpected response: ${JSON.stringify(startResp.body).slice(0, 200)}`,
+        );
+      }
+
+      step('5b. strategic-session/start creates/adopts resident', startOk ? 'PASS' : startBlocked ? 'DEAD_END' : 'FAIL', step5bNotes);
 
       // 5c. Poll GET strategic-liveness — assert the availability state advances
       // beyond 'ready' (starting/active/waiting) and the resident_session snapshot

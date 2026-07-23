@@ -68,9 +68,10 @@ vi.mock('ws', () => ({
 // Preload the handlers barrel so audits.ts (source of resolveCandidateSha) binds
 // against the mocked ../index.js in this module's context (mirrors specialized.test.ts).
 import './index.js';
-import { handleWalkthroughE2e } from './walkthrough-e2e.js';
-import { apiPost, persistAndPostStatus, readHandlerOutput } from '../index.js';
+import { handleWalkthroughE2e, prepareRunnerIsolation } from './walkthrough-e2e.js';
+import { apiPost, persistAndPostStatus, readHandlerOutput, sendLog } from '../index.js';
 import { execFileSync } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
 
 const TASK_ID = 'wt-task-1';
 const GH_TOKEN = 'gh-token';
@@ -341,5 +342,79 @@ describe('handleWalkthroughE2e — error paths', () => {
 
     // Teardown guaranteed even on the no-result failure path.
     expect(teardownMock).toHaveBeenCalled();
+  });
+});
+
+// ── prepareRunnerIsolation (Layer 1 — best-effort, never fatal) ──────────────────
+
+describe('prepareRunnerIsolation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Reset the subprocess/fs mocks to their permissive module-level defaults so
+    // per-test overrides do not bleed across.
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(existsSync).mockReturnValue(false);
+    vi.mocked(readFileSync).mockReturnValue('');
+  });
+
+  it('never throws when every probe and install fails', async () => {
+    // Both the subprocess probes AND the sysctl read blow up.
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw new Error('command not found');
+    });
+    vi.mocked(readFileSync).mockImplementation(() => {
+      throw new Error('no such sysctl');
+    });
+
+    // The promise must resolve — an isolation failure must not abort the caller.
+    const result = await prepareRunnerIsolation(null);
+    expect(result).toBeDefined();
+    expect(result.isolationOk).toBe(false);
+    expect(typeof result.detail).toBe('string');
+  });
+
+  it('returns isolationOk:false with a descriptive detail when bwrap/userns/agent are unavailable', async () => {
+    // No bwrap, no userns, no docker, no agent entry point.
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw new Error('unavailable');
+    });
+    vi.mocked(existsSync).mockReturnValue(false);
+    vi.mocked(readFileSync).mockReturnValue('0'); // userns explicitly disabled
+
+    const { isolationOk, detail } = await prepareRunnerIsolation(null);
+    expect(isolationOk).toBe(false);
+    expect(detail).toContain('bwrap:false');
+    expect(detail).toContain('docker:false');
+    expect(detail).toContain('agent:false');
+    expect(detail).toContain('userns:false');
+  });
+
+  it('returns isolationOk:true via the bwrap path when the probes report capable', async () => {
+    // bwrap + userns + agent entry present, but NO usable docker daemon —
+    // proves the primary rootless-bwrap composition, not the docker shortcut.
+    vi.mocked(execFileSync).mockImplementation((cmd) => {
+      if (cmd === 'docker') throw new Error('docker daemon not running');
+      return Buffer.from('');
+    });
+    vi.mocked(readFileSync).mockReturnValue('1'); // unprivileged_userns_clone = 1
+    vi.mocked(existsSync).mockReturnValue(true);   // agent dist/index.js present
+
+    const { isolationOk, detail } = await prepareRunnerIsolation(null);
+    expect(isolationOk).toBe(true);
+    expect(detail).toContain('bwrap:true');
+    expect(detail).toContain('userns:true');
+    expect(detail).toContain('agent:true');
+    expect(detail).toContain('docker:false');
+  });
+
+  it('logs a compact bwrap/docker/agent isolation summary to the stream', async () => {
+    await prepareRunnerIsolation(null);
+    const summaryLogged = vi.mocked(sendLog).mock.calls.some(
+      (c) => typeof c[1] === 'string'
+        && c[1].includes('bwrap:')
+        && c[1].includes('docker:')
+        && c[1].includes('agent:'),
+    );
+    expect(summaryLogged).toBe(true);
   });
 });

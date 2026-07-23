@@ -577,6 +577,7 @@ class StrategicSessionCommandExecute(BaseModel):
 class StrategicResidentSessionStart(BaseModel):
     runner_id: str | None = None
     expected_interaction_mode: Literal["continuous"] | None = None
+    allow_no_runner: bool = False
 
 
 _ATTACHMENT_DEFAULT_CONTENT_TYPE = "application/octet-stream"
@@ -3645,6 +3646,7 @@ async def start_project_strategic_resident_session(
             operator_user_id=current_user["user_id"],
             runner_id=data.runner_id,
             expected_interaction_mode=data.expected_interaction_mode,
+            allow_no_runner=data.allow_no_runner,
         )
     except _ResidentEnsureModeChanged:
         snapshot = await authoritative_resident_session_snapshot(session, project)

@@ -223,7 +223,10 @@
         "test_heartbeat_absent_decision_summary_fires_alert_after_stale_window",
         "test_heartbeat_absent_decision_summary_no_alert_before_stale_window",
         "test_heartbeat_absent_decision_summary_no_alert_below_min_sample",
-        "test_heartbeat_absent_decision_summary_recovery_clears_dedup"
+        "test_heartbeat_absent_decision_summary_recovery_clears_dedup",
+        "test_allow_no_runner_default_false_blocks_without_device",
+        "test_start_allow_no_runner_creates_session_without_task",
+        "test_stop_cleans_up_no_runner_session_without_error"
       ]
     },
     {

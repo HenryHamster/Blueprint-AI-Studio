@@ -13,6 +13,7 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 from sqlalchemy.orm.attributes import flag_modified
@@ -1743,3 +1744,113 @@ async def test_heartbeat_absent_decision_summary_recovery_clears_dedup(
     assert blob.get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY) is False, (
         "Absence dedup flag must be cleared when agent resumes sending a valid summary"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# allow_no_runner fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_start_allow_no_runner_creates_session_without_task(db_session):
+    """With no available runner and ``allow_no_runner=True``, the session starts
+    without a backing task — ``task_id`` and ``runner_id`` are None, no
+    ``strategic_review`` Task row is spawned, and the blob is live.
+    """
+    project = await _make_project(db_session)
+    # No runner enrolled — auto-select returns None.
+
+    snapshot = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        allow_no_runner=True,
+    )
+
+    assert snapshot["status"] == "active", (
+        "Session status must be 'active' — the lifecycle is exercised"
+    )
+    assert snapshot["task_id"] is None, (
+        "No backing task when allow_no_runner skips spawn"
+    )
+    assert snapshot["runner_id"] is None, (
+        "No runner when none is enrolled and allow_no_runner is True"
+    )
+    assert snapshot.get("worker_state") == "starting", (
+        "Worker state must remain 'starting' — no agent process streams"
+    )
+
+    # Verify no Task row was created.
+    tasks = (
+        await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(tasks) == 0, (
+        "No strategic_review task must be spawned when allow_no_runner is True"
+    )
+
+    # Verify the blob is durable (re-read through resident_session_snapshot).
+    project = await db_session.get(Project, project.id)
+    blob = read_resident_session(project.vision)
+    assert blob is not None
+    assert blob["session_id"] == snapshot["session_id"]
+    assert blob["task_id"] is None
+    assert blob["runner_id"] is None
+    assert blob["worker_state"] == "starting"
+    assert blob["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_allow_no_runner_default_false_blocks_without_device(db_session):
+    """Default ``allow_no_runner=False`` preserves the existing 409 block when
+    no eligible runner exists.
+    """
+    project = await _make_project(db_session)
+    # No runner enrolled.
+
+    with pytest.raises(HTTPException) as exc_info:
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+        )
+    assert exc_info.value.status_code == 409
+    assert "No device available" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_stop_cleans_up_no_runner_session_without_error(db_session):
+    """A session started with ``allow_no_runner=True`` can be stopped cleanly —
+    the stop path already tolerates ``task_id: None`` in the blob.
+    """
+    project = await _make_project(db_session)
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        allow_no_runner=True,
+    )
+    assert started["status"] == "active"
+    assert started["task_id"] is None
+
+    project = await db_session.get(Project, project.id)
+    ended = await stop_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    assert ended["status"] == "ended"
+    assert ended["session_id"] == started["session_id"]
+    assert ended.get("stop_requested") is True
+
+    # A second stop is a no-op (no blob to end).
+    project = await db_session.get(Project, project.id)
+    second = await stop_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    assert second.get("status") == "ended"
+    assert second.get("session_id") == started["session_id"]
