@@ -41,6 +41,8 @@ import {
 // { strokes } shape on load.
 // ---------------------------------------------------------------------------
 
+export const DEBOUNCE_MS = 1200;
+
 interface Point {
   x: number;
   y: number;
@@ -523,7 +525,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
     if (loadState.status !== 'ready' || !dirty) return;
     const timer = setTimeout(() => {
       void flush();
-    }, 1200);
+    }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [content, dirty, loadState.status, flush]);
 

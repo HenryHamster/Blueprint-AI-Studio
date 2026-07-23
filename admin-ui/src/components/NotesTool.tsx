@@ -32,7 +32,7 @@ type State =
 
 type Mode = 'edit' | 'preview';
 
-const DEBOUNCE_MS = 1500;
+export const DEBOUNCE_MS = 1500;
 const serialize = (text: string) => JSON.stringify({ text });
 
 // ---------------------------------------------------------------------------

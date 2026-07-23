@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, test, expect, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { registerToolKind } from '../toolRegistry';
@@ -14,7 +14,7 @@ vi.mock('../api/projectTools', async () => {
 });
 
 import { fetchToolContent, saveToolContent, ConflictError } from '../api/projectTools';
-import NotesTool from './NotesTool';
+import NotesTool, { DEBOUNCE_MS } from './NotesTool';
 
 const SAMPLE_TEXT = '# Research notes\n\nHypothesis: energy is $E = mc^2$.\n\n- point one\n- point two';
 
@@ -36,12 +36,17 @@ describe('NotesTool — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
   afterEach(() => {
     if (root) act(() => { root?.unmount(); });
     root = null;
     host?.remove();
     host = null;
     vi.resetAllMocks();
+    vi.useRealTimers();
   });
 
   // -----------------------------------------------------------------------
@@ -61,7 +66,7 @@ describe('NotesTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+      await act(async () => { await vi.runAllTimersAsync(); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('textarea')).toBeTruthy();
@@ -82,7 +87,7 @@ describe('NotesTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+      await act(async () => { await vi.runAllTimersAsync(); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('textarea')).toBeTruthy();
@@ -124,7 +129,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
     expect(textarea).toBeTruthy();
@@ -147,7 +152,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
 
     // Edit mode by default: textarea present, no rendered markdown <strong>.
@@ -161,7 +166,7 @@ describe('NotesTool — viewport regression', () => {
     expect(previewBtn).not.toBeNull();
     await act(async () => {
       previewBtn!.click();
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await vi.runAllTimersAsync();
     });
     expect(host.querySelector('textarea')).toBeNull();
     const strong = host.querySelector('strong');
@@ -180,7 +185,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Network error');
   });
@@ -207,7 +212,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
 
     if (!host) throw new Error('host not mounted');
     const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
@@ -220,8 +225,8 @@ describe('NotesTool — viewport regression', () => {
       textarea!.dispatchEvent(new Event('input', { bubbles: true }));
     });
 
-    // Wait for auto-save debounce (1500ms) + conflict reload.
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 3000)));
+    // Wait for auto-save debounce + conflict reload.
+    await act(async () => { await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 500); });
 
     // fetchToolContent: 1st call (initial load) + 2nd call (conflict reload).
     expect(fetchToolContent).toHaveBeenCalledTimes(2);
