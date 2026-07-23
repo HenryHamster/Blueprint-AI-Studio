@@ -1265,3 +1265,43 @@ def test_rewrite_expected_schema_revision_absent_returns_zero():
     out, n = rewrite_expected_schema_revision(src, "0138")
     assert n == 0
     assert out == src
+
+
+# ── Migration 0707 — remaining design-doc KV backfill ───────────────────────
+
+
+def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
+    """Migration 0707 must chain from 0702 and reference each KV-backed key.
+
+    Exercises the live 0707 migration file (production code) and confirms
+    EXPECTED_SCHEMA_REVISION in main.py has been bumped to match.
+    """
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    migration_path = versions_dir / "0707_backfill_remaining_design_doc_telemetry.py"
+    assert migration_path.exists(), (
+        f"Migration file not found: {migration_path}. "
+        "Run the 0707 backfill migration task to create it."
+    )
+
+    content = migration_path.read_text()
+    revision, down_revision = parse_revision_identifiers(content)
+
+    assert revision == "0707", f"Expected revision '0707', got {revision!r}"
+    assert down_revision == "0702", (
+        f"Expected down_revision '0702' (current chain head), got {down_revision!r}"
+    )
+
+    # Each KV-backed key must appear in the migration body so the backfill
+    # actually seeds the dedicated store for historical projects.
+    for key in ("repo_overview", "_broadcast_limit", "_auto_remediation"):
+        assert key in content, (
+            f"Backfill key {key!r} not referenced in 0707 migration body"
+        )
+
+    # EXPECTED_SCHEMA_REVISION in main.py must be bumped to 0707.
+    from app.main import EXPECTED_SCHEMA_REVISION
+
+    assert EXPECTED_SCHEMA_REVISION == "0707", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0707', got {EXPECTED_SCHEMA_REVISION!r}. "
+        "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
+    )

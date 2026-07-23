@@ -302,6 +302,10 @@ def test_telemetry_keys_set():
         "proposed_changes",
         "direction_first_attempt_feedback",
         "systems/completion-debt-ledger",
+        # Final God-column tranche: dual-written generic-KV blobs.
+        "repo_overview",
+        "_broadcast_limit",
+        "_auto_remediation",
     }
     assert TELEMETRY_KEYS == expected
 

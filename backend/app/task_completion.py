@@ -5762,6 +5762,13 @@ async def _handle_repo_bootstrap_completion(
 
             session.expire(project, ["design_doc"])
             await with_design_doc_locked(session, task.project_id, _mutate_design_doc)
+            # Dual-write repo_overview to project_telemetry (design_doc copy kept
+            # for rollback compatibility during the rolling God-column cutover).
+            from app.project_telemetry import set_project_telemetry
+
+            await set_project_telemetry(
+                session, task.project_id, "repo_overview", overview_block
+            )
 
             if not build_config.get("bootstrap_completed_at"):
                 build_config["bootstrap_completed_at"] = now_iso

@@ -1760,8 +1760,17 @@ async def _reconcile_if_managed_check_wait(
             # still snapshotted for the SPAWN MECHANICS (rate limits / suspension)
             # and falls back to defaults when the project never customized it.
             _harvest_selfheal_enabled = promotion_ci_selfheal_enabled(project)
+            from app.project_telemetry import read_telemetry_or_doc
+
             _harvest_ar_config = dict(
-                (project.design_doc or {}).get("_auto_remediation", {}) or {}
+                await read_telemetry_or_doc(
+                    session,
+                    _harvest_project_id,
+                    project.design_doc,
+                    "_auto_remediation",
+                    {},
+                )
+                or {}
             )
 
             # Release the row lock before GitHub I/O (mirrors the other reconcilers).

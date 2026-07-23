@@ -1409,7 +1409,18 @@ async def _check_full_suite_drift_sentinel(
 
             # Harvest is best-effort and self-gating (per-hour/concurrent caps).
             integration_branch, _ = release_qualifier._lts_branch_names(project)
-            auto_rem = (project.design_doc or {}).get("_auto_remediation") or {}
+            from app.project_telemetry import read_telemetry_or_doc
+
+            auto_rem = (
+                await read_telemetry_or_doc(
+                    session,
+                    version.project_id,
+                    project.design_doc,
+                    "_auto_remediation",
+                    {},
+                )
+                or {}
+            )
             await _harvest_promotion_ci_failures(
                 project_id=version.project_id,
                 version_id=version.id,

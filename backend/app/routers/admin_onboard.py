@@ -1187,14 +1187,16 @@ async def onboard_project(
     # attributes with a stale row — this is independent of the session's
     # autoflush setting (production AsyncSessionLocal is autoflush=True; the
     # SQLite test session is autoflush=False).
+    _auto_remediation_seed = {
+        "enabled": False,
+        "branch_whitelist": branch_whitelist,
+        "max_per_hour": 2,
+        "max_concurrent": 2,
+        "require_review": True,
+    }
+
     def _seed_remediation_config(doc: dict) -> None:
-        doc["_auto_remediation"] = {
-            "enabled": False,
-            "branch_whitelist": branch_whitelist,
-            "max_per_hour": 2,
-            "max_concurrent": 2,
-            "require_review": True,
-        }
+        doc["_auto_remediation"] = _auto_remediation_seed
         doc["_issue_implementation"] = {
             "enabled": False,
             "trigger_label": "auto:implement",
@@ -1210,6 +1212,13 @@ async def onboard_project(
 
     await session.flush()
     await with_design_doc_locked(session, project.id, _seed_remediation_config)
+    # Dual-write the auto-remediation seed to project_telemetry (design_doc copy
+    # kept for rollback compatibility during the rolling God-column cutover).
+    from app.project_telemetry import set_project_telemetry
+
+    await set_project_telemetry(
+        session, project.id, "_auto_remediation", _auto_remediation_seed
+    )
 
     # Seed the user's goal + optional steering into strategic intent so the
     # first strategic cycle reasons from it. Read defensively: the OnboardPayload

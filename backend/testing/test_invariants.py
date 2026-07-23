@@ -7498,6 +7498,54 @@ class TestDesignDocLockInvariant:
     def test_no_new_unlocked_design_doc_writes(self):
         _check_lock_invariant("design_doc", "design_doc", "with_design_doc_locked")
 
+
+class TestGodColumnDualWrittenKeysReserved:
+    """The final God-column tranche routes three generic-KV telemetry blobs
+    (repo_overview, _broadcast_limit, _auto_remediation) through the
+    project_telemetry table while KEEPING the design_doc write leg for rollback
+    compatibility during the rolling cutover.
+
+    Because their design_doc copies persist, each key must stay in
+    _RESERVED_DESIGN_DOC_KEYS so the retained blob does not consume the
+    agent-owned write budget — the reserved-key-drift bug class that let
+    telemetry blobs silently eat the agent design_doc budget. Each must also be
+    in TELEMETRY_KEYS (recognized as KV-backed) but NOT in
+    _TELEMETRY_MIGRATED_KEYS, since strip_migrated_doc_keys() must not yet drop
+    the design_doc copy an older serving engine still reads.
+    """
+
+    _DUAL_WRITTEN_KV_KEYS = frozenset(
+        {"repo_overview", "_broadcast_limit", "_auto_remediation"}
+    )
+
+    def test_dual_written_kv_keys_reserved_and_registered(self):
+        from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+        from app.project_telemetry import (
+            TELEMETRY_KEYS,
+            _TELEMETRY_MIGRATED_KEYS,
+        )
+
+        missing_reserved = self._DUAL_WRITTEN_KV_KEYS - _RESERVED_DESIGN_DOC_KEYS
+        assert not missing_reserved, (
+            "dual-written telemetry keys missing from _RESERVED_DESIGN_DOC_KEYS "
+            f"(would consume agent write budget): {sorted(missing_reserved)}"
+        )
+
+        missing_telemetry = self._DUAL_WRITTEN_KV_KEYS - TELEMETRY_KEYS
+        assert not missing_telemetry, (
+            "dual-written telemetry keys missing from TELEMETRY_KEYS: "
+            f"{sorted(missing_telemetry)}"
+        )
+
+        prematurely_stripped = (
+            self._DUAL_WRITTEN_KV_KEYS & _TELEMETRY_MIGRATED_KEYS
+        )
+        assert not prematurely_stripped, (
+            "keys in _TELEMETRY_MIGRATED_KEYS would be stripped from design_doc, "
+            "breaking older serving engines mid-cutover: "
+            f"{sorted(prematurely_stripped)}"
+        )
+
 # ── Directions Lock Invariant ─────────────────────────────────────────────────
 
 class TestDirectionsLockInvariant:
@@ -13360,7 +13408,7 @@ class TestProblemModelWritePathInvariants:
         # lifecycle.py: sanitize_problem_model_raw caller
         ("lifecycle.py", 369): "sanitize_problem_model_raw(dict(project.problem_model))",
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1057): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", 1062): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
         ("direction_lifecycle.py", 812): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)

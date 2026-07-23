@@ -1497,6 +1497,8 @@ async def post_auto_fix_result_message(
 
             # Mutable cell to capture side-effects from inside the lock closure.
             _escalation: dict = {}
+            # Captures the final config for the project_telemetry dual-write.
+            _persisted: dict = {}
 
             def _mutate(doc: dict) -> None:
                 ar_config = dict(doc.get("_auto_remediation", {}))
@@ -1543,6 +1545,7 @@ async def post_auto_fix_result_message(
                 ar_config["suspended_branches"] = suspended
                 ar_config["suspension_metadata"] = suspension_meta
                 doc["_auto_remediation"] = ar_config
+                _persisted["config"] = ar_config
 
             # expire_on_commit=False means an already-identity-mapped Project
             # carries a stale design_doc; expire it so the lock's SELECT FOR
@@ -1552,6 +1555,17 @@ async def post_auto_fix_result_message(
             if _proj is not None:
                 session.expire(_proj, ["design_doc"])
             await with_design_doc_locked(session, project_id, _mutate)
+
+            if _persisted.get("config") is not None:
+                # Dual-write to project_telemetry (design_doc copy kept for
+                # rollback compatibility with older serving engines).
+                from app.project_telemetry import (
+                    set_project_telemetry,
+                )
+
+                await set_project_telemetry(
+                    session, project_id, "_auto_remediation", _persisted["config"]
+                )
 
             if _escalation:
                 count = _escalation["count"]

@@ -108,6 +108,11 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
+        # Generic-KV telemetry blobs dual-written to project_telemetry during the
+        # final God-column cutover tranche; exempt from the agent-write cap while
+        # their design_doc copies are retained for rollback compatibility.
+        "_broadcast_limit",
+        "_auto_remediation",
         # Retained specialized-store fallbacks.
         "efficiency_baseline",
         "lane_baselines",

@@ -905,6 +905,20 @@ async def _redrive_promotion_failed_qualification(
                             promotion_ci_selfheal_enabled,
                         )
                         _intbranch, _ = release_qualifier._lts_branch_names(project)
+                        from app.project_telemetry import (
+                            read_telemetry_or_doc,
+                        )
+
+                        _redrive_ar_config = (
+                            await read_telemetry_or_doc(
+                                redrive_session,
+                                _proj_id,
+                                project.design_doc,
+                                "_auto_remediation",
+                                {},
+                            )
+                            or {}
+                        )
                         _harvest_kw = dict(
                             project_id=_proj_id,
                             version_id=_ver_id,
@@ -913,9 +927,7 @@ async def _redrive_promotion_failed_qualification(
                             repo=project.github_repo or "",
                             ci_source_sha=head_sha,
                             integration_branch=_intbranch,
-                            auto_remediation_config=(
-                                (project.design_doc or {}).get("_auto_remediation") or {}
-                            ),
+                            auto_remediation_config=_redrive_ar_config,
                             selfheal_enabled=promotion_ci_selfheal_enabled(project),
                         )
                     await redrive_session.commit()

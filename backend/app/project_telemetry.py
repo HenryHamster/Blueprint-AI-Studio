@@ -65,6 +65,17 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         # exemption / regrowth guarding during the transition (migration 0695
         # backfills and strips the stale design_doc key).
         "systems/completion-debt-ledger",
+        # Generic-KV telemetry blobs migrated in the final God-column tranche.
+        # Writers dual-write to both design_doc and this table; readers fall
+        # back to design_doc.  These are NOT in _TELEMETRY_MIGRATED_KEYS because
+        # the design_doc write leg is intentionally KEPT during the rolling
+        # cutover (an older serving engine still reads design_doc); the strip is
+        # a later cleanup.  repo_overview: bootstrap repo summary (task_completion).
+        # _broadcast_limit: per-project broadcast cap (admin_project_config).
+        # _auto_remediation: per-branch auto-recovery config (auto_remediation).
+        "repo_overview",
+        "_broadcast_limit",
+        "_auto_remediation",
     }
 )
 

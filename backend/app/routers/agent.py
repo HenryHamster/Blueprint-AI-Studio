@@ -4191,7 +4191,14 @@ async def claim_task(
         "strategic_review",
     }
     if task_type in _REPO_OVERVIEW_TASK_TYPES and project_for_playbook:
-        _raw_overview = (project_for_playbook.design_doc or {}).get("repo_overview")
+        from app.project_telemetry import read_telemetry_or_doc as _read_tel
+
+        _raw_overview = await _read_tel(
+            session,
+            project_for_playbook.id,
+            project_for_playbook.design_doc,
+            "repo_overview",
+        )
         if (
             isinstance(_raw_overview, dict)
             and isinstance(_raw_overview.get("tech_stack"), str)
