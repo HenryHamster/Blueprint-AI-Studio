@@ -49,6 +49,7 @@ describe('useTaskModal', () => {
   const originalError = console.error;
 
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     console.error = vi.fn();
     fetchSpy = vi.fn().mockResolvedValue({
       ok: true,
@@ -72,6 +73,7 @@ describe('useTaskModal', () => {
 
   afterEach(() => {
     console.error = originalError;
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -651,7 +653,7 @@ describe('useTaskModal', () => {
       });
     });
     // Wait past the 500ms debounce window for draft autosave.
-    await new Promise(r => setTimeout(r, 700));
+    await vi.advanceTimersByTimeAsync(700);
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:title')).toBeNull();
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:prompt')).toBeNull();
   });
@@ -668,7 +670,7 @@ describe('useTaskModal', () => {
     expect(result.current.newTaskType).toBe('web_research');
     expect(result.current.newTaskTitle).toContain('Postgres pooling behavior');
     expect(result.current.newTaskPrompt).toContain('Postgres pooling behavior');
-    await new Promise(r => setTimeout(r, 700));
+    await vi.advanceTimersByTimeAsync(700);
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:title')).toBeNull();
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:prompt')).toBeNull();
   });

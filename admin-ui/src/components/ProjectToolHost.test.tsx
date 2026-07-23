@@ -77,13 +77,13 @@ async function mount(node: React.ReactElement) {
   const r = createRoot(host);
   root = r;
   await act(async () => { r.render(node); });
-  await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(30); });
 }
 
 async function rerender(node: React.ReactElement) {
   if (!root) throw new Error('host not mounted');
   await act(async () => { root?.render(node); });
-  await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+  await act(async () => { await vi.advanceTimersByTimeAsync(30); });
 }
 
 function h(): HTMLDivElement {
@@ -112,6 +112,7 @@ function setInputValue(el: HTMLInputElement, value: string) {
 
 describe('ProjectToolHost — configure / rename / role gating', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
@@ -124,6 +125,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     root = null;
     host?.remove();
     host = null;
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -158,7 +160,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Configure').click(); });
     // wait for tool kinds to load
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     const titleInput = h().querySelector('input[type="text"]') as HTMLInputElement;
     expect(titleInput.value).toBe('My Widget');
     await act(async () => { setInputValue(titleInput, 'Renamed Widget'); });
@@ -173,7 +175,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
   test('configure shows schema config fields and sends coerced config', async () => {
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Configure').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     // The title input is first; the `threshold` config field is second.
     const inputs = h().querySelectorAll('input[type="text"]');
     const thresholdInput = inputs[1] as HTMLInputElement;
@@ -189,7 +191,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
   test('empty title blocks save and shows an error', async () => {
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Configure').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     const titleInput = h().querySelector('input[type="text"]') as HTMLInputElement;
     await act(async () => { setInputValue(titleInput, '   '); });
     // Save button is disabled for blank titles.
@@ -210,6 +212,7 @@ const MANIFEST_TOOL: ProjectToolManifestEntry = {
 
 describe('ProjectToolHost — manifest tool Hide persistence', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     localStorage.clear();
     vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [MANIFEST_TOOL], skills: [], error: null });
@@ -226,6 +229,7 @@ describe('ProjectToolHost — manifest tool Hide persistence', () => {
     host?.remove();
     host = null;
     localStorage.clear();
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -286,6 +290,7 @@ const MUTABLE_STATUS: ComputeImageStatusResponse = {
 
 describe('ProjectToolHost — compute image status panel', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
@@ -297,6 +302,7 @@ describe('ProjectToolHost — compute image status panel', () => {
     root = null;
     host?.remove();
     host = null;
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -338,21 +344,21 @@ describe('ProjectToolHost — compute image status panel', () => {
     vi.mocked(fetchComputeImageStatus).mockResolvedValueOnce(BUILT_STATUS);
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     // Wait for initial fetch
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     // Button appears when drift hasn't been checked yet
     const checkDriftBtn = findButton('Check drift');
     expect(checkDriftBtn).toBeTruthy();
     // Click and ensure fetchComputeImageStatus was called with check_drift=true
     vi.mocked(fetchComputeImageStatus).mockClear();
     await act(async () => { checkDriftBtn!.click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     expect(vi.mocked(fetchComputeImageStatus)).toHaveBeenCalledWith('proj-a', true);
   });
 
   test('fetch error is surfaced without breaking tool content', async () => {
     vi.mocked(fetchComputeImageStatus).mockRejectedValue(new Error('Network error'));
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     expect(h().textContent).toContain('Compute image');
     expect(h().textContent).toContain('Network error');
   });
@@ -360,7 +366,7 @@ describe('ProjectToolHost — compute image status panel', () => {
   test('shows up-to-date label when drift check finds no drift', async () => {
     vi.mocked(fetchComputeImageStatus).mockResolvedValueOnce(BUILT_STATUS);
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     const btn = findButton('Check drift');
     expect(btn).toBeTruthy();
     vi.mocked(fetchComputeImageStatus).mockResolvedValue({
@@ -368,7 +374,7 @@ describe('ProjectToolHost — compute image status panel', () => {
       drift: { drifted: false, current_dep_hash: 'dephash001', stored_dep_hash: 'dephash001' },
     });
     await act(async () => { btn!.click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     expect(h().textContent).toContain('Up to date');
   });
 });
@@ -407,6 +413,7 @@ const WALKTHROUGH_TOOLS: FetchProjectToolsResult = {
 
 describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     localStorage.clear();
     vi.mocked(fetchProjectTools).mockResolvedValue(WALKTHROUGH_TOOLS);
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({
@@ -429,6 +436,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     host?.remove();
     host = null;
     localStorage.clear();
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -448,7 +456,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
 
     // Open the Add form
     await act(async () => { requireButton('+ Add tool').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
 
     // Fill in the title field
     const titleInput = h().querySelector('input[placeholder="Tool title"]') as HTMLInputElement;
@@ -456,7 +464,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
 
     // Submit
     await act(async () => { requireButton('Create').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
 
     // Server-assigned slug (auto-uniquified to 'mock-widget-2') must be visible
     expect(h().textContent).toContain('mock-widget-2');
@@ -484,7 +492,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
 
     // Resolve the in-flight PATCH
     await act(async () => { resolveToggle({ ...WALKTHROUGH_DISABLED, enabled: true }); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
 
     // Only one PATCH was fired despite button being clicked while in-flight
     expect(vi.mocked(updateProjectTool)).toHaveBeenCalledTimes(1);
@@ -551,7 +559,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
 
     // Step 9: confirm deletion → deleteProjectTool fires exactly once, list refreshes
     await act(async () => { requireButton('Permanently remove').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     expect(vi.mocked(deleteProjectTool)).toHaveBeenCalledWith('proj-walkthrough', 'tool-enabled');
     // 3 fetches total: initial mount, post-Enable refresh, post-delete refresh.
     expect(vi.mocked(fetchProjectTools)).toHaveBeenCalledTimes(3);
@@ -560,6 +568,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
 
 describe('ProjectToolHost — delete confirmation gate', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
@@ -572,6 +581,7 @@ describe('ProjectToolHost — delete confirmation gate', () => {
     root = null;
     host?.remove();
     host = null;
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -605,7 +615,7 @@ describe('ProjectToolHost — delete confirmation gate', () => {
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Remove').click(); });
     await act(async () => { requireButton('Permanently remove').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
 
     expect(vi.mocked(deleteProjectTool)).toHaveBeenCalledWith('proj-a', 'tool-1');
     expect(vi.mocked(fetchProjectTools)).toHaveBeenCalledTimes(2);
@@ -630,7 +640,7 @@ describe('ProjectToolHost — delete confirmation gate', () => {
     expect(vi.mocked(deleteProjectTool)).not.toHaveBeenCalled();
 
     await act(async () => { requireButton('Permanently remove').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
     expect(vi.mocked(deleteProjectTool)).toHaveBeenCalledWith('proj-a', 'tool-disabled');
   });
 });
@@ -652,6 +662,7 @@ describe('ProjectToolHost — placement routes tool to correct surface (c-521499
   };
 
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
     vi.mocked(updateProjectTool).mockResolvedValue({ ...TOOL });
@@ -663,6 +674,7 @@ describe('ProjectToolHost — placement routes tool to correct surface (c-521499
     root = null;
     host?.remove();
     host = null;
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -692,6 +704,7 @@ describe('ProjectToolHost — placement routes tool to correct surface (c-521499
 
 describe('ProjectToolHost — project-scoped async actions', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
     vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
@@ -702,6 +715,7 @@ describe('ProjectToolHost — project-scoped async actions', () => {
     root = null;
     host?.remove();
     host = null;
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -729,7 +743,7 @@ describe('ProjectToolHost — project-scoped async actions', () => {
     expect(requireButton('Disable').textContent).toBe('Disable');
 
     await act(async () => { rejectToggle(new Error('project A update failed')); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
 
     expect(h().textContent).toContain('Project B Widget');
     expect(h().textContent).not.toContain('project A update failed');

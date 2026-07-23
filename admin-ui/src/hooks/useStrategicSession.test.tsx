@@ -87,8 +87,14 @@ function makeHeavyState(): StrategicStateResponse {
 }
 
 describe('useStrategicSession liveness fallback', () => {
-  beforeEach(() => vi.clearAllMocks());
-  afterEach(() => cleanup());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    cleanup();
+  });
 
   it('resolves mode + session fields from the liveness probe before the read model lands', () => {
     const { result } = renderHook(() =>
@@ -175,7 +181,7 @@ describe('useStrategicSession liveness fallback', () => {
 
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(readModel.refresh).toHaveBeenCalledTimes(1));
-    await new Promise(resolve => window.setTimeout(resolve, 350));
+    await vi.advanceTimersByTimeAsync(350);
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
   });
 
@@ -201,7 +207,7 @@ describe('useStrategicSession liveness fallback', () => {
 
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(readModel.refresh).toHaveBeenCalledTimes(1));
-    await new Promise(resolve => window.setTimeout(resolve, 350));
+    await vi.advanceTimersByTimeAsync(350);
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
   });
 
@@ -229,7 +235,7 @@ describe('useStrategicSession liveness fallback', () => {
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(readModel.refresh).toHaveBeenCalledTimes(1));
     rerender();
-    await new Promise(resolve => window.setTimeout(resolve, 600));
+    await vi.advanceTimersByTimeAsync(600);
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
   });
 
@@ -283,7 +289,7 @@ describe('useStrategicSession liveness fallback', () => {
         interaction_mode: 'chat',
       },
     });
-    await new Promise(resolve => window.setTimeout(resolve, 350));
+    await vi.advanceTimersByTimeAsync(350);
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
   });
 
@@ -322,7 +328,7 @@ describe('useStrategicSession liveness fallback', () => {
       session: null,
       ensure_outcome: 'mode_changed',
     });
-    await new Promise(resolve => window.setTimeout(resolve, 350));
+    await vi.advanceTimersByTimeAsync(350);
 
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
     expect(readModel.refresh).not.toHaveBeenCalled();
@@ -372,7 +378,7 @@ describe('useStrategicSession liveness fallback', () => {
         },
       },
     });
-    await new Promise(resolve => window.setTimeout(resolve, 600));
+    await vi.advanceTimersByTimeAsync(600);
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
 
     await act(async () => {
@@ -415,7 +421,7 @@ describe('useStrategicSession liveness fallback', () => {
         },
       },
     });
-    await new Promise(resolve => window.setTimeout(resolve, 50));
+    await vi.advanceTimersByTimeAsync(50);
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
 
     rerender({
@@ -545,7 +551,7 @@ describe('useStrategicSession liveness fallback', () => {
 
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
     rerender({ liveness: { ...terminal } });
-    await new Promise(resolve => window.setTimeout(resolve, 50));
+    await vi.advanceTimersByTimeAsync(50);
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
 
     const recovered: StrategicLivenessResponse = {
@@ -557,7 +563,7 @@ describe('useStrategicSession liveness fallback', () => {
       },
     };
     rerender({ liveness: recovered });
-    await new Promise(resolve => window.setTimeout(resolve, 50));
+    await vi.advanceTimersByTimeAsync(50);
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
   });
 
@@ -602,7 +608,7 @@ describe('useStrategicSession liveness fallback', () => {
 
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
     rerender({ liveness: { ...failedButNotYetCleared } });
-    await new Promise(resolve => window.setTimeout(resolve, 50));
+    await vi.advanceTimersByTimeAsync(50);
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
   });
 
@@ -643,7 +649,7 @@ describe('useStrategicSession liveness fallback', () => {
 
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
     rerender({ liveness: { ...wedged } });
-    await new Promise(resolve => window.setTimeout(resolve, 50));
+    await vi.advanceTimersByTimeAsync(50);
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
   });
 

@@ -5,6 +5,7 @@ import {
   type EventPref,
   eventPrefsKey,
   groupRoutineMessages,
+  outcomeBreakdown,
   insertTimeDividers,
   collapseStaleRoutineRows,
   STALE_ROUTINE_COLLAPSE_AGE_MS,
@@ -1416,6 +1417,154 @@ describe('countNewSinceLastVisit — pref-aware counting', () => {
   test('zero-arg prefs call is unchanged — existing callers unbroken', () => {
     const msgs = [makeMsg('failure_alert')];
     expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+});
+
+// ── outcomeBreakdown ──────────────────────────────────────────────────────────
+
+describe('outcomeBreakdown', () => {
+  function m(result?: string) { return { context: result ? { result } : {} }; }
+
+  test('returns empty string when no result fields present', () => {
+    expect(outcomeBreakdown([m(), m()])).toBe('');
+  });
+
+  test('shows failed count when only failures present', () => {
+    expect(outcomeBreakdown([m('failed'), m('failed'), m('failed')])).toBe('· 3 failed');
+  });
+
+  test('shows merged count when only merges present', () => {
+    expect(outcomeBreakdown([m('merged'), m('merged')])).toBe('· 2 merged');
+  });
+
+  test('shows mixed breakdown', () => {
+    const msgs = [m('failed'), m('failed'), m('merged'), m('review_needed')];
+    expect(outcomeBreakdown(msgs)).toBe('· 2 failed, 1 merged, 1 review');
+  });
+
+  test('silently degrades when result is absent on all messages', () => {
+    expect(outcomeBreakdown([{ context: { event_type: 'pr_merged' } }])).toBe('');
+  });
+});
+
+// ── groupRoutineMessages — group chip properties ──────────────────────────────
+
+describe('groupRoutineMessages — group chip properties', () => {
+  function makeItem(id: string, event_type: string) {
+    return { id, context: { event_type } };
+  }
+
+  test('group row carries event_type, label, and key from first message', () => {
+    const msgs = Array.from({ length: 5 }, (_, i) => makeItem(`id-${i}`, 'pr_merged'));
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('group');
+    if (rows[0].kind === 'group') {
+      expect(rows[0].event_type).toBe('pr_merged');
+      expect(rows[0].label).toBe('PR merges');
+      expect(rows[0].key).toBe('id-0');
+    }
+  });
+});
+
+// ── classifySignalLevel — explicit message-type coverage ─────────────────────
+
+describe('classifySignalLevel — message-type coverage', () => {
+  const base = { message_type: 'NOTE', from_type: 'system', context: {} };
+
+  test('user messages are always high-signal', () => {
+    expect(classifySignalLevel({ ...base, from_type: 'user' })).toBe('high');
+    expect(classifySignalLevel({ ...base, from_type: 'USER' })).toBe('high');
+  });
+
+  test('FEEDBACK is high-signal regardless of from_type', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'FEEDBACK', from_type: 'agent' })).toBe('high');
+  });
+
+  test('BLOCKER is high-signal', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'BLOCKER' })).toBe('high');
+  });
+
+  test('BUG_REPORT is high-signal', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'BUG_REPORT' })).toBe('high');
+  });
+
+  test('QUESTION is high-signal (awaiting operator reply)', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'QUESTION' })).toBe('high');
+  });
+
+  test('NOTE with failure_alert is high-signal', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'failure_alert' } })).toBe('high');
+  });
+
+  test('NOTE with rollback_recommended is high-signal', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('high');
+  });
+
+  test('NOTE with fix_loop_divergence_regressed is high-signal', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('high');
+  });
+
+  test('NOTE with pr_merged is routine', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'pr_merged' } })).toBe('routine');
+  });
+
+  test('NOTE with feedback_acknowledgment is routine', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('routine');
+  });
+
+  test('NOTE with unknown event_type is routine (fail-safe)', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'some_future_event' } })).toBe('routine');
+  });
+
+  test('NOTE with no event_type is routine', () => {
+    expect(classifySignalLevel({ ...base, context: {} })).toBe('routine');
+  });
+});
+
+// ── getToastSeverity — explicit message-type coverage ────────────────────────
+
+describe('getToastSeverity', () => {
+  const base = { message_type: 'NOTE', from_type: 'system', context: {} };
+
+  test('BLOCKER returns error', () => {
+    expect(getToastSeverity({ ...base, message_type: 'BLOCKER' })).toBe('error');
+  });
+
+  test('BUG_REPORT returns error', () => {
+    expect(getToastSeverity({ ...base, message_type: 'BUG_REPORT' })).toBe('error');
+  });
+
+  test('FEEDBACK returns info', () => {
+    expect(getToastSeverity({ ...base, message_type: 'FEEDBACK' })).toBe('info');
+  });
+
+  test('NOTE with failure_alert returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'failure_alert' } })).toBe('error');
+  });
+
+  test('NOTE with rollback_recommended returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('error');
+  });
+
+  test('NOTE with fix_loop_divergence_regressed returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('error');
+  });
+
+  test('NOTE with account_model_regression_quarantined returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('info');
+  });
+
+  test('NOTE with feedback_acknowledgment returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('info');
+  });
+
+  test('NOTE with routine event_type returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'pr_merged' } })).toBe('info');
+  });
+
+  test('NOTE with no event_type returns info', () => {
+    expect(getToastSeverity({ ...base, context: {} })).toBe('info');
   });
 });
 

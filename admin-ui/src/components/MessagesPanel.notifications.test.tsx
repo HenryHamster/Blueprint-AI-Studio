@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
-import { effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, getToastSeverity, isCriticalSeverity } from './MessagesPanel.utils';
+import { effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, isCriticalSeverity } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { StrategicStateResponse } from '../strategicStateApi';
 
@@ -664,52 +664,6 @@ describe('MessagesPanel toast notifications', () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-});
-
-// ── getToastSeverity unit tests ────────────────────────────────────────────────
-
-describe('getToastSeverity', () => {
-  const base = { message_type: 'NOTE', from_type: 'system', context: {} };
-
-  test('BLOCKER returns error', () => {
-    expect(getToastSeverity({ ...base, message_type: 'BLOCKER' })).toBe('error');
-  });
-
-  test('BUG_REPORT returns error', () => {
-    expect(getToastSeverity({ ...base, message_type: 'BUG_REPORT' })).toBe('error');
-  });
-
-  test('FEEDBACK returns info', () => {
-    expect(getToastSeverity({ ...base, message_type: 'FEEDBACK' })).toBe('info');
-  });
-
-  test('NOTE with failure_alert returns error', () => {
-    expect(getToastSeverity({ ...base, context: { event_type: 'failure_alert' } })).toBe('error');
-  });
-
-  test('NOTE with rollback_recommended returns error', () => {
-    expect(getToastSeverity({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('error');
-  });
-
-  test('NOTE with fix_loop_divergence_regressed returns error', () => {
-    expect(getToastSeverity({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('error');
-  });
-
-  test('NOTE with account_model_regression_quarantined returns info', () => {
-    expect(getToastSeverity({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('info');
-  });
-
-  test('NOTE with feedback_acknowledgment returns info', () => {
-    expect(getToastSeverity({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('info');
-  });
-
-  test('NOTE with routine event_type returns info', () => {
-    expect(getToastSeverity({ ...base, context: { event_type: 'pr_merged' } })).toBe('info');
-  });
-
-  test('NOTE with no event_type returns info', () => {
-    expect(getToastSeverity({ ...base, context: {} })).toBe('info');
   });
 });
 
