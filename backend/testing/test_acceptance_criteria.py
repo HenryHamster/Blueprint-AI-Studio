@@ -11313,6 +11313,23 @@ async def test_walkthrough_merge_evidence_flips_criterion_coverage(db_session):
     assert summary_after["uncovered"] == 0
     assert summary_after["total"] == 3
 
+    # Verify one CriterionEvidence row per criterion is in the DB with the
+    # correct source_kind and detail fields — not just the coverage summary.
+    for key, crit in criteria.items():
+        rows = await ac.get_evidence_for_criterion(db_session, crit.id)
+        assert len(rows) == 1, (
+            f"{key}: expected exactly 1 CriterionEvidence row, got {len(rows)}"
+        )
+        row = rows[0]
+        assert row.source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND, (
+            f"{key}: source_kind should be {ac.WALKTHROUGH_E2E_EVIDENCE_KIND!r}, "
+            f"got {row.source_kind!r}"
+        )
+        assert row.detail["candidate_sha"] == sha, f"{key}: detail.candidate_sha mismatch"
+        assert row.detail["criterion_key"] == key, f"{key}: detail.criterion_key mismatch"
+        assert row.detail["passed"] is True, f"{key}: detail.passed should be True"
+        assert "evaluated_at" in row.detail, f"{key}: detail missing evaluated_at"
+
 
 # ---------------------------------------------------------------------------
 # executed_named_test 'covered' tier (execution-trial earn loop)
