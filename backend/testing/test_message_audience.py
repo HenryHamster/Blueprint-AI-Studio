@@ -2403,3 +2403,257 @@ def test_projectmessage_table_args_include_audience_index():
         "ProjectMessage.__table_args__ must include ix_projectmessage_context_audience; "
         f"found: {sorted(index_names)}"
     )
+
+
+# ── Structural guard: no operator-directed reply resolves to non-operator ──
+#
+# The FORWARD direction (internal content leaking TO the operator) is covered by
+# _collect_ungated_emitters above.  This section covers the INVERSE direction:
+# an operator-directed REPLY (stamp_message_audience called with a context dict
+# containing a 'reply_to' key) that silently resolves to a NON-operator audience
+# and therefore never reaches the operator's inbox.
+#
+# Known reply seams:
+#   notification_dispatch.py post_question_answer        → "question_answer" (OPERATOR_FYI) ✓
+#   notification_dispatch.py post_feedback_reply_message → variable event_type (skipped by scan) ✓
+#   strategic_completion.py _handle_strategic_completion → variable ctx (skipped by scan) ✓
+#   routers/admin_agent_ops.py create_message            → variable ctx (skipped by scan) ✓
+#
+# The scanner flags ONLY sites where BOTH arguments are statically determinable:
+#   (a) the first arg is a literal ast.Dict with a Constant("reply_to") key, AND
+#   (b) the second arg is a literal string Constant whose route_event() is NOT
+#       operator-visible.
+# Variable contexts and variable event_types are silently skipped — those paths
+# are covered by the runtime contract tests above.
+
+
+def _collect_reply_misrouted_emitters(
+    source: str, *, filename: str, rel: str
+) -> list[str]:
+    """Return offender strings for stamp_message_audience() calls where the
+    context is a literal dict with a 'reply_to' key AND the event_type is a
+    literal string constant that resolves to a non-operator audience.
+
+    Only literal-dict contexts with a literal event_type second argument are
+    flagged — variable contexts or dynamic event_types cannot be verified at
+    scan time and are silently skipped (runtime contract tests cover those seams).
+    """
+
+    def _dict_has_reply_to(node: ast.Dict) -> bool:
+        return any(
+            isinstance(k, ast.Constant) and k.value == "reply_to"
+            for k in node.keys
+        )
+
+    tree = ast.parse(source, filename=filename)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _ast_called_name(node) != "stamp_message_audience":
+            continue
+        # First positional arg must be a literal dict with a "reply_to" key.
+        if not node.args:
+            continue
+        ctx_arg = node.args[0]
+        if not isinstance(ctx_arg, ast.Dict):
+            continue  # variable context — cannot determine reply status statically
+        if not _dict_has_reply_to(ctx_arg):
+            continue  # no reply_to → not a reply site; internal messages are legit
+        # Second positional arg must be a literal string constant.
+        if len(node.args) < 2:
+            continue
+        et_arg = node.args[1]
+        if not isinstance(et_arg, ast.Constant) or not isinstance(et_arg.value, str):
+            continue  # variable/BoolOp event_type — skip
+        event_type = et_arg.value
+        if is_operator_visible(route_event(event_type)):
+            continue  # resolves to operator-visible audience → correct, no flag
+        offenders.append(
+            f"  {rel}:{node.lineno} — stamp_message_audience"
+            f"({{..., 'reply_to': ...}}, {event_type!r}) resolves to a non-operator "
+            "audience; an operator-directed reply must resolve to an operator-visible "
+            "audience — default event_type to 'question_answer' when reply_to is present"
+        )
+    return offenders
+
+
+# ── Unit tests for the inverse-misroute scanner ──────────────────────────
+
+
+def test_reply_scan_flags_non_operator_event_type_with_reply_to():
+    """A stamp_message_audience call with reply_to and a strategist-internal
+    event_type is flagged — the reply would silently bypass the operator inbox."""
+    source = dedent(
+        """
+        async def post_reply(session, project_id, reply_id, content):
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id), "content": content},
+                "strategic_message",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert len(offenders) == 1
+    assert "strategic_message" in offenders[0]
+    assert "reply_to" in offenders[0]
+    assert "non-operator" in offenders[0]
+
+
+def test_reply_scan_accepts_operator_event_type_with_reply_to():
+    """A stamp_message_audience call with reply_to and an operator-visible
+    event_type ('question_answer' → OPERATOR_FYI) is accepted."""
+    source = dedent(
+        """
+        async def post_question_answer(session, project_id, original_msg_id, answer):
+            ctx = stamp_message_audience(
+                {
+                    "event_type": "question_answer",
+                    "reply_to": str(original_msg_id),
+                    "answer": answer,
+                },
+                "question_answer",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_skips_context_without_reply_to():
+    """A stamp_message_audience call with a strategist-internal event_type but
+    NO 'reply_to' key is NOT flagged — non-reply internal messages are legitimate."""
+    source = dedent(
+        """
+        async def post_internal_note(session, project_id, content):
+            ctx = stamp_message_audience(
+                {"event_type": "strategic_message", "content": content},
+                "strategic_message",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_skips_non_literal_event_type():
+    """A stamp_message_audience call where the event_type is a BoolOp expression
+    (not a literal constant) is skipped — it cannot be verified at scan time."""
+    source = dedent(
+        """
+        async def post_msg(session, project_id, reply_id, event_type):
+            default_event_type = "strategic_message"
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id)},
+                event_type or default_event_type,
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_skips_non_literal_context():
+    """A stamp_message_audience call where the context is a variable (not a
+    literal dict) is skipped — the scanner cannot determine if reply_to is set."""
+    source = dedent(
+        """
+        async def post_msg(session, project_id, msg_ctx):
+            msg_ctx = stamp_message_audience(msg_ctx, "strategic_message")
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_flags_unregistered_event_type_with_reply_to():
+    """An unregistered event_type alongside reply_to is flagged — unregistered
+    event_types fail closed to STRATEGIST_INTERNAL (non-operator)."""
+    source = dedent(
+        """
+        async def post_reply(session, project_id, reply_id):
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id)},
+                "some.completely.unknown.event",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert len(offenders) == 1
+    assert "some.completely.unknown.event" in offenders[0]
+
+
+def test_reply_scan_accepts_operator_action_needed_event_type_with_reply_to():
+    """An operator-action-needed event_type alongside reply_to is accepted —
+    the reply would surface as an escalation that needs operator attention."""
+    source = dedent(
+        """
+        async def post_escalation_reply(session, project_id, reply_id):
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id)},
+                "auto_fix_escalated",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+# ── Whole-app invariant: zero operator-directed replies resolve non-operator ──
+
+
+def test_no_operator_reply_resolves_to_non_operator_audience():
+    """Whole-app invariant: every stamp_message_audience() call under backend/app/
+    whose first argument is a literal dict containing a 'reply_to' key must supply
+    an operator-visible event_type as its second argument.
+
+    This is the inverse-misroute detector: it prevents a reply intended for the
+    operator from silently resolving to a non-operator (strategist-internal /
+    fail-closed) audience and disappearing from the operator's inbox.
+
+    Remediation: default event_type to 'question_answer' when reply_to is present
+    (route_event('question_answer') == OPERATOR_FYI). If a different operator-visible
+    event_type is intended, use it explicitly.
+
+    Sites where the context is a variable or the event_type is not a literal
+    constant are skipped by the static scan; the runtime contract tests
+    (test_strategist_reply_to_operator_is_operator_visible and
+    test_strategist_agent_output_reply_audience) cover those seams.
+    """
+    import glob
+
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    all_offenders: list[str] = []
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        all_offenders.extend(
+            _collect_reply_misrouted_emitters(source, filename=fpath, rel=rel)
+        )
+
+    assert not all_offenders, (
+        "Found stamp_message_audience() call(s) under backend/app/ where the context "
+        "dict contains 'reply_to' but the event_type resolves to a non-operator audience.\n"
+        "An operator-directed reply must resolve to an operator-visible audience so the "
+        "operator's inbox receives it.\n"
+        "Fix: default event_type to 'question_answer' (OPERATOR_FYI) when reply_to is "
+        "present, or use another registered operator-visible event_type explicitly:\n"
+        + "\n".join(all_offenders)
+    )
