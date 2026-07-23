@@ -10957,6 +10957,49 @@ async def test_seed_routing_verdict_from_snapshot_restores_verdict_state(db_sess
 
 
 @pytest.mark.asyncio
+async def test_seed_routing_verdict_prefers_keyed_telemetry(db_session):
+    """Startup restores the authoritative keyed container before design_doc."""
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+    from app.project_telemetry import set_project_telemetry
+    from app.shared_state import runtime_config as _rc
+
+    _rc.pop("provider_routing_verdict_state", None)
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {
+                        "state": PROVIDER_ROUTING_REJECT,
+                    }
+                }
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        DESIGN_DOC_KEY,
+        {
+            "snapshots": [
+                {
+                    "provider_routing_verdict": {
+                        "state": PROVIDER_ROUTING_ADOPT,
+                    }
+                }
+            ]
+        },
+    )
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    assert _rc.get("provider_routing_verdict_state") == PROVIDER_ROUTING_ADOPT
+    _rc.pop("provider_routing_verdict_state", None)
+
+
+@pytest.mark.asyncio
 async def test_seed_routing_verdict_from_snapshot_skips_project_without_verdict(db_session):
     """When no project has a verdict, the runtime_config key remains unset."""
     from app.shared_state import runtime_config as _rc

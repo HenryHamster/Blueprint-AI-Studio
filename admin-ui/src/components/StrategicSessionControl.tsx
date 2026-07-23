@@ -96,7 +96,7 @@ export function StrategicSessionControl({
               aria-label={`Switch Strategic mode to ${label}`}
               title={`Strategic mode: ${label}`}
               onClick={() => { if (!selected) onModeChange?.(value); }}
-              className={`${compact ? 'h-7 w-7' : 'min-h-9 px-2'} inline-flex items-center justify-center gap-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50 ${selected ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'}`}
+              className={`${compact ? 'h-11 w-11 sm:h-7 sm:w-7' : 'min-h-9 px-2'} inline-flex items-center justify-center gap-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50 ${selected ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'}`}
             >
               <Icon className="h-3.5 w-3.5" aria-hidden="true" />
               <span className={compact ? 'sr-only' : undefined}>{label}</span>

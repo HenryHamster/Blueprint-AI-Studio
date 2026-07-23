@@ -1837,6 +1837,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // launch two requests.
     if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active || restoringPendingAttachments) return;
     const submitOwner = submittingGuardRef.current.begin(submitActorUserId, submitProjectId);
+    const releaseSubmittedComposer = () => {
+      if (submittingGuardRef.current.finish(submitOwner)) {
+        setSubmitting(false);
+        setUploading(false);
+      }
+    };
     setSubmitting(true);
     try {
       // The activity inbox retains its legacy operational-resolution endpoint.
@@ -2134,6 +2140,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           void refreshStrategicState?.();
           didRefreshStrategicState = true;
         }
+        // The receipt is durable and the old draft has been cleared. Release
+        // composer ownership before the best-effort refresh so the operator can
+        // immediately begin the next turn, including selecting attachments.
+        releaseSubmittedComposer();
         await fetchMessages().catch(() => undefined);
         if (!didRefreshStrategicState) void refreshStrategicState?.();
         recordStrategicInteraction();
@@ -2209,10 +2219,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         if (submitStillCurrent() && !attachmentUploadFailed) addToast('Failed to send message', 'error');
       }
     } finally {
-      if (submittingGuardRef.current.finish(submitOwner)) {
-        setSubmitting(false);
-        setUploading(false);
-      }
+      releaseSubmittedComposer();
     }
   }
 

@@ -408,10 +408,11 @@ describe('DirectionsPanel', () => {
     render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Evaluating', steering_excerpt: 'Focus on reliability' }} />);
     await screen.findByRole('button', { name: 'New direction' });
     expect(screen.getByText('Strategist: Evaluating…')).toBeInTheDocument();
-    expect(screen.getByText(/"Focus on reliability"/)).toBeInTheDocument();
+    expect(screen.getByTestId('strategist-status-chip')).toHaveAttribute('title', 'Focus on reliability');
+    expect(screen.getByTestId('strategist-status-chip')).toHaveTextContent('Focus on reliability');
   });
 
-  it('shows cycle-completion receipt when lastCycleCompletion is set and strategist is idle', async () => {
+  it('shows the consolidated cycle-completion status when the strategist is idle', async () => {
     mockFetch(baseResponses);
     render(
       <DirectionsPanel
@@ -424,9 +425,9 @@ describe('DirectionsPanel', () => {
       />
     );
     await screen.findByRole('button', { name: 'New direction' });
-    expect(screen.getByText('Cycle complete')).toBeInTheDocument();
-    expect(screen.getByText(/\+2 direction/)).toBeInTheDocument();
-    expect(screen.getByText(/3 tasks spawned/)).toBeInTheDocument();
+    const statusChip = screen.getByTestId('strategist-status-chip');
+    expect(statusChip).toHaveTextContent('Cycle complete');
+    expect(statusChip).toHaveAttribute('title', 'Cycle complete');
   });
 
   it('hides cycle-completion receipt while strategist is still active', async () => {

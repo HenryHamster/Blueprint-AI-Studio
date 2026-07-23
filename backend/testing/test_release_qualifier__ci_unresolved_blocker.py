@@ -5818,7 +5818,9 @@ async def test_finalize_records_acceptance_window_counts_in_verdict_sub_scores(
     # Existing composite keys still present — additive, no breakage.
     assert "audit" in sub_scores
     assert "test_erosion" in sub_scores
-    assert "smoketest" in sub_scores
+    # Qualifier VM smoketest scoring was retired; ordinary post-promotion
+    # application smoke remains covered by its separate handler contract.
+    assert "smoketest" not in sub_scores
     # Acceptance window aggregate keys persisted alongside them.
     assert sub_scores["acceptance_window_total"] == 2
     assert sub_scores["acceptance_window_verified"] == 1

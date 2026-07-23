@@ -401,23 +401,26 @@ async def _seed_routing_verdict_from_snapshot():
     try:
         from app.shared_state import runtime_config as _rc
         from app.efficiency_snapshot import DESIGN_DOC_KEY
-        from app.models import ProjectEfficiencySnapshot
+        from app.models import ProjectTelemetry
 
         async with AsyncSessionLocal() as seed_session:
-            # Primary: read from the dedicated ProjectEfficiencySnapshot table.
+            # Primary: read the mutable efficiency container from the keyed
+            # telemetry table. ProjectEfficiencySnapshot is a time-series.
             eff_rows = (
                 (
                     await seed_session.execute(
-                        select(ProjectEfficiencySnapshot).limit(5000)
+                        select(ProjectTelemetry)
+                        .where(ProjectTelemetry.key == DESIGN_DOC_KEY)
+                        .limit(5000)
                     )
                 )
                 .scalars()
                 .all()
             )
             for eff_row in eff_rows:
-                if not eff_row or not eff_row.blob:
+                if not eff_row or not eff_row.value:
                     continue
-                container = eff_row.blob
+                container = eff_row.value
                 # Read the verdict from where write_snapshot actually stores it.
                 # Priority (newest-first):
                 #   1. snapshots[-1]["provider_routing_verdict"] — latest snapshot,

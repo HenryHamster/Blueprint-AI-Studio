@@ -17,10 +17,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // handleReview is unchanged by the rewrite — it still calls runClaudeCode
 // directly with the review prompt — so the bulk of the existing handleReview
 // tests pass through unchanged.
-vi.mock('../index.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../index.js')>();
-  return {
-    ...actual,
+vi.mock('../index.js', () => ({
+    normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
+    strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
+    resolveBaseBranch: (payload: Record<string, unknown>, task: Record<string, unknown>, fallback = 'main') => {
+      if (typeof payload.base_branch === 'string' && payload.base_branch) return payload.base_branch;
+      const meta = task.project_metadata as Record<string, unknown> | undefined;
+      if (typeof meta?.integration_branch === 'string' && meta.integration_branch) return meta.integration_branch;
+      return fallback;
+    },
+    sanitize: (s: string) => s,
     WORKSPACE: '/tmp/workspace',
     sendLog: vi.fn(),
     log: vi.fn(),
@@ -43,8 +49,7 @@ vi.mock('../index.js', async (importOriginal) => {
     cloneWithRetry: vi.fn(),
     sendHeartbeatSync: vi.fn(),
     setCurrentPromptFingerprint: vi.fn(),
-  };
-});
+}));
 
 // The test verification loop now lives in utils/test-fix-loop.ts; handlers import
 // captureTestBaseline and testFixLoop from there.

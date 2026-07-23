@@ -461,3 +461,43 @@ async def test_lane_baseline_per_version_keying_and_prune(db_session):
     assert await read_version_lane_baseline(db_session, project.id, total) == {
         "m": total
     }
+
+
+@pytest.mark.asyncio
+async def test_project_telemetry_lock_seeds_and_preserves_legacy_container(
+    db_session,
+):
+    """The first keyed mutation retains data that exists only in design_doc."""
+    from app.task_locking import with_project_telemetry_locked
+
+    legacy = {
+        "baseline": {"cost_per_merged_pr": 3.5},
+        "snapshots": [{"captured_at": "2026-07-21T00:00:00+00:00"}],
+    }
+    project = Project(
+        name="telemetry-lock-fallback",
+        user_id="user-lock",
+        design_doc={"efficiency_baseline": legacy},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    def _mark(container):
+        container["last_alerted_payoff_verdict"] = "COST_REGRESSION"
+
+    assert await with_project_telemetry_locked(
+        db_session,
+        project.id,
+        "efficiency_baseline",
+        _mark,
+        design_doc_fallback=project.design_doc,
+        skip_locked=False,
+    )
+    await db_session.commit()
+
+    stored = await get_project_telemetry(
+        db_session, project.id, "efficiency_baseline"
+    )
+    assert stored["baseline"] == legacy["baseline"]
+    assert stored["snapshots"] == legacy["snapshots"]
+    assert stored["last_alerted_payoff_verdict"] == "COST_REGRESSION"

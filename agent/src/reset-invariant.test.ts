@@ -66,7 +66,13 @@ describe('warm-VM per-role reset invariant (external modules)', () => {
   describe('telemetry.ts', () => {
     const src = readSrc('telemetry.ts');
     const perRoleVars = extractPerRoleVars(src);
-    const resetFns = ['resetLlmTelemetry', 'resetFormatComplianceTelemetry', 'setCurrentPromptFingerprint', 'resetOperatorDecisionCaptureTelemetry'];
+    const resetFns = [
+      'resetLlmTelemetry',
+      'resetFormatComplianceTelemetry',
+      'setCurrentPromptFingerprint',
+      'resetResidentTurnLatencyTelemetry',
+      'resetOperatorDecisionCaptureTelemetry',
+    ];
 
     it('has at least one @per-role variable', () => {
       expect(perRoleVars.length).toBeGreaterThan(0);

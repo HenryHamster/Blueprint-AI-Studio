@@ -37,6 +37,7 @@ from app.models import (
     _utcnow,
 )
 from app.project_telemetry import read_telemetry_many
+from app.sr_analytics_store import read_project_sr_analytics
 from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
 from app.sr_blind_spots import has_reviewer_confirmed_categories, safe_check_results
@@ -75,7 +76,7 @@ async def _evaluate_sr_catch_rate_targets(
     targets: Dict[str, Any] = project.sr_catch_rate_targets or {}
     if not targets:
         return
-    doc = project.design_doc or {}
+    doc = await read_project_sr_analytics(session, project)
     sr_trends = doc.get("sr_catch_rate_trends") or {}
     if sr_trends.get("prompt_version_changed"):
         return
@@ -159,7 +160,7 @@ async def _evaluate_lone_checker_alert(
     project = await session.get(Project, project_id)
     if not project:
         return
-    doc = project.design_doc or {}
+    doc = await read_project_sr_analytics(session, project)
     categories = (doc.get("sr_catch_rate_trends") or {}).get("categories") or {}
     lone_cats = [
         cat
@@ -993,26 +994,18 @@ async def compute_pipeline_health_summary(
         if recurrence:
             review_recurrence_by_category = recurrence
 
-    # Telemetry blobs prefer the dedicated project_telemetry KV table and fall
-    # back to project.design_doc (dual-write phase). Batch-fetch all the keys
-    # this summary needs in one indexed query.
+    # SR analytics live in their dedicated row. Generic project telemetry is
+    # still used for direction-first-attempt feedback only.
+    _sr_data: Dict[str, Any] = {}
     _tel_blobs: Dict[str, Any] = {}
     if project:
+        _sr_data = await read_project_sr_analytics(session, project)
         _tel_blobs = await read_telemetry_many(
-            session,
-            project_id,
-            [
-                "sr_catch_rate_trends",
-                "sr_regression_risk_test_signal_trends",
-                "sr_false_attestation_trends",
-                "fresh_reviewer_trend",
-                "edges_trend",
-                "direction_first_attempt_feedback",
-            ],
+            session, project_id, ["direction_first_attempt_feedback"]
         )
     _design_doc: Dict[str, Any] = (project.design_doc or {}) if project else {}
 
-    def _telemetry_blob(key: str) -> Any:
+    def _generic_telemetry_blob(key: str) -> Any:
         blob = _tel_blobs.get(key)
         return blob if blob is not None else _design_doc.get(key)
 
@@ -1021,22 +1014,22 @@ async def compute_pipeline_health_summary(
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     sr_false_attestation_trends: Optional[Dict[str, Any]] = None
     if project:
-        sr_trends = _telemetry_blob("sr_catch_rate_trends") or {}
+        sr_trends = _sr_data.get("sr_catch_rate_trends") or {}
         if sr_trends:
             self_review_prediction_accuracy_trends = _serialize_sr_catch_rate_trends(
                 sr_trends
             )
-        sr_rrts = _telemetry_blob("sr_regression_risk_test_signal_trends")
+        sr_rrts = _sr_data.get("sr_regression_risk_test_signal_trends")
         if sr_rrts:
             sr_regression_risk_test_signal_trends = sr_rrts
-        sft = _telemetry_blob("sr_false_attestation_trends")
+        sft = _sr_data.get("sr_false_attestation_trends")
         if sft:
             sr_false_attestation_trends = sft
 
     # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend.
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
     if project:
-        fr_trends = _telemetry_blob("fresh_reviewer_trend") or {}
+        fr_trends = _sr_data.get("fresh_reviewer_trend") or {}
         if fr_trends:
             fresh_reviewer_trend = {
                 "computed_at": fr_trends.get("computed_at"),
@@ -1053,7 +1046,7 @@ async def compute_pipeline_health_summary(
     # Edges-considered cycle-over-cycle trend from compute_edges_trend.
     edges_trend: Optional[Dict[str, Any]] = None
     if project:
-        et = _telemetry_blob("edges_trend") or {}
+        et = _sr_data.get("edges_trend") or {}
         if et:
             edges_trend = {
                 "computed_at": et.get("computed_at"),
@@ -1069,7 +1062,7 @@ async def compute_pipeline_health_summary(
 
     direction_first_attempt_feedback: Optional[Dict[str, Any]] = None
     if project:
-        dfa = _telemetry_blob("direction_first_attempt_feedback")
+        dfa = _generic_telemetry_blob("direction_first_attempt_feedback")
         if dfa:
             direction_first_attempt_feedback = dfa
 

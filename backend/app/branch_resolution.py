@@ -266,8 +266,9 @@ async def flush_pending_branch_alerts(session) -> int:
                 message=item.get("message") or title,
                 broadcast=True,
             )
-            if _alert is not None:
+            if _created:
                 created += 1
+            if _alert is not None:
                 existing_keys.add((project_id, title))
         except Exception:  # noqa: BLE001
             failed.append(item)

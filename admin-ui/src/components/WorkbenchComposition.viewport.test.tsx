@@ -4,6 +4,7 @@ import { act } from 'react';
 import { HeaderBar, PrimaryTabNav } from './HeaderBar';
 import { MessagesPanel } from './MessagesPanel';
 import { StrategicContextRail } from './StrategicContextRail';
+import { StrategicSessionControl } from './StrategicSessionControl';
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
 import { expectNoOverflowAt } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
@@ -371,7 +372,17 @@ describe('WorkbenchComposition viewport regression', () => {
             <WorkbenchSurface
               title="Strategic"
               showTitle={false}
-              actions={<></>}
+              actions={(
+                <StrategicSessionControl
+                  currentMode="chat"
+                  sessionActive={false}
+                  sessionState="ready"
+                  onStartSession={vi.fn()}
+                  onStopSession={vi.fn()}
+                  onModeChange={vi.fn()}
+                  density="compact"
+                />
+              )}
               flush
             >
               <WorkbenchSplit

@@ -551,6 +551,7 @@ async def test_activity_endpoint_excludes_conversation_projection(
             sequence=activity_sequence,
             surface=MessageSurface.ACTIVITY,
             content="activity only",
+            context={"audience": "operator-fyi"},
         ),
         # Non-operator (strategic) conversation projection: the activity list
         # excludes it. Operator-signal rows (user / FEEDBACK-BLOCKER-BUG_REPORT /
@@ -839,7 +840,11 @@ async def test_admin_messages_list_strips_large_context_keys(
         message_type=MessageType.BUG_REPORT,
         from_type="system",
         content="Message with large context",
-        context={"event_type": "task_failed", "strategic_session": {"version": 1, "huge": "x" * 10_000}},
+        context={
+            "event_type": "task_failed",
+            "audience": "operator-fyi",
+            "strategic_session": {"version": 1, "huge": "x" * 10_000},
+        },
         status="open",
     )
     db_session.add(msg)

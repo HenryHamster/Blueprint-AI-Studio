@@ -19,6 +19,12 @@ from testing._playbook_test_helpers import (
 )
 
 
+async def _read_sr_analytics(db_session: AsyncSession, project: Project) -> dict:
+    from app.sr_analytics_store import read_project_sr_analytics
+
+    return await read_project_sr_analytics(db_session, project)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests for compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,7 +141,9 @@ async def test_compute_sr_catch_rate_trends_stamps_heartbeat_on_low_sample(
     result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is None
-    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert "signal_last_computed_at" in stored, (
         "heartbeat must be stamped even when returning None (idle/low-data state)"
     )
@@ -173,7 +181,9 @@ async def test_compute_sr_catch_rate_trends_stamps_heartbeat_on_success(
     result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is not None
-    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert "signal_last_computed_at" in stored, (
         "heartbeat must be stamped on every successful invocation"
     )
@@ -213,7 +223,9 @@ async def test_compute_sr_catch_rate_trends_data_sufficient_false_on_low_sample(
     result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is None
-    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert stored.get("data_sufficient") is False, (
         "data_sufficient must be False when findings are insufficient"
     )
@@ -260,23 +272,22 @@ async def test_compute_sr_catch_rate_trends_data_sufficient_true_on_success(
     assert "last_sufficient_computed_at" in result, (
         "last_sufficient_computed_at must be set on a successful computation"
     )
-    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert stored.get("data_sufficient") is True
     assert "last_sufficient_computed_at" in stored
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_dual_writes_telemetry_on_success(
+async def test_compute_sr_catch_rate_trends_writes_dedicated_store_on_success(
     db_session: AsyncSession,
 ):
-    """A successful computation dual-writes sr_catch_rate_trends to project_telemetry.
+    """A successful computation writes sr_catch_rate_trends to ProjectSRAnalytics.
 
-    Exercises the Phase-1 dual-write in _compute_sr_catch_rate_trends_impl: the
-    design_doc copy is kept AND an identical blob is upserted into the dedicated
-    KV row, so a telemetry-preferring reader sees the same value.
+    The dedicated SR analytics row is authoritative after the store cutover.
     """
     from app.playbook_learning import compute_sr_catch_rate_trends
-    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -304,23 +315,21 @@ async def test_compute_sr_catch_rate_trends_dual_writes_telemetry_on_success(
     await db_session.flush()
 
     assert result is not None
-    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert stored.get("data_sufficient") is True
 
-    # Telemetry row mirrors the design_doc copy.
-    tel = await read_telemetry(db_session, project.id, "sr_catch_rate_trends")
-    assert tel is not None
-    assert tel.get("data_sufficient") is True
-    assert tel == stored
+    assert stored == result
+    assert (project.design_doc or {}).get("sr_catch_rate_trends") is None
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_dual_writes_insufficient_marker(
+async def test_compute_sr_catch_rate_trends_writes_dedicated_store_insufficient_marker(
     db_session: AsyncSession,
 ):
-    """The insufficient-sample marker is also mirrored into project_telemetry."""
+    """The insufficient-sample marker is written to the dedicated SR store."""
     from app.playbook_learning import compute_sr_catch_rate_trends
-    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -348,9 +357,12 @@ async def test_compute_sr_catch_rate_trends_dual_writes_insufficient_marker(
     await db_session.flush()
 
     assert result is None
-    tel = await read_telemetry(db_session, project.id, "sr_catch_rate_trends")
-    assert tel is not None
-    assert tel.get("data_sufficient") is False
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
+    assert stored.get("data_sufficient") is False
+    assert "signal_last_computed_at" in stored
+    assert (project.design_doc or {}).get("sr_catch_rate_trends") is None
 
 
 @pytest.mark.asyncio
@@ -386,7 +398,9 @@ async def test_compute_sr_catch_rate_trends_data_sufficient_preserves_last_suffi
 
     result1 = await compute_sr_catch_rate_trends(project.id, db_session, tasks_ok)
     assert result1 is not None
-    stored1 = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored1 = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     last_sufficient = stored1["last_sufficient_computed_at"]
 
     # Second run with insufficient data — should preserve last_sufficient_computed_at
@@ -404,7 +418,9 @@ async def test_compute_sr_catch_rate_trends_data_sufficient_preserves_last_suffi
 
     result2 = await compute_sr_catch_rate_trends(project.id, db_session, tasks_low)
     assert result2 is None
-    stored2 = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored2 = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert stored2.get("data_sufficient") is False
     assert stored2.get("last_sufficient_computed_at") == last_sufficient, (
         "last_sufficient_computed_at must be preserved (not cleared) after a low-data run"
@@ -1136,10 +1152,10 @@ async def test_compute_sr_catch_rate_trends_cycle_to_calendar_resets_history(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_persists_to_design_doc(
+async def test_compute_sr_catch_rate_trends_persists_to_dedicated_store(
     db_session: AsyncSession,
 ):
-    """Writes sr_catch_rate_trends key to project.design_doc."""
+    """Writes sr_catch_rate_trends to the authoritative SR analytics row."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
@@ -1168,11 +1184,13 @@ async def test_compute_sr_catch_rate_trends_persists_to_design_doc(
     await db_session.flush()
 
     assert result is not None
-    assert "sr_catch_rate_trends" in (project.design_doc or {})
-    stored = project.design_doc["sr_catch_rate_trends"]
+    analytics = await _read_sr_analytics(db_session, project)
+    assert "sr_catch_rate_trends" in analytics
+    stored = analytics["sr_catch_rate_trends"]
     assert "computed_at" in stored
     assert "categories" in stored
     assert "by_task_type" in stored
+    assert "sr_catch_rate_trends" not in (project.design_doc or {})
 
 
 def _make_sr_task_with_fix_iter(
@@ -2108,7 +2126,7 @@ async def test_reviewer_hallucination_rate_delta_direction(
 
 
 @pytest.mark.asyncio
-async def test_reviewer_hallucination_rate_persists_to_design_doc(
+async def test_reviewer_hallucination_rate_persists_to_dedicated_store(
     db_session: AsyncSession,
 ):
     """reviewer_hallucination_rate is persisted in project.design_doc['sr_catch_rate_trends']."""
@@ -2133,8 +2151,9 @@ async def test_reviewer_hallucination_rate_persists_to_design_doc(
     result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
     assert result is not None
     assert "reviewer_hallucination_rate" in result
-    doc = project.design_doc or {}
-    stored = doc.get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert "reviewer_hallucination_rate" in stored
 
 
@@ -3778,8 +3797,8 @@ async def test_sr_catch_rate_regression_no_duplicate_in_same_window(
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     # Verify alert state was persisted
-    await db_session.refresh(project)
-    assert "sr_catch_rate_trends_alert" in (project.design_doc or {})
+    analytics = await _read_sr_analytics(db_session, project)
+    assert "sr_catch_rate_trends_alert" in analytics
     assert mock_post.call_count == 1
 
     # Second call in the same window — should be deduped
@@ -4655,7 +4674,7 @@ async def test_compute_sr_catch_rate_trends_by_severity_absent_when_no_rev_hist(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(
+async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_dedicated_store(
     db_session: AsyncSession,
 ):
     """by_severity is persisted to project.design_doc['sr_catch_rate_trends']."""
@@ -4690,7 +4709,9 @@ async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(
     await db_session.flush()
 
     assert result is not None
-    stored = project.design_doc.get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     assert "by_severity" in stored
     assert "CRITICAL" in stored["by_severity"]
     assert "MAJOR" in stored["by_severity"]
@@ -5962,13 +5983,11 @@ async def test_compute_fresh_reviewer_trend_stable_classification(
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_persists_to_telemetry_table(
+async def test_compute_fresh_reviewer_trend_persists_to_sr_analytics(
     db_session: AsyncSession,
 ):
-    """Persists fresh_reviewer_trend to the project_telemetry table (migration
-    0678 moved it off design_doc)."""
+    """Persists fresh_reviewer_trend to the dedicated SR analytics store."""
     from app.playbook_learning import compute_fresh_reviewer_trend
-    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -5986,7 +6005,9 @@ async def test_compute_fresh_reviewer_trend_persists_to_telemetry_table(
     result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
     await db_session.flush()
 
-    persisted = await read_telemetry(db_session, project.id, "fresh_reviewer_trend")
+    persisted = (await _read_sr_analytics(db_session, project)).get(
+        "fresh_reviewer_trend"
+    )
     assert result is not None
     assert persisted is not None
     assert persisted["computed_at"] == result["computed_at"]
@@ -6216,7 +6237,7 @@ async def test_compute_sr_reviewer_disagreements_counts_disagreements(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_persists_to_design_doc(
+async def test_compute_sr_reviewer_disagreements_persists_to_dedicated_store(
     db_session: AsyncSession,
 ):
     """Result is written to project.design_doc['sr_reviewer_disagreements']."""
@@ -6242,7 +6263,9 @@ async def test_compute_sr_reviewer_disagreements_persists_to_design_doc(
 
     await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
 
-    stored = project.design_doc.get("sr_reviewer_disagreements") or {}
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_reviewer_disagreements"
+    ) or {}
     assert stored.get("disagreements")
     assert stored["disagreements"][0]["category"] == "test-coverage"
 
@@ -7165,11 +7188,9 @@ async def test_compute_edges_trend_stable_classification(db_session: AsyncSessio
 
 
 @pytest.mark.asyncio
-async def test_compute_edges_trend_persists_to_telemetry_table(db_session: AsyncSession):
-    """Persists edges_trend to the project_telemetry table (migration 0678 moved
-    it off design_doc)."""
+async def test_compute_edges_trend_persists_to_sr_analytics(db_session: AsyncSession):
+    """Persists edges_trend to the dedicated SR analytics store."""
     from app.playbook_learning import compute_edges_trend
-    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -7185,7 +7206,7 @@ async def test_compute_edges_trend_persists_to_telemetry_table(db_session: Async
     result = await compute_edges_trend(project.id, db_session, tasks)
     await db_session.flush()
 
-    persisted = await read_telemetry(db_session, project.id, "edges_trend")
+    persisted = (await _read_sr_analytics(db_session, project)).get("edges_trend")
     assert result is not None
     assert persisted is not None
     assert persisted["computed_at"] == result["computed_at"]
@@ -7231,9 +7252,7 @@ async def test_compute_edges_trend_history_capped_at_5(db_session: AsyncSession)
         await compute_edges_trend(project.id, db_session, tasks)
         await db_session.flush()
 
-    from app.project_telemetry import read_telemetry
-
-    persisted = await read_telemetry(db_session, project.id, "edges_trend")
+    persisted = (await _read_sr_analytics(db_session, project)).get("edges_trend")
     history = persisted["rate_history"]
     assert len(history) <= 5
 
@@ -7664,13 +7683,11 @@ async def test_compute_sr_regression_risk_test_signal_trends_skip_envelope_exclu
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_regression_risk_test_signal_trends_persists_to_table(
+async def test_compute_sr_regression_risk_test_signal_trends_persists_to_sr_analytics(
     db_session: AsyncSession,
 ):
-    """Result is written to the project_telemetry table under the key (migration
-    0678 moved it off design_doc)."""
+    """Result is written to the dedicated SR analytics store under the key."""
     from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
-    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session)
     tasks = []
@@ -7690,8 +7707,8 @@ async def test_compute_sr_regression_risk_test_signal_trends_persists_to_table(
     assert result is not None
 
     await db_session.flush()
-    persisted = await read_telemetry(
-        db_session, project.id, "sr_regression_risk_test_signal_trends"
+    persisted = (await _read_sr_analytics(db_session, project)).get(
+        "sr_regression_risk_test_signal_trends"
     )
     assert persisted is not None
     assert persisted["computed_at"] == result["computed_at"]
@@ -9326,7 +9343,9 @@ async def test_below_floor_flag_persisted_to_design_doc(db_session: AsyncSession
     await compute_sr_catch_rate_trends(project.id, db_session, tasks)
     await db_session.flush()
 
-    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    stored = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends", {}
+    )
     cat = stored.get("categories", {}).get("correctness", {})
     assert cat.get("below_floor") is True, (
         "below_floor must be True after two consecutive below-floor windows; "
@@ -9991,7 +10010,9 @@ async def test_refresh_sr_catch_rate_fetch_covers_both_windows(
     await _refresh_sr_catch_rate(session=db_session, project_id=project.id)
     await db_session.flush()
 
-    trends = (project.design_doc or {}).get("sr_catch_rate_trends")
+    trends = (await _read_sr_analytics(db_session, project)).get(
+        "sr_catch_rate_trends"
+    )
     assert trends is not None, "_refresh_sr_catch_rate must write sr_catch_rate_trends"
     assert trends.get("data_sufficient") is True, (
         "fetch must cover both 0-14 and 14-28 day windows; "

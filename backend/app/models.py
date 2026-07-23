@@ -5963,12 +5963,10 @@ class OperatorInboxLivenessObservation(SQLModel, table=True):
 
 
 class ProjectEfficiencySnapshot(SQLModel, table=True):
-    """Persisted efficiency-baseline telemetry for a project.
+    """Time-series efficiency telemetry for a project.
 
-    Replaces design_doc["efficiency_baseline"] — one row per (project, captured_at).
-    Migration 0694 rebuilt this table from the original one-row-per-project
-    schema to this multi-row time-series schema so project_telemetry.py can
-    store and retrieve snapshots with retention pruning.
+    Migration 0694 repairs the original one-row-per-project table from 0658
+    into the append-only shape used by project_telemetry.py.
     """
 
     __tablename__ = "project_efficiency_snapshot"
@@ -5995,7 +5993,9 @@ class ProjectEfficiencySnapshot(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
     __table_args__ = (
-        UniqueConstraint("project_id", "captured_at", name="uq_proj_efficiency_snap"),
+        UniqueConstraint(
+            "project_id", "captured_at", name="uq_proj_efficiency_snap"
+        ),
         Index("ix_project_efficiency_snapshot_project_id", "project_id"),
     )
 

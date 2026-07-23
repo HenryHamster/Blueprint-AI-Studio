@@ -55,7 +55,7 @@ describe('PrimaryTabNav — cross-tab alert indicator (PR #15230)', () => {
     return container;
   }
 
-  test('shows alert dot on all four tab buttons when activeAlerts > 0', () => {
+  test('shows alert dot on all five tab buttons when activeAlerts > 0', () => {
     const el = render(
       <PrimaryTabNav
         activeTab="chat"
@@ -66,7 +66,7 @@ describe('PrimaryTabNav — cross-tab alert indicator (PR #15230)', () => {
     act(() => {});
 
     const buttons = el.querySelectorAll<HTMLButtonElement>('button');
-    expect(buttons.length).toBe(4);
+    expect(buttons.length).toBe(5);
     // Every tab button should contain an alert-dot span regardless of which tab is active
     let dotCount = 0;
     for (const button of buttons) {
@@ -74,7 +74,7 @@ describe('PrimaryTabNav — cross-tab alert indicator (PR #15230)', () => {
       expect(dot).not.toBeNull();
       dotCount++;
     }
-    expect(dotCount).toBe(4);
+    expect(dotCount).toBe(5);
   });
 
   test('shows no alert dot when activeAlerts is 0', () => {

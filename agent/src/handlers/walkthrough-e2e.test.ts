@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mock handles for the candidate-stack controller ─────────────────
-const { bootMock, teardownMock, ctorMock } = vi.hoisted(() => {
+const { bootMock, teardownMock, ctorMock, deriveComposeProjectMock } = vi.hoisted(() => {
   const bootMock = vi.fn();
   const teardownMock = vi.fn().mockResolvedValue(undefined);
   const ctorMock = vi.fn().mockImplementation(() => ({ boot: bootMock, teardown: teardownMock }));
-  return { bootMock, teardownMock, ctorMock };
+  const deriveComposeProjectMock = vi.fn();
+  return { bootMock, teardownMock, ctorMock, deriveComposeProjectMock };
 });
 
 // ── Module mocks ────────────────────────────────────────────────────────────
@@ -28,6 +29,7 @@ vi.mock('../workspacePrep.js', async (importOriginal) => {
 
 vi.mock('./walkthrough-stack.js', () => ({
   CandidateStackController: ctorMock,
+  deriveComposeProject: deriveComposeProjectMock,
 }));
 
 vi.mock('child_process', () => ({

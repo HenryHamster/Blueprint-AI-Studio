@@ -287,6 +287,14 @@ def _operator_visible_audience():
     return operator_visible_message_audience_filter(ProjectMessage.context)
 
 
+def _operator_visible_audience_or_user_authored():
+    """Admit operator-authored messages while keeping non-user rows fail-closed."""
+    return or_(
+        ProjectMessage.from_type == "user",
+        _operator_visible_audience(),
+    )
+
+
 def _operator_signal_predicate():
     """Rows the operator Messages panel must surface regardless of ``surface``.
 
@@ -733,7 +741,7 @@ async def list_messages(
             ProjectMessage.surface == MessageSurface.ACTIVITY,
             _operator_signal_predicate(),
         ),
-        _operator_visible_audience(),
+        _operator_visible_audience_or_user_authored(),
     ]
     if project_id:
         try:
@@ -812,7 +820,7 @@ async def list_messages(
             ProjectMessage.project_id.in_(user_pids),
             ProjectMessage.status == "open",
             _operator_signal_predicate(),
-            _operator_visible_audience(),
+            _operator_visible_audience_or_user_authored(),
             *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
         ]
         if q_stripped:
