@@ -1654,9 +1654,7 @@ class TestSchemaRevisionSync:
                 for col_m in col_in_create_re.finditer(block):
                     migration_columns.add((table, col_m.group(1)))
 
-        # Tables whose migrations are pending (added by a sibling task in the same PR batch).
-        # Remove each entry once its migration file lands.
-        PENDING_MIGRATION_TABLES: set[str] = set()
+        from app.migration_guards import PENDING_MIGRATION_TABLES
 
         # Check each SQLModel table's columns against migrations
         missing: list[tuple[str, str]] = []
@@ -2159,9 +2157,7 @@ class TestSchemaRevisionSync:
                 if target:
                     effective.discard(target)
 
-        # Tables whose migrations are pending (added by a sibling task in the same PR batch).
-        # Remove each entry once its migration file lands.
-        PENDING_MIGRATION_TABLES: set[str] = set()
+        from app.migration_guards import PENDING_MIGRATION_TABLES
 
         missing: list[str] = []
         for table_name, table in SQLModel.metadata.tables.items():
@@ -2179,6 +2175,28 @@ class TestSchemaRevisionSync:
             + "\n".join(missing)
             + "\n\nAdd an op.create_index call to a migration for each missing "
             "index, or queries will silently fall back to sequential scans."
+        )
+
+    def test_pending_guards_are_eventually_resolved(self):
+        """PENDING_MIGRATION_TABLES in app.migration_guards must be empty.
+
+        Agents may temporarily add a table name to PENDING_MIGRATION_TABLES when
+        a sibling task adds a SQLModel table but its migration file lands in a
+        separate commit.  That escape hatch must be removed once the migration
+        merges — stale entries suppress the column- and index-coverage checks
+        indefinitely, hiding real drift.
+
+        This invariant fires on every CI run so forgotten entries are caught
+        automatically rather than silently accumulating.
+        """
+        from app.migration_guards import PENDING_MIGRATION_TABLES
+
+        assert PENDING_MIGRATION_TABLES == set(), (
+            "app.migration_guards.PENDING_MIGRATION_TABLES is not empty: "
+            + repr(PENDING_MIGRATION_TABLES)
+            + "\n\nRemove each entry once its migration file has landed on the "
+            "target branch.  This set is only meant to hold tables whose "
+            "migrations are in-flight in the same PR batch."
         )
 
     def test_migration_downgrade_bodies_are_substantive(self):
