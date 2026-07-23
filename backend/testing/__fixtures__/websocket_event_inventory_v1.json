@@ -5248,6 +5248,38 @@
       "source_path": "backend/app/workbench_events.py",
       "workbench_action": null,
       "workbench_resource": null
+    },
+    {
+      "callee": "broadcast_to_project",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "message_v1_payload",
+      "event": "message_updated",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 849,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "call:message_updated_event_payload",
+      "scope": "agent_poll_messages",
+      "source_path": "backend/app/routers/agent_strategic_messages.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
+      "callee": "broadcast_to_project",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "message_v1_payload",
+      "event": "message_created",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 855,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "call:message_event_payload",
+      "scope": "agent_poll_messages",
+      "source_path": "backend/app/routers/agent_strategic_messages.py",
+      "workbench_action": null,
+      "workbench_resource": null
     }
   ],
   "schema_version": 1,
@@ -5255,13 +5287,13 @@
     "legacy_global_event": 16,
     "legacy_project_event": 217,
     "legacy_review_required": 27,
-    "message_v1_payload": 19,
+    "message_v1_payload": 21,
     "raw_websocket_control": 3,
     "strategic_v1_emitter": 4,
     "strategic_v1_helper": 21,
+    "total_emitters": 329,
     "transport": 5,
     "workbench_v1_emitter": 1,
-    "workbench_v1_helper": 14,
-    "total_emitters": 327
+    "workbench_v1_helper": 14
   }
 }

@@ -697,6 +697,7 @@
   "testing/test_admin_routers.py::test_plan_subtasks_none_when_subtasks_not_a_list": 6.65,
   "testing/test_admin_routers.py::test_plan_subtasks_returns_title_and_depends_on_indices": 0.07,
   "testing/test_admin_routers.py::test_strategic_agent_ops_all_have_real_handlers": 0.16,
+  "testing/test_admin_routers__messages.py::TestMessagesSavedViews::test_sanitizer_handles_corrupt_non_list_rows": 3.65,
   "testing/test_admin_runners.py::TestCloudEquivalentCostHelper::test_cloud_backend_job_returns_none": 0.204,
   "testing/test_admin_runners.py::TestCloudEquivalentCostHelper::test_missing_timestamps_returns_none": 19.92,
   "testing/test_admin_runners.py::TestCloudEquivalentCostHelper::test_negative_or_zero_window_returns_none": 20.72,
@@ -5781,7 +5782,6 @@
   "testing/test_directions.py::test_strategic_api_reject_direction_cancels_queued_tasks": 19.336198162000073,
   "testing/test_directions.py::test_strategic_api_reject_direction_creates_tombstone": 0.31345845499981806,
   "testing/test_directions.py::test_strategic_api_set_memory": 0.28112179999880027,
-  "testing/test_directions.py::test_strategic_api_set_memory_cap": 0.3295361979999143,
   "testing/test_directions.py::test_strategic_api_set_memory_rejects_empty_note": 0.26099720199999865,
   "testing/test_directions.py::test_strategic_api_set_problem_model_accepts_capability_backing_paths": 0.3442457800001648,
   "testing/test_directions.py::test_strategic_api_set_problem_model_accepts_old_shape_capability": 0.2805563900001289,
@@ -18670,6 +18670,5 @@
   "testing/test_workbench_events.py::test_compute_job_feed_item_criterion_met_uses_active_tone": 0.93,
   "testing/test_workbench_events.py::test_compute_job_feed_item_unmet_criterion_uses_warning_tone": 2.45,
   "testing/test_workbench_events.py::test_payload_task_type_reads_first_payload": 14.7,
-  "testing/test_workbench_events.py::test_workbench_event_envelope_is_v1_and_dedupes_refetch_surfaces": 0.058,
-  "testing/test_admin_routers__messages.py::TestMessagesSavedViews::test_sanitizer_handles_corrupt_non_list_rows": 3.65
+  "testing/test_workbench_events.py::test_workbench_event_envelope_is_v1_and_dedupes_refetch_surfaces": 0.058
 }

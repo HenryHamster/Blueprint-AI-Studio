@@ -13490,9 +13490,17 @@ def test_no_callers_pass_raise_on_size_limit_false():
     behavior. If a legitimate caller needs this, add it to the allowlist below
     with a documented rationale.
     """
-    # Allowlist: (rel_path, lineno, rationale). Keep empty — no caller should
-    # silence the size-cap guard.
-    _ALLOWLIST: frozenset[tuple[str, int, str]] = frozenset()
+    # Allowlist: (rel_path, lineno, rationale). Keep as close to empty as possible — no caller
+    # should silence the size-cap guard.
+    _ALLOWLIST: frozenset[tuple[str, int, str]] = frozenset({
+        (
+            "app/efficiency_snapshot.py",
+            307,
+            "Telemetry mirror: silently skip the stale snapshot write when "
+            "the design_doc container is full — crashing the telemetry sync "
+            "is worse than a slightly stale efficiency snapshot.",
+        ),
+    })
     app_dir = BACKEND_ROOT / "app"
     # Known aliases for with_design_doc_locked in production code
     _ALIASES: frozenset[str] = frozenset({
