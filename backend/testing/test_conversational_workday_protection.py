@@ -536,6 +536,119 @@ def test_workday_invariant_suite_is_protected_with_all_tests():
     )
 
 
+def test_strategic_resident_session_is_protected_with_all_tests():
+    """The strategic resident session suite must appear in the manifest with all tests.
+
+    backend/testing/test_strategic_resident_session.py is the primary backend
+    seam for the operator-driven Workday session lifecycle (start, stop, lease,
+    handoff). Deleting or emptying it without operator sign-off must trip this
+    guard. Verifies: (a) the file is in the protect section, (b) every
+    def/async-def test function in the file is listed, and (c) counts match so
+    a silently-added test doesn't escape the manifest.
+    """
+    import re
+
+    manifest = _load_manifest()
+    target_path = "backend/testing/test_strategic_resident_session.py"
+
+    entries = [e for e in manifest["protect"] if e["path"] == target_path]
+    assert entries, (
+        f"{target_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so silent deletion of the resident session "
+        "suite is caught at every CI run."
+    )
+    entry = entries[0]
+
+    full_path = REPO_ROOT / target_path
+    if not full_path.exists():
+        pytest.skip(
+            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+        )
+
+    source = full_path.read_text(encoding="utf-8")
+    actual_tests = re.findall(
+        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
+        source,
+        re.MULTILINE,
+    )
+    listed_tests = entry["test_ids"]
+
+    missing_from_manifest = sorted(set(actual_tests) - set(listed_tests))
+    extra_in_manifest = sorted(set(listed_tests) - set(actual_tests))
+
+    assert not missing_from_manifest, (
+        "These test functions exist in test_strategic_resident_session.py but "
+        "are NOT listed in the protect manifest. Add them so deletion of any "
+        "resident session test is caught:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "test_strategic_resident_session.py. Update the manifest:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
+def test_strategic_resident_agent_handler_is_protected_with_all_tests():
+    """The strategic resident agent handler test suite must appear in the manifest with all tests.
+
+    agent/src/handlers/strategic-resident.test.ts is the deepest coverage of
+    the resident session path on the agent side — it covers operator reply,
+    compaction restart, workspace recovery, corrective tick, and provider-error
+    guard. Deleting or emptying it without operator sign-off must trip this
+    guard. Verifies: (a) the file is in the protect section, (b) every it()/
+    it.each() test label in the file is listed, and (c) counts match.
+    """
+    import re
+
+    manifest = _load_manifest()
+    target_path = "agent/src/handlers/strategic-resident.test.ts"
+
+    entries = [e for e in manifest["protect"] if e["path"] == target_path]
+    assert entries, (
+        f"{target_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so silent deletion of the resident handler "
+        "test suite is caught at every CI run."
+    )
+    entry = entries[0]
+
+    full_path = REPO_ROOT / target_path
+    if not full_path.exists():
+        pytest.skip(
+            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+        )
+
+    source = full_path.read_text(encoding="utf-8")
+
+    # Collect all plain it('label', ...) test labels from lines starting with it(.
+    actual_labels: set[str] = set(re.findall(
+        r"^\s*it\s*\(\s*'([^']+)'",
+        source,
+        re.MULTILINE,
+    ))
+    # Collect it.each(...)('template', ...) template strings — the template may
+    # appear on the same line or the next line after the closing ) of each(...).
+    for m in re.finditer(r"it\.each\b[\s\S]*?\)\s*\(\s*\n?\s*'([^']+)'", source):
+        actual_labels.add(m.group(1))
+
+    listed_labels = set(entry["test_ids"])
+
+    missing_from_manifest = sorted(actual_labels - listed_labels)
+    extra_in_manifest = sorted(listed_labels - actual_labels)
+
+    assert not missing_from_manifest, (
+        "These test labels exist in strategic-resident.test.ts but are NOT "
+        "listed in the protect manifest. Add them so deletion of any resident "
+        "handler test is caught:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "strategic-resident.test.ts. Update the manifest:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
 def test_no_removed_resident_task_type_in_task_capabilities():
     """R3: The strategic_resident_turn TaskType must not reappear.
 
