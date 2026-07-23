@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { ConfirmDialog } from './ConfirmDialog';
-import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -123,6 +123,48 @@ describe('ConfirmDialog — viewport regression', () => {
             message="The deploy could not be independently verified live. To force-clear, enter an attestation reason (required)."
             confirmLabel="Force clear"
             attestationInput={{ label: 'Attestation reason', placeholder: 'e.g. verified live by hand' }}
+            onConfirm={() => {}}
+            onCancel={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('confirm and cancel buttons meet minimum touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ConfirmDialog
+            title="Are you sure?"
+            message="This action cannot be undone."
+            confirmLabel="Confirm"
+            onConfirm={() => {}}
+            onCancel={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('renders without overflow at 1280px with long content', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ConfirmDialog
+            title="Are you sure you want to delete this research direction with all its associated findings and audit history?"
+            message="This action cannot be undone. All research findings, cycle history, and strategic decisions tied to this direction will be permanently removed from the system. Any active tasks referencing this direction will be orphaned."
+            confirmLabel="Delete Permanently"
             onConfirm={() => {}}
             onCancel={() => {}}
           />,
