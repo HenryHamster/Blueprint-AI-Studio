@@ -50,7 +50,7 @@
     "rollup_management.py": 6450,
     "rollup_migration_validation.py": 1350,
     "reaper.py": 4250,
-    "reaper_sweeps.py": 4000,
+    "reaper_sweeps.py": 4750,
     "reaper_fleet_health_sweeps.py": 500,
     "reaper_bug_message_sweeps.py": 1700,
     "reaper_evaluating_sweeps.py": 600,
@@ -372,11 +372,11 @@
     "test_release_qualifier.py": 52500,
     "test_operator_inbox_liveness.py": 2400,
     "test_compute_image_build_local.py": 9400,
-    "test_shard_balance.py": 100,
     "test_compute_runner_dispatch.py": 3350,
     "test_compute_gcp_startup.py": 2200,
+    "test_max_plan_pool_usage.py": 2750,
+    "test_shard_balance.py": 100,
     "test_admin_routers__messages.py": 5250,
-    "test_admin_routers__version_lifecycle.py": 4800,
-    "test_max_plan_pool_usage.py": 2750
+    "test_admin_routers__version_lifecycle.py": 4800
   }
 }

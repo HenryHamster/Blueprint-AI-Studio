@@ -721,8 +721,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [pendingConvertMsg, setPendingConvertMsg] = useState<ProjectMessage | null>(null);
   const [convertSubmitting, setConvertSubmitting] = useState(false);
   // Per-message action state
-  const [resolvingId, setResolvingId] = useState<string | null>(null);
-  const [resolveInput, setResolveInput] = useState('');
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [creatingDirectionIds, setCreatingDirectionIds] = useState<Set<string>>(new Set());
   const [investigatingId, setInvestigatingId] = useState<string | null>(null);
@@ -2240,22 +2238,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }
 
-  const handleResolve = useCallback(async (msgId: string, resolution: string) => {
-    setResolvingId(null);
-    setResolveInput('');
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msgId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resolution }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await fetchMessages();
-    } catch {
-      addToastRef.current('Failed to resolve message', 'error');
-    }
-  }, [fetchMessages]);
-
   const handleDelete = useCallback(async (msgId: string) => {
     setDeletingIds(prev => new Set(prev).add(msgId));
     try {
@@ -2447,30 +2429,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     setSelectMode(false);
     if (count > 0) addToast(`${count} direction${count > 1 ? 's' : ''} created`, 'success');
   }
-
-  async function handleResolveGroup(msgs: ProjectMessage[]) {
-    try {
-      for (const m of msgs) {
-        await apiFetch(`${API_BASE_URL}/api/admin/messages/${m.id}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolution: '' }),
-        });
-      }
-      await fetchMessages();
-    } catch {
-      addToast('Failed to resolve messages', 'error');
-    }
-  }
-
   // Stable per-bubble handlers so `bubbleProps` keeps a stable identity across
   // renders (see React.memo on MessageBubble). Setters/refs are stable, so most
   // carry an empty dependency array; the rest depend only on their (already
   // memoized) target handler.
   const onCreateInvestigation = useCallback((msg: ProjectMessage) => { void handleCreateInvestigation(msg); }, [handleCreateInvestigation]);
   const onDelete = useCallback((msgId: string) => { void handleDelete(msgId); }, [handleDelete]);
-  const onStartResolve = useCallback((msgId: string) => { setResolvingId(msgId); setResolveInput(''); }, []);
-  const onCancelResolve = useCallback(() => setResolvingId(null), []);
   const onStartInvestigate = useCallback((msgId: string) => setInvestigatingId(msgId), []);
   const onCancelInvestigate = useCallback(() => setInvestigatingId(null), []);
   const onReply = useCallback((replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
@@ -2484,8 +2448,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
 
   const bubbleProps = useMemo(() => ({
     actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
-    resolvingId,
-    resolveInput,
     deletingIds,
     creatingDirectionIds,
     investigatingId,
@@ -2496,11 +2458,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     onToggleSelect: toggleSelect,
     onCreateDirection: handleOpenConvertModal,
     onCreateInvestigation,
-    onResolve: handleResolve,
     onDelete,
-    onStartResolve,
-    onCancelResolve,
-    onSetResolveInput: setResolveInput,
     onStartInvestigate,
     onCancelInvestigate,
     onReply,
@@ -2508,8 +2466,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     currentActorUserId: auth.currentUser?.uid ?? null,
   }), [
     conversationMode,
-    resolvingId,
-    resolveInput,
     deletingIds,
     creatingDirectionIds,
     investigatingId,
@@ -2520,10 +2476,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     toggleSelect,
     handleOpenConvertModal,
     onCreateInvestigation,
-    handleResolve,
     onDelete,
-    onStartResolve,
-    onCancelResolve,
     onStartInvestigate,
     onCancelInvestigate,
     onReply,
@@ -3073,7 +3026,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setShowTempMuteMenu={setShowTempMuteMenu}
         addTemporaryMute={addTemporaryMute}
         getTop3NoisyEventTypes={getTop3NoisyEventTypes}
-        handleResolveGroup={handleResolveGroup}
         handleBulkDeleteResolved={handleBulkDeleteResolved}
         scrollToBottom={scrollToBottom}
       />

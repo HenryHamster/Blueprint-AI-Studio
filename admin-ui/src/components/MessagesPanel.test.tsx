@@ -957,7 +957,7 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(el.querySelector('button[title="Create Direction"]')).not.toBeNull();
     expect(el.querySelector('button[title="Investigate"]')).not.toBeNull();
-    expect(el.querySelector('button[title="Resolve"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Resolve"]')).toBeNull();
     expect(el.querySelector('button[title="Delete"]')).not.toBeNull();
   });
 

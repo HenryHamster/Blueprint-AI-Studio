@@ -298,6 +298,7 @@ from app.reaper_sweeps import (
     sweep_resolve_stale_open_bug_messages,
     sweep_resolve_linked_messages,
     sweep_decay_stale_open_messages,
+    sweep_auto_resolve_answered_messages,
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
     sweep_deliver_task_wakes,
@@ -3173,6 +3174,21 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Stale-open-bug decay sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18f: Answered-question auto-resolve — close OPEN QUESTION and
+                # operator-action-needed messages that have received a genuine
+                # strategic/agent/system reply so they stop inflating the
+                # needs-action badge. BLOCKERs are never auto-resolved here.
+                _mark_reaper_progress()
+                try:
+                    await sweep_auto_resolve_answered_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Answered-message auto-resolve sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

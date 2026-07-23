@@ -4556,3 +4556,237 @@ class TestMessagesMuteWindow:
         assert put_resp.status_code == 404
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_notifications.py — Auto-resolve answered messages (reaper sweep)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAnsweredQuestionAutoResolves:
+    """Auto-resolve sweep: OPEN QUESTION with a strategic reply → resolved."""
+
+    @pytest.mark.asyncio
+    async def test_answered_question_auto_resolves(self, client: AsyncClient, db_session):
+        """An open QUESTION with a strategic reply auto-resolves and leaves needs-action."""
+        from app.reaper_sweeps import sweep_auto_resolve_answered_messages
+        from app.message_convergence import derive_needs_action
+        from app.message_audience import OPERATOR_ACTION_NEEDED
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        parent = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Please explain the failure.",
+            status="open",
+            context={"audience": OPERATOR_ACTION_NEEDED},
+        )
+        db_session.add(parent)
+        await db_session.flush()
+
+        reply = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="Here is the explanation.",
+            status="open",
+            reply_to_message_id=parent.id,
+        )
+        db_session.add(reply)
+        await db_session.commit()
+
+        # Confirm it appears in the counts before the sweep
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        assert resp.json()["question"] == 1
+
+        count = await sweep_auto_resolve_answered_messages(db_session, now)
+        assert count == 1
+
+        await db_session.refresh(parent)
+        assert parent.status == "resolved"
+        assert parent.resolution == "answered"
+        assert not derive_needs_action(parent)
+
+        # Verify it disappears from the counts endpoint
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        assert resp.json()["question"] == 0
+
+    @pytest.mark.asyncio
+    async def test_answered_question_no_reply_stays_open(self, client: AsyncClient, db_session):
+        """An open QUESTION with no reply must remain open."""
+        from app.reaper_sweeps import sweep_auto_resolve_answered_messages
+        from app.message_audience import OPERATOR_ACTION_NEEDED
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        parent = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Unanswered question.",
+            status="open",
+            context={"audience": OPERATOR_ACTION_NEEDED},
+        )
+        db_session.add(parent)
+        await db_session.commit()
+
+        count = await sweep_auto_resolve_answered_messages(db_session, now)
+        assert count == 0
+
+        await db_session.refresh(parent)
+        assert parent.status == "open"
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        assert resp.json()["question"] == 1
+
+    @pytest.mark.asyncio
+    async def test_answered_blocker_not_auto_resolved(self, client: AsyncClient, db_session):
+        """A BLOCKER with a strategic reply must NOT be auto-resolved."""
+        from app.reaper_sweeps import sweep_auto_resolve_answered_messages
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        blocker = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="system",
+            content="Critical blocker.",
+            status="open",
+        )
+        db_session.add(blocker)
+        await db_session.flush()
+
+        reply = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="Working on it.",
+            status="open",
+            reply_to_message_id=blocker.id,
+        )
+        db_session.add(reply)
+        await db_session.commit()
+
+        count = await sweep_auto_resolve_answered_messages(db_session, now)
+        assert count == 0
+
+        await db_session.refresh(blocker)
+        assert blocker.status == "open"
+
+    @pytest.mark.asyncio
+    async def test_answered_operator_action_needed_note_resolves(self, db_session):
+        """An open NOTE with operator-action-needed audience and a strategic reply auto-resolves."""
+        from app.reaper_sweeps import sweep_auto_resolve_answered_messages
+        from app.message_convergence import derive_needs_action
+        from app.message_audience import OPERATOR_ACTION_NEEDED
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        parent = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="Action required.",
+            status="open",
+            context={"audience": OPERATOR_ACTION_NEEDED},
+        )
+        db_session.add(parent)
+        await db_session.flush()
+
+        reply = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="agent",
+            content="Done.",
+            status="open",
+            reply_to_message_id=parent.id,
+        )
+        db_session.add(reply)
+        await db_session.commit()
+
+        count = await sweep_auto_resolve_answered_messages(db_session, now)
+        assert count == 1
+
+        await db_session.refresh(parent)
+        assert parent.status == "resolved"
+        assert not derive_needs_action(parent)
+
+    @pytest.mark.asyncio
+    async def test_answered_question_user_reply_does_not_resolve(self, db_session):
+        """A reply from from_type='user' must NOT trigger auto-resolution."""
+        from app.reaper_sweeps import sweep_auto_resolve_answered_messages
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        parent = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Machine question.",
+            status="open",
+        )
+        db_session.add(parent)
+        await db_session.flush()
+
+        reply = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="User reply that shouldn't trigger.",
+            status="open",
+            reply_to_message_id=parent.id,
+        )
+        db_session.add(reply)
+        await db_session.commit()
+
+        count = await sweep_auto_resolve_answered_messages(db_session, now)
+        assert count == 0
+
+        await db_session.refresh(parent)
+        assert parent.status == "open"
+
+    @pytest.mark.asyncio
+    async def test_answered_question_already_resolved_is_idempotent(self, db_session):
+        """Already-resolved QUESTION with a strategic reply → sweep returns 0 (idempotent)."""
+        from app.reaper_sweeps import sweep_auto_resolve_answered_messages
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        parent = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="user",
+            content="Already resolved.",
+            status="resolved",
+            resolution="manual",
+        )
+        db_session.add(parent)
+        await db_session.flush()
+
+        reply = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="Response.",
+            status="open",
+            reply_to_message_id=parent.id,
+        )
+        db_session.add(reply)
+        await db_session.commit()
+
+        count = await sweep_auto_resolve_answered_messages(db_session, now)
+        assert count == 0
+
+        await db_session.refresh(parent)
+        assert parent.status == "resolved"
+        assert parent.resolution == "manual"
+

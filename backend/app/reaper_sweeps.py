@@ -2401,6 +2401,137 @@ async def sweep_decay_stale_open_messages(
     return resolved
 
 
+async def sweep_auto_resolve_answered_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Auto-resolve OPEN QUESTION / operator-action-needed messages that have a strategic reply.
+
+    A QUESTION or operator-action-needed NOTE/FEEDBACK that has received at
+    least one child reply authored by a non-operator party (from_type in
+    {'strategic', 'agent', 'system'}) is considered answered and resolved with
+    resolution='answered'.  BLOCKER messages are explicitly excluded — they
+    require explicit operator confirmation regardless of replies.
+
+    Uses only DURABLE fields (status, message_type, reply_to_message_id,
+    from_type) — never handling_state, which can be reverted by the
+    migration-0608 compat trigger.
+
+    Idempotent: targets status='open' only; re-runs find nothing.
+    Bounded at batch_size rows per cycle; broadcasts 'message_updated' per
+    resolved row.  Returns number of messages resolved.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+    from app.models import MessageType, ProjectMessage
+    from app.message_convergence import OPEN_STATUS, mark_message_resolved
+    from app.project_message_projection import message_updated_event_payload
+
+    # Fetch candidate parent messages: OPEN, non-BLOCKER, and whose
+    # message_type is QUESTION OR context audience is operator-action-needed.
+    # We load a bounded batch and filter per-row (the audience check is a JSONB
+    # field; doing the IN(...) on message_type first keeps the index hit tight).
+    CANDIDATE_TYPES = [MessageType.QUESTION.value, MessageType.NOTE.value, MessageType.FEEDBACK.value]
+    candidates = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.message_type.in_(CANDIDATE_TYPES),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not candidates:
+        return 0
+
+    if len(candidates) >= batch_size:
+        logger.warning(
+            "[REAPER] answered-message sweep hit cap=%d open candidate "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+
+    # Narrow to messages that qualify: QUESTION type OR operator-action-needed audience.
+    eligible_ids = []
+    for msg in candidates:
+        msg_type = msg.message_type.value if hasattr(msg.message_type, "value") else str(msg.message_type)
+        if msg_type == MessageType.QUESTION.value:
+            eligible_ids.append(msg.id)
+            continue
+        ctx = msg.context or {}
+        if ctx.get("audience") == OPERATOR_ACTION_NEEDED:
+            eligible_ids.append(msg.id)
+
+    if not eligible_ids:
+        return 0
+
+    # For each eligible parent, check whether a strategic/agent/system reply exists.
+    _NON_OPERATOR_FROM_TYPES = ("strategic", "agent", "system")
+    replied_ids: set = set()
+    for chunk_start in range(0, len(eligible_ids), 500):
+        chunk = eligible_ids[chunk_start : chunk_start + 500]
+        reply_rows = (
+            await session.execute(
+                select(ProjectMessage.reply_to_message_id)
+                .where(
+                    ProjectMessage.reply_to_message_id.in_(chunk),
+                    ProjectMessage.from_type.in_(list(_NON_OPERATOR_FROM_TYPES)),
+                )
+                .distinct()
+            )
+        ).scalars().all()
+        replied_ids.update(reply_rows)
+
+    if not replied_ids:
+        return 0
+
+    # Build a fast lookup: id -> msg object
+    id_to_msg = {msg.id: msg for msg in candidates}
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg_id in replied_ids:
+        msg = id_to_msg.get(msg_id)
+        if msg is None or msg.status != OPEN_STATUS:
+            continue
+        mark_message_resolved(msg, now, "answered")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] answered-message sweep: auto-resolved %s message %s (strategic reply present)",
+            msg.message_type.value if hasattr(msg.message_type, "value") else msg.message_type,
+            msg.id,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] answered-message sweep broadcast failed for %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] answered-message sweep: auto-resolved %d message(s)",
+            resolved,
+        )
+    return resolved
+
+
 # ── Re-exports from extracted sub-module ─────────────────────────────────────
 #
 # These symbols were extracted to app.reaper_bug_message_sweeps. They are
@@ -3957,6 +4088,7 @@ __all__ = [
     "sweep_resolve_stale_open_bug_messages",
     "sweep_resolve_linked_messages",
     "sweep_decay_stale_open_messages",
+    "sweep_auto_resolve_answered_messages",
     "sweep_decay_stale_pending_confirmations",
     "STALE_OPEN_DECAY_DAYS",
     "STALE_OPEN_BUG_CLASS_DECAY_DAYS",

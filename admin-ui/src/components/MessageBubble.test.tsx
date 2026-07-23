@@ -33,8 +33,6 @@ function makeProps(overrides: Partial<MessageBubbleProps> = {}): MessageBubblePr
     faded: false,
     readOnly: false,
     replyTarget: null,
-    resolvingId: null,
-    resolveInput: '',
     deletingIds: new Set(),
     creatingDirectionIds: new Set(),
     investigatingId: null,
@@ -44,11 +42,7 @@ function makeProps(overrides: Partial<MessageBubbleProps> = {}): MessageBubblePr
     onToggleSelect: vi.fn(),
     onCreateDirection: vi.fn(),
     onCreateInvestigation: vi.fn(),
-    onResolve: vi.fn(),
     onDelete: vi.fn(),
-    onStartResolve: vi.fn(),
-    onCancelResolve: vi.fn(),
-    onSetResolveInput: vi.fn(),
     onStartInvestigate: vi.fn(),
     onCancelInvestigate: vi.fn(),
     onReply: vi.fn(),
@@ -81,46 +75,12 @@ describe('MessageBubble', () => {
     expect(screen.getByText('Hello from test')).toBeTruthy();
   });
 
-  test('resolve action: clicking resolve calls onStartResolve', () => {
-    const onStartResolve = vi.fn();
-    // Resolve is an actionable-row (QUESTION/BLOCKER) affordance only.
-    render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type: 'BLOCKER' }), onStartResolve })} />);
-    const resolveBtn = screen.getByTitle('Resolve');
-    fireEvent.click(resolveBtn);
-    expect(onStartResolve).toHaveBeenCalledWith('msg-1');
-  });
-
-  test('resolve action: confirm calls onResolve with current resolveInput', () => {
-    const onResolve = vi.fn();
-    render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type: 'BLOCKER' }), resolvingId: 'msg-1', resolveInput: 'fixed it', onResolve })} />);
-    const confirmBtn = screen.getByTitle('Confirm resolve');
-    fireEvent.click(confirmBtn);
-    expect(onResolve).toHaveBeenCalledWith('msg-1', 'fixed it');
-  });
-
-  test('resolve action: cancel calls onCancelResolve', () => {
-    const onCancelResolve = vi.fn();
-    render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type: 'BLOCKER' }), resolvingId: 'msg-1', resolveInput: '', onCancelResolve })} />);
-    // The cancel button is the X next to the resolve confirm
-    const cancelBtns = screen.getAllByTitle('Cancel');
-    fireEvent.click(cancelBtns[0]);
-    expect(onCancelResolve).toHaveBeenCalled();
-  });
-
-  test('conversational rows (NOTE/FEEDBACK/BUG_REPORT) have no manual resolve control', () => {
-    for (const message_type of ['NOTE', 'FEEDBACK', 'BUG_REPORT'] as const) {
+  test('no message type shows the manual resolve control (affordance retired)', () => {
+    for (const message_type of ['NOTE', 'FEEDBACK', 'BUG_REPORT', 'QUESTION', 'BLOCKER'] as const) {
       const { unmount } = render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type }) })} />);
       expect(screen.queryByTitle('Resolve')).toBeNull();
       // Other transcript affordances remain available.
       expect(screen.getByTitle('Reply')).toBeTruthy();
-      unmount();
-    }
-  });
-
-  test('actionable rows (QUESTION/BLOCKER) keep the manual resolve control', () => {
-    for (const message_type of ['QUESTION', 'BLOCKER'] as const) {
-      const { unmount } = render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type }) })} />);
-      expect(screen.getByTitle('Resolve')).toBeTruthy();
       unmount();
     }
   });
@@ -161,13 +121,11 @@ describe('MessageBubble', () => {
 
   test('no action buttons when faded=true (resolved message display)', () => {
     render(<MessageBubble {...makeProps({ faded: true })} />);
-    expect(screen.queryByTitle('Resolve')).toBeNull();
     expect(screen.queryByTitle('Delete')).toBeNull();
   });
 
   test('no action buttons when readOnly=true', () => {
     render(<MessageBubble {...makeProps({ readOnly: true })} />);
-    expect(screen.queryByTitle('Resolve')).toBeNull();
     expect(screen.queryByTitle('Delete')).toBeNull();
   });
 
@@ -179,7 +137,6 @@ describe('MessageBubble', () => {
       onReply,
     })} />);
 
-    expect(screen.queryByTitle('Resolve')).toBeNull();
     expect(screen.queryByTitle('Delete')).toBeNull();
     expect(screen.queryByTitle('Create Direction')).toBeNull();
 
@@ -219,7 +176,6 @@ describe('MessageBubble', () => {
     expect(screen.queryByText('Failure alert')).toBeNull();
     expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
     expect(screen.queryByTitle('Copy message ref')).toBeNull();
-    expect(screen.queryByTitle('Resolve')).toBeNull();
     expect(screen.queryByTitle('Delete')).toBeNull();
     expect(screen.queryByTitle('Create Direction')).toBeNull();
 
@@ -497,81 +453,6 @@ describe('MessageBubble', () => {
     expect(screen.queryByText('some cited code missing on HEAD')).toBeNull();
     expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
     expect(screen.queryByText('citations could not be verified')).toBeNull();
-  });
-
-  test('QUESTION resolve: placeholder says "Your answer (required)..."', () => {
-    render(<MessageBubble {...makeProps({
-      msg: makeMsg({ message_type: 'QUESTION' }),
-      resolvingId: 'msg-1',
-      resolveInput: '',
-    })} />);
-    const input = screen.getByPlaceholderText('Your answer (required)...');
-    expect(input).toBeTruthy();
-  });
-
-  test('QUESTION resolve: confirm button is disabled when input is empty', () => {
-    render(<MessageBubble {...makeProps({
-      msg: makeMsg({ message_type: 'QUESTION' }),
-      resolvingId: 'msg-1',
-      resolveInput: '',
-    })} />);
-    const confirmBtn = screen.getByTitle('Confirm resolve') as HTMLButtonElement;
-    expect(confirmBtn.disabled).toBe(true);
-  });
-
-  test('QUESTION resolve: confirm button is enabled when input has text', () => {
-    render(<MessageBubble {...makeProps({
-      msg: makeMsg({ message_type: 'QUESTION' }),
-      resolvingId: 'msg-1',
-      resolveInput: 'my answer',
-    })} />);
-    const confirmBtn = screen.getByTitle('Confirm resolve') as HTMLButtonElement;
-    expect(confirmBtn.disabled).toBe(false);
-  });
-
-  test('QUESTION resolve: Enter key with empty input does not call onResolve', () => {
-    const onResolve = vi.fn();
-    render(<MessageBubble {...makeProps({
-      msg: makeMsg({ message_type: 'QUESTION' }),
-      resolvingId: 'msg-1',
-      resolveInput: '',
-      onResolve,
-    })} />);
-    const input = screen.getByPlaceholderText('Your answer (required)...');
-    fireEvent.keyDown(input, { key: 'Enter' });
-    expect(onResolve).not.toHaveBeenCalled();
-  });
-
-  test('QUESTION resolve: Enter key with non-empty input calls onResolve', () => {
-    const onResolve = vi.fn();
-    render(<MessageBubble {...makeProps({
-      msg: makeMsg({ message_type: 'QUESTION' }),
-      resolvingId: 'msg-1',
-      resolveInput: 'my answer',
-      onResolve,
-    })} />);
-    const input = screen.getByPlaceholderText('Your answer (required)...');
-    fireEvent.keyDown(input, { key: 'Enter' });
-    expect(onResolve).toHaveBeenCalledWith('msg-1', 'my answer');
-  });
-
-  test('non-QUESTION resolve: placeholder says "Note (optional)..."', () => {
-    render(<MessageBubble {...makeProps({
-      msg: makeMsg({ message_type: 'BLOCKER' }),
-      resolvingId: 'msg-1',
-      resolveInput: '',
-    })} />);
-    expect(screen.getByPlaceholderText('Note (optional)...')).toBeTruthy();
-  });
-
-  test('non-QUESTION resolve: confirm button enabled with empty input', () => {
-    render(<MessageBubble {...makeProps({
-      msg: makeMsg({ message_type: 'BLOCKER' }),
-      resolvingId: 'msg-1',
-      resolveInput: '',
-    })} />);
-    const confirmBtn = screen.getByTitle('Confirm resolve') as HTMLButtonElement;
-    expect(confirmBtn.disabled).toBe(false);
   });
 
   test('data-testid message-bubble is set', () => {

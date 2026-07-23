@@ -1,6 +1,6 @@
 /* eslint-disable react-hooks/refs */
 import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef, useCallback, useImperativeHandle } from 'react';
-import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, Check, MoreVertical } from 'lucide-react';
+import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, MoreVertical } from 'lucide-react';
 import { List, useDynamicRowHeight, useListRef, type RowComponentProps, type ListImperativeAPI } from 'react-window';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
 import { type RoutineRow, routineSummary, formatDailyDigestSummary, outcomeBreakdown, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
@@ -84,7 +84,6 @@ interface TriageRowData {
   setShowResolved: Dispatch<SetStateAction<boolean>>;
   setShowTempMuteMenu: Dispatch<SetStateAction<boolean>>;
   addTemporaryMute: (eventType: string, durationMs: number) => void;
-  handleResolveGroup: (msgs: ProjectMessage[]) => void;
   handleBulkDeleteResolved: () => void;
 }
 
@@ -116,7 +115,6 @@ function TriageRow({
   setShowResolved,
   setShowTempMuteMenu,
   addTemporaryMute,
-  handleResolveGroup,
   handleBulkDeleteResolved,
 }: RowComponentProps<TriageRowData>) {
   const item = items[index];
@@ -359,13 +357,6 @@ function TriageRow({
               </span>
               {bd && <span className="text-xs text-red-400">{bd}</span>}
             </button>
-            <button
-              onClick={() => handleResolveGroup(msgs)}
-              title="Resolve all"
-              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-            >
-              <Check className="w-3 h-3" />
-            </button>
           </div>
           {isExpanded && (
             <div className="space-y-2 p-2 border-t border-red-900/40">
@@ -477,13 +468,6 @@ function TriageRow({
             >
               <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
               <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
-            </button>
-            <button
-              onClick={() => handleResolveGroup(row.msgs)}
-              title="Resolve all"
-              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-            >
-              <Check className="w-3 h-3" />
             </button>
           </div>
           {isExpanded && (
@@ -812,7 +796,6 @@ export interface MessagesListViewProps {
   setShowTempMuteMenu: Dispatch<SetStateAction<boolean>>;
   addTemporaryMute: (eventType: string, durationMs: number) => void;
   getTop3NoisyEventTypes: () => Array<[string, number]>;
-  handleResolveGroup: (msgs: ProjectMessage[]) => void;
   handleBulkDeleteResolved: () => void;
   scrollToBottom: () => void;
 }
@@ -1117,7 +1100,6 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     setShowTempMuteMenu,
     addTemporaryMute,
     getTop3NoisyEventTypes,
-    handleResolveGroup,
     handleBulkDeleteResolved,
     hasOlderTriageMessages,
     loadingOlderTriageMessages,
@@ -1207,7 +1189,6 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     setShowResolved,
     setShowTempMuteMenu,
     addTemporaryMute,
-    handleResolveGroup,
     handleBulkDeleteResolved,
   }), [
     items, messagesById, dividerTime, totalNewCount,
@@ -1216,7 +1197,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     sectionIndices, bubbleProps, highlightedMessageId,
     visibleRoutineCount, mutedRoutineCount, routineOpen,
     onDismissDivider, onShowOnlyNew, setExpandedGroupKeys, setRoutineExpanded,
-    setShowResolved, setShowTempMuteMenu, addTemporaryMute, handleResolveGroup,
+    setShowResolved, setShowTempMuteMenu, addTemporaryMute,
     handleBulkDeleteResolved,
   ]);
 
