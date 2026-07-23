@@ -11521,3 +11521,140 @@ async def test_efficiency_table_retention_caps_at_seven(db_session):
     assert len(rows) == _SNAPSHOT_HISTORY_MAX
     # Newest window retained.
     assert rows[0].blob["i"] == _SNAPSHOT_HISTORY_MAX + 3
+
+
+# ---------------------------------------------------------------------------
+# Tests: endpoint snapshot-history merges design_doc + table rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_warm_reuse_dropout_trend_merges_table_rows(
+    client: AsyncClient, db_session
+):
+    """warm-reuse-dropout-trend must surface snapshots from the table, not only design_doc."""
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    # Seed a snapshot exclusively in the table (no design_doc entry).
+    cap = _utcnow()
+    table_snap = {
+        "captured_at": cap.isoformat(),
+        "reuse_dropout": {
+            "dropout_total": 7,
+            "dominant_dropout": {"reason": "table_only_reason", "share": 0.75},
+        },
+    }
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=cap,
+        metric_def_version=METRIC_DEF_VERSION,
+        blob=table_snap,
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/warm-reuse-dropout-trend"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "buckets" in data
+    reasons = [b["dominant_reason"] for b in data["buckets"]]
+    assert "table_only_reason" in reasons, (
+        "endpoint must include table-sourced snapshots; got: " + str(data["buckets"])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_pool_dispatch_funnel_trend_merges_table_rows(
+    client: AsyncClient, db_session
+):
+    """pool-dispatch-funnel-trend must surface snapshots from the table, not only design_doc."""
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    cap = _utcnow()
+    table_snap = {
+        "captured_at": cap.isoformat(),
+        "pool_dispatch_funnel": {
+            "pool_lease_hits": 10,
+            "cold_dispatches": 5,
+            "pool_hit_rate": 0.67,
+            "lease_miss_total": 3,
+            "dominant_miss": {"reason": "table_miss_reason", "share": 0.6},
+        },
+    }
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=cap,
+        metric_def_version=METRIC_DEF_VERSION,
+        blob=table_snap,
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-dispatch-funnel-trend"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "buckets" in data
+    reasons = [b["dominant_miss_reason"] for b in data["buckets"]]
+    assert "table_miss_reason" in reasons, (
+        "endpoint must include table-sourced snapshots; got: " + str(data["buckets"])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_batch_read_snapshot_histories_merges_table_rows(db_session):
+    """_batch_read_snapshot_histories includes table-only rows absent from design_doc."""
+    from app.efficiency_snapshot import _batch_read_snapshot_histories
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cap = _utcnow()
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=cap,
+        metric_def_version=METRIC_DEF_VERSION,
+        blob={"captured_at": cap.isoformat(), "source": "table"},
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    histories = await _batch_read_snapshot_histories(db_session, [project])
+    snaps = histories.get(project.id, [])
+    sources = [s.get("source") for s in snaps]
+    assert "table" in sources, (
+        "_batch_read_snapshot_histories must merge table rows; got: " + str(snaps)
+    )

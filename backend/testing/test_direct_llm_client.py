@@ -188,6 +188,49 @@ def test_normalize_rate_limit_data_exhausted_status():
     assert result["unified_5h"]["utilization"] == 100.0
 
 
+def test_normalize_rate_limit_data_with_unified_7d_headers():
+    """unified_7d bucket is extracted and utilization computed from 7d headers."""
+    from app.direct_llm_client import normalize_rate_limit_data
+
+    raw_headers = {
+        "anthropic-ratelimit-unified-7d-remaining": "3000000",
+        "anthropic-ratelimit-unified-7d-limit": "10000000",
+        "anthropic-ratelimit-unified-7d-status": "live",
+        "anthropic-ratelimit-unified-7d-reset": "2026-07-16T00:00:00Z",
+    }
+    result = normalize_rate_limit_data(raw_headers)
+
+    assert "unified_7d" in result
+    assert result["unified_7d"]["remaining_tokens"] == 3000000
+    assert result["unified_7d"]["limit_tokens"] == 10000000
+    assert result["unified_7d"]["status"] == "live"
+    assert result["unified_7d"]["resets_at"] == "2026-07-16T00:00:00Z"
+    # (1 - 3000000/10000000) * 100 = 70.0
+    assert result["unified_7d"]["utilization"] == 70.0
+
+
+def test_normalize_rate_limit_data_with_both_unified_windows():
+    """Both unified_5h and unified_7d buckets are populated simultaneously."""
+    from app.direct_llm_client import normalize_rate_limit_data
+
+    raw_headers = {
+        "anthropic-ratelimit-unified-5h-remaining": "400000",
+        "anthropic-ratelimit-unified-5h-limit": "1000000",
+        "anthropic-ratelimit-unified-5h-status": "live",
+        "anthropic-ratelimit-unified-5h-reset": "2026-07-09T18:00:00Z",
+        "anthropic-ratelimit-unified-7d-remaining": "6000000",
+        "anthropic-ratelimit-unified-7d-limit": "10000000",
+        "anthropic-ratelimit-unified-7d-status": "live",
+        "anthropic-ratelimit-unified-7d-reset": "2026-07-16T00:00:00Z",
+    }
+    result = normalize_rate_limit_data(raw_headers)
+
+    assert result["unified_5h"]["utilization"] == 60.0
+    assert result["unified_5h"]["remaining_tokens"] == 400000
+    assert result["unified_7d"]["utilization"] == 40.0
+    assert result["unified_7d"]["remaining_tokens"] == 6000000
+
+
 # ---------------------------------------------------------------------------
 # call_direct_llm — rate-limit header extraction
 # ---------------------------------------------------------------------------

@@ -7487,7 +7487,7 @@ async def test_strategic_state_currency_is_non_blocking(
     resolved_event = asyncio.Event()
 
     async def _slow_resolve(*args, **kwargs):
-        await asyncio.sleep(2)
+        await asyncio.sleep(0)
         resolved_event.set()
         return {"current": True, "candidate_sha": sha, "head_sha": sha}
 

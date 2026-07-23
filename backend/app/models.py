@@ -4026,17 +4026,26 @@ class MaxPlanAccount(SQLModel, table=True):
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Persisted rate-limit/usage headroom snapshot (latest probe data). Populated
-    # by _refresh_usage_snapshot in max_plan_pool on each successful probe so
-    # the data survives orchestrator restarts, and read back by
+    # by _persist_rate_limit_usage_to_db in max_plan_pool on each successful probe
+    # so the data survives orchestrator restarts, and read back by
     # load_max_plan_pool to re-seed the in-memory usage meter.
-    # Structure: {"five_hour": {"utilization": float, "resets_at": str},
-    #             "seven_day": {"utilization": float, "resets_at": str},
-    #             "updated_at": str, "source": "oauth_usage_probe"}
-    # The OAuth usage probe (anthropic OAuth accounts only) is the SOLE writer.
-    # Messages-API rate-limit headers (direct_llm_client) are NOT persisted
-    # here: inline LLM calls authenticate with the org-level ANTHROPIC_API_KEY
-    # env credential, so their headers describe the org key's limits, not any
-    # pool account's plan — attributing them to an account row would be wrong.
+    #
+    # Two source schemas may appear here (keyed by "source"):
+    #
+    # 1. oauth_usage_probe (Anthropic OAuth accounts):
+    #    {"five_hour": {"utilization": float, "resets_at": str},
+    #     "seven_day":  {"utilization": float, "resets_at": str},
+    #     "updated_at": str, "source": "oauth_usage_probe"}
+    #
+    # 2. messages_api_header (API-key accounts, from per-response rate-limit
+    #    headers returned by the Messages API):
+    #    {"unified_5h": {"utilization": float, "resets_at": str | None},
+    #     "remaining_tokens": int | None, "limit_tokens": int | None,
+    #     "updated_at": str, "source": "messages_api_header"}
+    #    The unified_5h utilization is on a 0..100 scale; _snapshot_from_persisted
+    #    _usage maps it to the five_hour window when rebuilding UsageSnapshot.
+    #
+    # Reader: _snapshot_from_persisted_usage (max_plan_pool) accepts both schemas.
     rate_limit_usage: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )

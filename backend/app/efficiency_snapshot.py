@@ -25,7 +25,7 @@ import statistics
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, or_
@@ -50,6 +50,7 @@ from app.models import (
     PoolVm,
     PoolVmState,
     Project,
+    ProjectEfficiencySnapshot,
     Task,
     TaskStatus,
     _utcnow,
@@ -445,6 +446,64 @@ async def _read_snapshot_history(
     if len(merged) > _SNAPSHOT_HISTORY_MAX:
         merged = merged[-_SNAPSHOT_HISTORY_MAX:]
     return merged
+
+
+async def _batch_read_snapshot_histories(
+    session: AsyncSession,
+    projects: Sequence[Project],
+) -> Dict[uuid.UUID, list[Dict[str, Any]]]:
+    """Return merged snapshot history for each project (one batch DB query).
+
+    Equivalent to calling :func:`_read_snapshot_history` once per project but
+    issues a single ``IN (...)`` query to the ``project_efficiency_snapshot``
+    table instead of N separate queries, making it safe for fleet-wide use.
+    """
+    if not projects:
+        return {}
+
+    project_ids = [p.id for p in projects]
+    result = await session.execute(
+        select(ProjectEfficiencySnapshot)
+        .where(ProjectEfficiencySnapshot.project_id.in_(project_ids))
+        .order_by(ProjectEfficiencySnapshot.captured_at.desc())
+    )
+    table_rows_by_project: Dict[uuid.UUID, list[ProjectEfficiencySnapshot]] = {}
+    for row in result.scalars().all():
+        table_rows_by_project.setdefault(row.project_id, []).append(row)
+
+    histories: Dict[uuid.UUID, list[Dict[str, Any]]] = {}
+    for project in projects:
+        container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+        by_captured_at: Dict[Any, Dict[str, Any]] = {}
+        order: list[Any] = []
+
+        def _add(snap: Any, _bca: dict = by_captured_at, _ord: list = order) -> None:  # noqa: ANN001
+            if not isinstance(snap, Mapping):
+                return
+            key = snap.get("captured_at")
+            if key is None:
+                key = ("__no_captured_at__", id(snap))
+            if key not in _bca:
+                _ord.append(key)
+            _bca[key] = dict(snap)
+
+        for snap in container.get("snapshots") or []:
+            _add(snap)
+        for row in table_rows_by_project.get(project.id, []):
+            _add(row.blob)
+
+        def _sort_key(key: Any, _bca: dict = by_captured_at) -> tuple:  # noqa: ANN001
+            captured = _bca[key].get("captured_at")
+            if isinstance(captured, str) and captured:
+                return (1, captured)
+            return (0, "")
+
+        merged = [by_captured_at[k] for k in sorted(order, key=_sort_key)]
+        if len(merged) > _SNAPSHOT_HISTORY_MAX:
+            merged = merged[-_SNAPSHOT_HISTORY_MAX:]
+        histories[project.id] = merged
+
+    return histories
 
 
 async def _load_recent_tasks(

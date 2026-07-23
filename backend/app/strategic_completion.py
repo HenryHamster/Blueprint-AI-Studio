@@ -3818,8 +3818,11 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
     try:
         first_payload = task.first_payload or {}
         packer_meta = first_payload.get("_packer_meta") or {}
-    except Exception:  # noqa: BLE001, S110
-        pass
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to read packer metadata from task.first_payload",
+            exc_info=True,
+        )
 
     dropped: list = packer_meta.get("dropped") or []
     trimmed: list = packer_meta.get("trimmed") or []

@@ -927,6 +927,90 @@ class TestAnthropicUsageNormalization:
         assert snap.known is False
 
 
+class TestSnapshotFromRateLimitData:
+    """Unit tests for _snapshot_from_rate_limit_data (API-key header path)."""
+
+    def test_five_hour_only_yields_known_snapshot(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        blob = {
+            "source": "messages_api_header",
+            "unified_5h": {
+                "remaining_tokens": 400000,
+                "limit_tokens": 1000000,
+                "utilization": 60.0,
+                "resets_at": "2026-07-09T18:00:00Z",
+            },
+        }
+        snap = _snapshot_from_rate_limit_data(blob, "2026-07-09T12:00:00Z")
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 60.0
+        assert snap.resets_at["five_hour"] == "2026-07-09T18:00:00Z"
+        assert "seven_day" not in snap.window_utilizations
+        assert snap.probed_at == "2026-07-09T12:00:00Z"
+
+    def test_both_unified_windows_yields_five_and_seven_day(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        blob = {
+            "source": "messages_api_header",
+            "unified_5h": {
+                "remaining_tokens": 400000,
+                "limit_tokens": 1000000,
+                "utilization": 60.0,
+                "resets_at": "2026-07-09T18:00:00Z",
+            },
+            "unified_7d": {
+                "remaining_tokens": 3000000,
+                "limit_tokens": 10000000,
+                "utilization": 70.0,
+                "resets_at": "2026-07-16T00:00:00Z",
+            },
+        }
+        snap = _snapshot_from_rate_limit_data(blob, "2026-07-09T12:00:00Z")
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 60.0
+        assert snap.window_utilizations["seven_day"] == 70.0
+        assert snap.resets_at["seven_day"] == "2026-07-16T00:00:00Z"
+        assert set(snap.load_bearing_utilizations()) == {60.0, 70.0}
+
+    def test_seven_day_without_five_hour_is_still_unknown(self):
+        """five_hour is load-bearing; missing it returns unknown even if 7d present."""
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        blob = {
+            "source": "messages_api_header",
+            "unified_7d": {"utilization": 50.0},
+        }
+        snap = _snapshot_from_rate_limit_data(blob, "2026-07-09T12:00:00Z")
+        assert snap.known is False
+
+    def test_missing_blob_is_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        assert _snapshot_from_rate_limit_data(None, "n").known is False
+        assert _snapshot_from_rate_limit_data("garbage", "n").known is False
+
+    def test_five_hour_missing_utilization_is_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        blob = {"unified_5h": {"remaining_tokens": 400000, "status": "live"}}
+        snap = _snapshot_from_rate_limit_data(blob, "n")
+        assert snap.known is False
+
+    def test_seven_day_with_no_resets_at_sets_none(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        blob = {
+            "unified_5h": {"utilization": 10.0},
+            "unified_7d": {"utilization": 50.0},
+        }
+        snap = _snapshot_from_rate_limit_data(blob, "n")
+        assert snap.known is True
+        assert snap.window_utilizations["seven_day"] == 50.0
+        assert snap.resets_at.get("seven_day") is None
+
+
 class TestAnthropicProbeUsage:
     @pytest.mark.asyncio
     async def test_probe_returns_known_snapshot_on_valid_response(self, monkeypatch):

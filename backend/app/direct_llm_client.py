@@ -136,6 +136,33 @@ def normalize_rate_limit_data(
             unified_5h["utilization"] = round(utilization, 1)
         normalized["unified_5h"] = unified_5h
 
+    # Unified 7d window (API-key accounts only; absent on OAuth responses)
+    unified_7d: dict[str, Any] = {}
+    for key, raw_val in raw_headers.items():
+        lk = key.lower()
+        if "unified-7d" not in lk:
+            continue
+        val = parse_rate_limit_header_value(raw_val)
+        if "remaining" in lk and isinstance(val, int):
+            unified_7d["remaining_tokens"] = val
+        elif "limit" in lk and isinstance(val, int):
+            unified_7d["limit_tokens"] = val
+        elif "status" in lk and isinstance(val, str):
+            unified_7d["status"] = val
+        elif "reset" in lk and isinstance(val, str):
+            unified_7d["resets_at"] = val
+    if unified_7d:
+        if (
+            "remaining_tokens" in unified_7d
+            and "limit_tokens" in unified_7d
+            and unified_7d["limit_tokens"] > 0
+        ):
+            utilization = (
+                1.0 - unified_7d["remaining_tokens"] / unified_7d["limit_tokens"]
+            ) * 100.0
+            unified_7d["utilization"] = round(utilization, 1)
+        normalized["unified_7d"] = unified_7d
+
     # Per-request rate-limit
     requests: dict[str, Any] = {}
     for key, raw_val in raw_headers.items():

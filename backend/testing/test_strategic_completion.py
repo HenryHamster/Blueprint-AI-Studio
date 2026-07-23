@@ -8,6 +8,7 @@ Covers:
 """
 
 import json
+import logging
 import uuid
 import pytest
 import pytest_asyncio
@@ -17885,6 +17886,46 @@ def test_compute_model_gc_telemetry_shipped_absent_backward_compat():
     assert result["budget_utilization_pct"] == 50.0
     # No shipped entries → no section_bytes from that path.
     assert result["top_budget_consumers"] == []
+
+
+def test_compute_model_gc_telemetry_logs_first_payload_failure(caplog, mocker):
+    """When task.first_payload raises (e.g. detached instance), the function logs a
+    warning and returns all packer-derived counts as empty/zero rather than crashing."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "t", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{}],
+        context={},
+    )
+    # first_payload is a property; mock it to raise so the except path fires.
+    mocker.patch.object(type(task), "first_payload", new_callable=mocker.PropertyMock, side_effect=RuntimeError("simulated packer read failure"))
+
+    with caplog.at_level(logging.WARNING):
+        result = _compute_model_gc_telemetry(project, task)
+
+    # Function does not crash — falls back to empty packer_meta.
+    assert isinstance(result, dict)
+    assert result["directions_dropped_count"] == 0
+    assert result["open_messages_dropped"] is False
+    assert result["version_phase_dropped"] is False
+    assert result["high_tier_dropped"] == []
+    assert result["problem_model_truncated"] is False
+    assert result["gap_memory_trimmed_count"] == 0
+    assert result["gap_memory_hidden_entries"] == 0
+    assert result["budget_utilization_pct"] is None
+    assert result["top_budget_consumers"] == []
+
+    # A warning was logged about the failure.
+    assert any("Failed to read packer metadata" in record.message for record in caplog.records)
 
 
 # ── QUESTION answer threading tests ──────────────────────────────────────────

@@ -1149,43 +1149,6 @@ def _friction_count_cap(model: ProblemModel) -> list[str]:
     return evicted
 
 
-def _byte_evictable(model: ProblemModel) -> bool:
-    """Whether the byte pass can actually bring ``model`` under the budget.
-
-    The byte pass touches only reference-only / terminal state — ``archived_gaps``,
-    the ``rejected_agent_edits`` ledger, the oldest active-gap append-only tails,
-    and terminal capabilities/friction (``planned`` capabilities, ``resolved``/
-    ``mitigated`` friction). If the live/active state alone (everything that
-    survives once those are reduced to their durable floor) already exceeds the
-    budget, evicting that history cannot get the model under the cap; doing so
-    would be futile destruction of re-fetchable reference state on every mature
-    project (a healthy within-caps model carries enough active gaps/history to
-    exceed the budget on its own). So gate eviction on it actually being
-    achievable: measure the floor with the evictable collections cleared and
-    active tails trimmed, restore the model, and only let the caller evict when
-    that floor fits. The legitimate target — a model whose archived/ledger/
-    terminal cap/friction bulk is large enough to blow the cap despite a small
-    live core — still has a sub-budget floor and is GC'd normally.
-
-    Crucially, the floor must drop terminal capabilities/friction too: without
-    that, a model whose bulk IS its ``planned`` capabilities or ``resolved``/
-    ``mitigated`` friction would measure an over-budget floor and the gate would
-    wrongly skip — leaving it oversized in the durable store (the precise gap
-    this backstop closes)."""
-    floor_model = model.model_copy(deep=True)
-    floor_model.archived_gaps = []
-    floor_model.rejected_agent_edits = []
-    floor_model.capabilities = [
-        c for c in floor_model.capabilities if not _is_evictable_capability(c)
-    ]
-    floor_model.friction = [
-        f for f in floor_model.friction if not _is_evictable_friction(f)
-    ]
-    for gap in sorted(floor_model.gaps, key=_active_gap_recency_key):
-        _trim_gap_append_only_tail(gap)
-    floor_bytes = _serialized_model_bytes(floor_model)
-    return floor_bytes <= PROBLEM_MODEL_BYTE_BUDGET
-
 
 def _diagnose_live_core_oversize(model: ProblemModel) -> str:
     """Name the largest live section dominating the byte oversize.
@@ -1293,8 +1256,7 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     friction_evicted.extend(_friction_count_cap(model))
 
     # Byte cap: evict reference-only / terminal state when over budget, then
-    # raise loudly if the live core alone is still too large.  Always attempt
-    # eviction first — do NOT skip because _byte_evictable returned False.
+    # raise loudly if the live core alone is still too large.
     ledger_trimmed = 0
     if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
         # Oldest-first so list.pop(0) drops the oldest archived gap.
@@ -1393,111 +1355,6 @@ def _deferral_is_stale(deferral: GapDeferral, now: datetime | None) -> bool:
     if created_at is not None:
         return created_at < now - timedelta(days=DEFERRAL_STALE_GRACE_DAYS)
     return False
-
-
-def lifecycle_bound_problem_model(
-    model: ProblemModel, now_iso: str
-) -> dict[str, Any]:
-    """Auto-archive/drop terminal-ish state so the durable model self-bounds
-    toward its healthy thresholds without manual strategist compaction.
-
-    Pure backend pass — mutates ``model`` in place and returns a small summary
-    of what it changed (empty dict on no-op, so the caller keeps the
-    diff/output byte-identical when nothing was touched). Runs BEFORE the
-    :func:`gc_problem_model` 200-item/byte backstop in :func:`apply_agent_update`
-    and composes cleanly with it: this pass reduces terminal state at the
-    healthy thresholds, and gc remains the generous last-resort structural cap.
-
-    Three actions, each touching ONLY terminal-ish / reference-only state —
-    the same reference-only class gc already treats as evictable, applied
-    eagerly at the healthy threshold instead of only at the 200-item backstop:
-
-    1. **Aged-deferred gaps → archive.** Each ACTIVE gap that carries a
-       ``deferral``, has no ``active_moves``, and whose deferral has aged past
-       its revisit point (see :func:`_deferral_is_stale`) is marked
-       ``abandoned`` with ``closed=now_iso`` and a ``lifecycle_auto_archived``
-       history event, then moved into ``archived_gaps`` by
-       :func:`archive_closed_gaps`. A gap with ``active_moves``, a fresh/held
-       deferral, or no deferral at all is NEVER touched. Archived gaps stay
-       re-fetchable by id, so this is reversible.
-    2. **Terminal friction surplus → drop.** Bounds total friction toward
-       :data:`MODEL_SIZE_HEALTHY_FRICTION` by dropping terminal
-       (``resolved`` then ``mitigated``) friction oldest-first, only as far as
-       needed. ALL ``active`` friction is kept, so an all-active list is left
-       untouched (and may legitimately stay above the threshold).
-    3. **Stale planned capabilities surplus → drop.** Bounds capabilities
-       toward :data:`MODEL_SIZE_HEALTHY_CAPABILITIES` by dropping ``planned``
-       (never-built) capabilities oldest-first, only as far as needed. ALL
-       ``working``/``partial`` capabilities are kept.
-
-    Returns a dict like ``{"gaps_lifecycle_archived": ["g-x"],
-    "friction_lifecycle_evicted": ["f-y"],
-    "capabilities_lifecycle_evicted": ["cap-z"]}`` — only the keys that had
-    activity are present; an all-live model returns ``{}``.
-    """
-    summary: dict[str, Any] = {}
-    now = _parse_iso_to_naive_utc(now_iso)
-
-    # 1. Aged-deferred, unstaffed gaps → mark abandoned so archive_closed_gaps
-    #    moves them into archived_gaps (reversible, re-fetchable by id).
-    archived_gap_ids: list[str] = []
-    for gap in model.gaps:
-        if gap.status != "active" or gap.active_moves or gap.deferral is None:
-            continue
-        if not _deferral_is_stale(gap.deferral, now):
-            continue
-        gap.status = "abandoned"
-        gap.closed = now_iso
-        gap.history.append(
-            GapHistoryEvent(
-                ts=now_iso,
-                event="lifecycle_auto_archived",
-                note=(
-                    "auto-archived: deferral aged past revisit point "
-                    "(lifecycle-bound pass)"
-                ),
-            )
-        )
-        archived_gap_ids.append(gap.id)
-    if archived_gap_ids:
-        archive_closed_gaps(model)
-        summary["gaps_lifecycle_archived"] = archived_gap_ids
-
-    # 2. Terminal friction surplus → drop toward the healthy friction threshold,
-    #    resolved before mitigated, oldest-first. Active friction is never
-    #    dropped, so an all-active list stays untouched.
-    friction_overage = len(model.friction) - MODEL_SIZE_HEALTHY_FRICTION
-    if friction_overage > 0:
-        resolved = [i for i, f in enumerate(model.friction) if f.status == "resolved"]
-        mitigated = [i for i, f in enumerate(model.friction) if f.status == "mitigated"]
-        evict_idx = set((resolved + mitigated)[:friction_overage])
-        if evict_idx:
-            evicted_friction: list[str] = []
-            kept_friction: list[Friction] = []
-            for i, fric in enumerate(model.friction):
-                if i in evict_idx:
-                    evicted_friction.append(fric.id)
-                else:
-                    kept_friction.append(fric)
-            model.friction = kept_friction
-            summary["friction_lifecycle_evicted"] = evicted_friction
-
-    # 3. Stale planned capabilities surplus → drop toward the healthy capability
-    #    threshold, oldest-first. working/partial capabilities are never dropped.
-    cap_overage = len(model.capabilities) - MODEL_SIZE_HEALTHY_CAPABILITIES
-    if cap_overage > 0:
-        evicted_caps: list[str] = []
-        kept_caps: list[Capability] = []
-        for cap in model.capabilities:
-            if len(evicted_caps) < cap_overage and _is_evictable_capability(cap):
-                evicted_caps.append(cap.name)
-            else:
-                kept_caps.append(cap)
-        if evicted_caps:
-            model.capabilities = kept_caps
-            summary["capabilities_lifecycle_evicted"] = evicted_caps
-
-    return summary
 
 
 def auto_archive_stale_problem_model_items(
@@ -1878,7 +1735,7 @@ is approaching the structural limit even if entry counts look healthy."""
 
 DEFERRAL_STALE_GRACE_DAYS = 30
 """Grace window (days) before a deferred, unstaffed gap is auto-archived by
-:func:`lifecycle_bound_problem_model` when its deferral carries no usable
+:func:`auto_archive_stale_problem_model_items` when its deferral carries no usable
 ``hold_until``.
 
 A gap's ``deferral`` is an explicit "real but intentionally not staffed this

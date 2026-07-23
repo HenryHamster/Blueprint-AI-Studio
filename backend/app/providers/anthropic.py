@@ -33,26 +33,38 @@ def _snapshot_from_rate_limit_data(
 ) -> UsageSnapshot:
     """Convert a normalize_rate_limit_data() blob to a UsageSnapshot.
 
-    Maps the ``unified_5h`` bucket (utilization 0..100) to the ``five_hour``
-    window so the Messages-API header path produces the same window key used
-    by the OAuth probe path.  Returns unknown when the blob is missing or
-    lacks a numeric utilization.
+    Maps ``unified_5h`` → ``five_hour`` and ``unified_7d`` → ``seven_day``
+    so the Messages-API header path produces the same window keys used by the
+    OAuth probe path.  Returns unknown when the blob is missing or lacks a
+    numeric five_hour utilization (five_hour is load-bearing; seven_day is
+    additive when present and its absence is documented — the API-key header
+    path may not carry it on all response types).
     """
     if not isinstance(rate_limit_data, dict):
         return UsageSnapshot.unknown(probed_at)
-    entry = rate_limit_data.get("unified_5h")
-    if not isinstance(entry, dict):
+    entry_5h = rate_limit_data.get("unified_5h")
+    if not isinstance(entry_5h, dict):
         return UsageSnapshot.unknown(probed_at)
-    util = entry.get("utilization")
-    if isinstance(util, bool) or not isinstance(util, (int, float)):
+    util_5h = entry_5h.get("utilization")
+    if isinstance(util_5h, bool) or not isinstance(util_5h, (int, float)):
         return UsageSnapshot.unknown(probed_at)
     resets: dict[str, str | None] = {}
-    reset = entry.get("resets_at")
-    if isinstance(reset, str) and reset:
-        resets["five_hour"] = reset
+    reset_5h = entry_5h.get("resets_at")
+    if isinstance(reset_5h, str) and reset_5h:
+        resets["five_hour"] = reset_5h
+    window_utilizations: dict[str, float] = {"five_hour": float(util_5h)}
+    # unified_7d is absent from most API-key response types (the header is not
+    # guaranteed); map it additively when present and numeric.
+    entry_7d = rate_limit_data.get("unified_7d")
+    if isinstance(entry_7d, dict):
+        util_7d = entry_7d.get("utilization")
+        if not isinstance(util_7d, bool) and isinstance(util_7d, (int, float)):
+            window_utilizations["seven_day"] = float(util_7d)
+            reset_7d = entry_7d.get("resets_at")
+            resets["seven_day"] = reset_7d if isinstance(reset_7d, str) and reset_7d else None
     return UsageSnapshot(
         known=True,
-        window_utilizations={"five_hour": float(util)},
+        window_utilizations=window_utilizations,
         resets_at=resets,
         probed_at=probed_at,
         raw_rate_limit_blob=rate_limit_data,

@@ -1655,7 +1655,7 @@ async def get_warm_reuse_dropout_trend(
     widening change reduced the leader. Returns an empty ``buckets`` list until
     at least one daily snapshot has captured the drop-out block.
     """
-    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+    from app.efficiency_snapshot import DESIGN_DOC_KEY, _read_snapshot_history  # noqa: PLC0415
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
@@ -1663,7 +1663,7 @@ async def get_warm_reuse_dropout_trend(
     project = await session.get(Project, project_id)
     container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
     buckets: List[Dict[str, Any]] = []
-    for snap in container.get("snapshots") or []:
+    for snap in await _read_snapshot_history(session, project_id, container):
         block = snap.get("reuse_dropout")
         if not isinstance(block, dict):
             continue
@@ -1715,7 +1715,7 @@ async def get_pool_dispatch_funnel_trend(
     ``warm-reuse-dropout-trend``. Returns an empty ``buckets`` list until at
     least one daily snapshot has captured the block. Observability only.
     """
-    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+    from app.efficiency_snapshot import DESIGN_DOC_KEY, _read_snapshot_history  # noqa: PLC0415
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
@@ -1723,7 +1723,7 @@ async def get_pool_dispatch_funnel_trend(
     project = await session.get(Project, project_id)
     container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
     buckets: List[Dict[str, Any]] = []
-    for snap in container.get("snapshots") or []:
+    for snap in await _read_snapshot_history(session, project_id, container):
         block = snap.get("pool_dispatch_funnel")
         if not isinstance(block, dict):
             continue
