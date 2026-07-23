@@ -1492,6 +1492,19 @@ class TestRecordRetiredDirectionMemory:
         record_retired_direction_memory(vision, d2, reason="strategic_retire")
         assert len(vision["_recently_retired_directions"]) == 2
 
+    def test_stores_readable_text_field(self):
+        """record_retired_direction_memory must persist the original direction text
+        in a ``text`` field so the summary builder can serve human-readable text
+        instead of reconstructing it from the stopword-stripped token bag."""
+        vision: dict = {}
+        readable = "Improve the authentication flow for enterprise users logging in"
+        d = {"id": "d-readable", "text": readable}
+        record_retired_direction_memory(vision, d, reason="saturation")
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["text"] == readable
+        # text_tokens must still be present for dedup/grounding consumers
+        assert "text_tokens" in entry
+        assert isinstance(entry["text_tokens"], list)
 
 
 class TestCheckGapRespawnBlock:

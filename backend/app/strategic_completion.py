@@ -3374,6 +3374,7 @@ def record_retired_direction_memory(
 
     entry: dict = {
         "id": direction.get("id", ""),
+        "text": text[:_RETIRED_OUTCOME_CHAR_CAP],
         "text_tokens": tokens,
         "retired_at": _utcnow().isoformat(),
         "reason": reason,

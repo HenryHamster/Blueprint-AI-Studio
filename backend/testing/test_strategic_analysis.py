@@ -3487,13 +3487,21 @@ def test_direction_knowledge_capped_at_five():
 
 def test_retired_directions_summary_includes_durable_memory_entries():
     """Direction in vision['_recently_retired_directions'] but pruned from the
-    live directions list still appears in the retired-directions summary."""
+    live directions list still appears in the retired-directions summary.
+
+    When the memory entry carries a ``text`` field (written by
+    ``record_retired_direction_memory`` since the scramble fix), the summary
+    must surface the original human-readable text, NOT a stopword-stripped
+    token-bag join.
+    """
+    readable_text = "Improve the authentication flow for users to log in faster"
     project = _make_project(
         directions=[],  # direction already pruned from live list
         vision={
             "_recently_retired_directions": [
                 {
                     "id": "d-pruned",
+                    "text": readable_text,
                     "text_tokens": ["improve", "auth", "performance"],
                     "retired_at": "2026-06-01T00:00:00",
                     "reason": "saturation",
@@ -3508,8 +3516,10 @@ def test_retired_directions_summary_includes_durable_memory_entries():
     assert entry["id"] == "d-pruned"
     assert entry["status"] == "retired"
     assert entry["retirement_reason"] == "saturation"
-    # text reconstructed from tokens
-    assert "auth" in entry["text"]
+    # Full readable text must be used, not a stopword-stripped token join.
+    assert entry["text"] == readable_text
+    # Sanity: the scrambled token-join form must NOT appear as the full text.
+    assert entry["text"] != "improve auth performance"
 
 
 def test_retired_directions_summary_surfaces_outcome():

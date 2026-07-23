@@ -208,7 +208,7 @@ def _build_retired_directions_summary(
             retired_at = mem_entry.get("retired_at", "")
             if retired_at and retired_at < cutoff_iso:
                 continue
-            text = " ".join(mem_entry.get("text_tokens") or [])
+            text = mem_entry.get("text") or " ".join(mem_entry.get("text_tokens") or [])
             mem_result: dict = {
                 "id": entry_id,
                 "text": text[:200],
