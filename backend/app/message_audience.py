@@ -371,6 +371,11 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # now unrecoverable.  OPERATOR_ACTION_NEEDED so the operator sees that a
     # webhook notification was permanently lost (double-failure path).
     "notification.dead_letter_lost": OPERATOR_ACTION_NEEDED,
+    # problem_model.live_core_over_budget: the problem model's live core (active
+    # gaps, capabilities, friction) exceeds the byte budget at write time —
+    # the precondition for the rev-1367 truncation/wipe cycle.  OPERATOR_ACTION_NEEDED
+    # so the operator sees the alert and can prune the model or raise the byte budget.
+    "problem_model.live_core_over_budget": OPERATOR_ACTION_NEEDED,
 }
 
 # Set of audiences that reach the operator through normal channels.

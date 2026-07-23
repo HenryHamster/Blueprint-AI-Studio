@@ -927,6 +927,71 @@ async def test_post_event_message_with_context_and_task_id(db_session):
 
 
 @pytest.mark.asyncio
+async def test_operator_message_produces_durable_delivery_record(db_session):
+    """Every operator-visible message emitted by post_event_message produces a
+    durable delivery record: a committed ProjectMessage row with the correct
+    audience stamp that survives a restart and is queryable from the DB.
+
+    This is the named invariant test for defect 5 (delivery-record gap):
+    previously, only in-memory counters were verified; this test proves the
+    row is actually committed and audience-stamped at both operator audience tiers.
+
+    Verifies two tiers:
+    - OPERATOR_ACTION_NEEDED: auto_fix_escalated (escalation that blocks operator)
+    - OPERATOR_FYI: question_answer (answer that reaches operator inbox)
+    """
+    from app.message_audience import OPERATOR_ACTION_NEEDED, OPERATOR_FYI
+
+    project_id = await _persist_test_project(db_session)
+
+    # --- OPERATOR_ACTION_NEEDED tier ---
+    msg_action = await post_event_message(
+        db_session,
+        project_id,
+        "auto_fix_escalated",
+        "Auto-fix needs operator input",
+    )
+    assert msg_action is not None
+    assert msg_action.context["audience"] == OPERATOR_ACTION_NEEDED
+
+    # --- OPERATOR_FYI tier ---
+    msg_fyi = await post_event_message(
+        db_session,
+        project_id,
+        "question_answer",
+        "Answer ready for review",
+    )
+    assert msg_fyi is not None
+    assert msg_fyi.context["audience"] == OPERATOR_FYI
+
+    # Commit both rows — the durable delivery record must survive the session flush.
+    await db_session.commit()
+
+    # Query back from DB to prove durability (not just in-memory state).
+    rows = (
+        (
+            await db_session.execute(
+                _select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    audience_values = {row.context["audience"] for row in rows}
+    assert OPERATOR_ACTION_NEEDED in audience_values, (
+        "auto_fix_escalated message must be durably committed with "
+        f"audience={OPERATOR_ACTION_NEEDED!r} — got audiences: {audience_values}"
+    )
+    assert OPERATOR_FYI in audience_values, (
+        "question_answer message must be durably committed with "
+        f"audience={OPERATOR_FYI!r} — got audiences: {audience_values}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_post_criterion_retracted_message(db_session):
     project_id = await _persist_test_project(db_session)
     version_id = uuid.uuid4()
