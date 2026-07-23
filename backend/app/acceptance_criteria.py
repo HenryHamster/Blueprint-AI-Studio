@@ -2826,6 +2826,30 @@ def _version_qualifying_candidate_sha(version: Any) -> str:
     return str(last_qualification.get("candidate_sha") or "").strip()
 
 
+#: Sub-criteria that must ALL appear as passed=True in a walkthrough results batch
+#: before the meta criterion (c-5214996f) may earn covered-tier evidence.
+_WALKTHROUGH_META_REQUIRED_SUBCRITERIA = frozenset({"c-dfdc9d82", "c-f52fd975"})
+
+
+def _walkthrough_meta_criterion_gate(results: list[dict]) -> bool:
+    """Return True only when all required sub-criteria are passed in ``results``.
+
+    Pure function (no I/O). The meta criterion c-5214996f summarises a full
+    re-walk; it MUST NOT be minted from a partial run where one or more of its
+    substantive sub-criteria failed or were absent.
+
+    Called by :func:`record_walkthrough_e2e_evidence` and
+    :func:`record_operator_walkthrough_evidence` before c-5214996f is allowed
+    into ``passed_keys``.
+    """
+    passed_in_batch = {
+        str(entry.get("criterion_key") or "").strip()
+        for entry in results
+        if isinstance(entry, dict) and entry.get("passed") is True
+    }
+    return _WALKTHROUGH_META_REQUIRED_SUBCRITERIA.issubset(passed_in_batch)
+
+
 async def record_walkthrough_e2e_evidence(
     session: AsyncSession,
     version: Any,
@@ -2926,6 +2950,9 @@ async def record_walkthrough_e2e_evidence(
 
     # Only passed=True results are eligible; collect their keys (preserving order,
     # de-duplicating) so a single query resolves all criteria at once.
+    # The meta criterion (c-5214996f) is excluded when its required sub-criteria
+    # are not all present and passed in this same batch.
+    meta_gate_passes = _walkthrough_meta_criterion_gate(results)
     passed_keys: list[str] = []
     skipped_not_passed = 0
     for entry in results:
@@ -2935,7 +2962,16 @@ async def record_walkthrough_e2e_evidence(
         if not key:
             continue
         if entry.get("passed") is True:
-            if key not in passed_keys:
+            if key == "c-5214996f" and not meta_gate_passes:
+                logger.warning(
+                    "record_walkthrough_e2e_evidence: skipping c-5214996f — "
+                    "required sub-criteria %s not all passed in this batch "
+                    "(version %s); no covered meta evidence written",
+                    sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                    getattr(version, "id", None),
+                )
+                skipped_not_passed += 1
+            elif key not in passed_keys:
                 passed_keys.append(key)
         else:
             skipped_not_passed += 1
@@ -3123,6 +3159,9 @@ async def record_operator_walkthrough_evidence(
 
     # Only passed=True results are eligible; collect their keys (preserving order,
     # de-duplicating) so a single query resolves all criteria at once.
+    # The meta criterion (c-5214996f) is excluded when its required sub-criteria
+    # are not all present and passed in this same batch.
+    meta_gate_passes = _walkthrough_meta_criterion_gate(results)
     passed_keys: list[str] = []
     skipped_not_passed = 0
     for entry in results:
@@ -3132,7 +3171,16 @@ async def record_operator_walkthrough_evidence(
         if not key:
             continue
         if entry.get("passed") is True:
-            if key not in passed_keys:
+            if key == "c-5214996f" and not meta_gate_passes:
+                logger.warning(
+                    "record_operator_walkthrough_evidence: skipping c-5214996f — "
+                    "required sub-criteria %s not all passed in this batch "
+                    "(version %s); no covered meta evidence written",
+                    sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                    getattr(version, "id", None),
+                )
+                skipped_not_passed += 1
+            elif key not in passed_keys:
                 passed_keys.append(key)
         else:
             skipped_not_passed += 1

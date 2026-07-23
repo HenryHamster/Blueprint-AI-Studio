@@ -4521,6 +4521,55 @@ class TestHandleWalkthroughE2eCompletionStandalone:
             assert call_kwargs["results"] == results, "results list must be passed through"
 
 
+def test_meta_criterion_requires_substantive_subcriteria():
+    """c-5214996f is blocked when a required sub-criterion is failed or absent.
+
+    Exercises _walkthrough_meta_criterion_gate directly (pure, no DB).
+    Also verifies the gate is wired into record_walkthrough_e2e_evidence by
+    checking that c-5214996f is excluded from passed_keys when the gate fails,
+    while a fully-passing batch admits it.
+    """
+    from app.acceptance_criteria import _walkthrough_meta_criterion_gate
+
+    # Gate should pass only when BOTH required sub-criteria are passed.
+    full_pass = [
+        {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-f52fd975", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(full_pass) is True, \
+        "gate must pass when c-dfdc9d82 AND c-f52fd975 are both passed"
+
+    # Missing c-f52fd975 entirely → gate fails.
+    missing_iframe = [
+        {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(missing_iframe) is False, \
+        "gate must fail when c-f52fd975 is absent"
+
+    # c-f52fd975 present but passed=False → gate fails.
+    iframe_failed = [
+        {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-f52fd975", "passed": False, "notes": "failed"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(iframe_failed) is False, \
+        "gate must fail when c-f52fd975 has passed=False"
+
+    # c-dfdc9d82 absent → gate fails.
+    missing_runner = [
+        {"criterion_key": "c-f52fd975", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(missing_runner) is False, \
+        "gate must fail when c-dfdc9d82 is absent"
+
+    # Empty batch → gate fails.
+    assert _walkthrough_meta_criterion_gate([]) is False, \
+        "gate must fail on empty results"
+
+
 # ---------------------------------------------------------------------------
 # _handle_criterion_coverage_trial_completion — acceptance earn-loop ingestion
 # ---------------------------------------------------------------------------

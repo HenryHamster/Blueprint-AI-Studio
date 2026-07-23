@@ -1545,42 +1545,66 @@ async function writeJsonResult(startTs, projectId) {
 
   // Map step results to per-criterion pass/fail.
   // Flow 1 → c-dfdc9d82 (Runner Enrollment)
-  // PASS requires: registration (1a) + fleet visible (1b) + live heartbeat (1d).
-  // Merely registering and listing back is insufficient — the daemon must connect
-  // and set last_seen_at/current_token_heartbeat_confirmed on the fleet record.
+  // PASS requires: registration (1a) + fleet visible (1b) + live heartbeat (1d)
+  // AND flow 6 bad-token explicit-error contract (6a bad-auth-401 + 6b two-button UI).
+  // The 'error, not endless waiting' honesty behavior is what c-dfdc9d82 is about;
+  // merely registering and listing back is insufficient — the daemon must connect AND
+  // the bad-token path must surface an explicit error, not silence.
   const runnerReg = results.find(r => r.name.includes('1a.'));
   const fleetVisible = results.find(r => r.name.includes('1b.'));
   const heartbeatStep = results.find(r => r.name.includes('1d.'));
+  const badAuthStep = results.find(r => r.name.includes('6a.'));
+  const twoButtonStep = results.find(r => r.name.includes('6b.'));
   const runnerEnrollmentPassed = shaValid
     && (runnerReg?.verdict === 'PASS')
     && (fleetVisible?.verdict === 'PASS')
-    && (heartbeatStep?.verdict === 'PASS');
+    && (heartbeatStep?.verdict === 'PASS')
+    && (badAuthStep?.verdict === 'PASS')
+    && (twoButtonStep?.verdict === 'PASS');
   const runnerNotes = runnerEnrollmentPassed
-    ? 'Runner registration, fleet visibility, and live daemon heartbeat all confirmed'
+    ? 'Runner registration, fleet visibility, live daemon heartbeat, bad-token 401, and two-button error UI all confirmed'
     : [
         runnerReg?.verdict !== 'PASS' ? `runner registration: ${runnerReg?.verdict || 'NOT RUN'}` : '',
         fleetVisible?.verdict !== 'PASS' ? `fleet visibility: ${fleetVisible?.verdict || 'NOT RUN'}` : '',
         heartbeatStep?.verdict !== 'PASS' ? `daemon heartbeat: ${heartbeatStep?.verdict || 'NOT RUN'}` : '',
+        badAuthStep?.verdict !== 'PASS' ? `bad-token explicit-error (6a): ${badAuthStep?.verdict || 'NOT RUN'}` : '',
+        twoButtonStep?.verdict !== 'PASS' ? `two-button UI contract (6b): ${twoButtonStep?.verdict || 'NOT RUN'}` : '',
         !shaValid ? 'SHA integrity check failed' : '',
       ].filter(Boolean).join('; ') || 'Runner enrollment not evaluated';
 
   // Flow 2 → c-f52fd975 (iframe subresource token)
-  // PASS requires: auth (2b) + route exists/fake-401 (2c) + valid-JWT 200 (2g).
-  // A 401 from a fake token (2c) proves the route is registered, but is NOT
-  // sufficient evidence of the fix — a valid minted JWT must return 200 (2g).
+  // PASS requires: auth (2b) + route exists/fake-401 (2c) + valid-JWT 200 (2g)
+  // AND flow 7 project-tools lifecycle (7a create + 7b disable + 7c re-enable +
+  // 7d add-same-kind + 7e no-Placement-dropdown honesty check).
+  // The tools-lifecycle honesty behavior is part of the tools criterion.
   const mintAuth = results.find(r => r.name.includes('2b.'));
   const pathRoute = results.find(r => r.name.includes('2c.'));
   const assetGet = results.find(r => r.name.includes('2g.'));
+  const toolCreate = results.find(r => r.name.includes('7a.'));
+  const toolDisable = results.find(r => r.name.includes('7b.'));
+  const toolReEnable = results.find(r => r.name.includes('7c.'));
+  const toolAddSame = results.find(r => r.name.includes('7d.'));
+  const toolNoPlacement = results.find(r => r.name.includes('7e.'));
   const iframeTokenPassed = shaValid
     && (mintAuth?.verdict === 'PASS')
     && (pathRoute?.verdict === 'PASS')
-    && (assetGet?.verdict === 'PASS');
+    && (assetGet?.verdict === 'PASS')
+    && (toolCreate?.verdict === 'PASS')
+    && (toolDisable?.verdict === 'PASS')
+    && (toolReEnable?.verdict === 'PASS')
+    && (toolAddSame?.verdict === 'PASS')
+    && (toolNoPlacement?.verdict === 'PASS');
   const iframeNotes = iframeTokenPassed
-    ? 'Asset-token minted, path-embedded route registered (fake → 401), and valid JWT returned 200 from seeded tool asset'
+    ? 'Asset-token minted, path-embedded route registered (fake → 401), valid JWT returned 200, and tools lifecycle (create/disable/re-enable/add-same-kind/no-Placement-dropdown) all confirmed'
     : [
         mintAuth?.verdict !== 'PASS' ? `asset-token auth: ${mintAuth?.verdict || 'NOT RUN'}` : '',
         pathRoute?.verdict !== 'PASS' ? `path-embedded route: ${pathRoute?.verdict || 'NOT RUN'}` : '',
         assetGet?.verdict !== 'PASS' ? `valid-JWT 200 assertion: ${assetGet?.verdict || 'NOT RUN'}` : '',
+        toolCreate?.verdict !== 'PASS' ? `tool create (7a): ${toolCreate?.verdict || 'NOT RUN'}` : '',
+        toolDisable?.verdict !== 'PASS' ? `tool disable (7b): ${toolDisable?.verdict || 'NOT RUN'}` : '',
+        toolReEnable?.verdict !== 'PASS' ? `tool re-enable (7c): ${toolReEnable?.verdict || 'NOT RUN'}` : '',
+        toolAddSame?.verdict !== 'PASS' ? `add same-kind tool (7d): ${toolAddSame?.verdict || 'NOT RUN'}` : '',
+        toolNoPlacement?.verdict !== 'PASS' ? `no-Placement-dropdown (7e): ${toolNoPlacement?.verdict || 'NOT RUN'}` : '',
         !shaValid ? 'SHA integrity check failed' : '',
       ].filter(Boolean).join('; ') || 'iframe subresource token check not evaluated';
 
@@ -1613,12 +1637,23 @@ async function writeJsonResult(startTs, projectId) {
       ].filter(Boolean).join('; ') || 'Workday session lifecycle not evaluated';
 
   // Walkthrough meta → c-5214996f
+  // PASS requires ALL named sub-criteria to have passed: c-dfdc9d82 (runner
+  // enrollment + bad-token error) AND c-f52fd975 (iframe token + tools lifecycle)
+  // AND c-workday-session-lifecycle. A single step passing anywhere is NOT enough —
+  // the meta criterion summarizes the full re-walk, not a partial green.
   const passCount = results.filter(r => r.verdict === 'PASS').length;
-  const walkthroughMetaPassed = shaValid && passCount > 0;
+  const walkthroughMetaPassed = shaValid
+    && runnerEnrollmentPassed
+    && iframeTokenPassed
+    && workdaySessionPassed;
   const walkthroughNotes = walkthroughMetaPassed
-    ? `Live walkthrough completed against SHA ${HEAD_SHA} at ${startTs} with ${passCount} passing steps`
+    ? `Live walkthrough completed against SHA ${HEAD_SHA} at ${startTs}: all substantive sub-criteria passed (runner enrollment, iframe token+tools, workday session)`
     : shaValid
-      ? 'No steps passed — walkthrough did not complete successfully'
+      ? [
+          !runnerEnrollmentPassed ? 'runner-enrollment criterion (c-dfdc9d82) not fully passed' : '',
+          !iframeTokenPassed ? 'iframe-token criterion (c-f52fd975) not fully passed' : '',
+          !workdaySessionPassed ? 'workday-session criterion (c-workday-session-lifecycle) not fully passed' : '',
+        ].filter(Boolean).join('; ') || 'Walkthrough did not complete successfully'
       : 'SHA integrity check failed — walkthrough report not trustworthy';
 
   const jsonResult = {
