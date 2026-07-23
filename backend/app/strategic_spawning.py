@@ -5559,12 +5559,18 @@ async def _spawn_strategic_review(
         _res_direction_counts = _build_direction_counts(project)
         _res_direction_stats = _build_direction_stats(project)[1]
         from app.strategic_analysis import _build_retired_directions_summary
+        from app.direction_event_trail import repair_retired_direction_memory_texts
 
         cycle_history = await strategic_cycle.recent_for_agent_context(
             session,
             project.id,
             limit=20,
         )
+        _vision_for_repair = project.vision or {}
+        if await repair_retired_direction_memory_texts(session, project.id, _vision_for_repair):
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(project, "vision")
+            session.add(project)
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
         _res_open_messages = await _fetch_open_messages(session, project.id)
@@ -7191,6 +7197,12 @@ async def _spawn_strategic_review(
     _payload_staleness: dict = _build_payload_staleness_block(_currency)
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
+    from app.direction_event_trail import repair_retired_direction_memory_texts  # noqa: PLC0415
+    _vision_for_repair = project.vision or {}
+    if await repair_retired_direction_memory_texts(session, project.id, _vision_for_repair):
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(project, "vision")
+        session.add(project)
     _retired_summary = _build_retired_directions_summary(project)
     if _retired_summary:
         _approaches_block = _build_retired_approaches_block(_retired_summary)

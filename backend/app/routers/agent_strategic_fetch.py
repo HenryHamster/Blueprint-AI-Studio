@@ -1396,6 +1396,13 @@ async def agent_fetch_payload_section(
     elif section_name == "playbook_summary":
         data = _build_playbook_summary(project)
     elif section_name == "retired_directions_summary":
+        from app.direction_event_trail import repair_retired_direction_memory_texts  # noqa: PLC0415
+        from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+        _vision_for_repair = project.vision or {}
+        if await repair_retired_direction_memory_texts(session, project.id, _vision_for_repair):
+            flag_modified(project, "vision")
+            session.add(project)
+            await session.commit()
         data = _build_retired_directions_summary(project)
     elif section_name == "rejected_proposals":
         cutoff = (_utcnow() - timedelta(days=30)).isoformat()
