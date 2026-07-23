@@ -649,6 +649,235 @@ def test_strategic_resident_agent_handler_is_protected_with_all_tests():
     )
 
 
+def test_strategic_resident_lib_is_protected_with_all_tests():
+    """The strategic-resident-lib agent test suite must appear in the manifest with all tests.
+
+    agent/src/handlers/strategic-resident-lib.test.ts covers the core utility
+    library for the conversational Workday resident session (config knobs, message
+    cursor, dedup, content blocks, bootstrap/autonomous prompts, compaction
+    checkpoint, exam ledger, operator-decision review, decisions register, surface
+    catalog, tick-verdict parsing, and frame coalescer). Deleting or emptying it
+    without operator sign-off must trip this guard. Verifies: (a) the file is in
+    the protect section, (b) every it()/it.each() label in the file is listed, and
+    (c) counts match so a silently-added test doesn't escape the manifest.
+    """
+    import re
+
+    manifest = _load_manifest()
+    target_path = "agent/src/handlers/strategic-resident-lib.test.ts"
+
+    entries = [e for e in manifest["protect"] if e["path"] == target_path]
+    assert entries, (
+        f"{target_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so silent deletion of the resident-lib "
+        "test suite is caught at every CI run."
+    )
+    entry = entries[0]
+
+    full_path = REPO_ROOT / target_path
+    if not full_path.exists():
+        pytest.skip(
+            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+        )
+
+    source = full_path.read_text(encoding="utf-8")
+
+    # Collect all plain it('label', ...) test labels.
+    actual_labels: set[str] = set(re.findall(
+        r"^\s*it\s*\(\s*'([^']+)'",
+        source,
+        re.MULTILINE,
+    ))
+    # Collect it.each(...)('template', ...) template strings.
+    for m in re.finditer(r"it\.each\b[\s\S]*?\)\s*\(\s*\n?\s*'([^']+)'", source):
+        actual_labels.add(m.group(1))
+
+    listed_labels = set(entry["test_ids"])
+
+    missing_from_manifest = sorted(actual_labels - listed_labels)
+    extra_in_manifest = sorted(listed_labels - actual_labels)
+
+    assert not missing_from_manifest, (
+        "These test labels exist in strategic-resident-lib.test.ts but are NOT "
+        "listed in the protect manifest. Add them so deletion of any resident-lib "
+        "test is caught:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "strategic-resident-lib.test.ts. Update the manifest:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
+def test_strategic_live_turn_is_protected_with_all_tests():
+    """The StrategicLiveTurn component test suite must appear in the manifest with all tests.
+
+    admin-ui/src/components/StrategicLiveTurn.test.tsx covers the
+    StrategicResidentActivityWidget timer-truthfulness contract: the elapsed timer
+    ticks only while a command is genuinely executing and freezes on idle or dead
+    state. Deleting or emptying it without operator sign-off must trip this guard.
+    Verifies: (a) the file is in the protect section, (b) every test() label in
+    the file is listed, and (c) counts match.
+    """
+    import re
+
+    manifest = _load_manifest()
+    target_path = "admin-ui/src/components/StrategicLiveTurn.test.tsx"
+
+    entries = [e for e in manifest["protect"] if e["path"] == target_path]
+    assert entries, (
+        f"{target_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so silent deletion of the StrategicLiveTurn "
+        "test suite is caught at every CI run."
+    )
+    entry = entries[0]
+
+    full_path = REPO_ROOT / target_path
+    if not full_path.exists():
+        pytest.skip(
+            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+        )
+
+    source = full_path.read_text(encoding="utf-8")
+
+    # StrategicLiveTurn.test.tsx uses test('...') not it('...').
+    actual_labels: set[str] = set(re.findall(
+        r"^\s*test\s*\(\s*'([^']+)'",
+        source,
+        re.MULTILINE,
+    ))
+
+    listed_labels = set(entry["test_ids"])
+
+    missing_from_manifest = sorted(actual_labels - listed_labels)
+    extra_in_manifest = sorted(listed_labels - actual_labels)
+
+    assert not missing_from_manifest, (
+        "These test labels exist in StrategicLiveTurn.test.tsx but are NOT "
+        "listed in the protect manifest. Add them so deletion of any "
+        "StrategicLiveTurn test is caught:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "StrategicLiveTurn.test.tsx. Update the manifest:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
+def test_strategic_live_turn_viewport_is_protected_with_all_tests():
+    """The StrategicLiveTurn viewport test suite must appear in the manifest with all tests.
+
+    admin-ui/src/components/StrategicLiveTurn.viewport.test.tsx covers viewport
+    regression for StrategicLiveTurn components at 375px mobile width, guarding
+    that streaming reply/reasoning and live activity strips remain contained.
+    Deleting or emptying it without operator sign-off must trip this guard.
+    Verifies: (a) the file is in the protect section, (b) every test() label in
+    the file is listed, and (c) counts match.
+    """
+    import re
+
+    manifest = _load_manifest()
+    target_path = "admin-ui/src/components/StrategicLiveTurn.viewport.test.tsx"
+
+    entries = [e for e in manifest["protect"] if e["path"] == target_path]
+    assert entries, (
+        f"{target_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so silent deletion of the StrategicLiveTurn "
+        "viewport test suite is caught at every CI run."
+    )
+    entry = entries[0]
+
+    full_path = REPO_ROOT / target_path
+    if not full_path.exists():
+        pytest.skip(
+            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+        )
+
+    source = full_path.read_text(encoding="utf-8")
+
+    # StrategicLiveTurn.viewport.test.tsx uses test('...') not it('...').
+    actual_labels: set[str] = set(re.findall(
+        r"^\s*test\s*\(\s*'([^']+)'",
+        source,
+        re.MULTILINE,
+    ))
+
+    listed_labels = set(entry["test_ids"])
+
+    missing_from_manifest = sorted(actual_labels - listed_labels)
+    extra_in_manifest = sorted(listed_labels - actual_labels)
+
+    assert not missing_from_manifest, (
+        "These test labels exist in StrategicLiveTurn.viewport.test.tsx but are NOT "
+        "listed in the protect manifest. Add them so deletion of any viewport "
+        "regression test is caught:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "StrategicLiveTurn.viewport.test.tsx. Update the manifest:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
+def test_use_strategic_liveness_is_protected_with_all_tests():
+    """The useStrategicLiveness hook test suite must appear in the manifest with all tests.
+
+    admin-ui/src/hooks/useStrategicLiveness.test.tsx covers the React hook that
+    probes the backend liveness endpoint for the conversational Workday resident
+    session (null/disabled short-circuit, mount fetch, stale-response generation
+    guard, error-swallowing). Deleting or emptying it without operator sign-off
+    must trip this guard. Verifies: (a) the file is in the protect section, (b)
+    every it() label in the file is listed, and (c) counts match.
+    """
+    import re
+
+    manifest = _load_manifest()
+    target_path = "admin-ui/src/hooks/useStrategicLiveness.test.tsx"
+
+    entries = [e for e in manifest["protect"] if e["path"] == target_path]
+    assert entries, (
+        f"{target_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so silent deletion of the useStrategicLiveness "
+        "test suite is caught at every CI run."
+    )
+    entry = entries[0]
+
+    full_path = REPO_ROOT / target_path
+    if not full_path.exists():
+        pytest.skip(
+            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+        )
+
+    source = full_path.read_text(encoding="utf-8")
+
+    # useStrategicLiveness.test.tsx uses it('...').
+    actual_labels: set[str] = set(re.findall(
+        r"^\s*it\s*\(\s*'([^']+)'",
+        source,
+        re.MULTILINE,
+    ))
+
+    listed_labels = set(entry["test_ids"])
+
+    missing_from_manifest = sorted(actual_labels - listed_labels)
+    extra_in_manifest = sorted(listed_labels - actual_labels)
+
+    assert not missing_from_manifest, (
+        "These test labels exist in useStrategicLiveness.test.tsx but are NOT "
+        "listed in the protect manifest. Add them so deletion of any liveness "
+        "hook test is caught:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "useStrategicLiveness.test.tsx. Update the manifest:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
 def test_no_removed_resident_task_type_in_task_capabilities():
     """R3: The strategic_resident_turn TaskType must not reappear.
 
