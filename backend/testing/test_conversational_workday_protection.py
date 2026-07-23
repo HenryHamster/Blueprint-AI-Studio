@@ -497,6 +497,50 @@ def test_removed_authority_modules_are_absent():
     )
 
 
+def test_authority_plane_field_names_are_absent():
+    """R2/R3: engine_owner and authority_generation must not reappear as ORM columns.
+
+    The boundary map (knowledge 2df23870) explicitly names re-adding
+    engine_owner or authority_generation as a resurrection of the removed
+    second-engine authority row. Guard that neither field name appears as a
+    SQLModel/SQLAlchemy column definition (Field(...) or Column(...) assignment)
+    in any backend/app Python module.
+    """
+    import re
+
+    backend_app_dir = REPO_ROOT / "backend" / "app"
+    assert backend_app_dir.is_dir(), f"backend/app/ not found at {backend_app_dir}"
+    py_files = list(backend_app_dir.rglob("*.py"))
+    assert py_files, f"No .py files found under {backend_app_dir}"
+
+    # Match column-definition patterns: `engine_owner: ... = Field(` or
+    # `engine_owner = Column(` — i.e. the identifier used as the column name
+    # in a class body, not a reference in a docstring or comment.
+    FIELD_NAMES = ("engine_owner", "authority_generation")
+    COLUMN_PATTERN = re.compile(
+        r"^\s*(?:"
+        + "|".join(re.escape(f) for f in FIELD_NAMES)
+        + r")\s*(?::[^=\n]*)?\s*=\s*(?:Field|Column)\s*\(",
+        re.MULTILINE,
+    )
+
+    reintroduced = []
+    for py_file in py_files:
+        source = py_file.read_text(encoding="utf-8")
+        m = COLUMN_PATTERN.search(source)
+        if m:
+            rel = py_file.relative_to(REPO_ROOT)
+            reintroduced.append(f"{rel} (match: {m.group().strip()!r})")
+
+    assert not reintroduced, (
+        "The following files reintroduce engine_owner or authority_generation as "
+        "ORM column definitions. These field names belong to the removed second-engine "
+        "authority row (migration 0657). Remove them or update this guard with "
+        "operator sign-off:\n"
+        + "\n".join(f"  - {r}" for r in reintroduced)
+    )
+
+
 def test_no_removed_resident_strategic_backend_modules():
     """R3: No strategic_resident_*.py modules beyond the kept session file.
 
@@ -909,23 +953,41 @@ def test_use_strategic_liveness_is_protected_with_all_tests():
 
 
 def test_no_removed_resident_task_type_in_task_capabilities():
-    """R3: The strategic_resident_turn TaskType must not reappear.
+    """R3: The strategic_resident_turn TaskType must not reappear anywhere.
 
     Migration 0657 removed the strategic_resident_turn task type along with the
-    autonomous resident subsystem. If this TaskType value is re-added to the
-    TaskType enum in task_capabilities.py (or referenced anywhere in the
-    module), a bad restore could resurrect resident-turn processing with all
-    file-based guards still green.
-    """
-    task_cap_path = REPO_ROOT / "backend" / "app" / "task_capabilities.py"
-    assert task_cap_path.exists(), (
-        f"task_capabilities.py not found at {task_cap_path}"
-    )
-    source = task_cap_path.read_text(encoding="utf-8")
+    autonomous resident subsystem. If this TaskType value is re-added to any
+    backend/app module (dispatch, spawning, lifecycle, capabilities) or to
+    agent/src handler files, a bad restore could resurrect resident-turn
+    processing while file-based guards elsewhere remain green.
 
-    assert "strategic_resident_turn" not in source, (
-        "strategic_resident_turn was found in task_capabilities.py. "
-        "This TaskType belonged to the autonomous resident control plane "
+    Scans the full backend/app tree (all *.py files) and agent/src/handlers/
+    (all *.ts files), matching the pattern used by the sibling ORM-class and
+    authority-module guards.
+    """
+    backend_app_dir = REPO_ROOT / "backend" / "app"
+    assert backend_app_dir.is_dir(), f"backend/app/ not found at {backend_app_dir}"
+
+    py_files = list(backend_app_dir.rglob("*.py"))
+    assert py_files, "No .py files found under backend/app/"
+
+    hits = []
+    for py_file in py_files:
+        source = py_file.read_text(encoding="utf-8")
+        if "strategic_resident_turn" in source:
+            hits.append(str(py_file.relative_to(REPO_ROOT)))
+
+    agent_handlers_dir = REPO_ROOT / "agent" / "src" / "handlers"
+    if agent_handlers_dir.is_dir():
+        for ts_file in agent_handlers_dir.rglob("*.ts"):
+            source = ts_file.read_text(encoding="utf-8")
+            if "strategic_resident_turn" in source:
+                hits.append(str(ts_file.relative_to(REPO_ROOT)))
+
+    assert not hits, (
+        "strategic_resident_turn was found in the following file(s):\n"
+        + "\n".join(f"  {h}" for h in hits)
+        + "\nThis TaskType belonged to the autonomous resident control plane "
         "removed in migration 0657. Remove it to prevent reinstating the "
         "resident turn processing path."
     )

@@ -14,6 +14,11 @@ from typing import Literal
 
 
 class TaskType(str, Enum):
+    # NOTE: The autonomous resident task type (resident_turn) was permanently
+    # removed in migration 0657. Do NOT re-add it here or in any dispatch /
+    # spawning module — the Workday protection suite scans the full
+    # backend/app tree and agent/src/handlers/ for its literal value and
+    # will fail CI if it reappears.
     create = "create"
     review = "review"
     fix = "fix"
