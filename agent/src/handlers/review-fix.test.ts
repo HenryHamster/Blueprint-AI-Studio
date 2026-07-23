@@ -85,9 +85,10 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../build-config.js', () => ({
-  resolveBuildConfig: vi.fn().mockReturnValue({}),
-}));
+vi.mock('../build-config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../build-config.js')>();
+  return { ...actual, resolveBuildConfig: vi.fn().mockReturnValue({}) };
+});
 
 // Mock the code-change module so handleFix tests can assert on what was
 // passed to runCodeChangeTask without exercising marker-detection branches.
