@@ -6179,10 +6179,14 @@ async def test_design_doc_observation_dedup_on_reprocessing(db_session, mocker):
     )
     _enable_grader(mocker)
 
-    # Process the same observation twice
+    # Process the same observation twice. proposed_changes is a telemetry-migrated
+    # key — stripped from design_doc at write time and canonical in project_telemetry.
+    from app.project_telemetry import read_telemetry
+
     await _handle_research_completion(task, "", db_session)
-    await db_session.refresh(_project)
-    proposals_after_first = _project.design_doc.get("proposed_changes", [])
+    proposals_after_first = (
+        await read_telemetry(db_session, _project.id, "proposed_changes") or []
+    )
     first_count = len(proposals_after_first)
 
     # Create a second task to simulate re-processing the same finding
@@ -6205,8 +6209,9 @@ async def test_design_doc_observation_dedup_on_reprocessing(db_session, mocker):
         return_value=[obs_finding],
     )
     await _handle_research_completion(task2, "", db_session)
-    await db_session.refresh(_project)
-    proposals_after_second = _project.design_doc.get("proposed_changes", [])
+    proposals_after_second = (
+        await read_telemetry(db_session, _project.id, "proposed_changes") or []
+    )
     second_count = len(proposals_after_second)
 
     assert first_count == second_count, (

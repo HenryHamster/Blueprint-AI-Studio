@@ -232,6 +232,15 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
         ("app/routers/admin_settings.py", "capability_proof_execution_trials_enabled", False): 2,
         ("app/routers/admin_settings.py", "capability_proof_gate_mode", "off"): 2,
         ("app/routers/admin_settings.py", "completion_debt_weight_mode", "observe"): 2,
+        # env_preflight_enabled ships True in production (registry source default
+        # AND promotion_policy.yaml `env_preflight_enabled: true`, seeded into
+        # runtime_config at import). These two admin-settings GET read-sites keep a
+        # True fallback that MATCHES that real production default. The autouse
+        # `reset_runtime_config` fixture (testing/conftest.py) force-sets the key to
+        # False for test isolation, so the guard's live `expected` reads False and
+        # flags the correct-for-prod True fallback as debt. Pinned, NOT "fixed":
+        # flipping these read-sites to False would misreport the prod default.
+        ("app/routers/admin_settings.py", "env_preflight_enabled", True): 2,
         ("app/routers/admin_settings.py", "max_global_autonomous_tasks_per_hour", 500): 1,
         ("app/routers/admin_settings.py", "metrics_integrity_sweep_max_checks", 30): 1,
         ("app/routers/admin_settings.py", "structural_health_audit_mode", "off"): 1,

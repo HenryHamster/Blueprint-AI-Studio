@@ -334,7 +334,13 @@ async def _maybe_auto_playbook(
         nonlocal entry_created, suppression_reason, captured_archive
 
         # Inject the real archive so suppression/prior-entry helpers work.
-        doc["playbook_archive"] = list(pre_fetched_archive or [])
+        # Prefer the project_telemetry copy; when no telemetry row exists yet
+        # (pre-backfill or post-rollback) fall back to whatever the locked
+        # design_doc already holds instead of clobbering it with an empty list.
+        if pre_fetched_archive is not None:
+            doc["playbook_archive"] = list(pre_fetched_archive)
+        else:
+            doc.setdefault("playbook_archive", [])
         # Inject the real deleted-keys list so _is_auto_playbook_suppressed sees
         # tombstones (strip_migrated_doc_keys strips this key from design_doc).
         if pre_fetched_deleted_keys is not None:

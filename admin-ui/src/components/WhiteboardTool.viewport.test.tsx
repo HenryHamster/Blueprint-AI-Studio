@@ -57,6 +57,9 @@ describe('WhiteboardTool — viewport regression', () => {
   // -----------------------------------------------------------------------
 
   test('renders with sample strokes without overflow at 375px', async () => {
+    // Viewport helpers settle layout via requestAnimationFrame (and page.viewport),
+    // which the global fake clock freezes — use real timers for helper-driven tests.
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { strokes: SAMPLE_STROKES },
       content_revision: 3,
@@ -69,7 +72,7 @@ describe('WhiteboardTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => { await vi.runAllTimersAsync(); });
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('canvas')).toBeTruthy();
@@ -78,6 +81,7 @@ describe('WhiteboardTool — viewport regression', () => {
   });
 
   test('renders with sample strokes without overflow at 1280px', async () => {
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { strokes: SAMPLE_STROKES },
       content_revision: 3,
@@ -91,7 +95,7 @@ describe('WhiteboardTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => { await vi.runAllTimersAsync(); });
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('canvas')).toBeTruthy();
@@ -213,6 +217,7 @@ describe('WhiteboardTool — viewport regression', () => {
   });
 
   test('controls meet minimum touch target at 1280px', async () => {
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { strokes: SAMPLE_STROKES },
       content_revision: 3,
@@ -226,7 +231,7 @@ describe('WhiteboardTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => { await vi.runAllTimersAsync(); });
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
   });
 });

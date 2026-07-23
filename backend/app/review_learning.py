@@ -779,8 +779,13 @@ async def extract_review_feedback_to_playbook(
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "review-playbook"
         doc["_meta"] = meta
-        # Capture archive before strip_migrated_doc_keys removes it from doc.
+        # Capture the migrated telemetry blobs BEFORE strip_migrated_doc_keys
+        # removes them from doc — the set_project_telemetry writes below read
+        # these values, and reading them after the strip persists empty dicts
+        # (silent data loss for downstream telemetry consumers).
         updated_archive = list(doc.get("playbook_archive") or [])
+        module_feedback_blob = dict(doc.get(_MODULE_FEEDBACK_KEY) or {})
+        direction_tally_blob = dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {})
         doc = strip_migrated_doc_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
@@ -798,7 +803,7 @@ async def extract_review_feedback_to_playbook(
                 session,
                 task.project_id,
                 _MODULE_FEEDBACK_KEY,
-                dict(doc.get(_MODULE_FEEDBACK_KEY) or {}),
+                module_feedback_blob,
             )
 
         if direction_tally_updated:
@@ -806,7 +811,7 @@ async def extract_review_feedback_to_playbook(
                 session,
                 task.project_id,
                 _DIRECTION_FIRST_ATTEMPT_KEY,
-                dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {}),
+                direction_tally_blob,
             )
 
         if created_keys:
