@@ -2843,7 +2843,7 @@ def _version_qualifying_candidate_sha(version: Any) -> str:
 
 #: Sub-criteria that must ALL appear as passed=True in a walkthrough results batch
 #: before the meta criterion (c-5214996f) may earn covered-tier evidence.
-_WALKTHROUGH_META_REQUIRED_SUBCRITERIA = frozenset({"c-dfdc9d82", "c-f52fd975"})
+_WALKTHROUGH_META_REQUIRED_SUBCRITERIA = frozenset({"c-dfdc9d82", "c-f52fd975", "c-workday-session-lifecycle"})
 
 
 def _walkthrough_meta_criterion_gate(results: list[dict]) -> bool:

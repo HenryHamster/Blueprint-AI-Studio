@@ -214,6 +214,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/routers/admin_agent_ops.py",
         "backend/app/routers/admin_debug.py",
         "backend/app/routers/admin_notifications.py",
+        "backend/app/routers/agent_strategic_messages.py",
         "backend/app/routers/admin_project_strategic_session.py",
         "backend/app/routers/agent.py",
         "backend/app/routers/agent_status.py",

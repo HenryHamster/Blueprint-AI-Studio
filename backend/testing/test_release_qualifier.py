@@ -264,12 +264,15 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     assert walk.first_payload["candidate_sha"] == candidate
     assert walk.first_payload["qualification_attempt_id"] == attempt_id
 
-    # PROPERTIES 3-4: Feed PASS results for all three registered keys.
+    # PROPERTIES 3-4: Feed PASS results for all three registered keys plus the
+    # FLOW 5 placeholder key (c-workday-session-lifecycle), required by the meta
+    # gate and routed to c-5214996f via the alias table.
     # exercised_engine_sha must equal candidate_sha to satisfy the SHA-match guard.
     results_batch = [
         {"criterion_key": key, "passed": True, "notes": f"green-{key}"}
         for key in REGISTERED_KEYS
     ]
+    results_batch.append({"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "green-flow5"})
     summary = await record_walkthrough_e2e_evidence(
         db_session,
         version=version,
@@ -281,8 +284,10 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     await db_session.commit()
 
     assert summary["status"] == "recorded"
-    # All three registered keys must be written (meta gate passes because both
-    # c-dfdc9d82 and c-f52fd975 are present and passed in the same batch).
+    # All three registered keys must be written (meta gate passes because
+    # c-dfdc9d82, c-f52fd975, and c-workday-session-lifecycle are all present
+    # and passed in the same batch; the alias routes c-workday-session-lifecycle
+    # to c-5214996f, so recorded=3 not 4).
     assert summary["recorded"] == 3
     assert summary["unmatched_keys"] == []
 

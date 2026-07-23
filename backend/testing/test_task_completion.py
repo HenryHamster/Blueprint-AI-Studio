@@ -4531,14 +4531,15 @@ def test_meta_criterion_requires_substantive_subcriteria():
     """
     from app.acceptance_criteria import _walkthrough_meta_criterion_gate
 
-    # Gate should pass only when BOTH required sub-criteria are passed.
+    # Gate should pass only when ALL required sub-criteria are passed.
     full_pass = [
         {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
         {"criterion_key": "c-f52fd975", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "ok"},
         {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
     ]
     assert _walkthrough_meta_criterion_gate(full_pass) is True, \
-        "gate must pass when c-dfdc9d82 AND c-f52fd975 are both passed"
+        "gate must pass when c-dfdc9d82, c-f52fd975, AND c-workday-session-lifecycle are all passed"
 
     # Missing c-f52fd975 entirely → gate fails.
     missing_iframe = [

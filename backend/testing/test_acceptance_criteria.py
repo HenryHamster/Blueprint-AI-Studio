@@ -11282,11 +11282,14 @@ async def test_walkthrough_merge_evidence_flips_criterion_coverage(db_session):
     assert summary_before["covered"] == 0
     assert summary_before["uncovered"] == 3
 
-    # Ingest walkthrough_e2e evidence for all three passing keys.
+    # Ingest walkthrough_e2e evidence for all three canonical keys plus the
+    # FLOW 5 placeholder key (c-workday-session-lifecycle), which is required
+    # by the meta gate and routes to c-5214996f via the alias table.
     results = [
         {"criterion_key": key, "passed": True, "notes": f"v26 walkthrough pass for {key}"}
         for key in keys
     ]
+    results.append({"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "v26 FLOW 5 pass"})
     summary = await ac.record_walkthrough_e2e_evidence(
         db_session,
         version,
