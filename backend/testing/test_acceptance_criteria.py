@@ -11465,6 +11465,213 @@ async def test_record_walkthrough_e2e_evidence_fail_open_on_alert_error(db_sessi
 
 
 # ---------------------------------------------------------------------------
+# FLOW 5 Workday session lifecycle — phantom key routing and re-walk evidence
+# ---------------------------------------------------------------------------
+#
+# These tests pin the two defects identified in the FLOW 5 walkthrough fix:
+# (a) c-workday-session-lifecycle is not a registered criterion — posting it
+#     via record_walkthrough_e2e_evidence MUST produce unmatched_keys, not
+#     silently dropping evidence without an observable signal.
+# (b) When FLOW 5's result is correctly routed to a registered criterion (the
+#     re-walk evidence lane, analogous to the c-5214996f criterion), covered-tier
+#     evidence is written and the criterion's coverage flips to "covered".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_canonical_phantom_workday_key_is_unmatched(
+    db_session,
+):
+    """c-workday-session-lifecycle is a phantom key in record_walkthrough_e2e_evidence.
+
+    Posting a PASS result keyed on c-workday-session-lifecycle must land in
+    unmatched_keys (no evidence written, alert fired) — exactly the behaviour
+    produced by the FLOW 5 defect before the routing fix.  Pinned here so a
+    future regression is immediately visible.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Phantom")
+    sha = "aa" * 20  # 40 hex chars
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # No criterion with this key is ever registered — it is the phantom key from
+    # the FLOW 5 bug.
+    phantom_key = "c-workday-session-lifecycle"
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": phantom_key,
+                "passed": True,
+                "notes": ["Workday session started and stopped cleanly"],
+            },
+        ],
+        qualification_attempt_id="attempt-flow5-phantom",
+    )
+
+    # Status is still "recorded" (no SHA rejection), but nothing was written.
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 0
+    assert summary["skipped_not_passed"] == 0
+    assert summary["unmatched_keys"] == [phantom_key], (
+        f"Expected [{phantom_key!r}] in unmatched_keys; got {summary['unmatched_keys']}"
+    )
+
+    # An operator-visible alert must exist — the drop must NOT be silent.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 unmatched-key alert, got {len(alerts)}: {alerts}"
+    assert alerts[0].event_type == "release.walkthrough_key_unmatched"
+    assert phantom_key in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_flow5_rewalk_criterion_writes_evidence(
+    db_session,
+):
+    """When FLOW 5's result is routed to a registered re-walk criterion, coverage flips.
+
+    This is the "natural home" for FLOW 5 evidence after the routing fix: fold
+    the workday-session result into the same criterion that collects re-walk
+    evidence (c-5214996f pattern).  Evidence must be written and the criterion
+    must show 'covered' tier.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Rewalk")
+    sha = "bb" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Register a real criterion (simulating the c-5214996f re-walk criterion that
+    # should receive FLOW 5's evidence after the routing fix).
+    rewalk_crit = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Operator click-to-talk Workday session lifecycle (re-walk)",
+        created_by="strategist",
+    )
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": rewalk_crit.criterion_key,
+                "passed": True,
+                "notes": [
+                    "Workday session started via UI Start button",
+                    "StrategicSessionControl Stop control rendered",
+                    "Session stopped cleanly via strategic-session/stop",
+                ],
+            },
+        ],
+        qualification_attempt_id="attempt-flow5-rewalk",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["skipped_not_passed"] == 0
+    assert summary["unmatched_keys"] == []
+
+    # Coverage must have flipped to covered.
+    evidence = await ac.get_evidence_for_criterion(db_session, rewalk_crit.id)
+    assert len(evidence) == 1
+    ev = evidence[0]
+    assert ev.source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND
+    assert ev.detail["candidate_sha"] == sha
+    assert ev.detail["passed"] is True
+    assert "evaluated_at" in ev.detail
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    # No alert should be created when all keys are matched.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts when key matches; got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_phantom_and_rewalk_key_mixed(
+    db_session,
+):
+    """Phantom key is dropped; real re-walk criterion still gets evidence.
+
+    This is the transition scenario: the walkthrough emits BOTH the phantom key
+    (c-workday-session-lifecycle) and the real registered re-walk criterion key.
+    The real key must receive covered-tier evidence; the phantom must land in
+    unmatched_keys with an alert.  This mirrors the post-fix FLOW 5 where the
+    old key is still present in the output but the new key is also emitted.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Mixed")
+    sha = "cc" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    rewalk_crit = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Workday session re-walk criterion",
+        created_by="strategist",
+    )
+    phantom_key = "c-workday-session-lifecycle"
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": rewalk_crit.criterion_key, "passed": True, "notes": "green"},
+            {"criterion_key": phantom_key, "passed": True, "notes": "phantom"},
+        ],
+        qualification_attempt_id="attempt-flow5-mixed",
+    )
+
+    # One real, one phantom.
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == [phantom_key]
+
+    # Real criterion: covered.
+    evidence = await ac.get_evidence_for_criterion(db_session, rewalk_crit.id)
+    assert len(evidence) == 1
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    # Alert fired for the dropped phantom key.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert phantom_key in alerts[0].message
+
+
+# ---------------------------------------------------------------------------
 # enroll_criterion_coverage_trial
 # ---------------------------------------------------------------------------
 

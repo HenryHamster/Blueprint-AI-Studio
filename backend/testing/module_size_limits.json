@@ -275,7 +275,7 @@
     "test_efficiency_snapshot.py": 13100,
     "test_digest.py": 12250,
     "test_task_lifecycle.py": 12100,
-    "test_acceptance_criteria.py": 11750,
+    "test_acceptance_criteria.py": 13650,
     "test_playbook_sr_metrics.py": 11650,
     "test_direction_outcomes.py": 11600,
     "test_strategic_state.py": 10600,

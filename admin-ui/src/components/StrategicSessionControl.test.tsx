@@ -263,3 +263,137 @@ describe('StrategicSessionControl click-to-talk affordance', () => {
     expect(screen.getByLabelText('Switch Strategic mode to Chat')).toBeDisabled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Walkthrough harness selectors — FLOW 5 affordance contract
+// ---------------------------------------------------------------------------
+// The v26-live-walkthrough.cjs FLOW 5 probes the StrategicSessionControl with
+// specific Playwright selectors.  These tests pin the exact attributes so a
+// component refactor that breaks the selectors shows up immediately in the
+// unit suite rather than surfacing only during a live walkthrough run.
+//
+// FLOW 5d: [data-testid="strategic-session-control"] button[title*="Stop Workday"]
+// FLOW 5f: [data-testid="strategic-session-control"] + aria-label + title="Start Workday session"
+// ---------------------------------------------------------------------------
+
+describe('StrategicSessionControl walkthrough selector contract', () => {
+  test('root element carries data-testid="strategic-session-control"', () => {
+    const { container } = render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive={false}
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    // The walkthrough uses [data-testid="strategic-session-control"] as the
+    // scoping ancestor for all child selectors.  It must be on the root div.
+    expect(container.querySelector('[data-testid="strategic-session-control"]')).not.toBeNull();
+  });
+
+  test('Stop button title matches FLOW 5d selector button[title*="Stop Workday"]', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    // FLOW 5d looks for button[title*="Stop Workday"] inside the control root.
+    // Both "Stop Workday session" and "Stop Workday session before restarting"
+    // satisfy title*="Stop Workday", so the title must start with that prefix.
+    const stopBtn = screen.getByTitle('Stop Workday session');
+    expect(stopBtn.tagName).toBe('BUTTON');
+    expect(stopBtn.title).toMatch(/^Stop Workday/);
+  });
+
+  test('Start button title matches FLOW 5f selector button[title="Start Workday session"]', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive={false}
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    // FLOW 5f looks for button[title="Start Workday session"] — exact match.
+    const startBtn = screen.getByTitle('Start Workday session');
+    expect(startBtn.tagName).toBe('BUTTON');
+    expect(startBtn.title).toBe('Start Workday session');
+  });
+
+  test('Workday toggle aria-label matches FLOW 5f selector aria-label="Switch Strategic mode to Workday"', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="chat"
+        sessionActive={false}
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    // FLOW 5f locates the Workday toggle via
+    //   aria-label="Switch Strategic mode to Workday"
+    // The label must be an exact string match for the Playwright locator.
+    const toggle = screen.getByLabelText('Switch Strategic mode to Workday');
+    expect(toggle.tagName).toBe('BUTTON');
+    expect(toggle.getAttribute('aria-label')).toBe('Switch Strategic mode to Workday');
+  });
+
+  test('FLOW 5f full selector chain: scope → toggle aria-label → start title → click fires callback', () => {
+    // Simulates the exact selector sequence FLOW 5f uses:
+    //   1. Scope to [data-testid="strategic-session-control"]
+    //   2. Find button[aria-label="Switch Strategic mode to Workday"] and click it
+    //   3. After mode switch, find button[title="Start Workday session"] and click it
+    const onModeChange = vi.fn();
+    const onStartSession = vi.fn();
+
+    const { container, rerender } = render(
+      <StrategicSessionControl
+        currentMode="chat"
+        sessionActive={false}
+        onModeChange={onModeChange}
+        onStartSession={onStartSession}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    const root = container.querySelector('[data-testid="strategic-session-control"]');
+    expect(root).not.toBeNull();
+    if (!root) throw new Error('strategic-session-control root not found');
+
+    // Click the Workday toggle scoped inside the root.
+    const workdayToggle = root.querySelector('button[aria-label="Switch Strategic mode to Workday"]') as HTMLButtonElement;
+    expect(workdayToggle).not.toBeNull();
+    fireEvent.click(workdayToggle);
+    expect(onModeChange).toHaveBeenCalledWith('continuous');
+
+    // Re-render in continuous mode (parent would update props after mode change).
+    rerender(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive={false}
+        onModeChange={onModeChange}
+        onStartSession={onStartSession}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    // Start button now available — click it scoped inside the root.
+    const startBtn = root.querySelector('button[title="Start Workday session"]') as HTMLButtonElement;
+    expect(startBtn).not.toBeNull();
+    expect(startBtn.disabled).toBe(false);
+    fireEvent.click(startBtn);
+    expect(onStartSession).toHaveBeenCalledTimes(1);
+  });
+});
