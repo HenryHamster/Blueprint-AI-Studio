@@ -63,6 +63,7 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 "app/vm_lifecycle.py" = ["BLE001"]
 "app/alert_dispatch.py" = ["BLE001", "E402"]
 "app/notification.py" = ["BLE001"]
+"app/notification_dispatch.py" = ["BLE001"]
 "app/deploy_health_alerts.py" = ["BLE001"]
 # runner.py was extracted from compute.py/main.py; the intentional broad-except
 # guards in next-compute-job (repo-token mint) and LLM account selection are

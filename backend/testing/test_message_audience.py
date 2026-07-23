@@ -173,6 +173,19 @@ def test_route_event_hotfix_backmerge_size_violation_is_strategist_internal():
     assert route_event("hotfix_backmerge.size_violation") == STRATEGIST_INTERNAL
 
 
+def test_notification_dead_letter_lost_is_operator_action_needed():
+    """notification.dead_letter_lost must route OPERATOR_ACTION_NEEDED and pass
+    operator_visible_alert_filter so the double-failure surface reaches the operator.
+
+    This event_type is emitted by the _write_dead_letter fallback when the
+    dead-letter persistence write itself fails — the notification is permanently
+    unrecoverable and the operator must be notified.
+    """
+    assert route_event("notification.dead_letter_lost") == OPERATOR_ACTION_NEEDED
+    operator_types = get_operator_event_types()
+    assert "notification.dead_letter_lost" in operator_types
+
+
 def test_route_event_pipeline_internal_bookkeeping_is_strategist_internal():
     """Pipeline-internal bookkeeping event types that must NOT reach the operator badge."""
     # Stale-branch cleanup summary (branch_cleanup.py)

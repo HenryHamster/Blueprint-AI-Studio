@@ -351,6 +351,11 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # because the audience IS operator-visible — the message was routed correctly
     # but the delivery receipt itself is missing, indicating a transport-level loss.
     "delivery.undelivered_strategist_reply": OPERATOR_ACTION_NEEDED,
+    # notification.dead_letter_lost: a notification exhausted all retries AND the
+    # subsequent dead-letter persistence write also failed — the notification is
+    # now unrecoverable.  OPERATOR_ACTION_NEEDED so the operator sees that a
+    # webhook notification was permanently lost (double-failure path).
+    "notification.dead_letter_lost": OPERATOR_ACTION_NEEDED,
 }
 
 # Set of audiences that reach the operator through normal channels.

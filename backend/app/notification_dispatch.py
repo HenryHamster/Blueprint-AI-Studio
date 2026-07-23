@@ -194,13 +194,39 @@ async def _write_dead_letter(
                 )
             )
             await session.commit()
-    except Exception as exc:  # noqa: BLE001 — durability write must not raise
-        logger.warning(
-            "[NOTIFY] Failed to persist dead-letter for %s (%s): %s",
+    except Exception as exc:
+        logger.exception(
+            "[NOTIFY] Dead-letter write FAILED for %s/%s (%s) — notification unrecoverable",
+            entry.project_id,
             entry.event_type,
             reason,
-            exc,
         )
+        # Best-effort: surface the double-failure (delivery failed + dead-letter
+        # write failed) as an operator-visible Alert so it is not silently lost.
+        try:
+            from app.database import closing_session as _cs
+            from app.models import Alert as _Alert, AlertSeverity as _Sev
+            async with _cs() as _alert_session:
+                _alert_session.add(
+                    _Alert(
+                        project_id=str(entry.project_id),
+                        severity=_Sev.WARNING,
+                        title="Notification delivery permanently lost",
+                        message=(
+                            f"A {entry.event_type!r} notification exhausted retries "
+                            f"({reason}) but the dead-letter record could not be "
+                            f"persisted: {exc}. The notification is unrecoverable."
+                        )[:1000],
+                        event_type="notification.dead_letter_lost",
+                    )
+                )
+                await _alert_session.commit()
+        except Exception:
+            logger.exception(
+                "[NOTIFY] Could not surface dead-letter loss as alert for %s/%s",
+                entry.project_id,
+                entry.event_type,
+            )
 
 
 async def _enqueue_retry_durable(entry: _RetryEntry) -> None:
@@ -504,7 +530,7 @@ async def notification_retry_drain_service() -> None:
                 await _drain_retry_queue()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — background loop must survive transient failures
+        except Exception as exc:
             logger.warning("[NOTIFY] Retry drain loop error: %s", exc)
 
 

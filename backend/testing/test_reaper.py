@@ -16670,6 +16670,13 @@ async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
     assert alerts[0].event_type == "deployment.wake_delivery_stalled"
+    # Verify the event_type passes operator_visible_alert_filter so the alert
+    # is visible in the operator badge/preview (not hidden as STRATEGIST_INTERNAL).
+    from app.message_audience import get_operator_event_types
+    assert alerts[0].event_type in get_operator_event_types(), (
+        f"event_type {alerts[0].event_type!r} not in operator_visible_alert_filter "
+        f"allowlist — stall alert would be hidden from operator surfaces"
+    )
 
     # Second call with delivery still stalled → deduped, no new Alert row.
     created2 = await sweep_wake_delivery_stall_alerts(

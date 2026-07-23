@@ -236,6 +236,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "efficiency.provider_routing_verdict": AlertEventPolicy(
         "efficiency.provider_routing_verdict",
     ),
+    "notification.dead_letter_lost": AlertEventPolicy(
+        "notification.dead_letter_lost"
+    ),
 }
 
 

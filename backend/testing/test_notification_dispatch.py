@@ -776,6 +776,74 @@ async def test_exhausted_or_evicted_notification_writes_dead_letter(db_session):
     assert len(nd._retry_queue) == nd._RETRY_QUEUE_MAXLEN
 
 
+@pytest.mark.asyncio
+async def test_dead_letter_double_failure_creates_operator_alert(db_session):
+    """When the dead-letter persistence write fails (double-failure), an operator-
+    visible notification.dead_letter_lost Alert is created as a fallback.
+
+    The scenario: notification delivery failed → _write_dead_letter called →
+    dead-letter DB write also fails → a notification.dead_letter_lost Alert must
+    surface so the operator sees the permanent notification loss.
+    """
+    import contextlib
+    from app.models import Alert, AlertSeverity
+    from app.message_audience import get_operator_event_types
+
+    # Create a real project so the Alert FK constraint is satisfied.
+    project_id = await _persist_test_project(db_session)
+    await db_session.commit()
+
+    entry = _RetryEntry(
+        project_id=project_id,
+        event_type="test.double_failure_event",
+        payload={"k": "v"},
+        body={"event_type": "test.double_failure_event"},
+        attempts=3,
+        next_retry_at=0.0,
+        webhook_url="https://example.com/hook",
+    )
+
+    call_count = 0
+
+    @contextlib.asynccontextmanager
+    async def _controlled_closing():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call (dead-letter write): simulate DB failure.
+            raise RuntimeError("simulated dead-letter DB write failure")
+        # Second call (alert creation fallback): use real test session.
+        yield db_session
+
+    with patch("app.database.closing_session", new=_controlled_closing):
+        await nd._write_dead_letter(entry, reason="exhausted", last_status=503)
+
+    assert call_count == 2, "must attempt dead-letter write then alert creation"
+
+    # The fallback Alert must exist and be operator-visible.
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == str(project_id),
+                    Alert.event_type == "notification.dead_letter_lost",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "double-failure must surface a notification.dead_letter_lost alert"
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "test.double_failure_event" in alert.message
+    assert "exhausted" in alert.message
+    # Verify event_type passes operator_visible_alert_filter (not hidden as STRATEGIST_INTERNAL).
+    assert alert.event_type in get_operator_event_types(), (
+        "notification.dead_letter_lost not in operator_visible_alert_filter allowlist"
+    )
+
+
 # ---------------------------------------------------------------------------
 # get_notification_stats
 # ---------------------------------------------------------------------------
