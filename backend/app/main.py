@@ -112,7 +112,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0682"
+EXPECTED_SCHEMA_REVISION = "0692"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
