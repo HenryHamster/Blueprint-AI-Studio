@@ -2276,3 +2276,151 @@ async def test_undelivered_strategist_replies_event_type_registered():
     assert is_operator_visible(audience), (
         "Undelivered-reply event must be operator-visible"
     )
+
+
+# ---------------------------------------------------------------------------
+# NULL-audience reply: reverse-audience detector + dead-letter heal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_null_audience_reply_detected_as_quarantined(db_session):
+    """A reply-bearing message with NO audience stamp is detected by the
+    reverse-audience detector and counted in reply_audience_quarantined.
+
+    NULL-audience replies are a silent dead-letter class: they are invisible
+    to the operator (excluded by operator_visible_message_audience_filter's
+    fail-closed IN-allowlist) but were previously invisible to the quarantine
+    detector too (which only checked for explicit non-operator audiences).
+    This test verifies the extended detector catches them.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.models import ProjectMessage
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "null-audience-quarantine-test")
+    pid = _uuid.UUID(project_id)
+
+    parent = ProjectMessage(
+        project_id=pid,
+        from_type="user",
+        message_type="NOTE",
+        status="open",
+        content="Parent operator message",
+        context={},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    reply = ProjectMessage(
+        project_id=pid,
+        from_type="system",
+        message_type="NOTE",
+        status="open",
+        content="Reply with no audience stamp",
+        context={},  # NULL audience — no audience key
+        reply_to_message_id=parent.id,
+    )
+    db_session.add(reply)
+    await db_session.flush()
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+
+    assert r.reply_audience_quarantined >= 1, (
+        f"NULL-audience reply must be detected as quarantined, "
+        f"got reply_audience_quarantined={r.reply_audience_quarantined}"
+    )
+    assert r.status == "flagged", (
+        f"Project with NULL-audience reply must be flagged, got {r.status!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_null_audience_reply_healed_to_operator_fyi(db_session):
+    """A NULL-audience reply is healed by the liveness check to OPERATOR_FYI
+    and stamped with delivered_at as a durable delivery receipt.
+
+    This is the delivery-record acceptance test for the dead-letter fix:
+    NULL-audience replies previously failed closed to STRATEGIST_INTERNAL (and
+    permanent invisibility) if their event_type was absent.  After the fix they
+    default to 'question_answer' (OPERATOR_FYI) and surface in the operator chat.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import OPERATOR_FYI, is_operator_visible
+    from app.models import ProjectMessage
+    from sqlmodel import select as _select
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "null-audience-heal-test")
+    pid = _uuid.UUID(project_id)
+
+    parent = ProjectMessage(
+        project_id=pid,
+        from_type="user",
+        message_type="NOTE",
+        status="open",
+        content="Parent operator message",
+        context={},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    reply = ProjectMessage(
+        project_id=pid,
+        from_type="system",
+        message_type="NOTE",
+        status="open",
+        content="Reply with no audience — would be lost without heal",
+        context={},  # NULL audience — no audience key, no event_type
+        reply_to_message_id=parent.id,
+    )
+    db_session.add(reply)
+    await db_session.flush()
+    reply_id = reply.id
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+
+    assert r.reply_audience_healed >= 1, (
+        f"Expected reply_audience_healed >= 1 after NULL-audience heal, "
+        f"got {r.reply_audience_healed}"
+    )
+
+    healed = (
+        await db_session.execute(
+            _select(ProjectMessage).where(ProjectMessage.id == reply_id)
+        )
+    ).scalars().first()
+    assert healed is not None
+
+    healed_audience = (healed.context or {}).get("audience")
+    assert is_operator_visible(healed_audience), (
+        f"Healed NULL-audience reply must have operator-visible audience, "
+        f"got {healed_audience!r}"
+    )
+    assert healed_audience == OPERATOR_FYI, (
+        f"NULL-audience reply must heal to OPERATOR_FYI (question_answer default), "
+        f"got {healed_audience!r}"
+    )
+    # Durable delivery receipt: delivered_at must be stamped on heal.
+    assert healed.delivered_at is not None, (
+        "Healed NULL-audience reply must have delivered_at stamped as "
+        "durable delivery receipt (authenticated Workday message poll path)"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()

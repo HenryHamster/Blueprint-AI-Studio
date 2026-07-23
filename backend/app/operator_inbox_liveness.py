@@ -561,6 +561,14 @@ def _remediate_forward_leaked_messages(session: Any, msgs: list) -> int:
     future ``operator_visible_message_audience_filter`` queries (fail-closed,
     no NULL pass-through) without waiting for the 14-day age-decay sweep.
 
+    Dead-letter guard: when a message has ``reply_to_message_id`` set AND an
+    absent or unregistered ``event_type``, the fail-closed STRATEGIST_INTERNAL
+    stamp would permanently hide an operator-directed reply.  For this case,
+    ``question_answer`` (OPERATOR_FYI) is substituted so the reply remains
+    visible — an operator-directed reply with no explicit event_type is
+    presumed to be a question answer, the same default used by
+    ``post_question_answer`` and ``_handle_strategic_completion``.
+
     Returns the number of messages successfully remediated.
     Error-isolated per-message so a single malformed row never aborts the tick.
     """
@@ -572,6 +580,11 @@ def _remediate_forward_leaked_messages(session: Any, msgs: list) -> int:
             ctx = dict(msg.context or {})
             event_type = ctx.get("event_type") or ""
             msg_type = getattr(msg, "message_type", None)
+            # Dead-letter guard: a reply with no event_type would fail-closed to
+            # STRATEGIST_INTERNAL and become permanently invisible.  Default to
+            # "question_answer" (OPERATOR_FYI) so the reply stays visible.
+            if not event_type and getattr(msg, "reply_to_message_id", None) is not None:
+                event_type = "question_answer"
             new_ctx = stamp_message_audience(ctx, event_type, message_type=msg_type)
             msg.context = new_ctx
             session.add(msg)
@@ -706,10 +719,14 @@ async def run_operator_inbox_liveness_check(
             or 0
         )
 
-        # Inverse detector: reply-bearing messages quarantined in a non-operator
-        # audience (STRATEGIST_INTERNAL or PIPELINE_LOG).  These are operator-
-        # directed replies that silently resolve to the wrong audience and are
-        # never surfaced — the exact 'dropped operator replies' bug class.
+        # Reverse-audience detector: reply-bearing messages that are invisible to
+        # the operator — either explicitly quarantined (audience IN non-operator)
+        # OR with a NULL audience (un-stamped rows that are also excluded by the
+        # fail-closed operator_visible_message_audience_filter).  NULL-audience
+        # replies are a silent dead-letter path: the backfill sweep would stamp
+        # them STRATEGIST_INTERNAL if their event_type is absent or unregistered,
+        # making the reply permanently invisible.  Detecting both classes here
+        # lets the heal pass surface them before the backfill can bury them.
         # Covers both reply_to-threaded messages and cover-style messages
         # (with _resident_reply_covered_message_ids but no reply_to).
         quarantined_reply_count = int(
@@ -724,8 +741,11 @@ async def run_operator_inbox_liveness_check(
                             ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
                         ),
                         ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-                        ProjectMessage.context["audience"].as_string().in_(
-                            _NON_OPERATOR_AUDIENCES
+                        or_(
+                            ProjectMessage.context["audience"].as_string().in_(
+                                _NON_OPERATOR_AUDIENCES
+                            ),
+                            ProjectMessage.context["audience"].as_string().is_(None),
                         ),
                     )
                 )
@@ -829,8 +849,11 @@ async def run_operator_inbox_liveness_check(
                             ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
                         ),
                         ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-                        ProjectMessage.context["audience"].as_string().in_(
-                            _NON_OPERATOR_AUDIENCES
+                        or_(
+                            ProjectMessage.context["audience"].as_string().in_(
+                                _NON_OPERATOR_AUDIENCES
+                            ),
+                            ProjectMessage.context["audience"].as_string().is_(None),
                         ),
                     )
                     .limit(sample_limit)

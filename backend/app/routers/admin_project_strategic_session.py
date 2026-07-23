@@ -142,7 +142,7 @@ from app.storage import (
     generate_download_signed_url,
     storage as gcs_storage,
 )
-from app.message_audience import stamp_message_audience
+from app.message_audience import stamp_message_audience, STRATEGIST_INTERNAL, PIPELINE_LOG
 from app.strategic_resident_session import (
     _ResidentEnsureModeChanged,
     authoritative_resident_session_snapshot,
@@ -1184,11 +1184,23 @@ _SESSION_OUTPUT_LIMIT = 8
 
 
 def _session_conversation_predicate():
+    # NULL-audience leak guard: exclude messages with an explicitly non-operator
+    # audience (strategist-internal / pipeline-log) that accidentally landed on the
+    # CONVERSATION surface.  NULL-audience rows are allowed through — they are either
+    # user-authored messages (which are never audience-stamped) or un-backfilled
+    # strategic messages awaiting the hourly NULL-audience sweep.  Fail-closed
+    # exclusion of ONLY the explicit non-operator classes avoids filtering out
+    # legitimate user messages.
+    _non_operator = [STRATEGIST_INTERNAL, PIPELINE_LOG]
     return and_(
         ProjectMessage.surface == MessageSurface.CONVERSATION,
         or_(
             ProjectMessage.context["event_type"].as_string().is_(None),
             ProjectMessage.context["event_type"].as_string() != _CHECK_IN_EVENT_TYPE,
+        ),
+        or_(
+            ProjectMessage.context["audience"].as_string().is_(None),
+            ~ProjectMessage.context["audience"].as_string().in_(_non_operator),
         ),
     )
 
