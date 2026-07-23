@@ -20,12 +20,13 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Index, delete, func
+from sqlalchemy import Column, Index, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
 
 from app.landed_signal import has_landed_signal, has_merge_unblock_signal
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from app.models_base import NaiveUTCDateTime
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,10 @@ class DirectionDriftSnapshot(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(index=True)
     direction_id: str = Field(index=True)
-    snapshot_at: datetime = Field(default_factory=_utcnow)
+    snapshot_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
     claimed_changes_count: int = Field(default=0)
     actually_merged_prs: int = Field(default=0)
     claim_shipped_consistency: float = Field(default=1.0)
