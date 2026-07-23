@@ -7956,11 +7956,15 @@ class TestBehindRecoveryUpdateBranchGuard:
     ``_PENDING_GUARDS`` is a *temporary* allowlist for known unguarded sites
     that are being fixed in a parallel PR. Each entry MUST carry a TODO
     referencing the parallel work. A companion test
-    (``test_pending_guards_are_eventually_resolved``) is marked
-    ``pytest.mark.xfail(strict=True)`` so that once the parallel fix lands —
-    making the pending site actually guarded — the test xpasses, strict
-    failure fires, and the maintainer is forced to remove the corresponding
-    ``_PENDING_GUARDS`` entry in the same change.
+    (``test_pending_guards_are_eventually_resolved``) **must** be decorated
+    with ``@pytest.mark.xfail(strict=True)`` whenever ``_PENDING_GUARDS`` is
+    non-empty. Add the decorator alongside each new entry and remove both
+    together when the fix lands — the test enforces this pairing and raises
+    ``AssertionError`` if ``_PENDING_GUARDS`` is non-empty while the decorator
+    is absent. Once the parallel fix lands and the pending site becomes
+    actually guarded, the test xpasses; strict failure then fires, forcing
+    the maintainer to remove both the xfail mark and the ``_PENDING_GUARDS``
+    entry in the same change.
     """
 
     # callee identifier (final segment, whether ``ast.Name`` or
@@ -8213,17 +8217,42 @@ class TestBehindRecoveryUpdateBranchGuard:
         )
 
     def test_pending_guards_are_eventually_resolved(self):
-        """Strict-xfail tripwire that flips once every site in
-        ``_PENDING_GUARDS`` becomes actually guarded in source.
+        """Tripwire that enforces the ``_PENDING_GUARDS`` / xfail mark pairing.
+
+        **When** ``_PENDING_GUARDS`` is non-empty, this test must be decorated
+        with ``@pytest.mark.xfail(strict=True)`` — the test asserts this and
+        raises ``AssertionError`` if the decorator is absent. Add the decorator
+        alongside each new ``_PENDING_GUARDS`` entry and remove both together
+        when the fix lands.
 
         For each ``"<rel>:<fn>"`` pending entry, this test parses the file,
         finds the named function, and asserts that ``pr_is_not_behind`` is
         referenced inside it. While the parallel fix is in flight, the
-        assertion fails (expected). The instant the fix lands the assertion
-        passes — strict xfail then fails the build, forcing the maintainer
-        to remove both the xfail mark and the corresponding
-        ``_PENDING_GUARDS`` entry in the same change.
+        assertion fails (expected, per xfail). The instant the fix lands the
+        assertion passes — strict xfail then fails the build, forcing the
+        maintainer to remove both the xfail mark and the ``_PENDING_GUARDS``
+        entry in the same change.
         """
+        # Machine-enforced tripwire: _PENDING_GUARDS non-empty requires the
+        # @pytest.mark.xfail(strict=True) decorator on THIS method.  Checked
+        # via pytestmark rather than at import time so the failure message
+        # points exactly here instead of blowing up at collection.
+        if self._PENDING_GUARDS:
+            _markers = getattr(
+                self.test_pending_guards_are_eventually_resolved, "pytestmark", []
+            )
+            _has_strict_xfail = any(
+                m.name == "xfail" and m.kwargs.get("strict", False)
+                for m in _markers
+            )
+            assert _has_strict_xfail, (
+                "_PENDING_GUARDS is non-empty but "
+                "test_pending_guards_are_eventually_resolved is missing "
+                "@pytest.mark.xfail(strict=True). "
+                "Add the decorator alongside each new _PENDING_GUARDS entry "
+                "and remove both together when the fix lands."
+            )
+
         import ast
 
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
