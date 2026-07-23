@@ -152,6 +152,7 @@ function runtimeProps(overrides: {
     versionLifecycleLastSuccessAt: null,
     versionLifecycleRefreshing: false,
     refreshVersionLifecycle: vi.fn(async () => {}),
+    addToast: vi.fn(),
   };
 }
 

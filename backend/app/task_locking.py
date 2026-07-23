@@ -776,41 +776,34 @@ async def with_efficiency_snapshot_locked(
     *,
     skip_locked: bool = False,
 ) -> bool:
-    """Atomic read-modify-write of ProjectEfficiencySnapshot.data.
+    """Atomic read-modify-write of the efficiency-baseline container.
 
-    Mirrors with_design_doc_locked but targets the dedicated efficiency
-    snapshot row rather than the design_doc God-column. Acquires
-    SELECT FOR UPDATE on the ProjectEfficiencySnapshot row (inserting an
-    empty row first if none exists), calls mutate_fn with the data dict,
-    then writes the result back.
+    Acquires SELECT FOR UPDATE on the Project row, reads the container from
+    ``project.design_doc[DESIGN_DOC_KEY]``, calls *mutate_fn* with the
+    container dict, then writes the result back to ``project.design_doc``.
+
+    Migration 0694 converted ProjectEfficiencySnapshot from a one-row-per-
+    project container to a multi-row time-series table, so the efficiency
+    container now lives directly under ``design_doc``.
     """
-    from app.models import ProjectEfficiencySnapshot
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from app.efficiency_snapshot import DESIGN_DOC_KEY
 
-    # Ensure the row exists before locking it.
-    await session.execute(
-        pg_insert(ProjectEfficiencySnapshot)
-        .values(project_id=project_id, data={}, updated_at=func.now())
-        .on_conflict_do_nothing()
-    )
-
-    stmt = (
-        select(ProjectEfficiencySnapshot)
-        .where(ProjectEfficiencySnapshot.project_id == project_id)
-        .with_for_update(skip_locked=skip_locked)
-    )
-    result = await session.execute(stmt)
-    eff_row = result.scalar_one_or_none()
-    if eff_row is None:
-        return False
-
-    data = dict(eff_row.data or {})
-    mutate_fn(data)
-    eff_row.data = data
-    eff_row.updated_at = func.now()
-    flag_modified(eff_row, "data")
-    session.add(eff_row)
-    return True
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        load_columns=[Project.id, Project.design_doc],
+    ) as project:
+        if project is None:
+            return False
+        doc = dict(project.design_doc or {})
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        mutate_fn(container)
+        doc[DESIGN_DOC_KEY] = container
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+        return True
 
 
 async def with_lane_baseline_locked(

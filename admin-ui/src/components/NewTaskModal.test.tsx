@@ -96,7 +96,7 @@ function DraftStateWrapper(props: Omit<React.ComponentProps<typeof NewTaskModal>
 
 describe('NewTaskModal — Draft contract', () => {
   let computeExperiment: ComputeExperimentForm;
-  let setComputeExperiment: ReturnType<typeof vi.fn>;
+  let setComputeExperiment: ReturnType<typeof vi.fn> & React.Dispatch<React.SetStateAction<ComputeExperimentForm>>;
 
   beforeEach(() => {
     vi.clearAllMocks();

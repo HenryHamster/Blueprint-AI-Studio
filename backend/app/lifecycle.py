@@ -415,9 +415,9 @@ async def _seed_routing_verdict_from_snapshot():
                 .all()
             )
             for eff_row in eff_rows:
-                if not eff_row or not eff_row.data:
+                if not eff_row or not eff_row.blob:
                     continue
-                container = eff_row.data
+                container = eff_row.blob
                 # Read the verdict from where write_snapshot actually stores it.
                 # Priority (newest-first):
                 #   1. snapshots[-1]["provider_routing_verdict"] — latest snapshot,

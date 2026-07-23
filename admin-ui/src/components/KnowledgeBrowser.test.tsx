@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KnowledgeBrowser } from './KnowledgeBrowser';
+import type { KnowledgeDocument } from '../api';
 import { waitFor } from '@testing-library/react';
 
 // A compute_experiment document — proves compute knowledge is recognized as a
@@ -199,7 +200,7 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
     );
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected knowledge document button');
-    await act(async () => { docButton.click(); });
+    await act(async () => { (docButton as HTMLElement).click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
   }
 
@@ -288,7 +289,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
 
     const metDoc = { ...computeDoc, criterion_met: true };
     vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
-      documents: [metDoc],
+      documents: [metDoc as KnowledgeDocument],
       total: 1,
       limit: 50,
       offset: 0
@@ -318,7 +319,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     );
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected document button');
-    await act(async () => { docButton.click(); });
+    await act(async () => { (docButton as HTMLElement).click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Criterion MET');
@@ -329,7 +330,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
 
     const notMetDoc = { ...measuredOnlyComputeDoc, criterion_met: false };
     vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
-      documents: [notMetDoc],
+      documents: [notMetDoc as KnowledgeDocument],
       total: 1,
       limit: 50,
       offset: 0
@@ -359,7 +360,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     );
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected document button');
-    await act(async () => { docButton.click(); });
+    await act(async () => { (docButton as HTMLElement).click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Criterion NOT MET');
@@ -370,7 +371,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
 
     const unmeasuredDoc = { ...computeDoc, id: 'doc-compute-unmeasured', criterion_met: null };
     vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
-      documents: [unmeasuredDoc],
+      documents: [unmeasuredDoc as KnowledgeDocument],
       total: 1,
       limit: 50,
       offset: 0
@@ -400,7 +401,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     );
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected document button');
-    await act(async () => { docButton.click(); });
+    await act(async () => { (docButton as HTMLElement).click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Criterion UNMEASURED');
@@ -474,7 +475,7 @@ describe('KnowledgeBrowser — pagination', () => {
 
   test('shows load-more button when docs.length < total', async () => {
     const { fetchKnowledgeDocuments } = await import('../api');
-    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [page1Doc], total: 2, limit: 50, offset: 0 });
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [page1Doc as KnowledgeDocument], total: 2, limit: 50, offset: 0 });
 
     const container = await renderBrowser();
     const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Load more'));
@@ -600,7 +601,7 @@ describe('KnowledgeBrowser — compute_experiment source kind', () => {
 
   async function renderWithComputeDoc() {
     const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
-    vi.mocked(fetchKnowledgeDocuments).mockResolvedValueOnce({ documents: [computeDoc], total: 1, limit: 50, offset: 0 });
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValueOnce({ documents: [computeDoc as KnowledgeDocument], total: 1, limit: 50, offset: 0 });
     vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({ ...computeDoc, body: '# Compute analysis\n\nResults here.' } as never);
 
     host = document.createElement('div');
@@ -645,7 +646,7 @@ describe('KnowledgeBrowser — compute_experiment source kind', () => {
     );
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected compute document button');
-    await act(async () => { docButton.click(); });
+    await act(async () => { (docButton as HTMLElement).click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Grounded 1 of 1 citation');

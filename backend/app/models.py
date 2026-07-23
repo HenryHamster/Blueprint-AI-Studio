@@ -5956,28 +5956,38 @@ class OperatorInboxLivenessObservation(SQLModel, table=True):
 class ProjectEfficiencySnapshot(SQLModel, table=True):
     """Persisted efficiency-baseline telemetry for a project.
 
-    Replaces design_doc["efficiency_baseline"] — moves the large daily
-    snapshot blob out of the design_doc God-column into a dedicated row.
-    One row per project; project_id is the primary key.
+    Replaces design_doc["efficiency_baseline"] — one row per (project, captured_at).
+    Migration 0694 rebuilt this table from the original one-row-per-project
+    schema to this multi-row time-series schema so project_telemetry.py can
+    store and retrieve snapshots with retention pruning.
     """
 
     __tablename__ = "project_efficiency_snapshot"
 
+    id: uuid.UUID = Field(
+        default_factory=uuid.uuid4,
+        sa_column=Column(GUID(), primary_key=True, nullable=False),
+    )
     project_id: uuid.UUID = Field(
         sa_column=Column(
             GUID(),
             ForeignKey("project.id", ondelete="CASCADE"),
-            primary_key=True,
             nullable=False,
         )
     )
-    data: Dict[str, Any] = Field(
+    captured_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    metric_def_version: str = Field(
+        sa_column=Column(String(64), nullable=False),
+    )
+    blob: Dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
-    updated_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    __table_args__ = (
+        UniqueConstraint("project_id", "captured_at", name="uq_proj_efficiency_snap"),
+        Index("ix_project_efficiency_snapshot_project_id", "project_id"),
     )
 
 

@@ -50,7 +50,6 @@ from app.models import (
     PoolVm,
     PoolVmState,
     Project,
-    ProjectEfficiencySnapshot,
     Task,
     TaskStatus,
     _utcnow,
@@ -3301,15 +3300,7 @@ async def write_snapshot(
         if project is None:
             raise ValueError(f"Project {project_id} not found")
 
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-        await session.execute(
-            pg_insert(ProjectEfficiencySnapshot)
-            .values(project_id=project_id, data={})
-            .on_conflict_do_nothing()
-        )
-        eff_row = await session.get(ProjectEfficiencySnapshot, project_id, populate_existing=True)
-        container = dict(eff_row.data or {})
+        container = dict((project.design_doc or {}).get(DESIGN_DOC_KEY) or {})
 
         if not container.get("baseline"):
             container["baseline"] = dict(snapshot)
@@ -3471,9 +3462,11 @@ async def write_snapshot(
         container["snapshots"] = snapshots
         container["last_run_at"] = captured_at
 
-        eff_row.data = container
-        flag_modified(eff_row, "data")
-        session.add(eff_row)
+        doc = dict(project.design_doc or {})
+        doc[DESIGN_DOC_KEY] = container
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
 
     from app.project_telemetry import set_project_telemetry
     await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, container)
@@ -3808,11 +3801,7 @@ async def read_baseline_with_drift(
     _pool_amortization_windowed_idle_usd = _windowed_idle_result["total"]
     _pool_amortization_windowed_by_account = _windowed_idle_result["by_account"]
 
-    eff_row = await session.get(ProjectEfficiencySnapshot, project_id)
-    if eff_row is not None:
-        container = dict(eff_row.data or {})
-    else:
-        container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     baseline = container.get("baseline") or {}
     snapshots = await _read_snapshot_history(session, project_id, container)
     latest = snapshots[-1] if snapshots else {}
@@ -4307,11 +4296,7 @@ async def maybe_write_daily_snapshot(
     if project is None:
         return None
 
-    eff_row = await session.get(ProjectEfficiencySnapshot, project_id)
-    if eff_row is not None:
-        container = dict(eff_row.data or {})
-    else:
-        container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     if not _last_run_due(container.get("last_run_at"), now):
         return None
     return await write_snapshot(session, project_id)
@@ -4387,14 +4372,10 @@ async def maybe_alert_pool_payoff_transition(
     # last state we have a durable alert for. The marker is advanced only after
     # an active alert row exists; otherwise a policy race could record "alerted"
     # without any operator-visible alert.
-    eff_row_read = await session.get(ProjectEfficiencySnapshot, project_id)
-    if eff_row_read is None:
-        _proj = await session.get(Project, project_id)
-        if _proj is None:
-            return None
-        container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
-    else:
-        container_read = dict(eff_row_read.data or {})
+    _proj = await session.get(Project, project_id)
+    if _proj is None:
+        return None
+    container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
     should_fire = container_read.get(LAST_ALERTED_PAYOFF_KEY) != state
 
     if not should_fire:
@@ -4667,14 +4648,10 @@ async def maybe_alert_provider_routing_transition(
 
     # Transition edge: only fire when the alert-worthy state differs from the
     # last state we have a durable alert for.
-    eff_row_read = await session.get(ProjectEfficiencySnapshot, project_id)
-    if eff_row_read is None:
-        _proj = await session.get(Project, project_id)
-        if _proj is None:
-            return None
-        container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
-    else:
-        container_read = dict(eff_row_read.data or {})
+    _proj = await session.get(Project, project_id)
+    if _proj is None:
+        return None
+    container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
     should_fire = container_read.get(LAST_ALERTED_ROUTING_KEY) != state
 
     if not should_fire:

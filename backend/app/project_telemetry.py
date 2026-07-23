@@ -77,16 +77,16 @@ _LANE_BASELINE_VERSIONS_MAX = 20
 
 __all__ = [
     "get_project_telemetry",
-    "set_project_telemetry",
+    "insert_efficiency_snapshot",
+    "read_all_lane_baselines",
+    "read_recent_efficiency_snapshots",
     "read_telemetry",
     "read_telemetry_many",
     "read_telemetry_or_doc",
-    "upsert_telemetry",
-    "insert_efficiency_snapshot",
-    "read_recent_efficiency_snapshots",
-    "upsert_lane_baseline",
     "read_version_lane_baseline",
-    "read_all_lane_baselines",
+    "set_project_telemetry",
+    "upsert_lane_baseline",
+    "upsert_telemetry",
 ]
 
 # ---------------------------------------------------------------------------
@@ -378,7 +378,7 @@ async def read_version_lane_baseline(
 ) -> Dict[str, Any] | None:
     """Return the lane-baseline blob for (project_id, version_number), or None."""
     result = await session.execute(
-        select(ProjectLaneBaseline.data).where(
+        select(ProjectLaneBaseline.blob).where(
             ProjectLaneBaseline.project_id == project_id,
             ProjectLaneBaseline.version_number == version_number,
         )
