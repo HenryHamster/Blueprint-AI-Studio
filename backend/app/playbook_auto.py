@@ -40,6 +40,7 @@ from app.playbook_storage import (
     _get_prior_archive_entry,
     _is_auto_playbook_suppressed,
 )
+from app.project_telemetry import get_project_telemetry, set_project_telemetry
 from app.shared_state import DEFAULT_TASK_SCOPE
 from app.task_locking import DesignDocSizeLimitExceeded, with_design_doc_locked
 
@@ -311,11 +312,24 @@ async def _maybe_auto_playbook(
         entry_scope = "universal"
         learned_from_direction = None
 
+    # Pre-fetch archive from project_telemetry so _get_prior_archive_entry and
+    # _is_auto_playbook_suppressed see the real data inside the design-doc lock
+    # (strip_migrated_doc_keys already removed "playbook_archive" from the
+    # persisted design_doc, so the lock-loaded doc would have an empty archive
+    # without this pre-fetch).
+    pre_fetched_archive = await get_project_telemetry(
+        session, task.project_id, "playbook_archive"
+    )
+
     entry_created = False
     suppression_reason: Optional[str] = None
+    captured_archive: Optional[list] = None
 
     def _mutate_design_doc(doc: dict) -> None:
-        nonlocal entry_created, suppression_reason
+        nonlocal entry_created, suppression_reason, captured_archive
+
+        # Inject the real archive so suppression/prior-entry helpers work.
+        doc["playbook_archive"] = list(pre_fetched_archive or [])
 
         if playbook_full_key in doc:
             suppression_reason = "exists"
@@ -341,6 +355,8 @@ async def _maybe_auto_playbook(
         archived_doc = maybe_archive_for_capacity(
             doc, len(json.dumps(new_entry).encode())
         )
+        # Capture archive before doc.clear() wipes archived_doc (same object).
+        captured_archive = list(archived_doc.get("playbook_archive") or [])
         doc.clear()
         doc.update(archived_doc)
 
@@ -389,6 +405,14 @@ async def _maybe_auto_playbook(
                 key,
             )
         return None
+
+    # Persist the archive captured inside the lock to project_telemetry so
+    # strip_migrated_doc_keys (which runs in with_design_doc_locked) doesn't
+    # lose any capacity-eviction entries added by maybe_archive_for_capacity.
+    if captured_archive is not None:
+        await set_project_telemetry(
+            session, task.project_id, "playbook_archive", captured_archive
+        )
 
     logger.info(
         "[AUTO_PLAYBOOK] project=%s created entry '%s' for pattern '%s' (seen %dx)",

@@ -645,6 +645,11 @@ class ComputeLaunchSpec:
     # checkpoint instead of restarting from zero. Validated at launch time (same
     # project, durable bundle present). Absent ⇒ no resume (existing behavior).
     input_artifact_job_id: str | None = None
+    # Optional metric name the task declared it will write to result.json. When
+    # set, the backend's poll_status uses this to check whether the declared metric
+    # was captured. Carried on the spec so callers do not need to re-read
+    # polling_metadata after the spec is built.
+    declared_metric: str | None = None
 
 
 @dataclass(slots=True)

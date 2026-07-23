@@ -22,6 +22,7 @@ from app.models import (
     _utcnow,
 )
 from app.playbook_storage import maybe_archive_for_capacity
+from app.project_telemetry import get_project_telemetry, set_project_telemetry, strip_migrated_doc_keys
 from app.task_capabilities import ALL_TASK_TYPES
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,13 @@ async def capture_success_pattern(
 
     doc = dict(project.design_doc or {})
 
+    # Hydrate archive from project_telemetry (with design_doc fallback) so
+    # capacity-eviction appends to the real archive, not an empty in-memory copy.
+    existing_archive = await get_project_telemetry(
+        session, task.project_id, "playbook_archive", design_doc_fallback=doc
+    )
+    doc["playbook_archive"] = list(existing_archive or [])
+
     # One entry per (task_type, scope) pair.
     scope_slug = scope.lower().replace(" ", "-")
     key = f"success-{task_type}-{scope_slug}"
@@ -218,9 +226,12 @@ async def capture_success_pattern(
     meta["updated_by"] = "success-playbook"
     doc["_meta"] = meta
 
+    updated_archive = list(doc.get("playbook_archive") or [])
+    strip_migrated_doc_keys(doc)
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)
+    await set_project_telemetry(session, task.project_id, "playbook_archive", updated_archive)
 
     logger.info(
         "[SUCCESS_PLAYBOOK] project=%s %s entry '%s' for task_type=%s scope=%s",

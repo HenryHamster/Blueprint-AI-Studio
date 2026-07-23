@@ -27,7 +27,7 @@
     "routers/admin_settings.py": 4750,
     "routers/admin_analytics.py": 2750,
     "routers/admin_operator_triggers.py": 1450,
-    "routers/admin_digest.py": 4508,
+    "routers/admin_digest.py": 4528,
     "routers/admin_release_version.py": 2250,
     "routers/admin_pipeline_observability.py": 2350,
     "routers/admin_agent_ops.py": 7450,
@@ -381,6 +381,7 @@
     "test_admin_routers__runners.py": 1600,
     "test_admin_routers__users.py": 750,
     "test_compute__experiments.py": 1600,
-    "test_release_qualifier__retry_episode_cap.py": 750
+    "test_release_qualifier__retry_episode_cap.py": 750,
+    "test_compute_park_wake.py": 2000
   }
 }

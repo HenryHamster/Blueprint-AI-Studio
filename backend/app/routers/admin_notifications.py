@@ -89,6 +89,11 @@ from app.playbook_storage import (
     _PLAYBOOK_CAPACITY_BYTES,
     record_playbook_tombstone,
 )
+from app.project_telemetry import (
+    get_project_telemetry,
+    set_project_telemetry,
+    strip_migrated_doc_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1843,11 +1848,20 @@ async def admin_playbook_delete(
     if playbook_key not in doc:
         raise HTTPException(status_code=404, detail=f"Playbook key '{key}' not found")
 
+    # Hydrate archive from project_telemetry (with design_doc fallback) so the
+    # tombstone is appended to the real archive, not an empty in-memory copy.
+    existing_archive = await get_project_telemetry(
+        session, project_id, "playbook_archive", design_doc_fallback=doc
+    )
+    doc["playbook_archive"] = list(existing_archive or [])
+
     del doc[playbook_key]
 
     # Record a tombstone so auto-playbook regeneration stays suppressed even
     # after archive trimming.
     record_playbook_tombstone(doc, playbook_key, archived_at=_utcnow().isoformat())
+
+    updated_archive = list(doc.get("playbook_archive") or [])
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1
@@ -1855,9 +1869,11 @@ async def admin_playbook_delete(
     meta["updated_by"] = "admin"
     doc["_meta"] = meta
 
+    strip_migrated_doc_keys(doc)
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)
+    await set_project_telemetry(session, project_id, "playbook_archive", updated_archive)
     await session.commit()
 
     return {"status": "ok", "key": key, "deleted": True}

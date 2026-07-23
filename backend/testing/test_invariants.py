@@ -6089,6 +6089,40 @@ class TestTestFileSizeGuardrails:
         enforce its cap, with no per-file test method to maintain."""
         self._check_test_file(relative_path)
 
+    def test_no_stale_testing_caps(self):
+        """Caps must remain close enough to actual file sizes to catch real growth.
+
+        A cap that has drifted to 3x+ the actual file size (typical after a
+        monolith is split) is no longer a meaningful guardrail. This test
+        enforces that every testing cap stays within max(actual + 500, actual * 2).
+
+        Remedy: tighten the cap in module_size_limits.json under 'testing' to
+        match the policy value returned by ``check_size_limits.py --fix`` for
+        the breaching entry. Do NOT modify this test to raise the threshold.
+        """
+        testing_root = os.path.dirname(__file__)
+        stale = []
+        for rel_path, cap in TESTING_SIZE_LIMITS.items():
+            abs_path = os.path.join(testing_root, rel_path)
+            if not os.path.exists(abs_path):
+                continue
+            with open(abs_path, encoding="utf-8") as fh:
+                actual = len(fh.readlines())
+            allowed_cap = max(actual + 500, actual * 2)
+            if cap > allowed_cap:
+                stale.append((rel_path, actual, cap, allowed_cap))
+        assert not stale, (
+            f"{len(stale)} testing cap(s) have drifted far above actual file size "
+            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+            "the file grows to an unreasonable size:\n\n"
+            + "\n".join(
+                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+                for r, actual, cap, allowed in stale
+            )
+            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+            "and commit the updated module_size_limits.json."
+        )
+
 
 # ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────
 #

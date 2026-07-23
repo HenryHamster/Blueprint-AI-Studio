@@ -3823,6 +3823,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
             else None
         ),
         input_artifact_job_id=meta.get("input_artifact_job_id") or None,
+        declared_metric=meta.get("declared_metric") or None,
     )
 
 

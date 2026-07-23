@@ -855,7 +855,162 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
 
     assert key == "success-create-small", "New entry should have been created"
     doc = project.design_doc or {}
-    archive = doc.get("playbook_archive", [])
+    # playbook_archive is now stored in project_telemetry, not design_doc.
+    assert "playbook_archive" not in doc, (
+        "design_doc must not contain playbook_archive after migration"
+    )
+    from app.project_telemetry import get_project_telemetry
+    archive = await get_project_telemetry(db_session, project.id, "playbook_archive") or []
     assert len(archive) >= 1, (
-        "At least one entry should have been archived for capacity"
+        "At least one entry should have been archived for capacity (in telemetry)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capture_success_archive_design_doc_clean(db_session: AsyncSession):
+    """capture_success_pattern must not persist playbook_archive in design_doc."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+
+    await capture_success_pattern(task, db_session)
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+    assert "playbook_archive" not in doc, (
+        "design_doc must be free of playbook_archive after capture_success_pattern"
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_suppressed_via_telemetry_archive(db_session: AsyncSession):
+    """_is_auto_playbook_suppressed must read archive from project_telemetry.
+
+    Proof: place a recently-archived entry ONLY in project_telemetry (not in
+    design_doc); then verify that the auto-playbook path still suppresses
+    re-creation of that entry.
+
+    The signature "test-pattern" maps to key "auto-test-pattern" via
+    _signature_to_key (fallback path: no traceback, no exception, returns the
+    raw string; _signature_to_key prefixes "auto-").
+    """
+    from app.playbook_auto import _maybe_auto_playbook, _signature_to_key
+    from app.project_telemetry import get_project_telemetry
+    from app.models import ProjectTelemetry, Task, TaskStatus
+
+    # Use a short, deterministic error_summary so the generated key is predictable.
+    error_summary = "test-pattern"
+    generated_key = _signature_to_key(error_summary)  # "auto-test-pattern"
+    full_key = f"playbook/{generated_key}"
+
+    project = await _make_project(db_session, design_doc={})
+
+    # Seed archive ONLY in project_telemetry (design_doc has none).
+    # Use ORM directly to avoid PostgreSQL-specific pg_insert dialect issues.
+    from app.models import _utcnow as _m_utcnow
+    recent_archived_at = (_m_utcnow() - timedelta(days=1)).isoformat()
+    seed_archive = [
+        {
+            "_archived_key": full_key,
+            "_archived_at": recent_archived_at,
+            "_retirement_reason": "capacity",
+        }
+    ]
+    telemetry_row = ProjectTelemetry(
+        project_id=project.id,
+        key="playbook_archive",
+        value=seed_archive,
+        updated_at=_m_utcnow(),
+    )
+    db_session.add(telemetry_row)
+    await db_session.flush()
+
+    # Create enough failure tasks to exceed the auto-playbook threshold (3).
+    # The tasks must have _failure_signature matching what _maybe_auto_playbook computes.
+    for _ in range(3):
+        t = Task(
+            project_id=project.id,
+            title="Failed task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.FAILED,
+            context={"scope": "small", "_failure_signature": error_summary},
+        )
+        db_session.add(t)
+    await db_session.flush()
+
+    task = Task(
+        project_id=project.id,
+        title="Current failing task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        context={"scope": "small"},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    result = await _maybe_auto_playbook(task, "CODE_ERROR", error_summary, db_session)
+
+    # Entry must be suppressed because it was archived within the cooldown window.
+    assert result is None, (
+        f"_maybe_auto_playbook must not create key '{generated_key}' suppressed "
+        f"by telemetry archive; got result={result!r}"
+    )
+    # Confirm the archive in telemetry is still intact.
+    stored = await get_project_telemetry(db_session, project.id, "playbook_archive")
+    assert stored is not None
+    assert any(e.get("_archived_key") == full_key for e in stored)
+
+
+@pytest.mark.asyncio
+async def test_playbook_delete_tombstone_in_telemetry_not_design_doc(db_session: AsyncSession):
+    """admin_playbook_delete must write the tombstone to project_telemetry, not design_doc."""
+    from app.project_telemetry import (
+        get_project_telemetry,
+        set_project_telemetry,
+        strip_migrated_doc_keys,
+    )
+    from app.playbook_storage import record_playbook_tombstone
+    from sqlalchemy.orm.attributes import flag_modified
+
+    full_key = "playbook/my-tip"
+    project = await _make_project(
+        db_session,
+        design_doc={
+            full_key: {"content": "operator tip", "confirmed_count": 0},
+        },
+    )
+    await db_session.flush()
+
+    # Simulate what admin_playbook_delete does.
+    doc = dict(project.design_doc or {})
+    existing_archive = await get_project_telemetry(
+        db_session, project.id, "playbook_archive", design_doc_fallback=doc
+    )
+    doc["playbook_archive"] = list(existing_archive or [])
+    del doc[full_key]
+    record_playbook_tombstone(doc, full_key, archived_at=_utcnow().isoformat())
+    updated_archive = list(doc.get("playbook_archive") or [])
+    strip_migrated_doc_keys(doc)
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await set_project_telemetry(db_session, project.id, "playbook_archive", updated_archive)
+    await db_session.flush()
+
+    # design_doc must be free of playbook_archive.
+    assert "playbook_archive" not in (project.design_doc or {}), (
+        "design_doc must not contain playbook_archive after delete"
+    )
+    # Tombstone must be readable from telemetry.
+    archive = await get_project_telemetry(db_session, project.id, "playbook_archive") or []
+    tombstones = [
+        e for e in archive
+        if e.get("_archived_key") == full_key
+        and e.get("_retirement_reason") == "operator_deleted"
+    ]
+    assert len(tombstones) == 1, (
+        "Tombstone must be present in project_telemetry.playbook_archive"
     )

@@ -35,7 +35,12 @@ from app.playbook_sr_metrics import (
     _SR_SEVERITY_DELTA_THRESHOLDS,
     _TREND_DELTA_THRESHOLD,
 )
-from app.project_telemetry import read_telemetry_or_doc, strip_migrated_doc_keys
+from app.project_telemetry import (
+    get_project_telemetry,
+    read_telemetry_or_doc,
+    set_project_telemetry,
+    strip_migrated_doc_keys,
+)
 from app.time_utils import _to_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -632,6 +637,14 @@ async def extract_review_feedback_to_playbook(
         return []
 
     doc = dict(project.design_doc or {})
+
+    # Hydrate archive from project_telemetry (with design_doc fallback) so
+    # suppression checks and capacity-eviction see the real archive data.
+    existing_archive = await get_project_telemetry(
+        session, task.project_id, "playbook_archive", design_doc_fallback=doc
+    )
+    doc["playbook_archive"] = list(existing_archive or [])
+
     buckets = _categorize_review_issues(review_history)
     related_files: list[str] = list((task.context or {}).get("related_files") or [])
     module_profiles_updated = bool(related_files and buckets)
@@ -745,13 +758,21 @@ async def extract_review_feedback_to_playbook(
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "review-playbook"
         doc["_meta"] = meta
+        # Capture archive before strip_migrated_doc_keys removes it from doc.
+        updated_archive = list(doc.get("playbook_archive") or [])
         doc = strip_migrated_doc_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
         session.add(project)
 
+        await set_project_telemetry(
+            session,
+            task.project_id,
+            "playbook_archive",
+            updated_archive,
+        )
+
         if module_profiles_updated:
-            from app.project_telemetry import set_project_telemetry
             await set_project_telemetry(
                 session,
                 task.project_id,
@@ -760,7 +781,6 @@ async def extract_review_feedback_to_playbook(
             )
 
         if direction_tally_updated:
-            from app.project_telemetry import set_project_telemetry
             await set_project_telemetry(
                 session,
                 task.project_id,
