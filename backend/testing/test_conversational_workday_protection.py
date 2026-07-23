@@ -41,6 +41,47 @@ def _load_manifest() -> dict:
         return json.load(fh)
 
 
+def _extract_ts_it_labels(source: str) -> set[str]:
+    """Extract all it('...') / it("...") / it(`...`) labels from TS source.
+
+    Handles all three JS/TS quote styles.  A single-quote-only regex would
+    silently miss labels written as it("…") or it(`…`), allowing a new test
+    to escape the manifest-completeness check and nullify the anti-deletion
+    guarantee.
+    """
+    import re
+
+    labels: set[str] = set()
+    for m in re.finditer(
+        r"""^\s*it\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)""",
+        source,
+        re.MULTILINE,
+    ):
+        label = m.group(1) or m.group(2) or m.group(3)
+        if label:
+            labels.add(label)
+    return labels
+
+
+def _extract_ts_it_each_labels(source: str) -> set[str]:
+    """Extract it.each(…)(label, …) template strings from TS source.
+
+    Handles all three JS/TS quote styles so that it.each(…)("label") and
+    it.each(…)(`label`) forms are not silently skipped.
+    """
+    import re
+
+    labels: set[str] = set()
+    for m in re.finditer(
+        r"""it\.each\b[\s\S]*?\)\s*\(\s*\n?\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)""",
+        source,
+    ):
+        label = m.group(1) or m.group(2) or m.group(3)
+        if label:
+            labels.add(label)
+    return labels
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -599,8 +640,6 @@ def test_strategic_resident_agent_handler_is_protected_with_all_tests():
     guard. Verifies: (a) the file is in the protect section, (b) every it()/
     it.each() test label in the file is listed, and (c) counts match.
     """
-    import re
-
     manifest = _load_manifest()
     target_path = "agent/src/handlers/strategic-resident.test.ts"
 
@@ -620,16 +659,12 @@ def test_strategic_resident_agent_handler_is_protected_with_all_tests():
 
     source = full_path.read_text(encoding="utf-8")
 
-    # Collect all plain it('label', ...) test labels from lines starting with it(.
-    actual_labels: set[str] = set(re.findall(
-        r"^\s*it\s*\(\s*'([^']+)'",
-        source,
-        re.MULTILINE,
-    ))
-    # Collect it.each(...)('template', ...) template strings — the template may
-    # appear on the same line or the next line after the closing ) of each(...).
-    for m in re.finditer(r"it\.each\b[\s\S]*?\)\s*\(\s*\n?\s*'([^']+)'", source):
-        actual_labels.add(m.group(1))
+    # Collect all it('label') / it("label") / it(`label`) test labels.
+    # _extract_ts_it_labels handles all three JS/TS quote styles so that a
+    # test written with double or backtick quotes is not silently missed.
+    actual_labels: set[str] = _extract_ts_it_labels(source)
+    # Collect it.each(...)('template') / it.each(...)("template") labels.
+    actual_labels |= _extract_ts_it_each_labels(source)
 
     listed_labels = set(entry["test_ids"])
 
@@ -661,8 +696,6 @@ def test_strategic_resident_lib_is_protected_with_all_tests():
     the protect section, (b) every it()/it.each() label in the file is listed, and
     (c) counts match so a silently-added test doesn't escape the manifest.
     """
-    import re
-
     manifest = _load_manifest()
     target_path = "agent/src/handlers/strategic-resident-lib.test.ts"
 
@@ -682,15 +715,12 @@ def test_strategic_resident_lib_is_protected_with_all_tests():
 
     source = full_path.read_text(encoding="utf-8")
 
-    # Collect all plain it('label', ...) test labels.
-    actual_labels: set[str] = set(re.findall(
-        r"^\s*it\s*\(\s*'([^']+)'",
-        source,
-        re.MULTILINE,
-    ))
-    # Collect it.each(...)('template', ...) template strings.
-    for m in re.finditer(r"it\.each\b[\s\S]*?\)\s*\(\s*\n?\s*'([^']+)'", source):
-        actual_labels.add(m.group(1))
+    # Collect all it('label') / it("label") / it(`label`) test labels.
+    # _extract_ts_it_labels handles all three JS/TS quote styles so that a
+    # test written with double or backtick quotes is not silently missed.
+    actual_labels: set[str] = _extract_ts_it_labels(source)
+    # Collect it.each(...)('template') / it.each(...)("template") labels.
+    actual_labels |= _extract_ts_it_each_labels(source)
 
     listed_labels = set(entry["test_ids"])
 
@@ -899,3 +929,161 @@ def test_no_removed_resident_task_type_in_task_capabilities():
         "removed in migration 0657. Remove it to prevent reinstating the "
         "resident turn processing path."
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _extract_ts_it_labels / _extract_ts_it_each_labels helpers
+#
+# These tests verify that the manifest-completeness guards collect test labels
+# regardless of which JS/TS quote style is used. A single-quote-only regex
+# would silently miss it("…") and it(`…`) forms, allowing a newly-added test
+# to bypass the anti-deletion guarantee without any guard failure.
+# ---------------------------------------------------------------------------
+
+
+def test_ts_label_extraction_single_quoted():
+    """_extract_ts_it_labels must collect single-quoted it() labels."""
+    source = "  it('finds single-quoted label', () => { expect(1).toBe(1) })\n"
+    labels = _extract_ts_it_labels(source)
+    assert labels == {"finds single-quoted label"}, (
+        f"Expected {{'finds single-quoted label'}}, got {labels!r}"
+    )
+
+
+def test_ts_label_extraction_double_quoted():
+    """_extract_ts_it_labels must collect double-quoted it() labels.
+
+    A regex that only matches single quotes silently misses this form, so a
+    test added as it("new test") would escape the manifest-completeness check.
+    """
+    source = '  it("finds double-quoted label", () => { expect(1).toBe(1) })\n'
+    labels = _extract_ts_it_labels(source)
+    assert labels == {"finds double-quoted label"}, (
+        f"Expected {{'finds double-quoted label'}}, got {labels!r}"
+    )
+
+
+def test_ts_label_extraction_backtick_quoted():
+    """_extract_ts_it_labels must collect backtick-quoted it() labels.
+
+    A regex that only matches single quotes silently misses this form, so a
+    test added as it(`new test`) would escape the manifest-completeness check.
+    """
+    source = "  it(`finds backtick-quoted label`, () => { expect(1).toBe(1) })\n"
+    labels = _extract_ts_it_labels(source)
+    assert labels == {"finds backtick-quoted label"}, (
+        f"Expected {{'finds backtick-quoted label'}}, got {labels!r}"
+    )
+
+
+def test_ts_label_extraction_mixed_quote_styles():
+    """_extract_ts_it_labels collects labels from all three quote styles in one file."""
+    source = (
+        "  it('single-quoted', () => {})\n"
+        '  it("double-quoted", () => {})\n'
+        "  it(`backtick-quoted`, () => {})\n"
+    )
+    labels = _extract_ts_it_labels(source)
+    assert labels == {"single-quoted", "double-quoted", "backtick-quoted"}, (
+        f"Expected all three quote styles captured, got {labels!r}"
+    )
+
+
+def test_ts_label_extraction_single_quote_only_regex_misses_double_quoted():
+    """Demonstrate the gap: old single-quote regex silently misses double-quoted labels.
+
+    This test documents the negative case: using a single-quote-only pattern
+    (the previous implementation) on a source that contains only a
+    double-quoted it() call produces an empty set — no guard failure would
+    fire for a manifest that does not list the label.  _extract_ts_it_labels
+    fixes this by handling all three quote styles.
+    """
+    import re
+
+    source = '  it("unlisted double-quoted test", () => { expect(1).toBe(1) })\n'
+
+    # The old single-quote-only regex misses this label entirely.
+    old_regex_result = set(re.findall(
+        r"^\s*it\s*\(\s*'([^']+)'",
+        source,
+        re.MULTILINE,
+    ))
+    assert old_regex_result == set(), (
+        "Sanity check failed: old single-quote regex should return nothing for "
+        f"a double-quoted label, but got {old_regex_result!r}"
+    )
+
+    # The fixed helper correctly finds the label.
+    fixed_result = _extract_ts_it_labels(source)
+    assert fixed_result == {"unlisted double-quoted test"}, (
+        f"Fixed helper should find the double-quoted label, got {fixed_result!r}"
+    )
+
+
+def test_ts_label_extraction_single_quote_only_regex_misses_backtick():
+    """Demonstrate the gap: old single-quote regex silently misses backtick labels."""
+    import re
+
+    source = "  it(`unlisted backtick test`, () => { expect(1).toBe(1) })\n"
+
+    old_regex_result = set(re.findall(
+        r"^\s*it\s*\(\s*'([^']+)'",
+        source,
+        re.MULTILINE,
+    ))
+    assert old_regex_result == set(), (
+        "Sanity check failed: old single-quote regex should return nothing for "
+        f"a backtick label, but got {old_regex_result!r}"
+    )
+
+    fixed_result = _extract_ts_it_labels(source)
+    assert fixed_result == {"unlisted backtick test"}, (
+        f"Fixed helper should find the backtick label, got {fixed_result!r}"
+    )
+
+
+def test_ts_it_each_label_extraction_double_quoted():
+    """_extract_ts_it_each_labels must collect double-quoted it.each templates."""
+    source = (
+        "  it.each([\n"
+        "    ['a'], ['b'],\n"
+        "  ])(\"handles %s in double quotes\", (val) => { expect(val).toBeTruthy() })\n"
+    )
+    labels = _extract_ts_it_each_labels(source)
+    assert labels == {"handles %s in double quotes"}, (
+        f"Expected double-quoted it.each template captured, got {labels!r}"
+    )
+
+
+def test_ts_it_each_label_extraction_backtick():
+    """_extract_ts_it_each_labels must collect backtick it.each templates."""
+    source = (
+        "  it.each([\n"
+        "    ['a'], ['b'],\n"
+        "  ])(`handles %s in backticks`, (val) => { expect(val).toBeTruthy() })\n"
+    )
+    labels = _extract_ts_it_each_labels(source)
+    assert labels == {"handles %s in backticks"}, (
+        f"Expected backtick it.each template captured, got {labels!r}"
+    )
+
+
+def test_ts_label_extraction_ignores_non_leading_it_calls():
+    """_extract_ts_it_labels must not collect inline 'it' mentions, only leading it()."""
+    source = (
+        "  it('valid test label', () => {\n"
+        "    // a comment mentioning it('inline') or describe it('as follows')\n"
+        "    expect(doIt('something')).toBe(true)\n"
+        "  })\n"
+    )
+    labels = _extract_ts_it_labels(source)
+    # Only the first line should be collected; inline mentions must be ignored.
+    assert labels == {"valid test label"}, (
+        f"Expected only the leading it() to be collected, got {labels!r}"
+    )
+
+
+def test_ts_label_extraction_empty_source():
+    """_extract_ts_it_labels returns an empty set for an empty source string."""
+    assert _extract_ts_it_labels("") == set()
+    assert _extract_ts_it_each_labels("") == set()

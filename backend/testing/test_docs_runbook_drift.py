@@ -3,7 +3,7 @@ with RunnerPreset definitions and the shipped blueprint-runner CLI.
 
 ``RunnerPreset`` in ``backend/app/routers/admin_runners.py`` is a ``Literal``
 of valid preset names. This file ensures the runbook covers every preset and
-contains no references to the (removed) resident subsystem — two failure modes
+contains no references to the excised strategic-resident subsystem — two failure modes
 that are easy to miss during a docs-only PR.
 
 ``FIRST_LAUNCH_COMMANDS`` and ``MIN_NODE_MAJOR`` in ``scripts/blueprint_runner.py``
@@ -104,12 +104,22 @@ def test_all_preset_names_appear_in_runbook() -> None:
 
 
 def test_no_resident_references() -> None:
-    """The runbook must not reference the excised resident subsystem."""
-    text = _RUNBOOK_PATH.read_text().lower()
-    assert "resident" not in text, (
-        "docs/RUNNER_RUNBOOK.md still references 'resident' "
-        "(strategic-resident subsystem was removed)"
-    )
+    """The runbook must not reference the excised strategic-resident subsystem.
+
+    The conversational Workday resident was restored (#16075) as a protected
+    surface pinned to the local runner, so the word 'resident' alone is no
+    longer banned.  The specific patterns that were excised — the
+    ``strategic_resident`` module name and the ``StrategicResident`` class —
+    remain prohibited so that any accidental re-introduction of the old
+    subsystem is caught immediately.
+    """
+    text = _RUNBOOK_PATH.read_text()
+    for banned in ("strategic_resident", "StrategicResident"):
+        assert banned not in text, (
+            f"docs/RUNNER_RUNBOOK.md references '{banned}' "
+            f"(strategic-resident subsystem was removed — use the conversational "
+            f"Workday resident API instead)"
+        )
 
 
 def test_first_launch_matches_shipped_cli() -> None:

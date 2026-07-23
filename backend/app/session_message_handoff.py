@@ -53,36 +53,28 @@ def _message_type(message: ProjectMessage) -> MessageType | None:
         return None
 
 
-async def handoff_session_messages(
+async def _apply_handoff_mutations(
     session: AsyncSession,
     project_id: uuid.UUID,
     resident_session_id: str | None,
-) -> int:
-    """Hand open messages from an ended resident session to the next owner.
+) -> tuple[int, tuple[MessageType, str] | None]:
+    """Apply message-release mutations to the open session without committing.
 
-    Answer evidence is deliberately durable and narrow: an open message is
-    considered answered when its handling state is already ``responded``, it
-    has a stored resolution, or a canonical strategic child reply points to it.
-    When a child reply carries resident-session or producer-task evidence, that
-    evidence must match the message being handed off. Those rows are repaired
-    to the normal resolved shape.
+    Locks the Project row (canonical Project→ProjectMessage order), classifies
+    each open message as answered or unanswered, and writes the mutations into
+    the current transaction. Returns ``(changed_count, rearm_request)`` where
+    ``rearm_request`` is the ``(MessageType, content)`` pair for the oldest
+    pending QUESTION/FEEDBACK message, or ``None`` when no re-arm is needed.
 
-    Every other open row remains open. Its ended-session association and stale
-    claim identity are cleared, and its handling state returns to ``pending``.
-    The row changes are committed before QUESTION/FEEDBACK rows make a separate,
-    best-effort cadence-arm attempt. A replacement resident can therefore see
-    the same rows even if cadence arming rolls back or is unavailable.
-
-    The Project row is locked before message rows to preserve the repository's
-    canonical Project -> ProjectMessage mutation order. Returns the number of
-    changed messages. A non-zero result has already been durably committed.
+    Callers are responsible for committing. Use ``_run_handoff_rearm`` after the
+    commit to perform the best-effort cadence arm without endangering durability.
     """
     if not resident_session_id:
-        return 0
+        return 0, None
 
     # Keep this guard for mixed-revision rollout safety.
     if not hasattr(ProjectMessage, "resident_session_id"):
-        return 0
+        return 0, None
 
     await session.execute(
         select(Project.id).where(Project.id == project_id).with_for_update()
@@ -103,7 +95,7 @@ async def handoff_session_messages(
         .all()
     )
     if not messages:
-        return 0
+        return 0, None
 
     message_ids = [message.id for message in messages]
     messages_by_id = {message.id: message for message in messages}
@@ -184,47 +176,8 @@ async def handoff_session_messages(
             rearm_request = (candidate_type, candidate.content)
 
     changed_count = answered_count + released_count
-    # This is the durability boundary. request_strategic_refresh may call
-    # session.rollback() after bounded lock contention; cadence failure must not
-    # restore the ended session's claims. Existing callers only invoke handoff
-    # after committing the session-ending transition, so this commit remains a
-    # deliberately separate follow-up transaction.
-    await session.commit()
-
-    if rearm_request is not None:
-        from app.strategic_trigger import maybe_arm_operator_refresh
-
-        candidate_type, candidate_content = rearm_request
-        try:
-            outcome = await maybe_arm_operator_refresh(
-                session,
-                project_id,
-                candidate_type,
-                message_content=candidate_content,
-                resident_session_active=False,
-            )
-            logger.info(
-                "[SESSION_HANDOFF] re-arm outcome %s for released session %s (project %s)",
-                outcome,
-                resident_session_id,
-                project_id,
-            )
-        except Exception:
-            # The handoff is already durable. Leave the session usable for the
-            # caller and report only the failed fallback arm.
-            try:
-                await session.rollback()
-            except Exception:
-                pass
-            logger.warning(
-                "[SESSION_HANDOFF] re-arm failed for released session %s (project %s)",
-                resident_session_id,
-                project_id,
-                exc_info=True,
-            )
-
     logger.info(
-        "[SESSION_HANDOFF] changed %d open message(s) for session %s (project %s): "
+        "[SESSION_HANDOFF] staged %d open message(s) for session %s (project %s): "
         "%d answered, %d released",
         changed_count,
         resident_session_id,
@@ -232,4 +185,86 @@ async def handoff_session_messages(
         answered_count,
         released_count,
     )
+    return changed_count, rearm_request
+
+
+async def _run_handoff_rearm(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    resident_session_id: str | None,
+    rearm_request: tuple[MessageType, str] | None,
+) -> None:
+    """Best-effort cadence arm after the handoff mutations have been committed.
+
+    A rollback inside ``maybe_arm_operator_refresh`` must never resurrect an ended
+    session's claims on messages — those are already committed. This helper is
+    always called after the durability boundary so rearm failure is isolated.
+    """
+    if rearm_request is None:
+        return
+    from app.strategic_trigger import maybe_arm_operator_refresh
+
+    candidate_type, candidate_content = rearm_request
+    try:
+        outcome = await maybe_arm_operator_refresh(
+            session,
+            project_id,
+            candidate_type,
+            message_content=candidate_content,
+            resident_session_active=False,
+        )
+        logger.info(
+            "[SESSION_HANDOFF] re-arm outcome %s for released session %s (project %s)",
+            outcome,
+            resident_session_id,
+            project_id,
+        )
+    except Exception:
+        # The handoff mutations are already durable. Leave the session usable and
+        # report only the failed fallback arm.
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "[SESSION_HANDOFF] re-arm failed for released session %s (project %s)",
+            resident_session_id,
+            project_id,
+            exc_info=True,
+        )
+
+
+async def handoff_session_messages(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    resident_session_id: str | None,
+) -> int:
+    """Hand open messages from an ended resident session to the next owner.
+
+    Answer evidence is deliberately durable and narrow: an open message is
+    considered answered when its handling state is already ``responded``, it
+    has a stored resolution, or a canonical strategic child reply points to it.
+    When a child reply carries resident-session or producer-task evidence, that
+    evidence must match the message being handed off. Those rows are repaired
+    to the normal resolved shape.
+
+    Every other open row remains open. Its ended-session association and stale
+    claim identity are cleared, and its handling state returns to ``pending``.
+    The row changes are committed before QUESTION/FEEDBACK rows make a separate,
+    best-effort cadence-arm attempt. A replacement resident can therefore see
+    the same rows even if cadence arming rolls back or is unavailable.
+
+    The Project row is locked before message rows to preserve the repository's
+    canonical Project -> ProjectMessage mutation order. Returns the number of
+    changed messages. A non-zero result has already been durably committed.
+    """
+    changed_count, rearm_request = await _apply_handoff_mutations(
+        session, project_id, resident_session_id
+    )
+    if changed_count:
+        # This is the durability boundary. request_strategic_refresh may call
+        # session.rollback() after bounded lock contention; cadence failure must
+        # not restore the ended session's claims on unanswered messages.
+        await session.commit()
+    await _run_handoff_rearm(session, project_id, resident_session_id, rearm_request)
     return changed_count

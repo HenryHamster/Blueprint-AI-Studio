@@ -2548,6 +2548,33 @@ async def stop_resident_session(
                 session.add(locked_task)
                 cancelled_task_id = locked_task.id
 
+    # Apply handoff mutations BEFORE the commit so they land in the same
+    # transaction as the session-end. If the process dies between the mutations
+    # and the commit, the whole transaction rolls back — both the session-end
+    # AND the message release — which is safe (the session is still "active"
+    # and the next renew/stop retries the handoff). This replaces the prior
+    # pattern of committing the session-end first and then running handoff in a
+    # separate follow-up transaction, which could leave messages permanently
+    # invisible to any replacement session if the second transaction never ran.
+    _session_id = ended_blob.get("session_id")
+    _handoff_rearm: tuple | None = None
+    if _session_id:
+        try:
+            from app.session_message_handoff import (
+                _apply_handoff_mutations,
+                _run_handoff_rearm,
+            )
+
+            _, _handoff_rearm = await _apply_handoff_mutations(
+                session, project.id, _session_id
+            )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] message handoff staging raised for session %s — stop still committed",
+                _session_id,
+                exc_info=True,
+            )
+
     await session.commit()
     await session.refresh(project)
     logger.info(
@@ -2556,26 +2583,16 @@ async def stop_resident_session(
         task_id,
     )
 
-    # Best-effort handoff: keep answered messages resolved, but release
-    # unanswered open messages to the next Resident owner or cadence so no
-    # operator turn is silently swallowed.
-    _session_id = ended_blob.get("session_id")
-    if _session_id:
+    if _session_id and _handoff_rearm is not None:
         try:
-            from app.session_message_handoff import handoff_session_messages
+            from app.session_message_handoff import _run_handoff_rearm
 
-            _handed_off = await handoff_session_messages(
-                session, project.id, _session_id
+            await _run_handoff_rearm(
+                session, project.id, _session_id, _handoff_rearm
             )
-            if _handed_off:
-                await session.commit()
         except Exception:
-            try:
-                await session.rollback()
-            except Exception:
-                pass
             logger.warning(
-                "[RESIDENT_SESSION] message handoff raised for session %s — stop still committed",
+                "[RESIDENT_SESSION] message handoff rearm raised for session %s — stop still committed",
                 _session_id,
                 exc_info=True,
             )
@@ -3465,6 +3482,28 @@ async def renew_resident_session_lease(
                 session_id,
                 exc_info=True,
             )
+    # Apply handoff mutations BEFORE the commit when the session is being capped
+    # or lapsed, so the message release lands in the same transaction as the
+    # session-end. This closes the non-atomic two-transaction window where a
+    # process death after the first commit (session-end) but before the second
+    # (handoff) would leave messages permanently stamped with the ended session
+    # and invisible to any replacement.
+    _cap_rearm: tuple | None = None
+    if holder["capped"] or holder["lapsed"]:
+        try:
+            from app.session_message_handoff import (
+                _apply_handoff_mutations,
+            )
+
+            _, _cap_rearm = await _apply_handoff_mutations(
+                session, project.id, session_id
+            )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] message handoff staging raised for session %s (cap/lapse) — ignored",
+                session_id,
+                exc_info=True,
+            )
     await session.commit()
     await session.refresh(project)
 
@@ -3492,27 +3531,19 @@ async def renew_resident_session_lease(
         # stamped ended + lease released) so the resident task can go terminal
         # and the legacy cadence reclaims strategic authority. Signal the agent
         # to wind down.
-        # Best-effort handoff: resolve only answered messages and release
-        # unanswered open messages to the next owner/cadence so they remain
-        # actionable.
-        try:
-            from app.session_message_handoff import handoff_session_messages
-
-            _handed_off = await handoff_session_messages(
-                session, project.id, session_id
-            )
-            if _handed_off:
-                await session.commit()
-        except Exception:
+        if _cap_rearm is not None:
             try:
-                await session.rollback()
+                from app.session_message_handoff import _run_handoff_rearm
+
+                await _run_handoff_rearm(
+                    session, project.id, session_id, _cap_rearm
+                )
             except Exception:
-                pass
-            logger.warning(
-                "[RESIDENT_SESSION] message handoff raised for session %s (cap/lapse) — ignored",
-                session_id,
-                exc_info=True,
-            )
+                logger.warning(
+                    "[RESIDENT_SESSION] message handoff rearm raised for session %s (cap/lapse) — ignored",
+                    session_id,
+                    exc_info=True,
+                )
         return {
             "authority_held": False,
             "leased_until": cont.get("expires_at"),

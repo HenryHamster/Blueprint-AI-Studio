@@ -512,6 +512,59 @@ async def test_stop_ends_task_releases_continuation_and_hands_off_messages(
 
 
 @pytest.mark.asyncio
+async def test_stop_handoff_is_atomic_with_session_end(db_session, monkeypatch):
+    """Message release must commit in the same transaction as the session-end.
+
+    Even if rearm fails after the commit, the message mutations are durable.
+    This validates the non-atomic two-transaction window is closed: previously,
+    a process death between the session-end commit and the follow-up handoff
+    commit would leave messages stamped with the ended session permanently.
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    pending = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="Will this message survive rearm failure?",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        resident_session_id=started["session_id"],
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    # Simulate rearm raising after commit — handoff mutations must already be durable.
+    import app.session_message_handoff as handoff_module
+
+    async def _raise_on_rearm(*args, **kwargs):
+        raise RuntimeError("rearm failed — simulating post-commit crash")
+
+    monkeypatch.setattr(handoff_module, "_run_handoff_rearm", _raise_on_rearm)
+
+    project = await db_session.get(Project, project.id)
+    # stop_resident_session should still succeed despite rearm raising
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert snapshot["status"] == "ended"
+    # The message must already be released (mutations committed atomically with session-end)
+    await db_session.refresh(pending)
+    assert pending.resident_session_id is None, (
+        "message.resident_session_id must be None: handoff must commit atomically "
+        "with session-end, not in a separate follow-up transaction"
+    )
+    assert pending.handling_state == MessageHandlingState.PENDING
+    assert pending.handled_by_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
@@ -565,6 +618,76 @@ async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
     await db_session.refresh(pending)
     assert pending.status == "open"
     assert pending.resident_session_id is None
+    assert pending.handling_state == MessageHandlingState.PENDING
+    assert pending.handled_by_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_unattended_cap_handoff_is_atomic_with_cap_end(
+    db_session, monkeypatch
+):
+    """Message release must commit atomically with the cap-end, not after it.
+
+    Even if rearm raises after the commit, the message release must be durable.
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    pending = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.FEEDBACK,
+        from_type="user",
+        content="Will this survive rearm failure on cap?",
+        created_at=_utcnow() - timedelta(hours=2),
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        resident_session_id=started["session_id"],
+    )
+    db_session.add(pending)
+    await db_session.commit()
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+
+    # Simulate rearm raising after commit — message mutations must be durable.
+    import app.session_message_handoff as handoff_module
+
+    async def _raise_on_rearm(*args, **kwargs):
+        raise RuntimeError("rearm failed — simulating post-cap crash")
+
+    monkeypatch.setattr(handoff_module, "_run_handoff_rearm", _raise_on_rearm)
+
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    capped = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=True,
+    )
+
+    assert capped["authority_held"] is False
+    assert capped["status"] == "ended"
+    # Message must be released even though rearm raised
+    await db_session.refresh(pending)
+    assert pending.resident_session_id is None, (
+        "message.resident_session_id must be None: cap handoff must commit "
+        "atomically with the cap-end, not in a separate follow-up transaction"
+    )
     assert pending.handling_state == MessageHandlingState.PENDING
     assert pending.handled_by_task_id is None
 
