@@ -2311,7 +2311,7 @@ def test_operator_visible_message_audience_filter_excludes_null_audience():
 def test_operator_visible_message_audience_filter_call_sites_updated():
     """Structural guard: operator_visible_audience_filter must NOT appear in ProjectMessage
     query paths in operator_attention.py, operator_inbox_liveness.py,
-    admin_notifications.py, or metrics_integrity_sweep.py.
+    admin_notifications.py, admin_debug.py, or metrics_integrity_sweep.py.
 
     These files previously used the NULL-retaining legacy filter for ProjectMessage
     queries; the correct filter for the message path is operator_visible_message_audience_filter.
@@ -2325,6 +2325,7 @@ def test_operator_visible_message_audience_filter_call_sites_updated():
         (os.path.join(app_dir, "operator_attention.py"), "operator_attention.py"),
         (os.path.join(app_dir, "operator_inbox_liveness.py"), "operator_inbox_liveness.py"),
         (os.path.join(app_dir, "routers", "admin_notifications.py"), "admin_notifications.py"),
+        (os.path.join(app_dir, "routers", "admin_debug.py"), "admin_debug.py"),
         (os.path.join(app_dir, "metrics_integrity_sweep.py"), "metrics_integrity_sweep.py"),
     ]
 

@@ -1973,7 +1973,7 @@ async def get_operator_inbox_liveness(
     if force_run:
         try:
             staleness_cutoff = _ts() - timedelta(minutes=15)
-            from app.message_audience import operator_visible_audience_filter
+            from app.message_audience import operator_visible_message_audience_filter
             from sqlalchemy import or_ as _or
 
             detail_rows = (
@@ -1993,7 +1993,7 @@ async def get_operator_inbox_liveness(
                             ProjectMessage.reply_to_message_id.isnot(None),
                             ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
                         ),
-                        operator_visible_audience_filter(ProjectMessage.context),
+                        operator_visible_message_audience_filter(ProjectMessage.context),
                     )
                     .order_by(ProjectMessage.created_at.asc())
                     .limit(200)

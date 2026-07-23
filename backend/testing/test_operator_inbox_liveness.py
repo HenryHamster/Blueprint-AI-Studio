@@ -460,32 +460,32 @@ async def _create_forward_leaked_message(
     message_type: str = "NOTE",
     from_type: str = "system",
 ) -> str:
-    """Create a ProjectMessage that will be detected as a forward leak.
+    """Create a ProjectMessage that triggers the liveness check to flag the project.
 
-    The message has operator-visible audience filter pass-through (NULL or
-    operator-action-needed/fyi) but does NOT satisfy derive_needs_action()
-    (a NOTE with operator-action-needed audience passes derive_needs_action
-    — so we use NULL audience to fail the filter or operator-fyi which is
-    excluded by the != OPERATOR_FYI guard).
+    Creates a quarantined-reply message: a reply-bearing message (via
+    _resident_reply_covered_message_ids) stamped with a non-operator audience
+    (strategist-internal).  The liveness check counts these as
+    quarantined_reply_count > 0, which sets delta > 0 and marks the project
+    'flagged'.
 
-    Actually, to create a forward-leaked message the liveness check will
-    detect: we need operator_visible_audience_filter to PASS (so the message
-    appears in the query) AND derive_needs_action to FAIL AND the audience
-    guard != OPERATOR_FYI to PASS.
-
-    A NOTE with audience=None passes operator_visible_audience_filter (NULL
-    is retained), fails derive_needs_action (NOTE is never needs-action),
-    and audience is not OPERATOR_FYI, so it's a forward leak.
+    Replaces the previous NULL-audience approach: operator_visible_message_audience_filter
+    (the fail-closed filter now used on ProjectMessage.context queries) excludes
+    NULL-audience rows, so NULL-audience messages never appear in the operator-visible
+    set and cannot trigger the liveness check.
     """
     from app.models import ProjectMessage
 
-    ctx = {"audience": audience} if audience else {}
+    effective_audience = audience if audience is not None else "strategist-internal"
+    ctx = {
+        "audience": effective_audience,
+        "_resident_reply_covered_message_ids": ["dummy-covered-id"],
+    }
     msg = ProjectMessage(
         project_id=_uuid.UUID(project_id),
         from_type=from_type,
         message_type=message_type,
         status=status,
-        content="Test forward-leaked message",
+        content="Test quarantined-reply message",
         context=ctx,
     )
     session.add(msg)
@@ -535,9 +535,8 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     _liveness_mod._reset_liveness_for_tests()
 
     project_id = await _create_test_project(db_session, "persistent-leak-test")
-    # Create a forward-leaked message: NULL-audience NOTE that passes
-    # operator_visible_audience_filter (NULL is retained) but fails
-    # derive_needs_action (NOTE is never needs-action).
+    # Create a quarantined-reply message: a reply-bearing message stamped
+    # strategist-internal so it triggers reply_audience_quarantined > 0.
     await _create_forward_leaked_message(db_session, project_id)
 
     # Tick 1 — first flagged tick (not yet persistent, < 3)
@@ -556,7 +555,7 @@ async def test_persistent_leak_escalates_once_to_strategist(db_session):
     assert len(escalations_1) == 0, "Should not escalate before persistence threshold"
 
     # Tick 2 — second flagged tick (still not persistent).
-    # Tick 1 remediated the previous message; create a fresh leaked one.
+    # Tick 1 healed the previous quarantined reply; create a fresh one.
     await _create_forward_leaked_message(db_session, project_id)
     results_2 = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
@@ -855,16 +854,17 @@ async def test_forward_leaked_message_is_remediated_on_run(db_session):
     project_id = await _create_test_project(db_session, "remediation-test")
     msg_id = await _create_forward_leaked_message(db_session, project_id)
 
-    # Tick 1 — should detect and remediate the leaked message.
+    # Tick 1 — should detect and heal the quarantined reply.
     results = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
     )
     assert results is not None
     flagged = [r for r in results if r.project_id == project_id and r.status == "flagged"]
     assert len(flagged) == 1, "Expected 1 flagged result on tick 1"
-    assert flagged[0].forward_leaked == 1, "Expected 1 forward-leaked message detected"
+    assert flagged[0].reply_audience_quarantined == 1, "Expected 1 quarantined-reply detected"
 
-    # After remediation the message's audience must be re-stamped to a non-operator value.
+    # After healing the message's audience must be re-stamped to an operator-visible value
+    # (quarantine healing restores the reply so it surfaces in the operator chat).
     msg = (
         await db_session.execute(
             select(ProjectMessage).where(
@@ -873,13 +873,14 @@ async def test_forward_leaked_message_is_remediated_on_run(db_session):
         )
     ).scalars().first()
     assert msg is not None
-    remediated_audience = (msg.context or {}).get("audience")
-    assert remediated_audience is not None, (
-        "Remediation must stamp a canonical audience — NULL means the message "
-        "will still pass operator_visible_audience_filter on the next tick"
+    healed_audience = (msg.context or {}).get("audience")
+    assert healed_audience is not None, (
+        "Healing must stamp a canonical audience — NULL means the message "
+        "will still appear as quarantined on the next tick"
     )
-    assert not is_operator_visible(remediated_audience), (
-        f"Remediated audience must NOT be operator-visible, got {remediated_audience!r}"
+    assert is_operator_visible(healed_audience), (
+        f"Healed audience must be operator-visible (reply restored for operator), "
+        f"got {healed_audience!r}"
     )
 
     # Tick 2 — with the message remediated, the project should be clean.
@@ -899,18 +900,19 @@ async def test_forward_leaked_message_is_remediated_on_run(db_session):
 
 @pytest.mark.asyncio
 async def test_forward_leak_converges_to_zero_after_remediation(db_session):
-    """After one remediation tick, forward_leaked converges to exactly 0 on the
+    """After one healing tick, reply_audience_quarantined converges to exactly 0 on the
     next tick — pinning the direction's ongoing-path success criterion.
 
     Guards against regression where a new emitter re-introduces leaks and the
-    liveness check still reports a non-zero forward_leaked count after running,
+    liveness check still reports a non-zero count after running,
     meaning self-healing did not actually fix the offending rows.
 
-    Tick 1: creates one forward-leaked message (NULL-audience NOTE), runs the
-            liveness check, asserts forward_leaked >= 1 for the project.
-    Tick 2: runs the liveness check again WITHOUT injecting a new leaked message;
-            the first message was re-stamped to a non-operator audience by
-            remediation, so asserts forward_leaked == 0 (exact numeric convergence).
+    Tick 1: creates one quarantined-reply message (strategist-internal audience +
+            _resident_reply_covered_message_ids), runs the liveness check,
+            asserts reply_audience_quarantined >= 1 for the project.
+    Tick 2: runs the liveness check again WITHOUT injecting a new quarantined message;
+            the first message was re-stamped to an operator-visible audience by the
+            healing pass, so asserts reply_audience_quarantined == 0.
     """
     import app.operator_inbox_liveness as _liveness_mod
 
@@ -919,32 +921,32 @@ async def test_forward_leak_converges_to_zero_after_remediation(db_session):
     project_id = await _create_test_project(db_session, "convergence-test")
     await _create_forward_leaked_message(db_session, project_id)
 
-    # Tick 1 — detect the leak; remediation re-stamps the message in-place.
+    # Tick 1 — detect the quarantined reply; healing re-stamps the message.
     results_1 = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
     )
     assert results_1 is not None
     proj_1 = [r for r in results_1 if r.project_id == project_id]
     assert proj_1, f"No result returned for project {project_id} on tick 1"
-    assert proj_1[0].forward_leaked >= 1, (
-        f"Expected at least 1 forward-leaked message on tick 1, "
-        f"got forward_leaked={proj_1[0].forward_leaked}"
+    assert proj_1[0].reply_audience_quarantined >= 1, (
+        f"Expected at least 1 quarantined-reply message on tick 1, "
+        f"got reply_audience_quarantined={proj_1[0].reply_audience_quarantined}"
     )
 
-    # Tick 2 — no new leaked message created; remediation on tick 1 must have
-    # re-stamped the offending row so it no longer passes operator_visible_audience_filter.
+    # Tick 2 — no new quarantined message created; healing on tick 1 must have
+    # re-stamped the offending row to an operator-visible audience so it no longer
+    # appears in the quarantined-reply count query.
     results_2 = await _liveness_mod.run_operator_inbox_liveness_check(
         db_session, _force=True
     )
     assert results_2 is not None
     proj_2 = [r for r in results_2 if r.project_id == project_id]
-    # If the project has zero leaks the check may return "ok" with no entry, or
-    # "skipped" — both mean forward_leaked is 0.
+    # If the project has zero quarantined replies the check returns "ok" or "skipped".
     if proj_2:
-        assert proj_2[0].forward_leaked == 0, (
-            f"forward_leaked must converge to 0 after one remediation tick, "
-            f"got forward_leaked={proj_2[0].forward_leaked} (status={proj_2[0].status!r}); "
-            f"remediation did not re-stamp all offending rows"
+        assert proj_2[0].reply_audience_quarantined == 0, (
+            f"reply_audience_quarantined must converge to 0 after one healing tick, "
+            f"got reply_audience_quarantined={proj_2[0].reply_audience_quarantined} "
+            f"(status={proj_2[0].status!r}); healing did not re-stamp all offending rows"
         )
 
     _liveness_mod._reset_liveness_for_tests()
@@ -1697,21 +1699,28 @@ async def test_backfill_null_audience_sweep_stamps_and_is_idempotent(db_session)
 
     project_id = await _create_test_project(db_session, "null-audience-backfill")
 
-    # NULL-audience rows (context has no "audience" key) that today fall through
-    # operator_visible_audience_filter's NULL pass-through.
-    blocker_id = await _create_forward_leaked_message(
-        db_session, project_id, message_type="BLOCKER", from_type="system"
-    )
-    question_id = await _create_forward_leaked_message(
-        db_session, project_id, message_type="QUESTION", from_type="agent"
-    )
-    note_id = await _create_forward_leaked_message(
-        db_session, project_id, message_type="NOTE", from_type="system"
-    )
+    # NULL-audience rows (context has no "audience" key).
+    # Use a direct insert helper (not _create_forward_leaked_message which now
+    # creates quarantined-reply rows with an explicit non-operator audience).
+
+    async def _insert_null_audience_msg(msg_type: str, ftype: str) -> str:
+        msg = ProjectMessage(
+            project_id=_uuid.UUID(project_id),
+            from_type=ftype,
+            message_type=msg_type,
+            status="open",
+            content="Test NULL-audience message",
+            context={},  # no audience key → NULL audience
+        )
+        db_session.add(msg)
+        await db_session.flush()
+        return str(msg.id)
+
+    blocker_id = await _insert_null_audience_msg("BLOCKER", "system")
+    question_id = await _insert_null_audience_msg("QUESTION", "agent")
+    note_id = await _insert_null_audience_msg("NOTE", "system")
     # A user-authored NULL-audience row: the drain must not touch it.
-    user_id = await _create_forward_leaked_message(
-        db_session, project_id, message_type="NOTE", from_type="user"
-    )
+    user_id = await _insert_null_audience_msg("NOTE", "user")
 
     t0 = _utcnow()
     stamped = await _sweeps.sweep_backfill_null_audience_messages(db_session, t0)
