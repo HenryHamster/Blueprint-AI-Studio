@@ -168,13 +168,6 @@ _DEFAULT_TIER_MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
-# TEMPORARY: claude-fable-5 is a limited-availability model (expected window
-# ~2 weeks from 2026-06-09). Removal plan: PATCH the runtime-config max cell
-# back to claude-opus-4-8 FIRST, then drop the enum/set entries here at
-# leisure — enum membership only gates settings writes, and the
-# _MODEL_FALLBACKS entry below keeps any task still pinned to fable
-# requeueing onto opus instead of dying when the model stops resolving.
-
 # Advisor-class model IDs the executor may run as (opus-tier or above).
 # Advisor pairing is gated on this set (an advisor-class executor silently
 # ignores an opus advisor); keeping prior opus versions here means a version
@@ -182,7 +175,6 @@ _DEFAULT_TIER_MODELS = {
 # older opus.
 _OPUS_MODELS: frozenset[str] = frozenset(
     {
-        "claude-fable-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
     }
@@ -196,7 +188,6 @@ _OPUS_MODELS: frozenset[str] = frozenset(
 # model can't use it.
 _1M_CONTEXT_MODELS: frozenset[str] = frozenset(
     {
-        "claude-fable-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
@@ -371,7 +362,6 @@ class AnthropicProvider(LLMProvider):
                 "model": {
                     "type": "string",
                     "enum": [
-                        "claude-fable-5",
                         "claude-opus-4-8",
                         "claude-opus-4-7",
                         "claude-sonnet-5",
@@ -380,9 +370,7 @@ class AnthropicProvider(LLMProvider):
                     ],
                     "description": (
                         "Concrete model. Leave blank to inherit the tier mapping from "
-                        "provider_tier_model_map. claude-fable-5 is TEMPORARY "
-                        "(limited availability) — pair it with fallback_model so "
-                        "tasks survive its retirement."
+                        "provider_tier_model_map."
                     ),
                 },
                 "effort": {
@@ -401,7 +389,7 @@ class AnthropicProvider(LLMProvider):
                     "description": (
                         "Opt into the 1M-token context window. Appends `[1m]` to "
                         "the model ID so Claude Code routes to the 1M variant. "
-                        "Requires fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-5, "
+                        "Requires opus-4-8, opus-4-7, opus-4-6, sonnet-5, "
                         "or sonnet-4-6 — haiku ignores the suffix (we drop it with "
                         "an unsupported marker). 1M costs more and is only worth it "
                         "when the prompt or exploration genuinely needs the extra "
@@ -421,7 +409,6 @@ class AnthropicProvider(LLMProvider):
                 "fallback_model": {
                     "type": "string",
                     "enum": [
-                        "claude-fable-5",
                         "claude-opus-4-8",
                         "claude-opus-4-7",
                         "claude-sonnet-5",
@@ -488,7 +475,7 @@ class AnthropicProvider(LLMProvider):
             elif use_1m:
                 unsupported.append(
                     f"use_1m_context=true requires a 1M-capable model "
-                    f"(fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-5, sonnet-4-6); "
+                    f"(opus-4-8, opus-4-7, opus-4-6, sonnet-5, sonnet-4-6); "
                     f"effective model {model!r} — suffix dropped, plain --model sent"
                 )
                 args += ["--model", model]

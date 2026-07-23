@@ -5868,6 +5868,42 @@ class TestBackendModuleSizeGuardrails:
             "recovery_post_commit.py instead."
         )
 
+    def test_no_stale_backend_caps(self):
+        """Caps must remain close enough to actual file sizes to catch real growth.
+
+        A cap that has drifted to 3x+ the actual file size (typical after a
+        refactor shrinks the file) is no longer a meaningful guardrail — a file
+        could triple in size before CI would notice.  This test enforces that
+        every backend cap stays within max(actual + 500, actual * 2) of the
+        file's current line count.
+
+        Remedy: tighten the cap in module_size_limits.json to match the policy
+        value returned by ``check_size_limits.py --fix`` for the breaching entry.
+        Do NOT modify this test to raise the threshold.
+        """
+        app_root = os.path.join(os.path.dirname(__file__), "..", "app")
+        stale = []
+        for rel_path, cap in MODULE_SIZE_LIMITS.items():
+            abs_path = os.path.join(app_root, rel_path)
+            if not os.path.exists(abs_path):
+                continue
+            with open(abs_path, encoding="utf-8") as fh:
+                actual = len(fh.readlines())
+            allowed_cap = max(actual + 500, actual * 2)
+            if cap > allowed_cap:
+                stale.append((rel_path, actual, cap, allowed_cap))
+        assert not stale, (
+            f"{len(stale)} backend cap(s) have drifted far above actual file size "
+            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+            "the file grows to an unreasonable size:\n\n"
+            + "\n".join(
+                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+                for r, actual, cap, allowed in stale
+            )
+            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+            "and commit the updated module_size_limits.json."
+        )
+
 _AGENT_SRC_ROOT = (
     os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
@@ -13241,8 +13277,8 @@ class TestProblemModelWritePathInvariants:
     _SAFE_SITES: dict[tuple[str, int], str] = {
         # lifecycle.py: sanitize_problem_model_raw caller
         ("lifecycle.py", 369): "sanitize_problem_model_raw(dict(project.problem_model))",
-        # task_locking.py: sanitize_problem_model_raw inside with_problem_model_locked
-        ("task_locking.py", 1058): "sanitize_problem_model_raw(…) upstream, variable assigned to .problem_model",
+        # task_locking.py: project.problem_model write-back inside with_problem_model_locked
+        ("task_locking.py", 1031): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
         ("direction_lifecycle.py", 812): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)

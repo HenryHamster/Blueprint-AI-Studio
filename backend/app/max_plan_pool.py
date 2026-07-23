@@ -852,13 +852,9 @@ _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-7": ("claude-opus-4-8",),
     "claude-opus-4-6": ("claude-opus-4-8",),
     "claude-sonnet-4-6": ("claude-opus-4-8",),
-    # TEMPORARY (fable availability window ~2 weeks from 2026-06-09): tracked
-    # on its own meter — we don't yet know whether a fable 429 implies the
-    # shared opus session bucket is exhausted. If it does, the CLI-level
-    # --fallback-model opus retry 429s immediately and the normal patterns
-    # disable the account, so isolation fails safe. On removal, rewrite to
-    # ("claude-opus-4-8",) like the legacy entries above.
-    "claude-fable-5": ("claude-fable-5",),
+    # fable-5 availability window elapsed (2026-06-09 + ~2 weeks); cascade to
+    # the shared opus meter like other legacy entries.
+    "claude-fable-5": ("claude-opus-4-8",),
 }
 
 _HAIKU_MODEL = "claude-haiku-4-5-20251001"

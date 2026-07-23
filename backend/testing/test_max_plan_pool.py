@@ -176,11 +176,10 @@ class TestCascadeDisabledModels:
         # Unknown variants must not silently cascade to the whole account.
         assert cascade_disabled_models("claude-future") == ("claude-future",)
 
-    def test_fable_isolated_on_own_meter(self):
-        # TEMPORARY model (limited availability): tracked on its own meter
-        # until we know empirically whether a fable 429 implies the shared
-        # opus bucket is exhausted. Must not cascade to opus.
-        assert cascade_disabled_models("claude-fable-5") == ("claude-fable-5",)
+    def test_fable_cascades_to_opus_after_retirement(self):
+        # fable-5 availability window elapsed; it now cascades to the shared
+        # opus-4-8 meter like other legacy entries.
+        assert cascade_disabled_models("claude-fable-5") == ("claude-opus-4-8",)
 
 
 # ── _filter_providers_by_cli ──────────────────────────────────────────────────

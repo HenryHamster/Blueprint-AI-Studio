@@ -9904,7 +9904,8 @@ async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-sr-fp-calib")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     project_ctx = resp.json().get("project_context", {})
     sr = project_ctx.get("self_review_catch_rate")
@@ -10052,7 +10053,8 @@ async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-sr-failure-mode")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     project_ctx = resp.json().get("project_context", {})
     sr = project_ctx.get("self_review_catch_rate")
@@ -19860,7 +19862,8 @@ async def test_claim_injects_self_review_catch_rate_for_direction_when_above_thr
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-srdir-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -19921,7 +19924,8 @@ async def test_claim_omits_self_review_catch_rate_for_direction_when_no_directio
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-srdir-2")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -19966,7 +19970,8 @@ async def test_claim_omits_self_review_catch_rate_for_direction_when_below_thres
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-srdir-3")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -20037,7 +20042,8 @@ async def test_claim_injects_sr_recent_miss_examples_for_create_task(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-miss-ex-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -20197,7 +20203,8 @@ async def test_claim_sr_recent_miss_examples_matches_typescript_consumer_contrac
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-contract-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -20323,7 +20330,8 @@ async def test_claim_sr_recent_miss_examples_global_unchanged_without_direction_
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-no-dir-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
@@ -20400,7 +20408,8 @@ async def test_claim_sr_recent_miss_examples_prefers_direction_examples(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-dir-pref-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
@@ -20465,7 +20474,8 @@ async def test_claim_sr_recent_miss_examples_falls_back_to_global_when_direction
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-dir-fallback-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})

@@ -1831,7 +1831,7 @@ def _materialize_local_manifest(vm_instance_id: str, manifest: dict) -> dict[str
         local_path.write_text(str(item.get("content", "")), encoding="utf-8")
         try:
             os.chmod(local_path, int(str(item.get("mode", "0600")), 8))
-        except OSError:
+        except (OSError, ValueError):
             logger.warning(f"[LOCAL] Failed to chmod local manifest file: {local_path}")
         path_map[original_path] = str(local_path)
 

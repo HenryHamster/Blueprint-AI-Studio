@@ -1868,17 +1868,11 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
-        "sr_reviewer_disagreements",
-        "sr_catch_rate_trends_alert",
-        "sr_catch_rate_floor_alert",
-        "sr_quadrant_alert",
-        "sr_pass_engagement_alert",
-        "sr_blind_spot_signal_last_computed_at",
-        "fix_loop_divergence_signal_last_computed_at",
-        "fix_loop_divergence_alerted_window",
-        "fix_loop_divergence_regressions",
-        "fix_loop_divergence_detected_at",
-        "viewport_coverage_snapshot",
+        # NOTE: sr_reviewer_disagreements, sr_catch_rate_trends_alert/floor_alert/
+        # quadrant_alert/pass_engagement_alert, sr_blind_spot_signal_last_computed_at,
+        # fix_loop_divergence_*, and viewport_coverage_snapshot have been migrated to
+        # ProjectSRAnalytics and are no longer stored in design_doc — they were
+        # removed from _RESERVED_DESIGN_DOC_KEYS accordingly.
     }
     missing = audit_keys - _RESERVED_DESIGN_DOC_KEYS
     assert not missing, f"code-written keys not yet reserved: {sorted(missing)}"
@@ -1910,10 +1904,11 @@ def test_migrated_telemetry_keys_dropped_from_reserved_set():
         f"{sorted(still_reserved)}"
     )
 
-    # Not-yet-cut-over blobs that still live in design_doc keep their exemption.
+    # Keys that still live in design_doc keep their exemption.
+    # efficiency_baseline and sr_catch_rate_trends were never added to the
+    # reserved set — they are excluded from the agent-size cap via their
+    # dedicated table path (ProjectEfficiencySnapshot / ProjectSRAnalytics).
     for key in (
-        "efficiency_baseline",
-        "sr_catch_rate_trends",
         "cochange_index",
         "cochange_applied_prs",
     ):

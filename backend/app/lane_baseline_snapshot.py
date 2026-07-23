@@ -3,8 +3,8 @@
 When a ReleaseVersion reaches a terminal status (promoted or abandoned), this
 module captures the version's lane-diagnostic aggregates and persists them
 durably as one row per version in the dedicated ``project_lane_baseline`` table
-(migration 0678 backfilled history off the former
-``project.design_doc["lane_baselines"]`` blob and stripped that key).
+(the former ``project.design_doc["lane_baselines"]`` blob is no longer the
+canonical store; the dedicated table is the sole source of truth).
 
 The stored blob is a subset of the lane-diag response plus per-PR relay medians
 for the v10 lane-pilot comparison.
@@ -313,10 +313,10 @@ async def persist_version_lane_baseline(
 
     # First-write-wins: if a baseline already exists for this version in the
     # dedicated project_lane_baseline table, leave it untouched and return it.
-    # Migration 0678 backfilled history and stripped design_doc['lane_baselines'],
-    # so the table is now the sole store and existence is checked there (this
-    # replaces the former with_design_doc_locked read-modify-write, which also
-    # means no Project row lock is taken — the row-scoped upsert below is enough).
+    # The dedicated project_lane_baseline table is the sole store; existence is
+    # checked there (this replaces the former with_design_doc_locked
+    # read-modify-write, which also means no Project row lock is taken — the
+    # row-scoped upsert below is enough).
     existing = await _read_table_lane_baseline(session, project_id, version_number)
     if existing is not None:
         logger.info(
@@ -395,9 +395,8 @@ async def backfill_missing_lane_baselines(
         if project_row is None:
             return []
 
-        # Existing versions now live in the dedicated project_lane_baseline table
-        # (migration 0678 stripped design_doc['lane_baselines']); read the gap set
-        # from there rather than the design_doc blob.
+        # Existing versions now live in the dedicated project_lane_baseline table;
+        # read the gap set from there rather than the design_doc blob.
         existing_keys = {
             str(row.version_number)
             for row in await read_all_lane_baselines(session, project_id)

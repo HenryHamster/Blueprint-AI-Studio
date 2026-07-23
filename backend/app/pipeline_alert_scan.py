@@ -396,7 +396,10 @@ async def run_pipeline_alert_scan_once(
         return 0
     _pas_sr_row = await session.get(ProjectSRAnalytics, project_id)
     _pas_sr_data = _pas_sr_row.data if _pas_sr_row else None
-    design_doc = _pas_sr_data or (project.design_doc or {})
+    # _pas_sr_data is the ProjectSRAnalytics row (canonical source for SR analytics
+    # keys) or None. When the dedicated table has data, prefer it; fall back to the
+    # design_doc God-column for projects that haven't been migrated yet.
+    sr_data_or_design_doc = _pas_sr_data or (project.design_doc or {})
 
     created = 0
     emitters: list[tuple[str, Any]] = [
@@ -409,7 +412,7 @@ async def run_pipeline_alert_scan_once(
     for name, fn in emitters:
         try:
             if name == "signal_staleness":
-                added = await fn(session, project_id, design_doc) or 0
+                added = await fn(session, project_id, sr_data_or_design_doc) or 0
                 await session.commit()
                 created += added
             elif name in ("sr_catch_rate_targets", "lone_checker"):

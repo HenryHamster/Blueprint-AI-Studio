@@ -598,16 +598,7 @@ runtime_config: Dict = {
             "low": {"model": "claude-haiku-4-5-20251001", "effort": "low"},
             "medium": {"model": "claude-sonnet-5", "effort": "medium"},
             "high": {"model": "claude-opus-4-8", "effort": "high"},
-            # TEMPORARY: fable-5 has a limited availability window (~2 weeks
-            # from 2026-06-09). fallback_model covers CLI-level rate limits;
-            # the provider's fallback_model() map covers outright model
-            # rejection (incl. retirement). On removal, set model back to
-            # claude-opus-4-8 and drop fallback_model.
-            "max": {
-                "model": "claude-fable-5",
-                "effort": "max",
-                "fallback_model": "claude-opus-4-8",
-            },
+            "max": {"model": "claude-opus-4-8", "effort": "max"},
         },
         "openai": {
             # Verbosity is graded to task-type category, not capability:

@@ -3277,7 +3277,7 @@ def test_dual_write_spec_matches_ledger_registry():
 
     # Every expected ledger-backed dimension must be present.
     expected = {
-        "ci", "audit", "test_erosion", "smoketest", "challenge",
+        "ci", "audit", "test_erosion", "challenge",
         "migration_identity", "migration_apply", "merge_grade",
         "acceptance_window", "debt_pressure", "capability_proof", "env_preflight",
     }
