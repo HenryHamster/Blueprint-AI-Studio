@@ -66,6 +66,38 @@ describe('MessagesComposer — live math preview', () => {
   });
 });
 
+describe('MessagesComposer — insert equation', () => {
+  test('renders an Insert equation button in minimal chrome', () => {
+    renderComposer({ chrome: 'minimal' });
+    expect(screen.getByLabelText('Insert equation')).toBeTruthy();
+  });
+
+  test('renders an Insert equation button in full chrome', () => {
+    renderComposer({ chrome: 'full' });
+    expect(screen.getByLabelText('Insert equation')).toBeTruthy();
+  });
+
+  test('clicking insert equation calls onChangeContent with $equation$ appended', () => {
+    const onChangeContent = vi.fn();
+    renderComposer({ newContent: 'Energy: ', onChangeContent });
+    fireEvent.click(screen.getByLabelText('Insert equation'));
+    expect(onChangeContent).toHaveBeenCalledWith('Energy: $equation$');
+  });
+
+  test('inserts $equation$ at cursor position when content is empty', () => {
+    const onChangeContent = vi.fn();
+    renderComposer({ newContent: '', onChangeContent });
+    fireEvent.click(screen.getByLabelText('Insert equation'));
+    expect(onChangeContent).toHaveBeenCalledWith('$equation$');
+  });
+
+  test('insert equation button is disabled when composerDisabled', () => {
+    renderComposer({ disabledReason: 'Composer disabled', chrome: 'minimal' });
+    const btn = screen.getByLabelText('Insert equation');
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
 describe('MessagesComposer — clickable pending image preview', () => {
   test('renders an exact-revision source chip and exposes explicit removal', () => {
     const onRemoveArtifactRef = vi.fn();

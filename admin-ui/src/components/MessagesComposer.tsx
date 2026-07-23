@@ -1,5 +1,5 @@
 import { memo, useRef, useState, type RefObject } from 'react';
-import { Command, X, Send, Reply, Paperclip, FileText, Image } from 'lucide-react';
+import { Command, X, Send, Reply, Paperclip, FileText, Image, Sigma } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
@@ -245,6 +245,20 @@ export const MessagesComposer = memo(function MessagesComposer({
   const attHasPreview = (att: PendingAttachment): string | null =>
     att.previewUrl;
 
+  function insertEquation() {
+    const el = textareaRef.current;
+    if (!el || composerDisabled || editingLocked) return;
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    const placeholder = 'equation';
+    const newText = `${newContent.slice(0, start)}$${placeholder}$${newContent.slice(end)}`;
+    onChangeContent(newText);
+    requestAnimationFrame(() => {
+      if (!textareaRef.current) return;
+      textareaRef.current.focus();
+      textareaRef.current.setSelectionRange(start + 1, start + 1 + placeholder.length);
+    });
+  }
 
   return (
     <div className={minimal
@@ -445,6 +459,16 @@ export const MessagesComposer = memo(function MessagesComposer({
             >
               <Paperclip className="h-3.5 w-3.5" />
             </button>
+            <button
+              type="button"
+              onClick={insertEquation}
+              disabled={composerDisabled || Boolean(editingLocked)}
+              title="Insert equation"
+              aria-label="Insert equation"
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40"
+            >
+              <Sigma className="h-3.5 w-3.5" />
+            </button>
           </>
         )}
         {!minimal && (
@@ -457,6 +481,18 @@ export const MessagesComposer = memo(function MessagesComposer({
             className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
           >
             <Paperclip className="w-4 h-4" />
+          </button>
+        )}
+        {!minimal && (
+          <button
+            type="button"
+            onClick={insertEquation}
+            disabled={composerDisabled || Boolean(editingLocked)}
+            title="Insert equation"
+            aria-label="Insert equation"
+            className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
+          >
+            <Sigma className="w-4 h-4" />
           </button>
         )}
         <div className="relative flex-1">
