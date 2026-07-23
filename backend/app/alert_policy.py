@@ -146,6 +146,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "deployment.halted_recovered": AlertEventPolicy(
         "deployment.halted_recovered", route=ROUTE_TIMELINE, action_required=False
     ),
+    "deployment.wake_delivery_stalled": AlertEventPolicy(
+        "deployment.wake_delivery_stalled"
+    ),
     "branch.unsafe_config": AlertEventPolicy("branch.unsafe_config"),
     "branch.missing_config": AlertEventPolicy("branch.missing_config"),
     "branch.promotion_target_landing": AlertEventPolicy(
