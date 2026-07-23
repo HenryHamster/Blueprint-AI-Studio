@@ -1808,3 +1808,186 @@ async def test_bound_detail_preserves_linked_tasks_through_link_and_truncate_cyc
     assert len(encoded) <= cd._MAX_DETAIL_BYTES, (
         f"detail must fit in _MAX_DETAIL_BYTES even after multiple links; got {len(encoded)}"
     )
+
+
+# ── no_ci_gate auto-resolution on verified recovery ──────────────────────────
+
+
+def test_no_ci_gate_debt_resolves_on_verified_recovery(sync_session):
+    """A verified real-test run auto-resolves an existing open no_ci_gate debt row.
+
+    This is the primary acceptance test for the no_ci_gate auto-resolver: a prior
+    unverified fall-open opens debt; a subsequent verified run (executed_real_tests=True)
+    discharges it by flipping the row to STATUS_RESOLVED with reason="verified_recovery".
+    """
+    project = Project(name="p-recovery", user_id="u")
+    sync_session.add(project)
+    sync_session.commit()
+
+    key = f"no_ci_gate:{project.id}"
+
+    # Step 1: fall-open → debt opened.
+    ci_resolution.record_no_ci_gate_runtime(
+        sync_session,
+        project,
+        executed_real_tests=False,
+        unverified_reason="verify_setup_failed",
+        when=_utcnow(),
+    )
+    sync_session.commit()
+
+    row = sync_session.execute(
+        select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+    ).scalar_one()
+    assert row.status == cd.STATUS_OPEN, "debt must be open after fall-open"
+
+    # Step 2: verified run → debt discharged.
+    ci_resolution.record_no_ci_gate_runtime(
+        sync_session,
+        project,
+        executed_real_tests=True,
+        unverified_reason=None,
+        when=_utcnow(),
+    )
+    sync_session.commit()
+
+    row = sync_session.execute(
+        select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+    ).scalar_one()
+    assert row.status == cd.STATUS_RESOLVED, (
+        "a verified real-test run must resolve the open no_ci_gate debt"
+    )
+    assert row.resolution_reason == "verified_recovery", (
+        "resolution_reason must be 'verified_recovery' when auto-discharged by the gate"
+    )
+    assert row.resolved_at is not None, "resolved_at must be stamped"
+    # Count must still be exactly 1 — the same row is mutated, not duplicated.
+    assert _count(sync_session, dedupe_key=key) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_ci_gate_debt_resolves_on_verified_recovery_async(db_session):
+    """Async path: arecord_no_ci_gate_runtime resolves open no_ci_gate debt on verified run."""
+    project = Project(name="p-async-recovery", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    key = f"no_ci_gate:{project.id}"
+
+    # Fall-open → opens debt.
+    await ci_resolution.arecord_no_ci_gate_runtime(
+        db_session,
+        project,
+        executed_real_tests=False,
+        unverified_reason="verify_setup_failed",
+        when=_utcnow(),
+    )
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_OPEN
+
+    # Verified run → resolves debt.
+    await ci_resolution.arecord_no_ci_gate_runtime(
+        db_session,
+        project,
+        executed_real_tests=True,
+        unverified_reason=None,
+        when=_utcnow(),
+    )
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_RESOLVED, (
+        "async verified run must resolve the open no_ci_gate debt"
+    )
+    assert row.resolution_reason == "verified_recovery"
+    assert await _acount(db_session, dedupe_key=key) == 1
+
+
+def test_no_ci_gate_verified_run_noop_when_no_debt_exists(sync_session):
+    """A verified run is a safe no-op when no no_ci_gate debt row was ever opened."""
+    project = Project(name="p-noop", user_id="u")
+    sync_session.add(project)
+    sync_session.commit()
+
+    key = f"no_ci_gate:{project.id}"
+    assert _count(sync_session, dedupe_key=key) == 0
+
+    ci_resolution.record_no_ci_gate_runtime(
+        sync_session,
+        project,
+        executed_real_tests=True,
+        unverified_reason=None,
+        when=_utcnow(),
+    )
+    sync_session.commit()
+
+    # Still no row — resolver is a no-op when no debt exists.
+    assert _count(sync_session, dedupe_key=key) == 0
+
+
+@pytest.mark.asyncio
+async def test_no_ci_gate_verified_run_does_not_affect_dismissed_debt(db_session):
+    """A verified run must NOT touch a DISMISSED no_ci_gate debt row.
+
+    A dismissed row represents a permanent operator disposition; the auto-resolver
+    (aresolve_completion_debt) only touches OPEN rows, so a dismissed row survives.
+    """
+    project = Project(name="p-dismissed", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    key = f"no_ci_gate:{project.id}"
+
+    # Open debt then dismiss it (operator disposition — permanent).
+    await ci_resolution.arecord_no_ci_gate_runtime(
+        db_session,
+        project,
+        executed_real_tests=False,
+        unverified_reason="verify_setup_failed",
+        when=_utcnow(),
+    )
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    await cd.dismiss_debt(
+        db_session, row.id, project_id=project.id, reason="operator:accepted-risk"
+    )
+    await db_session.commit()
+
+    # Verified run: resolver must leave the DISMISSED row untouched.
+    await ci_resolution.arecord_no_ci_gate_runtime(
+        db_session,
+        project,
+        executed_real_tests=True,
+        unverified_reason=None,
+        when=_utcnow(),
+    )
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_DISMISSED, (
+        "a dismissed no_ci_gate debt must not be altered by a verified run"
+    )
+    assert row.resolution_reason == "operator:accepted-risk", (
+        "operator dismissal reason must be preserved"
+    )
