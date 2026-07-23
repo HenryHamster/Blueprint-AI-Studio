@@ -213,9 +213,8 @@ _1M_CONTEXT_MODELS: frozenset[str] = frozenset(
 # Used by the dispatcher when no pool account can run the requested model
 # (e.g. plan doesn't include it, or the provider retires it): the task
 # requeues on the GA counterpart with the downgrade recorded on task.context.
-# This is also the removal-safety net for temporary models like fable — see
-# the TEMPORARY note above.
 _MODEL_FALLBACKS: dict[str, str] = {
+    # Safety net for in-flight tasks still carrying the retired fable-5 model id.
     "claude-fable-5": "claude-opus-4-8",
 }
 

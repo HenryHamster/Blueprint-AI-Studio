@@ -372,6 +372,7 @@
     "test_release_qualifier.py": 52500,
     "test_operator_inbox_liveness.py": 2400,
     "test_compute_image_build_local.py": 9400,
+    "test_shard_balance.py": 100,
     "test_compute_runner_dispatch.py": 3350,
     "test_compute_gcp_startup.py": 2200,
     "test_admin_routers__messages.py": 5250,
