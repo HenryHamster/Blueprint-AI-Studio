@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   HIGH_SIGNAL_NOTE_EVENTS,
   ESCALATION_EVENT_TYPES,
+  ROUTINE_EVENT_LABELS,
+  STRATEGIST_INTERNAL_FALLBACK_BLOCK,
   classifySignalLevel,
   effectiveSignal,
   getToastSeverity,
@@ -181,5 +183,138 @@ describe('audience-first signal classification', () => {
         context: { audience: 'operator-fyi' },
       }))).toBe(false);
     });
+  });
+});
+
+// ── New event type classification coverage ─────────────────────────────────
+// Tests added when operator_decision.summary_absent and notification.dead_letter_lost
+// were added to ROUTINE_EVENT_LABELS. notification.dead_letter_lost has
+// audience=operator-action-needed (not strategist-internal), making it a special
+// case: the audience stamp routes modern messages as HIGH, while the
+// STRATEGIST_INTERNAL_FALLBACK_BLOCK routes legacy (no-audience) messages as ROUTINE.
+
+describe('new routine event types — operator_decision.summary_absent', () => {
+  it('is in ROUTINE_EVENT_LABELS', () => {
+    expect('operator_decision.summary_absent' in ROUTINE_EVENT_LABELS).toBe(true);
+  });
+
+  it('has human-readable label', () => {
+    expect(ROUTINE_EVENT_LABELS['operator_decision.summary_absent']).toBeTruthy();
+  });
+
+  it('is not in HIGH_SIGNAL_NOTE_EVENTS', () => {
+    expect(HIGH_SIGNAL_NOTE_EVENTS.has('operator_decision.summary_absent')).toBe(false);
+  });
+
+  it('is not in ESCALATION_EVENT_TYPES', () => {
+    expect(ESCALATION_EVENT_TYPES.has('operator_decision.summary_absent')).toBe(false);
+  });
+
+  it('is in STRATEGIST_INTERNAL_FALLBACK_BLOCK (derived from ROUTINE_EVENT_LABELS keys)', () => {
+    expect(STRATEGIST_INTERNAL_FALLBACK_BLOCK.has('operator_decision.summary_absent')).toBe(true);
+  });
+
+  it('with strategist-internal audience → routine (audience is authoritative)', () => {
+    const classified = classifySignalLevel(makeTestMsg({
+      context: { audience: 'strategist-internal', event_type: 'operator_decision.summary_absent' },
+    }));
+    expect(classified).toBe('routine');
+  });
+
+  it('without audience stamp → routine (STRATEGIST_INTERNAL_FALLBACK_BLOCK)', () => {
+    const classified = classifySignalLevel(makeTestMsg({
+      context: { event_type: 'operator_decision.summary_absent' },
+    }));
+    expect(classified).toBe('routine');
+  });
+
+  it('snapshot audience matches strategist-internal', () => {
+    const entry = eventTypeSnapshot.event_types.find(
+      e => e.name === 'operator_decision.summary_absent'
+    );
+    expect(entry).toBeDefined();
+    expect(entry?.audience).toBe('strategist-internal');
+  });
+});
+
+describe('new routine event types — notification.dead_letter_lost', () => {
+  it('is in ROUTINE_EVENT_LABELS', () => {
+    expect('notification.dead_letter_lost' in ROUTINE_EVENT_LABELS).toBe(true);
+  });
+
+  it('has human-readable label', () => {
+    expect(ROUTINE_EVENT_LABELS['notification.dead_letter_lost']).toBeTruthy();
+  });
+
+  it('is not in HIGH_SIGNAL_NOTE_EVENTS', () => {
+    // notification.dead_letter_lost has operator-action-needed audience but is NOT
+    // in HIGH_SIGNAL_NOTE_EVENTS — it is in ROUTINE_EVENT_LABELS for display labeling.
+    // Signal level is determined at runtime by the audience stamp, not this set.
+    expect(HIGH_SIGNAL_NOTE_EVENTS.has('notification.dead_letter_lost')).toBe(false);
+  });
+
+  it('is not in ESCALATION_EVENT_TYPES', () => {
+    expect(ESCALATION_EVENT_TYPES.has('notification.dead_letter_lost')).toBe(false);
+  });
+
+  it('is in STRATEGIST_INTERNAL_FALLBACK_BLOCK (derived from ROUTINE_EVENT_LABELS keys)', () => {
+    // Even though its audience is operator-action-needed, the legacy fallback block
+    // is derived from ROUTINE_EVENT_LABELS keys, so it appears here.
+    expect(STRATEGIST_INTERNAL_FALLBACK_BLOCK.has('notification.dead_letter_lost')).toBe(true);
+  });
+
+  it('with operator-action-needed audience → high (audience is authoritative for modern messages)', () => {
+    // notification.dead_letter_lost carries audience=operator-action-needed from the backend.
+    // The audience stamp takes precedence over any fallback heuristic.
+    const classified = classifySignalLevel(makeTestMsg({
+      context: { audience: 'operator-action-needed', event_type: 'notification.dead_letter_lost' },
+    }));
+    expect(classified).toBe('high');
+  });
+
+  it('without audience stamp → routine (STRATEGIST_INTERNAL_FALLBACK_BLOCK prevents high promotion)', () => {
+    // Legacy messages without an audience stamp: STRATEGIST_INTERNAL_FALLBACK_BLOCK
+    // prevents notification.dead_letter_lost from being classified as high via
+    // HIGH_SIGNAL_NOTE_EVENTS (it's not in that set anyway, but the block guards
+    // against accidental future drift into HIGH_SIGNAL_NOTE_EVENTS).
+    const classified = classifySignalLevel(makeTestMsg({
+      context: { event_type: 'notification.dead_letter_lost' },
+    }));
+    expect(classified).toBe('routine');
+  });
+
+  it('with operator-action-needed audience → error toast (operator-facing)', () => {
+    const severity = getToastSeverity(makeTestMsg({
+      context: { audience: 'operator-action-needed', event_type: 'notification.dead_letter_lost' },
+    }));
+    expect(severity).toBe('error');
+  });
+
+  it('snapshot audience is operator-action-needed', () => {
+    // Verifies that notification.dead_letter_lost is the special-case event type
+    // that lives in ROUTINE_EVENT_LABELS but has operator-action-needed audience.
+    const entry = eventTypeSnapshot.event_types.find(
+      e => e.name === 'notification.dead_letter_lost'
+    );
+    expect(entry).toBeDefined();
+    expect(entry?.audience).toBe('operator-action-needed');
+  });
+});
+
+describe('ROUTINE_EVENT_LABELS and STRATEGIST_INTERNAL_FALLBACK_BLOCK parity', () => {
+  it('STRATEGIST_INTERNAL_FALLBACK_BLOCK contains exactly the keys of ROUTINE_EVENT_LABELS', () => {
+    const routineKeys = new Set(Object.keys(ROUTINE_EVENT_LABELS));
+    for (const key of routineKeys) {
+      expect(STRATEGIST_INTERNAL_FALLBACK_BLOCK.has(key)).toBe(true);
+    }
+    expect(STRATEGIST_INTERNAL_FALLBACK_BLOCK.size).toBe(routineKeys.size);
+  });
+
+  it('no ROUTINE_EVENT_LABELS key is in HIGH_SIGNAL_NOTE_EVENTS', () => {
+    // Guards against the invariant described in the STRATEGIST_INTERNAL_FALLBACK_BLOCK
+    // comment: STRATEGIST_INTERNAL_FALLBACK_BLOCK ∩ HIGH_SIGNAL_NOTE_EVENTS = ∅
+    for (const key of Object.keys(ROUTINE_EVENT_LABELS)) {
+      expect(HIGH_SIGNAL_NOTE_EVENTS.has(key)).toBe(false);
+    }
   });
 });

@@ -186,6 +186,40 @@ def test_notification_dead_letter_lost_is_operator_action_needed():
     assert "notification.dead_letter_lost" in operator_types
 
 
+def test_operator_decision_summary_absent_is_strategist_internal():
+    """operator_decision.summary_absent routes STRATEGIST_INTERNAL and is excluded
+    from operator badge counts.
+
+    This event_type is emitted by the resident session when the operator decision
+    summary is absent — it is a bookkeeping signal for the strategist, not an
+    operator-facing action item.  It must NOT appear in the operator badge.
+    """
+    assert route_event("operator_decision.summary_absent") == STRATEGIST_INTERNAL
+    non_operator = get_non_operator_event_types()
+    assert "operator_decision.summary_absent" in non_operator, (
+        "operator_decision.summary_absent is registered STRATEGIST_INTERNAL but absent "
+        "from get_non_operator_event_types() — operator_visible_alert_filter will NOT "
+        "exclude it from badge counts"
+    )
+
+
+def test_operator_decision_capture_rate_low_is_strategist_internal():
+    """operator_decision.capture_rate_low routes STRATEGIST_INTERNAL and is excluded
+    from operator badge counts.
+
+    This event_type is emitted when the operator decision capture rate is low — a
+    pipeline-health signal for the strategist that must not surface in the operator
+    badge or action-needed inbox.
+    """
+    assert route_event("operator_decision.capture_rate_low") == STRATEGIST_INTERNAL
+    non_operator = get_non_operator_event_types()
+    assert "operator_decision.capture_rate_low" in non_operator, (
+        "operator_decision.capture_rate_low is registered STRATEGIST_INTERNAL but absent "
+        "from get_non_operator_event_types() — operator_visible_alert_filter will NOT "
+        "exclude it from badge counts"
+    )
+
+
 def test_route_event_pipeline_internal_bookkeeping_is_strategist_internal():
     """Pipeline-internal bookkeeping event types that must NOT reach the operator badge."""
     # Stale-branch cleanup summary (branch_cleanup.py)
