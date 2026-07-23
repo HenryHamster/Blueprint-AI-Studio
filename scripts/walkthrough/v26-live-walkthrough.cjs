@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, spawn } = require('child_process');
+const { computeGates } = require('./criterion-gates.cjs');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -1543,24 +1544,22 @@ async function writeJsonResult(startTs, projectId) {
   const resultFile = process.env.WALKTHROUGH_RESULT_FILE || '/tmp/walkthrough_result.json';
   const shaValid = verifyShaExists(HEAD_SHA);
 
-  // Map step results to per-criterion pass/fail.
-  // Flow 1 → c-dfdc9d82 (Runner Enrollment)
-  // PASS requires: registration (1a) + fleet visible (1b) + live heartbeat (1d)
-  // AND flow 6 bad-token explicit-error contract (6a bad-auth-401 + 6b two-button UI).
-  // The 'error, not endless waiting' honesty behavior is what c-dfdc9d82 is about;
-  // merely registering and listing back is insufficient — the daemon must connect AND
-  // the bad-token path must surface an explicit error, not silence.
+  // Compute per-criterion pass/fail using the centralized gate definitions from
+  // criterion-gates.cjs. Each criterion requires ALL listed flow steps to pass;
+  // see that module for the authoritative flow-to-criterion mapping.
+  const {
+    runnerEnrollmentPassed,
+    iframeTokenPassed,
+    workdaySessionPassed,
+    walkthroughMetaPassed,
+  } = computeGates(results, shaValid);
+
+  // Individual step lookups — used only for diagnostic notes below.
   const runnerReg = results.find(r => r.name.includes('1a.'));
   const fleetVisible = results.find(r => r.name.includes('1b.'));
   const heartbeatStep = results.find(r => r.name.includes('1d.'));
   const badAuthStep = results.find(r => r.name.includes('6a.'));
   const twoButtonStep = results.find(r => r.name.includes('6b.'));
-  const runnerEnrollmentPassed = shaValid
-    && (runnerReg?.verdict === 'PASS')
-    && (fleetVisible?.verdict === 'PASS')
-    && (heartbeatStep?.verdict === 'PASS')
-    && (badAuthStep?.verdict === 'PASS')
-    && (twoButtonStep?.verdict === 'PASS');
   const runnerNotes = runnerEnrollmentPassed
     ? 'Runner registration, fleet visibility, live daemon heartbeat, bad-token 401, and two-button error UI all confirmed'
     : [
@@ -1572,11 +1571,8 @@ async function writeJsonResult(startTs, projectId) {
         !shaValid ? 'SHA integrity check failed' : '',
       ].filter(Boolean).join('; ') || 'Runner enrollment not evaluated';
 
-  // Flow 2 → c-f52fd975 (iframe subresource token)
-  // PASS requires: auth (2b) + route exists/fake-401 (2c) + valid-JWT 200 (2g)
-  // AND flow 7 project-tools lifecycle (7a create + 7b disable + 7c re-enable +
-  // 7d add-same-kind + 7e no-Placement-dropdown honesty check).
-  // The tools-lifecycle honesty behavior is part of the tools criterion.
+  // Flow 2 + Flow 7 → c-f52fd975 (iframe subresource token)
+  // Diagnostic step lookups for notes — gate boolean is from computeGates above.
   const mintAuth = results.find(r => r.name.includes('2b.'));
   const pathRoute = results.find(r => r.name.includes('2c.'));
   const assetGet = results.find(r => r.name.includes('2g.'));
@@ -1585,15 +1581,6 @@ async function writeJsonResult(startTs, projectId) {
   const toolReEnable = results.find(r => r.name.includes('7c.'));
   const toolAddSame = results.find(r => r.name.includes('7d.'));
   const toolNoPlacement = results.find(r => r.name.includes('7e.'));
-  const iframeTokenPassed = shaValid
-    && (mintAuth?.verdict === 'PASS')
-    && (pathRoute?.verdict === 'PASS')
-    && (assetGet?.verdict === 'PASS')
-    && (toolCreate?.verdict === 'PASS')
-    && (toolDisable?.verdict === 'PASS')
-    && (toolReEnable?.verdict === 'PASS')
-    && (toolAddSame?.verdict === 'PASS')
-    && (toolNoPlacement?.verdict === 'PASS');
   const iframeNotes = iframeTokenPassed
     ? 'Asset-token minted, path-embedded route registered (fake → 401), valid JWT returned 200, and tools lifecycle (create/disable/re-enable/add-same-kind/no-Placement-dropdown) all confirmed'
     : [
@@ -1613,22 +1600,13 @@ async function writeJsonResult(startTs, projectId) {
   // the canonical c-5214996f, and keeping the slug distinct from the meta entry
   // below avoids first-occurrence dedup silently dropping the meta entry (both
   // would collapse to c-5214996f otherwise). See WALKTHROUGH_LEGACY_CRITERION_ALIASES.
-  // PASS requires: session created + liveness reflects it + Stop control in UI +
-  // clean stop + UI click-to-talk (Workday toggle → Start button → liveness confirms).
   // Genuine streaming 'active' is intentionally NOT required (environment-gated).
-  // Step 5f (UI click-to-talk) is the evidence that the actual operator affordance
-  // — clicking the Workday toggle then Start — starts a session that liveness reflects.
+  // Diagnostic step lookups for notes — gate boolean is from computeGates above.
   const workdayStart = results.find(r => r.name.includes('5b.'));
   const workdayLiveness = results.find(r => r.name.includes('5c.'));
   const workdayControl = results.find(r => r.name.includes('5d.'));
   const workdayStop = results.find(r => r.name.includes('5e.'));
   const workdayUIClick = results.find(r => r.name.includes('5f.'));
-  const workdaySessionPassed = shaValid
-    && workdayStart?.verdict === 'PASS'
-    && workdayLiveness?.verdict === 'PASS'
-    && workdayControl?.verdict === 'PASS'
-    && workdayStop?.verdict === 'PASS'
-    && workdayUIClick?.verdict === 'PASS';
   const workdayNotes = workdaySessionPassed
     ? 'Workday resident session created, reflected by strategic-liveness, rendered a Stop control in the UI, stopped cleanly with handoff, AND UI click-to-talk (Workday toggle → Start → liveness confirms) exercised'
     : [
@@ -1641,15 +1619,7 @@ async function writeJsonResult(startTs, projectId) {
       ].filter(Boolean).join('; ') || 'Workday session lifecycle not evaluated';
 
   // Walkthrough meta → c-5214996f
-  // PASS requires ALL named sub-criteria to have passed: c-dfdc9d82 (runner
-  // enrollment + bad-token error) AND c-f52fd975 (iframe token + tools lifecycle)
-  // AND c-workday-session-lifecycle. A single step passing anywhere is NOT enough —
-  // the meta criterion summarizes the full re-walk, not a partial green.
-  const passCount = results.filter(r => r.verdict === 'PASS').length;
-  const walkthroughMetaPassed = shaValid
-    && runnerEnrollmentPassed
-    && iframeTokenPassed
-    && workdaySessionPassed;
+  // PASS requires ALL named sub-criteria to have passed (from computeGates above).
   const walkthroughNotes = walkthroughMetaPassed
     ? `Live walkthrough completed against SHA ${HEAD_SHA} at ${startTs}: all substantive sub-criteria passed (runner enrollment, iframe token+tools, workday session)`
     : shaValid
