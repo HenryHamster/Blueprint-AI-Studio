@@ -57,6 +57,85 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# --- Gap-respawn observe-mode observability ------------------------------------
+
+#: Lane discriminator for AuditLaneDecisionLog rows recording observe-mode
+#: would-have-blocked events from the direction_gap_respawn_block_mode check.
+_GAP_RESPAWN_LANE = "gap_respawn"
+
+#: Bounded in-memory ring of recent observe-mode would-have-blocked events
+#: (mirrors the pattern in evergreen_backlog / structural_health_audit).
+from collections import deque as _deque  # noqa: E402
+_GAP_RESPAWN_OBSERVE_RING: _deque = _deque(maxlen=50)  # type: ignore[type-arg]
+
+
+async def _record_gap_respawn_observe_event(
+    session: Any,
+    *,
+    ts: Any,
+    direction_text: str,
+    gap_id: str | None,
+    matched_retired_id: str,
+    match_kind: str,
+    project_id: Any,
+) -> None:
+    """Record an observe-mode would-have-blocked event durably and in-memory.
+
+    Writes one row to ``AuditLaneDecisionLog`` (lane='gap_respawn') so the
+    mode-knob graduation harness can read a durable multi-day window, and
+    appends to the bounded in-memory ring for live operator observability.
+    Best-effort: a DB error is logged and swallowed.
+    """
+    from app.models import AuditLaneDecisionLog
+
+    payload = {
+        "direction_text": direction_text[:200],
+        "gap_id": gap_id,
+        "matched_retired_id": matched_retired_id,
+        "match_kind": match_kind,
+        "project_id": str(project_id) if project_id else None,
+    }
+
+    # In-memory ring (bounded, process-local).
+    _GAP_RESPAWN_OBSERVE_RING.append({
+        "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        "direction_text": direction_text[:200],
+        "gap_id": gap_id,
+        "matched_retired_id": matched_retired_id,
+        "match_kind": match_kind,
+    })
+
+    # Durable DB row.
+    try:
+        row = AuditLaneDecisionLog(
+            ts=ts,
+            lane=_GAP_RESPAWN_LANE,
+            mode="observe",
+            tripped=True,
+            enrolled=0,
+            payload=payload,
+        )
+        session.add(row)
+        await session.flush()
+    except Exception:
+        logger.warning(
+            "[STRATEGIC] _record_gap_respawn_observe_event failed to persist",
+            exc_info=True,
+        )
+
+
+def get_gap_respawn_observability() -> dict:
+    """Return the current in-memory gap-respawn observability snapshot."""
+    return {
+        "would_have_blocked_recent": list(_GAP_RESPAWN_OBSERVE_RING),
+        "would_have_blocked_count": len(_GAP_RESPAWN_OBSERVE_RING),
+    }
+
+
+def _reset_gap_respawn_observability_for_tests() -> None:
+    """Reset the in-memory ring (test isolation only)."""
+    _GAP_RESPAWN_OBSERVE_RING.clear()
+
 
 def spawn_budget_status(
     per_review_count: int,
@@ -5165,6 +5244,19 @@ async def _handle_strategic_completion(
                         _gap_block_reason,
                         _gap_block_mode,
                     )
+                    # In observe mode, record the would-have-blocked event durably
+                    # so the mode-knob graduation harness can measure lift over a
+                    # multi-day window (direction_gap_respawn_block_mode).
+                    if _gap_block_mode == "observe":
+                        await _record_gap_respawn_observe_event(
+                            session,
+                            ts=_utcnow(),
+                            direction_text=text,
+                            gap_id=op_entry.get("gap_id"),
+                            matched_retired_id=_retired_direction_id,
+                            match_kind=_gap_match_kind,
+                            project_id=project.id,
+                        )
                     if _gap_block_mode == "enforce":
                         continue
                 success_evidence = str(op_entry.get("success_evidence", "")).strip()

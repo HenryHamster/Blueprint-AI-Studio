@@ -313,9 +313,6 @@ def test_seed_is_idempotent_and_covers_families(sync_session):
     assert first > 0
     assert second == 0, "re-seeding must never duplicate rows"
     assert _count(sync_session) == total_after_first
-    # Standing inventory families are present.
-    assert _count(sync_session, dedupe_key="seed:no_ci_gate_live_trial") == 1
-    assert _count(sync_session, dedupe_key="seed:capability_trial_rail") == 1
     # Dormant runtime-config knobs are enumerated into the ledger.
     assert _count(sync_session, kind=cd.KIND_DORMANT_KNOB) >= 1
 
@@ -329,7 +326,28 @@ async def test_aseed_matches_sync_seed_and_is_idempotent(db_session):
 
     assert created > 0
     assert again == 0
-    assert await _acount(db_session, dedupe_key="seed:no_ci_gate_live_trial") == 1
+
+
+@pytest.mark.asyncio
+async def test_seed_inventory_rows_are_resolvable(db_session):
+    """Standing seed-inventory rows (no_ci_gate_live_trial, capability_trial_rail,
+    adversarial_observe_watch) are no longer auto-seeded — they had no resolver and
+    permanently consumed open-debt snapshot slots, duplicating dynamic recorders
+    that DO resolve."""
+    # The _standing_inventory_debts function has been removed.
+    assert not hasattr(cd, "_standing_inventory_debts")
+    # The _iter_seed_debts generator no longer yields seed:* keys.
+    from app.completion_debt import _iter_seed_debts
+
+    seed_keys = {d["dedupe_key"] for d in _iter_seed_debts()}
+    assert not any(k.startswith("seed:") for k in seed_keys)
+    # After seeding the full inventory, the former static rows are absent.
+    await cd.aseed_completion_debt_inventory(db_session)
+    assert await _acount(db_session, dedupe_key="seed:no_ci_gate_live_trial") == 0
+    assert await _acount(db_session, dedupe_key="seed:capability_trial_rail") == 0
+    assert await _acount(db_session, dedupe_key="seed:adversarial_observe_watch") == 0
+    # Dormant runtime-config knobs are still seeded.
+    assert await _acount(db_session, kind=cd.KIND_DORMANT_KNOB) >= 1
 
 
 @pytest.mark.asyncio
@@ -1324,9 +1342,6 @@ async def test_seed_writes_completion_debt_design_doc_section(db_session):
     assert cd.KIND_NO_CI_GATE in section["debt_kinds"], "no_ci_gate must be in debt_kinds"
     assert cd.KIND_RETIREMENT_RESIDUAL in section["debt_kinds"], (
         "retirement_residual must be in debt_kinds"
-    )
-    assert cd.KIND_SEED_INVENTORY in section["debt_kinds"], (
-        "seed_inventory must be in debt_kinds"
     )
     assert "recorders" in section, "section must list recorder surfaces"
     assert "reconciliation_surfaces" in section, "section must list reconciliation surfaces"

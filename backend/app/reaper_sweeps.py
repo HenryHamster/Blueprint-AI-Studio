@@ -698,6 +698,22 @@ async def sweep_metrics_integrity(session, now=None) -> dict | None:
     return await run_metrics_integrity_sweep(session, now)
 
 
+async def sweep_mode_knob_graduation(session, now=None) -> list | None:
+    """Always-on shared mode-knob graduation harness — independent of sweep mode.
+
+    Thin delegator to :func:`app.mode_knob_graduation.run_mode_knob_graduation`.
+    Gated ONLY by its own ``mode_knob_graduation_enabled`` flag (default False)
+    inside the callee — deliberately NOT gated on ``metrics_integrity_sweep_mode``
+    so the harness that disposes dormant knobs never itself depends on a dormant
+    knob being enforced. Returns the per-knob decision list, or an empty list when
+    the harness is disabled. The reaper wraps this call in its own
+    try/except+rollback so a raised error can never crash the cycle.
+    """
+    from app.mode_knob_graduation import run_mode_knob_graduation
+
+    return await run_mode_knob_graduation(session, now=now)
+
+
 async def sweep_operator_inbox_liveness(session, now=None) -> list | None:
     """Always-on operator-inbox liveness signal — independent of sweep mode.
 

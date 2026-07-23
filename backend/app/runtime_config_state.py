@@ -301,6 +301,120 @@ runtime_config: Dict = {
             "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
         )
     ),
+    # --- Shared mode-knob graduation harness (app.mode_knob_graduation) --------
+    # Generalizes the proven capability_proof_gate auto-graduation pattern into a
+    # reusable driver that disposes dormant mode-knobs with MEASURED evidence:
+    # graduate off→observe→enforce on measured lift, emit a legible CUT
+    # recommendation (with numbers) when the enforce branch would never bind, or
+    # HOLD below threshold. Gated by a single dedicated enabled flag, default OFF
+    # — mirrors capability_proof_gate_auto_graduation_enabled. Runs independently
+    # of any single knob's own mode (it does NOT require the target knob — or the
+    # metrics-integrity sweep — to already be enforcing).
+    "mode_knob_graduation_enabled": os.getenv(
+        "MODE_KNOB_GRADUATION_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Per-knob thresholds for autonomous_spawn_budget_mode. The graduation SIGNAL
+    # is initiative pressure = initiative_count / initiative_cap over the trailing
+    # window. off→observe once pressure clears the observe threshold; observe→
+    # enforce once it clears the enforce threshold (defaults to 1.0 — the cap is
+    # being hit, so enforce would bind). CUT is recommended when pressure sits
+    # below cut_threshold AND nothing would have been blocked over a window with
+    # at least min_sample observed spawns (measured no-lift).
+    "autonomous_spawn_budget_graduation_observe_threshold": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_OBSERVE_THRESHOLD", "0.5")
+    ),
+    "autonomous_spawn_budget_graduation_enforce_threshold": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_ENFORCE_THRESHOLD", "1.0")
+    ),
+    "autonomous_spawn_budget_graduation_cut_threshold": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_CUT_THRESHOLD", "0.1")
+    ),
+    "autonomous_spawn_budget_graduation_min_sample": int(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_MIN_SAMPLE", "20")
+    ),
+    "autonomous_spawn_budget_graduation_window_hours": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_WINDOW_HOURS", "24")
+    ),
+    # --- Per-knob graduation thresholds: evergreen_fill_mode --------------------
+    # Signal = would_have_fired_rate = fraction of observe-mode ticks that would
+    # have spawned a probe. off→observe once the rate clears the observe threshold;
+    # observe→enforce once it clears the enforce threshold. CUT when nothing would
+    # have fired over a representative window (zero-lift).
+    "evergreen_fill_graduation_observe_threshold": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_OBSERVE_THRESHOLD", "0.1")
+    ),
+    "evergreen_fill_graduation_enforce_threshold": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_ENFORCE_THRESHOLD", "0.25")
+    ),
+    "evergreen_fill_graduation_cut_threshold": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_CUT_THRESHOLD", "0.05")
+    ),
+    "evergreen_fill_graduation_min_sample": int(
+        os.getenv("EVERGREEN_FILL_GRADUATION_MIN_SAMPLE", "10")
+    ),
+    "evergreen_fill_graduation_window_hours": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_WINDOW_HOURS", "168")
+    ),
+    # --- Per-knob graduation thresholds: structural_health_audit_mode -----------
+    # Signal = tripped_rate = fraction of audit cycles where at least one offender
+    # was found. CUT when zero cycles tripped over the window (enforce would never
+    # enroll anything).
+    "structural_health_audit_graduation_observe_threshold": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_OBSERVE_THRESHOLD", "0.1")
+    ),
+    "structural_health_audit_graduation_enforce_threshold": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_ENFORCE_THRESHOLD", "0.25")
+    ),
+    "structural_health_audit_graduation_cut_threshold": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_CUT_THRESHOLD", "0.05")
+    ),
+    "structural_health_audit_graduation_min_sample": int(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_MIN_SAMPLE", "3")
+    ),
+    "structural_health_audit_graduation_window_hours": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_WINDOW_HOURS", "168")
+    ),
+    # --- Per-knob graduation thresholds: metrics_integrity_sweep_mode -----------
+    # Signal = tripped_rate = fraction of sweep ticks where at least one drift
+    # finding was flagged. CUT when zero ticks flagged over the window (enforce
+    # would never enroll anything). The harness does NOT require this knob to be
+    # in enforce to run its own graduation.
+    "metrics_integrity_sweep_graduation_observe_threshold": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_OBSERVE_THRESHOLD", "0.1")
+    ),
+    "metrics_integrity_sweep_graduation_enforce_threshold": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_ENFORCE_THRESHOLD", "0.25")
+    ),
+    "metrics_integrity_sweep_graduation_cut_threshold": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_CUT_THRESHOLD", "0.05")
+    ),
+    "metrics_integrity_sweep_graduation_min_sample": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_MIN_SAMPLE", "3")
+    ),
+    "metrics_integrity_sweep_graduation_window_hours": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_WINDOW_HOURS", "168")
+    ),
+    # --- Per-knob graduation thresholds: direction_gap_respawn_block_mode -------
+    # Signal = would_have_blocked_count = raw count of observe-mode would-have-
+    # blocked events in the window. This knob only takes observe/enforce (no off),
+    # so only the enforce threshold applies. CUT when zero would-have-blocked over
+    # a representative window.
+    "direction_gap_respawn_block_graduation_observe_threshold": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_OBSERVE_THRESHOLD", "0.0")
+    ),
+    "direction_gap_respawn_block_graduation_enforce_threshold": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_ENFORCE_THRESHOLD", "3.0")
+    ),
+    "direction_gap_respawn_block_graduation_cut_threshold": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_CUT_THRESHOLD", "0.0")
+    ),
+    "direction_gap_respawn_block_graduation_min_sample": int(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_MIN_SAMPLE", "1")
+    ),
+    "direction_gap_respawn_block_graduation_window_hours": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_WINDOW_HOURS", "168")
+    ),
     # Machine-verified capability-proof earn path: gates the bounded,
     # executed-named_test trial dispatch/enrollment.  Default ON now that the
     # complete path is wired (discovery -> targeted execution -> green-result

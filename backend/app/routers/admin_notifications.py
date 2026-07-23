@@ -273,6 +273,9 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "question_answer",
         "capability_proof_gate_graduated_observe",
         "capability_proof_gate_graduated_enforce",
+        "mode_knob_graduated_observe",
+        "mode_knob_graduated_enforce",
+        "mode_knob_cut_recommended",
     }
 )
 

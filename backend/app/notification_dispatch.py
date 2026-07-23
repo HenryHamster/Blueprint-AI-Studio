@@ -102,6 +102,9 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "question_answer",  # post_question_answer
         "capability_proof_gate_graduated_observe",  # post_capability_proof_gate_graduated_message
         "capability_proof_gate_graduated_enforce",  # post_capability_proof_gate_graduated_message
+        "mode_knob_graduated_observe",  # post_mode_knob_graduated_message
+        "mode_knob_graduated_enforce",  # post_mode_knob_graduated_message
+        "mode_knob_cut_recommended",  # post_mode_knob_cut_recommendation_message
     }
 )
 
@@ -913,6 +916,99 @@ async def post_capability_proof_gate_graduated_message(
             "projects_contributing": projects_contributing,
             "total_non_exempt": total_non_exempt,
             "total_proven": total_proven,
+        },
+        task_id=task_id,
+    )
+
+
+async def post_mode_knob_graduated_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    config_key: str,
+    from_mode: str,
+    to_mode: str,
+    signal: float,
+    threshold: float,
+    measurements: dict[str, Any],
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL system NOTE when a dormant mode-knob auto-graduates.
+
+    The generalization of :func:`post_capability_proof_gate_graduated_message` to
+    every knob driven by the shared mode-knob graduation harness
+    (:mod:`app.mode_knob_graduation`). The knob advances ``off → observe → enforce``
+    autonomously once its measured counterfactual signal crosses the configured
+    threshold. The event type (and hence audience) is split by target mode:
+
+    * ``→ observe`` → ``mode_knob_graduated_observe`` (``operator-fyi``): the knob
+      now records its would-be decisions but does not enforce them.
+    * ``→ enforce`` → ``mode_knob_graduated_enforce`` (``operator-action-needed``):
+      the knob's real blocking branch is now live.
+    """
+    to_mode_norm = (to_mode or "").strip().lower()
+    if to_mode_norm == "enforce":
+        event_type = "mode_knob_graduated_enforce"
+        impact = "the knob's enforce branch is now live and can block"
+    else:
+        event_type = "mode_knob_graduated_observe"
+        impact = "the knob now records its would-be decisions (no blocking yet)"
+
+    summary = (
+        f"Mode-knob {config_key} auto-graduated {from_mode} → {to_mode_norm} "
+        f"(measured signal={signal:.3f} ≥ threshold={threshold:.3f}) — {impact}."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type=event_type,
+        summary=summary,
+        context={
+            "config_key": config_key,
+            "from_mode": from_mode,
+            "to_mode": to_mode_norm,
+            "signal": round(float(signal), 4),
+            "threshold": round(float(threshold), 4),
+            "measurements": measurements,
+        },
+        task_id=task_id,
+    )
+
+
+async def post_mode_knob_cut_recommendation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    config_key: str,
+    signal: float,
+    measurements: dict[str, Any],
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL system NOTE recommending a dormant mode-knob be CUT.
+
+    Fired by the shared mode-knob graduation harness when a knob's measured
+    counterfactual shows its enforce branch would never bind (no lift) over a
+    representative window — the default-off PRINCIPLE's "cut, with numbers"
+    disposition. Carries the measured signal so the operator can act (remove the
+    knob) rather than let it age as completion debt indefinitely. FYI-class: it
+    changes nothing on its own.
+    """
+    would_have_blocked = measurements.get("would_have_blocked")
+    summary = (
+        f"Mode-knob {config_key} shows NO measured lift "
+        f"(signal={signal:.3f}, would-have-blocked={would_have_blocked}) — "
+        "recommend CUT: the enforce branch would never bind. Remove the knob "
+        "rather than carry it as dormant completion debt."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="mode_knob_cut_recommended",
+        summary=summary,
+        context={
+            "config_key": config_key,
+            "signal": round(float(signal), 4),
+            "measurements": measurements,
         },
         task_id=task_id,
     )

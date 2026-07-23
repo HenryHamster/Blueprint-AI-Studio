@@ -90,6 +90,14 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # BLOCKING task spawning and release promotion, so it needs attention.
     "capability_proof_gate_graduated_observe": OPERATOR_FYI,
     "capability_proof_gate_graduated_enforce": OPERATOR_ACTION_NEEDED,
+    # Shared mode-knob graduation harness (app.mode_knob_graduation). Same split
+    # as the capability-proof gate: off→observe is informational; →enforce turns
+    # on a real blocking branch, so it needs attention. A measured CUT
+    # recommendation (the enforce branch would never bind) is FYI — advisory
+    # signal the operator acts on by removing the knob.
+    "mode_knob_graduated_observe": OPERATOR_FYI,
+    "mode_knob_graduated_enforce": OPERATOR_ACTION_NEEDED,
+    "mode_knob_cut_recommended": OPERATOR_FYI,
     # Criterion mutation removes/replaces a quality gate → operator-action-needed
     "criterion_retracted": OPERATOR_ACTION_NEEDED,
     "criterion_superseded": OPERATOR_ACTION_NEEDED,

@@ -474,6 +474,65 @@ async def link_task_to_debt(
     return entry
 
 
+async def astamp_cut_recommendation(
+    session: Any,
+    dedupe_key: str,
+    *,
+    recommendation: dict,
+) -> bool:
+    """Stamp a legible CUT recommendation onto an OPEN debt row's detail (ASYNC).
+
+    The default-off PRINCIPLE demands that a dormant knob be either graduated on
+    measured lift OR cut with measured numbers — but there was no CUT surface on
+    the ledger.  This is that surface: the shared mode-knob graduation harness
+    (:mod:`app.mode_knob_graduation`) calls it when a knob's counterfactual shows
+    the enforce branch would never bind, merging ``recommendation`` (the measured
+    signal — would-have-blocked counts, pressure, window) under
+    ``detail['cut_recommendation']`` so an operator reviewing the completion-debt
+    ledger sees WHY the knob should be removed, not just that it is dormant.
+
+    Idempotent-by-overwrite: re-running replaces the recommendation with the
+    latest measurement.  The row stays OPEN — a CUT recommendation is advisory
+    signal, not a disposition; the operator (or a follow-up removal PR) closes the
+    row.  Best-effort and non-fatal: a missing/non-open row or any error returns
+    ``False`` and never raises, mirroring the other ledger mutators.  Returns
+    ``True`` iff the recommendation was stamped.
+    """
+    if not dedupe_key or session is None or not isinstance(recommendation, dict):
+        return False
+    try:
+        from app.models import CompletionDebtEntry
+
+        async with session.begin_nested():
+            entry = (
+                await session.execute(
+                    select(CompletionDebtEntry)
+                    .where(
+                        CompletionDebtEntry.dedupe_key == dedupe_key,
+                        CompletionDebtEntry.status == STATUS_OPEN,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if entry is None:
+                return False
+            detail = dict(entry.detail) if isinstance(entry.detail, dict) else {}
+            detail["cut_recommendation"] = dict(recommendation)
+            entry.detail = _bound_detail(detail)
+            entry.updated_at = _utcnow()
+            flag_modified(entry, "detail")
+            session.add(entry)
+            await session.flush()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to stamp cut recommendation (key=%s)",
+            dedupe_key,
+            exc_info=True,
+        )
+        return False
+
+
 def debt_to_dict(entry) -> dict[str, Any]:
     return _serialize_debt(entry)
 
@@ -908,50 +967,9 @@ async def aresolve_hotfix_deploy_backfill_debts(
 # ── Seed inventory ───────────────────────────────────────────────────────────
 
 
-def _standing_inventory_debts() -> list[dict]:
-    """Static, deployment-global backlog items present on HEAD that are not
-    already enumerable from runtime-config knobs."""
-    return [
-        {
-            "dedupe_key": "seed:no_ci_gate_live_trial",
-            "kind": KIND_NO_CI_GATE,
-            "title": (
-                "No-CI merge gate live-trial: the gate may fall open to "
-                "UNVERIFIED merges until an enforce policy is proven"
-            ),
-            "project_id": None,
-            "source": KIND_SEED_INVENTORY,
-            "detail": {"backlog_item": "no_ci_gate_live_trial"},
-        },
-        {
-            "dedupe_key": "seed:capability_trial_rail",
-            "kind": KIND_CAPABILITY_TRIAL,
-            "title": (
-                "Capability-trial/adoption rail: observe-mode capabilities "
-                "lacking a decided enforce verdict"
-            ),
-            "project_id": None,
-            "source": KIND_SEED_INVENTORY,
-            "detail": {"backlog_item": "capability_trial_adoption"},
-        },
-        {
-            "dedupe_key": "seed:adversarial_observe_watch",
-            "kind": KIND_RETIREMENT_RESIDUAL,
-            "title": (
-                "Adversarial / retirement observe-watch rail: challenges are "
-                "recorded but never enforced pending graduation"
-            ),
-            "project_id": None,
-            "source": KIND_SEED_INVENTORY,
-            "detail": {"backlog_item": "adversarial_observe_watch"},
-        },
-    ]
-
-
 def _iter_seed_debts() -> Iterable[dict]:
-    """All seed rows: the static standing inventory plus the currently-dormant
-    runtime-config knobs enumerated by ``runtime_config_state``."""
-    yield from _standing_inventory_debts()
+    """All seed rows: the currently-dormant runtime-config knobs enumerated by
+    ``runtime_config_state``."""
     try:
         from app.runtime_config_state import iter_dormant_knob_debts
 
@@ -1096,7 +1114,6 @@ def _build_completion_debt_design_doc_section() -> dict:
             KIND_NO_CI_GATE,
             KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
             KIND_RETIREMENT_RESIDUAL,
-            KIND_SEED_INVENTORY,
         ],
         "recorders": {
             "dormant_knob": "backend/app/runtime_config_state.py",
@@ -1104,7 +1121,6 @@ def _build_completion_debt_design_doc_section() -> dict:
             "no_ci_gate": "backend/app/ci_resolution.py",
             "hotfix_deploy_pending_backfill": "backend/app/release_qualifier.py",
             "retirement_residual": "backend/app/strategic_completion.py",
-            "seed_inventory": "backend/app/completion_debt.py",
         },
         "reconciliation_surfaces": [
             "knob graduation via admin settings endpoint resolves dormant-knob debt",

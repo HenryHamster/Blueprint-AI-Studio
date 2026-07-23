@@ -305,6 +305,7 @@ from app.reaper_sweeps import (
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
     sweep_metrics_integrity,
+    sweep_mode_knob_graduation,
     sweep_operator_inbox_liveness,
     sweep_backfill_null_audience_messages,
     sweep_capability_backing_proofs,
@@ -3060,6 +3061,25 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Metrics-integrity sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16c2: Shared mode-knob graduation harness — disposes
+                # dormant runtime-config mode-knobs with MEASURED evidence
+                # (graduate off→observe→enforce on measured lift, emit a legible
+                # CUT recommendation on measured no-lift, or HOLD). Runs
+                # INDEPENDENTLY of metrics_integrity_sweep_mode (a harness that
+                # disposes dormant knobs must not itself hinge on a dormant knob
+                # being enforced); gated only by its own mode_knob_graduation_enabled
+                # flag (default off). Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    await sweep_mode_knob_graduation(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Mode-knob graduation sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

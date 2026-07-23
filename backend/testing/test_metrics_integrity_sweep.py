@@ -1285,16 +1285,15 @@ async def test_completion_debt_completeness_flags_missing_expected_obligations(d
     assert len(global_flags) == 1, f"expected one global flag, got {results}"
     f = global_flags[0]
     assert f.check == "completion_debt_completeness"
-    assert f.delta >= 1  # at least the standing seed inventory is missing
+    assert f.delta >= 1  # at least the dormant knob debts are missing
     assert f.self_reported == 0  # no open rows exist
     assert f.ground_truth == f.delta  # every expected obligation is missing
     assert "under-count" in f.detail
-    # The recomputed expected set covers the standing seed inventory: delta counts
-    # at least the three seed:* rows plus whatever dormant knobs are currently off.
+    # The recomputed expected set covers the currently-dormant knob debts.
     from app.completion_debt import _iter_seed_debts
 
     seed_keys = {d["dedupe_key"] for d in _iter_seed_debts()}
-    assert any(k.startswith("seed:") for k in seed_keys)
+    assert len(seed_keys) >= 1
     assert f.delta >= len(seed_keys)
 
 

@@ -13279,27 +13279,27 @@ class TestProblemModelWritePathInvariants:
         # lifecycle.py: sanitize_problem_model_raw caller
         ("lifecycle.py", 369): "sanitize_problem_model_raw(dict(project.problem_model))",
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1031): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", 999): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
         ("direction_lifecycle.py", 812): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 840): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 4796): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 4875): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 4844): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 4923): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 6175): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 6267): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1088): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1104): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1197): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1213): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
-        ("routers/admin_projects.py", 737): "validated pydantic model_dump",
+        ("routers/admin_projects.py", 741): "validated pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1134): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1138): "current_model pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1230): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1234): "current_model pydantic model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 959): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (6 sites)
