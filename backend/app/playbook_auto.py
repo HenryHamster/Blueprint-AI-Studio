@@ -320,6 +320,11 @@ async def _maybe_auto_playbook(
     pre_fetched_archive = await get_project_telemetry(
         session, task.project_id, "playbook_archive"
     )
+    # Pre-fetch playbook_deleted_keys so _is_auto_playbook_suppressed sees the
+    # real tombstone list (strip_migrated_doc_keys strips this key from design_doc).
+    pre_fetched_deleted_keys = await get_project_telemetry(
+        session, task.project_id, "playbook_deleted_keys"
+    )
 
     entry_created = False
     suppression_reason: Optional[str] = None
@@ -330,6 +335,10 @@ async def _maybe_auto_playbook(
 
         # Inject the real archive so suppression/prior-entry helpers work.
         doc["playbook_archive"] = list(pre_fetched_archive or [])
+        # Inject the real deleted-keys list so _is_auto_playbook_suppressed sees
+        # tombstones (strip_migrated_doc_keys strips this key from design_doc).
+        if pre_fetched_deleted_keys is not None:
+            doc["playbook_deleted_keys"] = list(pre_fetched_deleted_keys)
 
         if playbook_full_key in doc:
             suppression_reason = "exists"

@@ -972,13 +972,16 @@ async def compute_pipeline_health_summary(
         }
 
     # Persistent review issues and full review effectiveness trends from
-    # compute_review_effectiveness stored in project.design_doc.
+    # compute_review_effectiveness stored in project_telemetry (with
+    # project.design_doc fallback for pre-migration values).
     persistent_review_issues: Optional[List[str]] = None
     review_effectiveness_trends: Optional[Dict[str, Any]] = None
     review_recurrence_by_category: Optional[Dict[str, float]] = None
     project = await session.get(Project, project_id)
     if project and project.design_doc:
-        eff = project.design_doc.get("review_effectiveness") or {}
+        eff = await _get_project_telemetry(
+            session, project_id, "review_effectiveness", design_doc_fallback=project.design_doc
+        ) or {}
         issues = eff.get("persistent_issues") or []
         if issues:
             persistent_review_issues = issues
