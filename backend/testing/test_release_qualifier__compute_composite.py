@@ -28,19 +28,6 @@ class TestComputeCompositeHardBlockers:
         assert result["promote"] is False
         assert result["blocker"] == "ci_not_green"
 
-    def test_smoketest_startup_failure_forces_zero(self):
-        """A None smoketest_score (startup-suite failure) hard-blocks."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=None,
-            policy=_POLICY,
-        )
-        assert result["confidence"] == 0.0
-        assert result["promote"] is False
-        assert result["blocker"] == "smoketest_startup_failed"
-
     def test_deleted_test_file_forces_zero(self):
         """A None test_erosion (deleted test file) hard-blocks — reported as
         test_file_deleted only when the audit report itself was present."""
@@ -151,7 +138,6 @@ class TestComputeCompositeHardBlockers:
         assert result["sub_scores"] == {
             "audit": 0.8,
             "test_erosion": 0.9,
-            "smoketest": 0.7,
         }
 
 
@@ -327,7 +313,7 @@ class TestComputeCompositeWeightedSum:
         assert result["blocker"] is None
 
     def test_weighted_sum_arithmetic(self):
-        """0.40*0.5 + 0.30*1.0 + 0.30*1.0 = 0.80."""
+        """With active 4/7 + 3/7 weights, 0.5 audit yields 5/7."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=0.5,
@@ -335,11 +321,11 @@ class TestComputeCompositeWeightedSum:
             smoketest_score=1.0,
             policy=_POLICY,
         )
-        assert result["confidence"] == pytest.approx(0.80)
-        assert result["promote"] is True
+        assert result["confidence"] == pytest.approx(round(5 / 7, 4))
+        assert result["promote"] is False
 
     def test_weights_are_applied_per_dimension(self):
-        """Audit carries 0.40 weight: a 0.0 audit alone caps confidence at 0.60."""
+        """Audit carries 4/7 weight: a 0.0 audit caps confidence at 3/7."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=0.0,
@@ -347,7 +333,7 @@ class TestComputeCompositeWeightedSum:
             smoketest_score=1.0,
             policy=_POLICY,
         )
-        assert result["confidence"] == pytest.approx(0.60)
+        assert result["confidence"] == pytest.approx(round(3 / 7, 4))
         assert result["promote"] is False
 
     def test_sub_scores_clamped_above_one(self):
@@ -420,117 +406,14 @@ class TestComputeCompositeThreshold:
         assert result["promote"] is False
 
 
-class TestComputeCompositeSmoketestDisabled:
-    """Audit H3: with smoketest_enabled=False the smoketest dimension is
-    dropped, the audit + test_erosion weights renormalize to sum 1.0, and a
-    None smoketest_score is NOT a hard blocker (the subsystem simply didn't
-    run)."""
-
-    def test_none_smoketest_is_not_a_blocker_when_disabled(self):
-        """A None smoketest_score does NOT hard-block when smoketest_enabled is
-        False — without this, no candidate could ever promote with the
-        subsystem off."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=None,
-            policy=_POLICY,
-            smoketest_enabled=False,
-        )
-        assert result["blocker"] is None
-        assert result["promote"] is True
-
-    def test_weights_renormalized_to_audit_plus_test(self):
-        """With the default 0.40/0.30/0.30 policy, dropping smoketest
-        renormalizes to audit≈0.5714 / test≈0.4286 (0.40/0.70, 0.30/0.70).
-        A perfect audit + perfect test_erosion therefore scores exactly 1.0."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=None,
-            policy=_POLICY,
-            smoketest_enabled=False,
-        )
-        assert result["confidence"] == pytest.approx(1.0)
-
-    def test_renormalized_weight_split_is_proportional(self):
-        """The renormalized split keeps the original audit:test_erosion ratio.
-        0.40:0.30 → 0.5714:0.4286.  A 0.0 audit alone caps confidence at the
-        renormalized test_erosion weight (0.30/0.70 ≈ 0.4286).
-
-        compute_composite rounds the returned confidence to 4 decimal places
-        (see its docstring + the ``round(_clamp01(confidence), 4)`` final
-        step), so the expected value is rounded the same way — 0.30/0.70 in
-        full precision (0.428571…) differs from the stored 0.4286 by more
-        than pytest.approx's default 1e-6 relative tolerance."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=0.0,
-            test_erosion=1.0,
-            smoketest_score=None,
-            policy=_POLICY,
-            smoketest_enabled=False,
-        )
-        # The proportional split is exact; only the 4-dp rounding is applied.
-        assert result["confidence"] == pytest.approx(round(0.30 / 0.70, 4))
-
-    def test_ci_red_still_blocks_when_smoketest_disabled(self):
-        """CI red is still a hard blocker regardless of smoketest_enabled."""
-        result = rq.compute_composite(
-            ci_green=False,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=None,
-            policy=_POLICY,
-            smoketest_enabled=False,
-        )
-        assert result["blocker"] == "ci_not_green"
-        assert result["promote"] is False
-
-    def test_audit_missing_still_blocks_when_smoketest_disabled(self):
-        """A missing audit report still hard-blocks with smoketest disabled —
-        the audit dimension is still mandatory."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=None,
-            test_erosion=1.0,
-            smoketest_score=None,
-            policy=_POLICY,
-            smoketest_enabled=False,
-        )
-        assert result["blocker"] == "audit_missing"
-
-    def test_deleted_test_file_still_blocks_when_smoketest_disabled(self):
-        """A deleted test file still hard-blocks with smoketest disabled."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=None,
-            smoketest_score=None,
-            policy=_POLICY,
-            smoketest_enabled=False,
-        )
-        assert result["blocker"] == "test_file_deleted"
-
-    def test_enabled_mode_unchanged_is_the_default(self):
-        """smoketest_enabled defaults to True — the existing rubric is the
-        default behaviour and a None smoketest_score still hard-blocks."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=None,
-            policy=_POLICY,
-        )
-        assert result["blocker"] == "smoketest_startup_failed"
-
-
-# ===========================================================================
-# Blocker vocabulary — no operator-facing label without an emitter
-# ===========================================================================
-
+class TestComputeCompositeQualifierSmokeRetired:
+    def test_legacy_smoke_arguments_are_inert(self):
+        common = dict(ci_green=True, audit_score=1.0, test_erosion=1.0, policy=_POLICY)
+        missing = rq.compute_composite(**common, smoketest_score=None, smoketest_enabled=True)
+        failed = rq.compute_composite(**common, smoketest_score=0.0, smoketest_enabled=True)
+        passed = rq.compute_composite(**common, smoketest_score=1.0, smoketest_enabled=False)
+        assert missing == failed == passed
+        assert "smoketest" not in passed["sub_scores"]
 
 def test_blocker_labels_have_emitters():
     """Every ``_BLOCKER_LABELS`` key must be a blocker some code path can emit.
@@ -623,7 +506,6 @@ def test_uncorroborated_attestation_is_fully_retired():
     assert "uncorroborated_attestation" not in rq._BLOCKER_LABELS
     assert "uncorroborated_attestation" not in rs.BLOCKER_EXECUTION_SITE
     assert rs.blocker_execution_site("uncorroborated_attestation") is None
-
 
 # ===========================================================================
 # compute_composite — debt-pressure signal (observe mode)
@@ -895,11 +777,9 @@ class TestCompletionDebtWeightModeGate:
             clear=False,
         )
         policy = rq._load_policy()
-        assert policy["weights"] == {
-            "audit": pytest.approx(0.40),
-            "test_erosion": pytest.approx(0.30),
-            "smoketest": pytest.approx(0.30),
-        }
+        assert policy["weights"] == pytest.approx(
+            {"audit": 4 / 7, "test_erosion": 3 / 7}
+        )
         assert policy["threshold"] == pytest.approx(0.90)
 
 
@@ -981,12 +861,76 @@ class TestPolicyFromBuildConfig:
         policy, source, _ = rq._resolve_policy_with_provenance(proj)
         assert source == "build_config"
         assert policy["threshold"] == pytest.approx(0.75)
-        assert policy["weights"]["audit"] == pytest.approx(0.5)
+        assert policy["weights"]["audit"] == pytest.approx(0.625)
+        assert policy["weights"]["test_erosion"] == pytest.approx(0.375)
+        assert "smoketest" not in policy["weights"]
         # _load_policy threads the project through too.
         assert rq._load_policy(proj)["threshold"] == pytest.approx(0.75)
 
+    def test_equivalent_policy_sources_produce_identical_weights_and_verdict(
+        self, mocker, tmp_path
+    ):
+        """Legacy, YAML, runtime, and build-config 4:3 ratios are deterministic."""
+        default_weights = rq._DEFAULT_POLICY["weights"]
+        legacy_weights = {"audit": 0.4, "test_erosion": 0.3, "smoketest": 0.3}
+        assert rq._normalize_active_promotion_weights(legacy_weights) == pytest.approx(default_weights)
+
+        build_policy = rq._policy_from_build_config(
+            self._proj({"promotion_weights": legacy_weights})
+        )
+        assert build_policy["weights"] == pytest.approx(default_weights)
+
+        _point_policy_at(
+            mocker,
+            tmp_path,
+            "weights:\n"
+            "  audit: 0.5714285714285714\n"
+            "  test_erosion: 0.4285714285714286\n"
+            "threshold: 0.9\n",
+        )
+        mocker.patch.dict(
+            rq._runtime_config,
+            {"completion_debt_weight_mode": "observe"},
+            clear=False,
+        )
+        yaml_policy = rq._load_policy()
+        assert yaml_policy["weights"] == pytest.approx(default_weights)
+
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.9,
+                "promotion_weights": legacy_weights,
+                "completion_debt_weight_mode": "observe",
+            },
+            clear=False,
+        )
+        runtime_policy = rq._load_policy()
+        assert runtime_policy["weights"] == pytest.approx(default_weights)
+
+        results = [
+            rq.compute_composite(
+                ci_green=True,
+                audit_score=0.825,
+                test_erosion=1.0,
+                smoketest_score=smoke,
+                smoketest_enabled=True,
+                policy={"weights": weights, "threshold": 0.9},
+            )
+            for weights, smoke in (
+                (legacy_weights, 0.0),
+                (default_weights, None),
+                (yaml_policy["weights"], 1.0),
+                (runtime_policy["weights"], 0.5),
+                (build_policy["weights"], None),
+            )
+        ]
+        assert all(result == results[0] for result in results[1:])
+        assert results[0]["confidence"] == pytest.approx(0.9)
+        assert results[0]["promote"] is True
+
     def test_threshold_clamped_to_floor(self):
-        # A project cannot set a near-zero bar. With default weights (audit 0.4)
+        # A project cannot set a near-zero bar. With default active weights (audit 4/7)
         # the threshold clamps up to the audit-veto floor (1 - audit_weight +
         # margin), which sits above the plain 0.5 safety floor.
         proj = self._proj({"promotion_threshold": 0.2})
@@ -1012,10 +956,10 @@ class TestPolicyFromBuildConfig:
                 {"promotion_threshold": 0.5, "promotion_weights": weights}
             )
             policy = rq._load_policy(proj)
-            assert policy["threshold"] > 1.0 - weights["audit"]
+            assert policy["threshold"] > 1.0 - policy["weights"]["audit"]
 
     def test_threshold_only_uses_default_weights(self, mocker):
-        # Pin observe so this asserts the base three-core-weight rubric without
+        # Pin observe so this asserts the base two-dimension active rubric without
         # the enforce-default completion_debt overlay (covered separately).
         mocker.patch.dict(
             rq._runtime_config,
@@ -1131,7 +1075,7 @@ class TestLoadPolicy:
             {
                 "promotion_threshold": None,
                 "promotion_weights": None,
-                # Pin observe: assert the on-disk three-core-weight shape without
+                # Pin observe: assert the on-disk active-weight shape without
                 # the enforce-default completion_debt overlay.
                 "completion_debt_weight_mode": "observe",
             },
@@ -1139,35 +1083,29 @@ class TestLoadPolicy:
         )
         policy = rq._load_policy()
         assert {"weights", "threshold"} <= set(policy.keys())
-        assert set(policy["weights"].keys()) == {
-            "audit",
-            "test_erosion",
-            "smoketest",
-        }
+        assert set(policy["weights"].keys()) == {"audit", "test_erosion"}
         # Values are coerced to float.
         for v in policy["weights"].values():
             assert isinstance(v, float)
         assert isinstance(policy["threshold"], float)
         # Matches the shipped defaults.
-        assert policy["weights"]["audit"] == pytest.approx(0.40)
-        assert policy["weights"]["test_erosion"] == pytest.approx(0.30)
-        assert policy["weights"]["smoketest"] == pytest.approx(0.30)
+        assert policy["weights"]["audit"] == pytest.approx(4 / 7)
+        assert policy["weights"]["test_erosion"] == pytest.approx(3 / 7)
+        assert "smoketest" not in policy["weights"]
         assert policy["threshold"] == pytest.approx(0.90)
 
     def test_fallback_on_missing_file(self, mocker, tmp_path):
         """A missing policy file falls back to hardcoded defaults, no raise."""
         _point_policy_at(mocker, tmp_path, None)
-        # Pin observe so the fallback asserts the base three-core rubric without
+        # Pin observe so the fallback asserts the base two-dimension active rubric without
         # the enforce-default completion_debt overlay.
         mocker.patch.dict(
             rq._runtime_config, {"completion_debt_weight_mode": "observe"}, clear=False
         )
         policy = rq._load_policy()
-        assert policy["weights"] == {
-            "audit": 0.40,
-            "test_erosion": 0.30,
-            "smoketest": 0.30,
-        }
+        assert policy["weights"] == pytest.approx(
+            {"audit": 4 / 7, "test_erosion": 3 / 7}
+        )
         assert policy["threshold"] == 0.90
 
     def test_fallback_on_malformed_yaml(self, mocker, tmp_path):
@@ -1175,7 +1113,7 @@ class TestLoadPolicy:
         _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
         policy = rq._load_policy()
         assert policy["threshold"] == 0.90
-        assert policy["weights"]["audit"] == 0.40
+        assert policy["weights"]["audit"] == pytest.approx(4 / 7)
 
     def test_fallback_on_missing_weights_key(self, mocker, tmp_path):
         """A policy file with no 'weights' mapping falls back to defaults."""
@@ -1183,7 +1121,7 @@ class TestLoadPolicy:
         # fallback (vs the file's parsed value) is unambiguous.
         _point_policy_at(mocker, tmp_path, "threshold: 0.55\n")
         policy = rq._load_policy()
-        assert policy["weights"]["audit"] == 0.40
+        assert policy["weights"]["audit"] == pytest.approx(4 / 7)
         assert policy["threshold"] == 0.90
 
     def test_fallback_on_non_numeric_weight(self, mocker, tmp_path):
@@ -1196,13 +1134,13 @@ class TestLoadPolicy:
         )
         policy = rq._load_policy()
         # Coercion failure → full fallback.
-        assert policy["weights"]["audit"] == 0.40
+        assert policy["weights"]["audit"] == pytest.approx(4 / 7)
 
     def test_fallback_on_scalar_yaml(self, mocker, tmp_path):
         """YAML that parses to a non-mapping (a bare scalar) falls back."""
         _point_policy_at(mocker, tmp_path, "just-a-string\n")
         policy = rq._load_policy()
-        assert policy["weights"]["audit"] == 0.40
+        assert policy["weights"]["audit"] == pytest.approx(4 / 7)
         assert policy["threshold"] == 0.90
 
     def test_fallback_when_weights_sum_above_one(self, mocker, tmp_path):
@@ -1215,17 +1153,15 @@ class TestLoadPolicy:
             "weights:\n  audit: 0.6\n  test_erosion: 0.6\n"
             "  smoketest: 0.6\nthreshold: 0.75\n",
         )
-        # Pin observe so the fallback asserts the base three-core rubric without
+        # Pin observe so the fallback asserts the base two-dimension active rubric without
         # the enforce-default completion_debt overlay.
         mocker.patch.dict(
             rq._runtime_config, {"completion_debt_weight_mode": "observe"}, clear=False
         )
         policy = rq._load_policy()
-        assert policy["weights"] == {
-            "audit": 0.40,
-            "test_erosion": 0.30,
-            "smoketest": 0.30,
-        }
+        assert policy["weights"] == pytest.approx(
+            {"audit": 4 / 7, "test_erosion": 3 / 7}
+        )
         assert policy["threshold"] == 0.90
 
     def test_fallback_when_weights_sum_below_one(self, mocker, tmp_path):
@@ -1239,9 +1175,9 @@ class TestLoadPolicy:
             "  smoketest: 0.1\nthreshold: 0.75\n",
         )
         policy = rq._load_policy()
-        assert policy["weights"]["audit"] == 0.40
-        assert policy["weights"]["test_erosion"] == 0.30
-        assert policy["weights"]["smoketest"] == 0.30
+        assert policy["weights"]["audit"] == pytest.approx(4 / 7)
+        assert policy["weights"]["test_erosion"] == pytest.approx(3 / 7)
+        assert "smoketest" not in policy["weights"]
 
     def test_weights_summing_to_one_within_tolerance_accepted(self, mocker, tmp_path):
         """A custom policy whose weights sum to exactly 1.0 is honoured."""
@@ -1253,8 +1189,8 @@ class TestLoadPolicy:
         )
         policy = rq._load_policy()
         # Sum is 1.0 exactly — parsed, not the fallback.
-        assert policy["weights"]["audit"] == pytest.approx(0.5)
-        assert policy["weights"]["test_erosion"] == pytest.approx(0.25)
+        assert policy["weights"]["audit"] == pytest.approx(2 / 3)
+        assert policy["weights"]["test_erosion"] == pytest.approx(1 / 3)
         assert policy["threshold"] == pytest.approx(0.8)
 
     def test_weights_within_tolerance_band_accepted(self, mocker, tmp_path):
@@ -1268,7 +1204,8 @@ class TestLoadPolicy:
             "  smoketest: 0.30\nthreshold: 0.75\n",
         )
         policy = rq._load_policy()
-        assert policy["weights"]["audit"] == pytest.approx(0.401)
+        assert policy["weights"]["audit"] == pytest.approx(0.401 / 0.701)
+        assert policy["weights"]["test_erosion"] == pytest.approx(0.3 / 0.701)
 
     def test_fallback_never_returns_module_constant(self, mocker, tmp_path):
         """The fallback returns a copy — mutating it must not corrupt the
@@ -1279,7 +1216,7 @@ class TestLoadPolicy:
         policy["threshold"] = 999.0
         # A fresh fallback must still see the real defaults.
         fresh = rq._load_policy()
-        assert fresh["weights"]["audit"] == 0.40
+        assert fresh["weights"]["audit"] == pytest.approx(4 / 7)
         assert fresh["threshold"] == 0.90
 
     def test_parses_custom_valid_yaml(self, mocker, tmp_path):
@@ -1291,7 +1228,7 @@ class TestLoadPolicy:
             "  smoketest: 0.25\nthreshold: 0.8\n",
         )
         policy = rq._load_policy()
-        assert policy["weights"]["audit"] == pytest.approx(0.5)
+        assert policy["weights"]["audit"] == pytest.approx(2 / 3)
         assert policy["threshold"] == pytest.approx(0.8)
 
     def test_runtime_config_override_wins_over_yaml(self, mocker, tmp_path):
@@ -1323,7 +1260,7 @@ class TestLoadPolicy:
         )
         policy = rq._load_policy()
         assert policy["threshold"] == pytest.approx(0.75)
-        assert policy["weights"]["audit"] == pytest.approx(0.5)
+        assert policy["weights"]["audit"] == pytest.approx(2 / 3)
 
     def test_runtime_config_falls_back_to_yaml_when_unset(self, mocker, tmp_path):
         """When runtime_config has no rubric, _load_policy reads the YAML file."""
@@ -1399,12 +1336,12 @@ class TestLoadPolicyProvenance:
         policy, source, error = rq._resolve_policy_with_provenance()
         assert source == "yaml_file"
         assert error is None
-        assert policy["weights"]["audit"] == pytest.approx(0.5)
+        assert policy["weights"]["audit"] == pytest.approx(2 / 3)
 
     def test_hardcoded_defaults_provenance_includes_parse_error(self, mocker, tmp_path):
         """A broken YAML file falls back to hardcoded defaults with an error string."""
         _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
-        # Pin observe so the hardcoded fallback asserts the base three-core
+        # Pin observe so the hardcoded fallback asserts the base two-dimension active
         # rubric without the enforce-default completion_debt overlay.
         mocker.patch.dict(
             rq._runtime_config, {"completion_debt_weight_mode": "observe"}, clear=False
@@ -1418,15 +1355,13 @@ class TestLoadPolicyProvenance:
             or "ParserError" in error
             or "while parsing" in error
         )
-        assert policy["weights"] == {
-            "audit": 0.40,
-            "test_erosion": 0.30,
-            "smoketest": 0.30,
-        }
+        assert policy["weights"] == pytest.approx(
+            {"audit": 4 / 7, "test_erosion": 3 / 7}
+        )
 
 
 # ===========================================================================
-# _score_audit / _score_smoketest — artifact → sub-score derivation
+# _score_audit — artifact → sub-score derivation
 # ===========================================================================
 
 
@@ -5733,118 +5668,6 @@ def test_challenge_telemetry_counts_binding_challenge_as_challenged():
     assert result["challenged"]["disagreement_rate"] == pytest.approx(1.0)
 
 
-class TestScoreSmoketest:
-    def test_all_tests_pass(self):
-        """A fully-passing smoketest yields a 1.0 score."""
-        result = {
-            "passed": True,
-            "tests": [
-                {"name": "a", "status": "pass"},
-                {"name": "b", "status": "pass"},
-            ],
-            "suites": {"startup": {"passed": True}},
-        }
-        assert rq._score_smoketest(result) == pytest.approx(1.0)
-
-    def test_partial_pass_ratio(self):
-        """The score is the pass ratio (passed / total)."""
-        result = {
-            "passed": False,
-            "tests": [
-                {"name": "a", "status": "pass"},
-                {"name": "b", "status": "pass"},
-                {"name": "c", "status": "fail"},
-                {"name": "d", "status": "fail"},
-            ],
-            "suites": {"startup": {"passed": True}},
-        }
-        assert rq._score_smoketest(result) == pytest.approx(0.5)
-
-    def test_skipped_tests_count_as_zero(self):
-        """A 'skip' status counts as 0 (conservative) — not as a pass.  Two
-        passing + two skipped tests score 0.5, not 1.0."""
-        result = {
-            "passed": True,
-            "tests": [
-                {"name": "a", "status": "pass"},
-                {"name": "b", "status": "pass"},
-                {"name": "c", "status": "skip"},
-                {"name": "d", "status": "skip"},
-            ],
-            "suites": {"startup": {"passed": True}},
-        }
-        assert rq._score_smoketest(result) == pytest.approx(0.5)
-
-    def test_startup_suite_failure_returns_none(self):
-        """A failed startup suite returns the None hard-blocker sentinel."""
-        result = {
-            "passed": False,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": False}},
-        }
-        assert rq._score_smoketest(result) is None
-
-    def test_none_result_returns_none(self):
-        """A None result (no artifact) is treated as a startup failure."""
-        assert rq._score_smoketest(None) is None
-
-    def test_no_tests_are_unavailable_evidence(self):
-        """A top-level pass claim without test evidence hard-blocks scoring."""
-        result = {"passed": True, "tests": [], "suites": {}}
-        assert rq._score_smoketest(result) is None
-
-    def test_error_bearing_result_is_unavailable_evidence(self):
-        result = {
-            "passed": False,
-            "tests": [
-                {"name": "a", "status": "pass"},
-                {"name": "database setup", "status": "error"},
-            ],
-        }
-        assert rq._score_smoketest(result) is None
-
-    def test_all_skipped_result_is_unavailable_evidence(self):
-        result = {
-            "passed": False,
-            "tests": [{"name": "suite unavailable", "status": "skip"}],
-        }
-        assert rq._score_smoketest(result) is None
-
-    def test_top_level_failure_cannot_be_erased_by_flat_passes(self):
-        result = {
-            "passed": False,
-            "tests": [{"name": "health", "status": "pass"}],
-        }
-        assert rq._score_smoketest(result) is None
-
-    def test_malformed_test_entry_is_unavailable_evidence(self):
-        result = {
-            "passed": False,
-            "tests": [
-                {"name": "health", "status": "pass"},
-                {"name": "pytest"},
-            ],
-        }
-        assert rq._score_smoketest(result) is None
-
-    def test_unknown_status_is_unavailable_evidence(self):
-        result = {
-            "passed": False,
-            "tests": [
-                {"name": "health", "status": "pass"},
-                {"name": "pytest", "status": "could-not-run"},
-            ],
-        }
-        assert rq._score_smoketest(result) is None
-
-    def test_non_boolean_passed_is_unavailable_evidence(self):
-        result = {
-            "passed": "false",
-            "tests": [{"name": "health", "status": "pass"}],
-        }
-        assert rq._score_smoketest(result) is None
-
-
 class TestExtractTestErosionDetail:
     def test_deleted_test_file_present(self):
         """A deleted test file is carried as actionable detail."""
@@ -5914,53 +5737,3 @@ class TestExtractTestErosionDetail:
         assert rq._extract_test_erosion_detail(None) is None
         assert rq._extract_test_erosion_detail("nope") is None
         assert rq._extract_test_erosion_detail({"test_erosion": "bad"}) is None
-
-
-class TestExtractSmoketestDetail:
-    def test_startup_suite_failure(self):
-        """A failed startup suite is named explicitly."""
-        result = {
-            "passed": False,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": False}},
-        }
-        detail = rq._extract_smoketest_detail(result)
-        assert detail["startup_failed"] is True
-        assert detail["failed_suite"] == "startup"
-
-    def test_failed_named_tests(self):
-        """Failing tests are carried by name with pass/total counts."""
-        result = {
-            "passed": False,
-            "tests": [
-                {"name": "a", "status": "pass"},
-                {"name": "b", "status": "fail"},
-                {"name": "c", "status": "fail"},
-            ],
-            "suites": {"startup": {"passed": True}},
-        }
-        detail = rq._extract_smoketest_detail(result)
-        assert detail["failed_tests"] == ["b", "c"]
-        assert detail["passed"] == 1
-        assert detail["total"] == 3
-
-    def test_failed_tests_capped(self):
-        """The failing-test list is capped with a truncation marker."""
-        tests = [{"name": f"t{i}", "status": "fail"} for i in range(12)]
-        result = {"tests": tests, "suites": {"startup": {"passed": True}}}
-        detail = rq._extract_smoketest_detail(result)
-        assert len(detail["failed_tests"]) == rq._MAX_FAILED_SMOKE_TESTS
-        assert detail["failed_tests_truncated"] == 12 - rq._MAX_FAILED_SMOKE_TESTS
-
-    def test_all_pass_returns_none(self):
-        """A clean smoketest yields None (nothing to carry)."""
-        result = {
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        }
-        assert rq._extract_smoketest_detail(result) is None
-
-    def test_non_dict_returns_none(self):
-        assert rq._extract_smoketest_detail(None) is None
-        assert rq._extract_smoketest_detail("nope") is None

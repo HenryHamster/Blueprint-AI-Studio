@@ -226,8 +226,6 @@ async def _collect_terminal_infra_child_events(
     challenge_id = qual.get("challenge_task_id") or qual.get("audit_challenge_task_id")
     if challenge_id:
         terminal_ids.append(("challenge", str(challenge_id)))
-    if qual.get("smoketest_task_id"):
-        terminal_ids.append(("smoketest", str(qual.get("smoketest_task_id"))))
 
     seen_failed_ids = {
         str(row.get("failed_task_id"))
@@ -238,7 +236,7 @@ async def _collect_terminal_infra_child_events(
     # Collect valid UUIDs not yet in seen_failed_ids, then batch-fetch in one
     # query instead of one session.get per leg.
     valid_uuids: list[uuid.UUID] = []
-    for leg, task_id in terminal_ids:
+    for _leg, task_id in terminal_ids:
         if task_id in seen_failed_ids:
             continue
         try:
@@ -459,72 +457,6 @@ async def _spawn_release_audit_challenge_task(
                     if primary_audit_task_id is not None
                     else {}
                 ),
-            },
-        )
-    )
-    return task
-
-
-async def _spawn_qualifier_smoketest_task(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    version_id: uuid.UUID,
-    candidate_sha: str,
-    qualification_attempt_id: uuid.UUID | str,
-) -> Task:
-    """Create + queue a qualify-time ``smoketest`` task on the candidate commit."""
-    project = await session.get(Project, project_id)
-    integration_branch, _promotion_target = _lts_branch_names(project)
-    payload: dict[str, Any] = {
-        "type": "smoketest",
-        "base_branch": integration_branch,
-        # Audit C4: pin the smoketest to the exact qualified commit.  The agent
-        # clones the integration branch then checks out this SHA.
-        "candidate_sha": candidate_sha,
-        "qualification_attempt_id": str(qualification_attempt_id),
-    }
-    type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
-    if type_model:
-        payload["model"] = type_model
-    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get("smoketest")
-    if type_effort:
-        payload["effort"] = type_effort
-    health_check_urls = _runtime_config.get("health_check_urls") or []
-    if health_check_urls:
-        payload["health_check_urls"] = health_check_urls
-    try:
-        payload = validate_internal_payload(payload, "release_qualifier:smoketest")
-    except PayloadTooLargeError:
-        raise
-
-    task = Task(
-        project_id=project_id,
-        title=f"Qualifier smoketest: candidate {candidate_sha[:8]}",
-        description=(f"Qualify-time smoketest of release candidate {candidate_sha}"),
-        payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        context={
-            "release_version_id": str(version_id),
-            "qualifier_smoketest": True,
-            "candidate_sha": candidate_sha,
-            "qualification_attempt_id": str(qualification_attempt_id),
-        },
-    )
-    session.add(task)
-    await session.flush()
-    session.add(
-        TaskHistory(
-            task_id=task.id,
-            action="SPAWNED",
-            details={
-                "spawned_by": "RELEASE_QUALIFIER",
-                "task_type": "smoketest",
-                "qualifier_smoketest": True,
-                "release_version_id": str(version_id),
-                "qualification_attempt_id": str(qualification_attempt_id),
             },
         )
     )
@@ -1046,7 +978,7 @@ async def _handle_infra_failure(
         "candidate_sha": qual.get("candidate_sha"),
         "engine_sha": engine_sha,
         "ci_green": qual.get("ci_green"),
-        "smoketest_enabled": qual.get("smoketest_enabled", True),
+        "smoketest_enabled": qual.get("smoketest_enabled", False),
         "status": "infra_failure",
         "error": infra_error,
         # Which single dimension this infra failure isolated to (the other
@@ -1183,7 +1115,7 @@ async def _handle_infra_failure(
                 f"infrastructure errors ({infra_error!r}) — the qualifier "
                 f"agent VM or clone pipeline is broken. This is NOT a "
                 f"quality finding about the release candidate. Inspect the "
-                f"release_audit / qualifier-smoketest agent infrastructure "
+                f"release-audit, challenge, and goal-grade agent infrastructure "
                 f"and re-queue to retry once the issue is resolved. "
                 f"Signature: {signature}; same as previous: "
                 f"{same_error_as_prior}."
@@ -1336,7 +1268,7 @@ async def _handle_independent_blocker(
         "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
         "ci_green": qual.get("ci_green"),
-        "smoketest_enabled": qual.get("smoketest_enabled", True),
+        "smoketest_enabled": qual.get("smoketest_enabled", False),
         "status": "not_promoted",
         "blocker": "audit_challenge_independent_blocker",
         "started_at": qual.get("started_at"),

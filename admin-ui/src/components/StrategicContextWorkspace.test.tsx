@@ -5,6 +5,7 @@ import { StrategicContextWorkspace } from './StrategicContextWorkspace';
 import type {
   StrategicStateResponse,
   StrategicWorkbenchState,
+  StrategicWorkSessionEvent,
 } from '../strategicStateApi';
 
 type SessionRefs = StrategicWorkbenchState['selected_refs'];
@@ -293,6 +294,23 @@ describe('StrategicContextWorkspace', () => {
     return { host, props };
   }
 
+  function stateWithWorkSessionEvents(events: StrategicWorkSessionEvent[]): StrategicStateResponse {
+    const workSession = STATE.work_session;
+    if (!workSession) throw new Error('STATE fixture must include work_session');
+    return {
+      ...STATE,
+      work_session: {
+        ...workSession,
+        events: {
+          version: 1,
+          limit: 24,
+          has_more: true,
+          items: events,
+        },
+      },
+    };
+  }
+
   test('does not render while closed', () => {
     const { host } = mount({ open: false });
     expect(host.textContent).toBe('');
@@ -483,6 +501,42 @@ describe('StrategicContextWorkspace', () => {
       ?.click();
     expect(onOpenMessageTarget).toHaveBeenLastCalledWith({ messageId: 'msg-operator', action: 'reply' });
     expect(onClose).toHaveBeenCalledTimes(3);
+  });
+
+  test('renders recent session flow and opens existing targets', () => {
+    const onClose = vi.fn();
+    const onOpenTarget = vi.fn();
+    const { host } = mount({
+      onClose,
+      onOpenTarget,
+      state: stateWithWorkSessionEvents([
+        {
+          id: 'event-runtime',
+          schema_version: 1,
+          project_id: 'proj-1',
+          resource: 'alert',
+          action: 'raised',
+          refetch: { surfaces: ['runtime'] },
+          occurred_at: '2026-06-29T01:02:00Z',
+          source: 'runner',
+          title: 'Runner stale',
+          summary: 'The local runner stopped heartbeating.',
+          tone: 'warning',
+          target: { surface: 'runtime', section: 'devices' },
+        },
+      ]),
+    });
+
+    expect(host.querySelector('[data-testid="strategic-context-workspace-events"]')?.textContent).toContain('Recent flow');
+    expect(host.textContent).toContain('Runner stale');
+    expect(host.textContent).toContain('The local runner stopped heartbeating.');
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.title === 'Open Runner stale')
+      ?.click();
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'devices' });
   });
 
   test('renders model-integrity conflicts with recovery hints and criterion links', () => {

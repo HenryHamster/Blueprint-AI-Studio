@@ -1333,10 +1333,8 @@ async def test_finalize_persists_advisory_audit_challenge_synthesis(db_session, 
                 "test_count_delta": 0,
             },
         },
-        # A valid passing SMOKETEST_RESULT: _score_smoketest requires an
-        # executable ``tests`` list (a bare ``{"passed": True}`` scores None →
-        # smoketest_startup_failed hard blocker), so this test — which asserts a
-        # promotable dry_run — must supply the real passing shape.
+        # Keep a realistic legacy smoke artifact in the fixture to prove it does
+        # not interfere with the active challenge/audit verdict.
         smoke_logs={
             "passed": True,
             "tests": [{"name": "a", "status": "pass"}],
@@ -3778,11 +3776,9 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
     assert version.last_qualification["test_erosion_detail"] == {
         "test_count_delta": 373, "assertion_delta": 840,
     }
-    # Smoketest detail names the specific failing test so the agent can target it.
-    smoketest_detail = version.last_qualification["smoketest_detail"]
-    assert smoketest_detail["failed_tests"] == ["b"]
-    assert smoketest_detail["passed"] == 1
-    assert smoketest_detail["total"] == 2
+    # Old smoke artifacts remain readable input, but new qualification verdicts
+    # do not preserve or act on retired qualifier-smoke detail.
+    assert "smoketest_detail" not in version.last_qualification
 
 
 @pytest.mark.asyncio

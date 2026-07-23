@@ -20,6 +20,7 @@ The fix: 0657 now skips the resident_session_id drop; 0671 is made idempotent
 import importlib.util
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -194,8 +195,8 @@ def test_0671_adds_column_when_absent():
         assert val is None, "re-added column must default to NULL for existing rows"
 
 
-def test_0671_downgrade_preserves_canonical_column_and_index():
-    """Downgrade cannot delete revision-0396 schema or Workday history."""
+def test_0671_downgrade_is_explicitly_irreversible_and_preserves_history():
+    """Downgrade refuses to delete revision-0396 schema or Workday history."""
     mig0671 = _load("0671_restore_workday_message_session_id.py")
 
     engine = sa.create_engine("sqlite:///:memory:")
@@ -217,7 +218,8 @@ def test_0671_downgrade_preserves_canonical_column_and_index():
             )
         )
 
-        mig0671.downgrade()
+        with pytest.raises(NotImplementedError, match="intentionally irreversible"):
+            mig0671.downgrade()
         inspector = sa.inspect(conn)
         columns = {column["name"] for column in inspector.get_columns("projectmessage")}
         indexes = {index["name"] for index in inspector.get_indexes("projectmessage")}

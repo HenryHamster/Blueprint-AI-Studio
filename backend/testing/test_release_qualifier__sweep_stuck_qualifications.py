@@ -1021,7 +1021,7 @@ async def test_sweep_no_pending_versions_returns_zero(db_session):
 
 
 @pytest.mark.asyncio
-async def test_finalize_smoketest_disabled_drops_dimension(db_session):
+async def test_finalize_retired_smoketest_is_absent_from_active_dimensions(db_session):
     """Audit H3: a smoketest-disabled qualification (no smoketest child, no
     SMOKETEST_RESULT) finalizes on audit + test_erosion alone — the smoketest
     dimension is dropped, no smoketest_startup_failed blocker fires, and a
@@ -1059,8 +1059,7 @@ async def test_finalize_smoketest_disabled_drops_dimension(db_session):
     rec = version.last_qualification
     assert rec["status"] == "dry_run"
     assert rec["smoketest_enabled"] is False
-    # The smoketest sub-score is reported as 0.0 but carries 0 weight.
-    assert rec["sub_scores"]["smoketest"] == 0.0
+    assert "smoketest" not in rec["sub_scores"]
 
 
 @pytest.mark.asyncio
@@ -1096,6 +1095,81 @@ async def test_maybe_finalize_smoketest_disabled_audit_only(db_session):
 
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_smoke_status",
+    [TaskStatus.IN_PROGRESS, TaskStatus.FAILED, TaskStatus.CANCELLED],
+)
+async def test_legacy_smoke_child_status_is_archival_and_never_gates(
+    db_session, legacy_smoke_status
+):
+    """Legacy smoke configuration and IDs remain inspectable, but the retired
+    smoke child cannot delay or fail finalization regardless of its status."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=legacy_smoke_status,
+    )
+    archived_smoke_id = str(smoke_task.id)
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "findings": [],
+                    "test_erosion": {"deleted_test_files": []},
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    result = await rq.maybe_finalize_qualification(
+        audit_task, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result["status"] == "dry_run"
+    assert result.get("blocker") is None
+
+    await db_session.refresh(version)
+    record = version.last_qualification
+    assert record["status"] == "dry_run"
+    # Preserve the historical record exactly for operator inspection.  The
+    # active qualifier dimensions, rather than this archival flag, determine
+    # whether finalization can proceed.
+    assert record["smoketest_enabled"] is True
+    assert record["smoketest_task_id"] == archived_smoke_id
+    assert "smoketest" not in record["sub_scores"]
+
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id,
+                    QualificationDimensionResult.dimension == "smoketest",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == legacy_smoke_status
 
 
 @pytest.mark.asyncio
@@ -1215,8 +1289,8 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
 
     project, version = await _make_project_and_version(db_session)
 
-    # The smoketest child is still IN_PROGRESS — normally the sweep would skip
-    # this version. started_at is well past the timeout.
+    # A current required audit child is still IN_PROGRESS, while an archival
+    # legacy smoke child is also running. started_at is past the timeout.
     old_started = (
         _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
     ).isoformat()
@@ -1224,8 +1298,8 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
         db_session,
         project,
         version,
-        audit_status=TaskStatus.COMPLETED,
-        smoke_status=TaskStatus.IN_PROGRESS,  # hung child, never terminal
+        audit_status=TaskStatus.IN_PROGRESS,  # current required child hung
+        smoke_status=TaskStatus.IN_PROGRESS,  # archival child, cleanup only
         started_at=old_started,
     )
 
@@ -1249,10 +1323,10 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     assert smoke_task.status == TaskStatus.CANCELLED
     assert smoke_task.vm_stopped_at is not None
 
-    # The already-completed audit child is untouched.
+    # The running current audit child is cancelled as the cause of timeout.
     await db_session.refresh(audit_task)
-    assert audit_task.status == TaskStatus.COMPLETED
-    assert audit_task.vm_stopped_at is None  # never set — task was already done
+    assert audit_task.status == TaskStatus.CANCELLED
+    assert audit_task.vm_stopped_at is not None
 
     # An operator-visible Alert was raised.
     alerts = (
@@ -1332,8 +1406,8 @@ async def test_sweep_spares_timed_out_qualification_while_pipeline_paused(
 ):
     """PAUSE-AWARE 6h qualification-timeout backstop: a qualification whose raw
     wall-clock age exceeds the limit is NOT force-finalized when the excess is
-    pipeline-pause time.  While the pipeline is PAUSED the audit/smoketest
-    children cannot run, so the pending triple is not "stuck" — force-finalizing
+    pipeline-pause time. While the pipeline is PAUSED the current audit/grade
+    children cannot run, so the pending qualification is not "stuck" — force-finalizing
     it would send the version back to stabilize and re-fire the whole triple,
     which then times out again 6h later, re-spawning it against the newest
     candidate for the entire duration of the pause (the qualifier churn observed
@@ -1359,18 +1433,17 @@ async def test_sweep_spares_timed_out_qualification_while_pipeline_paused(
 
     project, version = await _make_project_and_version(db_session)
 
-    # Started 7h ago — 1h past the 6h timeout — with the smoke child still
-    # IN_PROGRESS so the ONLY thing that could finalize it is the wall-clock
-    # timeout backstop (never a real verdict).
+    # Started 7h ago with the required audit child still IN_PROGRESS, so the
+    # wall-clock timeout backstop is the only possible finalizer.
     old_started = (
         _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
     ).isoformat()
-    _audit_task, smoke_task = await _seed_pending_qualification(
+    audit_task, smoke_task = await _seed_pending_qualification(
         db_session,
         project,
         version,
-        audit_status=TaskStatus.COMPLETED,
-        smoke_status=TaskStatus.IN_PROGRESS,  # hung child, never terminal
+        audit_status=TaskStatus.IN_PROGRESS,  # current required child hung
+        smoke_status=TaskStatus.IN_PROGRESS,  # archival child, cleanup only
         started_at=old_started,
     )
 
@@ -1396,7 +1469,10 @@ async def test_sweep_spares_timed_out_qualification_while_pipeline_paused(
     assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
-    # The still-running child is left alone (not cancelled/torn down).
+    # Both the required audit child and archival smoke child remain untouched.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.IN_PROGRESS
+    assert audit_task.vm_stopped_at is None
     await db_session.refresh(smoke_task)
     assert smoke_task.status == TaskStatus.IN_PROGRESS
     assert smoke_task.vm_stopped_at is None
@@ -1433,7 +1509,7 @@ async def test_sweep_finalizes_timed_out_qualification_despite_brief_pause(
     old_started = (
         _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
     ).isoformat()
-    _audit_task, smoke_task = await _seed_pending_qualification(
+    audit_task, smoke_task = await _seed_pending_qualification(
         db_session,
         project,
         version,
@@ -2089,17 +2165,19 @@ async def test_finalize_in_dedicated_session_triggers_strategic_on_settled_outco
 @pytest.mark.asyncio
 async def test_sweep_does_not_time_out_a_fresh_qualification(db_session):
     """Audit H2: a qualification still within the timeout window with a
-    running child is NOT force-finalized — the timeout is a backstop, not an
-    aggressive killer."""
+    running required audit child is NOT force-finalized — the timeout is a
+    backstop, not an aggressive killer.  A retired smoke child is irrelevant."""
     project, version = await _make_project_and_version(db_session)
 
-    # Fresh started_at (default = now), one child still running.
+    # Fresh started_at (default = now), with the required audit child running.
+    # The legacy smoke child is archival and must not be the reason this stays
+    # pending.
     await _seed_pending_qualification(
         db_session,
         project,
         version,
-        audit_status=TaskStatus.COMPLETED,
-        smoke_status=TaskStatus.IN_PROGRESS,
+        audit_status=TaskStatus.IN_PROGRESS,
+        smoke_status=TaskStatus.CANCELLED,
     )
 
     count = await rq.sweep_stuck_qualifications(
@@ -3245,17 +3323,18 @@ async def test_sweep_no_timeout_when_started_at_unparseable_but_row_fresh(
 ):
     """R4-H5: the unparseable-started_at fallback does NOT make the timeout
     over-aggressive — when updated_at is recent, a corrupt started_at does not
-    cause a premature force-finalize.  A still-running child keeps the version
-    pending."""
+    cause a premature force-finalize.  The still-running required audit child
+    keeps the version pending; the retired smoke child remains irrelevant."""
     project, version = await _make_project_and_version(db_session)
 
-    # Corrupt started_at, but the row was just written (updated_at = now).
+    # Corrupt started_at, but the row was just written (updated_at = now).  The
+    # audit child is the active gate; a terminal legacy smoke child is archival.
     await _seed_pending_qualification(
         db_session,
         project,
         version,
-        audit_status=TaskStatus.COMPLETED,
-        smoke_status=TaskStatus.IN_PROGRESS,
+        audit_status=TaskStatus.IN_PROGRESS,
+        smoke_status=TaskStatus.CANCELLED,
         started_at="garbage",
     )
 
@@ -4729,14 +4808,9 @@ async def test_promote_idempotent_success_records_meaningful_pr_url(db_session, 
 class TestFmtSubScores:
     """_fmt_sub_scores renders a composite's sub-scores for operator messages."""
 
-    def test_renders_all_three_dimensions(self):
-        out = rq._fmt_sub_scores({"audit": 0.95, "test_erosion": 1.0, "smoketest": 0.8})
-        assert out == "audit 0.95 · test 1.00 · smoke 0.80"
-
-    def test_omits_smoke_when_subsystem_disabled(self):
+    def test_ignores_archival_smoke_sub_score(self):
         out = rq._fmt_sub_scores(
-            {"audit": 0.95, "test_erosion": 1.0, "smoketest": 0.0},
-            smoketest_enabled=False,
+            {"audit": 0.95, "test_erosion": 1.0, "smoketest": 0.8}
         )
         assert out == "audit 0.95 · test 1.00"
         assert "smoke" not in out

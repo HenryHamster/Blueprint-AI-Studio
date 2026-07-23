@@ -374,63 +374,13 @@ export async function handleSmoketest(
   const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
-  // CRITICAL (C4): the qualifier-smoketest must run against ONE pinned
-  // candidate commit, not whatever `automain` has drifted to by the time this
-  // VM starts. The release qualifier passes the snapshotted candidate as a
-  // full 40-char `candidate_sha` in the task payload. `git clone --branch <X>`
-  // (the path prepareWorkspaceForRole takes) accepts a branch/tag name, NOT a
-  // SHA — so we clone the branch normally, then fetch+checkout the exact SHA.
-  // A plain post-merge smoketest carries no candidate_sha and is unaffected.
-  const candidateSha = resolveCandidateSha(payload, task);
-
-  // Clone (read-only — no work branch or push needed). When pinning a
-  // candidate SHA, clone with FULL history (depth 0): the snapshotted commit
-  // may be older than a shallow clone's depth, and the SHA checkout below must
-  // be able to reach it.
   statusRef.value = `Cloning ${owner}/${repo}...`;
-  sendLog(
-    ws,
-    candidateSha
-      ? `Cloning ${owner}/${repo} @ ${baseBranch}, pinning candidate ${candidateSha.slice(0, 12)}...\n`
-      : `Cloning ${owner}/${repo} @ ${baseBranch}...\n`,
-  );
+  sendLog(ws, `Cloning ${owner}/${repo} @ ${baseBranch}...\n`);
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
-    branch: baseBranch, baseBranch, depth: candidateSha ? 0 : 100,
+    branch: baseBranch, baseBranch, depth: 100,
   });
-
-  // Pin the workspace to the exact candidate commit. `git fetch origin <sha>`
-  // brings the precise object (GitHub permits fetching a SHA reachable from a
-  // ref; candidate_sha is the snapshotted `automain` HEAD, so it is reachable),
-  // then a detached checkout moves the working tree onto it. Fail loud if the
-  // SHA cannot be obtained — a smoketest of the wrong commit produces a
-  // meaningless qualifier signal.
-  if (candidateSha) {
-    sendLog(ws, `Fetching + checking out candidate commit ${candidateSha.slice(0, 12)}...\n`);
-    try {
-      execFileSync('git', ['fetch', 'origin', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
-      execFileSync('git', ['checkout', '--detach', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
-      sendLog(ws, `Checked out candidate commit ${candidateSha.slice(0, 12)} (detached HEAD).\n`);
-    } catch (e) {
-      const detail = sanitizeError(e);
-      sendLog(ws, `[ERROR] Could not check out candidate commit ${candidateSha}: ${detail}\n`);
-      await persistAndPostStatus(taskId, {
-        task_id: taskId,
-        status: 'FAILED',
-        artifact_type: 'ERROR_LOG',
-        failure_category: 'clone_failed',
-        logs: sanitize(
-          `Qualifier smoketest aborted: could not check out the pinned ` +
-          `candidate commit ${candidateSha}. The candidate must be the exact ` +
-          `commit the release qualifier snapshotted; running the smoketest ` +
-          `against a different commit would produce a meaningless signal. ` +
-          `Detail: ${detail}`,
-        ),
-      });
-      return;
-    }
-  }
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
@@ -581,14 +531,7 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     const passCount = smoketestResult.tests.filter(t => t.status === 'pass').length;
     const summary = `Smoke tests ${passed ? 'PASSED' : 'FAILED'}: ${passCount}/${smoketestResult.tests.length} passed`;
     sendLog(ws, `\n${summary}\n`);
-    const taskContext = task.context && typeof task.context === 'object'
-      ? task.context as Record<string, unknown>
-      : {};
-    const qualifierSmoketest = taskContext.qualifier_smoketest === true;
-    // Qualifier smoketests remain COMPLETED so their artifact feeds the release
-    // score. Ordinary smoketest failures use the existing FAILED path, which
-    // stores the same artifact and triggers the established repair-task flow.
-    const terminalStatus = passed || qualifierSmoketest ? 'COMPLETED' : 'FAILED';
+    const terminalStatus = passed ? 'COMPLETED' : 'FAILED';
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: terminalStatus,

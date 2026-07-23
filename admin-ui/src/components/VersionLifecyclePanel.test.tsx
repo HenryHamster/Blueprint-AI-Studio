@@ -3831,7 +3831,7 @@ describe('VersionLifecyclePanel', () => {
   });
 
   describe('smoketest disabled indicator', () => {
-    it('renders "smoke disabled" instead of "smoke 0%" when smoketest_enabled is false on last_qualification', () => {
+    it('renders "qualifier smoke retired" instead of "smoke 0%" when smoketest_enabled is false on last_qualification', () => {
       const data = makeVersionLifecycleResponse({
         current_version: makeCurrentVersion({
           last_qualification: makeQualification({
@@ -3845,7 +3845,7 @@ describe('VersionLifecyclePanel', () => {
         <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
       );
 
-      expect(screen.getByText('smoke disabled')).toBeInTheDocument();
+      expect(screen.getByText('qualifier smoke retired')).toBeInTheDocument();
       expect(screen.queryByText(/smoke \d+%/)).not.toBeInTheDocument();
     });
 
@@ -3884,7 +3884,20 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByText('smoke disabled')).not.toBeInTheDocument();
     });
 
-    it('renders "s:—" in verdict history sub-scores when smoketest_enabled is false', async () => {
+    it('renders smoke n/a for an unmarked record with no numeric legacy score', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          last_qualification: makeQualification({
+            sub_scores: { audit: 0.90, test_erosion: 0.85 },
+          }),
+        }),
+      });
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      expect(screen.getByText('smoke n/a')).toBeInTheDocument();
+      expect(screen.queryByText(/smoke NaN/)).not.toBeInTheDocument();
+    });
+
+    it('renders "s:retired" in verdict history sub-scores when smoketest_enabled is false', async () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
         verdicts: [
           {
@@ -3920,7 +3933,7 @@ describe('VersionLifecyclePanel', () => {
       const history = await screen.findByTestId('verdict-history');
       expect(history).toBeInTheDocument();
       // The compact sub-score should show "s:—" not "s:0" when smoke is disabled.
-      expect(history.textContent).toContain('s:—');
+      expect(history.textContent).toContain('s:retired');
       expect(history.textContent).not.toContain('s:0');
     });
   });

@@ -73,7 +73,7 @@ from app.models import (
 # mirror promotion_policy.yaml; the threshold is pinned at 0.75 here so the
 # threshold-boundary tests stay deterministic regardless of the shipped value.
 _POLICY = {
-    "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+    "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
     "threshold": 0.75,
 }
 

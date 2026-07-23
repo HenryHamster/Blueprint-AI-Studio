@@ -2090,7 +2090,9 @@ async def _fully_loaded_project(session, name: str) -> Project:
 
 
 @pytest.mark.asyncio
-async def test_projection_lock_does_not_downgrade_preloaded_project(db_session):
+async def test_projection_lock_does_not_downgrade_preloaded_project(
+    db_session, expire_fidelity
+):
     """A ``load_columns`` lock must not leave a already-loaded project less
     loaded than it found it.
 
@@ -2121,7 +2123,7 @@ async def test_projection_lock_does_not_downgrade_preloaded_project(db_session):
 
 
 @pytest.mark.asyncio
-async def test_projection_lock_survives_explicit_expire(db_session):
+async def test_projection_lock_survives_explicit_expire(db_session, expire_fidelity):
     """Same invariant, driven by the explicit ``session.expire()`` several
     completion paths perform — the shape that bit the research spawn flow.
 
@@ -2146,7 +2148,9 @@ async def test_projection_lock_survives_explicit_expire(db_session):
 
 
 @pytest.mark.asyncio
-async def test_with_vision_locked_leaves_project_readable(db_session):
+async def test_with_vision_locked_leaves_project_readable(
+    db_session, expire_fidelity
+):
     """``with_vision_locked`` both projects the instance AND leaves ``vision``
     dirty. The dirty-plus-projected combination is what escalated a lazy-load
     into a session-poisoning autoflush outside the greenlet."""

@@ -455,7 +455,7 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
         from_type="agent",
         from_task_id=task_id,
         content="Full admin route contract",
-        context=None,
+        context={"audience": "operator-action-needed"},
         status="linked",
         resolution="Owned by task",
         resolved_at=datetime(2026, 2, 3, 4, 5, 6, tzinfo=timezone.utc),
@@ -501,6 +501,37 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
     assert item["status"] == "linked"
     assert item["resolution"] == "Owned by task"
     assert item["resolved_at"].startswith("2026-02-03T04:05:06")
+    assert item["delivered_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_messages_endpoint_eager_loads_delivered_at_under_raiseload(
+    client: AsyncClient,
+    db_session,
+):
+    """The list serializer must not touch a column omitted by its raiseload projection."""
+    project = await _make_project(db_session)
+    delivered_at = datetime(2026, 2, 4, 5, 6, 7, tzinfo=timezone.utc)
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="Delivered projection receipt",
+            status="open",
+            context={"audience": "operator-fyi"},
+            delivered_at=delivered_at,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/messages?project_id={project.id}&status=all"
+    )
+
+    assert response.status_code == 200, response.text
+    [message] = response.json()["messages"]
+    assert message["delivered_at"].startswith("2026-02-04T05:06:07")
 
 
 @pytest.mark.asyncio

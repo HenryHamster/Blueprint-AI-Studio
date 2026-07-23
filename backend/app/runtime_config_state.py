@@ -1132,10 +1132,9 @@ runtime_config: Dict = {
     # Release qualifier (Phase 3+). promotion_enabled gates whether the
     # qualifier may promote a qualified automain candidate to main — default
     # False ships the qualifier in dry-run (score + log, never promote).
-    # Qualifier VM smoketests are opt-in. CI supplies deterministic test
-    # coverage, while env-preflight evidence is collected without a VM.
-    # Operator-tunable via runtime_config_json; persisted across restarts.
+    # Qualifier promotion remains separately gated and uses promotion PR CI.
     "promotion_enabled": False,
+    # Ordinary post-promotion deployment smoke only; never a qualifier child.
     "smoketest_enabled": False,
     # walkthrough_e2e_enabled gates the qualifier-spawned ``walkthrough_e2e``
     # child task (the live-stack Playwright walkthrough evidence lane).
@@ -1181,7 +1180,7 @@ runtime_config: Dict = {
     # _seed_promotion_policy() below, then made live + admin-tunable via the
     # /api/admin/settings PATCH so calibrating the bar no longer needs a
     # redeploy. release_qualifier._load_policy() reads these at decision time.
-    # The effective default stays the shipped 0.90 / 0.40-0.30-0.30 rubric.
+    # The effective default stays the shipped 0.90 / 4:3 audit-to-erosion rubric.
     "promotion_threshold": None,  # set by _seed_promotion_policy()
     "promotion_weights": None,  # set by _seed_promotion_policy()
     # Broadcast alert safety cap — limits the number of projects receiving
@@ -1367,7 +1366,7 @@ def iter_dormant_knob_debts() -> list[dict]:
 # Promotion-policy key set — the rubric controls that live in runtime_config.
 # Used both by the seed below and by _apply_settings validation.
 PROMOTION_POLICY_KEYS = ("promotion_threshold", "promotion_weights")
-_PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
+_PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion")
 # backend/promotion_policy.yaml lives two parents up from this file
 # (backend/app/runtime_config_state.py).
 _PROMOTION_POLICY_PATH = (
@@ -1381,7 +1380,7 @@ def _read_promotion_policy_file() -> dict | None:
 
     Mirrors release_qualifier._load_policy's parse + validation contract: the
     file must parse to a mapping with a ``weights`` sub-mapping (audit /
-    test_erosion / smoketest, each float-coercible and summing to ~1.0) and a
+    test_erosion, with an optional legacy smoketest key, float-coercible and summing to ~1.0) and a
     float ``threshold``.  ANY failure (missing file, bad YAML, missing/non-numeric
     keys, mis-weighted sum) returns None so the caller falls back to the hardcoded
     _DEFAULT_POLICY rubric rather than honouring a broken file.  Never raises.
@@ -1396,13 +1395,25 @@ def _read_promotion_policy_file() -> dict | None:
         if not isinstance(weights_raw, dict):
             raise ValueError("promotion_policy.yaml missing 'weights' mapping")
         weights = {k: float(weights_raw[k]) for k in _PROMOTION_WEIGHT_KEYS}
+        legacy_smoke = float(weights_raw.get("smoketest", 0.0))
         threshold = float(parsed["threshold"])
-        weight_sum = sum(weights.values())
+        weight_sum = sum(weights.values()) + legacy_smoke
         if abs(weight_sum - 1.0) > 0.01:
             raise ValueError(
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
-        # Optional completion_debt blend factor — SEPARATE from the three-core
+        from decimal import Decimal
+
+        active_decimals = {
+            key: Decimal(str(weights_raw[key])) for key in _PROMOTION_WEIGHT_KEYS
+        }
+        active_sum = sum(active_decimals.values(), Decimal("0"))
+        if active_sum <= 0:
+            raise ValueError("active promotion weights must be positive")
+        weights = {
+            key: float(value / active_sum) for key, value in active_decimals.items()
+        }
+        # Optional completion_debt blend factor — SEPARATE from the active core
         # weights that must sum to ~1.0 (mirrors release_qualifier resolution).
         # Read + preserve it (default 0.0, clamped to [0, 0.5]) so a YAML rubric
         # that documents a completion_debt weight seeds it into runtime_config.

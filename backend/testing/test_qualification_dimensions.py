@@ -2,10 +2,10 @@
 
 The registry in ``app.qualification_dimensions`` consolidates the dimension
 vocabulary that used to be declared independently in
-``qualification_state_resolver`` and ``release_qualifier``.  These tests pin the
-derived collections to the EXACT legacy literal values so the consolidation
-cannot silently change behavior, and assert both consumer modules read the
-registry rather than re-declaring the vocabulary.
+``qualification_state_resolver`` and ``release_qualifier``. These tests pin the
+active qualifier contract and assert both consumers use the registry. Legacy
+smoke fields remain readable on stored rows, but retired VM smoke is not an
+active dimension.
 """
 
 import inspect
@@ -16,12 +16,11 @@ from app import qualification_state_resolver as qsr
 from app import release_qualifier as rq
 
 
-# The historical literals, copied verbatim from the pre-refactor source.
+# Active literals after qualifier VM-smoke retirement.
 
-_LEGACY_UI_DIMENSIONS = (
+_EXPECTED_UI_DIMENSIONS = (
     ("audit", "Audit"),
     ("test_erosion", "Test Erosion"),
-    ("smoketest", "Smoketest"),
     ("ci", "CI"),
     ("migration_identity", "Migration Identity"),
     ("migration_apply", "Migration Apply"),
@@ -35,14 +34,13 @@ _LEGACY_UI_DIMENSIONS = (
     ("env_preflight", "Env Preflight"),
 )
 
-_LEGACY_BLOCKER_TO_DIM = {
+_EXPECTED_BLOCKER_TO_DIM = {
     "ci_not_green": "ci",
     "ci_unresolved": "ci",
     "migration_identity_collision": "migration_identity",
     "migration_apply_drift": "migration_apply",
     "merge_grade_misses": "merge_grade",
     "criterion_coverage_incomplete": "criterion_coverage",
-    "smoketest_startup_failed": "smoketest",
     "audit_missing": "audit",
     "test_file_deleted": "test_erosion",
     "capability_proof_gate_blocked": "capability_proof",
@@ -50,10 +48,10 @@ _LEGACY_BLOCKER_TO_DIM = {
     "boot_prereq_evidence_missing": "env_preflight",
 }
 
-_LEGACY_LEDGER_KEYS = frozenset({
+_EXPECTED_LEDGER_KEYS = frozenset({
     "acceptance_window", "audit", "capability_proof", "challenge", "ci",
     "debt_pressure", "env_preflight", "merge_grade",
-    "migration_apply", "migration_identity", "smoketest", "test_erosion",
+    "migration_apply", "migration_identity", "test_erosion",
 })
 
 # The pre-consolidation snapshot held only the three candidate-stable-vs-mutable
@@ -73,19 +71,22 @@ _LEGACY_PROMOTION_REQUIRED = (
 )
 
 
-def test_ui_dimensions_order_and_labels_match_legacy():
+def test_ui_dimensions_order_and_labels_match_active_contract():
     # Order matters: the read model surfaces dimensions in this exact order.
-    assert qd.UI_DIMENSIONS == _LEGACY_UI_DIMENSIONS
+    assert qd.UI_DIMENSIONS == _EXPECTED_UI_DIMENSIONS
+    assert "smoketest" not in dict(qd.UI_DIMENSIONS)
 
 
-def test_blocker_to_dimension_matches_legacy():
-    assert qd.BLOCKER_TO_DIMENSION == _LEGACY_BLOCKER_TO_DIM
+def test_blocker_to_dimension_matches_active_contract():
+    assert qd.BLOCKER_TO_DIMENSION == _EXPECTED_BLOCKER_TO_DIM
+    assert "smoketest_startup_failed" not in qd.BLOCKER_TO_DIMENSION
 
 
-def test_ledger_dimension_keys_match_legacy():
-    assert qd.LEDGER_DIMENSION_KEYS == _LEGACY_LEDGER_KEYS
-    # Exactly 12 dual-written dimensions.
-    assert len(qd.LEDGER_DIMENSION_KEYS) == 12
+def test_ledger_dimension_keys_match_active_contract():
+    assert qd.LEDGER_DIMENSION_KEYS == _EXPECTED_LEDGER_KEYS
+    # Exactly 11 active dual-written dimensions; legacy smoke rows remain
+    # deserializable but are never composed into a new promotion decision.
+    assert len(qd.LEDGER_DIMENSION_KEYS) == 11
 
 
 def test_mutable_dimension_keys_match_legacy():
@@ -100,10 +101,11 @@ def test_promotion_required_order_and_set_match_legacy():
     assert qd.PROMOTION_REQUIRED_DIMENSIONS == _LEGACY_PROMOTION_REQUIRED
 
 
-def test_registry_has_fourteen_dimensions_with_unique_keys():
+def test_registry_has_thirteen_dimensions_with_unique_keys():
     keys = [d.key for d in qd.QUALIFICATION_DIMENSIONS]
-    assert len(keys) == 14
-    assert len(set(keys)) == 14
+    assert len(keys) == 13
+    assert len(set(keys)) == 13
+    assert "smoketest" not in keys
 
 
 def test_promotion_required_is_a_subset_of_ledger_backed():
@@ -155,7 +157,7 @@ def test_dual_write_spec_covers_exactly_ledger_dimension_keys():
 
 
 def test_dimension_column_includes_capability_proof():
-    """The dimension column docstring/comment lists all 12 ledger keys.
+    """The dimension column docstring/comment lists all active ledger keys.
 
     A future operator inspecting the model documentation should see every
     ledger-backed dimension, including capability_proof.

@@ -1651,50 +1651,40 @@ async def _apply_settings(
             raise HTTPException(
                 status_code=400, detail="promotion_weights must be a dict"
             )
-        _PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
-        # ``completion_debt`` is an OPTIONAL, SEPARATE blend factor (NOT part of
-        # the three-core-weight sum) — accept it but require the three core keys.
-        _allowed_weight_keys = set(_PROMOTION_WEIGHT_KEYS) | {"completion_debt"}
-        missing_core = set(_PROMOTION_WEIGHT_KEYS) - set(val.keys())
+        _ACTIVE_WEIGHT_KEYS = ("audit", "test_erosion")
+        _allowed_weight_keys = set(_ACTIVE_WEIGHT_KEYS) | {"smoketest", "completion_debt"}
+        missing_core = set(_ACTIVE_WEIGHT_KEYS) - set(val.keys())
         extra_keys = set(val.keys()) - _allowed_weight_keys
         if missing_core or extra_keys:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "promotion_weights must have the keys "
-                    f"{sorted(_PROMOTION_WEIGHT_KEYS)} "
-                    "and may optionally include 'completion_debt'"
-                ),
+                detail="promotion_weights requires audit and test_erosion; legacy smoketest and completion_debt are optional",
             )
+        declared_keys = [*_ACTIVE_WEIGHT_KEYS]
+        if "smoketest" in val:
+            declared_keys.append("smoketest")
         cleaned_weights: Dict[str, float] = {}
-        for wk in _PROMOTION_WEIGHT_KEYS:
+        for wk in declared_keys:
             try:
                 wv = float(val[wk])
             except (ValueError, TypeError):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"promotion_weights[{wk}] must be a number",
-                )
+                raise HTTPException(status_code=400, detail=f"promotion_weights[{wk}] must be a number")
             if wv < 0.0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"promotion_weights[{wk}] must be non-negative",
-                )
+                raise HTTPException(status_code=400, detail=f"promotion_weights[{wk}] must be non-negative")
             cleaned_weights[wk] = wv
-        # Weights decide what reaches production main: a sum != 1.0 either
-        # saturates confidence (gate effectively disabled) or makes it
-        # unreachable (gate stuck closed). Reject a mis-weighted set rather than
-        # silently honour it — same invariant release_qualifier._load_policy
-        # enforces on the YAML file.  Only the THREE CORE weights participate in
-        # this sum; completion_debt is validated separately below.
-        weight_sum = sum(cleaned_weights.values())
-        if abs(weight_sum - 1.0) > 0.01:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"),
-            )
+        declared_sum = sum(cleaned_weights.values())
+        if abs(declared_sum - 1.0) > 0.01:
+            raise HTTPException(status_code=400, detail=f"promotion_weights must sum to ~1.0 (got {declared_sum:.4f})")
+        from decimal import Decimal
+
+        active_decimals = {
+            wk: Decimal(str(val[wk])) for wk in _ACTIVE_WEIGHT_KEYS
+        }
+        active_sum = sum(active_decimals.values(), Decimal("0"))
+        if active_sum <= 0:
+            raise HTTPException(status_code=400, detail="active promotion weights must be positive")
         stored_weights = {
-            wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
+            wk: float(active_decimals[wk] / active_sum) for wk in _ACTIVE_WEIGHT_KEYS
         }
         # Optional completion_debt blend factor: a number in [0.0, 0.5].
         if "completion_debt" in val:

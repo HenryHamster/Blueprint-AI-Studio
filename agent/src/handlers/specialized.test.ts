@@ -140,10 +140,12 @@ const { walkthroughBootMock, walkthroughTeardownMock } = vi.hoisted(() => ({
   walkthroughTeardownMock: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('./walkthrough-stack.js', () => ({
-  CandidateStackController: vi.fn().mockImplementation(() => ({
-    boot: walkthroughBootMock,
-    teardown: walkthroughTeardownMock,
-  })),
+  CandidateStackController: vi.fn().mockImplementation(function CandidateStackControllerMock() {
+    return {
+      boot: walkthroughBootMock,
+      teardown: walkthroughTeardownMock,
+    };
+  }),
 }));
 
 // fs is consumed by both default + namespace imports across the modules under
@@ -402,23 +404,6 @@ describe('handleSmoketest — URL health checks', () => {
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
     expect(call.failure_category).toBeUndefined();
-    const stored = JSON.parse(call.logs as string) as { passed: boolean };
-    expect(stored.passed).toBe(false);
-  });
-
-  it('reports COMPLETED with SMOKETEST_RESULT for a qualifier genuine test failure', async () => {
-    const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
-    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
-    const qualifierTask = {
-      ...BASE_TASK,
-      context: { qualifier_smoketest: true },
-    };
-
-    await handleSmoketest(TASK_ID, BASE_PAYLOAD, qualifierTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('COMPLETED');
-    expect(call.artifact_type).toBe('SMOKETEST_RESULT');
     const stored = JSON.parse(call.logs as string) as { passed: boolean };
     expect(stored.passed).toBe(false);
   });
@@ -2394,130 +2379,6 @@ describe('specialized handler task-specific content contracts', () => {
       // Run order
       expect(p).toContain('IN ORDER');
     });
-  });
-});
-
-// ── handleSmoketest — qualifier-smoketest candidate-SHA pinning (C4) ──────────
-//
-// The qualifier-smoketest must run against ONE pinned candidate commit, not
-// whatever `automain` has drifted to by the time the agent VM starts. The
-// backend passes the snapshotted `candidate_sha` in the task payload. Since
-// `git clone --branch <X>` cannot accept a SHA, the handler clones the branch
-// normally then `git fetch origin <sha>` + `git checkout --detach <sha>`.
-describe('handleSmoketest — candidate-SHA pinning', () => {
-  const CANDIDATE_SHA = 'b2c3d4e5f60718293a4b5c6d7e8f901234567890';
-  const QUALIFIER_PAYLOAD = { base_branch: 'automain', candidate_sha: CANDIDATE_SHA };
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    vi.mocked(git).mockReturnValue('');
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
-    vi.mocked(readHandlerOutput).mockReturnValue({ passed: true, tests: [] });
-  });
-
-  it('clones with FULL history (depth 0) when a candidate_sha is pinned', async () => {
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
-    expect(opts.branch).toBe('automain');
-    // depth 0 → full clone; the snapshotted commit may predate a shallow depth.
-    expect(opts.depth).toBe(0);
-  });
-
-  it('fetches and detaches onto the EXACT candidate commit', async () => {
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const gitExec = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'git');
-    const fetchCall = gitExec.find(c => (c[1] as string[])[0] === 'fetch');
-    const checkoutCall = gitExec.find(c => (c[1] as string[])[0] === 'checkout');
-    expect(fetchCall?.[1]).toEqual(['fetch', 'origin', CANDIDATE_SHA]);
-    // Detached checkout pins the working tree onto the exact commit.
-    expect(checkoutCall?.[1]).toEqual(['checkout', '--detach', CANDIDATE_SHA]);
-    // The smoketest still runs after pinning.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
-  });
-
-  it('reads candidate_sha from task.context as a fallback', async () => {
-    const taskWithCtx = { ...BASE_TASK, context: { candidate_sha: CANDIDATE_SHA } };
-    await handleSmoketest(
-      TASK_ID, { base_branch: 'automain' }, taskWithCtx, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
-    );
-
-    const checkoutCall = vi.mocked(execFileSync).mock.calls.find(
-      c => c[0] === 'git' && (c[1] as string[])[0] === 'checkout',
-    );
-    expect(checkoutCall?.[1]).toEqual(['checkout', '--detach', CANDIDATE_SHA]);
-  });
-
-  it('does NOT fetch/checkout a SHA for a plain post-merge smoketest (no candidate_sha)', async () => {
-    // BASE_PAYLOAD carries no candidate_sha — the plain post-merge smoketest
-    // path must be untouched: a shallow clone and no SHA pinning.
-    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
-    expect(opts.depth).toBe(100); // unchanged shallow clone
-    const checkoutCall = vi.mocked(execFileSync).mock.calls.find(
-      c => c[0] === 'git' && (c[1] as string[])[0] === 'checkout',
-    );
-    expect(checkoutCall).toBeUndefined();
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
-  });
-
-  it('FAILS LOUD when the candidate-SHA fetch fails — does not run the smoketest', async () => {
-    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
-      const a = args as string[];
-      if (Array.isArray(a) && a[0] === 'fetch') throw new Error('fatal: remote unreachable');
-      return Buffer.from('');
-    });
-
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    // A smoketest of the wrong commit is meaningless — the handler must abort.
-    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.artifact_type).toBe('ERROR_LOG');
-    expect(call.failure_category).toBe('clone_failed');
-    expect(call.logs).toContain(CANDIDATE_SHA);
-  });
-
-  it('FAILS LOUD when the candidate-SHA checkout fails', async () => {
-    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
-      const a = args as string[];
-      if (Array.isArray(a) && a[0] === 'checkout') throw new Error('fatal: reference is not a tree');
-      return Buffer.from('');
-    });
-
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.failure_category).toBe('clone_failed');
-  });
-
-  it('sanitizes GitHub token embedded in git error message before persisting logs', async () => {
-    const rawToken = 'ghp_realTokenABC123XYZ456789ABCDEF';
-    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
-      const a = args as string[];
-      if (Array.isArray(a) && a[0] === 'fetch') {
-        throw new Error(
-          `fatal: unable to access 'https://x-access-token:${rawToken}@github.com/owner/repo.git': Could not resolve host`,
-        );
-      }
-      return Buffer.from('');
-    });
-
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.failure_category).toBe('clone_failed');
-    // The raw token must never appear in the persisted log.
-    expect(call.logs).not.toContain(rawToken);
-    // The URL credential pattern must be masked.
-    expect(call.logs).not.toContain('x-access-token:ghp_');
   });
 });
 

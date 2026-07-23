@@ -18,6 +18,7 @@ import type {
   StrategicStateResponse,
   StrategicWorkbenchState,
   StrategicWorkSessionAction,
+  StrategicWorkSessionEvent,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import {
@@ -27,6 +28,7 @@ import {
 } from '../utils/strategicWorkbenchSession';
 import { WorkbenchPanel } from './WorkbenchLayout';
 import { RailMiniCanvas } from './RailMiniCanvas';
+import { StrategicSessionEvents } from './StrategicSessionEvents';
 import { WhiteboardRailSection } from './WhiteboardRailSection';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
@@ -303,6 +305,12 @@ function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is 
     (work.parked_wakes?.counts.active ?? 0) > 0 ||
     (work.parked_wakes?.counts.problem ?? 0) > 0
   );
+}
+
+function workSessionEventHasActionableSignal(event: StrategicWorkSessionEvent): boolean {
+  const tone = event.tone?.toLowerCase();
+  if (tone === 'critical' || tone === 'warning') return true;
+  return event.target?.surface === 'messages' && event.target.action === 'reply';
 }
 
 function RailButton({
@@ -983,6 +991,11 @@ export const StrategicContextRail = memo(function StrategicContextRail({
     () => attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`)),
     [attentionItems, visibleWorkSessionActionIds],
   );
+  const actionableWorkSessionEvents = useMemo(
+    () => (state?.work_session?.events?.items ?? []).filter(workSessionEventHasActionableSignal).slice(0, 2),
+    [state?.work_session?.events?.items],
+  );
+  const showActionableSessionActivity = visibleWorkSessionActions.length === 0 && actionableWorkSessionEvents.length > 0;
   const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
   const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
   const selectedRefDescriptors = useMemo(() => {
@@ -1234,6 +1247,22 @@ export const StrategicContextRail = memo(function StrategicContextRail({
                 />
               ))}
             </div>
+          </div>
+        )}
+        {showActionableSessionActivity && (
+          <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-session-activity">
+            <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
+              <span className="truncate text-xs font-semibold text-neutral-100">Recent signal</span>
+              <span className="shrink-0 font-mono text-ui-sm text-neutral-600">
+                {formatCompactNumber(actionableWorkSessionEvents.length)}
+              </span>
+            </div>
+            <StrategicSessionEvents
+              events={actionableWorkSessionEvents}
+              limit={2}
+              density="compact"
+              onOpenTarget={openContextTarget}
+            />
           </div>
         )}
         <ShaFreshnessBlock shaFreshness={shaFreshness} />

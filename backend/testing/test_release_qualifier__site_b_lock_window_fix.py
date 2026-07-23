@@ -1358,6 +1358,52 @@ async def test_sweep_current_dry_run_uses_cheap_promote_not_requalify(
 
 
 @pytest.mark.asyncio
+async def test_sweep_legacy_smoke_dry_run_requalifies_instead_of_direct_promote(
+    db_session, mocker
+):
+    """A legacy smoke-participating pass must run the current policy first."""
+    from app import shared_state
+
+    candidate_sha = "legdry11" * 5
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": "legacy-hash",
+        "smoketest_enabled": True,
+        "smoketest_task_id": "legacy-smoke-task",
+        "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+        "confidence": 1.0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    force_promote = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    force_promote.assert_not_awaited()
+    run_qual.assert_awaited_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "requalification_requested"
+    assert version.last_qualification["previous_status"] == "dry_run"
+
+
+@pytest.mark.asyncio
 async def test_promote_dry_run_pass_noop_when_promotion_still_disabled(
     db_session, mocker
 ):
@@ -1520,8 +1566,7 @@ class TestComputeCompositeCapabilityProofGate:
         assert result["blocker"] == "capability_proof_gate_blocked"
 
     def test_compute_composite_capability_proof_blocker_precedence(self):
-        """capability_proof_gate_blocked fires AFTER criterion_coverage_incomplete
-        but BEFORE smoketest_startup_failed in the hard-blocker ordering."""
+        """Criterion coverage retains precedence over capability proof."""
         # Trigger the criterion-coverage gate (via category_verdicts — the actual
         # blocking input; criterion_coverage is observability-only) AND
         # capability_proof_blocked. Must report criterion_coverage_incomplete
@@ -1540,9 +1585,7 @@ class TestComputeCompositeCapabilityProofGate:
         )
         assert result["blocker"] == "criterion_coverage_incomplete"
 
-        # When criterion coverage is complete and capability_proof_blocked=True
-        # but smoketest_score is also None — must report capability_proof_gate_blocked
-        # first (it has higher priority than smoketest_startup_failed).
+        # A legacy smoke argument cannot alter the active capability-proof gate.
         result2 = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
@@ -1853,7 +1896,7 @@ async def test_collect_terminal_infra_child_events_batch_fetches_tasks(db_sessio
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Create a FAILED audit task and a CANCELLED smoketest task.
+    # Create a FAILED audit task and a CANCELLED challenge task.
     audit_task = Task(
         project_id=project.id,
         title="Audit task",
@@ -1861,10 +1904,10 @@ async def test_collect_terminal_infra_child_events_batch_fetches_tasks(db_sessio
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
     )
-    smoke_task = Task(
+    challenge_task = Task(
         project_id=project.id,
-        title="Smoketest task",
-        payloads=[{"type": "smoketest"}],
+        title="Challenge task",
+        payloads=[{"type": "release_audit_challenge"}],
         status=TaskStatus.CANCELLED,
         created_by="ORCHESTRATOR",
     )
@@ -1876,15 +1919,15 @@ async def test_collect_terminal_infra_child_events_batch_fetches_tasks(db_sessio
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
     )
-    db_session.add_all([audit_task, smoke_task, running_task])
+    db_session.add_all([audit_task, challenge_task, running_task])
     await db_session.commit()
     await db_session.refresh(audit_task)
-    await db_session.refresh(smoke_task)
+    await db_session.refresh(challenge_task)
     await db_session.refresh(running_task)
 
     qual = {
         "audit_task_id": str(audit_task.id),
-        "smoketest_task_id": str(smoke_task.id),
+        "challenge_task_id": str(challenge_task.id),
         "infra_failure_child_events": [],
     }
 
@@ -1895,7 +1938,7 @@ async def test_collect_terminal_infra_child_events_batch_fetches_tasks(db_sessio
     # Both terminal tasks must appear; the in-progress task must be absent.
     legs = {e["leg"] for e in result}
     assert "audit" in legs
-    assert "smoketest" in legs
+    assert "challenge" in legs
     assert len(result) == 2
 
     # Running task must not be included (non-terminal status).
@@ -3547,7 +3590,7 @@ async def test_record_v22_live_verification_evidence_records_evidence_row(db_ses
 @pytest.mark.asyncio
 async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, mocker):
     """_finalize_qualification writes one QualificationDimensionResult row per
-    gate (audit, test_erosion, ci, smoketest, migration_identity, migration_apply,
+    active gate (audit, test_erosion, ci, migration_identity, migration_apply,
     merge_grade, acceptance_window, debt_pressure, capability_proof, env_preflight)
     on a clean pass.
 
@@ -3610,7 +3653,6 @@ async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, moc
         "audit",
         "test_erosion",
         "ci",
-        "smoketest",
         "challenge",
         "migration_identity",
         "migration_apply",
@@ -3959,9 +4001,6 @@ class TestAttemptContractFreeze:
         mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
             return_value=MagicMock(id=uuid.uuid4())
         ))
-        mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
-            return_value=MagicMock(id=uuid.uuid4())
-        ))
 
         project, version = await _make_project_and_version(db_session, phase="stabilize")
         version.goal = "Deliver a working login flow"
@@ -3992,9 +4031,6 @@ class TestAttemptContractFreeze:
                 return_value={"ci_green": True, "state": "success", "resolved_sha": None}
             ))
             mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
-                return_value=MagicMock(id=uuid.uuid4())
-            ))
-            mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
                 return_value=MagicMock(id=uuid.uuid4())
             ))
 

@@ -3770,12 +3770,12 @@ async def test_run_qualification_uses_project_integration_branch(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_smoketest_payload_uses_project_integration_branch(db_session, mocker):
-    """The qualifier-smoketest payload's base_branch must equal the project's
-    configured integration_branch, not the global runtime_config default.
+async def test_legacy_smoketest_flags_cannot_resurrect_qualifier_vm_smoke(db_session, mocker):
+    """Legacy global and project flags cannot resurrect qualifier VM smoke.
 
-    A project with integration_branch='trunk' should produce a smoketest task
-    whose payload.base_branch == 'trunk'.
+    The ordinary qualification still resolves the project's integration branch
+    and spawns its active evidence children, but it never creates a smoketest
+    child or records one as required.
     """
     from app import shared_state
 
@@ -3787,6 +3787,12 @@ async def test_smoketest_payload_uses_project_integration_branch(db_session, moc
         promotion_target="release",
         phase="stabilize",
     )
+    project.build_config = {
+        **(project.build_config or {}),
+        "smoketest_enabled": True,
+    }
+    db_session.add(project)
+    await db_session.commit()
 
     candidate = "smktrunk" * 5  # 40-char SHA
 
@@ -3805,23 +3811,20 @@ async def test_smoketest_payload_uses_project_integration_branch(db_session, moc
 
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
+    await db_session.refresh(version)
 
     assert result["status"] == "spawned"
-    assert result["smoketest_enabled"] is True
+    assert result["smoketest_enabled"] is False
+    assert result["smoketest_task_id"] is None
+    assert version.last_qualification["smoketest_enabled"] is False
+    assert version.last_qualification["smoketest_task_id"] is None
 
     tasks = (
         (await db_session.execute(select(Task).where(Task.project_id == project.id)))
         .scalars()
         .all()
     )
-    by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
-    smoke_task = by_type.get("smoketest")
-    assert smoke_task is not None, "Smoketest task was not spawned"
-
-    # base_branch must be the per-project integration_branch, not 'main'.
-    assert smoke_task.first_payload["base_branch"] == "trunk", (
-        f"Expected base_branch='trunk' but got {smoke_task.first_payload['base_branch']!r}"
-    )
+    assert all((task.first_payload or {}).get("type") != "smoketest" for task in tasks)
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,13 @@
 - Agent: `cd agent && npx tsc --noEmit`. `./check test` also runs `npx vitest run` (the agent unit suite) when agent/ files changed.
 - JS/TS unit suites: `./check test` runs both `cd agent && npx vitest run` and `cd admin-ui && npx vitest run` for their respective stacks. These match the blocking CI jobs at the promotion PR, so regressions surface at the merge gate instead of weeks later.
 
+## Release Qualification Boundaries
+- The automain to main qualifier must never spawn, wait for, respawn, score, or ledger-write a VM `smoketest` child.
+- Promotion PR CI is the hard deterministic test gate. CI red and unresolved/pending required CI remain blocking.
+- Ordinary post-promotion/deployment `smoketest` tasks are a separate operational check and must remain available.
+- Legacy `smoketest_task_id` and `smoketest_enabled` fields are read-model compatibility only; they never gate a current qualification.
+- Promotion weights use `audit` and `test_erosion`. Legacy three-key policies are accepted by ignoring and renormalizing the retired `smoketest` weight.
+
 ## Test Guidelines
 - When fixing test failures, first diagnose: is the failure in the CODE or the TEST?
 - Do NOT delete or skip tests just to make them pass

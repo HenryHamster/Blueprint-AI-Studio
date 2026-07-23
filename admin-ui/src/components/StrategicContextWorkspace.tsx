@@ -25,6 +25,7 @@ import {
 } from '../utils/strategicWorkbenchSession';
 import { StrategicContextMap } from './StrategicContextMap';
 import { ArtifactViewablePreviews, StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
+import { StrategicSessionEvents } from './StrategicSessionEvents';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
@@ -587,6 +588,7 @@ export function StrategicContextWorkspace({
   const tokenCount = contextPackage?.token_count ?? 0;
   const attentionCounts = state?.attention?.counts ?? null;
   const workSession = state?.work_session ?? null;
+  const workSessionEvents = workSession?.events?.items ?? [];
 
   const selectedRefs = useMemo(
     () => workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [],
@@ -884,6 +886,21 @@ export function StrategicContextWorkspace({
                 )}
               </div>
             </Section>
+
+            {workSessionEvents.length > 0 && (
+              <Section
+                title="Recent flow"
+                meta={workSession?.events?.has_more ? `${workSessionEvents.length}+` : `${workSessionEvents.length}`}
+                testId="strategic-context-workspace-events"
+              >
+                <StrategicSessionEvents
+                  events={workSessionEvents}
+                  limit={10}
+                  density="comfortable"
+                  onOpenTarget={handleOpenTarget}
+                />
+              </Section>
+            )}
 
             {state?.model_integrity && state.model_integrity.counts.total > 0 && (
               <Section

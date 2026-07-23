@@ -279,11 +279,12 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
 
   it('removes stale reply artifacts before the session starts or autonomous work runs', async () => {
     const events: string[] = [];
+    const residentWorkspace = process.env.AGENT_WORKSPACE || '/tmp/workspace';
     vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
       expect([
-        '/tmp/.resident-reply-idempotency-key',
-        '/tmp/.resident-reply-receipt.json',
-        '/tmp/.resident-reply-staged-message.json',
+        residentWorkspace + '/.resident-reply-idempotency-key',
+        residentWorkspace + '/.resident-reply-receipt.json',
+        residentWorkspace + '/.resident-reply-staged-message.json',
       ]).toContain(file);
       events.push(`stale-artifact-removed:${path.basename(String(file))}`);
     });

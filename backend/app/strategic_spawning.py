@@ -6835,12 +6835,12 @@ async def _spawn_strategic_review(
             )
             # Determine the dimension that actually limits promotion.  A hard
             # blocker forces confidence to zero regardless of sub-scores; with no
-            # blocker the binding dimension is the lowest active sub-score (the
-            # smoketest dimension is excluded when the subsystem was disabled —
-            # its 0.0 is a meaningless placeholder, not a real low score).
+            # blocker the binding dimension is the lowest current sub-score.
+            # Retired smoke scores are archival and never binding.
             _blocker = _last_qual.get("blocker")
+            if _blocker == "smoketest_startup_failed":
+                _blocker = None
             _sub_scores = _last_qual.get("sub_scores")
-            _smoke_enabled = bool(_last_qual.get("smoketest_enabled", True))
             _binding_desc = "the audit sub-score is the binding constraint on promotion"
             if _blocker:
                 _binding_desc = (
@@ -6854,11 +6854,6 @@ async def _spawn_strategic_review(
                     for _k, _v in (
                         ("audit", _sub_scores.get("audit")),
                         ("test_erosion", _sub_scores.get("test_erosion")),
-                        *(
-                            (("smoketest", _sub_scores.get("smoketest")),)
-                            if _smoke_enabled
-                            else ()
-                        ),
                     )
                     if isinstance(_v, (int, float)) and not isinstance(_v, bool)
                 }

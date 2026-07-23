@@ -400,8 +400,9 @@ async def _redrive_infra_failure_qualification(
         # failing dimension is absent or the ledger read fails (preserving
         # pre-Phase-1b behaviour in those edge cases).
         _failing_dim = qual.get("failing_dimension")
-        _dim_streak: int | None = None
-        if _failing_dim:
+        _legacy_smoke_failure = release_qualifier._legacy_smoke_infra_lineage(qual)
+        _dim_streak: int | None = 0 if _legacy_smoke_failure else None
+        if _failing_dim and not _legacy_smoke_failure:
             try:
                 from app.models import QualificationDimensionResult
 
@@ -489,14 +490,15 @@ async def _redrive_infra_failure_qualification(
             if isinstance(row, dict)
         ]
         _same_sig_streak = 0
-        for _entry in reversed(_attempt_history):
-            if (
-                _entry.get("signature") == _cur_sig
-                and _entry.get("engine_sha") == _cur_eng
-            ):
-                _same_sig_streak += 1
-            else:
-                break
+        if not _legacy_smoke_failure:
+            for _entry in reversed(_attempt_history):
+                if (
+                    _entry.get("signature") == _cur_sig
+                    and _entry.get("engine_sha") == _cur_eng
+                ):
+                    _same_sig_streak += 1
+                else:
+                    break
         _required_wait = _infra_backoff_seconds(_same_sig_streak)
         if _required_wait > 0:
             _finalized_at_str = qual.get("finalized_at")

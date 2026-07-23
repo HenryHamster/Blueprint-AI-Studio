@@ -2028,6 +2028,26 @@ def test_qual_state_not_promoted_includes_scores():
     assert "0.62" in state["summary"]
 
 
+def test_qual_state_legacy_smoke_rejection_is_stale_and_archival():
+    state = rv.summarize_qualification_state(
+        {
+            "status": "not_promoted",
+            "smoketest_enabled": True,
+            "blocker": "smoketest_startup_failed",
+            "detail": {"legacy": "timeout"},
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 0.0},
+        }
+    )
+    assert state["state"] == "not_promoted"
+    assert state["stale"] is True
+    assert state["stale_reason"] == "retired_qualifier_smoketest"
+    assert "re-qualify" in state["summary"].lower()
+    assert "retired" in state["summary"].lower()
+    assert state["blocker"] == "smoketest_startup_failed"
+    assert state["detail"] == {"legacy": "timeout"}
+    assert state["sub_scores"]["smoketest"] == 0.0
+
+
 def test_qual_state_dry_run_is_promotion_ready():
     state = rv.summarize_qualification_state({"status": "dry_run"})
     assert state["state"] == "dry_run"

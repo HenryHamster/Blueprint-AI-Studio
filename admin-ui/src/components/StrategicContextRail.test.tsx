@@ -12,6 +12,7 @@ import type {
   StrategicStateResponse,
   StrategicWorkbenchState,
   StrategicWorkSessionAction,
+  StrategicWorkSessionEvent,
 } from '../strategicStateApi';
 
 // The rail imports the pending-confirmation accept/dismiss helpers from
@@ -764,6 +765,24 @@ describe('StrategicContextRail', () => {
       work_session: {
         ...workSession,
         actions,
+      },
+    };
+  }
+
+  function stateWithWorkSessionEvents(events: StrategicWorkSessionEvent[]): StrategicStateResponse {
+    const workSession = STATE.work_session;
+    if (!workSession) throw new Error('STATE fixture must include work_session');
+    return {
+      ...STATE,
+      work_session: {
+        ...workSession,
+        actions: [],
+        events: {
+          version: 1,
+          limit: 24,
+          has_more: false,
+          items: events,
+        },
       },
     };
   }
@@ -1681,6 +1700,54 @@ describe('StrategicContextRail', () => {
     expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-action', action: 'reply' });
     expect(onOpenTask).not.toHaveBeenCalled();
     expect(onOpenTarget).not.toHaveBeenCalled();
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('renders warning work session signals and routes event targets', () => {
+    const onOpenMessages = vi.fn();
+    const { host, props } = mount({
+      state: stateWithWorkSessionEvents([
+        {
+          id: 'event-message',
+          schema_version: 1,
+          project_id: 'proj-1',
+          resource: 'project_message',
+          action: 'created',
+          refetch: { surfaces: ['messages'] },
+          occurred_at: '2026-06-29T01:02:00Z',
+          source: 'strategic',
+          title: 'Question message',
+          summary: 'Strategic needs a routing choice.',
+          tone: 'warning',
+          target: { surface: 'messages', message_id: 'msg-flow', action: 'reply' },
+        },
+        {
+          id: 'event-task',
+          schema_version: 1,
+          project_id: 'proj-1',
+          resource: 'task',
+          action: 'in_progress',
+          refetch: { surfaces: ['pipeline'] },
+          occurred_at: '2026-06-29T01:01:00Z',
+          source: 'task',
+          title: 'Task update',
+          summary: 'Implementation started.',
+          tone: 'active',
+          target: { surface: 'task', task_id: 'task-flow' },
+        },
+      ]),
+      onOpenMessages,
+    });
+
+    expect(host.textContent).toContain('Recent signal');
+    expect(host.textContent).toContain('Question message');
+    expect(host.textContent).not.toContain('Task update');
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.title === 'Open Question message')
+      ?.click();
+
+    expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-flow', action: 'reply' });
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 

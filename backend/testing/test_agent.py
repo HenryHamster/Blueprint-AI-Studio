@@ -21371,16 +21371,15 @@ async def test_failed_release_audit_last_child_triggers_finalization(
 
 
 @pytest.mark.asyncio
-async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
+async def test_legacy_qualifier_smoke_failure_is_ignored_by_finalization(
     db_session, mocker
 ):
-    """CRITICAL: a qualifier-smoketest that FAILS without posting a
-    SMOKETEST_RESULT artifact (harness ERROR_LOG, VM crash, reaper kill) must
-    still finalize the qualification when it is the last child.
+    """A terminal legacy qualifier-smoke task may wake finalization, but its
+    failure and missing artifact are archival facts, never a qualification gate.
 
-    The old agent_status.py hook was gated on
-    `artifact_type == SMOKETEST_RESULT`, so an artifact-less smoketest failure
-    never reached it. The relocated hook keys on context, not artifact_type.
+    The active audit remains authoritative. Because this fixture deliberately
+    gives that COMPLETED audit no report, finalization must report the audit
+    infrastructure failure rather than resurrecting a smoke failure.
     """
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
@@ -21401,8 +21400,9 @@ async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
     )
 
     project, version = await _make_qualifier_project_and_version(db_session)
-    # Audit sibling already terminal; the qualifier-smoketest is the last child
-    # and fails terminally with NO artifact attached to the payload.
+    # The legacy smoke child fails terminally with no artifact. Its historical
+    # marker still routes through the cheap finalization wake-up, but the
+    # retired child must not influence the result.
     _audit, smoke_task = await _seed_qualifier_children(
         db_session,
         project,
@@ -21420,14 +21420,11 @@ async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
         refetched = await fresh.get(ReleaseVersion, version.id)
         qual = refetched.last_qualification or {}
 
-    assert qual.get("status") != "pending", (
-        f"artifact-less FAILED qualifier-smoketest left version wedged: {qual}"
-    )
-    # A FAILED required smoketest child is an infrastructure failure (VM crash /
-    # harness ERROR_LOG), NOT a quality verdict — it routes to infra_failure
-    # rather than recording a smoketest_startup_failed quality blocker.
+    assert qual.get("status") != "pending", f"version left wedged: {qual}"
     assert qual.get("status") == "infra_failure"
-    assert qual.get("error") == "smoketest_task_failed"
+    assert qual.get("error") == "audit_report_missing"
+    assert qual.get("error") != "smoketest_task_failed"
+    assert "smoketest" not in (qual.get("sub_scores") or {})
 
 
 @pytest.mark.asyncio
@@ -21521,11 +21518,15 @@ async def test_blocked_release_audit_last_child_triggers_finalization(
 
 
 @pytest.mark.asyncio
-async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
+async def test_running_legacy_qualifier_smoke_cannot_delay_audit_failure(
     db_session, mocker
 ):
-    """A FAILED qualifier child must NOT finalize while its sibling is still
-    running — finalization waits for BOTH children to be terminal."""
+    """An archival qualifier-smoke child cannot delay an active qualification.
+
+    Even when the old smoke task is still IN_PROGRESS, the terminal required
+    audit drives finalization. This protects upgraded databases containing
+    legacy ``smoketest_task_id`` values from remaining pending forever.
+    """
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
     from app.models import ReleaseVersion
@@ -21545,7 +21546,7 @@ async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
     )
 
     project, version = await _make_qualifier_project_and_version(db_session)
-    # Smoketest sibling still IN_PROGRESS — finalization must defer.
+    # Legacy smoketest sibling remains IN_PROGRESS. It is not a required child.
     audit_task, _smoke = await _seed_qualifier_children(
         db_session,
         project,
@@ -21562,28 +21563,21 @@ async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
         refetched = await fresh.get(ReleaseVersion, version.id)
         qual = refetched.last_qualification or {}
 
-    # Sibling still running — qualification stays pending (not yet finalized).
-    assert qual.get("status") == "pending"
+    assert qual.get("status") == "infra_failure"
+    assert qual.get("error") == "audit_task_failed"
+    assert qual.get("error") != "smoketest_task_failed"
+    assert "smoketest" not in (qual.get("sub_scores") or {})
 
 
 @pytest.mark.asyncio
-async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
+async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
     client: AsyncClient, db_session, mocker
 ):
-    """CRITICAL (unflushed-artifact regression): when a qualifier-smoketest is
-    the SECOND child to finish, finalization must see the SMOKETEST_RESULT
-    artifact posted in the SAME /api/agent/status request.
+    """A legacy SMOKETEST_RESULT posted at terminal status is stored but inert.
 
-    The status handler disables autoflush and only session.add(...)s the
-    artifact. The old in-handler finalize ran before the early commit, so its
-    SELECT could not see the pending artifact → _score_smoketest(None) → hard
-    blocker → a PASSING candidate wrongly recorded not_promoted. Finalization
-    now runs in _process_post_commit AFTER the early commit, so the artifact
-    and the task's terminal status are committed and visible.
-
-    Here the smoketest PASSES every test; with promotion shipping dark the
-    correct outcome is a dry-run with a non-zero smoketest sub-score — proving
-    the artifact was read, not seen as None.
+    The historical qualifier marker still suppresses ordinary task-repair
+    handling and may wake finalization, while the artifact itself must never be
+    loaded into the active score or reintroduce the retired smoke gate.
     """
     import json as _json
     from app import release_version as _rv
@@ -21636,9 +21630,7 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     await db_session.commit()
     await db_session.refresh(version)
 
-    # The release_audit sibling already COMPLETED with a clean audit report
-    # (high audit score, no test erosion) so the only remaining input is the
-    # smoketest about to be posted.
+    # The active release audit already completed with a clean report.
     audit_task = Task(
         project_id=project.id,
         title="Release audit child",
@@ -21669,7 +21661,8 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     )
     await db_session.commit()
 
-    # The qualifier-smoketest is IN_PROGRESS and about to post its result.
+    # A legacy qualifier-smoketest is IN_PROGRESS and about to post its archival
+    # result through the ordinary agent endpoint.
     smoke_task = Task(
         project_id=project.id,
         title="Qualifier smoketest child",
@@ -21730,15 +21723,20 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     async with _process_post_commit_factory(db_session)() as fresh:
         refetched = await fresh.get(ReleaseVersion, version.id)
         qual = refetched.last_qualification or {}
+        archival_artifact = await fresh.scalar(
+            select(Artifact).where(
+                Artifact.task_id == smoke_task.id,
+                Artifact.artifact_type == ArtifactType.SMOKETEST_RESULT,
+            )
+        )
 
-    # Finalization ran and the smoketest artifact was visible: a passing
-    # smoketest yields a non-zero smoketest sub-score (not the 0.0 / hard
-    # blocker the unflushed-artifact bug produced).
+    assert archival_artifact is not None
+    # Finalization ran, but the archival artifact is absent from active scoring.
     assert qual.get("status") != "pending", f"version left wedged: {qual}"
     assert qual.get("blocker") is None, (
-        f"passing candidate wrongly hard-blocked — artifact not visible: {qual}"
+        f"archival smoketest wrongly hard-blocked the candidate: {qual}"
     )
-    assert qual.get("sub_scores", {}).get("smoketest", 0.0) > 0.0
+    assert "smoketest" not in qual.get("sub_scores", {})
     # Promotion ships dark (promotion_enabled False) → dry-run, not promoted.
     assert qual.get("status") == "dry_run"
 

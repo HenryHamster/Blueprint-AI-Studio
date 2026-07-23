@@ -37,7 +37,7 @@ REPO_ROOT = _resolve_repo_root()
 
 
 def _load_manifest() -> dict:
-    with MANIFEST_PATH.open() as fh:
+    with MANIFEST_PATH.open(encoding="utf-8") as fh:
         return json.load(fh)
 
 

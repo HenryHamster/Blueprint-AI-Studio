@@ -113,64 +113,79 @@ class TestFinalizeInfraFailure:
         assert len(verdicts) == 1
         assert verdicts[0].terminal_status == "infra_failure"
 
+
+
+    @pytest.mark.parametrize(
+        "legacy_artifact_logs",
+        [
+            None,
+            "not json {{{",
+            json.dumps(
+                {
+                    "passed": False,
+                    "tests": [{"name": "legacy-failure", "status": "fail"}],
+                    "suites": {"startup": {"passed": False}},
+                }
+            ),
+        ],
+        ids=["missing", "unparseable", "failed-result"],
+    )
     @pytest.mark.asyncio
-    async def test_smoketest_task_failed_records_infra_failure_when_enabled(
-        self, db_session
+    async def test_legacy_smoke_artifact_is_archival_and_unscored(
+        self, db_session, legacy_artifact_logs
     ):
-        """When smoketest_enabled=True and smoketest FAILED, infra_failure is
-        recorded — NOT a quality verdict (even though audit may be COMPLETED)."""
+        """Historical smoke artifacts cannot block or influence a new verdict."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
         project, version = await _make_project_and_version(db_session)
-        # Audit completed (no quality issue), smoketest FAILED (infra failure).
-        await _seed_infra_failure_children(
+        audit_task, smoke_task = await _seed_infra_failure_children(
             db_session,
             project,
             version,
             audit_status=TaskStatus.COMPLETED,
-            smoke_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
             smoketest_enabled=True,
         )
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "audit_score": 1.0,
+                        "findings": [],
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        if legacy_artifact_logs is not None:
+            db_session.add(
+                Artifact(
+                    task_id=smoke_task.id,
+                    artifact_type=ArtifactType.SMOKETEST_RESULT,
+                    logs=legacy_artifact_logs,
+                )
+            )
+        legacy_smoke_id = str(smoke_task.id)
+        version.last_qualification = {
+            **version.last_qualification,
+            "env_preflight_enabled": False,
+        }
+        db_session.add(version)
+        await db_session.commit()
 
         result = await rq._finalize_qualification(db_session, version)
         await db_session.commit()
 
-        assert result["status"] == "infra_failure"
-        assert "smoketest_task_failed" in result["error"]
-
+        assert result["status"] == "dry_run"
         await db_session.refresh(version)
-        assert version.last_qualification["status"] == "infra_failure"
-
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 1
-        assert verdicts[0].terminal_status == "infra_failure"
-
-    @pytest.mark.asyncio
-    async def test_smoketest_task_blocked_records_infra_failure_when_enabled(
-        self, db_session
-    ):
-        """Smoketest BLOCKED routes to infra_failure before artifact scoring."""
-        project, version = await _make_project_and_version(db_session)
-        await _seed_infra_failure_children(
-            db_session,
-            project,
-            version,
-            audit_status=TaskStatus.COMPLETED,
-            smoke_status=TaskStatus.BLOCKED,
-            smoketest_enabled=True,
-        )
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "smoketest_task_blocked"
-
-        await db_session.refresh(version)
-        assert version.last_qualification["status"] == "infra_failure"
-        assert version.last_qualification["error"] == "smoketest_task_blocked"
-
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 1
-        assert verdicts[0].terminal_status == "infra_failure"
+        qual = version.last_qualification
+        assert qual["smoketest_task_id"] == legacy_smoke_id
+        assert "smoketest" not in (qual.get("sub_scores") or {})
+        assert qual.get("smoketest_detail") is None
+        assert "smoketest" not in (await _dimension_rows_by_dim(db_session, version))
 
     @pytest.mark.asyncio
     async def test_infra_failure_does_not_appear_in_promotion_readiness(
@@ -405,160 +420,8 @@ class TestFinalizeInfraFailure:
             f"would_promote should be True for a clean audit, got {result}"
         )
 
-    @pytest.mark.asyncio
-    async def test_smoketest_completed_no_report_reclassified_as_infra_failure(
-        self, db_session
-    ):
-        """A COMPLETED smoketest with no SMOKETEST_RESULT is infra_failure,
-        not a smoketest_startup_failed verdict."""
-        project, version = await _make_project_and_version(db_session)
-        await _seed_infra_failure_children(
-            db_session,
-            project,
-            version,
-            audit_status=TaskStatus.COMPLETED,
-            smoke_status=TaskStatus.COMPLETED,
-            smoketest_enabled=True,
-        )
 
-        db_session.add(
-            Artifact(
-                task_id=version.last_qualification["audit_task_id"],
-                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
-                logs=json.dumps(
-                    {
-                        "audit_score": 1.0,
-                        "test_erosion": {"deleted_test_files": []},
-                    }
-                ),
-            )
-        )
-        await db_session.commit()
-        await db_session.refresh(version)
 
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "smoketest_report_missing"
-
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 1
-        assert verdicts[0].terminal_status == "infra_failure"
-
-    @pytest.mark.asyncio
-    async def test_smoketest_completed_unparseable_artifact_reclassified_as_infra_failure(
-        self, db_session
-    ):
-        """A COMPLETED smoketest with an unparseable SMOKETEST_RESULT is infra_failure."""
-        project, version = await _make_project_and_version(db_session)
-        audit_task, smoke_task = await _seed_infra_failure_children(
-            db_session,
-            project,
-            version,
-            audit_status=TaskStatus.COMPLETED,
-            smoke_status=TaskStatus.COMPLETED,
-            smoketest_enabled=True,
-        )
-        db_session.add(
-            Artifact(
-                task_id=audit_task.id,
-                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
-                logs=json.dumps(
-                    {
-                        "audit_score": 1.0,
-                        "test_erosion": {"deleted_test_files": []},
-                    }
-                ),
-            )
-        )
-        db_session.add(
-            Artifact(
-                task_id=smoke_task.id,
-                artifact_type=ArtifactType.SMOKETEST_RESULT,
-                logs="not json {{{",
-            )
-        )
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "smoketest_report_missing"
-
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 1
-        assert verdicts[0].terminal_status == "infra_failure"
-
-    @pytest.mark.asyncio
-    async def test_smoketest_completed_with_failed_tests_produces_quality_verdict(
-        self, db_session
-    ):
-        """A COMPLETED smoketest child whose SMOKETEST_RESULT artifact has
-        passed=False is scored as a quality verdict (low sub-score), NOT routed
-        through infra_failure.
-
-        This is the end-to-end proof of the agent-side fix: the smoketest agent
-        now always posts status=COMPLETED when Claude ran and produced a parseable
-        result, letting the qualifier read _score_smoketest and produce a real
-        quality verdict instead of stalling promotion forever via _handle_infra_failure.
-        """
-        project, version = await _make_project_and_version(db_session)
-        # Audit passes cleanly; smoketest COMPLETED but tests failed (passed=False,
-        # non-startup suite failure so score > 0 but < 1, not a hard blocker).
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs={
-                "audit_score": 1.0,
-                "test_erosion": {"deleted_test_files": []},
-            },
-            smoke_logs={
-                "passed": False,
-                "tests": [
-                    {"name": "test_startup_ok", "status": "pass"},
-                    {"name": "test_regression_a", "status": "fail", "message": "AssertionError"},
-                    {"name": "test_regression_b", "status": "fail", "message": "AssertionError"},
-                ],
-                "suites": {
-                    "startup": {"passed": True},
-                    "regression": {"passed": False},
-                },
-            },
-        )
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        # Must NOT be infra_failure — a COMPLETED smoketest with parsed artifact
-        # produces a quality verdict regardless of passed=True/False.
-        assert result["status"] != "infra_failure", (
-            f"Expected quality verdict, got infra_failure: {result}"
-        )
-        # A low smoketest score drives composite below threshold → not_promoted.
-        # The key invariant is that we reached the scoring path, not infra_failure.
-        assert result["status"] in ("not_promoted", "dry_run"), (
-            f"Expected a quality verdict (not_promoted or dry_run), got: {result['status']}"
-        )
-        await db_session.refresh(version)
-        sub_scores = (version.last_qualification or {}).get("sub_scores") or {}
-        assert "smoketest" in sub_scores, f"smoketest sub_score missing in last_qualification: {version.last_qualification}"
-        # 1 pass out of 3 tests → approx 0.33 score, well below threshold.
-        assert sub_scores["smoketest"] < 1.0, (
-            f"Expected smoketest sub_score < 1.0 for failed tests, got {sub_scores['smoketest']}"
-        )
-
-        # Confirm a quality verdict row was written (not an infra_failure row).
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 1, (
-            f"Expected 1 quality verdict row, got {len(verdicts)}"
-        )
-        assert verdicts[0].terminal_status != "infra_failure", (
-            f"Expected a quality verdict (not infra_failure), got terminal_status={verdicts[0].terminal_status}"
-        )
 
     @pytest.mark.asyncio
     async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):
@@ -888,40 +751,6 @@ class TestFinalizeInfraFailure:
         await db_session.refresh(version)
         assert version.last_qualification["error"] == "audit_task_failed"
 
-    @pytest.mark.asyncio
-    async def test_smoketest_task_failed_enriches_error_with_failure_category(
-        self, db_session
-    ):
-        """FAILED smoketest with agent_failure_category_raw → enriched error label."""
-        project, version = await _make_project_and_version(db_session)
-        _audit_task, smoke_task = await _seed_infra_failure_children(
-            db_session,
-            project,
-            version,
-            audit_status=TaskStatus.COMPLETED,
-            smoke_status=TaskStatus.FAILED,
-            smoketest_enabled=True,
-        )
-        # Patch the smoketest task's context to include a failure category.
-        smoke_task.context = {
-            **dict(smoke_task.context or {}),
-            "agent_failure_category_raw": "rate_limited",
-        }
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "smoketest_task_failed_rate_limited"
-
-        await db_session.refresh(version)
-        assert (
-            version.last_qualification["error"] == "smoketest_task_failed_rate_limited"
-        )
 
     @pytest.mark.asyncio
     async def test_challenge_task_failed_records_infra_failure(self, db_session):
@@ -2448,83 +2277,6 @@ class TestFinalizeInfraFailure:
         # No hotfix_preview for non-migration-apply legs
         assert result["hotfix_preview"] is None
 
-    @pytest.mark.asyncio
-    async def test_smoketest_leg_permanent_incapacity_after_streak(
-        self, db_session, mocker
-    ):
-        """Smoketest errors repeating with the same signature across
-        _MIN_INFRA_ERROR_STREAK attempts trigger permanent gate-incapacity.
-        Alert message names the 'smoketest' gate, not 'migration-apply gate'."""
-        from app import release_qualifier_audit as rqa
-
-        notify_mock = mocker.patch(
-            "app.release_qualifier._notify_operator", new=AsyncMock()
-        )
-        project, version = await _make_project_and_version(db_session)
-        # Signature is "{leg}:unknown:{stable_error_code}" per _infra_failure_signature
-        sig = "smoketest:unknown:smoketest_task_failed"
-        same_entry = {
-            "finalized_at": "2026-07-10T00:00:00",
-            "error": "smoketest_task_failed",
-            "signature": sig,
-            "candidate_sha": "cafe" * 10,
-            "failing_leg": "smoketest",
-            "child_failures": [],
-        }
-        version.last_qualification = {
-            "status": "pending",
-            "candidate_sha": "cafe" * 10,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-07-10T00:00:00",
-            "audit_task_id": None,
-            "smoketest_task_id": None,
-            "prior_infra_streak": 2,
-            "infra_attempt_history": [
-                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
-                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
-            ],
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rqa._handle_infra_failure(
-            db_session,
-            version,
-            dict(version.last_qualification),
-            "smoketest_task_failed",
-        )
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["is_permanent_gate_incapacity"] is True
-        assert result["same_signature_streak"] == 3
-        # No hotfix_preview for smoketest leg
-        assert result["hotfix_preview"] is None
-
-        # The alert message must name the 'smoketest' gate, not 'migration-apply gate'
-        alerts = (
-            (await db_session.execute(
-                select(Alert).where(
-                    Alert.project_id == project.id,
-                    Alert.severity == "WARNING",
-                )
-            ))
-            .scalars()
-            .all()
-        )
-        assert len(alerts) >= 1
-        latest = alerts[-1]
-        assert "smoketest gate" in latest.message
-        assert "persistently incapable" in latest.message
-        assert "migration-apply gate" not in latest.message
-
-        # Operator notify also names the smoketest leg
-        notify_mock.assert_awaited()
-        notify_message = notify_mock.await_args.args[3]
-        assert "smoketest gate" in notify_message
-        assert "persistently incapable" in notify_message.lower() or "persistently" in notify_message
 
     @pytest.mark.asyncio
     async def test_migration_apply_permanent_incapacity_still_detected(
@@ -2744,172 +2496,7 @@ class TestFinalizeInfraFailure:
             == "audit_admin_cancel_respawn_cap_exceeded"
         )
 
-    @pytest.mark.asyncio
-    async def test_smoketest_admin_cancel_respawns_new_task(self, db_session):
-        """CANCELLED+ADMIN_CANCEL smoketest child → respawn, not infra_failure.
 
-        A smoketest task externally cancelled with ADMIN_CANCEL classification
-        is a transient interruption — the qualifier must re-spawn the smoketest
-        and return status='smoketest_admin_cancel_respawned'.
-        """
-        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
-        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
-
-        project, version = await _make_project_and_version(db_session)
-        attempt_id = uuid.uuid4()
-        candidate = "beef5678" * 5
-
-        audit_task = Task(
-            project_id=project.id,
-            title="audit",
-            payloads=[{"type": "release_audit", "base_branch": "automain"}],
-            vm_instance_id="vm-audit-smoke-ac",
-            status=TaskStatus.COMPLETED,
-            context={"release_version_id": str(version.id)},
-        )
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[
-                {
-                    "type": "smoketest",
-                    "candidate_sha": candidate,
-                    "qualification_attempt_id": str(attempt_id),
-                }
-            ],
-            vm_instance_id="vm-smoke-admin-cancel",
-            status=TaskStatus.CANCELLED,
-            context={
-                "release_version_id": str(version.id),
-                "qualification_attempt_id": str(attempt_id),
-            },
-        )
-        db_session.add(audit_task)
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(audit_task)
-        await db_session.refresh(smoke_task)
-
-        persist_failure_category(smoke_task, ADMIN_CANCEL)
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        original_smoke_id = str(smoke_task.id)
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "qualification_attempt_id": str(attempt_id),
-            "retry_episode": 0,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": str(audit_task.id),
-            "smoketest_task_id": original_smoke_id,
-            "prior_infra_streak": 0,
-        }
-        version.active_qualification_attempt_id = attempt_id
-        version.qualification_attempts = 1
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "smoketest_admin_cancel_respawned"
-        assert result["respawn_count"] == 1
-
-        await db_session.refresh(version)
-        new_qual = version.last_qualification
-        assert new_qual["smoketest_admin_cancel_respawn_count"] == 1
-        assert new_qual["smoketest_task_id"] != original_smoke_id
-        assert new_qual["retry_episode"] == 1
-        assert new_qual["retry_episode_cap"] == _MAX_AUDIT_RL_RESPAWNS
-
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 0
-
-        infra_msg_count = (
-            await db_session.execute(
-                select(sa_func.count()).where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.context["event_type"].as_string()
-                    == "release_infra_failure",
-                )
-            )
-        ).scalar()
-        assert infra_msg_count == 0
-
-    @pytest.mark.asyncio
-    async def test_smoketest_admin_cancel_cap_exceeded_routes_to_infra_failure(
-        self, db_session
-    ):
-        """When smoketest_admin_cancel_respawn_count hits cap, fall through to
-        infra_failure with label 'smoketest_admin_cancel_respawn_cap_exceeded'."""
-        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
-        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
-
-        project, version = await _make_project_and_version(db_session)
-        candidate = "dead9999" * 5
-
-        audit_task = Task(
-            project_id=project.id,
-            title="audit",
-            payloads=[{"type": "release_audit", "base_branch": "automain"}],
-            vm_instance_id="vm-audit-smoke-ac-cap",
-            status=TaskStatus.COMPLETED,
-            context={"release_version_id": str(version.id)},
-        )
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[{"type": "smoketest", "candidate_sha": candidate}],
-            vm_instance_id="vm-smoke-ac-cap",
-            status=TaskStatus.CANCELLED,
-            context={"release_version_id": str(version.id)},
-        )
-        db_session.add(audit_task)
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(audit_task)
-        await db_session.refresh(smoke_task)
-
-        persist_failure_category(smoke_task, ADMIN_CANCEL)
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": str(audit_task.id),
-            "smoketest_task_id": str(smoke_task.id),
-            "prior_infra_streak": 0,
-            "smoketest_admin_cancel_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "smoketest_admin_cancel_respawn_cap_exceeded"
-
-        await db_session.refresh(version)
-        assert version.phase == "stabilize"
-        assert version.last_qualification["status"] == "infra_failure"
-        assert (
-            version.last_qualification["error"]
-            == "smoketest_admin_cancel_respawn_cap_exceeded"
-        )
 
     async def _seed_challenge_admin_cancel_scenario(
         self,
@@ -3124,349 +2711,13 @@ class TestFinalizeInfraFailure:
 
     # --- Smoketest PROVISION_FAILURE / AGENT_TIMEOUT respawn tests -----------
 
-    @pytest.mark.asyncio
-    async def test_smoketest_provision_failure_respawns_new_task(
-        self, db_session
-    ):
-        """FAILED smoketest with PROVISION_FAILURE → respawn, not infra_failure."""
-        from app.failure_classification import (
-            PROVISION_FAILURE,
-            persist_failure_category,
-        )
 
-        project, version = await _make_project_and_version(db_session)
-        candidate = "cafe" * 10
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[{"type": "smoketest", "base_branch": "automain"}],
-            vm_instance_id="vm-smoke-pf",
-            status=TaskStatus.FAILED,
-            context={"release_version_id": str(version.id)},
-        )
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
 
-        persist_failure_category(smoke_task, PROVISION_FAILURE)
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        original_smoke_id = str(smoke_task.id)
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": None,
-            "smoketest_task_id": original_smoke_id,
-            "prior_infra_streak": 0,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "smoketest_infra_respawned"
-        assert result["respawn_count"] == 1
-
-        await db_session.refresh(version)
-        new_qual = version.last_qualification
-        assert new_qual["smoketest_infra_respawn_count"] == 1
-        assert new_qual["smoketest_task_id"] != original_smoke_id
-
-        # No QualificationVerdict — verdict not rendered on respawn.
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 0
-
-    @pytest.mark.asyncio
-    async def test_smoketest_agent_timeout_respawns_new_task(
-        self, db_session
-    ):
-        """FAILED smoketest with AGENT_TIMEOUT → respawn, not infra_failure."""
-        from app.failure_classification import (
-            AGENT_TIMEOUT,
-            persist_failure_category,
-        )
-
-        project, version = await _make_project_and_version(db_session)
-        candidate = "dead" * 10
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[{"type": "smoketest", "base_branch": "automain"}],
-            vm_instance_id="vm-smoke-at",
-            status=TaskStatus.FAILED,
-            context={"release_version_id": str(version.id)},
-        )
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        persist_failure_category(smoke_task, AGENT_TIMEOUT)
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        original_smoke_id = str(smoke_task.id)
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": None,
-            "smoketest_task_id": original_smoke_id,
-            "prior_infra_streak": 0,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "smoketest_infra_respawned"
-        assert result["respawn_count"] == 1
-
-        await db_session.refresh(version)
-        new_qual = version.last_qualification
-        assert new_qual["smoketest_infra_respawn_count"] == 1
-        assert new_qual["smoketest_task_id"] != original_smoke_id
-
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 0
-
-    @pytest.mark.asyncio
-    async def test_smoketest_infra_respawn_cap_exceeded_routes_to_infra_failure(
-        self, db_session
-    ):
-        """When smoketest_infra_respawn_count hits cap, route to infra_failure
-        with label 'smoketest_infra_respawn_cap_exceeded'."""
-        from app.failure_classification import (
-            PROVISION_FAILURE,
-            persist_failure_category,
-        )
-        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
-
-        project, version = await _make_project_and_version(db_session)
-        candidate = "dead" * 10
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[{"type": "smoketest", "base_branch": "automain"}],
-            vm_instance_id="vm-smoke-cap",
-            status=TaskStatus.FAILED,
-            context={"release_version_id": str(version.id)},
-        )
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        persist_failure_category(smoke_task, PROVISION_FAILURE)
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": None,
-            "smoketest_task_id": str(smoke_task.id),
-            "smoketest_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
-            "prior_infra_streak": 0,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "smoketest_infra_respawn_cap_exceeded"
-
-        await db_session.refresh(version)
-        assert version.phase == "stabilize"
-        assert (
-            version.last_qualification["error"]
-            == "smoketest_infra_respawn_cap_exceeded"
-        )
 
     # --- Smoketest claude_code_failed (env-death) respawn tests --------------
 
-    @pytest.mark.asyncio
-    async def test_smoketest_env_death_claude_code_failed_respawns_new_task(
-        self, db_session
-    ):
-        """FAILED smoketest with claude_code_failed → env-death respawn, not infra_failure."""
-        project, version = await _make_project_and_version(db_session)
-        candidate = "beef" * 10
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[{"type": "smoketest", "base_branch": "automain"}],
-            vm_instance_id="vm-smoke-envdeath",
-            status=TaskStatus.FAILED,
-            context={
-                "release_version_id": str(version.id),
-                "failure_category": "claude_code_failed",
-            },
-        )
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
 
-        original_smoke_id = str(smoke_task.id)
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": None,
-            "smoketest_task_id": original_smoke_id,
-            "prior_infra_streak": 0,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
 
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "smoketest_env_death_respawned"
-        assert result["respawn_count"] == 1
-
-        await db_session.refresh(version)
-        new_qual = version.last_qualification
-        assert new_qual["smoketest_env_death_respawn_count"] == 1
-        assert new_qual["smoketest_task_id"] != original_smoke_id
-
-        # No QualificationVerdict — verdict not rendered on respawn.
-        verdicts = await _infra_verdicts_for_version(db_session, version)
-        assert len(verdicts) == 0
-
-    @pytest.mark.asyncio
-    async def test_smoketest_env_death_second_respawn_increments_count(
-        self, db_session
-    ):
-        """Second env-death respawn (count=1 → 2) stays below cap, no infra_failure."""
-        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
-
-        project, version = await _make_project_and_version(db_session)
-        candidate = "bead" * 10
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[{"type": "smoketest", "base_branch": "automain"}],
-            vm_instance_id="vm-smoke-envdeath2",
-            status=TaskStatus.FAILED,
-            context={
-                "release_version_id": str(version.id),
-                "failure_category": "claude_code_failed",
-            },
-        )
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        original_smoke_id = str(smoke_task.id)
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": None,
-            "smoketest_task_id": original_smoke_id,
-            "smoketest_env_death_respawn_count": 1,
-            "prior_infra_streak": 0,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        # Only run this assertion when cap > 1 (currently _MAX_AUDIT_RL_RESPAWNS == 2).
-        if _MAX_AUDIT_RL_RESPAWNS <= 1:
-            return
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "smoketest_env_death_respawned"
-        assert result["respawn_count"] == 2
-
-        await db_session.refresh(version)
-        new_qual = version.last_qualification
-        assert new_qual["smoketest_env_death_respawn_count"] == 2
-        assert new_qual["smoketest_task_id"] != original_smoke_id
-
-    @pytest.mark.asyncio
-    async def test_smoketest_env_death_respawn_cap_exceeded_routes_to_infra_failure(
-        self, db_session
-    ):
-        """When smoketest_env_death_respawn_count hits cap, route to infra_failure
-        with label 'smoketest_env_death_respawn_cap_exceeded'."""
-        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
-
-        project, version = await _make_project_and_version(db_session)
-        candidate = "face" * 10
-        smoke_task = Task(
-            project_id=project.id,
-            title="smoke",
-            payloads=[{"type": "smoketest", "base_branch": "automain"}],
-            vm_instance_id="vm-smoke-envdeath-cap",
-            status=TaskStatus.FAILED,
-            context={
-                "release_version_id": str(version.id),
-                "failure_category": "claude_code_failed",
-            },
-        )
-        db_session.add(smoke_task)
-        await db_session.commit()
-        await db_session.refresh(smoke_task)
-
-        version.last_qualification = {
-            "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
-            "candidate_sha": candidate,
-            "ci_green": True,
-            "smoketest_enabled": True,
-            "started_at": "2026-05-19T00:00:00",
-            "audit_task_id": None,
-            "smoketest_task_id": str(smoke_task.id),
-            "smoketest_env_death_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
-            "prior_infra_streak": 0,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-
-        assert result["status"] == "infra_failure"
-        assert result["error"] == "smoketest_env_death_respawn_cap_exceeded"
-
-        await db_session.refresh(version)
-        assert version.phase == "stabilize"
-        assert (
-            version.last_qualification["error"]
-            == "smoketest_env_death_respawn_cap_exceeded"
-        )
 
     # --- Merge-grade PROVISION_FAILURE / AGENT_TIMEOUT respawn tests --------
 
@@ -4216,57 +3467,33 @@ async def test_maybe_finalize_non_qualifier_task_returns_none(db_session):
     assert result is None
 
 
+@pytest.mark.parametrize(
+    "legacy_status",
+    [
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+        TaskStatus.COMPLETED,
+    ],
+)
 @pytest.mark.asyncio
-async def test_maybe_finalize_only_one_child_terminal_returns_none(db_session):
-    """When only one of the two qualifier children has terminated,
-    maybe_finalize_qualification returns None and does NOT call
-    _finalize_qualification."""
+async def test_legacy_smoke_task_status_never_gates_or_respawns(
+    db_session, legacy_status
+):
+    """A historical smoke child is archival regardless of its task status."""
     from app import shared_state
+    from app.release_qualifier import _required_children_terminal
 
     shared_state.runtime_config["promotion_enabled"] = False
-
     project, version = await _make_project_and_version(db_session)
-
-    # audit child is COMPLETED, smoketest is still IN_PROGRESS.
-    audit_task, _smoke_task = await _seed_pending_qualification(
-        db_session,
-        project,
-        version,
-        audit_status=TaskStatus.COMPLETED,
-        smoke_status=TaskStatus.IN_PROGRESS,
-    )
-
-    result = await rq.maybe_finalize_qualification(
-        audit_task, session_factory=_shared_session_factory(db_session)
-    )
-
-    assert result is None
-
-    # Version must still be pending — finalize must NOT have run.
-    await db_session.refresh(version)
-    assert version.last_qualification["status"] == "pending"
-
-
-@pytest.mark.asyncio
-async def test_maybe_finalize_both_children_terminal_calls_finalize(db_session, mocker):
-    """When both children are in terminal states, maybe_finalize_qualification
-    calls _finalize_qualification and returns its result dict."""
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False
-
-    project, version = await _make_project_and_version(db_session)
-
     audit_task, smoke_task = await _seed_pending_qualification(
         db_session,
         project,
         version,
         audit_status=TaskStatus.COMPLETED,
-        smoke_status=TaskStatus.COMPLETED,
+        smoke_status=legacy_status,
     )
-
-    # Seed RELEASE_AUDIT_REPORT and SMOKETEST_RESULT artifacts so that
-    # _finalize_qualification can compute a real composite.
     db_session.add(
         Artifact(
             task_id=audit_task.id,
@@ -4277,43 +3504,53 @@ async def test_maybe_finalize_both_children_terminal_calls_finalize(db_session, 
                     "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
-                        "assertion_delta": 2,
+                        "assertion_delta": 1,
                         "test_count_delta": 1,
                     },
                 }
             ),
         )
     )
-    db_session.add(
-        Artifact(
-            task_id=smoke_task.id,
-            artifact_type=ArtifactType.SMOKETEST_RESULT,
-            logs=json.dumps(
-                {
-                    "passed": True,
-                    "tests": [{"name": "a", "status": "pass"}],
-                    "suites": {"startup": {"passed": True}},
-                }
-            ),
-        )
-    )
+    legacy_smoke_id = str(smoke_task.id)
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": False,
+        "smoketest_infra_respawn_count": 99,
+        "smoketest_admin_cancel_respawn_count": 99,
+        "smoketest_env_death_respawn_count": 99,
+    }
+    db_session.add(version)
     await db_session.commit()
-
-    # Use the smoke_task as the "just completed" trigger.
-    result = await rq.maybe_finalize_qualification(
-        smoke_task, session_factory=_shared_session_factory(db_session)
-    )
-    await db_session.commit()
-
-    # _finalize_qualification ran and returned a result dict.
-    assert result is not None
-    # With promotion_enabled=False and a high-confidence candidate: dry_run.
-    assert result["status"] == "dry_run"
-    assert result["would_promote"] is True
-
-    # Version is no longer pending.
     await db_session.refresh(version)
-    assert version.last_qualification["status"] == "dry_run"
+
+    assert await _required_children_terminal(db_session, version) is True
+    result = await rq.maybe_finalize_qualification(
+        audit_task, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    await db_session.refresh(smoke_task)
+    qual = version.last_qualification
+    assert qual["smoketest_task_id"] == legacy_smoke_id
+    assert qual["smoketest_enabled"] is True
+    assert smoke_task.status == legacy_status
+    assert "smoketest" not in (qual.get("sub_scores") or {})
+    assert qual.get("smoketest_detail") is None
+    assert "smoketest" not in (await _dimension_rows_by_dim(db_session, version))
+
+    smoke_tasks = [
+        task
+        for task in (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalars()
+        if task.first_payload.get("type") == "smoketest"
+    ]
+    assert [str(task.id) for task in smoke_tasks] == [legacy_smoke_id]
+
+
 
 
 @pytest.mark.asyncio
@@ -4341,12 +3578,40 @@ async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_sessio
         "manifest_source": "backend/app/required_runtime_env.py",
     }
 
-    with_result, with_qual = await _finalize_with_smoketest_logs(
-        db_session, {**base_smoke, "env_preflight": env_preflight_body}
+    async def _finalize_with_env_preflight_evidence(evidence):
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 1.0,
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 1,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs=dict(base_smoke),
+        )
+        version.last_qualification = {
+            **version.last_qualification,
+            "env_preflight_enabled": True,
+            "env_preflight_evidence": evidence,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        return result, dict(version.last_qualification)
+
+    with_result, with_qual = await _finalize_with_env_preflight_evidence(
+        env_preflight_body
     )
-    without_result, without_qual = await _finalize_with_smoketest_logs(
-        db_session, dict(base_smoke)
-    )
+    without_result, without_qual = await _finalize_with_env_preflight_evidence(None)
 
     # Evidence surfaced, sanitized to presence-only (no smuggled value).
     stored = with_qual["env_preflight"]
@@ -4409,18 +3674,18 @@ async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkey
     # K_REVISION absent → deploy_target_scope = "always", so scope:"always" vars are in scope.
     monkeypatch.delenv("K_REVISION", raising=False)
 
+    env_preflight_evidence = {
+        "required_env": [
+            # scope "always" → evaluated in every deploy target (cloud_run AND non-cloud_run).
+            {"name": _ABSENT_VAR, "scope": "always"},
+        ],
+        "startup_check_names": [],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
     smoke_logs = {
         "passed": True,
         "tests": [{"name": "startup_check", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
-        "env_preflight": {
-            "required_env": [
-                # scope "always" → evaluated in every deploy target (cloud_run AND non-cloud_run).
-                {"name": _ABSENT_VAR, "scope": "always"},
-            ],
-            "startup_check_names": [],
-            "manifest_source": "backend/app/required_runtime_env.py",
-        },
     }
 
     project, version = await _make_project_and_version(db_session)
@@ -4442,6 +3707,7 @@ async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkey
     version.last_qualification = {
         **version.last_qualification,
         "env_preflight_enabled": True,
+        "env_preflight_evidence": env_preflight_evidence,
     }
     db_session.add(version)
     await db_session.commit()
@@ -4552,17 +3818,17 @@ async def test_env_preflight_gate_inert_for_cloud_run_only_var_in_non_cloud_run_
     # K_REVISION absent → deploy_target_scope = "always"; cloud_run-scoped vars are out of scope.
     monkeypatch.delenv("K_REVISION", raising=False)
 
+    env_preflight_evidence = {
+        "required_env": [
+            {"name": _CLOUD_RUN_VAR, "scope": "cloud_run"},
+        ],
+        "startup_check_names": [],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
     smoke_logs = {
         "passed": True,
         "tests": [{"name": "a", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
-        "env_preflight": {
-            "required_env": [
-                {"name": _CLOUD_RUN_VAR, "scope": "cloud_run"},
-            ],
-            "startup_check_names": [],
-            "manifest_source": "backend/app/required_runtime_env.py",
-        },
     }
 
     project, version = await _make_project_and_version(db_session)
@@ -4584,6 +3850,7 @@ async def test_env_preflight_gate_inert_for_cloud_run_only_var_in_non_cloud_run_
     version.last_qualification = {
         **version.last_qualification,
         "env_preflight_enabled": True,
+        "env_preflight_evidence": env_preflight_evidence,
     }
     db_session.add(version)
     await db_session.commit()
@@ -4616,15 +3883,15 @@ async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatc
     monkeypatch.delenv(_ABSENT_VAR, raising=False)
     monkeypatch.delenv("K_REVISION", raising=False)
 
+    env_preflight_evidence = {
+        "required_env": [{"name": _ABSENT_VAR, "scope": "always"}],
+        "startup_check_names": [],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
     smoke_logs = {
         "passed": True,
         "tests": [{"name": "a", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
-        "env_preflight": {
-            "required_env": [{"name": _ABSENT_VAR, "scope": "always"}],
-            "startup_check_names": [],
-            "manifest_source": "backend/app/required_runtime_env.py",
-        },
     }
 
     project, version = await _make_project_and_version(db_session)
@@ -4646,6 +3913,7 @@ async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatc
     version.last_qualification = {
         **version.last_qualification,
         "env_preflight_enabled": True,
+        "env_preflight_evidence": env_preflight_evidence,
         "ack_env_will_be_bound": {
             "actor": "test-operator",
             "acknowledged_at": "2026-07-16T00:00:00",
@@ -4744,18 +4012,18 @@ async def test_env_preflight_passes_with_evidence_even_without_smoketest(db_sess
     shared_state.runtime_config["promotion_enabled"] = False
     monkeypatch.delenv("K_REVISION", raising=False)
 
+    env_preflight_evidence = {
+        "required_env": [
+            # scope "always" → in scope for non-cloud-run.
+            {"name": "SOME_PRESENT_VAR", "scope": "always"},
+        ],
+        "startup_check_names": [],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
     smoke_logs = {
         "passed": True,
         "tests": [{"name": "a", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
-        "env_preflight": {
-            "required_env": [
-                # scope "always" → in scope for non-cloud-run.
-                {"name": "SOME_PRESENT_VAR", "scope": "always"},
-            ],
-            "startup_check_names": [],
-            "manifest_source": "backend/app/required_runtime_env.py",
-        },
     }
 
     project, version = await _make_project_and_version(db_session)
@@ -4778,6 +4046,7 @@ async def test_env_preflight_passes_with_evidence_even_without_smoketest(db_sess
         **version.last_qualification,
         "smoketest_enabled": False,
         "env_preflight_enabled": True,
+        "env_preflight_evidence": env_preflight_evidence,
     }
     db_session.add(version)
     await db_session.commit()
@@ -4814,15 +4083,15 @@ async def test_env_preflight_passes_with_empty_requirements(db_session, monkeypa
     shared_state.runtime_config["promotion_enabled"] = False
     monkeypatch.delenv("K_REVISION", raising=False)
 
+    env_preflight_evidence = {
+        "required_env": [],  # candidate genuinely declares zero prerequisites
+        "startup_check_names": [],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
     smoke_logs = {
         "passed": True,
         "tests": [{"name": "a", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
-        "env_preflight": {
-            "required_env": [],  # candidate genuinely declares zero prerequisites
-            "startup_check_names": [],
-            "manifest_source": "backend/app/required_runtime_env.py",
-        },
     }
 
     project, version = await _make_project_and_version(db_session)
@@ -4844,6 +4113,7 @@ async def test_env_preflight_passes_with_empty_requirements(db_session, monkeypa
     version.last_qualification = {
         **version.last_qualification,
         "env_preflight_enabled": True,
+        "env_preflight_evidence": env_preflight_evidence,
     }
     db_session.add(version)
     await db_session.commit()
@@ -4900,43 +4170,6 @@ async def test_maybe_finalize_already_finalized_version_returns_none(db_session)
     assert version.last_qualification["status"] == "dry_run"
 
 
-@pytest.mark.asyncio
-async def test_maybe_finalize_qualification_blocked_child_triggers(db_session):
-    """When a qualifier child transitions to BLOCKED and the other child is
-    already terminal, maybe_finalize_qualification must run (not skip) and
-    finalize the qualification.  BLOCKED is a terminal status in
-    _TERMINAL_STATUSES — the task_lifecycle guard must include it so the
-    reaper sweep is not the only path to finalization.
-    """
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False
-
-    project, version = await _make_project_and_version(db_session)
-
-    # Audit child is COMPLETED; smoketest child transitions to BLOCKED.
-    audit_task, smoke_task = await _seed_pending_qualification(
-        db_session,
-        project,
-        version,
-        audit_status=TaskStatus.COMPLETED,
-        smoke_status=TaskStatus.BLOCKED,
-    )
-
-    # Trigger finalization using the BLOCKED smoke child as the "just updated"
-    # task — this mirrors the task_lifecycle.py code path that now includes
-    # BLOCKED in its status guard.
-    result = await rq.maybe_finalize_qualification(
-        smoke_task, session_factory=_shared_session_factory(db_session)
-    )
-    await db_session.commit()
-
-    # maybe_finalize_qualification must have run finalization (not returned None).
-    assert result is not None
-
-    # Version must no longer be pending — BLOCKED child triggered finalization.
-    await db_session.refresh(version)
-    assert version.last_qualification["status"] != "pending"
 
 
 @pytest.mark.asyncio
@@ -5265,34 +4498,50 @@ async def test_sweep_finalizes_version_stuck_pending(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_skips_version_with_running_child(db_session):
-    """A 'pending' version with a still-running child is NOT swept — the
-    normal completion path will (or already does) handle it."""
+async def test_sweep_ignores_running_legacy_smoke_child(db_session):
+    """A running legacy smoke child cannot keep an active audit pending."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = False
-
     project, version = await _make_project_and_version(db_session)
-
-    # Audit COMPLETED but smoketest still IN_PROGRESS — not stuck, just running.
-    await _seed_pending_qualification(
+    audit_task, smoke_task = await _seed_pending_qualification(
         db_session,
         project,
         version,
         audit_status=TaskStatus.COMPLETED,
         smoke_status=TaskStatus.IN_PROGRESS,
     )
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "findings": [],
+                    "test_erosion": {"deleted_test_files": []},
+                }
+            ),
+        )
+    )
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": False,
+    }
+    db_session.add(version)
+    await db_session.commit()
 
     count = await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)
     )
     await db_session.commit()
 
-    assert count == 0
-
-    # Version untouched — still pending.
+    assert count == 1
     await db_session.refresh(version)
-    assert version.last_qualification["status"] == "pending"
+    await db_session.refresh(smoke_task)
+    assert version.last_qualification["status"] == "dry_run"
+    assert version.last_qualification["smoketest_task_id"] == str(smoke_task.id)
+    assert smoke_task.status == TaskStatus.IN_PROGRESS
 
 
 @pytest.mark.asyncio
@@ -6141,10 +5390,6 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
         status="passed", candidate_sha=sha,
     )
     await _seed_dimension_row(
-        db_session, project, version, "smoketest",
-        status="passed", candidate_sha=sha,
-    )
-    await _seed_dimension_row(
         db_session, project, version, "ci",
         status="passed", candidate_sha=sha,
     )
@@ -6197,10 +5442,6 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
         "app.release_qualifier._spawn_release_merge_grade_task",
         new=AsyncMock(),
     )
-    smoketest_spawn = mocker.patch(
-        "app.release_qualifier._spawn_qualifier_smoketest_task",
-        new=AsyncMock(),
-    )
     mocker.patch(
         "app.github.get_branch_sha",
         new=_branch_sha_mock(automain=sha),
@@ -6230,8 +5471,6 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     # --- Core assertions: resolved-dimension children were NOT re-spawned ---
     # audit child was NOT spawned (audit+test_erosion already resolved).
     audit_spawn.assert_not_called()
-    # smoketest child was NOT spawned (smoketest already resolved).
-    smoketest_spawn.assert_not_called()
     # merge_grade child WAS spawned (merge_grade was still 'unavailable').
     merge_grade_spawn.assert_awaited_once()
 
@@ -6243,14 +5482,12 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     assert resolved["audit"]["sub_score"] == 0.85
     assert "test_erosion" in resolved
     assert resolved["test_erosion"]["status"] == "passed"
-    assert "smoketest" in resolved
-    assert resolved["smoketest"]["status"] == "passed"
+    assert "smoketest" not in resolved
     # merge_grade was NOT resolved (status=unavailable), so not in resolved_dims.
     assert "merge_grade" not in resolved
 
     # --- Task ID fields reflect which children were spawned ---
     assert qual["audit_task_id"] is None
-    assert qual["smoketest_task_id"] is None
     assert qual["merge_grade_task_id"] is not None
 
 
@@ -6290,10 +5527,6 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     await _seed_dimension_row(
         db_session, project, version, "audit",
         status="unavailable", candidate_sha=sha,
-    )
-    await _seed_dimension_row(
-        db_session, project, version, "smoketest",
-        status="passed", sub_score=0.91, candidate_sha=sha,
     )
     await _seed_dimension_row(
         db_session, project, version, "test_erosion",
@@ -6347,10 +5580,6 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
         "app.release_qualifier._spawn_release_audit_task",
         new=AsyncMock(),
     )
-    smoketest_spawn = mocker.patch(
-        "app.release_qualifier._spawn_qualifier_smoketest_task",
-        new=AsyncMock(),
-    )
     merge_grade_spawn = mocker.patch(
         "app.release_qualifier._spawn_release_merge_grade_task",
         new=AsyncMock(),
@@ -6376,13 +5605,10 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
 
     # --- (a) ONLY the failing (audit) dimension is redriven -----------------
     audit_spawn.assert_awaited_once()
-    # smoketest already 'passed' — NOT re-spawned by the audit-gate re-drive.
-    smoketest_spawn.assert_not_called()
     # Automain's rubric provenance is attempt-scoped: a prior merge grade is
     # re-measured for the newly frozen rubric even when the candidate is stable.
     merge_grade_spawn.assert_awaited_once()
     assert qual["audit_task_id"] is not None
-    assert qual["smoketest_task_id"] is None
     assert qual["merge_grade_task_id"] is not None
 
     # Audit is being re-measured, so it is not in the carried-forward reuse set.
@@ -6390,8 +5616,7 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     # only immutable resolved dimensions are carried forward.
     resolved = qual.get("resolved_dimensions") or {}
     assert "audit" not in resolved
-    assert resolved.get("smoketest", {}).get("status") == "passed"
-    assert resolved["smoketest"]["sub_score"] == 0.91
+    assert "smoketest" not in resolved
     assert "ci" not in resolved
     assert "migration_identity" not in resolved
     assert "migration_apply" not in resolved
@@ -6400,10 +5625,6 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     # and un-downgraded: the audit-gate transient failure could not throw away
     # or weaken another dimension's already-earned passed result.
     ledger = await _dimension_rows_by_dim(db_session, version)
-    # The smoketest passed fact is still present, still 'passed', still 0.91.
-    assert "smoketest" in ledger, "smoketest passed ledger fact was discarded"
-    assert ledger["smoketest"].status == "passed"
-    assert ledger["smoketest"].sub_score == 0.91
     # The ci passed fact is likewise intact (second surviving control).
     assert "ci" in ledger, "ci passed ledger fact was discarded"
     assert ledger["ci"].status == "passed"
@@ -6465,10 +5686,6 @@ async def test_redrive_failed_audit_without_passed_challenge_re_measures(
         "app.release_qualifier._spawn_release_audit_task",
         new=AsyncMock(),
     )
-    smoketest_spawn = mocker.patch(
-        "app.release_qualifier._spawn_qualifier_smoketest_task",
-        new=AsyncMock(),
-    )
     mocker.patch(
         "app.github.get_branch_sha",
         new=_branch_sha_mock(automain=sha),
@@ -6491,17 +5708,14 @@ async def test_redrive_failed_audit_without_passed_challenge_re_measures(
     # Core assertion: the 'failed' audit was NOT reused — a fresh audit child was
     # spawned to re-measure it through the challenge gate.
     audit_spawn.assert_awaited_once()
-    # smoketest (independently 'passed') is still reused — the guard is scoped to
-    # the unconfirmed audit only.
-    smoketest_spawn.assert_not_called()
 
     # The challenge is re-driven (spawn pending) once the fresh audit lands.
     assert qual.get("audit_challenge_spawn_pending") is True
-    # audit + test_erosion are dropped from the reuse set; smoketest stays.
+    # Audit and test erosion are dropped from the reuse set.
     resolved = qual.get("resolved_dimensions") or {}
     assert "audit" not in resolved
     assert "test_erosion" not in resolved
-    assert "smoketest" in resolved
+    assert "smoketest" not in resolved
     assert qual["audit_task_id"] is not None
 
 
@@ -6620,8 +5834,7 @@ async def test_redrive_blocked_audit_fact_re_measures_instead_of_reblocking(
     )
     # Every OTHER gate resolved cleanly — so the audit fact is the only thing
     # standing between this candidate and a verdict.
-    for dim in ("smoketest", "ci", "migration_identity", "migration_apply",
-                "merge_grade"):
+    for dim in ("ci", "migration_identity", "migration_apply", "merge_grade"):
         await _seed_dimension_row(
             db_session, project, version, dim, status="passed", candidate_sha=sha,
         )
@@ -6643,10 +5856,6 @@ async def test_redrive_blocked_audit_fact_re_measures_instead_of_reblocking(
 
     audit_spawn = mocker.patch(
         "app.release_qualifier._spawn_release_audit_task",
-        new=AsyncMock(),
-    )
-    smoketest_spawn = mocker.patch(
-        "app.release_qualifier._spawn_qualifier_smoketest_task",
         new=AsyncMock(),
     )
     mocker.patch(
@@ -6683,10 +5892,9 @@ async def test_redrive_blocked_audit_fact_re_measures_instead_of_reblocking(
     )
     assert "test_erosion" not in resolved
 
-    # Scoped: sibling gates that resolved on their own merits are still reused —
-    # the recovery valve must not turn into a full re-qualification.
-    smoketest_spawn.assert_not_called()
-    assert resolved.get("smoketest", {}).get("status") == "passed"
+    # Scoped: active sibling gates that resolved on their own merits are still
+    # reused; retired smoke never enters the active reuse set.
+    assert "smoketest" not in resolved
 
 
 @pytest.mark.asyncio
@@ -6816,6 +6024,77 @@ def test_infra_backoff_seconds_schedule():
     assert _infra_backoff_seconds(3) == 1800
     # Clamped to last entry for streak > len(schedule)-1.
     assert _infra_backoff_seconds(100) == 1800
+
+
+@pytest.mark.parametrize("current_leg", ["audit", "challenge"])
+def test_legacy_smoke_infra_lineage_preserves_current_non_smoke_retry_state(
+    current_leg,
+):
+    """Historic smoke failures do not reset a current active-gate failure."""
+    from app.release_qualifier import _legacy_smoke_infra_lineage
+
+    qual = {
+        "status": "infra_failure",
+        "error": "child_terminal_failure",
+        "infra_failure_signature": "unknown:terminal:failed",
+        "infra_failure_child_events": [{"leg": "smoketest"}],
+        "infra_attempt_history": [
+            {"failing_leg": "smoketest", "signature": "smoketest:terminal:failed"},
+            {
+                "failing_leg": current_leg,
+                "signature": f"{current_leg}:terminal:failed",
+            },
+        ],
+    }
+
+    assert _legacy_smoke_infra_lineage(qual) is False
+
+@pytest.mark.asyncio
+async def test_legacy_smoke_infra_lineage_does_not_consume_cap_or_backoff(
+    db_session, mocker
+):
+    """Old smoke-only infra records re-enter immediately under active gates."""
+    from datetime import datetime
+    from app.release_qualifier_redrive import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "smokeold" * 5,
+        # Deliberately lacks failing_dimension and smoke-prefixed error/signature:
+        # the surviving legacy discriminator is child-event/history lineage.
+        "error": "child_terminal_failure",
+        "infra_failure_signature": "unknown:terminal:failed",
+        "engine_sha": "engine-old",
+        "consecutive_infra_errors": 99,
+        "infra_failure_child_events": [{"leg": "smoketest"}],
+        "infra_attempt_history": [
+            {
+                "signature": "unknown:terminal:failed",
+                "engine_sha": "engine-old",
+                "failing_leg": "smoketest",
+            }
+        ],
+        "finalized_at": "2026-07-10T12:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+    mocker.patch(
+        "app.release_qualifier_redrive._utcnow",
+        return_value=datetime(2026, 7, 10, 12, 0, 1),
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is True
+    run_qual.assert_awaited_once()
 
 
 @pytest.mark.asyncio

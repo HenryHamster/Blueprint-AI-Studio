@@ -2661,9 +2661,9 @@ async def _reconcile_if_pending_qualification_superseded(
             # EVERY required qualifier child must gate this, not just audit +
             # smoketest: a still-running blind merge-grade or audit-challenge
             # child is just as much "in flight" as a running audit.  The prior
-            # audit+smoketest-only check diverged from the canonical in-flight
+            # older partial-child check diverged from the canonical in-flight
             # definition (_qualification_in_flight, which also covers merge_grade
-            # and challenge) — so an attempt whose audit/smoke had finished but
+            # and challenge) — so an attempt whose audit had finished but
             # whose merge-grade/challenge was still running could be falsely
             # superseded, cancelling a legitimately in-flight attempt and
             # burning it, exactly when automain advances beneath the pinned
@@ -2683,10 +2683,9 @@ async def _reconcile_if_pending_qualification_superseded(
                     TaskStatus.BLOCKED,
                 }
             )
-            smoketest_required = bool(qual.get("smoketest_enabled", True))
+            # Qualifier VM smoke is retired; legacy smoke ids never delay or
+            # protect a pending qualification from reconciliation.
             in_flight_child_keys = ["audit_task_id"]
-            if smoketest_required:
-                in_flight_child_keys.append("smoketest_task_id")
             # The blind merge-grade and audit-challenge children are required
             # only when the qualifying run recorded them (a non-empty goal /
             # verified findings); absent ids simply skip.

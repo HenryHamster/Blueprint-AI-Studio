@@ -199,7 +199,7 @@ export interface CiResolution {
 export interface VersionQualificationSubScores {
   audit: number;
   test_erosion: number;
-  smoketest: number;
+  smoketest?: number | null;
   ci_resolution?: CiResolution | null;
   debt_pressure?: number | null;
 }
@@ -318,7 +318,7 @@ export interface VersionQualification {
   migration_apply_safety_detail?: string | null;
   test_erosion_detail?: Record<string, unknown> | null;
   smoketest_detail?: Record<string, unknown> | null;
-  // Whether the smoketest dimension was enabled for this qualification run.
+  // Legacy qualifier-smoke marker. New attempts always report false; retained to render historical verdicts.
   // False means the dimension was disabled and the 0.0 sub-score is a
   // zero-weighted placeholder, not an active lane. Null/absent on legacy records.
   smoketest_enabled?: boolean | null;
@@ -1168,7 +1168,7 @@ export interface QualificationVerdictRecord {
   migration_apply_safety_detail?: string | null;
   test_erosion_detail?: Record<string, unknown> | null;
   smoketest_detail?: Record<string, unknown> | null;
-  // Whether the smoketest dimension was enabled for this qualification run.
+  // Legacy qualifier-smoke marker. New attempts always report false; retained to render historical verdicts.
   // False means the 0.0 sub-score is a zero-weighted placeholder, not an
   // active lane. Null/absent on legacy verdict rows that predate this field.
   smoketest_enabled?: boolean | null;

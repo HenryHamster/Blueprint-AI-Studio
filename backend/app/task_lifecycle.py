@@ -5705,7 +5705,7 @@ async def _process_post_commit(
 
         # Release-qualifier finalization — fires from EVERY terminal path
         # (COMPLETED / FAILED / CANCELLED / BLOCKED) for BOTH a release_audit
-        # task and a qualifier-smoketest task. This deliberately lives in the
+        # task and other current qualifier children. This deliberately lives in the
         # terminal section (not the COMPLETED-only review-pipeline block above):
         # a qualifier child that fails/cancels/blocks must still advance
         # qualification,
@@ -5735,7 +5735,7 @@ async def _process_post_commit(
         # children are terminal) and a cheap O(1) no-op — no session opened, no
         # I/O — for the overwhelming majority of tasks (those with no
         # release_version_id in context). Keyed on context["release_version_id"]
-        # and/or task_type == "release_audit" / context["qualifier_smoketest"].
+        # and/or task_type == "release_audit".
         if payload.status in (
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
@@ -5747,7 +5747,6 @@ async def _process_post_commit(
             _is_qualifier_child = bool(
                 _qual_ctx.get("release_version_id")
                 or _qual_first_payload.get("type") == "release_audit"
-                or _qual_ctx.get("qualifier_smoketest")
             )
             if _is_qualifier_child:
                 try:

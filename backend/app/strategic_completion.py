@@ -1356,7 +1356,7 @@ async def _apply_qualify_request(
     open ``ReleaseVersion``, gates on
     ``phase == "stabilize"``, verifies the current automain HEAD is not blocked
     by CI-compliance violations, and calls ``release_qualifier.run_qualification``
-    (which snapshots the candidate SHA + spawns the audit/smoketest children;
+    (which snapshots the candidate SHA + spawns the active qualifier children;
     the caller's surrounding commit persists its version-row writes). When
     CI-compliance blocks qualification, the cap-bump remediation task is spawned
     before returning.

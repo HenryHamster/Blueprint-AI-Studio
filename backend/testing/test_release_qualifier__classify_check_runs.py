@@ -497,15 +497,14 @@ async def test_resolve_candidate_ci_caps_pr_head_sweep(mocker, caplog):
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
+async def test_run_qualification_never_spawns_retired_smoke_when_flag_is_true(
     db_session, mocker
 ):
-    """With smoketest_enabled=True, run_qualification snapshots the SHA,
-    spawns release_audit + qualifier-smoketest, and stamps
-    version.last_qualification = {status: 'pending', ...}.  The binding
-    release_audit_challenge is deferred until the audit report exists, while
-    the audit diff_range remains pinned to main...<candidate_sha> (NOT
-    main...automain)."""
+    """The legacy shared smoke flag cannot revive qualifier VM smoke.
+
+    Qualification still snapshots the SHA and spawns its release audit, while
+    persisting explicit false/None compatibility fields for old readers.
+    """
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = True
@@ -532,18 +531,18 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     assert result["status"] == "spawned"
     assert result["ci_green"] is True
     assert result["candidate_sha"] == candidate
-    assert result["smoketest_enabled"] is True
+    assert result["smoketest_enabled"] is False
 
     # last_qualification stamped pending, attempts bumped.
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
     assert version.last_qualification["candidate_sha"] == candidate
     assert version.last_qualification["ci_green"] is True
-    assert version.last_qualification["smoketest_enabled"] is True
+    assert version.last_qualification["smoketest_enabled"] is False
     assert version.qualification_attempts == 1
 
-    # Two child tasks exist: release_audit and smoketest. The binding challenge
-    # is spawned later, once the audit findings are available.
+    # Only release_audit exists; the binding challenge is spawned later once
+    # audit findings exist. No runtime flag can create qualifier VM smoke.
     from sqlmodel import select
 
     tasks = (
@@ -552,11 +551,10 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
         .all()
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
-    assert types == ["release_audit", "smoketest"]
+    assert types == ["release_audit"]
 
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     audit_task = by_type["release_audit"]
-    smoke_task = by_type["smoketest"]
 
     assert audit_task.first_payload["base_branch"] == "main"
     assert audit_task.first_payload["diff_range"] == f"main...{candidate}"
@@ -579,11 +577,7 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
         datetime(2026, 1, 1, tzinfo=timezone.utc) - hb_cutoff
     ).total_seconds() == 420
 
-    # The qualifier smoketest carries candidate_sha in its payload too and is
-    # flagged so its failure does not spawn a fix task.
-    assert smoke_task.first_payload["candidate_sha"] == candidate
-    assert smoke_task.context["qualifier_smoketest"] is True
-    assert smoke_task.context["release_version_id"] == str(version.id)
+    assert version.last_qualification["smoketest_task_id"] is None
 
 
 @pytest.mark.asyncio
@@ -4204,6 +4198,115 @@ async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_legacy_smoke_rejection_bypasses_same_sha_cache(
+    db_session, mocker
+):
+    """Retiring a gate can turn its historical rejection into a pass."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "smokeret" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "smoketest_enabled": True,
+        "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 0.0},
+        "blocker": "smoketest_startup_failed",
+        "ci_green": True,
+        "confidence": 0.0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["smoketest_enabled"] is False
+    assert version.last_qualification["smoketest_task_id"] is None
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_legacy_smoke_dry_run_bypasses_same_sha_cache(
+    db_session, mocker
+):
+    """A legacy smoke-participating dry-run is not a current-policy pass."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "smokedry" * 5
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "smoketest_enabled": True,
+        "smoketest_task_id": "legacy-smoke-task",
+        "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+        "ci_green": True,
+        "confidence": 1.0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["smoketest_enabled"] is False
+    assert version.last_qualification["smoketest_task_id"] is None
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_ci_unresolved_bypasses_cached_verdict(
     db_session, mocker
 ):
@@ -5404,7 +5507,6 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
         "ci",
         "audit",
         "test_erosion",
-        "smoketest",
         "challenge",
         "migration_identity",
         "migration_apply",
@@ -5425,7 +5527,6 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     assert by_dim["audit"].status == "passed"
     assert by_dim["audit"].sub_score == 1.0
     assert by_dim["test_erosion"].status == "passed"
-    assert by_dim["smoketest"].status == "passed"
     assert by_dim["migration_identity"].status == "passed"
     assert by_dim["migration_apply"].status == "passed"
     # No version goal / merge-grade child was seeded → not-applicable → unavailable.
@@ -5469,7 +5570,6 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     # The other dimensions that already passed are NOT discarded by the re-check.
     assert by_dim2["audit"].status == "passed"
     assert by_dim2["audit"].sub_score == 1.0
-    assert by_dim2["smoketest"].status == "passed"
 
 
 @pytest.mark.asyncio
@@ -5695,10 +5795,8 @@ async def test_finalize_infra_failure_persists_partial_dimension_results(
     assert by_dim["test_erosion"].status == "passed"
     assert by_dim["test_erosion"].candidate_sha == candidate_sha
 
-    # Smoketest was eagerly written (artifact read -> passed).
-    assert "smoketest" in by_dim
-    assert by_dim["smoketest"].status == "passed"
-    assert by_dim["smoketest"].candidate_sha == candidate_sha
+    # Legacy smoke artifacts never create a new qualifier ledger fact.
+    assert "smoketest" not in by_dim
 
     # Migration_identity was recorded as "unavailable" by _handle_infra_failure.
     assert "migration_identity" in by_dim
@@ -6366,13 +6464,13 @@ async def test_promotion_dimension_ledger_complete_requires_full_same_sha_set(
     project, version = await _make_project_and_version(db_session)
 
     required = ["ci", "audit", "test_erosion", "migration_identity",
-                "migration_apply", "merge_grade", "smoketest"]
+                "migration_apply", "merge_grade"]
     for dim in required:
         await _seed_dimension_row(db_session, project, version, dim, status="passed")
     await db_session.commit()
 
     complete, missing = await rq._promotion_dimension_ledger_complete(
-        db_session, version, _LEDGER_SHA_A, smoketest_enabled=True
+        db_session, version, _LEDGER_SHA_A
     )
     assert complete is True
     assert missing == []
@@ -6380,7 +6478,7 @@ async def test_promotion_dimension_ledger_complete_requires_full_same_sha_set(
     # A required dimension whose only fact is at a DIFFERENT candidate tree does
     # NOT satisfy the same-tree invariant.
     complete_b, missing_b = await rq._promotion_dimension_ledger_complete(
-        db_session, version, _LEDGER_SHA_B, smoketest_enabled=True
+        db_session, version, _LEDGER_SHA_B
     )
     assert complete_b is False
     assert set(missing_b) == set(required)
@@ -6400,7 +6498,7 @@ async def test_promotion_dimension_ledger_incomplete_when_dimension_missing(
     await db_session.commit()
 
     complete, missing = await rq._promotion_dimension_ledger_complete(
-        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+        db_session, version, _LEDGER_SHA_A
     )
     assert complete is False
     assert missing == ["migration_apply"]
@@ -6436,7 +6534,7 @@ async def test_promotion_dimension_ledger_incomplete_when_required_fact_unavaila
     await db_session.commit()
 
     complete, missing = await rq._promotion_dimension_ledger_complete(
-        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+        db_session, version, _LEDGER_SHA_A
     )
     assert complete is False
     assert missing == ["migration_apply"]
@@ -6469,7 +6567,7 @@ async def test_promotion_dimension_ledger_accepts_explicit_non_applicable_fact(
     await db_session.commit()
 
     complete, missing = await rq._promotion_dimension_ledger_complete(
-        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+        db_session, version, _LEDGER_SHA_A
     )
     assert complete is True
     assert missing == []
@@ -6856,23 +6954,18 @@ async def test_finalize_holds_on_empty_ledger_first_attempt(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
+async def test_reused_blocked_legacy_smoketest_fact_is_ignored(
     db_session, mocker
 ):
-    """Same-SHA ledger reuse of a BLOCKED smoketest fact must propagate the
-    hard-blocker sentinel (None), never coerce to a clean 1.0.
+    """A same-SHA legacy smoke fact cannot reintroduce a retired hard gate.
 
-    A prior finalize resolved smoketest as 'blocked' (startup-suite failure) and
-    stored sub_score=None to the per-dimension ledger.  On a re-drive at the same
-    candidate_sha the smoketest child is NOT re-spawned; finalize composes the
-    dimension from the ledger.  The fail-open this closes coerced the None
-    sub_score to 1.0, silently dropping the smoketest_startup_failed hard blocker
-    and letting a candidate that can't even boot promote.  Blocked must stay
-    blocked.
+    Old rows may retain ``resolved_dimensions.smoketest``. Finalization must
+    compose only active audit/test-erosion facts and reach the ordinary dry-run
+    result instead of resurrecting ``smoketest_startup_failed``.
     """
     from app import shared_state
 
-    shared_state.runtime_config["promotion_enabled"] = True
+    shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session)
     sha = _LEDGER_SHA_A
@@ -6889,7 +6982,6 @@ async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
         "resolved_dimensions": {
             "audit": {"status": "passed", "sub_score": 1.0},
             "test_erosion": {"status": "passed", "sub_score": 1.0},
-            # A prior startup-suite failure: blocked with the None sentinel.
             "smoketest": {"status": "blocked", "sub_score": None},
         },
     }
@@ -6904,10 +6996,9 @@ async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
     )
     await db_session.commit()
 
-    # The blocked smoketest re-raises the hard blocker rather than composing 1.0.
-    assert result["status"] == "not_promoted"
-    assert result["blocker"] == "smoketest_startup_failed"
-    assert result["confidence"] == 0.0
+    assert result["status"] == "dry_run"
+    assert result.get("blocker") is None
+    assert "smoketest" not in version.last_qualification["sub_scores"]
     promote_spy.assert_not_called()
 
 
@@ -6965,15 +7056,17 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
 
 
 @pytest.mark.asyncio
-async def test_reused_passed_smoketest_with_absent_score_still_neutral(
+async def test_archival_passed_smoketest_fact_is_ignored(
     db_session, mocker
 ):
-    """Guard the blocked-fact fix from over-reaching: a resolved smoketest fact
-    whose status is 'passed' but whose sub_score is absent still falls back to the
-    neutral 1.0 (only a 'blocked' status propagates the None sentinel)."""
+    """An archival passed smoke fact with no score is ignored, not neutralized.
+
+    Retired smoke rows must contribute neither a hard blocker nor a synthesized
+    1.0 sub-score to the active qualification composite.
+    """
     from app import shared_state
 
-    shared_state.runtime_config["promotion_enabled"] = True
+    shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session)
     sha = _LEDGER_SHA_A
@@ -6990,7 +7083,7 @@ async def test_reused_passed_smoketest_with_absent_score_still_neutral(
         "resolved_dimensions": {
             "audit": {"status": "passed", "sub_score": 1.0},
             "test_erosion": {"status": "passed", "sub_score": 1.0},
-            # passed + absent score → neutral 1.0, NOT the blocked sentinel.
+            # Archival only: never materialize a neutral active score.
             "smoketest": {"status": "passed", "sub_score": None},
         },
     }
@@ -6998,20 +7091,17 @@ async def test_reused_passed_smoketest_with_absent_score_still_neutral(
     await db_session.commit()
     await db_session.refresh(version)
 
-    promote_spy = mocker.patch(
-        "app.release_qualifier.promote",
-        new=AsyncMock(return_value={"status": "promoted"}),
-    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
 
     result = await rq._finalize_qualification(
         db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
     )
     await db_session.commit()
 
-    # No smoketest hard blocker — the passed dimension composes neutrally.
-    assert result.get("blocker") != "smoketest_startup_failed"
-    assert result["status"] == "promoted"
-    promote_spy.assert_called_once()
+    assert result["status"] == "dry_run"
+    assert result.get("blocker") is None
+    assert "smoketest" not in version.last_qualification["sub_scores"]
+    promote_spy.assert_not_called()
 
 
 @pytest.mark.asyncio

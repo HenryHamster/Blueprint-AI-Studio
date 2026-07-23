@@ -42,4 +42,7 @@ def downgrade() -> None:
     # through 0657, so 0671 normally creates nothing. There is no durable marker
     # proving that this revision created either object on a partially upgraded
     # nonproduction database; removing them would destroy valid Workday history.
-    pass
+    raise NotImplementedError(
+        "0671 is intentionally irreversible: dropping resident_session_id would "
+        "destroy canonical Workday conversation identity and history"
+    )

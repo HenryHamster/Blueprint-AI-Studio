@@ -10184,13 +10184,22 @@ class TestNotificationConfigSettings:
     async def test_promotion_weights_round_trip_and_validation(
         self, client: AsyncClient
     ):
-        """promotion_weights accepts a 3-key set summing to ~1.0, rejects a
-        mis-weighted set / wrong keys, and is visible on GET."""
+        """Two-key policies round-trip; legacy smoke weight is normalized away."""
         from app.shared_state import runtime_config as _rc
 
         original = _rc.get("promotion_weights")
         try:
-            resp = await client.patch(
+            current = await client.patch(
+                "/api/admin/settings",
+                json={"promotion_weights": {"audit": 0.6, "test_erosion": 0.4}},
+            )
+            assert current.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["promotion_weights"] == pytest.approx(
+                {"audit": 0.6, "test_erosion": 0.4}
+            )
+
+            legacy = await client.patch(
                 "/api/admin/settings",
                 json={
                     "promotion_weights": {
@@ -10200,11 +10209,13 @@ class TestNotificationConfigSettings:
                     }
                 },
             )
-            assert resp.status_code == 200
+            assert legacy.status_code == 200
             body = (await client.get("/api/admin/settings")).json()
-            assert body["promotion_weights"]["audit"] == pytest.approx(0.5)
+            assert body["promotion_weights"] == pytest.approx(
+                {"audit": 2 / 3, "test_erosion": 1 / 3}
+            )
+            assert "smoketest" not in body["promotion_weights"]
 
-            # Sum != 1.0 rejected.
             bad_sum = await client.patch(
                 "/api/admin/settings",
                 json={
@@ -10216,13 +10227,11 @@ class TestNotificationConfigSettings:
                 },
             )
             assert bad_sum.status_code == 400
-            # Wrong key set rejected.
             bad_keys = await client.patch(
                 "/api/admin/settings",
                 json={"promotion_weights": {"audit": 1.0}},
             )
             assert bad_keys.status_code == 400
-            # Non-dict rejected.
             bad_type = await client.patch(
                 "/api/admin/settings", json={"promotion_weights": 0.4}
             )
@@ -33395,4 +33404,3 @@ class TestComputeImageStatus:
         body = resp.json()
         assert body["status"] == "never_built"
         assert "drift" not in body
-

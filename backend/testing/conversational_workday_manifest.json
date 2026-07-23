@@ -241,16 +241,65 @@
         "restarts after prompt SIGINT process exit and answers the queued operator message",
         "does not restart or mask a queued-message child close classified as %s"
       ]
+    },
+    {
+      "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
+      "reason": "Covers the StrategicSessionEvents component — the live event feed and target drilldowns for a conversational Workday session. Restored with the persistent Workday UI; guard ensures the event feed is not silently deleted again.",
+      "test_ids": [
+        "renders bounded event rows with compact metadata",
+        "opens event targets through the provided handler",
+        "renders an empty label when requested",
+        "treats backend naive timestamps as UTC"
+      ]
+    },
+    {
+      "path": "admin-ui/src/App.wiring.test.ts",
+      "reason": "Protects the App-level chat Workday seam so the lifecycle control remains connected to the live session state, pinned runner selection, and start/stop handlers.",
+      "test_ids": [
+        "keeps chat Workday lifecycle wired to live session state and runner controls"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/StrategicContextRail.test.tsx",
+      "reason": "Protects the compact Strategic rail's recent Workday signal rendering and event-target navigation.",
+      "test_ids": [
+        "renders warning work session signals and routes event targets"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/StrategicContextWorkspace.test.tsx",
+      "reason": "Protects the full Strategic context workspace's recent Workday flow and event-target navigation.",
+      "test_ids": [
+        "renders recent session flow and opens existing targets"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/MessagesPanel.test.tsx",
+      "reason": "Protects the reachable paginated conversation history path, including server-authoritative totals and terminal expanded windows.",
+      "test_ids": [
+        "loads the next triage page from the reachable load-older control",
+        "uses server total when guaranteed high-signal rows make the response longer than the requested page",
+        "keeps a terminal expanded window terminal when the capped newest-window poll runs"
+      ]
+    },
+    {
+      "path": "admin-ui/src/hooks/useConversation.test.tsx",
+      "reason": "Protects realtime acknowledgement deduplication across callback changes and targeted conversation navigation.",
+      "test_ids": [
+        "acknowledges the same realtime message only once when callback identity changes",
+        "keeps acknowledgement dedup across include-target and search navigation"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/MessagesPanel.advanced.test.tsx",
+      "reason": "Protects end-to-end attachment recovery when an upload receipt expires, including byte re-upload and stable message identity.",
+      "test_ids": [
+        "expired attachment receipt re-uploads durable bytes under the same message identity"
+      ]
     }
   ],
 
   "deleted_frontend": [
-    {
-      "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
-      "status": "RESTORE-ON-RESTORE",
-      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
-      "reason": "Covered the StrategicSessionEvents component — the live event feed for a conversational session. Must be re-added when the component is restored."
-    },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",
       "status": "SAFE-TO-CUT",

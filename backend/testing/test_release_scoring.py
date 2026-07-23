@@ -21,12 +21,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app import release_scoring as rs
 
 # Fixed policy mirroring promotion_policy.yaml; threshold pinned low so the
 # judged-tier penalty (a few %) never crosses the promote boundary by accident.
 _POLICY = {
-    "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+    "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
     "threshold": 0.75,
 }
 
@@ -1063,7 +1065,6 @@ class TestBlockerExecutionSite:
         for code in (
             "ci_not_green",
             "ci_unresolved",
-            "smoketest_startup_failed",
             "audit_missing",
             "test_file_deleted",
             "merge_grade_misses",
@@ -1745,66 +1746,29 @@ class TestEnvPreflightArmedDefault:
         assert result["promote"] is False
 
 
-class TestSmoketestDisabledDefault:
-    """Guards the opt-in default for smoketest_enabled.
+class TestQualifierSmoketestRetired:
+    """Retired smoke arguments are accepted for legacy callers but inert."""
 
-    The qualifier records the per-run smoketest_enabled flag at spawn time.
-    Tests that exercise specific smoketest scenarios set it explicitly on the
-    record.  These tests read the source literal directly via AST to verify the
-    literal default is False, and confirm explicitly enabled gate behaviour.
-    """
-
-    def test_smoketest_literal_default_is_false(self):
-        """runtime_config_state.py must not enable VM smoketests by default."""
-        import ast
-        import pathlib
-
-        src = (
-            pathlib.Path(__file__).parent.parent / "app" / "runtime_config_state.py"
-        ).read_text()
-        tree = ast.parse(src)
-        found = None
-        for node in ast.walk(tree):
-            value = None
-            if isinstance(node, (ast.AnnAssign, ast.Assign)) and isinstance(node.value, ast.Dict):
-                value = node.value
-            if value is None:
-                continue
-            for k, v in zip(value.keys, value.values):
-                if isinstance(k, ast.Constant) and k.value == "smoketest_enabled":
-                    found = v.value if isinstance(v, ast.Constant) else None
-                    break
-            if found is not None:
-                break
-        assert found is False, (
-            f"runtime_config literal smoketest_enabled must be False (opt-in), "
-            f"got {found!r}."
-        )
-
-    def test_armed_smoketest_blocks_on_missing_score(self):
-        """With smoketest_enabled=True, a None smoketest_score is a hard block."""
-        result = rs.compute_composite(
+    def test_legacy_smoke_inputs_do_not_change_score(self):
+        missing = rs.compute_composite(
             **_perfect_kwargs(smoketest_enabled=True, smoketest_score=None)
         )
-        assert result["blocker"] == "smoketest_startup_failed"
-        assert result["confidence"] == 0.0
-        assert result["promote"] is False
-
-    def test_armed_smoketest_passes_with_full_score(self):
-        """With smoketest_enabled=True and a passing score, no smoketest blocker fires."""
-        result = rs.compute_composite(
+        passing = rs.compute_composite(
             **_perfect_kwargs(smoketest_enabled=True, smoketest_score=1.0)
         )
-        assert result["blocker"] is None
-        assert result["promote"] is True
-        assert result["sub_scores"]["smoketest"] == 1.0
-
-    def test_disabled_smoketest_drops_dimension(self):
-        """With smoketest_enabled=False, a None score does NOT block; weights renormalize."""
-        result = rs.compute_composite(
-            **_perfect_kwargs(smoketest_enabled=False, smoketest_score=None)
+        failing = rs.compute_composite(
+            **_perfect_kwargs(smoketest_enabled=True, smoketest_score=0.0)
         )
-        assert result["blocker"] is None
-        assert result["promote"] is True
-        # smoketest dimension contributes 0 when disabled; audit+test_erosion renormalize
-        assert result["sub_scores"]["smoketest"] == 0.0
+        assert missing == passing == failing
+        assert "smoketest" not in passing["sub_scores"]
+
+    def test_legacy_three_key_and_current_two_key_weights_match(self):
+        from app.release_qualifier import _normalize_active_promotion_weights
+
+        legacy = _normalize_active_promotion_weights(
+            {"audit": 0.4, "test_erosion": 0.3, "smoketest": 0.3}
+        )
+        current = _normalize_active_promotion_weights(
+            {"audit": 4 / 7, "test_erosion": 3 / 7}
+        )
+        assert legacy == pytest.approx(current)

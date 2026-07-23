@@ -5,6 +5,21 @@ import path from 'node:path';
 const appSource = readFileSync(path.join(process.cwd(), 'src', 'App.tsx'), 'utf8');
 
 describe('App workbench wiring', () => {
+  test('keeps chat Workday lifecycle wired to live session state and runner controls', () => {
+    const control = appSource.match(/<StrategicSessionControl[\s\S]*?\/>/)?.[0] ?? '';
+
+    expect(control).toContain("currentMode={strategicInteractionMode === 'continuous' ? 'continuous' : 'chat'}");
+    expect(control).toContain('sessionActive={strategicSessionActive}');
+    expect(control).toContain('sessionStatus={strategicSessionStatus}');
+    expect(control).toContain('sessionState={strategicSessionState}');
+    expect(control).toContain('sessionRunners={residentStrategicSessionRunners}');
+    expect(control).toContain('sessionSelectedRunnerId={strategicSessionSelectedRunnerId}');
+    expect(control).toContain('onSelectRunner={handleSelectStrategicRunner}');
+    expect(control).toContain('onStartSession={handleStartStrategicSession}');
+    expect(control).toContain('onStopSession={handleStopStrategicSession}');
+    expect(control).toContain('onModeChange={setStrategicInteractionMode}');
+  });
+
   test('wires the real Strategic MessagesPanel to the context workspace opener', () => {
     expect(appSource).toContain('const openStrategicContextWorkspace = useCallback(');
     expect(appSource).toMatch(/<MessagesPanel[\s\S]*onOpenCommandPalette=\{openCommandPalette\}[\s\S]*onOpenStrategicContextWorkspace=\{openStrategicContextWorkspace\}/);
