@@ -2,7 +2,7 @@ import { afterEach, describe, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { StrategicSessionControl } from './StrategicSessionControl';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectFullViewportAt, expectNoOverflowAt } from '../test/viewport';
 
 describe('StrategicSessionControl — viewport regression', () => {
   let root: Root | null = null;
@@ -16,7 +16,7 @@ describe('StrategicSessionControl — viewport regression', () => {
   });
 
   test('Workday controls remain contained at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
+    await expectFullViewportAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);
