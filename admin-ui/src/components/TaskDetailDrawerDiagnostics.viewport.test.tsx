@@ -5,10 +5,10 @@ import { TaskDiagnosticsPanel } from './TaskDetailDrawerDiagnostics';
 import type { Task } from '../types/task';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
-const fetchSerialMock = vi.fn(async () => ({ serial_log: 'live serial output', source: 'live', vm_status: 'RUNNING', vm_instance_id: 'test' }));
+const fetchSerialMock = vi.fn<(...args: unknown[]) => Promise<{ serial_log: string; source: string; vm_status: string; vm_instance_id: string }>>(async () => ({ serial_log: 'live serial output', source: 'live', vm_status: 'RUNNING', vm_instance_id: 'test' }));
 
 vi.mock('../api', () => ({
-  fetchTaskSerialConsole: (...args: unknown[]) => fetchSerialMock(...(args as [])),
+  fetchTaskSerialConsole: (...args: unknown[]) => fetchSerialMock(...args),
 }));
 
 // FAILED status opens the panel by default (no click needed).

@@ -216,12 +216,13 @@ describe('ProviderModelBreakdownPanel', () => {
     });
 
     const calls = apiFetchMock.mock.calls;
-    const postCall = calls.find(
-      ([url, opts]: [string, RequestInit]) =>
-        url.includes('acct-abc') &&
+    const postCall = calls.find((call) => {
+      const url = call[0] as string;
+      const opts = call[1] as RequestInit | undefined;
+      return url.includes('acct-abc') &&
         url.includes('regression-quarantine/clear') &&
-        (opts as RequestInit)?.method === 'POST',
-    );
+        opts?.method === 'POST';
+    });
     expect(postCall).toBeDefined();
   });
 

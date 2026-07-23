@@ -14,7 +14,6 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     task_type: 'create',
     created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
     pr_url: 'https://github.com/example/repo/pull/100',
-    duration_seconds: 3600,
     requires_approval: false,
     created_by: 'tester',
     ...overrides,
@@ -30,16 +29,16 @@ const archiveTasks: Task[] = [
     status: 'FAILED',
     task_type: 'fix',
     created_at: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString(),
-    pr_url: null,
+    pr_url: undefined,
   }),
   makeTask({
     id: 'task-archive-3',
     title: 'test: add viewport regression tests for archive controls',
-    description: null,
+    description: '',
     status: 'CANCELLED',
     task_type: 'create',
     created_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
-    pr_url: null,
+    pr_url: undefined,
   }),
 ];
 

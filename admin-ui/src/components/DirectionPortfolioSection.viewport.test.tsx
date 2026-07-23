@@ -44,7 +44,8 @@ describe('DirectionPortfolioSection — viewport regression', () => {
 
   afterEach(() => {
     if (root) {
-      act(() => root.unmount());
+      const r = root;
+      act(() => r.unmount());
       root = null;
     }
     if (host) {

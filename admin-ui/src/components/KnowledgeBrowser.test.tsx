@@ -22,7 +22,7 @@ const computeDoc = {
   created_at: '2026-06-01T00:00:00Z',
   updated_at: '2026-06-01T00:00:00Z',
   knowledge_acceptance_evidence: true,
-  compute_acceptance_grade: 'acceptance',
+  compute_acceptance_grade: 'acceptance' as const,
   compute_acceptance_reason: 'llm_artifact_cited',
   criterion_met: true,
   forward_quality_verdict: {
@@ -59,7 +59,7 @@ const measuredOnlyComputeDoc = {
   created_at: '2026-06-01T00:00:00Z',
   updated_at: '2026-06-01T00:00:00Z',
   knowledge_acceptance_evidence: false,
-  compute_acceptance_grade: 'measured_only',
+  compute_acceptance_grade: 'measured_only' as const,
   compute_acceptance_reason: 'analysis_mode_not_llm',
   unavailable_cause: 'analysis-disabled',
   analysis_fallback_reason: 'precondition-not-met',
@@ -195,7 +195,7 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
       );
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('Survey of reachable web sources'),
     );
     expect(docButton).toBeTruthy();
@@ -314,7 +314,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
 
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU benchmark'),
     );
     expect(docButton).toBeTruthy();
@@ -355,7 +355,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
 
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('deterministic'),
     );
     expect(docButton).toBeTruthy();
@@ -396,7 +396,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
 
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU benchmark'),
     );
     expect(docButton).toBeTruthy();
@@ -624,7 +624,7 @@ describe('KnowledgeBrowser — compute_experiment source kind', () => {
     await renderWithComputeDoc();
 
     // The document card should have a badge that says 'Compute'.
-    const docCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docCard = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU benchmark'),
     );
     expect(docCard).toBeTruthy();
@@ -641,7 +641,7 @@ describe('KnowledgeBrowser — compute_experiment source kind', () => {
 
   test('compute document with grounding probe surfaces acceptance detail in detail view', async () => {
     await renderWithComputeDoc();
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU benchmark'),
     );
     expect(docButton).toBeTruthy();
@@ -711,10 +711,10 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     await renderList([computeDoc, measuredOnlyComputeDoc]);
 
     // Both documents stay visible in the list — measured-only is labeled, not hidden.
-    const acceptanceCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const acceptanceCard = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU benchmark'),
     );
-    const measuredCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const measuredCard = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU fallback summary'),
     );
     expect(acceptanceCard).toBeTruthy();
@@ -738,7 +738,7 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     await renderList([computeDoc, measuredOnlyComputeDoc]);
 
     // Open the measured-only document and verify the concrete fallback cause shows up.
-    const measuredCardAgain = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const measuredCardAgain = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU fallback summary'),
     );
     if (!measuredCardAgain) throw new Error('expected measured compute card');
@@ -763,7 +763,7 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     };
     await renderList([legacyMeasuredOnlyComputeDoc]);
 
-    const docCard = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docCard = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('Legacy fallback summary'),
     );
     expect(docCard).toBeTruthy();
@@ -777,7 +777,7 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     // renders no acceptance badge but stays a first-class 'Compute' document.
     const ungraded = { ...computeDoc, id: 'doc-ungraded', title: 'GPU legacy doc', compute_acceptance_grade: undefined, compute_acceptance_reason: undefined };
     await renderList([ungraded]);
-    const card = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const card = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU legacy doc'),
     );
     expect(card).toBeTruthy();
@@ -904,7 +904,7 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
   }
 
   function cardFor(title: string): Element | undefined {
-    return Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    return Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(title),
     );
   }
@@ -1028,7 +1028,7 @@ describe('KnowledgeBrowser — lifecycle status badge', () => {
   }
 
   function cardFor(title: string): Element | undefined {
-    return Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    return Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(title),
     );
   }
@@ -1153,7 +1153,7 @@ describe('KnowledgeBrowser — document body load failure', () => {
     vi.mocked(fetchKnowledgeDocument).mockRejectedValue(new Error('body fetch failed'));
 
     const container = await renderBrowser();
-    const docButton = Array.from(container.querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from(container.querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('Survey of reachable web sources'),
     );
     expect(docButton).toBeTruthy();
@@ -1251,7 +1251,7 @@ describe('KnowledgeBrowser — live proof release evidence', () => {
       );
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-    const card = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const card = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes((doc as { title: string }).title),
     );
     if (!card) throw new Error('expected document card');
@@ -1313,7 +1313,7 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
       r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(doc.title),
     );
     if (!docButton) throw new Error('expected document button');
@@ -1467,7 +1467,7 @@ describe('KnowledgeBrowser — renders execution-location badge on compute_exper
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
 
-    return Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    return Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(doc.title),
     ) as HTMLElement | undefined;
   }
@@ -1541,7 +1541,7 @@ describe('KnowledgeBrowser — renders execution-location badge on compute_exper
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
 
-    const card = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const card = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(nonComputeDoc.title),
     );
     expect(card).toBeTruthy();
@@ -1599,7 +1599,7 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
       );
     });
     const docButton = await waitFor(() => {
-      const button = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      const button = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
         b => b.textContent?.includes('Survey of reachable web sources'),
       );
       if (!button) throw new Error('expected knowledge document button');
@@ -1653,7 +1653,7 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
       );
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('Survey of reachable web sources'),
     );
     if (!docButton) throw new Error('expected knowledge document button');

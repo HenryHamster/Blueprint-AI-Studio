@@ -269,7 +269,7 @@ const STATE = {
     },
   },
   design: { has_design_doc: true, revision: 2 },
-} as StrategicStateResponse;
+} as unknown as StrategicStateResponse;
 
 function makeHeaderProps() {
   return {
@@ -292,7 +292,7 @@ function makeHeaderProps() {
     lastFetchTime: 0,
     deployState: null,
     selectedProjectId: 'project-123',
-    projects: [{ id: 'project-123', name: 'Blueprint', github_owner: 'Blueprint', github_repo: 'Blueprint' }],
+    projects: [{ id: 'project-123', name: 'Blueprint', github_owner: 'Blueprint', github_repo: 'Blueprint', status: 'active', autonomous_enabled: false, created_at: '2026-01-01T00:00:00Z' }],
     onSelectProject: noop,
     activeTab: 'chat' as const,
     onTabChange: noop,

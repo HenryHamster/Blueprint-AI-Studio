@@ -20,9 +20,8 @@ const mockListFleetRunners = vi.mocked(listFleetRunners);
 
 function catalogEntry(overrides: Partial<TaskTypeCatalogEntry> & { id: string }): TaskTypeCatalogEntry {
   return {
-    id: overrides.id,
-    label: overrides.label ?? overrides.id,
-    description: overrides.description ?? '',
+    label: overrides.id,
+    description: '',
     agent_mode: 'write',
     default_category: null,
     user_launchable: true,

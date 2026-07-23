@@ -41,7 +41,6 @@ const richTask: Task = {
   parent_task_id: 'task-550e8400e29b41d4a716446655440001',
   project_id: '550e8400-e29b-41d4-a716-446655440000',
   vm_instance_id: 'blueprint-agent-c99e9c2f7a9e8b1c2d3e4f5a6b7c8d9e-0123',
-  branch: 'feature/add-comprehensive-error-handling-to-data-pipeline',
   repo_url: 'https://github.com/HenryHamster/BlueprintAIStudio',
   pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
   commit_hash: '550e8400e29b41d4a716446655440000abcdef12',

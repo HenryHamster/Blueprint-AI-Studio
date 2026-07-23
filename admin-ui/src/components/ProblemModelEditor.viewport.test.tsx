@@ -35,7 +35,7 @@ function makeProblemModel(overrides: Partial<ProblemModel> = {}): ProblemModel {
     archived_gaps: [],
     revision: 5,
     last_updated: '2026-05-08T15:45:00Z',
-    last_updated_by: 'blueprint-agent',
+    last_updated_by: 'agent',
     ...overrides,
   };
 }

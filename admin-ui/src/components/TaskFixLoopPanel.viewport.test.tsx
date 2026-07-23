@@ -19,7 +19,7 @@ vi.mock('../api', () => ({
 describe('TaskFixLoopPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
-  afterEach(() => { if (root) act(() => root.unmount()); root = null; host?.remove(); host = null; });
+  afterEach(() => { if (root) { const r = root; act(() => r.unmount()); } root = null; host?.remove(); host = null; });
   test('renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');

@@ -262,7 +262,7 @@ const STATE = {
     },
     cumulative_estimated_cost_usd: 0,
   },
-} as StrategicStateResponse;
+} as unknown as StrategicStateResponse;
 
 describe('StrategicContextWorkspace', () => {
   let root: Root | null = null;
@@ -368,10 +368,10 @@ describe('StrategicContextWorkspace', () => {
             label: 'Strategic map resource',
             summary: 'The map is the shared frame for this discussion.',
           },
-          ...STATE.context_package.resources,
+          ...(STATE.context_package?.resources ?? []),
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     const { host } = mount({ state, onUpdateSessionRefs });
     const mapSection = host.querySelector('[data-testid="strategic-context-workspace-map"]');
@@ -411,7 +411,7 @@ describe('StrategicContextWorkspace', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     const { host } = mount({ state });
     const artifactsSection = host.querySelector('[data-testid="strategic-context-workspace-artifacts"]');
@@ -428,7 +428,7 @@ describe('StrategicContextWorkspace', () => {
       context_package: {
         ...STATE.context_package,
         canvas: {
-          ...STATE.context_package.canvas,
+          ...(STATE.context_package?.canvas ?? {}),
           edge_count: 2,
           edges: [
             { source: 'project', target: 'problem-model', label: 'defines' },
@@ -436,7 +436,7 @@ describe('StrategicContextWorkspace', () => {
           ],
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     const { host } = mount({ state });
 
@@ -618,7 +618,7 @@ describe('StrategicContextWorkspace', () => {
           },
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     // projectId omitted → uses the baked URL directly (no signed-URL fetch).
     const { host } = mount({ state: stateWithPreview });
@@ -664,7 +664,7 @@ describe('StrategicContextWorkspace', () => {
           },
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     const { host } = mount({ state: stateWithTruncation });
     const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
@@ -684,7 +684,7 @@ describe('StrategicContextWorkspace', () => {
           artifacts: { total: 3, live_count: 2, items: contextPackage.evidence!.artifacts!.items },
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     const { host } = mount({ state: stateWithLive });
     const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');

@@ -99,6 +99,14 @@ describe('NewTaskModal — viewport regression', () => {
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
           />,
         );
       });
@@ -157,6 +165,14 @@ describe('NewTaskModal — viewport regression', () => {
           onRepoChange={() => {}}
           onSubmit={async () => {}}
           onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
         />,
       );
     });
@@ -219,6 +235,14 @@ describe('NewTaskModal — viewport regression', () => {
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
           />,
         );
       });
@@ -283,6 +307,14 @@ describe('NewTaskModal — viewport regression', () => {
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
           />,
         );
       });
@@ -345,6 +377,14 @@ describe('NewTaskModal — viewport regression', () => {
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
           />,
         );
       });
@@ -404,6 +444,14 @@ describe('NewTaskModal — viewport regression', () => {
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
           />,
         );
       });
@@ -465,6 +513,14 @@ describe('NewTaskModal — viewport regression', () => {
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
           />,
         );
       });
@@ -526,6 +582,14 @@ describe('NewTaskModal — viewport regression', () => {
           onRepoChange={() => {}}
           onSubmit={async () => {}}
           onClose={() => {}}
+            preflightResult={null}
+            preflightLoading={false}
+            preflightError={null}
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
         />,
       );
     });
@@ -587,13 +651,18 @@ describe('NewTaskModal — viewport regression', () => {
             taskBranchDefaultsLoading={false}
             taskBranchDefaultsError={null}
             preflightResult={{
+              resolved_machine_type: 'n1-standard-4',
+              rate_per_second: null,
               rate_per_hour: null,
               projected_cost_usd: null,
               max_runtime_seconds: null,
+              effective_spend_cap_usd: null,
+              effective_deadline_seconds: null,
               in_policy: false,
               reason: 'GPU type H100 exceeds project hardware restrictions',
               allowed_accelerator_types: ['T4', 'A100'],
               allowed_machine_types: null,
+              shape_rejection: null,
             }}
             preflightLoading={false}
             preflightError="Request timeout after 5s — unable to estimate cost"

@@ -115,7 +115,7 @@ describe('LlmCostBreakdownPanel — viewport regression', () => {
   let host: HTMLDivElement | null = null;
 
   afterEach(() => {
-    if (root) { act(() => root.unmount()); root = null; }
+    if (root) { const r = root; act(() => r.unmount()); root = null; }
     if (host) { host.remove(); host = null; }
   });
 
@@ -158,8 +158,13 @@ describe('LlmCostBreakdownPanel — viewport regression', () => {
           share_of_total_cost: null,
           task_count: 84,
           llm_call_count: 320,
+          merged_count: 0,
+          merge_rate: null,
+          verified_merged_count: 0,
+          verified_merge_rate: null,
           priced: false,
           approximate_priced: false,
+          cost_per_merge: null,
         },
       ],
       totals: {
@@ -174,6 +179,8 @@ describe('LlmCostBreakdownPanel — viewport regression', () => {
         priced_task_count: 0,
         unpriced_task_count: 84,
         unpriced_coverage_fraction: 1.0,
+        fallback_task_count: 0,
+        fallback_cost_usd: 0,
       },
       unpriced_combos: ['custom-provider:custom-model'],
       approximate_priced_combos: [],

@@ -94,7 +94,7 @@ vi.mock('../api', () => ({
   API_BASE_URL: '',
   authGet: vi.fn(() => Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })),
   authHeaders: vi.fn(() => Promise.resolve({})),
-  fetchKnowledgeDocuments: vi.fn((projectId: string, params?: Record<string, unknown>) => {
+  fetchKnowledgeDocuments: vi.fn((_projectId: string, params?: Record<string, unknown>) => {
     const q = typeof params?.q === 'string' ? params.q : '';
     if (q.includes('no-match')) {
       return Promise.resolve({ documents: [], total: 0, limit: 50, offset: 0 });
@@ -151,7 +151,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
   test('detail view renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       await renderList();
-      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
         b => b.textContent?.includes('Resilient connection pooling'),
       );
       if (docButton) {
@@ -186,7 +186,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
     const onLaunchWebResearchTask = vi.fn();
     await expectNoOverflowAt(375, async () => {
       await renderList(onLaunchWebResearchTask);
-      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
         b => b.textContent?.includes('Resilient connection pooling'),
       );
       if (docButton) {
@@ -266,7 +266,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
   test('detail view with finding-origin provenance renders without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       await renderList();
-      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
         b => b.textContent?.includes('Resilient connection pooling'),
       );
       if (docButton) {
@@ -281,7 +281,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
 
   test('compute_experiment detail view renders run provenance with execution location', async () => {
     await renderList();
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('CUDA driver smoke test'),
     );
     expect(docButton).toBeTruthy();
@@ -323,7 +323,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
     });
 
     await renderList();
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('CUDA driver smoke test'),
     );
     expect(docButton).toBeTruthy();
@@ -361,7 +361,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
     });
 
     await renderList();
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('CUDA driver smoke test'),
     );
     expect(docButton).toBeTruthy();
@@ -376,7 +376,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
 
   test('detail view renders provenance branch and sha when present', async () => {
     await renderList();
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('Resilient connection pooling'),
     );
     expect(docButton).toBeTruthy();
@@ -428,7 +428,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
         r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />);
       });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
         b => b.textContent?.includes('GPU benchmark with execution provenance'),
       );
       if (docButton) {

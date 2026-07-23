@@ -146,13 +146,13 @@ function runtimeProps(overrides: {
     onApproveExperiment: vi.fn(async () => {}),
     onDismissExperiment: vi.fn(async () => {}),
     onNavigateToKnowledge: vi.fn(),
+    addToast: vi.fn(),
     onRestartOrchestrator: vi.fn(async () => {}),
     versionLifecycle: null,
     versionLifecycleError: null,
     versionLifecycleLastSuccessAt: null,
     versionLifecycleRefreshing: false,
     refreshVersionLifecycle: vi.fn(async () => {}),
-    addToast: vi.fn(),
   };
 }
 

@@ -47,6 +47,7 @@ import {
   countHighSignalMessages,
   countNewSinceLastVisit,
   fetchBackendLastSeen,
+  type RoutineRow,
 } from './MessagesPanel.utils';
 
 vi.mock('../api', async () => {
@@ -407,8 +408,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     const rows = groupRoutineMessages(msgs);
 
     // m1 and m3 should be in the same group (even though m2 is between them)
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // Should have 0 groups (only 2 msgs of same type, below threshold) and 3 singles
     expect(groups.length).toBe(0);
@@ -425,8 +426,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     const rows = groupRoutineMessages(msgs);
 
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // Should have 1 group with all 3 consecutive msgs
     expect(groups.length).toBe(1);
@@ -442,8 +443,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     const rows = groupRoutineMessages(msgs);
 
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // 2 msgs is below the 3-msg threshold, so rendered as singles
     expect(groups.length).toBe(0);
@@ -470,8 +471,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     // m2 and m3 are on the same day and within 1 hour, should group
     // m1 is on a different day, should not group with m2/m3
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // m1 rendered as single, m2+m3 as single or group depending on other criteria
     // Since m2+m3 are only 2 msgs, they render as singles too
@@ -495,7 +496,7 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     // Actually, with rolling window: early (10:00), inwindow (10:30 within 1hr of early), outofwindow (11:05 within 1hr of inwindow at 10:30)
     // So yes, all 4 should be in same group since each is within 1hr of the previous
 
-    const groups = rows.filter(r => r.kind === 'group');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
     expect(groups.length).toBe(1);
     expect(groups[0].msgs.length).toBe(4);
   });
@@ -519,7 +520,11 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     // But output should maintain the message order, so between group and singles...
 
     // Let's verify the IDs are in a reasonable order
-    const ids = rows.map(r => (r.kind === 'group' ? `group(${r.msgs.map((m: TestMessage) => m.id).join(',')})` : r.msg.id));
+    const ids = rows.map(r => {
+      if (r.kind === 'group') return `group(${r.msgs.map((m: TestMessage) => m.id).join(',')})`;
+      if (r.kind === 'single') return r.msg.id;
+      return `digest(${r.day})`;
+    });
     expect(ids[0]).toBe('group(a1,a2,a3)'); // a1 group rendered first
     expect(ids[1]).toBe('b1');
     expect(ids[2]).toBe('c1');
@@ -534,7 +539,7 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     const rows = groupRoutineMessages(msgs);
 
-    const singles = rows.filter(r => r.kind === 'single');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
     expect(singles.length).toBe(3);
     expect(singles.map(s => s.msg.id)).toEqual(['m1', 'm2', 'm3']);
   });
@@ -552,7 +557,7 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     // m1, m2 are within 1 hour -> group 1 (but <3 so singles)
     // m3, m4 are within 1 hour -> group 2 (but <3 so singles)
     // All rendered as singles due to <3 threshold
-    const singles = rows.filter(r => r.kind === 'single');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
     expect(singles.length).toBe(4);
   });
 });
@@ -712,9 +717,12 @@ describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
     const rows = groupRoutineMessages([makeMsg('m1', 'pr_merged', msgTs)]);
     const collapsed = collapseStaleRoutineRows(rows);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0].kind).toBe('daily_digest');
-    expect(collapsed[0].count).toBe(1);
-    expect(collapsed[0].breakdown['pr_merged']).toBe(1);
+    const digest = collapsed[0];
+    expect(digest.kind).toBe('daily_digest');
+    if (digest.kind === 'daily_digest') {
+      expect(digest.count).toBe(1);
+      expect(digest.breakdown['pr_merged']).toBe(1);
+    }
   });
 
   it('(2) fresh burst of 3 routine messages within 30min stays as a 1h-window group', () => {
@@ -728,8 +736,11 @@ describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
     expect(rows[0].kind).toBe('group'); // sanity: 1h-window grouping fired
     const collapsed = collapseStaleRoutineRows(rows);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0].kind).toBe('group');
-    expect(collapsed[0].msgs).toHaveLength(3);
+    const groupRow = collapsed[0];
+    expect(groupRow.kind).toBe('group');
+    if (groupRow.kind === 'group') {
+      expect(groupRow.msgs).toHaveLength(3);
+    }
   });
 
   it('(3) high-signal event type older than threshold renders as single, not collapsed', () => {
@@ -737,8 +748,11 @@ describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
     const rows = groupRoutineMessages([makeMsg('m1', 'failure_alert', msgTs)]);
     const collapsed = collapseStaleRoutineRows(rows);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0].kind).toBe('single');
-    expect(collapsed[0].msg.id).toBe('m1');
+    const singleRow = collapsed[0];
+    expect(singleRow.kind).toBe('single');
+    if (singleRow.kind === 'single') {
+      expect(singleRow.msg.id).toBe('m1');
+    }
   });
 });
 
@@ -793,7 +807,9 @@ describe('Timezone correctness of day labels (naive backend UTC strings)', () =>
     const rows = groupRoutineMessages(msgs);
     expect(rows).toHaveLength(1);
     expect(rows[0].kind).toBe('group');
-    expect(rows[0].msgs).toHaveLength(3);
+    if (rows[0].kind === 'group') {
+      expect(rows[0].msgs).toHaveLength(3);
+    }
   });
 });
 

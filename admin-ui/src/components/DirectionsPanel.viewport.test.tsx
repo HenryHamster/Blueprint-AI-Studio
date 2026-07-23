@@ -242,7 +242,6 @@ const stressDir: Direction = {
   held: true, held_reason: 'Repeated CODE_ERROR failures exceeded the automatic hold threshold.', held_at: '2026-05-15T00:00:00Z', held_until: '2026-05-15T02:00:00Z',
   needs_manual_intervention: true, diagnosis_summary: stressStrings.errorSnippet, possibly_saturated: true,
   cost_by_provider_model: { 'anthropic|claude-opus-4-7': 38.5, 'anthropic|claude-sonnet-4-6': 8.7 },
-  merge_rate: 0.6,
   research_history: [{ timestamp: '2026-05-10T10:00:00Z', task_id: 'r1', tasks_created: 8,
     finding_titles: [stressStrings.shortTitle], key_finding_descriptions: [stressStrings.errorSnippet] }],
 };

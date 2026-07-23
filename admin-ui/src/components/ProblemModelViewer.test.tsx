@@ -44,6 +44,10 @@ function makeProblemModel(overrides: Partial<ProblemModel> = {}): ProblemModel {
         description: 'When a generated URL or API shape mismatches, the agent retries from scratch.',
         priority: 'high',
         size: 'large',
+        status: 'active' as const,
+        active_moves: [],
+        past_moves: [],
+        history: [],
       },
       {
         id: 'gap-2',
@@ -51,6 +55,10 @@ function makeProblemModel(overrides: Partial<ProblemModel> = {}): ProblemModel {
         description: 'Creating viewport tests occasionally introduces unrelated changes.',
         priority: 'medium',
         size: 'medium',
+        status: 'active' as const,
+        active_moves: [],
+        past_moves: [],
+        history: [],
       },
     ],
     friction: [],
@@ -104,7 +112,7 @@ describe('ProblemModelViewer — gap-card callback wiring', () => {
     await act(async () => { spawnBtn!.click(); });
 
     expect(onSpawnDirection).toHaveBeenCalledTimes(1);
-    expect(onSpawnDirection).toHaveBeenCalledWith(pm.gaps[0].id, pm.gaps[0].name);
+    expect(onSpawnDirection).toHaveBeenCalledWith(pm.gaps![0].id, pm.gaps![0].name);
   });
 
   test('clicking second gap Spawn direction passes the second gap id and name', async () => {
@@ -130,7 +138,7 @@ describe('ProblemModelViewer — gap-card callback wiring', () => {
     expect(spawnBtns.length).toBeGreaterThanOrEqual(2);
     await act(async () => { spawnBtns[1].click(); });
 
-    expect(onSpawnDirection).toHaveBeenCalledWith(pm.gaps[1].id, pm.gaps[1].name);
+    expect(onSpawnDirection).toHaveBeenCalledWith(pm.gaps![1].id, pm.gaps![1].name);
   });
 
   test('selecting a direction in GapLinkSelect invokes onLinkDirection with (directionId, gapId)', async () => {
@@ -164,7 +172,7 @@ describe('ProblemModelViewer — gap-card callback wiring', () => {
     });
 
     expect(onLinkDirection).toHaveBeenCalledTimes(1);
-    expect(onLinkDirection).toHaveBeenCalledWith('d-def67890', pm.gaps[0].id);
+    expect(onLinkDirection).toHaveBeenCalledWith('d-def67890', pm.gaps![0].id);
   });
 
   test('selecting first direction in GapLinkSelect passes the first direction id', async () => {
@@ -198,7 +206,7 @@ describe('ProblemModelViewer — gap-card callback wiring', () => {
     });
 
     expect(onLinkDirection).toHaveBeenCalledTimes(1);
-    expect(onLinkDirection).toHaveBeenCalledWith('d-first-111', pm.gaps[0].id);
+    expect(onLinkDirection).toHaveBeenCalledWith('d-first-111', pm.gaps![0].id);
   });
 
   test('selecting placeholder (empty) option in GapLinkSelect does not invoke onLinkDirection', async () => {

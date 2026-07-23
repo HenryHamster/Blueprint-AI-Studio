@@ -261,7 +261,7 @@ describe('NewProjectModal — viewport regression', () => {
     };
     onboardProjectMock.mockResolvedValueOnce({
       project_id: 'project-12345',
-      build_config: { language: 'python', directories: [{ path: 'backend/', test_cmd: 'pytest' }] },
+      build_config: { language: 'python', directories: [{ path: 'backend/', type: 'python', test_cmd: 'pytest' }] },
       default_branch: 'main',
       merge_verification_verdict: verdict,
     });

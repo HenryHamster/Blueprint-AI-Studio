@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { act } from 'react';
 import { LaneDiagPanel } from './LaneDiagPanel';
+import type { LaneBaselinesResponse } from '../api/strategic';
 
 const mockLaneDiagResponse = {
   pr_count: 5,
@@ -70,7 +71,7 @@ const mockLaneDiagResponse = {
   },
 };
 
-const mockBaselinesResponse = {
+const mockBaselinesResponse: LaneBaselinesResponse = {
   project_id: 'project-1',
   count: 2,
   baselines: [],
@@ -114,7 +115,7 @@ const { apiFetch, fetchLaneBaselines } = vi.hoisted(() => ({
   apiFetch: vi.fn(async () => {
     return new Response(JSON.stringify(mockLaneDiagResponse), { status: 200 });
   }),
-  fetchLaneBaselines: vi.fn(async () => mockBaselinesResponse),
+  fetchLaneBaselines: vi.fn(async (): Promise<LaneBaselinesResponse> => mockBaselinesResponse),
 }));
 
 vi.mock('../api', () => ({

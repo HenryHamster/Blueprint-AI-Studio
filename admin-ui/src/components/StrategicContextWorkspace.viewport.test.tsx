@@ -217,17 +217,8 @@ describe('StrategicContextWorkspace — viewport regression', () => {
         <StrategicContextWorkspace
           open
           state={STATE}
-          accountSpend={{
-            totalAccounts: 4,
-            availableAccounts: 3,
-            enabledAccounts: 4,
-            trackedSpendUsd: 18.42,
-          }}
           onClose={vi.fn()}
           onOpenTarget={vi.fn()}
-          onModeChange={vi.fn()}
-          onCheckIn={vi.fn()}
-          onOpenAccounts={vi.fn()}
           onUpdateSessionRefs={vi.fn()}
         />,
       );

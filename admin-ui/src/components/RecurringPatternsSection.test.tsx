@@ -22,7 +22,7 @@ describe('RecurringPatternsSection', () => {
         example_message: 'Error message',
         affected_direction_count: 2,
         affected_directions: [],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
       {
         fingerprint: 'fp-2',
@@ -30,7 +30,7 @@ describe('RecurringPatternsSection', () => {
         example_message: 'Another error',
         affected_direction_count: 1,
         affected_directions: [],
-        remediation_status: 'investigating',
+        remediation_status: 'investigating' as const,
       },
     ];
 
@@ -118,7 +118,7 @@ describe('RecurringPatternsSection', () => {
         example_message: longMessage,
         affected_direction_count: 0,
         affected_directions: [],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 
@@ -142,7 +142,7 @@ describe('RecurringPatternsSection', () => {
         example_message: message,
         affected_direction_count: 0,
         affected_directions: [],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 
@@ -165,7 +165,7 @@ describe('RecurringPatternsSection', () => {
         example_message: 'Error',
         affected_direction_count: 0,
         affected_directions: [],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 
@@ -191,7 +191,7 @@ describe('RecurringPatternsSection', () => {
           { direction_id: 'dir-2', direction_text: 'Direction Two' },
           { direction_id: 'dir-3', direction_text: 'Direction Three' },
         ],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 
@@ -223,7 +223,7 @@ describe('RecurringPatternsSection', () => {
           { direction_id: 'dir-5', direction_text: 'Direction Five' },
           { direction_id: 'dir-6', direction_text: 'Direction Six' },
         ],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 
@@ -253,7 +253,7 @@ describe('RecurringPatternsSection', () => {
         affected_directions: [
           { direction_id: 'dir-123', direction_text: 'Test Direction' },
         ],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 
@@ -280,7 +280,7 @@ describe('RecurringPatternsSection', () => {
         affected_directions: [
           { direction_id: 'dir-123', direction_text: '' },
         ],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 
@@ -325,7 +325,7 @@ describe('RecurringPatternsSection', () => {
         example_message: null,
         affected_direction_count: 0,
         affected_directions: [],
-        remediation_status: 'unaddressed',
+        remediation_status: 'unaddressed' as const,
       },
     ];
 

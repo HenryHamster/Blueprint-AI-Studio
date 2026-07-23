@@ -272,7 +272,7 @@ describe('MessagesPanel — viewport regression', () => {
             last_interaction_at: null,
           },
           design: { has_design_doc: false, revision: null },
-        } as StrategicStateResponse,
+        } as unknown as StrategicStateResponse,
       });
     });
 
@@ -318,7 +318,7 @@ describe('MessagesPanel — viewport regression', () => {
             sources: [],
             drilldowns: [],
           },
-        } as StrategicStateResponse,
+        } as unknown as StrategicStateResponse,
         onOpenCommandPalette: vi.fn(),
       });
     });

@@ -238,7 +238,8 @@ describe('ActivityFeed — viewport regression', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    if (searchInput.value !== '') {
+    const clearedValue: string = searchInput.value;
+    if (clearedValue !== '') {
       throw new Error('Search input did not clear');
     }
     const restoredText = host?.textContent ?? '';

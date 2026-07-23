@@ -5,10 +5,10 @@ import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import type { Task } from '../types/task';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
-const apiFetchMock = vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }));
+const apiFetchMock = vi.fn<(...args: unknown[]) => Promise<Response>>(async () => new Response(JSON.stringify({}), { status: 200 }));
 
 vi.mock('../api', () => ({
-  apiFetch: (...args: unknown[]) => apiFetchMock(...(args as [])),
+  apiFetch: (...args: unknown[]) => apiFetchMock(...args),
 }));
 
 const richTask: Task = {

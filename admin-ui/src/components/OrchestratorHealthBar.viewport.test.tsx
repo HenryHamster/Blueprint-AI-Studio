@@ -1,6 +1,6 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react';
+import { act, type ComponentProps } from 'react';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
@@ -12,7 +12,7 @@ vi.mock('../api', () => ({
   apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
 }));
 
-const baseProps = {
+const baseProps: ComponentProps<typeof OrchestratorHealthBar> = {
   health: {
     last_cycle_seconds_ago: 132,
     // Progress-based liveness: genuinely wedged worst-case (red/down dot with
@@ -75,9 +75,9 @@ const baseProps = {
   wsConnected: false,
   lastFetchTime: Date.UTC(2026, 4, 7, 0, 0, 0),
   tasks: [
-    { id: 'task-1', status: 'IN_PROGRESS', last_heartbeat: '2026-05-06T23:40:00Z' },
-    { id: 'task-2', status: 'IN_PROGRESS', last_heartbeat: '2026-05-06T22:30:00Z' },
-    { id: 'task-3', status: 'QUEUED', last_heartbeat: null },
+    { id: 'task-1', title: 'Task 1', description: '', status: 'IN_PROGRESS' as const, created_by: 'test', requires_approval: false, created_at: '2026-05-06T00:00:00Z', last_heartbeat: '2026-05-06T23:40:00Z' },
+    { id: 'task-2', title: 'Task 2', description: '', status: 'IN_PROGRESS' as const, created_by: 'test', requires_approval: false, created_at: '2026-05-06T00:00:00Z', last_heartbeat: '2026-05-06T22:30:00Z' },
+    { id: 'task-3', title: 'Task 3', description: '', status: 'QUEUED' as const, created_by: 'test', requires_approval: false, created_at: '2026-05-06T00:00:00Z', last_heartbeat: undefined },
   ],
   pipelineThrottle: {
     reason: 'deploy',
@@ -170,7 +170,7 @@ describe('OrchestratorHealthBar — viewport regression', () => {
       json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0 }),
     } as Response);
 
-    const pausedProps = {
+    const pausedProps: ComponentProps<typeof OrchestratorHealthBar> = {
       ...baseProps,
       health: {
         last_cycle_seconds_ago: 5,
@@ -184,6 +184,7 @@ describe('OrchestratorHealthBar — viewport regression', () => {
         deploy_state: {
           status: 'PAUSED',
           rollback_count: 0,
+          rollback_reason: null,
           pause_reason: 'External dependency temporarily unavailable',
           monitoring_since: '2026-05-06T20:00:00Z',
           recent_outcomes: [],

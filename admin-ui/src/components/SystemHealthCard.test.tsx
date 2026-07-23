@@ -6,9 +6,11 @@ import type { Task } from '../types/task';
 const mockTask: Task = {
   id: 'task-1',
   title: 'Test Task',
-  status: 'completed',
+  description: '',
+  status: 'COMPLETED',
+  created_by: 'test',
+  requires_approval: false,
   created_at: '2024-01-01',
-  updated_at: '2024-01-01',
 };
 
 const mockHealthyResponse: HealthOverviewResponse = {

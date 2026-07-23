@@ -103,7 +103,7 @@ describe('NewTaskModal — Draft contract', () => {
     computeExperiment = makeComputeExperiment();
     setComputeExperiment = vi.fn().mockImplementation((updater: unknown) => {
       if (typeof updater === 'function') {
-        computeExperiment = updater(computeExperiment);
+        computeExperiment = (updater as (prev: ComputeExperimentForm) => ComputeExperimentForm)(computeExperiment);
       } else {
         computeExperiment = updater as ComputeExperimentForm;
       }

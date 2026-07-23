@@ -34,7 +34,7 @@ describe('ProjectAutoReviewSection — viewport regression', () => {
   let host: HTMLDivElement | null = null;
 
   afterEach(() => {
-    if (root) { act(() => root.unmount()); root = null; }
+    if (root) { const r = root; act(() => r.unmount()); root = null; }
     if (host) { host.remove(); host = null; }
   });
 

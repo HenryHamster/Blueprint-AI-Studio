@@ -312,7 +312,7 @@ describe('FleetRunnersPanel — behavioral', () => {
   });
 
   test('enroll snippet targets the API base URL, not the admin-UI hosting origin', async () => {
-    const clipboardWrite = vi.fn(async () => {});
+    const clipboardWrite = vi.fn<(text: string) => Promise<void>>(async () => {});
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText: clipboardWrite },
@@ -331,12 +331,12 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(psCopyBtn).not.toBeNull();
 
     await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
-    const shellSnippet = clipboardWrite.mock.calls.at(-1)?.[0] as string;
+    const shellSnippet = clipboardWrite.mock.calls.at(-1)?.[0];
     expect(shellSnippet).toContain(`--url '${API_BASE_URL_FIXTURE}'`);
     expect(shellSnippet).not.toContain(window.location.origin);
 
     await act(async () => { (psCopyBtn as HTMLButtonElement).click(); });
-    const psSnippet = clipboardWrite.mock.calls.at(-1)?.[0] as string;
+    const psSnippet = clipboardWrite.mock.calls.at(-1)?.[0];
     expect(psSnippet).toContain(`--url '${API_BASE_URL_FIXTURE}'`);
     expect(psSnippet).not.toContain(window.location.origin);
   });

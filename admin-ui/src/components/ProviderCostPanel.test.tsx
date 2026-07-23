@@ -13,9 +13,9 @@ vi.mock('../api', () => ({
 // ProviderCostPanel also calls useEfficiencySnapshot, which issues its own
 // apiFetch on a separate poll interval. Stub it so apiFetch call-count
 // assertions reflect only the provider-cost-summary endpoint.
-const mockUseEfficiencySnapshot = vi.fn(() => null);
+const mockUseEfficiencySnapshot = vi.fn<() => unknown>(() => null);
 vi.mock('../hooks/useEfficiencySnapshot', () => ({
-  useEfficiencySnapshot: (...args: unknown[]) => mockUseEfficiencySnapshot(...args),
+  useEfficiencySnapshot: () => mockUseEfficiencySnapshot(),
   fmtEffSecs: () => '—',
   fmtEffRate: () => '—',
   fmtEffIter: () => '—',

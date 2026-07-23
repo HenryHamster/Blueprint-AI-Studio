@@ -299,7 +299,7 @@ describe('useWorkbenchCommands', () => {
           strategic: { cycles_completed: 0 },
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, markStrategicChecked, setCommandPaletteOpen });
 
@@ -401,7 +401,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({
       strategicState,
@@ -560,7 +560,7 @@ describe('useWorkbenchCommands', () => {
         ],
         commands,
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({
       strategicState,
@@ -1045,7 +1045,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, openStrategicContextTarget, setCommandPaletteOpen });
 
@@ -1249,7 +1249,7 @@ describe('useWorkbenchCommands', () => {
           },
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
     const strategicWorkbenchState = {
       version: 1,
       interaction_mode: 'continuous',
@@ -1361,7 +1361,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, updateStrategicSessionRefs });
 
@@ -1402,7 +1402,7 @@ describe('useWorkbenchCommands', () => {
           edges: [],
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, updateStrategicSessionRefs });
 
@@ -1465,7 +1465,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, openStrategicContextTarget, openStrategicMessageTarget, setCommandPaletteOpen });
 
@@ -1564,7 +1564,7 @@ describe('useWorkbenchCommands', () => {
           },
         },
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, openStrategicMessageTarget, openStrategicContextTarget, setCommandPaletteOpen });
 
@@ -1639,7 +1639,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, openStrategicContextTarget, openStrategicMessageTarget, setCommandPaletteOpen });
 
@@ -1672,7 +1672,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, openStrategicContextTarget, setCommandPaletteOpen });
 
@@ -1726,7 +1726,7 @@ describe('useWorkbenchCommands', () => {
     ];
     const strategicState = {
       work_session: { actions },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, openStrategicContextTarget });
 
@@ -1811,7 +1811,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     mount({ strategicState, openStrategicContextTarget, setCommandPaletteOpen });
 
@@ -1929,7 +1929,7 @@ describe('useWorkbenchCommands', () => {
     }
 
     const shortcutOwners = captured
-      .filter(command => command.shortcut)
+      .filter((command): command is typeof command & { shortcut: string } => Boolean(command.shortcut))
       .map(command => [command.shortcut, command.id]);
     expect(new Set(shortcutOwners.map(([shortcut]) => shortcut)).size).toBe(shortcutOwners.length);
     expect(Object.fromEntries(shortcutOwners.map(([shortcut, commandId]) => [shortcut.toLowerCase(), commandId])))
@@ -2099,7 +2099,7 @@ describe('useWorkbenchCommands', () => {
           },
         ],
       },
-    } as StrategicStateResponse;
+    } as unknown as StrategicStateResponse;
 
     expect(() => mount({ strategicState, openStrategicContextTarget })).not.toThrow();
     const stringCmd = captured.find(command => command.id === 'strategic.session.metric.metric.string_value');
