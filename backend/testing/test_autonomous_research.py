@@ -40,6 +40,7 @@ from app.autonomous_spawn_budget import (
 )
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
+from app.direction_metrics import _compute_direction_quality_score
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 from app.capability_demand import collect_missing_capability_demand
 from app.payload_schemas import validate_internal_payload
@@ -11069,29 +11070,14 @@ def _history_entry(
     }
 
 
-def _load_quality_score():
-    """Sibling cluster (cluster 1/2) adds _compute_direction_quality_score.
-    Skip until it lands so this cluster can merge independently."""
-    pytest.importorskip("app.direction_metrics")
-    import app.direction_metrics as dm
-
-    if not hasattr(dm, "_compute_direction_quality_score"):
-        pytest.skip(
-            "_compute_direction_quality_score not yet available (sibling cluster pending)"
-        )
-    return dm._compute_direction_quality_score
-
-
 def test_quality_score_neutral_for_new_direction():
     """A direction with no history returns the neutral 0.5 sentinel."""
-    compute = _load_quality_score()
-    assert compute({}) == 0.5
-    assert compute({"research_history": []}) == 0.5
+    assert _compute_direction_quality_score({}) == 0.5
+    assert _compute_direction_quality_score({"research_history": []}) == 0.5
 
 
 def test_quality_score_high_for_actionable_taxonomy():
     """Failures dominated by code_defect/scope_related yield a healthy score."""
-    _compute_direction_quality_score = _load_quality_score()
     d = {
         "research_history": [
             _history_entry(tasks_created=3, prs_merged=2, code_defect=3),
@@ -11108,7 +11094,6 @@ def test_quality_score_high_for_actionable_taxonomy():
 
 def test_quality_score_low_for_structural_taxonomy():
     """Failures dominated by infra_related/review_quality yield a poor score."""
-    _compute_direction_quality_score = _load_quality_score()
     d = {
         "research_history": [
             _history_entry(tasks_created=3, prs_merged=0, infra_related=3),
@@ -11125,7 +11110,6 @@ def test_quality_score_low_for_structural_taxonomy():
 
 def test_quality_score_penalizes_wasted_cycles():
     """Cycles where tasks are created but nothing merges reduce the score."""
-    _compute_direction_quality_score = _load_quality_score()
     healthy = {
         "research_history": [
             _history_entry(tasks_created=2, prs_merged=2, code_defect=1),
@@ -11147,7 +11131,6 @@ def test_quality_score_penalizes_wasted_cycles():
 
 def test_quality_score_penalizes_scope_dominated_failures():
     """When scope_related failures dominate (>50%), the score signals mis-sizing."""
-    _compute_direction_quality_score = _load_quality_score()
     balanced = {
         "research_history": [
             _history_entry(
@@ -11170,7 +11153,6 @@ def test_quality_score_penalizes_scope_dominated_failures():
 @pytest.mark.asyncio
 async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
     """With equivalent productivity, the direction with healthier taxonomy wins selection."""
-    _load_quality_score()  # skip unless sibling integration has landed
     from app.shared_state import runtime_config as _runtime_config
 
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)

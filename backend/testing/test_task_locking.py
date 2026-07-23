@@ -2238,5 +2238,12 @@ async def test_projection_lock_undoes_downgrade_on_error_path(db_session):
     # below lazy-load outside the greenlet and raise MissingGreenlet.
     await db_session.refresh(project)
 
-    assert project.directions == [{"id": "d1", "status": "active"}]
     assert project.design_doc == {"proposed_changes": []}
+    assert project.directions == [{"id": "d1", "status": "active"}]
+
+
+def test_with_lane_baseline_locked_removed():
+    """Dead-code guard: with_lane_baseline_locked was removed (stale .data column)."""
+    import app.task_locking as task_locking_module
+
+    assert not hasattr(task_locking_module, "with_lane_baseline_locked")

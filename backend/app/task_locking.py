@@ -796,48 +796,6 @@ async def with_efficiency_snapshot_locked(
         return True
 
 
-async def with_lane_baseline_locked(
-    session: AsyncSession,
-    project_id,
-    mutate_fn: Callable[[dict], None],
-    *,
-    skip_locked: bool = False,
-) -> bool:
-    """Atomic read-modify-write of ProjectLaneBaseline.data.
-
-    Mirrors with_design_doc_locked but targets the dedicated lane baseline
-    row. Acquires SELECT FOR UPDATE on the ProjectLaneBaseline row (inserting
-    an empty row first if none exists), calls mutate_fn with the data dict,
-    then writes the result back.
-    """
-    from app.models import ProjectLaneBaseline
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-    await session.execute(
-        pg_insert(ProjectLaneBaseline)
-        .values(project_id=project_id, data={}, updated_at=func.now())
-        .on_conflict_do_nothing()
-    )
-
-    stmt = (
-        select(ProjectLaneBaseline)
-        .where(ProjectLaneBaseline.project_id == project_id)
-        .with_for_update(skip_locked=skip_locked)
-    )
-    result = await session.execute(stmt)
-    lb_row = result.scalar_one_or_none()
-    if lb_row is None:
-        return False
-
-    data = dict(lb_row.data or {})
-    mutate_fn(data)
-    lb_row.data = data
-    lb_row.updated_at = func.now()
-    flag_modified(lb_row, "data")
-    session.add(lb_row)
-    return True
-
-
 async def with_sr_analytics_locked(
     session: AsyncSession,
     project_id,

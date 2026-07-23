@@ -593,9 +593,6 @@ class TestBalancedSuccessRateSelection:
                 _account_by_id.pop(high_success_id, None)
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        strict=False, reason="Balanced success-rate tiebreak added by cluster 1/2"
-    )
     async def test_equal_load_high_sample_high_success_wins(self):
         """Among healthy candidates with equal active_tasks, the account with a
         materially higher 7d success rate should be selected over one with a low
