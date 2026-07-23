@@ -6495,14 +6495,19 @@ async def test_orphan_projects_batch_expired_after_rollback_guard_re_fetches(
     """
     project = await _make_project(reaper_db)
 
-    # Two research-type orphans sharing the same project.
+    # Two research-type orphans sharing the same project.  Research/plan are
+    # thinking-heavy task types, whose heartbeat-stale cutoff is floored at
+    # _THINKING_HEAVY_PROGRESS_STALE_SECONDS (1500s / 25 min) — a live agent may
+    # legitimately go silent for 20+ min mid-reasoning (b2410541 incident). The
+    # heartbeat must therefore be older than that floor for these orphans to be
+    # classified for reaping and reach the research-retry guard this test targets.
     poison = Task(
         project_id=project.id,
         payloads=[{"type": "research"}],
         vm_instance_id="vm-poison-research",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
     )
     healthy = Task(
         project_id=project.id,
@@ -6510,7 +6515,7 @@ async def test_orphan_projects_batch_expired_after_rollback_guard_re_fetches(
         vm_instance_id="vm-healthy-research",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(poison)
     reaper_db.add(healthy)

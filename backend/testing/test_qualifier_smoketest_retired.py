@@ -74,8 +74,13 @@ def test_ci_red_and_pending_remain_hard_blockers():
 
 def test_ordinary_post_promotion_smoke_handler_remains():
     lifecycle = (APP_ROOT / "task_lifecycle.py").read_text(encoding="utf-8")
-    agent = AGENT_HANDLER.read_text(encoding="utf-8")
     assert "post-promotion" in lifecycle
     assert 'get("smoketest_enabled")' in lifecycle
+    # The agent tree is not present in the backend-only Docker test context;
+    # gate the handler-side assertions on its availability (matches the
+    # convention used across test_ci_compliance_gate / test_efficiency_snapshot).
+    if not AGENT_HANDLER.exists():
+        pytest.skip("agent/src not available in this test environment")
+    agent = AGENT_HANDLER.read_text(encoding="utf-8")
     assert "export async function handleSmoketest" in agent
     assert "qualifierSmoketest" not in agent
