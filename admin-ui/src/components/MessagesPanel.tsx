@@ -1596,9 +1596,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       const requestOffset = loadingOlderTriage
         ? triageOffsetRef.current + TRIAGE_PAGE_SIZE
         : 0;
-      const requestLimit = loadingOlderTriage
-        ? TRIAGE_PAGE_SIZE
-        : Math.min(200, TRIAGE_PAGE_SIZE + triageOffsetRef.current);
+      const requestLimit = TRIAGE_PAGE_SIZE;
       const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: String(requestLimit) });
       if (requestOffset > 0) params.set('offset', String(requestOffset));
       if (searchQuery.trim()) params.set('q', searchQuery.trim());

@@ -1703,9 +1703,144 @@ describe('MessagesPanel chrome modes', () => {
     await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
     await waitFor(() => {
       expect(_messagesGetCalls().map(call => String(call[0]))
-        .some(url => url.includes('limit=200') && !url.includes('offset='))).toBe(true);
+        .some(url => url.includes('limit=30') && !url.includes('offset='))).toBe(true);
       expect([...el.querySelectorAll('button')]
         .some(candidate => candidate.textContent === 'Load older messages')).toBe(false);
+    });
+  });
+
+  test('needsActionOnly defaults to true and resets on project switch', async () => {
+    // msg-a: in strategicState needs_operator attention items → appears when needsActionOnly=true
+    // msg-b: NOT in attention items → hidden when needsActionOnly=true, visible when false
+    const msgA = makeMsg({
+      id: 'msg-a',
+      message_type: 'QUESTION',
+      from_type: 'agent',
+      content: 'action-required message',
+      project_id: 'proj-1',
+    });
+    const msgB = makeMsg({
+      id: 'msg-b',
+      message_type: 'QUESTION',
+      from_type: 'agent',
+      content: 'non-operator message',
+      project_id: 'proj-1',
+    });
+
+    const proj1State = makeStrategicState({
+      project_id: 'proj-1',
+      attention: {
+        level: 'needs_operator',
+        summary: '1 item needs action',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 1,
+          watch: 0,
+          unread: 0,
+          questions: 1,
+          blockers: 0,
+          approvals: 0,
+          manual_directions: 0,
+          failed_tasks: 0,
+          blocked_tasks: 0,
+          parked_tasks: 0,
+        },
+        items: [
+          {
+            id: 'message:msg-a',
+            kind: 'message' as const,
+            severity: 'needs_operator' as const,
+            reason: 'question',
+            label: 'Question waiting',
+            ref: { kind: 'message' as const, id: 'msg-a', project_id: 'proj-1' },
+          },
+        ],
+      },
+    });
+
+    // Phase 1: default state — filter bar visible, "Needs action" pressed, msg-b absent
+    const el = await renderPanel({ strategicState: proj1State }, [msgA, msgB]);
+
+    const filterBar = el.querySelector('[data-testid="needs-action-filter-bar"]');
+    expect(filterBar).not.toBeNull(); // usesStrategicReadModel=true → bar rendered
+
+    const needsActionBtn = el.querySelector<HTMLButtonElement>('[data-testid="needs-action-filter-needs-action"]');
+    const showAllBtn = el.querySelector<HTMLButtonElement>('[data-testid="needs-action-filter-show-all"]');
+    expect(needsActionBtn).not.toBeNull();
+    expect(showAllBtn).not.toBeNull();
+
+    // needsActionOnly defaults to true
+    expect(needsActionBtn!.getAttribute('aria-pressed')).toBe('true');
+    expect(showAllBtn!.getAttribute('aria-pressed')).toBe('false');
+
+    // Only msg-a (in needsOperatorIds) appears in the message list; msg-b is filtered out
+    expect(el.querySelector('[data-message-id="msg-a"]')).not.toBeNull();
+    expect(el.querySelector('[data-message-id="msg-b"]')).toBeNull();
+
+    // Phase 2: click "Show all" → needsActionOnly=false → msg-b becomes visible
+    await act(async () => { showAllBtn!.click(); });
+
+    expect(needsActionBtn!.getAttribute('aria-pressed')).toBe('false');
+    expect(showAllBtn!.getAttribute('aria-pressed')).toBe('true');
+    expect(el.querySelector('[data-message-id="msg-b"]')).not.toBeNull();
+
+    // Phase 3: switch to proj-2 → needsActionOnly resets to true
+    const proj2State = makeStrategicState({ project_id: 'proj-2' });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-2');
+    _setupApiFetchMock({ defaultMessages: [] });
+
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId="proj-2"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          strategicState={proj2State}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // After project switch, needsActionOnly is reset to true
+    const needsActionBtnAfter = el.querySelector<HTMLButtonElement>('[data-testid="needs-action-filter-needs-action"]');
+    const showAllBtnAfter = el.querySelector<HTMLButtonElement>('[data-testid="needs-action-filter-show-all"]');
+    expect(needsActionBtnAfter!.getAttribute('aria-pressed')).toBe('true');
+    expect(showAllBtnAfter!.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  test('test_triage_poll_request_window_is_constant_after_load_older', async () => {
+    // Regression: after load-older, the poll used TRIAGE_PAGE_SIZE + triageOffset
+    // (growing to 200) instead of the constant TRIAGE_PAGE_SIZE. Every poll tick
+    // should always request exactly TRIAGE_PAGE_SIZE messages from offset=0.
+    const page = (prefix: string, length = 30) => Array.from({ length }, (_, index) => makeMsg({
+      id: `${prefix}-${index}`,
+      content: `${prefix} message ${index}`,
+    }));
+    const pages = [page('initial'), page('older'), page('poll-after-load-older')];
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _setupApiFetchMock({ messagesQueue: pages, messageTotalsQueue: [60, 60, 60] });
+    const el = await mountPanel();
+
+    const loadOlder = await waitFor(() => {
+      const button = [...el.querySelectorAll('button')]
+        .find(candidate => candidate.textContent === 'Load older messages');
+      expect(button).toBeDefined();
+      return button as HTMLButtonElement;
+    });
+    await act(async () => { loadOlder.click(); });
+
+    await waitFor(() => {
+      expect(_messagesGetCalls().map(call => String(call[0]))
+        .some(url => url.includes('offset=30') && url.includes('limit=30'))).toBe(true);
+    });
+
+    // Trigger a normal poll after load-older; it must use limit=30, not limit=60.
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+    await waitFor(() => {
+      const pollUrls = _messagesGetCalls().map(call => String(call[0]));
+      const normalPolls = pollUrls.filter(url => !url.includes('offset='));
+      expect(normalPolls.every(url => url.includes('limit=30'))).toBe(true);
+      expect(normalPolls.some(url => url.includes('limit=60') || url.includes('limit=200'))).toBe(false);
     });
   });
 });

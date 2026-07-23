@@ -105,6 +105,8 @@ export const ROUTINE_EVENT_LABELS: Record<string, string> = {
   review_feedback: 'review feedback',
   feedback_acknowledgment: 'feedback acks',
   'operator_decision.capture_rate_low': 'op-decision capture rate',
+  'operator_decision.summary_absent': 'op-decision summary absent',
+  'notification.dead_letter_lost': 'notification failures',
 };
 
 // Event types that the server stamps as audience=strategist-internal. All entries
