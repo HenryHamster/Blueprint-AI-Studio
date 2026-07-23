@@ -4014,3 +4014,79 @@ class TestCiInfraFlakeLogSignatures:
             },
         )
         assert classify_failure(t) == BLOCKED_PRECONDITION
+
+
+class TestSmoketestClaudeCodeFailedClassification:
+    """Smoketest tasks that crash with a generic code-error label (e.g.
+    claude_code_failed) are infrastructure failures — the deployed engine
+    is stale or in a deadlock — not code defects in the candidate. They
+    must route to PROVISION_FAILURE so pipeline health dashboards reflect
+    accurate failure patterns, not inflated CODE_ERROR counts."""
+
+    def _smoketest(self, msg: str = "", ctx: dict | None = None) -> Task:
+        t = _task(msg, ctx)
+        t.first_payload = {"type": "smoketest"}
+        return t
+
+    def test_smoketest_claude_code_failed_is_provision_failure(self):
+        """classify_failure must route a smoketest with claude_code_failed
+        to PROVISION_FAILURE (infrastructure failure, not code defect)."""
+        t = self._smoketest(
+            "Claude subprocess exited with code 1",
+            {"failure_category": "claude_code_failed"},
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_normal_task_claude_code_failed_stays_code_error(self):
+        """Regression: a create task with claude_code_failed must still be
+        CODE_ERROR — the distinction is task-type-scoped."""
+        t = _task(
+            "Claude subprocess exited with code 1",
+            {"failure_category": "claude_code_failed"},
+        )
+        t.first_payload = {"type": "create"}
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_smoketest_normalize_agent_category_routes_to_provision_failure(self):
+        """normalize_agent_failure_category must also route the smoketest
+        claude_code_failed to PROVISION_FAILURE."""
+        t = self._smoketest("Claude subprocess exited with code 1")
+        assert (
+            normalize_agent_failure_category("claude_code_failed", t)
+            == PROVISION_FAILURE
+        )
+
+    def test_normal_task_normalize_agent_category_stays_code_error(self):
+        """Regression: normalize_agent_failure_category must not route a
+        create task with claude_code_failed to PROVISION_FAILURE."""
+        t = _task("Claude subprocess exited with code 1")
+        t.first_payload = {"type": "create"}
+        assert (
+            normalize_agent_failure_category("claude_code_failed", t)
+            == CODE_ERROR
+        )
+
+    def test_smoketest_specific_label_not_overridden(self):
+        """A smoketest with a specific agent label (test_failed) is an
+        authoritative verdict about the work — must NOT be overridden."""
+        t = self._smoketest(
+            "pytest failed",
+            {"failure_category": "test_failed"},
+        )
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_smoketest_no_agent_category_falls_through(self):
+        """A smoketest without a failure_category in context still falls
+        through to text classification normally."""
+        t = self._smoketest("AssertionError: expected 1 got 2")
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_smoketest_no_first_payload_does_not_crash(self):
+        """A smoketest-like task without first_payload set must not crash
+        the classifier — degrades gracefully to CODE_ERROR."""
+        t = _task(
+            "Claude subprocess exited with code 1",
+            {"failure_category": "claude_code_failed"},
+        )
+        # first_payload not explicitly set on the mock
+        assert classify_failure(t) == CODE_ERROR

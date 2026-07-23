@@ -179,9 +179,11 @@ def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
             "strategic_review": {"anthropic": {"effort": "max"}},
         }
         now = datetime(2026, 1, 1, 12, 0, 0)
-        # strategic_review override sets effort=max → 720s floor overrides the
-        # 300s small-scope threshold.
-        assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=720)
+        # strategic_review: effort=max gives 720s effort floor, but the thinking-heavy
+        # task-type floor (1500s) wins — heartbeat window must be at least as wide as
+        # the progress-stale window so a live-but-thinking agent isn't heartbeat-reaped
+        # before its progress-stale budget expires.
+        assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=1500)
     finally:
         if original_overrides is None:
             _runtime_config.pop("task_type_provider_overrides", None)
@@ -198,6 +200,47 @@ def test_heartbeat_stale_cutoff_unknown_effort_uses_scope_threshold():
 
     class _T:
         context = {"scope": "small", "effort": "unknown_effort_xyz"}  # noqa: RUF012
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=300)
+
+
+def test_heartbeat_stale_cutoff_thinking_heavy_type_raises_floor_to_1500s():
+    """Thinking-heavy task types get a 1500s heartbeat floor matching their progress-stale window.
+
+    A research/plan/investigate task with a small-scope heartbeat cutoff (300s) or
+    medium-effort floor (300s) would be heartbeat-reaped while it is legitimately deep
+    in a reasoning pass. The floor matches _THINKING_HEAVY_PROGRESS_STALE_SECONDS so
+    the heartbeat and progress-stale windows are co-incident.
+    """
+
+    class _T:
+        context = {"scope": "small", "type": "research"}  # noqa: RUF012
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    # Small-scope default is 300s; thinking-heavy floor raises it to 1500s.
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=1500)
+
+
+def test_heartbeat_stale_cutoff_thinking_heavy_does_not_weaken_larger_cutoff():
+    """A large-scope task whose threshold already exceeds 1500s is not weakened."""
+
+    class _T:
+        context = {"scope": "large", "effort": "max", "type": "research"}  # noqa: RUF012
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    # large-scope=900s, max-effort floor=720s → max(900, 720, 1500) = 1500s.
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=1500)
+
+
+def test_heartbeat_stale_cutoff_non_thinking_type_unaffected():
+    """Non-thinking-heavy task types are not affected by the thinking-heavy floor."""
+
+    class _T:
+        context = {"scope": "small", "type": "create"}  # noqa: RUF012
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)

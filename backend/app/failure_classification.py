@@ -361,6 +361,22 @@ ADMIN_CANCEL = "ADMIN_CANCEL"
 CO_DEFERRED_SHELVED = "_co_deferred_shelved"
 
 
+# Task types that are deployment-health checks, not candidate-code-authoring.
+# When these tasks fail with a generic code-error label (claude_code_failed),
+# the cause is typically an infrastructure condition (stale engine, deployment
+# deadlock) rather than a code defect in the candidate — route to an INFRA
+# class so the CODE_ERROR count in pipeline health dashboards is not inflated.
+_DEPLOYMENT_CHECK_TASK_TYPES: frozenset[str] = frozenset({"smoketest"})
+
+
+def _is_deployment_check_task(task: "Task") -> bool:
+    """True when the task is a post-deployment health check (smoketest)."""
+    payload = getattr(task, "first_payload", None)
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("type") in _DEPLOYMENT_CHECK_TASK_TYPES
+
+
 def is_non_death_cancellation(task: "Task") -> bool:
     """True if ``task`` is a terminal-but-NOT-genuinely-dead cancellation.
 
@@ -2069,6 +2085,11 @@ def normalize_agent_failure_category(
                 return override
             if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
                 return PROVISION_FAILURE
+            # Deployment check tasks (smoketest): a generic code error is an
+            # infrastructure condition (stale engine, deployment deadlock),
+            # not a code defect in the candidate.
+            if _is_deployment_check_task(task):
+                return PROVISION_FAILURE
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
         return label
@@ -2630,6 +2651,11 @@ def _classify_failure_class(
                     report_class = _agent_error_report_reclass(task)
                     if report_class:
                         return report_class
+                    # Deployment check tasks (smoketest): a generic code
+                    # error is an infrastructure condition (stale engine,
+                    # deployment deadlock), not a code defect in candidate.
+                    if _is_deployment_check_task(task):
+                        return PROVISION_FAILURE
                 combined = (
                     (task.latest_status_message or "").lower()
                     + " "

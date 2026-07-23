@@ -5071,7 +5071,10 @@ async def agent_heartbeat(
         if not check_task:
             raise HTTPException(status_code=404, detail="Task not found")
         if check_task.vm_instance_id != token.get("vm_instance_id"):
-            raise HTTPException(status_code=404, detail="Task not found for this VM")
+            raise HTTPException(
+                status_code=404,
+                detail={"detail": "Task not found for this VM", "reason": "vm_reassigned"},
+            )
         # Row exists but was locked — tell agent to retry next cycle
         return JSONResponse(
             status_code=409,

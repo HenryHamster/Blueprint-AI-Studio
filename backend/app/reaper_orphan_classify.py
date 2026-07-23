@@ -892,6 +892,16 @@ def _heartbeat_stale_cutoff(task, now: datetime, has_open_pr: bool = False) -> d
             effort = overrides.get("effort") or defaults.get("effort")
     floor = _HEARTBEAT_EFFORT_FLOORS.get(effort, 0)
     seconds = max(seconds, floor)
+
+    # Thinking-heavy task types legitimately go silent for 20+ min during deep
+    # reasoning passes (b2410541 incident). The progress-stale cutoff already
+    # grants them 1500s; the heartbeat-stale cutoff must be at least as generous
+    # so a live-but-thinking agent isn't heartbeat-reaped before its progress-stale
+    # window would fire — both branches guard the same failure mode.
+    task_type = (task.context or {}).get("type") or (task.first_payload or {}).get("type")
+    if task_type in _THINKING_HEAVY_TASK_TYPES:
+        seconds = max(seconds, _THINKING_HEAVY_PROGRESS_STALE_SECONDS)
+
     return now - timedelta(seconds=seconds)
 
 

@@ -18,7 +18,7 @@ import {
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
 import { resetForNextRole, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
-import { isHeartbeatTransient } from './heartbeat-classify.js';
+import { isHeartbeatTransient, parseHeartbeatStatus } from './heartbeat-classify.js';
 import {
   type FixLoopEvent,
   pushFixLoopEvent,
@@ -2454,7 +2454,8 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       }
       // Other 4xx (401/403/404 …) = task genuinely reassigned/deauthorized — graceful shutdown
       if (e instanceof Error && /failed \(4\d{2}\)/.test(e.message)) {
-        log('Task no longer assigned to this VM — self-terminating gracefully');
+        const statusCode = parseHeartbeatStatus(e.message);
+        log(`Task no longer assigned to this VM (HTTP ${statusCode ?? 'unknown'}) — self-terminating gracefully`);
         // Signal the rest of the agent (incl. any later heartbeat tick that has
         // already passed the classification gate) that we are shutting down.
         requestCancel();
