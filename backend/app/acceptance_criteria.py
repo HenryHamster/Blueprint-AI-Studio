@@ -349,6 +349,21 @@ MACHINE_PROBE_WINDOW_DAYS = 14
 #: trust and returns ``False`` in :func:`_evidence_is_walkthrough_e2e`.
 WALKTHROUGH_E2E_WINDOW_DAYS = 14
 
+# Legacy criterion-key aliases.  A walkthrough script may post a semantic slug
+# (e.g. 'c-workday-session-lifecycle') before the script is updated to emit the
+# canonical registered criterion key.  Both evidence-recording lanes apply this
+# map before the get_criteria_by_keys lookup so resolution is identical.
+# unmatched_keys always reports the ORIGINAL slug so alerts remain readable.
+WALKTHROUGH_LEGACY_CRITERION_ALIASES: dict[str, str] = {
+    "c-workday-session-lifecycle": "c-5214996f",
+}
+
+
+def _resolve_walkthrough_criterion_key(key: str) -> str:
+    """Return the canonical criterion key, resolving any legacy alias."""
+    return WALKTHROUGH_LEGACY_CRITERION_ALIASES.get(key, key)
+
+
 #: Coverage-tier constant: how long an ``executed_named_test`` evidence row (a
 #: green ``criterion_coverage_trial`` execution against a pinned checkout) counts
 #: as full ``'covered'`` tier before it expires and the criterion falls back to
@@ -2950,8 +2965,12 @@ async def record_walkthrough_e2e_evidence(
 
     # Only passed=True results are eligible; collect their keys (preserving order,
     # de-duplicating) so a single query resolves all criteria at once.
-    # The meta criterion (c-5214996f) is excluded when its required sub-criteria
-    # are not all present and passed in this same batch.
+    # The meta criterion (c-5214996f) is NOT excluded here: it must still flow
+    # through alias resolution and the unmatched-key check so that a phantom post
+    # (c-5214996f not registered) surfaces as an unmatched-key alert rather than
+    # a silent drop. The meta gate is instead applied at the evidence-writing
+    # loop below, where the key has already resolved to an ACTIVE criterion — so
+    # the gate only ever suppresses covered meta evidence, never observability.
     meta_gate_passes = _walkthrough_meta_criterion_gate(results)
     passed_keys: list[str] = []
     skipped_not_passed = 0
@@ -2962,16 +2981,7 @@ async def record_walkthrough_e2e_evidence(
         if not key:
             continue
         if entry.get("passed") is True:
-            if key == "c-5214996f" and not meta_gate_passes:
-                logger.warning(
-                    "record_walkthrough_e2e_evidence: skipping c-5214996f — "
-                    "required sub-criteria %s not all passed in this batch "
-                    "(version %s); no covered meta evidence written",
-                    sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
-                    getattr(version, "id", None),
-                )
-                skipped_not_passed += 1
-            elif key not in passed_keys:
+            if key not in passed_keys:
                 passed_keys.append(key)
         else:
             skipped_not_passed += 1
@@ -2986,25 +2996,51 @@ async def record_walkthrough_e2e_evidence(
             "candidate_sha": posted_sha,
         }
 
+    # Resolve legacy aliases (e.g. 'c-workday-session-lifecycle' → 'c-5214996f')
+    # before the DB lookup.  passed_keys keeps the original slugs so that
+    # unmatched_keys reports the posted key, not the alias target.
+    resolved_keys = [_resolve_walkthrough_criterion_key(k) for k in passed_keys]
     criteria = await get_criteria_by_keys(
-        session, project_id, passed_keys, release_version_id=release_version_id
+        session, project_id, resolved_keys, release_version_id=release_version_id
     )
     active_by_key = {c.criterion_key: c for c in criteria if c.status == "active"}
-    unmatched_keys = [k for k in passed_keys if k not in active_by_key]
+    unmatched_keys = [
+        k for k in passed_keys
+        if _resolve_walkthrough_criterion_key(k) not in active_by_key
+    ]
 
     # Look up the notes for each passed key from the first matching result.
+    # Index by the resolved key so the active_by_key loop can retrieve them.
     notes_by_key: dict[str, Any] = {}
     for entry in results:
         if not isinstance(entry, dict):
             continue
         key = str(entry.get("criterion_key") or "").strip()
-        if key and entry.get("passed") is True and key not in notes_by_key:
-            notes_by_key[key] = entry.get("notes")
+        if key and entry.get("passed") is True:
+            resolved = _resolve_walkthrough_criterion_key(key)
+            if resolved not in notes_by_key:
+                notes_by_key[resolved] = entry.get("notes")
 
     evaluated_at = _utcnow().isoformat()
     attempt_token = str(qualification_attempt_id or "na").strip() or "na"
     recorded = 0
     for key, criterion in active_by_key.items():
+        # Meta-gate: the meta criterion c-5214996f (reachable directly or via the
+        # 'c-workday-session-lifecycle' legacy alias, both of which resolve into
+        # active_by_key under the canonical key) MUST NOT earn covered evidence
+        # from a partial run where its required sub-criteria did not all pass in
+        # this same batch. Gating here (post-resolution) leaves the unmatched-key
+        # alert path intact for the not-registered case.
+        if key == "c-5214996f" and not meta_gate_passes:
+            logger.warning(
+                "record_walkthrough_e2e_evidence: skipping c-5214996f — "
+                "required sub-criteria %s not all passed in this batch "
+                "(version %s); no covered meta evidence written",
+                sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                getattr(version, "id", None),
+            )
+            skipped_not_passed += 1
+            continue
         detail: dict[str, Any] = {
             "candidate_sha": posted_sha,
             "evaluated_at": evaluated_at,
@@ -3159,8 +3195,12 @@ async def record_operator_walkthrough_evidence(
 
     # Only passed=True results are eligible; collect their keys (preserving order,
     # de-duplicating) so a single query resolves all criteria at once.
-    # The meta criterion (c-5214996f) is excluded when its required sub-criteria
-    # are not all present and passed in this same batch.
+    # The meta criterion (c-5214996f) is NOT excluded here: it must still flow
+    # through alias resolution and the unmatched-key check so that a phantom post
+    # (c-5214996f not registered) surfaces as an unmatched-key alert rather than
+    # a silent drop. The meta gate is instead applied at the evidence-writing
+    # loop below, where the key has already resolved to an ACTIVE criterion — so
+    # the gate only ever suppresses covered meta evidence, never observability.
     meta_gate_passes = _walkthrough_meta_criterion_gate(results)
     passed_keys: list[str] = []
     skipped_not_passed = 0
@@ -3171,16 +3211,7 @@ async def record_operator_walkthrough_evidence(
         if not key:
             continue
         if entry.get("passed") is True:
-            if key == "c-5214996f" and not meta_gate_passes:
-                logger.warning(
-                    "record_operator_walkthrough_evidence: skipping c-5214996f — "
-                    "required sub-criteria %s not all passed in this batch "
-                    "(version %s); no covered meta evidence written",
-                    sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
-                    getattr(version, "id", None),
-                )
-                skipped_not_passed += 1
-            elif key not in passed_keys:
+            if key not in passed_keys:
                 passed_keys.append(key)
         else:
             skipped_not_passed += 1
@@ -3195,24 +3226,48 @@ async def record_operator_walkthrough_evidence(
             "candidate_sha": posted_sha,
         }
 
+    # Resolve legacy aliases before the DB lookup; report unmatched using the
+    # original slug so alerts remain human-readable.
+    resolved_keys = [_resolve_walkthrough_criterion_key(k) for k in passed_keys]
     criteria = await get_criteria_by_keys(
-        session, project_id, passed_keys, release_version_id=release_version_id
+        session, project_id, resolved_keys, release_version_id=release_version_id
     )
     active_by_key = {c.criterion_key: c for c in criteria if c.status == "active"}
-    unmatched_keys = [k for k in passed_keys if k not in active_by_key]
+    unmatched_keys = [
+        k for k in passed_keys
+        if _resolve_walkthrough_criterion_key(k) not in active_by_key
+    ]
 
     # Look up the notes for each passed key from the first matching result.
+    # Index by the resolved key so the active_by_key loop can retrieve them.
     notes_by_key: dict[str, Any] = {}
     for entry in results:
         if not isinstance(entry, dict):
             continue
         key = str(entry.get("criterion_key") or "").strip()
-        if key and entry.get("passed") is True and key not in notes_by_key:
-            notes_by_key[key] = entry.get("notes")
+        if key and entry.get("passed") is True:
+            resolved = _resolve_walkthrough_criterion_key(key)
+            if resolved not in notes_by_key:
+                notes_by_key[resolved] = entry.get("notes")
 
     evaluated_at = _utcnow().isoformat()
     recorded = 0
     for key, criterion in active_by_key.items():
+        # Meta-gate: c-5214996f (direct or via the 'c-workday-session-lifecycle'
+        # legacy alias, both resolving into active_by_key under the canonical key)
+        # MUST NOT earn covered evidence from a partial run whose required
+        # sub-criteria did not all pass in this batch. Gating post-resolution
+        # keeps the unmatched-key alert intact for the not-registered case.
+        if key == "c-5214996f" and not meta_gate_passes:
+            logger.warning(
+                "record_operator_walkthrough_evidence: skipping c-5214996f — "
+                "required sub-criteria %s not all passed in this batch "
+                "(version %s); no covered meta evidence written",
+                sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                getattr(version, "id", None),
+            )
+            skipped_not_passed += 1
+            continue
         detail: dict[str, Any] = {
             "candidate_sha": posted_sha,
             "evaluated_at": evaluated_at,

@@ -1608,7 +1608,11 @@ async function writeJsonResult(startTs, projectId) {
         !shaValid ? 'SHA integrity check failed' : '',
       ].filter(Boolean).join('; ') || 'iframe subresource token check not evaluated';
 
-  // Flow 5 → c-workday-session-lifecycle (Workday resident session lifecycle)
+  // Flow 5 → c-workday-session-lifecycle (Workday resident session lifecycle).
+  // Posted under the legacy slug on purpose: the backend alias resolves it to
+  // the canonical c-5214996f, and keeping the slug distinct from the meta entry
+  // below avoids first-occurrence dedup silently dropping the meta entry (both
+  // would collapse to c-5214996f otherwise). See WALKTHROUGH_LEGACY_CRITERION_ALIASES.
   // PASS requires: session created + liveness reflects it + Stop control in UI +
   // clean stop + UI click-to-talk (Workday toggle → Start button → liveness confirms).
   // Genuine streaming 'active' is intentionally NOT required (environment-gated).

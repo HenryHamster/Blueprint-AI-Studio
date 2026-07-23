@@ -11855,6 +11855,291 @@ async def test_record_walkthrough_e2e_evidence_phantom_and_rewalk_key_mixed(
     assert phantom_key in alerts[0].message
 
 
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_workday_slug_routes_to_live_criterion(
+    db_session,
+):
+    """Legacy slug 'c-workday-session-lifecycle' routes to the registered c-5214996f criterion.
+
+    When a VersionAcceptanceCriterion exists with the canonical key 'c-5214996f',
+    a walkthrough result posted under the legacy slug must write covered-tier
+    evidence against that criterion. Because c-5214996f is the meta criterion, the
+    batch must also carry its required sub-criteria (passing) so the meta gate is
+    satisfied — resolving the alias BEFORE the meta-gate check is the behaviour
+    under test (a partial run posting only the alias would be gated out; see the
+    dedicated gate tests). Expect unmatched_keys==[] and covered meta evidence.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-E2E")
+    sha = "dd" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Register the meta criterion under the canonical alias-target key, plus its
+    # required sub-criteria so the meta gate can legitimately pass.
+    canonical_key = "c-5214996f"
+    for ck, txt in (
+        (canonical_key, "Workday click-to-talk session lifecycle (re-walk)"),
+        ("c-dfdc9d82", "Workday session sub-criterion A"),
+        ("c-f52fd975", "Workday session sub-criterion B"),
+    ):
+        db_session.add(VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=ck,
+            text=txt,
+            status="active",
+        ))
+    await db_session.commit()
+    crit = (await db_session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.release_version_id == version.id,
+            VersionAcceptanceCriterion.criterion_key == canonical_key,
+        )
+    )).scalars().one()
+
+    legacy_slug = "c-workday-session-lifecycle"
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": legacy_slug,
+                "passed": True,
+                "notes": ["Workday toggle → Start → liveness reflects session"],
+            },
+            {"criterion_key": "c-dfdc9d82", "passed": True, "notes": ["sub A"]},
+            {"criterion_key": "c-f52fd975", "passed": True, "notes": ["sub B"]},
+        ],
+        qualification_attempt_id="attempt-alias-e2e",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 3, f"Expected 3 recorded; got {summary}"
+    assert summary["unmatched_keys"] == [], f"Expected no unmatched; got {summary['unmatched_keys']}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts when alias resolves; got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_workday_slug_routes_to_live_criterion(
+    db_session,
+):
+    """Operator lane: legacy slug 'c-workday-session-lifecycle' routes to c-5214996f criterion.
+
+    Mirrors test_record_walkthrough_e2e_evidence_workday_slug_routes_to_live_criterion
+    for the record_operator_walkthrough_evidence path (the one the walkthrough script
+    actually POSTs to via the operator-walkthrough-evidence endpoint). Because
+    c-5214996f is the meta criterion, the alias resolves BEFORE the meta gate, so the
+    batch must also carry the passing sub-criteria for covered meta evidence.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-Op")
+    sha = "ee" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    canonical_key = "c-5214996f"
+    for ck, txt in (
+        (canonical_key, "Workday click-to-talk session lifecycle (re-walk)"),
+        ("c-dfdc9d82", "Workday session sub-criterion A"),
+        ("c-f52fd975", "Workday session sub-criterion B"),
+    ):
+        db_session.add(VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=ck,
+            text=txt,
+            status="active",
+        ))
+    await db_session.commit()
+    crit = (await db_session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.release_version_id == version.id,
+            VersionAcceptanceCriterion.criterion_key == canonical_key,
+        )
+    )).scalars().one()
+
+    legacy_slug = "c-workday-session-lifecycle"
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": legacy_slug,
+                "passed": True,
+                "notes": ["Workday session started and liveness confirmed"],
+            },
+            {"criterion_key": "c-dfdc9d82", "passed": True, "notes": ["sub A"]},
+            {"criterion_key": "c-f52fd975", "passed": True, "notes": ["sub B"]},
+        ],
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 3, f"Expected 3 recorded; got {summary}"
+    assert summary["unmatched_keys"] == [], f"Expected no unmatched; got {summary['unmatched_keys']}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts when alias resolves; got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_workday_alias_gated_when_subcriteria_absent(
+    db_session,
+):
+    """The legacy alias resolves to the meta criterion BEFORE the meta gate runs.
+
+    A partial run that posts ONLY 'c-workday-session-lifecycle' (which resolves to
+    c-5214996f) without its required sub-criteria (c-dfdc9d82, c-f52fd975) must be
+    gated out: no covered meta evidence is minted from a partial re-walk. Guards the
+    alias-bypass fix at acceptance_criteria.py — the comparison resolves the key.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-Gate-E2E")
+    sha = "cd" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-5214996f",
+        text="Workday click-to-talk session lifecycle (re-walk)",
+        status="active",
+    )
+    db_session.add(crit)
+    await db_session.commit()
+    await db_session.refresh(crit)
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": ["partial"]},
+        ],
+        qualification_attempt_id="attempt-alias-gate-e2e",
+    )
+
+    assert summary["recorded"] == 0, f"Alias must not bypass meta gate; got {summary}"
+    assert summary["skipped_not_passed"] == 1
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_workday_alias_gated_when_subcriteria_absent(
+    db_session,
+):
+    """Operator lane: the alias resolves to c-5214996f before the meta gate.
+
+    Mirrors the e2e gate test for record_operator_walkthrough_evidence — a partial run
+    posting only the alias must not mint covered meta evidence.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-Gate-Op")
+    sha = "ce" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-5214996f",
+        text="Workday click-to-talk session lifecycle (re-walk)",
+        status="active",
+    )
+    db_session.add(crit)
+    await db_session.commit()
+    await db_session.refresh(crit)
+
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": ["partial"]},
+        ],
+    )
+
+    assert summary["recorded"] == 0, f"Alias must not bypass meta gate; got {summary}"
+    assert summary["skipped_not_passed"] == 1
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_workday_slug_unmatched_when_no_canonical_criterion(
+    db_session,
+):
+    """Fail-closed: when c-5214996f is not registered, the slug still lands in unmatched_keys."""
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-FailClosed")
+    sha = "ff" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    legacy_slug = "c-workday-session-lifecycle"
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": legacy_slug, "passed": True, "notes": "test"},
+        ],
+    )
+
+    assert summary["recorded"] == 0
+    assert summary["unmatched_keys"] == [legacy_slug]
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].event_type == "release.walkthrough_key_unmatched"
+    assert legacy_slug in alerts[0].message
+
+
 # ---------------------------------------------------------------------------
 # enroll_criterion_coverage_trial
 # ---------------------------------------------------------------------------

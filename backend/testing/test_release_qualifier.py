@@ -314,7 +314,12 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     # PROPERTY 5: A phantom/drifted key must appear in unmatched_keys, trigger a
     # loud Alert, and write NO evidence row.
-    phantom_key = "c-workday-session-lifecycle"
+    # NOTE: this must be a key that is neither registered NOR a recognized legacy
+    # alias. 'c-workday-session-lifecycle' is intentionally NOT used here — it is a
+    # live legacy alias (WALKTHROUGH_LEGACY_CRITERION_ALIASES) that resolves to the
+    # active meta criterion c-5214996f, so it is not a phantom. A truly-drifted key
+    # exercises the unmatched-key alert path.
+    phantom_key = "c-workday-phantom-drift"
     summary2 = await record_walkthrough_e2e_evidence(
         db_session,
         version=version,
