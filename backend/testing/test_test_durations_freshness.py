@@ -8,6 +8,7 @@ import ast
 import glob
 import json
 import re
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -317,3 +318,208 @@ def test_durations_no_stale_entries() -> None:
         f"Fix: remove these entries from backend/.test_durations, or regenerate "
         f"via scripts/store-backend-durations.sh."
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _extract_valid_test_ids
+# ---------------------------------------------------------------------------
+
+
+def _write_tmp_py(content: str) -> Path:
+    """Write Python source to a temporary file and return its Path."""
+    tf = tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False)
+    tf.write(content)
+    tf.flush()
+    tf.close()
+    return Path(tf.name)
+
+
+def test_extract_valid_test_ids_top_level_sync_functions() -> None:
+    """Top-level sync test_* functions are collected."""
+    p = _write_tmp_py(
+        "def test_alpha(): pass\n"
+        "def test_beta(): pass\n"
+        "def helper(): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    assert result == {"test_alpha", "test_beta"}
+
+
+def test_extract_valid_test_ids_top_level_async_functions() -> None:
+    """Top-level async test_* functions are collected."""
+    p = _write_tmp_py(
+        "async def test_async_one(): pass\n"
+        "async def setup(): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    assert result == {"test_async_one"}
+
+
+def test_extract_valid_test_ids_test_class_methods() -> None:
+    """test_* methods inside Test* classes are collected as ClassName::method."""
+    p = _write_tmp_py(
+        "class TestFoo:\n"
+        "    def test_one(self): pass\n"
+        "    def test_two(self): pass\n"
+        "    def helper(self): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    assert result == {"TestFoo::test_one", "TestFoo::test_two"}
+
+
+def test_extract_valid_test_ids_async_methods_in_class() -> None:
+    """async test_* methods inside Test* classes are collected."""
+    p = _write_tmp_py(
+        "class TestBar:\n"
+        "    async def test_async_method(self): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    assert result == {"TestBar::test_async_method"}
+
+
+def test_extract_valid_test_ids_non_test_class_excluded() -> None:
+    """Methods in classes NOT named Test* are not collected."""
+    p = _write_tmp_py(
+        "class Helper:\n"
+        "    def test_this_is_not_collected(self): pass\n"
+        "class Util:\n"
+        "    def test_also_not_collected(self): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    assert result == set()
+
+
+def test_extract_valid_test_ids_mixed_module() -> None:
+    """Top-level functions and class methods both appear in mixed file."""
+    p = _write_tmp_py(
+        "def test_standalone(): pass\n"
+        "class TestGroup:\n"
+        "    def test_member(self): pass\n"
+        "class NotATestClass:\n"
+        "    def test_invisible(self): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    assert result == {"test_standalone", "TestGroup::test_member"}
+
+
+def test_extract_valid_test_ids_syntax_error_returns_empty() -> None:
+    """A file with a syntax error returns an empty set instead of raising."""
+    p = _write_tmp_py("def test_broken(\n")  # unclosed paren → SyntaxError
+    result = _extract_valid_test_ids(p)
+    assert result == set()
+
+
+def test_extract_valid_test_ids_nonexistent_file_returns_empty() -> None:
+    """A path that does not exist returns an empty set instead of raising."""
+    result = _extract_valid_test_ids(Path("/nonexistent/path/test_fake.py"))
+    assert result == set()
+
+
+def test_extract_valid_test_ids_empty_file() -> None:
+    """An empty file returns an empty set."""
+    p = _write_tmp_py("")
+    result = _extract_valid_test_ids(p)
+    assert result == set()
+
+
+def test_extract_valid_test_ids_no_test_functions() -> None:
+    """A valid Python file with no test_* functions returns an empty set."""
+    p = _write_tmp_py(
+        "import os\n"
+        "def setup(): pass\n"
+        "class MyClass:\n"
+        "    def method(self): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    assert result == set()
+
+
+def test_extract_valid_test_ids_nested_class_not_collected() -> None:
+    """
+    test_* methods inside a class nested within another class are NOT collected.
+    pytest's default collector only looks one level deep: top-level classes.
+    """
+    p = _write_tmp_py(
+        "class TestOuter:\n"
+        "    class Inner:\n"
+        "        def test_nested(self): pass\n"
+        "    def test_outer(self): pass\n"
+    )
+    result = _extract_valid_test_ids(p)
+    # Only the top-level class method is collected; nested class is ignored.
+    assert "TestOuter::test_outer" in result
+    assert "TestOuter::Inner::test_nested" not in result
+    assert "Inner::test_nested" not in result
+
+
+# ---------------------------------------------------------------------------
+# Meta-tests: verify the staleness guard detects phantom entries
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_detection_catches_renamed_function() -> None:
+    """
+    Simulate a test rename: entry points to 'test_old_name' which no longer
+    exists in the file (only 'test_new_name' does). Guard must detect it.
+    """
+    p = _write_tmp_py("def test_new_name(): pass\n")
+    valid_ids = _extract_valid_test_ids(p)
+
+    # 'test_old_name' is gone after the rename
+    assert "test_old_name" not in valid_ids
+    # 'test_new_name' is present
+    assert "test_new_name" in valid_ids
+
+
+def test_staleness_detection_parametrize_suffix_stripped() -> None:
+    """
+    Parametrized variants like 'test_foo[param1-val]' must resolve to 'test_foo'
+    after stripping the '[...]' suffix, and must be found in the file.
+    """
+    p = _write_tmp_py("def test_foo(): pass\n")
+    valid_ids = _extract_valid_test_ids(p)
+
+    raw_node_id = "test_foo[param1-val]"
+    base_node_id = raw_node_id.split("[")[0]
+    assert base_node_id in valid_ids
+
+
+def test_staleness_detection_parametrize_suffix_removed_function_is_stale() -> None:
+    """
+    A parametrized entry for a function that was removed is correctly classified
+    as stale after stripping the '[...]' suffix.
+    """
+    p = _write_tmp_py("def test_remaining(): pass\n")
+    valid_ids = _extract_valid_test_ids(p)
+
+    raw_node_id = "test_removed[case1]"
+    base_node_id = raw_node_id.split("[")[0]
+    assert base_node_id not in valid_ids
+
+
+def test_staleness_detection_class_method_rename() -> None:
+    """
+    A class method rename leaves a stale 'TestFoo::test_old' entry while
+    'TestFoo::test_renamed' is the current name.
+    """
+    p = _write_tmp_py(
+        "class TestFoo:\n"
+        "    def test_renamed(self): pass\n"
+    )
+    valid_ids = _extract_valid_test_ids(p)
+
+    assert "TestFoo::test_old" not in valid_ids
+    assert "TestFoo::test_renamed" in valid_ids
+
+
+def test_staleness_detection_split_file_stale_in_original() -> None:
+    """
+    Simulates a file-split: original file retains only 'test_remaining'
+    while 'test_moved_to_new_file' was moved out. The moved entry should
+    be detected as stale in the original file.
+    """
+    original = _write_tmp_py("def test_remaining(): pass\n")
+    valid_ids = _extract_valid_test_ids(original)
+
+    assert "test_moved_to_new_file" not in valid_ids
+    assert "test_remaining" in valid_ids
