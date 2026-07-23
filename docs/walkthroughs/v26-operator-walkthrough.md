@@ -1,9 +1,9 @@
 # v26 Operator Walkthrough Report
 
 > **Qualification target:** criterion c-5214996f
-> **SHA walked:** `751f5d9455feeb67203a2cd669777266e6b126f1`
+> **SHA walked:** `3f63afa77ae1f0960bd47123edf5fe3798b8b718`
 > **Date:** 2026-07-23
-> **Run at:** 2026-07-23T11:06:13.585Z
+> **Run at:** 2026-07-23T19:11:39.493Z
 
 ## Environment
 
@@ -20,9 +20,9 @@
 
 | Verdict | Count |
 |---------|-------|
-| ✅ PASS | 30 |
-| ❌ FAIL | 0 |
-| ⚠️ DEAD_END | 11 |
+| ✅ PASS | 32 |
+| ❌ FAIL | 1 |
+| ⚠️ DEAD_END | 8 |
 
 ## Screenshot Integrity
 
@@ -31,15 +31,15 @@
 ### Screenshot Hashes (md5)
 
 ```
-  f966d4cb5eef6ec0…  flow0-app-load.png  (step: App loads (VITE_DASHBOARD_API_TOKEN bypasses Firebase sign-in))
-  d1f62979b2a08e07…  flow2-ui-project-tools.png  (step: 2f. UI state for project tools)
-  0f03a78baff599b1…  flow3-messages-ui.png  (step: 3e. MessagesPanel renders in UI)
-  3b91caf1fcb63974…  flow3f-cross-tab-alert-indicator.png  (step: 3f. Cross-tab alert indicator (PR #15230))
-  5042a15b957a2bc5…  flow4-compute-artifacts.png  (step: 4d. Compute artifact gallery renders viewable media inline)
-  64ac8dfc5e0418ce…  flow5-workday-session-control.png  (step: 5d. StrategicSessionControl renders a Stop control in Workday mode)
-  bd2798b81c1edaa9…  flow5f-ui-click-to-talk-start.png  (step: 5f. UI click-to-talk: Workday toggle → Start → strategic-liveness reflects session)
-  ae62d70250f70384…  flow7-tools-configure-no-placement.png  (step: 7e. Configure dialog has NO Placement dropdown (commit 28a260c18))
-  ca0e9bfb4e4afc98…  flow8-messages-load-older.png  (step: 8c. MessagesPanel renders "Load older messages" button)
+  d550f60c78fbcd1c…  flow0-app-load.png  (step: App loads (VITE_DASHBOARD_API_TOKEN bypasses Firebase sign-in))
+  290bd21b4f78b9b0…  flow2-ui-project-tools.png  (step: 2f. UI state for project tools)
+  4a28134fce97ad5a…  flow3-messages-ui.png  (step: 3e. MessagesPanel renders in UI)
+  48a9c99396eea54c…  flow3f-cross-tab-alert-indicator.png  (step: 3f. Cross-tab alert indicator (PR #15230))
+  a21c5761fc4addd1…  flow4-compute-artifacts.png  (step: 4d. Compute artifact gallery renders viewable media inline)
+  222f6ff057af4ff7…  flow5-workday-session-control.png  (step: 5d. StrategicSessionControl renders a Stop control in Workday mode)
+  f18dae5454023af6…  flow5f-ui-click-to-talk-start.png  (step: 5f. UI click-to-talk: Workday toggle → Start → strategic-liveness reflects session)
+  cda503918f53480c…  flow7-tools-configure-no-placement.png  (step: 7e. Configure dialog has NO Placement dropdown (commit 28a260c18))
+  35c5515e7f44d268…  flow8-messages-load-older.png  (step: 8c. MessagesPanel renders "Load older messages" button)
 ```
 
 ---
@@ -61,7 +61,7 @@
 ### ✅ `PASS` — App loads (VITE_DASHBOARD_API_TOKEN bypasses Firebase sign-in)
 
 - Page title: "Blueprint AI Studio"
-- Body length: 618 chars
+- Body length: 619 chars
 - First 200 chars: All Projects Manage Ctrl K Search, ask, open task... Chat Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 
 - Console errors so far: 0
 
@@ -70,15 +70,15 @@
 ### ✅ `PASS` — 1a. Runner registration API
 
 - POST /api/admin/projects/00000000-0000-4000-8000-000000000001/runners/register → 200
-- runner_id: cf9b55b1-03d4-4cda-bc73-38267d1a0761
+- runner_id: fc3700ac-50bb-4336-b2be-24dfa3231adc
 - token: 43 chars (one-time secret, not stored)
 - hostname: walkthrough-playwright-vm-2026-07-16
 
 ### ✅ `PASS` — 1b. Enrolled runner visible in fleet list
 
 - GET /api/admin/projects/00000000-0000-4000-8000-000000000001/runners → 200
-- Total runners: 1
-- Runner cf9b55b1-03d4-4cda-bc73-38267d1a0761: FOUND
+- Total runners: 2
+- Runner fc3700ac-50bb-4336-b2be-24dfa3231adc: FOUND
 - status: active, hostname: walkthrough-playwright-vm-2026-07-16
 
 ### ✅ `PASS` — 1c. Install snippet generated
@@ -94,9 +94,9 @@
 - Exit code: 0
 - ✓ Preflight passed — token valid, orchestrator reachable
 -   Blueprint local fleet runner — preflight
--     runner host     : agent-vm-a66802c452684734b771ba37b165d720
+-     runner host     : agent-vm-434f778cba2a454faab666839f6782ea
 -     orchestrator    : http://127.0.0.1:8080   [reachable]
--     runner token    : f7Oo0pIl...   [valid]
+-     runner token    : Erc6fwp1...   [valid]
 -     python          : 3.10.12
 -     workspace       : /tmp/blueprint-agent-workspaces   [writable]
 -     concurrency     : agents=2  compute=2  (separate pools; up to 4 tasks total)
@@ -115,25 +115,25 @@
 -       compute      : CLAIMED via docker (image jobs, --nv/--gpus)
 - --- Phase 2: full daemon connect + heartbeat ---
 - Node v22.23.1 ✓ — daemon mode (not --check; real connection to orchestrator)
-- Fleet snapshot BEFORE daemon start: last_seen_at=2026-07-23T11:06:19.230680
-- Fleet snapshot AFTER 10s daemon run: last_seen_at=2026-07-23T11:06:24.072639
+- Fleet snapshot BEFORE daemon start: last_seen_at=2026-07-23T19:11:44.317903
+- Fleet snapshot AFTER 10s daemon run: last_seen_at=2026-07-23T19:11:46.861490
 - current_token_heartbeat_confirmed: true
 - Heartbeat observed in fleet state: ✓ YES — runner is live
 - Token generation confirmed: ✓ YES
 - Health status: connected
-- ✓ Full daemon enrollment PROVEN: runner cf9b55b1-03d4-4cda-bc73-38267d1a0761 connected and heartbeated
+- ✓ Full daemon enrollment PROVEN: runner fc3700ac-50bb-4336-b2be-24dfa3231adc connected and heartbeated
 - --- fleet API response after enrollment (key fields) ---
--   id: cf9b55b1-03d4-4cda-bc73-38267d1a0761
--   hostname: agent-vm-a66802c452684734b771ba37b165d720
+-   id: fc3700ac-50bb-4336-b2be-24dfa3231adc
+-   hostname: agent-vm-434f778cba2a454faab666839f6782ea
 -   status: active
--   last_seen_at: 2026-07-23T11:06:24.072639
+-   last_seen_at: 2026-07-23T19:11:46.861490
 -   current_token_heartbeat_confirmed: true
 -   health.device_status: connected
 - --- daemon stdout/stderr (first 20 lines) ---
 -   Blueprint local fleet runner — preflight
--     runner host     : agent-vm-a66802c452684734b771ba37b165d720
+-     runner host     : agent-vm-434f778cba2a454faab666839f6782ea
 -     orchestrator    : http://127.0.0.1:8080   [reachable]
--     runner token    : f7Oo0pIl...   [valid]
+-     runner token    : Erc6fwp1...   [valid]
 -     python          : 3.10.12
 -     workspace       : /tmp/blueprint-agent-workspaces   [writable]
 -     concurrency     : agents=2  compute=2  (separate pools; up to 4 tasks total)
@@ -158,10 +158,10 @@
 
 ### ✅ `PASS` — 2b. Asset-token endpoint — auth passes
 
-- POST /api/admin/projects/00000000-0000-4000-8000-000000000001/tools/walkthrough-iframe-tool/asset-token → 404
+- POST /api/admin/projects/00000000-0000-4000-8000-000000000001/tools/walkthrough-iframe-tool/asset-token → 200
 - Auth result: PASS (not 401/403)
-- Detail: {"error":{"code":404,"message":"Tool 'walkthrough-iframe-tool' not found in project manifest"}}
-- 404 = auth passed, tool not found — set BLUEPRINT_LOCAL_TOOLS_ROOT=/tmp/walkthrough-tools and re-run seed_test_data.py
+- Detail: {"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzY29wZSI6InRvb2wtYXNzZXQiLCJwcm9qZWN0X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbF9zbHVnIjoid2Fsa3Rocm91Z2gtaWZyYW1lLXRvb2wiLCJle
+- ✓ Real asset token minted (276 chars)
 
 ### ✅ `PASS` — 2c. Path-embedded token route (PR #15163 fix)
 
@@ -171,10 +171,10 @@
 - This route is the PR #15163 fix: path-embedding means relative subresources
 - (app.js, styles.css, images) inherit the token without query-string loss
 
-### ⚠️ `DEAD_END` — 2g. Valid JWT → 200 from tool asset endpoint (c-f52fd975 proof)
+### ✅ `PASS` — 2g. Valid JWT → 200 from tool asset endpoint (c-f52fd975 proof)
 
-- Token mint returned non-200 — BLUEPRINT_LOCAL_TOOLS_ROOT not set or fixture missing
-- Run seed_test_data.py and set BLUEPRINT_LOCAL_TOOLS_ROOT=/tmp/walkthrough-tools in backend env
+- GET /t/{token}/assets/index.html → 200
+- ✓ 200 — valid minted JWT grants access to seeded walkthrough-iframe-tool/index.html
 - ✓ fake JWT → 401 confirmed (route-exists guard holds)
 
 ### ✅ `PASS` — 2d. Legacy query-param token route (backward compat)
@@ -197,7 +197,7 @@
 
 - Navigated to Project → Tools surface; project "v26 Walkthrough Test Project" selected
 - Navigation completed without error
-- Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Project null/null Projects Members Upd
+- Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Project / Projects Members Update Dire
 
 ![2f. UI state for project tools](screenshots/flow2-ui-project-tools.png)
 
@@ -205,23 +205,23 @@
 
 - GET /api/admin/projects/00000000-0000-4000-8000-000000000001/messages → 200
 - Message count: 2
-- First message: id=00000000-0000-4000-8000-000000000011, type=QUESTION, status=open
+- First message: id=266959cf-90de-4634-a1b9-18107e676fc8, type=NOTE, status=open
 
 ### ✅ `PASS` — 3b. Alerts API (notification surface)
 
 - GET /api/admin/alerts?project_id=00000000-0000-4000-8000-000000000001 → 200
-- Alert count: 1
-- First alert: Orchestrator error loop (ERROR)
+- Alert count: 2
+- First alert: Branch backfill failed — integration_branch or promotion_target still NULL (WARNING)
 
 ### ✅ `PASS` — 3c. Message resolve (self-clearing action)
 
-- PATCH /api/admin/messages/00000000-0000-4000-8000-000000000011 → 200
-- Message 00000000-0000-4000-8000-000000000011 resolved — self-clearing confirmed (PATCH /api/admin/messages/{id})
+- PATCH /api/admin/messages/266959cf-90de-4634-a1b9-18107e676fc8 → 200
+- Message 266959cf-90de-4634-a1b9-18107e676fc8 resolved — self-clearing confirmed (PATCH /api/admin/messages/{id})
 
 ### ✅ `PASS` — 3d. Resolved message removed from open list
 
-- Messages after resolve: 2
-- Message 00000000-0000-4000-8000-000000000011 still open: false
+- Messages after resolve: 1
+- Message 266959cf-90de-4634-a1b9-18107e676fc8 still open: false
 
 ### ⚠️ `DEAD_END` — 3e. MessagesPanel renders in UI
 
@@ -288,15 +288,15 @@
 
 ### ⚠️ `DEAD_END` — 5a. Eligible live runner for Workday resident
 
-- POST /api/admin/projects/00000000-0000-4000-8000-000000000001/runners/register → 200 (runner_id: 2416e26b-f3cc-4729-8ca0-3b3d7911840a)
+- POST /api/admin/projects/00000000-0000-4000-8000-000000000001/runners/register → 200 (runner_id: 92a29013-b8ab-48f7-ba72-596b6f1900c9)
 - Spawned scripts/local_runner.py daemon (SUPERVISED=1); polled strategic-liveness for eligibility
-- resident_session_runners: 2; eligible: 0
+- resident_session_runners: 3; eligible: 0
 - ✗ No eligible runner — start will BLOCK (no_runner). Likely agent runtime/isolation unavailable on this VM (DEAD_END, not a code defect).
 - --- daemon stdout/stderr (first 12 lines) ---
 -   Blueprint local fleet runner — preflight
--     runner host     : agent-vm-a66802c452684734b771ba37b165d720
+-     runner host     : agent-vm-434f778cba2a454faab666839f6782ea
 -     orchestrator    : http://127.0.0.1:8080   [reachable]
--     runner token    : Yag9kDUH...   [valid]
+-     runner token    : r-O6FNYX...   [valid]
 -     python          : 3.10.12
 -     workspace       : /tmp/blueprint-agent-workspaces   [writable]
 -     concurrency     : agents=2  compute=2  (separate pools; up to 4 tasks total)
@@ -373,16 +373,16 @@
 ### ✅ `PASS` — 7a. Create project tool (notes kind)
 
 - POST /api/admin/projects/00000000-0000-4000-8000-000000000001/tools → 200
-- ✓ Tool created: id=beb5adc9-8281-46a1-aab3-4f9a021e2691, slug=notes
+- ✓ Tool created: id=059454f9-b99f-4163-b401-f732a288b9dd, slug=notes
 
 ### ✅ `PASS` — 7b. Disable tool — PATCH enabled:false
 
-- PATCH /api/admin/projects/00000000-0000-4000-8000-000000000001/tools/beb5adc9-8281-46a1-aab3-4f9a021e2691 {enabled:false} → 200
+- PATCH /api/admin/projects/00000000-0000-4000-8000-000000000001/tools/059454f9-b99f-4163-b401-f732a288b9dd {enabled:false} → 200
 - ✓ Tool disabled (enabled=false confirmed in response)
 
 ### ✅ `PASS` — 7c. Re-enable disabled tool — PATCH enabled:true
 
-- PATCH /api/admin/projects/00000000-0000-4000-8000-000000000001/tools/beb5adc9-8281-46a1-aab3-4f9a021e2691 {enabled:true} → 200
+- PATCH /api/admin/projects/00000000-0000-4000-8000-000000000001/tools/059454f9-b99f-4163-b401-f732a288b9dd {enabled:true} → 200
 - ✓ Tool re-enabled (enabled=true confirmed in response)
 
 ### ✅ `PASS` — 7d. Add second tool of same kind (no 409)
@@ -395,7 +395,7 @@
 - Navigation to tools surface completed
 - Configure panel open: false (Title field + Cancel button visible)
 - ✓ Placement label/dropdown is ABSENT — phantom-control fix confirmed (commit 28a260c18)
-- Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Project null/null Projects Members Upd
+- Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Project / Projects Members Update Dire
 - Source evidence: admin-ui/src/components/ProjectToolHost.tsx renderConfigPanel() has Title + schema fields only, no placement <select>
 - Unit test: ProjectToolHost.test.tsx placement-based routing tests (line ~646)
 
@@ -406,20 +406,20 @@
 - Seeded 35/35 messages via POST /api/admin/projects/00000000-0000-4000-8000-000000000001/messages
 - ✓ All 35 messages seeded successfully
 
-### ⚠️ `DEAD_END` — 8b. Admin messages endpoint returns total for pagination
+### ✅ `PASS` — 8b. Admin messages endpoint returns total for pagination
 
 - GET /api/admin/messages?project_id=00000000-0000-4000-8000-000000000001&status=all&limit=30 → 200
-- ⚠ total=1 — not enough messages to trigger load-older (need > 30)
-- Returned 1 messages in first page
+- ✓ total=37 > 30 → "Load older messages" button will appear in MessagesPanel
+- Returned 36 messages in first page
 - MessagesPanel source: TRIAGE_PAGE_SIZE=30 (MessagesPanel.tsx:69)
 - MessagesPanel source: hasOlderTriageMessages = responseTotal > loadedWindow (MessagesPanel.tsx:1501)
 - MessagesListView source: "Load older messages" button rendered when hasOlderTriageMessages (MessagesListView.tsx:892-900)
 
-### ⚠️ `DEAD_END` — 8c. MessagesPanel renders "Load older messages" button
+### ❌ `FAIL` — 8c. MessagesPanel renders "Load older messages" button
 
 - Navigation to MessagesPanel completed
 - "Load older messages" button visible: false (found 0 idle + 0 loading-state buttons)
-- ⚠ Admin messages endpoint returned 200 — MessagesPanel cannot show load-older (DEAD_END)
+- ✗ Load older button missing despite pagination data being available
 - Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat 1 Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Chat Workday Blocked Workday device 
 - Source: MessagesListView.tsx:892-900 renders {row.kind === "load_older"} button
 - Fix evidence: admin-ui/src/components/MessagesListView.tsx:1241 — "Load older messages" button triggers loadOlderTriage callback
@@ -428,7 +428,7 @@
 
 ### ⚠️ `DEAD_END` — 8d. "Load older messages" click actually loads older messages
 
-- ⚠ Skipped — admin messages endpoint returned 200 (not 200); MessagesPanel cannot load paginated data
+- ⚠ Skipped — Load older button not visible in step 8c
 - Source evidence: MessagesPanel.tsx:1562-1566 — loadOlderTriage callback increments triageOffset and re-fetches
 - Fix verification: audit finding 5045cb32 fix is on automain; live verification blocked by endpoint status
 
@@ -437,11 +437,6 @@
 ## Dead Ends and Blockers
 
 The following steps were blocked by environment constraints (not code defects):
-
-**2g. Valid JWT → 200 from tool asset endpoint (c-f52fd975 proof)** (DEAD_END):
-- Token mint returned non-200 — BLUEPRINT_LOCAL_TOOLS_ROOT not set or fixture missing
-- Run seed_test_data.py and set BLUEPRINT_LOCAL_TOOLS_ROOT=/tmp/walkthrough-tools in backend env
-- ✓ fake JWT → 401 confirmed (route-exists guard holds)
 
 **3e. MessagesPanel renders in UI** (DEAD_END):
 - MessagesPanel surface not confirmed — screenshot may not represent the claimed surface
@@ -452,15 +447,15 @@ The following steps were blocked by environment constraints (not code defects):
 - Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat 1 Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Chat Workday Context Search ⚠ 1 need
 
 **5a. Eligible live runner for Workday resident** (DEAD_END):
-- POST /api/admin/projects/00000000-0000-4000-8000-000000000001/runners/register → 200 (runner_id: 2416e26b-f3cc-4729-8ca0-3b3d7911840a)
+- POST /api/admin/projects/00000000-0000-4000-8000-000000000001/runners/register → 200 (runner_id: 92a29013-b8ab-48f7-ba72-596b6f1900c9)
 - Spawned scripts/local_runner.py daemon (SUPERVISED=1); polled strategic-liveness for eligibility
-- resident_session_runners: 2; eligible: 0
+- resident_session_runners: 3; eligible: 0
 - ✗ No eligible runner — start will BLOCK (no_runner). Likely agent runtime/isolation unavailable on this VM (DEAD_END, not a code defect).
 - --- daemon stdout/stderr (first 12 lines) ---
 -   Blueprint local fleet runner — preflight
--     runner host     : agent-vm-a66802c452684734b771ba37b165d720
+-     runner host     : agent-vm-434f778cba2a454faab666839f6782ea
 -     orchestrator    : http://127.0.0.1:8080   [reachable]
--     runner token    : Yag9kDUH...   [valid]
+-     runner token    : r-O6FNYX...   [valid]
 -     python          : 3.10.12
 -     workspace       : /tmp/blueprint-agent-workspaces   [writable]
 -     concurrency     : agents=2  compute=2  (separate pools; up to 4 tasks total)
@@ -506,24 +501,16 @@ The following steps were blocked by environment constraints (not code defects):
 - Component: admin-ui/src/components/StrategicSessionControl.tsx — Workday toggle (aria-label) + Start button (title="Start Workday session")
 - Unit coverage: admin-ui/src/components/StrategicSessionControl.test.tsx — "full click-to-talk sequence" test
 
-**8b. Admin messages endpoint returns total for pagination** (DEAD_END):
-- GET /api/admin/messages?project_id=00000000-0000-4000-8000-000000000001&status=all&limit=30 → 200
-- ⚠ total=1 — not enough messages to trigger load-older (need > 30)
-- Returned 1 messages in first page
-- MessagesPanel source: TRIAGE_PAGE_SIZE=30 (MessagesPanel.tsx:69)
-- MessagesPanel source: hasOlderTriageMessages = responseTotal > loadedWindow (MessagesPanel.tsx:1501)
-- MessagesListView source: "Load older messages" button rendered when hasOlderTriageMessages (MessagesListView.tsx:892-900)
-
-**8c. MessagesPanel renders "Load older messages" button** (DEAD_END):
+**8c. MessagesPanel renders "Load older messages" button** (FAIL):
 - Navigation to MessagesPanel completed
 - "Load older messages" button visible: false (found 0 idle + 0 loading-state buttons)
-- ⚠ Admin messages endpoint returned 200 — MessagesPanel cannot show load-older (DEAD_END)
+- ✗ Load older button missing despite pagination data being available
 - Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat 1 Pipeline Project Runtime Fleet health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Chat Workday Blocked Workday device 
 - Source: MessagesListView.tsx:892-900 renders {row.kind === "load_older"} button
 - Fix evidence: admin-ui/src/components/MessagesListView.tsx:1241 — "Load older messages" button triggers loadOlderTriage callback
 
 **8d. "Load older messages" click actually loads older messages** (DEAD_END):
-- ⚠ Skipped — admin messages endpoint returned 200 (not 200); MessagesPanel cannot load paginated data
+- ⚠ Skipped — Load older button not visible in step 8c
 - Source evidence: MessagesPanel.tsx:1562-1566 — loadOlderTriage callback increments triageOffset and re-fetches
 - Fix verification: audit finding 5045cb32 fix is on automain; live verification blocked by endpoint status
 
@@ -573,7 +560,7 @@ The following steps were blocked by environment constraints (not code defects):
 
 ### c-5214996f — Real walkthrough criterion
 > This document IS the real walkthrough. Execution evidence:
-> - SHA: `751f5d9455feeb67203a2cd669777266e6b126f1`
-> - Timestamp: 2026-07-23T11:06:13.585Z
+> - SHA: `3f63afa77ae1f0960bd47123edf5fe3798b8b718`
+> - Timestamp: 2026-07-23T19:11:39.493Z
 > - Live HTTP responses recorded above
 > - Screenshots in `docs/walkthroughs/screenshots/`
