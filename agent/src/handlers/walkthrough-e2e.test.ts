@@ -4,7 +4,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { bootMock, teardownMock, ctorMock, deriveComposeProjectMock } = vi.hoisted(() => {
   const bootMock = vi.fn();
   const teardownMock = vi.fn().mockResolvedValue(undefined);
-  const ctorMock = vi.fn().mockImplementation(() => ({ boot: bootMock, teardown: teardownMock }));
+  const ctorMock = vi.fn().mockImplementation(function CandidateStackControllerMock() {
+    return { boot: bootMock, teardown: teardownMock };
+  });
   const deriveComposeProjectMock = vi.fn();
   return { bootMock, teardownMock, ctorMock, deriveComposeProjectMock };
 });

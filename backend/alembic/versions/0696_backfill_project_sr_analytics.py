@@ -79,7 +79,7 @@ def upgrade() -> None:
         sa.text("SELECT project_id, data FROM project_sr_analytics ORDER BY project_id")
     ).mappings().all()
     existing_by_project = {
-        str(row["project_id"]): _as_mapping(row["data"])
+        str(row["project_id"]): row["data"]
         for row in existing_rows
     }
 
@@ -108,7 +108,30 @@ def upgrade() -> None:
         legacy = _legacy_sr_payload(project["design_doc"])
         if not legacy:
             continue
-        existing = existing_by_project.get(project_id)
+        if project_id in existing_by_project:
+            existing_value = existing_by_project[project_id]
+            if isinstance(existing_value, Mapping):
+                existing = dict(existing_value)
+            elif conn.dialect.name != "postgresql" and isinstance(
+                existing_value, str
+            ):
+                # SQLite returns JSON columns selected through text() as their
+                # serialized representation; decode only for that compatibility
+                # path. PostgreSQL JSONB strings remain authoritative scalars.
+                try:
+                    decoded = json.loads(existing_value)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(decoded, Mapping):
+                    continue
+                existing = dict(decoded)
+            else:
+                # The dedicated row is authoritative even when it contains a
+                # legacy/malformed non-object JSON value. Do not coerce and
+                # overwrite a valid raw JSON shape during backfill.
+                continue
+        else:
+            existing = None
         merged = {**legacy, **(existing or {})}
         params = {
             "project_id": project_id,

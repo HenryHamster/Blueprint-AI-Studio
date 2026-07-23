@@ -4,12 +4,26 @@ from __future__ import annotations
 
 import importlib.util
 import json
-from datetime import datetime
+import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from sqlalchemy.engine import make_url
+
+from app.migration_apply_gate import ephemeral_postgres_database
+
+_USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
+requires_postgres = pytest.mark.skipif(
+    not _USE_POSTGRES,
+    reason="requires the real PostgreSQL migration harness",
+)
 
 
 def _migration():
@@ -85,7 +99,7 @@ def test_upgrade_backfills_only_sr_keys_and_dedicated_values_win():
             {
                 "project_id": "partial-dedicated",
                 "data": {"sr_catch_rate_trends": {"source": "dedicated"}},
-                "updated_at": datetime(2026, 7, 22),
+                "updated_at": datetime(2026, 7, 22, tzinfo=timezone.utc),
             },
         )
 
@@ -169,3 +183,87 @@ def test_upgrade_backfills_every_documented_legacy_key():
         assert rows[0]["data"] == all_legacy_values
         assert set(rows[0]["data"]) == migration.LEGACY_SR_ANALYTICS_KEYS
         assert "unrelated" not in rows[0]["data"]
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_postgres_preserves_authoritative_non_mapping_jsonb_rows():
+    migration = _migration()
+    authoritative_at = datetime(2026, 7, 23, 17, 0, tzinfo=timezone.utc)
+    raw_values = {
+        "list": ["dedicated", {"shape": "list"}],
+        "string": "dedicated-string",
+        "number": 7,
+        "boolean": False,
+        "null": None,
+    }
+    project_ids = {name: uuid.uuid4() for name in raw_values}
+
+    async with ephemeral_postgres_database(make_url(os.environ["DATABASE_URL"])) as (
+        engine,
+        _database_name,
+    ):
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text(
+                    "CREATE TABLE project ("
+                    "id uuid PRIMARY KEY, design_doc jsonb NOT NULL)"
+                )
+            )
+            await connection.execute(
+                sa.text(
+                    "CREATE TABLE project_sr_analytics ("
+                    "project_id uuid PRIMARY KEY, data jsonb NOT NULL, "
+                    "updated_at timestamptz NOT NULL)"
+                )
+            )
+            for name, project_id in project_ids.items():
+                await connection.execute(
+                    sa.text(
+                        "INSERT INTO project (id, design_doc) VALUES "
+                        "(CAST(:id AS uuid), CAST(:design_doc AS jsonb))"
+                    ),
+                    {
+                        "id": project_id,
+                        "design_doc": json.dumps(
+                            {"sr_floor_threshold": {"legacy": name}}
+                        ),
+                    },
+                )
+                await connection.execute(
+                    sa.text(
+                        "INSERT INTO project_sr_analytics "
+                        "(project_id, data, updated_at) VALUES "
+                        "(CAST(:project_id AS uuid), CAST(:data AS jsonb), "
+                        ":updated_at)"
+                    ),
+                    {
+                        "project_id": project_id,
+                        "data": json.dumps(raw_values[name]),
+                        "updated_at": authoritative_at,
+                    },
+                )
+
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: _run_upgrade(migration, sync_connection)
+            )
+
+        async with engine.connect() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        sa.text(
+                            "SELECT project_id, data, updated_at "
+                            "FROM project_sr_analytics ORDER BY project_id"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            by_project = {str(row["project_id"]): row for row in rows}
+            for name, project_id in project_ids.items():
+                row = by_project[str(project_id)]
+                assert row["data"] == raw_values[name]
+                assert row["updated_at"] == authoritative_at

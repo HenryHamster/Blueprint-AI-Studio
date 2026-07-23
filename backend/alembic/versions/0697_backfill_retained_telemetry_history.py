@@ -27,6 +27,7 @@ depends_on = None
 
 EFFICIENCY_KEY = "efficiency_baseline"
 LANE_KEY = "lane_baselines"
+_PG_INTEGER_MAX = 2_147_483_647
 
 
 def _as_mapping(value: Any) -> dict[str, Any]:
@@ -64,7 +65,13 @@ def _version_number(value: Any) -> int | None:
         return None
     if parsed < 0 or str(parsed) != str(value).strip():
         return None
-    return parsed
+    return parsed if parsed <= _PG_INTEGER_MAX else None
+
+
+def _definition_version(value: Any) -> str:
+    if isinstance(value, str) and value and len(value) <= 64:
+        return value
+    return "legacy"
 
 
 def _json(value: Any) -> str:
@@ -170,9 +177,9 @@ def upgrade() -> None:
                     continue
                 if snapshot_key in existing_efficiency_snapshots:
                     continue
-                metric_def_version = snapshot.get("metric_def_version")
-                if not isinstance(metric_def_version, str) or not metric_def_version:
-                    metric_def_version = "legacy"
+                metric_def_version = _definition_version(
+                    snapshot.get("metric_def_version")
+                )
                 conn.execute(
                     insert_efficiency,
                     {
@@ -197,9 +204,9 @@ def upgrade() -> None:
                 continue
             if lane_key in existing_lane_baselines:
                 continue
-            baseline_def_version = baseline.get("baseline_def_version")
-            if not isinstance(baseline_def_version, str) or not baseline_def_version:
-                baseline_def_version = "legacy"
+            baseline_def_version = _definition_version(
+                baseline.get("baseline_def_version")
+            )
             conn.execute(
                 insert_lane,
                 {

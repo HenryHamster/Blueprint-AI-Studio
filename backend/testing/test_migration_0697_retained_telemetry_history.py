@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from sqlalchemy.engine import make_url
+
+from app.migration_apply_gate import ephemeral_postgres_database
+
+_USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
+requires_postgres = pytest.mark.skipif(
+    not _USE_POSTGRES,
+    reason="requires the real PostgreSQL migration harness",
+)
 
 
 def _migration():
@@ -278,3 +293,139 @@ def test_upgrade_skips_malformed_entries_without_stripping_fallback():
 def test_downgrade_is_non_destructive():
     migration = _migration()
     assert migration.downgrade() is None
+
+
+def test_schema_bound_normalizers_match_rebuilt_table_limits():
+    migration = _migration()
+
+    assert migration._version_number("2147483647") == 2_147_483_647
+    assert migration._version_number("2147483648") is None
+    assert migration._definition_version("v1") == "v1"
+    assert migration._definition_version("x" * 65) == "legacy"
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_postgres_skips_integer_overflow_and_normalizes_long_def_versions():
+    migration = _migration()
+    project_id = uuid.uuid4()
+    captured_at = "2026-07-23T18:00:00+00:00"
+    long_version = "x" * 65
+    design_doc = {
+        "efficiency_baseline": {
+            "snapshots": [
+                {
+                    "captured_at": captured_at,
+                    "metric_def_version": long_version,
+                    "score": 1,
+                }
+            ]
+        },
+        "lane_baselines": {
+            "2147483647": {
+                "captured_at": captured_at,
+                "baseline_def_version": long_version,
+                "score": 2,
+            },
+            "2147483648": {
+                "captured_at": captured_at,
+                "baseline_def_version": "overflow",
+                "score": 3,
+            },
+        },
+    }
+
+    async with ephemeral_postgres_database(make_url(os.environ["DATABASE_URL"])) as (
+        engine,
+        _database_name,
+    ):
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text(
+                    "CREATE TABLE project ("
+                    "id uuid PRIMARY KEY, design_doc jsonb NOT NULL)"
+                )
+            )
+            await connection.execute(
+                sa.text(
+                    "CREATE TABLE project_telemetry ("
+                    "id uuid PRIMARY KEY, project_id uuid NOT NULL, "
+                    "key varchar(100) NOT NULL, value jsonb, "
+                    "updated_at timestamptz NOT NULL, "
+                    "UNIQUE (project_id, key))"
+                )
+            )
+            await connection.execute(
+                sa.text(
+                    "CREATE TABLE project_efficiency_snapshot ("
+                    "id uuid PRIMARY KEY, project_id uuid NOT NULL, "
+                    "captured_at timestamptz NOT NULL, "
+                    "metric_def_version varchar(64) NOT NULL, blob jsonb NOT NULL, "
+                    "UNIQUE (project_id, captured_at))"
+                )
+            )
+            await connection.execute(
+                sa.text(
+                    "CREATE TABLE project_lane_baseline ("
+                    "id uuid PRIMARY KEY, project_id uuid NOT NULL, "
+                    "version_number integer NOT NULL, "
+                    "captured_at timestamptz NOT NULL, "
+                    "baseline_def_version varchar(64) NOT NULL, "
+                    "blob jsonb NOT NULL, UNIQUE (project_id, version_number))"
+                )
+            )
+            await connection.execute(
+                sa.text(
+                    "INSERT INTO project (id, design_doc) VALUES "
+                    "(CAST(:id AS uuid), CAST(:design_doc AS jsonb))"
+                ),
+                {"id": project_id, "design_doc": json.dumps(design_doc)},
+            )
+
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: _run_upgrade(migration, sync_connection)
+            )
+
+        async with engine.connect() as connection:
+            efficiency_row = (
+                (
+                    await connection.execute(
+                        sa.text(
+                            "SELECT metric_def_version, blob "
+                            "FROM project_efficiency_snapshot"
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert efficiency_row["metric_def_version"] == "legacy"
+            assert efficiency_row["blob"]["metric_def_version"] == long_version
+
+            lane_rows = (
+                (
+                    await connection.execute(
+                        sa.text(
+                            "SELECT version_number, baseline_def_version, blob "
+                            "FROM project_lane_baseline ORDER BY version_number"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            assert len(lane_rows) == 1
+            assert lane_rows[0]["version_number"] == 2_147_483_647
+            assert lane_rows[0]["baseline_def_version"] == "legacy"
+            assert lane_rows[0]["blob"]["baseline_def_version"] == long_version
+
+            telemetry_value = await connection.scalar(
+                sa.text(
+                    "SELECT value FROM project_telemetry "
+                    "WHERE project_id = CAST(:project_id AS uuid) "
+                    "AND key = 'efficiency_baseline'"
+                ),
+                {"project_id": project_id},
+            )
+            assert telemetry_value == design_doc["efficiency_baseline"]

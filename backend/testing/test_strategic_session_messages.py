@@ -542,24 +542,24 @@ async def test_resident_final_fence_orders_equal_timestamps_deterministically(
 ):
     project, task = await _make_resident_poll_worker(db_session)
     equal_time = _BASE
+    seq_four = await _add_message(
+        db_session,
+        project,
+        id=uuid.UUID("00000000-0000-0000-0000-000000000040"),
+        from_type="user",
+        status="open",
+        content="sequence four inserted first",
+        sequence=4,
+        created_at=equal_time,
+    )
     seq_two = await _add_message(
         db_session,
         project,
         id=uuid.UUID("00000000-0000-0000-0000-000000000020"),
         from_type="user",
         status="open",
-        content="sequence two inserted first",
+        content="sequence two inserted second",
         sequence=2,
-        created_at=equal_time,
-    )
-    null_high = await _add_message(
-        db_session,
-        project,
-        id=uuid.UUID("00000000-0000-0000-0000-000000000040"),
-        from_type="user",
-        status="open",
-        content="legacy null high UUID inserted second",
-        sequence=None,
         created_at=equal_time,
     )
     seq_one = await _add_message(
@@ -572,14 +572,14 @@ async def test_resident_final_fence_orders_equal_timestamps_deterministically(
         sequence=1,
         created_at=equal_time,
     )
-    null_low = await _add_message(
+    seq_three = await _add_message(
         db_session,
         project,
         id=uuid.UUID("00000000-0000-0000-0000-000000000030"),
         from_type="user",
         status="open",
-        content="legacy null low UUID inserted last",
-        sequence=None,
+        content="sequence three inserted last",
+        sequence=3,
         created_at=equal_time,
     )
 
@@ -592,8 +592,8 @@ async def test_resident_final_fence_orders_equal_timestamps_deterministically(
     assert [row["id"] for row in response.json()["messages"]] == [
         str(seq_one.id),
         str(seq_two.id),
-        str(null_low.id),
-        str(null_high.id),
+        str(seq_three.id),
+        str(seq_four.id),
     ]
 
 
