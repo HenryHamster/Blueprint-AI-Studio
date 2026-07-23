@@ -341,7 +341,7 @@
     "test_message_audience.py": 2750,
     "test_alerts.py": 2300,
     "test_strategic_context_package.py": 2250,
-    "test_task_locking.py": 2250,
+    "test_task_locking.py": 2600,
     "test_admin_runners.py": 2100,
     "test_admin_project_config.py": 2100,
     "test_llm_runtime.py": 2100,

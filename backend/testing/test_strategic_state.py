@@ -9538,3 +9538,348 @@ async def test_checkpoint_state_returns_knowledge_index(db_session):
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_admin_strategic_state_returns_knowledge_doc_index_shape(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-state returns the KnowledgeDocument index for memory.
+
+    The strategic_memory_notes key must carry {id, title, ...} index entries
+    (superseded/dismissed facts excluded), NOT the raw JSONB {note, set_at}
+    shape — even when a legacy JSONB list is still present on the project.
+    """
+    project = Project(
+        name="P-admin-strategic-memory",
+        user_id=TEST_USER_ID,
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+    )
+    await db_session.commit()
+
+    active_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Always measure user-visible improvement",
+        summary="Measure shipped improvement, not green CI.",
+        body="Measure shipped improvement, not green CI.",
+        topic="operator_preference",
+        tags=["quality"],
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True},
+    )
+    dismissed_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Superseded fact",
+        summary="Old belief, superseded.",
+        body="Old belief, superseded.",
+        source_citations=[],
+        lifecycle_status="dismissed",
+        forward_quality_verdict={"passed": True},
+    )
+    db_session.add(active_doc)
+    db_session.add(dismissed_doc)
+    await db_session.commit()
+    await db_session.refresh(active_doc)
+    active_id = str(active_doc.id)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200, resp.text
+    notes = resp.json()["strategic_memory_notes"]
+    assert isinstance(notes, list)
+    ids = [n.get("id") for n in notes]
+    assert active_id in ids
+    # Dismissed (superseded) fact excluded.
+    assert str(dismissed_doc.id) not in ids
+    entry = next(n for n in notes if n.get("id") == active_id)
+    assert entry.get("title") == "Always measure user-visible improvement"
+    # KnowledgeDoc-index shape, not raw JSONB {note, set_at}.
+    for n in notes:
+        assert "note" not in n
+        assert "set_at" not in n
+
+
+@pytest.mark.asyncio
+async def test_section_fetch_strategic_memory_returns_knowledge_doc_index_shape(
+    db_session,
+):
+    """GET /sections/strategic_memory_notes returns the KnowledgeDocument index.
+
+    Same KnowledgeDocument-index shape as the checkpoint-state and admin
+    strategic-state paths, with superseded facts excluded and the raw JSONB
+    shape absent.
+    """
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(
+        name="P-section-strategic-memory",
+        user_id="u1",
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    active_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Prefer concrete action proposals",
+        summary="Give concrete proposals when blocking on operator input.",
+        body="Give concrete proposals when blocking on operator input.",
+        topic="process_rule",
+        tags=[],
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True},
+    )
+    dismissed_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Superseded fact",
+        summary="Old belief.",
+        body="Old belief.",
+        source_citations=[],
+        lifecycle_status="dismissed",
+        forward_quality_verdict={"passed": True},
+    )
+    db_session.add(active_doc)
+    db_session.add(dismissed_doc)
+    await db_session.commit()
+    await db_session.refresh(active_doc)
+    active_id = str(active_doc.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            resp = await ac.get(
+                f"/api/agent/projects/{project.id}/sections/strategic_memory_notes"
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert isinstance(data, list)
+        ids = [n.get("id") for n in data]
+        assert active_id in ids
+        assert str(dismissed_doc.id) not in ids
+        entry = next(n for n in data if n.get("id") == active_id)
+        assert entry.get("title") == "Prefer concrete action proposals"
+        for n in data:
+            assert "note" not in n
+            assert "set_at" not in n
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+def _load_migration_0699():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / (
+        "alembic/versions/0699_backfill_strategic_memory_knowledge.py"
+    )
+    spec = importlib.util.spec_from_file_location("migration_0699", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_migration_0699_backfills_legacy_notes_into_knowledge_documents(
+    db_session,
+):
+    """Migration 0699 backfills pre-existing legacy notes into KnowledgeDocuments.
+
+    Pre-seeds a project's strategic_memory_notes JSONB list with legacy entries
+    (no doc_id), runs the migration, and asserts one consumed strategic_memory
+    KnowledgeDocument exists per entry with the correct body/title/summary and is
+    retrievable via list_knowledge_documents(source_kind='strategic_memory').
+    Re-running the migration is idempotent (no duplicates).
+    """
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.knowledge_query import list_knowledge_documents
+
+    migration = _load_migration_0699()
+
+    project = Project(
+        name="P-0699-backfill",
+        user_id="u1",
+        strategic_memory_notes=[
+            {
+                "note": "Do not assert timelines without supporting evidence.",
+                "set_at": "2026-07-08T14:30:00Z",
+            },
+            {
+                "note": "Verify external claims before escalating them.",
+                "set_at": "2026-07-08T15:00:00+00:00",
+            },
+            # A malformed/empty entry must be skipped, not crash the migration.
+            {"set_at": "2026-07-08T16:00:00Z"},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _apply(sync_session):
+        connection = sync_session.connection()
+        original_op = migration.op
+        migration.op = Operations(MigrationContext.configure(connection))
+        try:
+            migration.upgrade()
+        finally:
+            migration.op = original_op
+
+    # Run twice to prove idempotency (deterministic uuid5 ids + skip-existing).
+    await db_session.run_sync(_apply)
+    await db_session.run_sync(_apply)
+
+    listed = await list_knowledge_documents(
+        db_session, project.id, source_kind="strategic_memory"
+    )
+    # Two well-formed notes → two docs; the malformed entry is skipped.
+    assert listed["total"] == 2
+    titles = {d["title"] for d in listed["documents"]}
+    assert "Do not assert timelines without supporting evidence." in titles
+    assert "Verify external claims before escalating them." in titles
+
+    rows = (
+        await db_session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+    for doc in rows:
+        assert doc.lifecycle_status == "consumed"
+        assert doc.forward_quality_verdict == {"passed": True, "strategy": "backfill"}
+        assert doc.body in {
+            "Do not assert timelines without supporting evidence.",
+            "Verify external claims before escalating them.",
+        }
+        assert doc.summary == doc.body
+        assert doc.source_citations[0]["note"] == (
+            "backfilled from legacy strategic_memory_notes"
+        )
+
+    # The legacy JSONB column is left in place (not cleared) for rollback safety.
+    await db_session.refresh(project)
+    assert len(project.strategic_memory_notes) == 3
+
+    # Downgrade removes ONLY the backfill-marked rows (precisely reversible).
+    def _revert(sync_session):
+        connection = sync_session.connection()
+        original_op = migration.op
+        migration.op = Operations(MigrationContext.configure(connection))
+        try:
+            migration.downgrade()
+        finally:
+            migration.op = original_op
+
+    await db_session.run_sync(_revert)
+    after = await list_knowledge_documents(
+        db_session, project.id, source_kind="strategic_memory"
+    )
+    assert after["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_0699_skips_entries_with_existing_doc_id(db_session):
+    """Entries carrying a doc_id pointing at an existing row are not duplicated."""
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.knowledge_query import list_knowledge_documents
+
+    migration = _load_migration_0699()
+
+    project = Project(name="P-0699-skip", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A post-0680 KnowledgeDocument already exists for this fact.
+    existing = KnowledgeDocument(
+        project_id=project.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Already migrated fact",
+        summary="Already migrated fact",
+        body="Already migrated fact",
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True, "strategy": "agent_self_attested"},
+    )
+    db_session.add(existing)
+    await db_session.commit()
+    await db_session.refresh(existing)
+
+    project.strategic_memory_notes = [
+        {
+            "note": "Already migrated fact",
+            "set_at": "2026-07-08T14:30:00Z",
+            "doc_id": str(existing.id),
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "strategic_memory_notes")
+    db_session.add(project)
+    await db_session.commit()
+
+    def _apply(sync_session):
+        connection = sync_session.connection()
+        original_op = migration.op
+        migration.op = Operations(MigrationContext.configure(connection))
+        try:
+            migration.upgrade()
+        finally:
+            migration.op = original_op
+
+    await db_session.run_sync(_apply)
+
+    listed = await list_knowledge_documents(
+        db_session, project.id, source_kind="strategic_memory"
+    )
+    # No duplicate row created for the already-migrated entry.
+    assert listed["total"] == 1
+    assert listed["documents"][0]["id"] == str(existing.id)

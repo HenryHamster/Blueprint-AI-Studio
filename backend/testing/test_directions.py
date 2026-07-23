@@ -6293,9 +6293,10 @@ async def test_strategic_api_reflect(db_session):
 
 @pytest.mark.asyncio
 async def test_strategic_api_set_memory(db_session):
-    """op=set_memory appends a durable note to project.strategic_memory_notes."""
+    """op=set_memory writes a strategic_memory KnowledgeDocument (sole write path)."""
     from httpx import AsyncClient, ASGITransport
     from app.main import app
+    from app.knowledge_query import list_knowledge_documents
 
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
@@ -6313,13 +6314,20 @@ async def test_strategic_api_set_memory(db_session):
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["op"] == "set_memory"
+        assert body["source_kind"] == "strategic_memory"
         assert body["entry_count"] == 1
+        assert body["doc_id"]
+
+        # The KnowledgeDocument row is the store; the legacy JSONB column is
+        # frozen (dual-write leg cut).
+        listed = await list_knowledge_documents(
+            db_session, project.id, source_kind="strategic_memory"
+        )
+        assert listed["total"] == 1
+        assert listed["documents"][0]["id"] == body["doc_id"]
 
         await db_session.refresh(project)
-        assert len(project.strategic_memory_notes) == 1
-        entry = project.strategic_memory_notes[0]
-        assert entry["note"] == "Always verify claims before escalating them."
-        assert "set_at" in entry
+        assert (project.strategic_memory_notes or []) == []
     finally:
         _cleanup_strategic_overrides()
 
@@ -6392,15 +6400,22 @@ async def test_strategic_api_set_memory_rejects_empty_note(db_session):
 
 
 @pytest.mark.asyncio
-async def test_strategic_api_set_memory_cap(db_session):
-    """set_memory caps strategic_memory_notes at 100 entries (FIFO eviction)."""
+async def test_strategic_api_set_memory_leaves_legacy_jsonb_frozen(db_session):
+    """The JSONB dual-write leg is cut: a pre-existing legacy list is untouched.
+
+    The former FIFO-cap-at-100 behavior no longer applies — the JSONB column is
+    retained for rollback safety but no longer receives writes. New facts land
+    only as KnowledgeDocument rows.
+    """
     from httpx import AsyncClient, ASGITransport
     from app.main import app
 
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
-        # Pre-fill with 100 entries
-        project.strategic_memory_notes = [{"note": f"entry {i}", "set_at": "2026-01-01T00:00:00"} for i in range(100)]
+        preexisting = [
+            {"note": f"entry {i}", "set_at": "2026-01-01T00:00:00"} for i in range(3)
+        ]
+        project.strategic_memory_notes = list(preexisting)
         from sqlalchemy.orm.attributes import flag_modified as _fm
         _fm(project, "strategic_memory_notes")
         db_session.add(project)
@@ -6420,10 +6435,8 @@ async def test_strategic_api_set_memory_cap(db_session):
         assert resp.status_code == 200, resp.text
 
         await db_session.refresh(project)
-        # Should still be 100 (oldest entry 0 evicted)
-        assert len(project.strategic_memory_notes) == 100
-        assert project.strategic_memory_notes[0]["note"] == "entry 1"  # entry 0 was evicted
-        assert project.strategic_memory_notes[-1]["note"] == "newest note"
+        # The legacy JSONB list is frozen — no append, no eviction.
+        assert project.strategic_memory_notes == preexisting
     finally:
         _cleanup_strategic_overrides()
 

@@ -7578,19 +7578,21 @@ def test_sb5_4_migration_0672_exists_and_strips_truncated():
 
 
 def test_sb5_5_completion_debt_key_in_telemetry_keys():
-    """TELEMETRY_KEYS must include 'systems/completion-debt-ledger' so completion_debt.py
-    dual-writes the system description to project_telemetry alongside design_doc.
+    """TELEMETRY_KEYS must include 'systems/completion-debt-ledger' so it stays
+    budget-exempt / regrowth-guarded through the God-column cutover.
 
-    Finding sb5-5: completion_debt.py still wrote the system-description section only
-    to design_doc; adding dual-write to project_telemetry reduces design_doc pressure
-    and makes the section queryable without holding the design_doc lock.
+    Finding sb5-5: completion_debt.py originally wrote the system-description
+    section only to design_doc; it now persists SOLELY to project_telemetry (the
+    design_doc write leg is cut). The key stays in TELEMETRY_KEYS so any residual
+    design_doc copy remains exempt from the agent-write budget until migration
+    0695 strips it, and so the reserved-subset invariant continues to hold.
     """
     from app.project_telemetry import TELEMETRY_KEYS
 
     assert "systems/completion-debt-ledger" in TELEMETRY_KEYS, (
         "TELEMETRY_KEYS in project_telemetry.py must include 'systems/completion-debt-ledger' "
-        "so completion_debt.seed_completion_debt_design_doc_section dual-writes to "
-        "project_telemetry when the section is seeded or refreshed"
+        "so completion_debt.seed_completion_debt_design_doc_section's dedicated "
+        "project_telemetry row stays budget-exempt / reserved through the cutover"
     )
 
 

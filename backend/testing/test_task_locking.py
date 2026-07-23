@@ -1915,6 +1915,23 @@ def test_rolling_cutover_keys_remain_reserved():
     assert not missing, f"rolling-cutover keys must remain reserved: {sorted(missing)}"
 
 
+def test_telemetry_keys_are_subset_of_reserved_design_doc_keys():
+    """Every key in TELEMETRY_KEYS must appear in _RESERVED_DESIGN_DOC_KEYS.
+
+    Dual-written telemetry blobs live in design_doc during the cutover window,
+    so they must be exempted from the agent-owned 500 KB write budget.  This
+    guard runs standalone (no Postgres) so drift is caught in the smoke suite —
+    the same assertion in test_project_telemetry.py is Postgres-gated.
+    """
+    from app.project_telemetry import TELEMETRY_KEYS
+    from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+
+    missing = TELEMETRY_KEYS - _RESERVED_DESIGN_DOC_KEYS
+    assert not missing, (
+        f"TELEMETRY_KEYS keys not in _RESERVED_DESIGN_DOC_KEYS: {sorted(missing)}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_legacy_lane_baseline_does_not_consume_agent_ceiling(db_session):
     """A retained system-owned lane fallback cannot block a small agent write."""

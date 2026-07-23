@@ -875,9 +875,18 @@ export interface StrategicResidentSessionAvailability {
  * `eligible` = online + agent-ready + can handle strategic work (the full
  * auto-pick gate). The pinned device rides on `resident_session.runner_id`.
  */
+/**
+ * A strategic-memory fact, sourced from the KnowledgeDocument index
+ * (`source_kind='strategic_memory'`). Superseded facts are excluded server-side.
+ * Replaces the former `{note, set_at}` legacy-JSONB shape.
+ */
 export interface StrategicMemoryNote {
-  note: string;
-  set_at: string;
+  id: string;
+  title: string;
+  topic?: string;
+  summary?: string;
+  tags?: string[];
+  created_at?: string;
 }
 
 export interface StrategicAccountSpendStatus {

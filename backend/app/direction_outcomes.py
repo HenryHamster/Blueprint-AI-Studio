@@ -10,7 +10,6 @@ import statistics
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.failure_stage import _derive_failure_stage
@@ -56,7 +55,7 @@ from app.models import (
 )
 from app.project_telemetry import read_telemetry, upsert_telemetry
 from app.task_capabilities import PRODUCT_TASK_TYPES, READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES
-from app.task_locking import DesignDocSizeLimitExceeded, with_design_doc_locked, with_directions_locked
+from app.task_locking import with_directions_locked
 
 # Task types that never open a PR. Derived directly from the registry so that
 # newly-registered read_only types are automatically excluded from the
@@ -534,10 +533,13 @@ def _apply_cochange_to_doc(
     merged_files_lists: list[list[str]],
     pr_keys: list[str] | None = None,
 ) -> None:
-    """Apply co-change affinity index updates to a design_doc dict in place.
+    """Apply co-change affinity index updates to a ``cochange_index`` /
+    ``cochange_applied_prs`` carrier dict in place.
 
-    Core logic extracted from _update_cochange_index so it can be called
-    inside with_design_doc_locked (which passes the doc dict directly).
+    Pure accumulation logic over a dict holding ``cochange_index`` /
+    ``cochange_applied_prs``. Callers seed the dict from the ``cochange_state``
+    telemetry row (its sole store since the design_doc write leg was cut) and
+    persist the mutated result back to that row.
 
     When pr_keys is provided (a list aligned with merged_files_lists), each
     entry is only folded in once — already-applied keys are skipped.  If all
@@ -625,23 +627,6 @@ def _apply_cochange_to_doc(
         if len(updated_applied) > APPLIED_CAP:
             updated_applied = updated_applied[-APPLIED_CAP:]
         doc["cochange_applied_prs"] = updated_applied
-
-
-def _update_cochange_index(
-    project: Project, merged_files_lists: list[list[str]]
-) -> None:
-    """Update the co-change affinity index in project.design_doc.
-
-    For each merged PR's file list, records which files changed together.
-    Scores decay on each call so stale associations fade over time.
-    Keeps top-5 affinities per file, capped at 200 files total.
-    """
-    if not merged_files_lists:
-        return
-    doc = dict(project.design_doc or {})
-    _apply_cochange_to_doc(doc, merged_files_lists)
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
 
 
 async def read_cochange_index(session: AsyncSession, project: Project) -> dict:
@@ -2698,53 +2683,36 @@ async def _update_direction_research_outcomes(
     await with_directions_locked(session, project_id, _apply_direction_outcomes)
 
     if merged_files_lists:
-        # Flush the directions mutation before reacquiring the same Project row
-        # for the design_doc/cochange write. Without this, the second
-        # populate_existing refresh can reload a pre-mutation directions blob and
-        # clobber the newly-added research_history metrics in the same session.
+        # Flush the directions mutation before the co-change write so the two
+        # persist under a single commit (preserving the original crash-atomicity:
+        # the directions write cannot land without the co-change write).
         await session.flush()
-        session.expire(project, ["design_doc"])
-        cochange_capture: dict = {}
 
-        def _apply_and_capture(doc: dict) -> None:
-            _apply_cochange_to_doc(doc, merged_files_lists, pr_keys=merged_pr_keys)
-            # Snapshot the post-mutation co-change state so we can mirror it into
-            # the merged 'cochange_state' KV row (index + applied_prs together).
-            cochange_capture["index"] = doc.get("cochange_index") or {}
-            cochange_capture["applied_prs"] = list(
-                doc.get("cochange_applied_prs") or []
-            )
-
-        try:
-            await with_design_doc_locked(
-                session, project_id, _apply_and_capture
-            )
-        except DesignDocSizeLimitExceeded as exc:
-            # Cap hit — design_doc write skipped, but the directions mutation
-            # above still succeeded. Skip the cochange telemetry dual-write
-            # (same semantic as the old applied=False guard) and commit.
-            import logging  # noqa: PLC0415 — lazy import matches file convention
-            logging.getLogger(__name__).warning(
-                "[DIRECTION_OUTCOMES] design_doc size limit exceeded "
-                "for project %s — cochange telemetry write skipped: %s",
-                project_id,
-                exc,
-            )
-            pass
-        else:
-            if cochange_capture:
-                # Dual-write the merged co-change blob into the dedicated KV table.
-                # The design_doc cochange_index/cochange_applied_prs keys above stay
-                # as the rollback fallback for this phase.
-                await upsert_telemetry(
-                    session,
-                    project_id,
-                    "cochange_state",
-                    {
-                        "index": cochange_capture["index"],
-                        "applied_prs": cochange_capture["applied_prs"],
-                    },
-                )
+        # God-column cutover: the co-change index is stored SOLELY in the
+        # dedicated ``project_telemetry`` ``cochange_state`` row — the
+        # design_doc write leg is cut. This removes the Project row lock
+        # (``with_design_doc_locked``) from the merge path entirely, which is the
+        # write-serialization relief the decomposition targets. We seed the
+        # accumulator from the table's prior state (not design_doc), fold in the
+        # newly-merged PRs, and upsert only the KV row. Readers
+        # (``read_cochange_index`` / ``read_cochange_applied_prs``) already
+        # prefer this row, with a design_doc fallback retained for pre-backfill /
+        # rollback safety.
+        prev_state = await read_telemetry(session, project_id, "cochange_state")
+        working: dict = {
+            "cochange_index": dict((prev_state or {}).get("index") or {}),
+            "cochange_applied_prs": list((prev_state or {}).get("applied_prs") or []),
+        }
+        _apply_cochange_to_doc(working, merged_files_lists, pr_keys=merged_pr_keys)
+        await upsert_telemetry(
+            session,
+            project_id,
+            "cochange_state",
+            {
+                "index": working.get("cochange_index") or {},
+                "applied_prs": working.get("cochange_applied_prs") or [],
+            },
+        )
 
     await session.commit()
 

@@ -1302,34 +1302,39 @@ async def test_autonomous_spawn_budget_mode_seeds_and_graduates_dormant_debt(db_
 
 @pytest.mark.asyncio
 async def test_seed_writes_completion_debt_design_doc_section(db_session):
-    """Verify the design-doc section is seeded when absent and is idempotent.
+    """Verify the ledger section is seeded to project_telemetry, not design_doc.
 
-    Regression test for named_test acceptance requirement: the section must be
-    written to design_doc and re-seeding must not duplicate or churn fields.
+    God-column cutover: the section is stored SOLELY in the dedicated
+    ``project_telemetry`` row (design_doc write leg cut). Re-seeding must be
+    idempotent, must NOT write the design_doc key, and must preserve
+    operator-authored additions carried on the row.
     """
     from app.completion_debt import seed_completion_debt_design_doc_section
+    from app.project_telemetry import read_telemetry, set_project_telemetry
 
     project = Project(name="test-seed-doc", user_id="u")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    # First seed should write the section.
+    section_key = "systems/completion-debt-ledger"
+
+    # First seed should write the section row.
     result_first = await seed_completion_debt_design_doc_section(db_session, project.id)
     await db_session.commit()
 
     assert result_first is True, "first seed should return True (section written)"
 
-    # Refresh project to read the updated design_doc.
+    # The section lives in the telemetry table — NOT in design_doc.
     db_session.expire(project, ["design_doc"])
     await db_session.refresh(project)
-
     doc = project.design_doc or {}
-    section_key = "systems/completion-debt-ledger"
-    assert section_key in doc, f"section '{section_key}' must exist in design_doc"
+    assert section_key not in doc, (
+        f"design_doc write leg is cut: '{section_key}' must NOT be in design_doc"
+    )
 
-    section = doc[section_key]
-    assert isinstance(section, dict), "section must be a dict"
+    section = await read_telemetry(db_session, project.id, section_key)
+    assert isinstance(section, dict), "section must be a dict in project_telemetry"
     assert section.get("summary") is not None, "section must have a summary"
     assert section.get("status") == "active", "section status must be 'active'"
     assert "debt_kinds" in section, "section must list debt_kinds"
@@ -1348,6 +1353,7 @@ async def test_seed_writes_completion_debt_design_doc_section(db_session):
     assert "strategist_surface" in section, "section must document strategist surface"
     assert "admin_surface" in section, "section must document admin surface"
     assert "module" in section, "section must list the source module"
+    assert section.get("_authored_by") == "code", "seeded section must be code-authored"
 
     # Re-seeding should be idempotent (no churn, no duplication).
     result_second = await seed_completion_debt_design_doc_section(db_session, project.id)
@@ -1355,43 +1361,32 @@ async def test_seed_writes_completion_debt_design_doc_section(db_session):
 
     assert result_second is False, "second seed should return False (no changes)"
 
-    # Refresh again and verify the section is unchanged.
-    db_session.expire(project, ["design_doc"])
-    await db_session.refresh(project)
-    doc_after_reseed = project.design_doc or {}
-    assert doc_after_reseed.get(section_key) == section, (
+    section_after_reseed = await read_telemetry(db_session, project.id, section_key)
+    assert section_after_reseed == section, (
         "re-seeding must not churn or modify the section"
     )
 
-    # Verify that operator-authored additions are not clobbered.
-    # Manually add an operator field via a fresh DB read, then re-seed.
-    # Need to use with_design_doc_locked to properly track changes to JSONB.
-    from app.task_locking import with_design_doc_locked
-
-    def _add_operator_note(doc):
-        doc[section_key]["operator_note"] = "This is an operator-added note"
-
-    await with_design_doc_locked(db_session, project.id, _add_operator_note, skip_locked=False)
+    # Operator-authored additions on the row must survive a re-seed.
+    section_with_note = dict(section)
+    section_with_note["operator_note"] = "This is an operator-added note"
+    await set_project_telemetry(db_session, project.id, section_key, section_with_note)
     await db_session.commit()
 
-    # Re-seed again — the operator_note should remain.
     await seed_completion_debt_design_doc_section(db_session, project.id)
     await db_session.commit()
 
-    db_session.expire(project, ["design_doc"])
-    await db_session.refresh(project)
-    doc_after_op = project.design_doc or {}
-    section_after_op = doc_after_op.get(section_key, {})
+    section_after_op = await read_telemetry(db_session, project.id, section_key)
     assert section_after_op.get("operator_note") == "This is an operator-added note", (
         "re-seeding must preserve operator-authored additions"
     )
     assert section_after_op.get("summary") is not None, (
-        "re-seeding must refresh code-authored fields (summary)"
+        "re-seeding must retain code-authored fields (summary)"
     )
-    # The code fields should have been refreshed (result_third should be False if no code change
-    # between this test run and the previous, but it could be True if code fields changed).
-    # We just verify the section still has the expected structure.
     assert "debt_kinds" in section_after_op, "section must still have debt_kinds after re-seed"
+    # design_doc still untouched by the seeder.
+    db_session.expire(project, ["design_doc"])
+    await db_session.refresh(project)
+    assert section_key not in (project.design_doc or {})
 
 
 @pytest.mark.asyncio

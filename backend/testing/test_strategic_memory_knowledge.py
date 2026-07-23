@@ -115,13 +115,11 @@ async def test_set_memory_creates_strategic_memory_knowledge_document(db_session
         assert listed["total"] == 1
         assert listed["documents"][0]["id"] == doc_id
 
-        # Legacy JSONB dual-write preserved during the migration window.
+        # The legacy JSONB dual-write leg is CUT: set_memory no longer touches
+        # Project.strategic_memory_notes. The KnowledgeDocument row is the sole
+        # write path.
         await db_session.refresh(project)
-        assert len(project.strategic_memory_notes) == 1
-        entry = project.strategic_memory_notes[0]
-        assert entry["note"] == "Always verify claims before escalating them."
-        assert entry["doc_id"] == doc_id
-        assert "set_at" in entry
+        assert (project.strategic_memory_notes or []) == []
     finally:
         _cleanup_strategic_overrides()
 
@@ -217,25 +215,31 @@ async def test_set_memory_rich_fields_and_supersede(db_session):
 
 
 @pytest.mark.asyncio
-async def test_set_memory_dual_write_caps_legacy_notes(db_session):
-    """The legacy JSONB dual-write stays FIFO-capped at 100 entries."""
+async def test_set_memory_never_writes_legacy_jsonb_column(db_session):
+    """The dual-write leg is cut: set_memory leaves strategic_memory_notes frozen.
+
+    A pre-existing legacy list (e.g. written before the cutover, or backfilled)
+    is left untouched — new facts land ONLY as KnowledgeDocument rows.
+    """
     from sqlalchemy.orm.attributes import flag_modified
 
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
-        project.strategic_memory_notes = [
-            {"note": f"entry {i}", "set_at": "2026-01-01T00:00:00"} for i in range(100)
+        preexisting = [
+            {"note": f"entry {i}", "set_at": "2026-01-01T00:00:00"} for i in range(3)
         ]
+        project.strategic_memory_notes = list(preexisting)
         flag_modified(project, "strategic_memory_notes")
         db_session.add(project)
         await db_session.commit()
 
         resp = await _post_set_memory({"note": "newest note"}, task_id)
         assert resp.status_code == 200, resp.text
+        # entry_count now counts active KnowledgeDocument rows, not JSONB entries.
+        assert resp.json()["entry_count"] == 1
 
+        # The legacy JSONB column is frozen — no append, no cap mutation.
         await db_session.refresh(project)
-        assert len(project.strategic_memory_notes) == 100
-        assert project.strategic_memory_notes[0]["note"] == "entry 1"
-        assert project.strategic_memory_notes[-1]["note"] == "newest note"
+        assert project.strategic_memory_notes == preexisting
     finally:
         _cleanup_strategic_overrides()

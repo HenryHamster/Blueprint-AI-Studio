@@ -6477,11 +6477,11 @@ def test_gc_problem_model_evictable_model_does_not_raise():
     assert any(c.name == "cap-working" for c in model.capabilities)
 
 
-def test_apply_agent_update_raises_when_live_core_exceeds_budget():
-    """apply_agent_update raises ValueError when gc_problem_model finds the live
-    core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction — the error
-    propagates so the caller surfaces an actionable failure instead of silently
-    committing an oversized model.
+def test_apply_agent_update_live_core_exceeds_budget_returns_flag():
+    """apply_agent_update does NOT raise when the live core exceeds
+    PROBLEM_MODEL_BYTE_BUDGET — instead it sets diff["live_core_exceeds_budget"]
+    to the oversize section description and returns normally, so the op endpoint
+    can return HTTP 400 (not an opaque 500) naming the problematic section.
     """
     big = "x" * 5_000
     # Build a current model whose live core is over budget (all working/active).
@@ -6498,5 +6498,16 @@ def test_apply_agent_update_raises_when_live_core_exceeds_budget():
     }
     proposed = {"gaps": current_raw["gaps"]}
 
-    with pytest.raises(ValueError, match="live core exceeds PROBLEM_MODEL_BYTE_BUDGET"):
-        apply_agent_update(current_raw, proposed, "2026-07-22T12:00:00")
+    # Must NOT raise — the overflow is surfaced as a structured diff flag.
+    result_raw, diff = apply_agent_update(current_raw, proposed, "2026-07-22T12:00:00")
+
+    assert diff.get("live_core_exceeds_budget"), (
+        "Expected diff['live_core_exceeds_budget'] to be set when live core is over budget"
+    )
+    oversize_section = diff["live_core_exceeds_budget"]
+    assert isinstance(oversize_section, str)
+    assert any(
+        s in oversize_section for s in ("active_gaps", "live_capabilities", "active_friction")
+    ), f"Expected section name in live_core_exceeds_budget; got: {oversize_section}"
+    # A model dict is still returned (callers check the flag before deciding to commit).
+    assert isinstance(result_raw, dict)

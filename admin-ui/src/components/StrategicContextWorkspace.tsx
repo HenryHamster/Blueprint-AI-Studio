@@ -971,9 +971,14 @@ export function StrategicContextWorkspace({
               >
                 <div className={CONTEXT_LIST_CLASS}>
                   {strategicMemoryNotes.map((item, idx) => (
-                    <div key={idx} className="border-t border-neutral-800/70 py-2.5 first:border-t-0">
-                      <span className="block whitespace-pre-wrap text-sm text-neutral-100">{item.note}</span>
-                      <span className="mt-0.5 block text-ui-sm text-neutral-500">{item.set_at}</span>
+                    <div key={item.id ?? idx} className="border-t border-neutral-800/70 py-2.5 first:border-t-0">
+                      <span className="block whitespace-pre-wrap text-sm text-neutral-100">{item.title || item.summary}</span>
+                      {item.topic && (
+                        <span className="mt-0.5 mr-2 inline-block rounded bg-neutral-800/80 px-1.5 py-0.5 text-ui-sm text-neutral-400">{item.topic}</span>
+                      )}
+                      {item.created_at && (
+                        <span className="mt-0.5 block text-ui-sm text-neutral-500">{item.created_at}</span>
+                      )}
                     </div>
                   ))}
                 </div>

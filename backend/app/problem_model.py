@@ -3034,12 +3034,16 @@ def apply_agent_update(
     # are eligible) and BEFORE the revision-log append so the eviction is
     # recorded in the same revision that performed it. Folds what was dropped
     # into the diff so the GC is observable in the revision log.
-    gc_summary = gc_problem_model(proposed)
+    try:
+        gc_summary = gc_problem_model(proposed)
+    except ValueError:
+        # Live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction.
+        # Surface as a structured diff flag so callers can reject loudly (HTTP 400
+        # for the op endpoint) rather than propagating an opaque uncaught exception.
+        diff["live_core_exceeds_budget"] = _diagnose_live_core_oversize(proposed)
+        gc_summary = {}
     if gc_summary:
         diff.update(gc_summary)
-    # gc_problem_model raises ValueError when the live core alone exceeds the
-    # byte budget after full eviction; that error propagates here so the caller
-    # gets an actionable failure rather than a silently oversized durable model.
 
     append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
 

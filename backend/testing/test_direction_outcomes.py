@@ -22,7 +22,6 @@ from app.direction_outcomes import (
     _is_non_genuine_cancelled,
     _longest_chain_length,
     _refresh_pipeline_scope_merge_rates,
-    _update_cochange_index,
     _update_direction_research_outcomes,
     acceptance_metric_invariant_violations,
     acceptance_metrics_consistent,
@@ -2834,6 +2833,23 @@ def _make_project_with_design_doc(design_doc: dict | None = None) -> Project:
     )
 
 
+def _update_cochange_index(project, merged_files_lists):
+    """Local test helper: apply the pure co-change compute onto project.design_doc.
+
+    Mirrors the pre-cutover ``app.direction_outcomes._update_cochange_index``,
+    which was removed as dead production code — the live writer now persists the
+    index SOLELY to the ``cochange_state`` telemetry row. These unit tests still
+    exercise ``_apply_cochange_to_doc``'s accumulation / decay / prune logic via
+    a design_doc carrier dict; the design_doc assignment here is test-only and
+    intentionally not lock-guarded (the app-side guard invariant scans app/ only).
+    """
+    if not merged_files_lists:
+        return
+    doc = dict(project.design_doc or {})
+    _apply_cochange_to_doc(doc, merged_files_lists)
+    project.design_doc = doc
+
+
 def test_cochange_index_basic_pairs():
     """Co-changed files are recorded bidirectionally with score 1."""
     project = _make_project_with_design_doc()
@@ -2910,12 +2926,12 @@ def test_cochange_index_caps_total_files():
 
 @pytest.mark.asyncio
 async def test_cochange_state_dual_written_to_telemetry(db_session: AsyncSession):
-    """The merge path dual-writes the co-change blob to project_telemetry.
+    """The merge path persists the co-change blob SOLELY to project_telemetry.
 
-    Exercises the Phase-1 dual-write added to _update_direction_research_outcomes:
-    the design_doc cochange_index/cochange_applied_prs keys are kept AND the
-    merged {"index", "applied_prs"} blob is upserted to the 'cochange_state' KV
-    row; the telemetry-preferring readers return the reconstructed values.
+    God-column cutover: _update_direction_research_outcomes writes the merged
+    {"index", "applied_prs"} blob to the 'cochange_state' KV row and NO LONGER
+    writes the design_doc cochange_index/cochange_applied_prs keys (the write leg
+    is cut). The telemetry-preferring readers return the reconstructed values.
     """
     from app.direction_outcomes import (
         read_cochange_applied_prs,
@@ -2955,12 +2971,12 @@ async def test_cochange_state_dual_written_to_telemetry(db_session: AsyncSession
     )
     await db_session.refresh(project)
 
-    # design_doc copy preserved as the rollback fallback.
+    # design_doc write leg is CUT: neither co-change key is written there.
     doc = project.design_doc or {}
-    assert "alpha.py" in (doc.get("cochange_index") or {})
-    assert str(child.id) in (doc.get("cochange_applied_prs") or [])
+    assert "cochange_index" not in doc
+    assert "cochange_applied_prs" not in doc
 
-    # cochange_state telemetry row mirrors the merged blob shape.
+    # cochange_state telemetry row is the sole authoritative store.
     state = await read_telemetry(db_session, project.id, "cochange_state")
     assert state is not None
     assert "alpha.py" in state["index"]
@@ -2972,6 +2988,82 @@ async def test_cochange_state_dual_written_to_telemetry(db_session: AsyncSession
     assert "beta.py" in idx["alpha.py"]
     applied = await read_cochange_applied_prs(db_session, project)
     assert str(child.id) in applied
+
+
+@pytest.mark.asyncio
+async def test_cochange_writer_accumulates_from_telemetry_not_design_doc(
+    db_session: AsyncSession,
+):
+    """The cut writer folds new PRs onto the prior cochange_state TABLE row.
+
+    Regression guard for the design_doc write-leg cut: the affinity accumulator
+    must seed from the ``cochange_state`` telemetry row (its new sole source of
+    truth), not from ``design_doc``. A pre-seeded table affinity must survive
+    (decayed) a fresh merge, and design_doc must stay free of the co-change keys.
+    """
+    from app.direction_outcomes import read_cochange_index
+    from app.project_telemetry import read_telemetry, upsert_telemetry
+
+    direction_id = "d-cochange-accum"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
+    await db_session.flush()
+
+    # Pre-seed prior state ONLY in the telemetry table (nothing in design_doc).
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        "cochange_state",
+        {"index": {"old_a.py": {"old_b.py": 5.0}}, "applied_prs": ["seeded-pr"]},
+    )
+    await db_session.flush()
+
+    child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "pr_number": 202,
+            "_pr_changed_files": ["new_x.py", "new_y.py"],
+        },
+        title="second-cycle merge",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    state = await read_telemetry(db_session, project.id, "cochange_state")
+    assert state is not None
+    idx = state["index"]
+    # Prior table affinity survived (decayed 5.0 -> 4.5), proving the accumulator
+    # seeded from the table rather than the empty design_doc.
+    assert "old_a.py" in idx
+    assert idx["old_a.py"]["old_b.py"] == pytest.approx(4.5, abs=0.01)
+    # New merge folded in on top.
+    assert "new_y.py" in idx.get("new_x.py", {})
+    assert str(child.id) in state["applied_prs"]
+    assert "seeded-pr" in state["applied_prs"]
+
+    # design_doc write leg stays cut.
+    doc = project.design_doc or {}
+    assert "cochange_index" not in doc
+    assert "cochange_applied_prs" not in doc
+
+    # Reader returns the table-sourced index.
+    assert "old_a.py" in await read_cochange_index(db_session, project)
 
 
 @pytest.mark.asyncio
@@ -3102,10 +3194,14 @@ async def test_cochange_index_updated_on_merged_pr(db_session: AsyncSession):
     )
 
     await db_session.refresh(project)
-    idx = (project.design_doc or {}).get("cochange_index", {})
+    from app.direction_outcomes import read_cochange_index
+
+    idx = await read_cochange_index(db_session, project)
     assert "app/models.py" in idx
     assert "app/schemas.py" in idx["app/models.py"]
     assert "tests/test_models.py" in idx["app/models.py"]
+    # design_doc write leg is cut — the index lives only in the telemetry row.
+    assert "cochange_index" not in (project.design_doc or {})
 
 
 @pytest.mark.asyncio
@@ -3142,7 +3238,9 @@ async def test_cochange_index_not_updated_when_no_changed_files(
 
     await db_session.refresh(project)
     # cochange_index should not exist or be empty
-    idx = (project.design_doc or {}).get("cochange_index", {})
+    from app.direction_outcomes import read_cochange_index
+
+    idx = await read_cochange_index(db_session, project)
     assert idx == {}
 
 
@@ -3175,6 +3273,11 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.flush()
 
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+
     # First refresh: folds child1 in
     await _update_direction_research_outcomes(
         project_id=project.id,
@@ -3184,13 +3287,13 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.refresh(project)
     idx_after_first = dict(
-        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+        (await read_cochange_index(db_session, project)).get("app/models.py", {})
     )
     score_after_first = idx_after_first.get("app/schemas.py", 0.0)
     assert score_after_first == pytest.approx(1.0, abs=0.01), (
         f"Expected score 1.0 after first refresh, got {score_after_first}"
     )
-    applied_after_first = (project.design_doc or {}).get("cochange_applied_prs", [])
+    applied_after_first = await read_cochange_applied_prs(db_session, project)
     assert str(child1.id) in applied_after_first
 
     # Second refresh with identical child set (simulates post-commit replay) —
@@ -3203,7 +3306,7 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.refresh(project)
     idx_after_replay = dict(
-        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+        (await read_cochange_index(db_session, project)).get("app/models.py", {})
     )
     score_after_replay = idx_after_replay.get("app/schemas.py", 0.0)
     assert score_after_replay == pytest.approx(score_after_first, abs=0.01), (
@@ -3232,7 +3335,7 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.refresh(project)
     idx_after_new_pr = dict(
-        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+        (await read_cochange_index(db_session, project)).get("app/models.py", {})
     )
     score_after_new_pr = idx_after_new_pr.get("app/schemas.py", 0.0)
     # New PR increments by 1, previous score decayed once: ~1.0 * 0.9 + 1.0 = 1.9
@@ -10194,72 +10297,4 @@ async def test_non_genuine_cancels_excluded_from_generalized_health_rate(
     assert entry["generalized_health_rate"] == expected_health_rate, (
         f"expected health_rate {expected_health_rate}, "
         f"got {entry['generalized_health_rate']}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_cochange_design_doc_size_limit_logs_warning(
-    db_session: AsyncSession, caplog: pytest.LogCaptureFixture
-):
-    """When _update_direction_research_outcomes hits a DesignDocSizeLimitExceeded
-    on the cochange-index design_doc write, a warning is logged and the function
-    still completes (the directions mutation already succeeded)."""
-    import logging
-    from unittest.mock import patch
-
-    from app.task_locking import DesignDocSizeLimitExceeded
-
-    direction_id = "d-cochange-cap"
-    project = await _create_project(db_session, directions=[])
-    research_task = await _make_research_task(db_session, project.id)
-    research_task_id = str(research_task.id)
-
-    project.directions = [
-        _make_direction(direction_id, research_task_id, tasks_created=1)
-    ]
-    await db_session.flush()
-
-    # Create a merged child with _pr_changed_files so the cochange path is reached
-    await _create_child_task(
-        db_session,
-        research_task.id,
-        project.id,
-        status=TaskStatus.COMPLETED,
-        context={
-            "pr_merged": True,
-            "landed_on_integration": True,
-            "direction_id": direction_id,
-            "_pr_changed_files": ["file1.py", "file2.py"],
-        },
-        payloads=[{"type": "create", "scope": "small"}],
-        title="merged-child",
-    )
-
-    with patch(
-        "app.direction_outcomes.with_design_doc_locked",
-        side_effect=DesignDocSizeLimitExceeded(
-            project_id=project.id,
-            old_size=400_000,
-            new_size=500_100,
-            ceiling=500_000,
-        ),
-    ):
-        with caplog.at_level(logging.WARNING, logger="app.direction_outcomes"):
-            await _update_direction_research_outcomes(
-                project_id=project.id,
-                direction_id=direction_id,
-                research_task_id=research_task_id,
-                session=db_session,
-            )
-
-    await db_session.refresh(project)
-
-    # Warning was emitted with attributable context
-    assert any(
-        "design_doc size limit exceeded" in rec.message
-        and str(project.id) in rec.message
-        for rec in caplog.records
-    ), (
-        "Expected a logger.warning with project_id and 'design_doc size limit exceeded' "
-        f"in caplog records: {[r.message for r in caplog.records]}"
     )

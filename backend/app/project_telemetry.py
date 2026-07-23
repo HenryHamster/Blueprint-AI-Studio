@@ -60,8 +60,10 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         # to both design_doc and this table; readers fall back to design_doc.
         "direction_first_attempt_feedback",
         # Completion-debt-ledger system description seeded by completion_debt.py.
-        # Writers dual-write to both design_doc (for strategist visibility) and
-        # this table; readers may fall back to design_doc.
+        # God-column cutover COMPLETE: the seeder now persists SOLELY to this
+        # row; the design_doc write leg is cut. Retained here for budget
+        # exemption / regrowth guarding during the transition (migration 0695
+        # backfills and strips the stale design_doc key).
         "systems/completion-debt-ledger",
     }
 )

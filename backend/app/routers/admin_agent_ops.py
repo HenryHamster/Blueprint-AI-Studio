@@ -4208,6 +4208,19 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model: {ve}"
             ) from None
+        # Reject with HTTP 400 when the live core alone exceeds the byte budget.
+        # Fire the alert and commit it before raising so it persists despite the 400.
+        if pm_diff.get("live_core_exceeds_budget"):
+            await _maybe_create_problem_model_live_core_alert(project.id, session)
+            await session.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"problem_model live core exceeds byte budget — "
+                    f"oversize section: {pm_diff['live_core_exceeds_budget']}. "
+                    "Reduce the size of active gaps, live capabilities, or active friction."
+                ),
+            )
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
         # Surface blocked gap deletions (active direction still references the gap).
@@ -4223,11 +4236,6 @@ async def strategic_operation(
                 await _maybe_create_problem_model_wipe_alert(
                     project.id, session, field=_wipe_field
                 )
-        # Fire a deduplicated ERROR alert when the live core alone exceeds the
-        # byte budget — byte eviction is futile and the model was committed
-        # oversized (rev-1367 wipe precondition).
-        if pm_diff.get("live_core_exceeds_budget"):
-            await _maybe_create_problem_model_live_core_alert(project.id, session)
         # Normalize stale active_moves via the shared helper so both write paths
         # (op-endpoint + log-parse fallback) stay converged.
         _active_dir_ids = {
@@ -4517,9 +4525,10 @@ async def strategic_operation(
         # Backward-compatible op shape: the legacy `note` field is still
         # accepted (mapped to the document body); richer optional fields
         # (title/summary/topic/tags/supersedes_id) let the agent categorize and
-        # supersede facts. During the migration window we ALSO dual-write a
-        # compact entry to strategic_memory_notes so agents on older images keep
-        # seeing memory via the legacy section.
+        # supersede facts. The KnowledgeDocument row is the SOLE write path; the
+        # legacy strategic_memory_notes JSONB dual-write was cut once every
+        # reader switched to build_strategic_memory_index() (migration 0699
+        # backfilled the pre-existing legacy notes).
         if not isinstance(data, dict):
             raise HTTPException(
                 status_code=400,
@@ -4644,15 +4653,11 @@ async def strategic_operation(
                 old.dismissed_reason = f"superseded by {doc.id}"
                 session.add(old)
 
-        # Dual-write a compact entry to the legacy JSONB list during the
-        # migration window (bounded to last 100, as before).
-        entry = {"note": fact_body, "set_at": _utcnow().isoformat(), "doc_id": str(doc.id)}
-        if project.strategic_memory_notes is None:
-            project.strategic_memory_notes = []
-        project.strategic_memory_notes.append(entry)
-        project.strategic_memory_notes = project.strategic_memory_notes[-100:]
-        flag_modified(project, "strategic_memory_notes")
-        session.add(project)
+        # The KnowledgeDocument row is now the SOLE write path for strategic
+        # memory. The legacy Project.strategic_memory_notes JSONB list is no
+        # longer written (readers switched to build_strategic_memory_index);
+        # the column is retained for rollback safety but frozen. Migration 0699
+        # backfilled pre-existing notes into KnowledgeDocument rows.
 
         ctx = task.context or {}
         task.context = {**ctx, "_strategic_api_called": True}
@@ -4663,6 +4668,20 @@ async def strategic_operation(
             f"[STRATEGIC API] Wrote strategic_memory KnowledgeDocument {doc.id} "
             f"for project {project.id} (topic={fact_topic})"
         )
+        # entry_count now reflects the active (non-superseded) strategic_memory
+        # KnowledgeDocument rows, the authoritative store, rather than the frozen
+        # legacy JSONB list.
+        entry_count = (
+            await session.execute(
+                select(_func.count())
+                .select_from(KnowledgeDocument)
+                .where(
+                    KnowledgeDocument.project_id == project.id,
+                    KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+                    KnowledgeDocument.lifecycle_status == "consumed",
+                )
+            )
+        ).scalar_one()
         return _resp(
             {
                 "status": "ok",
@@ -4670,7 +4689,7 @@ async def strategic_operation(
                 "doc_id": str(doc.id),
                 "source_kind": SourceKind.STRATEGIC_MEMORY.value,
                 "superseded_id": str(superseded_id) if superseded_id is not None else None,
-                "entry_count": len(project.strategic_memory_notes),
+                "entry_count": int(entry_count),
             }
         )
 

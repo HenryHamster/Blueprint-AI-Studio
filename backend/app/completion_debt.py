@@ -1101,9 +1101,10 @@ async def areconcile_dormant_knob_debts(
 
 
 def _build_completion_debt_design_doc_section() -> dict:
-    """Build the completion-debt-ledger system description for the design doc.
+    """Build the completion-debt-ledger system description section.
 
-    Returns a dict suitable for insertion into ``design_doc["systems/completion-debt-ledger"]``.
+    Returns the section dict stored under the dedicated ``project_telemetry``
+    row (key ``systems/completion-debt-ledger``).
     """
     return {
         "summary": "Durable ledger that makes merged-but-unfinished work first-class, recording obligations created by dormant knobs, capability trials, no-CI merges, and retirement residuals.",
@@ -1134,64 +1135,52 @@ def _build_completion_debt_design_doc_section() -> dict:
 
 
 async def seed_completion_debt_design_doc_section(session: Any, project_id: Any) -> bool:
-    """Seed the design-doc section for completion-debt ledger (idempotent per project).
+    """Seed the completion-debt ledger system section (idempotent per project).
 
-    Writes to ``project.design_doc["systems/completion-debt-ledger"]`` if absent,
-    and refreshes code-owned fields (summary, status, debt_kinds, etc.) without
-    clobbering operator- or strategist-authored additions.
+    God-column cutover: the section is stored SOLELY in the dedicated
+    ``project_telemetry`` row (key ``systems/completion-debt-ledger``) — the
+    design_doc write leg is cut, so this no longer takes the Project row lock.
+    Seeds the row when absent and refreshes code-owned fields (summary, status,
+    debt_kinds, etc.) without clobbering operator- or strategist-authored
+    additions carried on the existing row.
 
-    Returns ``True`` if a new section was written or code fields were refreshed,
-    ``False`` if the section already exists with current code state.
+    Returns ``True`` if the row was newly written or code fields were refreshed,
+    ``False`` if the row already exists with current code state.
     """
     if session is None or project_id is None:
         return False
 
-    from app.task_locking import with_design_doc_locked
+    from app.project_telemetry import read_telemetry, set_project_telemetry
 
     section_key = "systems/completion-debt-ledger"
     new_section = _build_completion_debt_design_doc_section()
-    changed = [False]  # Use list to allow modification in nested function
-    doc_section_value: list = [None]  # Captures the written section for dual-write
-
-    def _mutate(doc: dict) -> None:
-        now = _utcnow().isoformat()
-        existing = doc.get(section_key)
-        if existing is None:
-            # No section yet — seed it as code-authored.
-            doc[section_key] = {**new_section, "_authored_by": "code"}
-            changed[0] = True
-        else:
-            # Section exists — start with existing (preserves operator/strategist keys).
-            # Then refresh code-owned fields only (those present in new_section).
-            refreshed = dict(existing)
-            for key, value in new_section.items():
-                if refreshed.get(key) != value:
-                    refreshed[key] = value
-                    changed[0] = True
-            # Mark authorship if missing.
-            if "_authored_by" not in refreshed:
-                refreshed["_authored_by"] = "code"
-            doc[section_key] = refreshed
-
-        # Update _meta if section changed.
-        if changed[0]:
-            meta = dict(doc.get("_meta") or {"revision": 0})
-            meta["revision"] = meta.get("revision", 0) + 1
-            meta["last_updated"] = now
-            doc["_meta"] = meta
-            doc_section_value[0] = doc[section_key]
 
     try:
-        await with_design_doc_locked(session, project_id, _mutate, skip_locked=True)
-        if changed[0]:
-            from app.project_telemetry import set_project_telemetry
-            await set_project_telemetry(
-                session, project_id, section_key, doc_section_value[0]
-            )
-        return changed[0]
+        existing = await read_telemetry(session, project_id, section_key)
+        changed = False
+        if existing is None:
+            # No row yet — seed it as code-authored.
+            section = {**new_section, "_authored_by": "code"}
+            changed = True
+        else:
+            # Row exists — start with existing (preserves operator/strategist
+            # keys). Then refresh code-owned fields only (those in new_section).
+            section = dict(existing)
+            for key, value in new_section.items():
+                if section.get(key) != value:
+                    section[key] = value
+                    changed = True
+            # Mark authorship if missing (does not by itself count as a change,
+            # matching the pre-cutover semantics).
+            if "_authored_by" not in section:
+                section["_authored_by"] = "code"
+
+        if changed:
+            await set_project_telemetry(session, project_id, section_key, section)
+        return changed
     except Exception:  # noqa: BLE001
         logger.warning(
-            "[COMPLETION_DEBT] failed to seed design-doc section for project %s",
+            "[COMPLETION_DEBT] failed to seed completion-debt ledger section for project %s",
             project_id,
             exc_info=True,
         )

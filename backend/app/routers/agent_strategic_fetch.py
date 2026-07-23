@@ -28,7 +28,11 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
-from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
+from app.knowledge_query import (
+    build_compute_sweep_groups,
+    build_strategic_memory_index,
+    build_sweep_knowledge_index,
+)
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
 from app.project_message_projection import agent_fetch_message_dict
@@ -1383,7 +1387,10 @@ async def agent_fetch_payload_section(
     if section_name == "self_reflection_log":
         data: Any = project.self_reflection_log or []
     elif section_name == "strategic_memory_notes":
-        data = project.strategic_memory_notes or []
+        # Strategic memory is served from KnowledgeDocument rows (source_kind=
+        # 'strategic_memory'); the compact index omits superseded (dismissed)
+        # facts. Shape: {id, title, topic, summary, tags, created_at}.
+        data = await build_strategic_memory_index(session, project.id)
     elif section_name == "anomaly_summary":
         data = _build_anomaly_summary(project)
     elif section_name == "playbook_summary":

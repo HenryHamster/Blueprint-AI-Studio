@@ -73,6 +73,7 @@ from app.project_message_projection import (
     MESSAGE_EVENT_REFETCH_SURFACES,
     message_preview_dict,
 )
+from app.knowledge_query import build_strategic_memory_index
 from app.strategic_context_package import (
     build_strategic_context_package_summary,
     load_strategic_context_evidence,
@@ -2701,7 +2702,13 @@ async def get_project_strategic_state(
         "state_revision": _revision,
         "model_integrity": model_integrity,
         "integrity_conflict_trend": integrity_trend,
-        "strategic_memory_notes": project.strategic_memory_notes or [],
+        # Strategic memory now lives in KnowledgeDocument rows (source_kind=
+        # 'strategic_memory'); the compact index excludes superseded (dismissed)
+        # facts, unlike the append-only legacy JSONB list. Shape is
+        # {id, title, topic, summary, tags, created_at}.
+        "strategic_memory_notes": await build_strategic_memory_index(
+            session, project.id
+        ),
     }
 
     # HTTP 304 transmission short-circuit. The full-body ETag covers every
