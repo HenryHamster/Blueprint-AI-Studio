@@ -1313,6 +1313,35 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     return summary
 
 
+def enforce_problem_model_size(
+    model: ProblemModel,
+) -> tuple[dict[str, Any], str | None]:
+    """Run gc_problem_model and return (gc_summary, oversize_section_or_None).
+
+    Mutates *model* in place (same as :func:`gc_problem_model`).  Returns:
+
+    * ``(summary, None)``  — eviction brought model under
+      :data:`PROBLEM_MODEL_BYTE_BUDGET`.
+    * ``(partial_summary, section_str)`` — live core alone still exceeds the
+      budget after full eviction; *section_str* names the dominant section.
+
+    Never raises.  Callers decide whether to reject (GROW paths) or log-and-
+    persist (SHRINK / background paths).
+    """
+    try:
+        summary = gc_problem_model(model)
+        return summary, None
+    except ValueError as exc:
+        msg = str(exc)
+        section: str = msg
+        prefix = "oversize section: "
+        idx = msg.find(prefix)
+        if idx >= 0:
+            # Extract up to the first period so we get only the section name.
+            section = msg[idx + len(prefix) :].split(".")[0].strip()
+        return {}, section
+
+
 def _parse_iso_to_naive_utc(value: str | None) -> datetime | None:
     """Parse an ISO-8601 string into a naive-UTC datetime, or ``None``.
 

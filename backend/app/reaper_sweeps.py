@@ -1101,6 +1101,25 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
                     model, signals, _now.isoformat()
                 )
                 if cleared:
+                    from app.problem_model import (
+                        enforce_problem_model_size as _enforce_pm_size,
+                    )
+
+                    _gc_summary, _oversize_section = _enforce_pm_size(model)
+                    if _oversize_section:
+                        from app.alert_dispatch import (
+                            _maybe_create_problem_model_live_core_alert,
+                        )
+
+                        logger.error(
+                            "[REAPER] project %s: problem_model live core exceeds "
+                            "byte budget after moot-confirmation gc: %s",
+                            getattr(project, "id", "?"),
+                            _oversize_section,
+                        )
+                        await _maybe_create_problem_model_live_core_alert(
+                            project.id, session
+                        )
                     project.problem_model = model.model_dump()
                     flag_modified(project, "problem_model")
                     session.add(project)
@@ -1210,6 +1229,25 @@ async def sweep_decay_stale_pending_confirmations(session, now=None) -> int:
 
                 decayed = decay_stale_pending_confirmations(model, now_iso)
                 if decayed:
+                    from app.problem_model import (
+                        enforce_problem_model_size as _enforce_pm_size,
+                    )
+
+                    _gc_summary, _oversize_section = _enforce_pm_size(model)
+                    if _oversize_section:
+                        from app.alert_dispatch import (
+                            _maybe_create_problem_model_live_core_alert,
+                        )
+
+                        logger.error(
+                            "[REAPER] project %s: problem_model live core exceeds "
+                            "byte budget after stale-decay gc: %s",
+                            getattr(project, "id", "?"),
+                            _oversize_section,
+                        )
+                        await _maybe_create_problem_model_live_core_alert(
+                            project.id, session
+                        )
                     project.problem_model = model.model_dump()
                     flag_modified(project, "problem_model")
                     session.add(project)

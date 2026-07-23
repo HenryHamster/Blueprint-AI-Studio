@@ -166,7 +166,10 @@ async def test_capture_timeout_does_not_block_teardown(vm_db, mocker):
     """A capture that hangs past the timeout must not delay/block teardown."""
 
     async def _hang(*_a, **_k):
-        await asyncio.sleep(3600)
+        # Block until cancelled by the teardown-forensics timeout — the point is
+        # that the capture never returns on its own, so it must be event-driven
+        # rather than a real multi-second sleep that CI would actually incur.
+        await asyncio.Event().wait()
 
     mocker.patch(
         "app.vm_lifecycle._capture_and_persist_teardown_forensics", side_effect=_hang

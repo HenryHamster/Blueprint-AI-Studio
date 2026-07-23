@@ -738,6 +738,24 @@ async def update_project(
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model patch: {ve}"
             ) from None
+        from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+        _gc_summary, _oversize_section = _enforce_pm_size(validated)
+        if _oversize_section:
+            from app.alert_dispatch import (
+                _maybe_create_problem_model_live_core_alert,
+            )
+
+            await _maybe_create_problem_model_live_core_alert(project.id, session)
+            await session.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Problem model live core exceeds byte budget after applying "
+                    f"patch: {_oversize_section}. Reduce the size of active state "
+                    f"(active gaps, live capabilities, or active friction)."
+                ),
+            )
         project.problem_model = validated.model_dump()
         flag_modified(project, "problem_model")
 
@@ -1135,6 +1153,22 @@ async def dismiss_pending_confirmation(
             "dismissal_note": payload.note,
         }
         append_revision_log(current_model, f"operator dismissed {matched.type}", changes)
+    # SHRINK path: always persist; alert when live core is still over budget.
+    from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+    _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+    if _oversize_section:
+        from app.alert_dispatch import (
+            _maybe_create_problem_model_live_core_alert,
+        )
+
+        logger.warning(
+            "dismiss_pending_confirmation: project %s problem_model live core "
+            "still over budget after gc: %s",
+            project_id,
+            _oversize_section,
+        )
+        await _maybe_create_problem_model_live_core_alert(project_id, session)
     project.problem_model = current_model.model_dump()
     flag_modified(project, "problem_model")
     session.add(project)
@@ -1231,6 +1265,22 @@ async def accept_pending_confirmation(
             changes["decision_question"] = matched.proposal
         append_revision_log(current_model, f"operator accepted {matched.type}", changes)
 
+    # SHRINK path: always persist; alert when live core is still over budget.
+    from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+    _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+    if _oversize_section:
+        from app.alert_dispatch import (
+            _maybe_create_problem_model_live_core_alert,
+        )
+
+        logger.warning(
+            "accept_pending_confirmation: project %s problem_model live core "
+            "still over budget after gc: %s",
+            project_id,
+            _oversize_section,
+        )
+        await _maybe_create_problem_model_live_core_alert(project_id, session)
     project.problem_model = current_model.model_dump()
     flag_modified(project, "problem_model")
     session.add(project)

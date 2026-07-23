@@ -13366,23 +13366,23 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 840): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 4875): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 4889): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 4923): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 4926): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 6267): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 6289): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1104): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1123): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1213): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1251): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
-        ("routers/admin_projects.py", 741): "validated pydantic model_dump",
+        ("routers/admin_projects.py", 759): "validated pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1138): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1172): "current_model pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1234): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1284): "current_model pydantic model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
-        ("routers/admin_onboard.py", 959): "pm parsed from ProblemModel, model_dump",
+        ("routers/admin_onboard.py", 967): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (6 sites)
         ("routers/admin_agent_ops.py", 1659): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         ("routers/admin_agent_ops.py", 2006): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
@@ -13394,9 +13394,9 @@ class TestProblemModelWritePathInvariants:
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
         ("routers/admin_agent_ops.py", 4252): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 4769): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4783): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 4836): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4865): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):

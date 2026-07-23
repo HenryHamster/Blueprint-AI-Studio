@@ -1131,8 +1131,9 @@ async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkey
 
         async def launch(self, spec):
             launch_started.set()
-            # Simulate a slow GCP insert LRO that outlasts the provisioning budget.
-            await asyncio.sleep(1.0)
+            # Simulate a slow GCP insert LRO that outlasts the provisioning
+            # budget by blocking until wait_for cancels it at the deadline.
+            await asyncio.Event().wait()
             return ComputeLaunchResult(
                 external_id="lro-slow-vm",
                 started_at=_utcnow(),

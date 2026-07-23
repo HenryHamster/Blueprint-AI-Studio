@@ -404,7 +404,7 @@ async def test_get_open_completion_debt_includes_global_rows(db_session):
     await cd.arecord_completion_debt(
         db_session,
         dedupe_key="global:test_global_item",
-        kind=cd.KIND_SEED_INVENTORY,
+        kind=cd.KIND_DORMANT_KNOB,
         title="Global seed item (no project)",
         project_id=None,
     )
@@ -419,8 +419,8 @@ async def test_get_open_completion_debt_includes_global_rows(db_session):
 
     snapshot = await cd.get_open_completion_debt(db_session, project.id)
     kinds = {e["kind"] for e in snapshot["items"]}
-    assert cd.KIND_SEED_INVENTORY in kinds, (
-        "global seed rows (project_id=None) must surface in per-project snapshots"
+    assert cd.KIND_DORMANT_KNOB in kinds, (
+        "global rows (project_id=None) must surface in per-project snapshots"
     )
     assert cd.KIND_NO_CI_GATE in kinds, "project-scoped rows must also surface"
 
@@ -455,7 +455,7 @@ async def test_open_debt_snapshot_reports_true_totals_and_per_kind_bounds(db_ses
         await cd.arecord_completion_debt(
             db_session,
             dedupe_key=f"global:seed:{i}",
-            kind=cd.KIND_SEED_INVENTORY,
+            kind=cd.KIND_RETIREMENT_RESIDUAL,
             title=f"Global seed {i}",
             project_id=None,
         )
@@ -469,8 +469,8 @@ async def test_open_debt_snapshot_reports_true_totals_and_per_kind_bounds(db_ses
 
     # Project-scoped rows float to the top: all 6 project rows must appear in
     # the snapshot before any global seed rows.
-    project_items = [e for e in snapshot["items"] if e["kind"] != cd.KIND_SEED_INVENTORY]
-    global_items = [e for e in snapshot["items"] if e["kind"] == cd.KIND_SEED_INVENTORY]
+    project_items = [e for e in snapshot["items"] if e["project_id"] is not None]
+    global_items = [e for e in snapshot["items"] if e["project_id"] is None]
     assert len(project_items) == 6, "all 6 project-scoped rows must appear in snapshot"
     assert len(global_items) == 4, "remaining 4 slots filled from global rows"
     # Project rows come before global rows in the snapshot.
@@ -1298,6 +1298,46 @@ async def test_autonomous_spawn_budget_mode_seeds_and_graduates_dormant_debt(db_
         "graduating autonomous_spawn_budget_mode to 'enforce' must resolve its "
         "completion-debt entry"
     )
+
+
+def test_completion_debt_design_doc_section_includes_all_kinds():
+    """``_build_completion_debt_design_doc_section`` must list every live debt kind.
+
+    Every defined debt-kind constant that has an active writer in the codebase
+    must appear in both the ``debt_kinds`` array and the ``recorders`` map of
+    the design-doc section so the system-surface documentation is complete.
+    Missing a live kind means the seed will silently drop it from the stored
+    section on the next restart, making it invisible through discovery.
+    """
+    section = cd._build_completion_debt_design_doc_section()
+
+    # Every kind with a live writer must appear in the debt_kinds list.
+    assert cd.KIND_DORMANT_KNOB in section["debt_kinds"]
+    assert cd.KIND_CAPABILITY_TRIAL in section["debt_kinds"]
+    assert cd.KIND_NO_CI_GATE in section["debt_kinds"]
+    assert cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL in section["debt_kinds"]
+    assert cd.KIND_RETIREMENT_RESIDUAL in section["debt_kinds"]
+    assert cd.KIND_CAPABILITY_EARN_OBLIGATION in section["debt_kinds"]
+
+    # Every debt kind must have a recorder entry pointing to its writer file.
+    kind_to_recorder_key = {
+        cd.KIND_DORMANT_KNOB: "dormant_knob",
+        cd.KIND_CAPABILITY_TRIAL: "capability_trial",
+        cd.KIND_NO_CI_GATE: "no_ci_gate",
+        cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL: "hotfix_deploy_pending_backfill",
+        cd.KIND_RETIREMENT_RESIDUAL: "retirement_residual",
+        cd.KIND_CAPABILITY_EARN_OBLIGATION: "capability_earn_obligation",
+    }
+    for kind, key in kind_to_recorder_key.items():
+        assert key in section["recorders"], f"recorders missing entry for {kind} (key={key})"
+
+    # Removed/retired kinds must not appear in the code-generated section.
+    # Use getattr so the assertion is robust if the sibling task removing
+    # KIND_SEED_INVENTORY has already landed.
+    if hasattr(cd, "KIND_SEED_INVENTORY"):
+        assert cd.KIND_SEED_INVENTORY not in section["debt_kinds"], (
+            "KIND_SEED_INVENTORY is retired — must not appear in code-generated section"
+        )
 
 
 @pytest.mark.asyncio

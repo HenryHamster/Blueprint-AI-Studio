@@ -4766,6 +4766,20 @@ async def strategic_operation(
             "added pending_user_confirmation",
             {"pending_confirmation_added": [pending.id]},
         )
+        from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+        _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+        if _oversize_section:
+            await _maybe_create_problem_model_live_core_alert(project.id, session)
+            await session.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Problem model live core exceeds byte budget after adding "
+                    f"pending_confirmation: {_oversize_section}. Reduce the size "
+                    f"of active state before adding new items."
+                ),
+            )
         project.problem_model = current_model.model_dump()
         flag_modified(project, "problem_model")
         session.add(project)
@@ -4818,7 +4832,10 @@ async def strategic_operation(
         removed = len(before) - len(remaining)
         if removed:
             current_model.pending_user_confirmation = remaining
-            from app.problem_model import append_revision_log as _append_revision_log
+            from app.problem_model import (
+                append_revision_log as _append_revision_log,
+                enforce_problem_model_size as _enforce_pm_size,
+            )
 
             now_iso = _utcnow().isoformat()
             current_model.revision = (current_model.revision or 0) + 1
@@ -4833,6 +4850,18 @@ async def strategic_operation(
                 "resolved pending_user_confirmation",
                 {"pending_confirmation_resolved": [target_id]},
             )
+            # SHRINK path: always persist the (now-gc-bounded) model.  Alert when
+            # the live core alone exceeds the budget after full eviction — the
+            # operator needs to know even though we do not reject.
+            _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+            if _oversize_section:
+                logger.error(
+                    "[STRATEGIC API] resolve_pending_confirm: project %s "
+                    "problem_model live core still over budget after gc: %s",
+                    project.id,
+                    _oversize_section,
+                )
+                await _maybe_create_problem_model_live_core_alert(project.id, session)
             project.problem_model = current_model.model_dump()
             flag_modified(project, "problem_model")
             session.add(project)

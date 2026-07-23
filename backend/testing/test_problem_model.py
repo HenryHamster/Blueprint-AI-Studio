@@ -49,6 +49,7 @@ from app.problem_model import (
     capability_evidence_status,
     gap_evidence_status,
     detect_wipe_risk,
+    enforce_problem_model_size,
     gc_problem_model,
     is_empty,
     normalize_active_moves_writeback,
@@ -6511,3 +6512,181 @@ def test_apply_agent_update_live_core_exceeds_budget_returns_flag():
     ), f"Expected section name in live_core_exceeds_budget; got: {oversize_section}"
     # A model dict is still returned (callers check the flag before deciding to commit).
     assert isinstance(result_raw, dict)
+
+
+# ---------------------------------------------------------------------------
+# strategic_completion integration: oversized model must NOT be persisted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_oversize_model_not_persisted(db_session, mocker):
+    """When apply_agent_update returns live_core_exceeds_budget in the diff,
+    strategic_completion must NOT write the new model to project.problem_model.
+    The prior model must be preserved unchanged.
+
+    This is the acceptance test for the rev-1367 regression guard: the oversized
+    model that previously poisoned durable state must be silently rejected rather
+    than committed.
+    """
+    import json
+    from unittest.mock import AsyncMock
+
+    from app.models import Project, Task
+    from app.strategic_completion import _handle_strategic_completion
+
+    prior_pm = {"revision": 5, "gaps": [], "capabilities": []}
+
+    project = Project(
+        name="oversize-pm-test",
+        user_id="u1",
+        problem_model=prior_pm,
+        vision={"revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "p", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    oversized_raw = {
+        "revision": 6,
+        "gaps": [{"id": f"g-{i}", "name": f"g {i}", "status": "active"} for i in range(10)],
+        "capabilities": [],
+    }
+    mocker.patch(
+        "app.problem_model.apply_agent_update",
+        return_value=(oversized_raw, {"live_core_exceeds_budget": "active_gaps"}),
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_problem_model_live_core_alert",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    logs = json.dumps({"problem_model": oversized_raw})
+    await _handle_strategic_completion(task, logs, db_session, project=project)
+
+    await db_session.refresh(project)
+    pm = project.problem_model or {}
+    assert pm.get("revision") == 5, (
+        f"Oversized model must NOT be persisted; expected revision=5, got {pm.get('revision')}"
+    )
+    assert len(pm.get("gaps", [])) == 0, (
+        f"Prior model gaps must be preserved; got {len(pm.get('gaps', []))} gap(s)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# enforce_problem_model_size helper
+# ---------------------------------------------------------------------------
+
+
+def test_enforce_problem_model_size_under_budget_returns_none_section():
+    """A model under budget: enforce_problem_model_size returns (summary, None)."""
+    model = ProblemModel(
+        gaps=[Gap(id="g-1", name="small gap", status="active", description="short")]
+    )
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    gc_summary, oversize_section = enforce_problem_model_size(model)
+    assert oversize_section is None, (
+        f"Expected no oversize section for an under-budget model; got: {oversize_section}"
+    )
+    assert isinstance(gc_summary, dict)
+
+
+def test_enforce_problem_model_size_evictable_returns_none_section():
+    """A model that is over budget but has evictable archived gaps:
+    enforce_problem_model_size evicts them and returns (summary, None)."""
+    big = "w" * 5_000
+    archived = [
+        Gap(id=f"g-arch-{i}", name=f"arch {i}", status="closed",
+            closed=f"2025-0{(i % 9) + 1}-01T00:00:00", description=big)
+        for i in range(20)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "test setup: model must exceed budget before eviction"
+    )
+    _gc_summary, oversize_section = enforce_problem_model_size(model)
+    assert oversize_section is None, (
+        f"Expected no oversize section after eviction; got: {oversize_section}"
+    )
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+
+
+def test_operator_mutator_rejects_oversize():
+    """enforce_problem_model_size returns a non-None oversize_section for a model
+    whose live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction.
+
+    This proves GROW mutator paths (context edit, config patch, pending_confirm ADD)
+    will detect the overflow and must reject with HTTP 400 rather than committing
+    an oversized model — the non-None oversize_section is the signal callers
+    check before raising HTTPException 400.
+    """
+    model = _make_oversized_live_core_model()
+    gc_summary, oversize_section = enforce_problem_model_size(model)
+    # GROW paths check: oversize_section non-None → HTTP 400 must fire.
+    assert oversize_section is not None, (
+        "Expected enforce_problem_model_size to detect oversize live core "
+        "and return a non-None oversize_section so GROW paths can reject with 400"
+    )
+    assert any(
+        s in oversize_section
+        for s in ("active_gaps", "live_capabilities", "active_friction")
+    ), f"oversize_section must name the dominant section; got: {oversize_section}"
+    # enforce_problem_model_size must never raise — callers decide what to do.
+    assert isinstance(gc_summary, dict)
+
+
+def test_shrink_path_persists_bounded_result_does_not_reject():
+    """A SHRINK path (dismiss / resolve confirmation) on an already-oversized model:
+    enforce_problem_model_size does NOT raise; it returns (summary, oversize_section)
+    so the caller can still persist the (gc-bounded) result.
+
+    Removing a pending_confirmation from an oversized model reduces total bytes,
+    so the model after gc may or may not still be over budget — the key invariant
+    is that enforce_problem_model_size never raises regardless, and the model is
+    at least as small as it was before gc ran.
+    """
+    big = "x" * 5_000
+    caps = [
+        Capability(name=f"cap-live-{i}", status="working", notes=big)
+        for i in range(20)
+    ]
+    pending = [
+        PendingConfirmation(
+            id=f"p-{i}",
+            type="credentials_needed",
+            proposal="Need credentials",
+            created_at="2026-01-01T00:00:00",
+        )
+        for i in range(3)
+    ]
+    model = ProblemModel(capabilities=caps, pending_user_confirmation=pending)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "test setup: model must exceed budget"
+    )
+    bytes_before = _serialized_bytes(model)
+
+    # Simulate dismiss: remove one pending confirmation (SHRINK).
+    model.pending_user_confirmation = model.pending_user_confirmation[1:]
+
+    # enforce_problem_model_size must not raise, even if still over budget.
+    gc_summary, _oversize_section = enforce_problem_model_size(model)
+    assert isinstance(gc_summary, dict)
+    # The model must be at most as large as before gc ran.
+    assert _serialized_bytes(model) <= bytes_before, (
+        "enforce_problem_model_size must not grow the model"
+    )

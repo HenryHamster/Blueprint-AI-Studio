@@ -90,7 +90,8 @@ async def test_bounded_raises_on_hang():
     from app.services import _bounded
 
     async def _never():
-        await asyncio.sleep(100)
+        # Block until cancelled at the ceiling — never returns on its own.
+        await asyncio.Event().wait()
 
     with pytest.raises(asyncio.TimeoutError):
         await _bounded(_never(), 0.05, what="unit-hang")
@@ -214,7 +215,7 @@ async def test_eval_timeout_hung_github_call_does_not_block_other_rows(db, mocke
     )
 
     async def _hanging_get_pr(*a, **k):
-        await asyncio.sleep(100)  # never returns within the ceiling
+        await asyncio.Event().wait()  # never returns within the ceiling
 
     mocker.patch("app.github.get_pull_request", side_effect=_hanging_get_pr)
 

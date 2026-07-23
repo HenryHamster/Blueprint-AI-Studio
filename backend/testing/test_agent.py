@@ -19053,9 +19053,11 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
     real_ensure = vm_lifecycle_mod._ensure_vm_deleted
 
     async def _slow_delete(*args, **kwargs):
-        # Simulate GCP delete latency. If fire_and_forget were
-        # accidentally awaited, the caller would block for 2 seconds.
-        await asyncio.sleep(2.0)
+        # Simulate GCP delete latency by blocking until cancelled. If
+        # fire_and_forget were accidentally awaited, the caller would block
+        # here instead of returning synchronously (modeled event-driven so CI
+        # never incurs a real multi-second sleep).
+        await asyncio.Event().wait()
         return True
 
     vm_lifecycle_mod._ensure_vm_deleted = _slow_delete  # type: ignore[assignment]

@@ -196,7 +196,8 @@ class TestBoundedLeaderStep:
         _orch._orchestrator_last_progress = _utcnow() - timedelta(seconds=300)
 
         async def hang():
-            await asyncio.sleep(10)
+            # Block until abandoned at the budget — never returns on its own.
+            await asyncio.Event().wait()
 
         # Must not raise.
         await _orch._bounded_leader_step("hang", hang(), budget=0.05)

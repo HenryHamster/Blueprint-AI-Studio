@@ -12,9 +12,6 @@ follow-through:
                               merge;
   * ``retirement_residual`` — a strategic retirement/deferral that left a
                               residual handoff behind;
-  * ``seed_inventory``      — a standing backlog item seeded once from the HEAD
-                              dormant-state inventory.
-
 Every entry is IDEMPOTENT on ``dedupe_key`` (globally unique): repeated recorder
 or seed invocations upsert the same logical obligation rather than duplicating a
 row.  Recording is BEST-EFFORT at every write site — the recorders never raise
@@ -53,7 +50,6 @@ KIND_NO_CI_GATE = "no_ci_gate"
 # hotfix contributes to debt-pressure rather than being silently blessed.
 KIND_HOTFIX_DEPLOY_PENDING_BACKFILL = "hotfix_deploy_pending_backfill"
 KIND_RETIREMENT_RESIDUAL = "retirement_residual"
-KIND_SEED_INVENTORY = "seed_inventory"
 # A working capability that already carries a structural path_proven proof
 # (backing_path tier) but has NO discoverable covering test — permanently stuck
 # because the execution-trial earn path requires a convention-named test file.
@@ -647,6 +643,7 @@ async def get_open_completion_debt(session: Any, project_id: Any) -> dict[str, A
             "kind": entry.kind,
             "title": entry.title,
             "description": description,
+            "project_id": str(entry.project_id) if entry.project_id is not None else None,
             "created_at": created_at.isoformat() if created_at else None,
             "age_days": (
                 max(0, (now - created_at).days) if created_at is not None else None
@@ -1107,7 +1104,7 @@ def _build_completion_debt_design_doc_section() -> dict:
     row (key ``systems/completion-debt-ledger``).
     """
     return {
-        "summary": "Durable ledger that makes merged-but-unfinished work first-class, recording obligations created by dormant knobs, capability trials, no-CI merges, and retirement residuals.",
+        "summary": "Durable ledger that makes merged-but-unfinished work first-class, recording obligations created by dormant knobs, capability trials, no-CI merges, hotfix deploy backfills, retirement residuals, and capability earn obligations.",
         "status": "active",
         "debt_kinds": [
             KIND_DORMANT_KNOB,
@@ -1115,6 +1112,7 @@ def _build_completion_debt_design_doc_section() -> dict:
             KIND_NO_CI_GATE,
             KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
             KIND_RETIREMENT_RESIDUAL,
+            KIND_CAPABILITY_EARN_OBLIGATION,
         ],
         "recorders": {
             "dormant_knob": "backend/app/runtime_config_state.py",
@@ -1122,11 +1120,13 @@ def _build_completion_debt_design_doc_section() -> dict:
             "no_ci_gate": "backend/app/ci_resolution.py",
             "hotfix_deploy_pending_backfill": "backend/app/release_qualifier.py",
             "retirement_residual": "backend/app/strategic_completion.py",
+            "capability_earn_obligation": "backend/app/metrics_integrity_sweep.py",
         },
         "reconciliation_surfaces": [
             "knob graduation via admin settings endpoint resolves dormant-knob debt",
             "decided capability verdicts resolve capability-trial debt",
             "a passing normal qualification gate resolves hotfix-deploy backfill debt",
+            "adding a discoverable covering test file resolves capability earn obligation debt",
         ],
         "strategist_surface": "open_completion_debt payload section / ./fetch completion-debt verb",
         "admin_surface": "PATCH /api/admin/completion-debt endpoints (list, dismiss, resolve)",

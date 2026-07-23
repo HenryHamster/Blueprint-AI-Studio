@@ -4872,33 +4872,12 @@ async def _handle_strategic_completion(
                     f"keeping prior state. Error: {pm_err}"
                 )
             else:
-                project.problem_model = new_pm_raw
-                flag_modified(project, "problem_model")
-                # Surface blocked gap deletions (active direction still references).
-                _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
-                if _blocked_dels:
-                    logger.warning(
-                        f"[STRATEGIC] Task {task.id}: gap deletion(s) blocked — "
-                        f"still referenced by active direction(s): {_blocked_dels}"
-                    )
-                for _wipe_field in ("gaps", "capabilities"):
-                    if pm_diff.get(f"{_wipe_field}_wipe_risk"):
-                        logger.warning(
-                            f"[STRATEGIC] Task {task.id}: problem_model {_wipe_field} "
-                            f"wipe-without-deletions detected — agent proposed empty "
-                            f"{_wipe_field} with no _deletions directive; existing "
-                            f"{_wipe_field} preserved via non-destructive merge"
-                        )
-                        from app.alert_dispatch import (
-                            _maybe_create_problem_model_wipe_alert,
-                        )
-                        await _maybe_create_problem_model_wipe_alert(
-                            project.id, session, field=_wipe_field
-                        )
                 if pm_diff.get("live_core_exceeds_budget"):
                     logger.error(
                         f"[STRATEGIC] Task {task.id}: problem_model live core exceeds "
-                        f"byte budget — model committed oversized (rev-1367 wipe precondition)"
+                        f"byte budget — rejecting write to prevent oversized durable state "
+                        f"(rev-1367 wipe precondition avoided); section: "
+                        f"{pm_diff['live_core_exceeds_budget']}"
                     )
                     from app.alert_dispatch import (
                         _maybe_create_problem_model_live_core_alert,
@@ -4906,59 +4885,83 @@ async def _handle_strategic_completion(
                     await _maybe_create_problem_model_live_core_alert(
                         project.id, session
                     )
-                # Normalize stale active_moves via shared helper so both write
-                # paths (op-endpoint + log-parse fallback) stay converged.
-                _active_dir_ids = {
-                    str(d.get("id"))
-                    for d in (project.directions or [])
-                    if d.get("status") == "active"
-                }
-                new_pm_raw, _norm = _normalize_active_moves_writeback(
-                    new_pm_raw, _active_dir_ids, _utcnow().isoformat()
-                )
-                if _norm:
-                    logger.info(
-                        f"[STRATEGIC] Task {task.id}: auto-normalized active_moves: {_norm}"
-                    )
+                else:
                     project.problem_model = new_pm_raw
                     flag_modified(project, "problem_model")
-                logger.info(
-                    f"[STRATEGIC] Updated problem_model for project {project.id} "
-                    f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
-                )
-                # Carry proof records and adoption verdicts onto survivor keys
-                # when a capability consolidation occurred in this write.
-                _consolidated = (
-                    pm_diff.get("capabilities_consolidated") if pm_diff else None
-                )
-                if _consolidated:
-                    from app.capability_proof import (
-                        carry_proof_records_for_consolidation,
+                    # Surface blocked gap deletions (active direction still references).
+                    _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
+                    if _blocked_dels:
+                        logger.warning(
+                            f"[STRATEGIC] Task {task.id}: gap deletion(s) blocked — "
+                            f"still referenced by active direction(s): {_blocked_dels}"
+                        )
+                    for _wipe_field in ("gaps", "capabilities"):
+                        if pm_diff.get(f"{_wipe_field}_wipe_risk"):
+                            logger.warning(
+                                f"[STRATEGIC] Task {task.id}: problem_model {_wipe_field} "
+                                f"wipe-without-deletions detected — agent proposed empty "
+                                f"{_wipe_field} with no _deletions directive; existing "
+                                f"{_wipe_field} preserved via non-destructive merge"
+                            )
+                            from app.alert_dispatch import (
+                                _maybe_create_problem_model_wipe_alert,
+                            )
+                            await _maybe_create_problem_model_wipe_alert(
+                                project.id, session, field=_wipe_field
+                            )
+                    # Normalize stale active_moves via shared helper so both write
+                    # paths (op-endpoint + log-parse fallback) stay converged.
+                    _active_dir_ids = {
+                        str(d.get("id"))
+                        for d in (project.directions or [])
+                        if d.get("status") == "active"
+                    }
+                    new_pm_raw, _norm = _normalize_active_moves_writeback(
+                        new_pm_raw, _active_dir_ids, _utcnow().isoformat()
                     )
-                    from app.capability_trial_verdict import (
-                        carry_adoption_verdicts_for_consolidation,
+                    if _norm:
+                        logger.info(
+                            f"[STRATEGIC] Task {task.id}: auto-normalized active_moves: {_norm}"
+                        )
+                        project.problem_model = new_pm_raw
+                        flag_modified(project, "problem_model")
+                    logger.info(
+                        f"[STRATEGIC] Updated problem_model for project {project.id} "
+                        f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
                     )
+                    # Carry proof records and adoption verdicts onto survivor keys
+                    # when a capability consolidation occurred in this write.
+                    _consolidated = (
+                        pm_diff.get("capabilities_consolidated") if pm_diff else None
+                    )
+                    if _consolidated:
+                        from app.capability_proof import (
+                            carry_proof_records_for_consolidation,
+                        )
+                        from app.capability_trial_verdict import (
+                            carry_adoption_verdicts_for_consolidation,
+                        )
 
-                    if not isinstance(
-                        getattr(project, "capability_proof_records", None), dict
-                    ):
-                        project.capability_proof_records = {}
-                    project.capability_proof_records = (
-                        carry_proof_records_for_consolidation(
-                            _consolidated, project.capability_proof_records
+                        if not isinstance(
+                            getattr(project, "capability_proof_records", None), dict
+                        ):
+                            project.capability_proof_records = {}
+                        project.capability_proof_records = (
+                            carry_proof_records_for_consolidation(
+                                _consolidated, project.capability_proof_records
+                            )
                         )
-                    )
-                    flag_modified(project, "capability_proof_records")
-                    if not isinstance(
-                        getattr(project, "capability_adoption_verdicts", None), dict
-                    ):
-                        project.capability_adoption_verdicts = {}
-                    project.capability_adoption_verdicts = (
-                        carry_adoption_verdicts_for_consolidation(
-                            _consolidated, project.capability_adoption_verdicts
+                        flag_modified(project, "capability_proof_records")
+                        if not isinstance(
+                            getattr(project, "capability_adoption_verdicts", None), dict
+                        ):
+                            project.capability_adoption_verdicts = {}
+                        project.capability_adoption_verdicts = (
+                            carry_adoption_verdicts_for_consolidation(
+                                _consolidated, project.capability_adoption_verdicts
+                            )
                         )
-                    )
-                    flag_modified(project, "capability_adoption_verdicts")
+                        flag_modified(project, "capability_adoption_verdicts")
         except Exception:
             logger.exception(
                 "[STRATEGIC] Failed to apply problem_model update (non-fatal)"
@@ -6264,6 +6267,25 @@ async def _handle_strategic_completion(
                             _result.model_dump(),
                         )
                 if _pm_changed:
+                    from app.problem_model import (
+                        enforce_problem_model_size as _enforce_pm_size,
+                    )
+
+                    _gc_summary, _oversize_section = _enforce_pm_size(_pm_model)
+                    if _oversize_section:
+                        from app.alert_dispatch import (
+                            _maybe_create_problem_model_live_core_alert,
+                        )
+
+                        logger.error(
+                            "[STRATEGIC] Task %s: problem_model live core exceeds "
+                            "byte budget after gap-staffing reconciliation: %s",
+                            task.id,
+                            _oversize_section,
+                        )
+                        await _maybe_create_problem_model_live_core_alert(
+                            task.project_id, session
+                        )
                     project.problem_model = _pm_model.model_dump()
                     flag_modified(project, "problem_model")
 

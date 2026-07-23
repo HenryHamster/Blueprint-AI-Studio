@@ -956,6 +956,14 @@ def _seed_strategic_intent(
                     detail=f"Invalid initial_steering: {e}",
                 ) from e
     pm.last_updated_by = "user"
+    from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+    _gc_summary, _oversize_section = _enforce_pm_size(pm)
+    if _oversize_section:
+        raise ValueError(
+            f"Problem model live core exceeds byte budget after seeding intent: "
+            f"{_oversize_section}. Reduce the size of active state."
+        )
     project.problem_model = pm.model_dump()
     flag_modified(project, "problem_model")
 
@@ -1209,13 +1217,20 @@ async def onboard_project(
     seed_sequence = await lock_project_and_next_message_sequence(
         session, project.id
     )
-    seeded_message = _seed_strategic_intent(
-        project,
-        getattr(payload, "goal", None),
-        getattr(payload, "initial_steering", None),
-        actor_user_id=current_user["user_id"],
-        sequence=seed_sequence,
-    )
+    try:
+        seeded_message = _seed_strategic_intent(
+            project,
+            getattr(payload, "goal", None),
+            getattr(payload, "initial_steering", None),
+            actor_user_id=current_user["user_id"],
+            sequence=seed_sequence,
+        )
+    except ValueError as _seed_ve:
+        from app.alert_dispatch import _maybe_create_problem_model_live_core_alert
+
+        await _maybe_create_problem_model_live_core_alert(project.id, session)
+        await session.commit()
+        raise HTTPException(status_code=400, detail=str(_seed_ve)) from None
     if seeded_message is not None:
         session.add(seeded_message)
         session.add(project)
