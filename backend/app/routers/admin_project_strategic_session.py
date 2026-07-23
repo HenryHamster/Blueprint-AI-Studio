@@ -1548,7 +1548,9 @@ async def _build_strategic_session_response(
         project_id,
         context_package=context_package,
         include_message_id=include_message_id,
+        stamp_delivery=True,
     )
+    await session.commit()
     latest_cycle = (
         (state.get("strategic") or {}).get("latest_cycle")
         if isinstance(state.get("strategic"), dict)

@@ -1,15 +1,20 @@
-"""Regression tests for ProjectMessage.delivered_at stamping via WebSocket message_ack.
+"""Regression tests for ProjectMessage.delivered_at stamping on both delivery paths.
 
 Covers:
-1. Ack stamps delivered_at end-to-end (real uvicorn server, real DB).
+1. WS ack stamps delivered_at end-to-end (real uvicorn server, real DB).
 2. Idempotency: second ack does NOT change the already-set timestamp.
 3. Cross-project isolation: unknown/cross-project message_id is a silent no-op.
 4. project_message_base projection surfaces delivered_at correctly.
+5. REST GET /strategic-conversation stamps delivered_at on strategist/system replies.
+6. REST GET /strategic-conversation does NOT stamp user messages.
+7. REST GET /strategic-session (via _build_strategic_session_response) stamps delivered_at.
+8. REST stamp idempotency: repeated GET does not overwrite an existing delivered_at.
 
-Uses AsyncSessionLocal (patched to the test engine by conftest) directly rather
-than the db_session fixture, to avoid triggering the pre-existing projecttelemetry
-teardown error (the table is named project_telemetry in migrations but the model
-derives projecttelemetry, so conftest's cleanup DELETEs from the wrong name).
+Tests 1–4 use AsyncSessionLocal (patched to the test engine by conftest) directly
+rather than the db_session fixture, to avoid triggering the pre-existing
+projecttelemetry teardown error (the table is named project_telemetry in migrations
+but the model derives projecttelemetry, so conftest's cleanup DELETEs from the wrong
+name). Tests 5–8 use the client/db_session conftest fixtures.
 """
 
 import asyncio
@@ -17,7 +22,7 @@ import json
 import socket
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import uvicorn
@@ -27,7 +32,7 @@ from sqlalchemy import select
 
 from app.auth import create_ws_ticket
 from app.database import AsyncSessionLocal
-from app.models import Project, ProjectMessage
+from app.models import MessageSurface, MessageType, Project, ProjectMember, ProjectMessage
 from app.routers.projects import router as projects_router
 
 
@@ -303,4 +308,157 @@ def test_project_message_base_includes_delivered_at_iso_string():
     )
     assert "2024" in result["delivered_at"], (
         f"delivered_at ISO string should contain the year: {result['delivered_at']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests 5–8: REST conversation poll stamps delivered_at
+# ---------------------------------------------------------------------------
+# These tests exercise both REST paths that load the conversation transcript:
+# - GET /strategic-conversation (the lightweight poll endpoint)
+# - GET /strategic-session     (the full session endpoint, via
+#                               _build_strategic_session_response)
+# Both must stamp delivered_at on strategist/system messages so that the
+# durable delivery record reflects operator reads regardless of transport.
+# ---------------------------------------------------------------------------
+
+_REST_TEST_USER = "test-user-123"
+_REST_BASE_URL = "/api/admin/projects"
+
+
+async def _make_rest_project(db_session) -> Project:
+    project = Project(name="delivery-rest-test", user_id=_REST_TEST_USER)
+    db_session.add(project)
+    await db_session.flush()
+    member = ProjectMember(
+        project_id=project.id, user_id=_REST_TEST_USER, role="owner"
+    )
+    db_session.add(member)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+async def _add_conversation_message(
+    db_session,
+    project_id: uuid.UUID,
+    *,
+    from_type: str,
+    sequence: int,
+    delivered_at=None,
+) -> ProjectMessage:
+    msg = ProjectMessage(
+        project_id=project_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type=from_type,
+        content=f"{from_type} message {sequence}",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        delivered_at=delivered_at,
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_rest_conversation_poll_stamps_delivered_at(client, db_session):
+    """GET /strategic-conversation stamps delivered_at on strategist and system messages.
+
+    This is the primary REST conversation poll path.  Strategist and system
+    replies with delivered_at=NULL must be stamped on read; user messages must
+    remain un-stamped (they are outbound, not inbound strategist replies).
+    """
+    project = await _make_rest_project(db_session)
+    strategic_msg = await _add_conversation_message(
+        db_session, project.id, from_type="strategic", sequence=1
+    )
+    system_msg = await _add_conversation_message(
+        db_session, project.id, from_type="system", sequence=2
+    )
+    user_msg = await _add_conversation_message(
+        db_session, project.id, from_type="user", sequence=3
+    )
+
+    resp = await client.get(f"{_REST_BASE_URL}/{project.id}/strategic-conversation")
+    assert resp.status_code == 200, resp.text
+
+    items = {item["id"]: item for item in resp.json()["items"]}
+
+    # strategist and system replies must be stamped in the response payload
+    assert items[str(strategic_msg.id)]["delivered_at"] is not None, (
+        "GET /strategic-conversation must stamp delivered_at on returned strategic messages"
+    )
+    assert items[str(system_msg.id)]["delivered_at"] is not None, (
+        "GET /strategic-conversation must stamp delivered_at on returned system messages"
+    )
+    # user outbound messages must NOT be stamped
+    assert items[str(user_msg.id)]["delivered_at"] is None, (
+        "GET /strategic-conversation must not stamp delivered_at on user messages"
+    )
+
+    # verify the stamps are durable in the DB (not just in-memory)
+    await db_session.refresh(strategic_msg)
+    await db_session.refresh(system_msg)
+    await db_session.refresh(user_msg)
+    assert strategic_msg.delivered_at is not None, "strategic_msg.delivered_at must be durable"
+    assert system_msg.delivered_at is not None, "system_msg.delivered_at must be durable"
+    assert user_msg.delivered_at is None, "user_msg.delivered_at must remain NULL"
+
+
+@pytest.mark.asyncio
+async def test_rest_session_endpoint_stamps_delivered_at(client, db_session):
+    """GET /strategic-session stamps delivered_at via _build_strategic_session_response.
+
+    The full-session endpoint loads the conversation via _build_strategic_session_response.
+    Stamping must happen there too so that the initial page load (before the lighter poll
+    starts) also records delivery.
+    """
+    project = await _make_rest_project(db_session)
+    msg = await _add_conversation_message(
+        db_session, project.id, from_type="strategic", sequence=1
+    )
+
+    resp = await client.get(f"{_REST_BASE_URL}/{project.id}/strategic-session")
+    assert resp.status_code == 200, resp.text
+
+    # the message must appear in the conversation window
+    conversation = resp.json().get("conversation") or resp.json().get("session", {}).get(
+        "conversation", {}
+    )
+    items = {item["id"]: item for item in (conversation.get("items") or [])}
+    assert str(msg.id) in items, "strategic message must appear in strategic-session conversation"
+    assert items[str(msg.id)]["delivered_at"] is not None, (
+        "GET /strategic-session must stamp delivered_at on returned strategic messages"
+    )
+
+    # verify the stamp is durable in the DB
+    await db_session.refresh(msg)
+    assert msg.delivered_at is not None, (
+        "delivered_at stamp from GET /strategic-session must be committed to the DB"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_conversation_stamp_is_idempotent(client, db_session):
+    """Repeated REST GET calls do not overwrite an existing delivered_at timestamp."""
+    project = await _make_rest_project(db_session)
+    msg = await _add_conversation_message(
+        db_session, project.id, from_type="strategic", sequence=1
+    )
+
+    resp1 = await client.get(f"{_REST_BASE_URL}/{project.id}/strategic-conversation")
+    assert resp1.status_code == 200
+    await db_session.refresh(msg)
+    first_stamp = msg.delivered_at
+    assert first_stamp is not None, "first GET must stamp delivered_at"
+
+    resp2 = await client.get(f"{_REST_BASE_URL}/{project.id}/strategic-conversation")
+    assert resp2.status_code == 200
+    await db_session.refresh(msg)
+    assert msg.delivered_at == first_stamp, (
+        f"Second GET overwrote delivered_at: {first_stamp!r} → {msg.delivered_at!r}; "
+        "stamp must be a one-time idempotent write"
     )
