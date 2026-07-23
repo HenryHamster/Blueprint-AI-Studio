@@ -57,22 +57,37 @@ function runScanner(): ScanResult {
 }
 
 // This guard shells out to the Python scanner in the co-located backend tree.
-// The agent vitest suite must not hard-depend on that cross-surface tooling:
-// when python3 is unavailable or the backend script is not checked out, the
-// tests SKIP (rather than throwing) so the suite stays runnable standalone.
-// When both deps are present the real assertions run.
+// Both python3 and the backend scanner MUST be present — missing either is a
+// hard failure so a dependency gap never silently drops this coverage.
 const DEPS_PRESENT = fs.existsSync(SCANNER) && pythonAvailable();
 const scan: ScanResult | null = DEPS_PRESENT ? runScanner() : null;
 
+function requireDeps(): void {
+  if (!pythonAvailable()) {
+    throw new Error(
+      'python3 is required for the branch-literal regression guard but was not found on PATH.\n' +
+      'Install python3 (Linux CI always has it). Missing python3 silently drops critical coverage.',
+    );
+  }
+  if (!fs.existsSync(SCANNER)) {
+    throw new Error(
+      `branch_literal_compliance.py scanner not found at:\n  ${SCANNER}\n` +
+      'Ensure the backend tree is checked out alongside agent/ so this cross-surface gate runs.',
+    );
+  }
+}
+
 describe('hardcoded branch-literal regression guard (agent)', () => {
-  it.skipIf(!DEPS_PRESENT)('scans a meaningful number of production files (no-op guard)', () => {
+  it('scans a meaningful number of production files (no-op guard)', () => {
+    requireDeps();
     // Mirrors the defensive `expect(found.size).toBeGreaterThan(3)` idiom
     // in prompt-helper-refs.test.ts:53 — if the file walker / regex set
     // ever silently turns into a no-op, this fails immediately.
     expect(scan?.files_scanned).toBeGreaterThan(5);
   });
 
-  it.skipIf(!DEPS_PRESENT)('contains no un-allowlisted branch-decision literals', () => {
+  it('contains no un-allowlisted branch-decision literals', () => {
+    requireDeps();
     if ((scan?.offenders.length ?? 0) > 0) {
       const lines = (scan?.offenders ?? [])
         .map(o => `  ${o.path}:${o.line} [${o.pattern}]: ${o.snippet}`)
@@ -90,7 +105,8 @@ describe('hardcoded branch-literal regression guard (agent)', () => {
     }
   });
 
-  it.skipIf(!DEPS_PRESENT)('every ALLOWLIST entry still matches its recorded line (no rot)', () => {
+  it('every ALLOWLIST entry still matches its recorded line (no rot)', () => {
+    requireDeps();
     // Guards against allowlist rot: if production code is refactored and
     // the allowlisted literal moves or disappears, this test surfaces the
     // stale entry so it gets cleaned up — rather than silently exempting
