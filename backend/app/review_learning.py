@@ -35,7 +35,7 @@ from app.playbook_sr_metrics import (
     _SR_SEVERITY_DELTA_THRESHOLDS,
     _TREND_DELTA_THRESHOLD,
 )
-from app.project_telemetry import read_telemetry_or_doc
+from app.project_telemetry import read_telemetry_or_doc, strip_migrated_doc_keys
 from app.time_utils import _to_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -745,6 +745,7 @@ async def extract_review_feedback_to_playbook(
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "review-playbook"
         doc["_meta"] = meta
+        doc = strip_migrated_doc_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
         session.add(project)

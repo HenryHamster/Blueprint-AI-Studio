@@ -68,6 +68,25 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# Design-doc keys that have been migrated to the project_telemetry table.
+# These are no longer written to project.design_doc — the module-level writers
+# still mutate them in the in-memory doc dict for internal consistency, but
+# strip_migrated_doc_keys() removes them before the dict is persisted via
+# flag_modified / with_design_doc_locked.  The canonical write target is now
+# the project_telemetry KV table via set_project_telemetry / upsert_telemetry.
+_TELEMETRY_MIGRATED_KEYS: frozenset[str] = frozenset(
+    {
+        "cochange_index",
+        "cochange_applied_prs",
+        "module_feedback",
+        "retired_diagnoses_archive",
+        "playbook_archive",
+        "proposed_changes",
+        "direction_first_attempt_feedback",
+        "systems/completion-debt-ledger",
+    }
+)
+
 # Retention caps mirror the pre-existing in-design_doc caps so behavior is
 # preserved after cutover:
 #   * efficiency_snapshot.py::_SNAPSHOT_HISTORY_MAX = 7
@@ -85,9 +104,24 @@ __all__ = [
     "read_telemetry_or_doc",
     "read_version_lane_baseline",
     "set_project_telemetry",
+    "strip_migrated_doc_keys",
     "upsert_lane_baseline",
     "upsert_telemetry",
 ]
+
+
+def strip_migrated_doc_keys(doc: dict) -> dict:
+    """Remove migrated telemetry keys from *doc* in-place, returning it.
+
+    These keys are now persisted exclusively via the ``project_telemetry`` KV
+    table.  The in-memory mutations on *doc* are still needed for internal
+    consistency during a locked write scope (consecutive calls to the same
+    mutate function rely on seeing intermediate state), but the resulting
+    values must NOT be written to ``project.design_doc``.
+    """
+    for _key in _TELEMETRY_MIGRATED_KEYS:
+        doc.pop(_key, None)
+    return doc
 
 # ---------------------------------------------------------------------------
 # Latest-value KV store: project_telemetry

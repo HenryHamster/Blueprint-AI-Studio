@@ -3784,11 +3784,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Also index by parent_direction_id in task context as fallback
     _parent_direction_id = (task.context or {}).get("direction_id")
 
-    _cochange_index_for_decomp = (
-        (_scope_cal_project.design_doc or {}).get("cochange_index")
-        if _scope_cal_project
-        else None
-    )
+    _cochange_index_for_decomp = None
+    if _scope_cal_project:
+        from app.direction_outcomes import read_cochange_index as _read_cci
+
+        _cochange_index_for_decomp = await _read_cci(session, _scope_cal_project)
     # Global kill-switch for co-change auto-decomposition. Default OFF: live data
     # showed split sub-findings merging at ~0% while ~3x-ing task fan-out, so by
     # default findings pass through unsplit. Flip cochange_decomposition_enabled

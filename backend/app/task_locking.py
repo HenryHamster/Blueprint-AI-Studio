@@ -101,6 +101,11 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         # it doesn't consume the agent-write 500KB budget.
         "cochange_index",
         "cochange_applied_prs",
+        # Per-direction first-attempt review feedback tallies.  Dual-written to
+        # project_telemetry; exempted from agent budget during the transition.
+        "direction_first_attempt_feedback",
+        # Completion-debt-ledger system description seeded by completion_debt.py.
+        "systems/completion-debt-ledger",
         # Analytics/sweep keys written by background code (not by agents)
         "repo_overview",
         "review_effectiveness",
@@ -743,6 +748,11 @@ async def with_design_doc_locked(
                     project_id, old_agent_size, new_agent_size, DESIGN_DOC_MAX_BYTES
                 )
             return False
+        # Strip migrated telemetry keys before persist — these are now written
+        # exclusively via project_telemetry.set_project_telemetry / upsert_telemetry.
+        from app.project_telemetry import strip_migrated_doc_keys as _strip_migrated_doc_keys
+
+        _strip_migrated_doc_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
         session.add(project)

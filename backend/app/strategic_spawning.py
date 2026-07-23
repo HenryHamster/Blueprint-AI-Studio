@@ -80,6 +80,7 @@ from app.capability_registry import (
     registry_capability_names,
     registry_capability_vocabulary,
 )
+from app.project_telemetry import read_telemetry
 from app.problem_model import (
     REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY,
     resolve_project_purpose,
@@ -4179,7 +4180,9 @@ async def _spawn_design_doc_update(
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             **({"pending_followups": _pending_followups} if _pending_followups else {}),
             **({"compute_experiment_sweeps": _dd_compute_sweep_groups} if _dd_compute_sweep_groups else {}),
-            "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
+            "proposed_changes": await read_telemetry(
+                session, project.id, "proposed_changes"
+            ) or (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": _agent_visible_vision(project.vision),
             "effective_purpose": resolve_project_purpose(project),

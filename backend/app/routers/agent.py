@@ -2760,20 +2760,30 @@ async def claim_task(
                             logger.debug(
                                 "[AGENT] Low-success-rate retirement skipped (non-critical)"
                             )
+                        # Strip migrated telemetry keys before persist.
+                        from app.project_telemetry import (
+                            set_project_telemetry,
+                            strip_migrated_doc_keys,
+                        )
+
+                        _archive = strip_migrated_doc_keys(doc).pop(
+                            "playbook_archive", None
+                        )
                         _pb_proj.design_doc = doc
                         flag_modified(_pb_proj, "design_doc")
                         session.add(_pb_proj)
-                        if doc.get("playbook_archive") is not None:
+                        if _archive is not None:
                             try:
-                                from app.project_telemetry import set_project_telemetry
                                 await set_project_telemetry(
                                     session,
                                     _pb_proj.id,
                                     "playbook_archive",
-                                    doc["playbook_archive"],
+                                    _archive,
                                 )
                             except Exception:  # noqa: BLE001 — best-effort
-                                logger.debug("[AGENT] playbook_archive telemetry dual-write skipped")
+                                logger.debug(
+                                    "[AGENT] playbook_archive telemetry write skipped"
+                                )
                 # Store shown playbook keys in task context for outcome tracking at completion
                 task_ctx = dict(task.context or {})
                 task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
@@ -3551,7 +3561,11 @@ async def claim_task(
 
     # Inject per-module review feedback warnings for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
-        module_feedback = (project_for_playbook.design_doc or {}).get("module_feedback")
+        from app.project_telemetry import read_telemetry_or_doc as _read_tel
+
+        module_feedback = await _read_tel(
+            session, project_for_playbook.id, project_for_playbook.design_doc, "module_feedback"
+        )
         if module_feedback:
             task_related_files = _claimed_context.get("related_files", [])
             module_warnings = []

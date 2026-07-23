@@ -1691,12 +1691,20 @@ async def update_playbook_entry(
     elif action == "archive":
         archive_playbook_entry(doc, full_key, archived_at=now_iso)
 
+    # Strip migrated telemetry keys before persist — playbook_archive is now
+    # written exclusively via project_telemetry.
+    _pb_archive_value = doc.get("playbook_archive")
+    from app.project_telemetry import (
+        set_project_telemetry as _set_pb_telemetry,
+        strip_migrated_doc_keys as _strip_migrated,
+    )
+
+    _strip_migrated(doc)
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)
-    if action == "archive" and doc.get("playbook_archive") is not None:
-        from app.project_telemetry import set_project_telemetry
-        await set_project_telemetry(session, project.id, "playbook_archive", doc["playbook_archive"])
+    if action == "archive" and _pb_archive_value is not None:
+        await _set_pb_telemetry(session, project.id, "playbook_archive", _pb_archive_value)
     await session.commit()
 
     if action == "archive":

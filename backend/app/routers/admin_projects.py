@@ -606,6 +606,10 @@ async def update_project(
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "user"
         doc["_meta"] = meta
+        # Strip migrated telemetry keys before persist (safety net).
+        from app.project_telemetry import strip_migrated_doc_keys as _strip_migrated_keys
+
+        _strip_migrated_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
     if payload.build_config is not None:
