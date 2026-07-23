@@ -1862,7 +1862,6 @@ async def admin_playbook_delete(
     record_playbook_tombstone(doc, playbook_key, archived_at=_utcnow().isoformat())
 
     updated_archive = list(doc.get("playbook_archive") or [])
-    updated_deleted_keys = list(doc.get("playbook_deleted_keys") or [])
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1
@@ -1875,7 +1874,6 @@ async def admin_playbook_delete(
     flag_modified(project, "design_doc")
     session.add(project)
     await set_project_telemetry(session, project_id, "playbook_archive", updated_archive)
-    await set_project_telemetry(session, project_id, "playbook_deleted_keys", updated_deleted_keys)
     await session.commit()
 
     return {"status": "ok", "key": key, "deleted": True}
