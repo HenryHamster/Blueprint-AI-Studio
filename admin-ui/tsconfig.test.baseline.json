@@ -23,29 +23,8 @@
       "TS2741: Property 'description' is missing in type '{ id: string; title: string; status: \"IN_PROGRESS\"; created_by: string; requires_approval: false; created_at: string; started_at: string; }' but required in type 'Task'.": 1,
       "TS2741: Property 'description' is missing in type '{ id: string; title: string; status: \"QUEUED\"; created_by: string; requires_approval: false; created_at: string; }' but required in type 'Task'.": 1
     },
-    "src/components/DirectionCard.test.tsx": {
-      "TS2739: Type '{ direction: Direction; statusKey: string; activeItems: Direction[]; editingId: null; editText: string; editPriority: \"medium\"; editStatus: \"active\"; editCategory: null; ... 35 more ...; setForceConfirmId: Mock<...>; }' is missing the following properties from type 'DirectionCardProps': activateStagedDirection, cancelStagedDirection": 55,
-      "TS2739: Type '{ editingId: string; editText: string; editCompletionCriteria: string; setEditCompletionCriteria: Mock<Procedure>; direction: Direction; statusKey: string; ... 37 more ...; setForceConfirmId: Mock<...>; }' is missing the following properties from type 'DirectionCardProps': activateStagedDirection, cancelStagedDirection": 1,
-      "TS2739: Type '{ editingId: string; editText: string; editSuccessEvidence: string; editRetirementCondition: string; setEditSuccessEvidence: Mock<Procedure>; setEditRetirementCondition: Mock<...>; ... 37 more ...; setForceConfirmId: Mock<...>; }' is missing the following properties from type 'DirectionCardProps': activateStagedDirection, cancelStagedDirection": 1,
-      "TS2739: Type '{ onViewKnowledge: Mock<Procedure>; direction: Direction; statusKey: string; activeItems: Direction[]; editingId: null; editText: string; editPriority: \"medium\"; ... 37 more ...; setForceConfirmId: Mock<...>; }' is missing the following properties from type 'DirectionCardProps': activateStagedDirection, cancelStagedDirection": 2,
-      "TS2739: Type '{ editingId: string; editText: string; editCostBudget: string; setEditCostBudget: Mock<Procedure>; direction: Direction; statusKey: string; activeItems: Direction[]; ... 38 more ...; setForceConfirmId: Mock<...>; }' is missing the following properties from type 'DirectionCardProps': activateStagedDirection, cancelStagedDirection": 1,
-      "TS2739: Type '{ editingId: string; editText: string; direction: Direction; statusKey: string; activeItems: Direction[]; editPriority: \"medium\"; editStatus: \"active\"; editCategory: null; ... 35 more ...; setForceConfirmId: Mock<...>; }' is missing the following properties from type 'DirectionCardProps': activateStagedDirection, cancelStagedDirection": 1,
-      "TS2739: Type '{ decideChurnRetirement: Mock<Procedure>; direction: Direction; statusKey: string; activeItems: Direction[]; editingId: null; editText: string; ... 38 more ...; setForceConfirmId: Mock<...>; }' is missing the following properties from type 'DirectionCardProps': activateStagedDirection, cancelStagedDirection": 6
-    },
-    "src/components/DirectionCard.viewport.test.tsx": {
-      "TS2353: Object literal may only specify known properties, and 'merge_rate' does not exist in type 'Direction'.": 1,
-      "TS2739: Type '{ direction: Direction; statusKey: string; activeItems: Direction[]; editingId: null; editText: string; editPriority: \"high\"; editStatus: \"active\"; editCategory: \"product\"; ... 37 more ...; onNavigateToTask: () => void; }' is missing the following properties from type 'DirectionCardProps': editSuccessEvidence, editRetirementCondition, setEditSuccessEvidence, setEditRetirementCondition": 5,
-      "TS2739: Type '{ statusKey: string; direction: Direction; activeItems: Direction[]; editingId: null; editText: string; editPriority: \"high\"; editStatus: \"active\"; editCategory: \"product\"; ... 37 more ...; onNavigateToTask: () => void; }' is missing the following properties from type 'DirectionCardProps': editSuccessEvidence, editRetirementCondition, setEditSuccessEvidence, setEditRetirementCondition": 7,
-      "TS2739: Type '{ direction: Direction; editingId: string; editStatus: \"staged\"; stageTargetVersion: number; statusKey: string; activeItems: Direction[]; editText: string; editPriority: \"high\"; ... 38 more ...; onNavigateToTask: () => void; }' is missing the following properties from type 'DirectionCardProps': editSuccessEvidence, editRetirementCondition, setEditSuccessEvidence, setEditRetirementCondition": 1,
-      "TS2739: Type '{ direction: Direction; editingId: string; stageTargetVersion: null; statusKey: string; activeItems: Direction[]; editText: string; editPriority: \"high\"; editStatus: \"active\"; ... 38 more ...; onNavigateToTask: () => void; }' is missing the following properties from type 'DirectionCardProps': editSuccessEvidence, editRetirementCondition, setEditSuccessEvidence, setEditRetirementCondition": 1,
-      "TS2739: Type '{ direction: Direction; editingId: string; stageTargetVersion: number; statusKey: string; activeItems: Direction[]; editText: string; editPriority: \"high\"; editStatus: \"active\"; ... 38 more ...; onNavigateToTask: () => void; }' is missing the following properties from type 'DirectionCardProps': editSuccessEvidence, editRetirementCondition, setEditSuccessEvidence, setEditRetirementCondition": 2,
-      "TS2739: Type '{ statusKey: string; direction: Direction; decideChurnRetirement: () => Promise<void>; activeItems: Direction[]; editingId: null; editText: string; editPriority: \"high\"; ... 39 more ...; onNavigateToTask: () => void; }' is missing the following properties from type 'DirectionCardProps': editSuccessEvidence, editRetirementCondition, setEditSuccessEvidence, setEditRetirementCondition": 2
-    },
     "src/components/DirectionPortfolioSection.viewport.test.tsx": {
       "TS18047: 'root' is possibly 'null'.": 1
-    },
-    "src/components/DirectionsPanel.test.tsx": {
-      "TS2322: Type '{ id: string; name: string; }[]' is not assignable to type 'Project[]'.": 18
     },
     "src/components/DirectionsPanel.viewport.test.tsx": {
       "TS2353: Object literal may only specify known properties, and 'merge_rate' does not exist in type 'Direction'.": 1
@@ -193,36 +172,17 @@
     "src/components/StrategicContextWorkspace.viewport.test.tsx": {
       "TS2322: Type '{ open: true; state: StrategicStateResponse; accountSpend: { totalAccounts: number; availableAccounts: number; enabledAccounts: number; trackedSpendUsd: number; }; ... 5 more ...; onUpdateSessionRefs: Mock<...>; }' is not assignable to type 'IntrinsicAttributes & StrategicContextWorkspaceProps'.": 1
     },
-    "src/components/StrategicLiveTurn.viewport.test.tsx": {
-      "TS2322: Type 'string' is not assignable to type 'number'.": 1
-    },
     "src/components/SystemHealthCard.test.tsx": {
       "TS2820: Type '\"completed\"' is not assignable to type 'TaskStatus'. Did you mean '\"COMPLETED\"'?": 1
     },
     "src/components/SystemMaturityCard.test.tsx": {
       "TS1484: 'SystemMaturityRow' is a type and must be imported using a type-only import when 'verbatimModuleSyntax' is enabled.": 1
     },
-    "src/components/TaskCard.test.tsx": {
-      "TS2322: Type '\"compute_experiment\"' is not assignable to type '\"create\" | \"review\" | \"fix\" | \"plan\" | \"research\" | \"strategic_review\" | \"design_doc_update\" | \"security_audit\" | \"qa\" | \"deps\" | \"docs\" | \"migrate\" | \"smoketest\" | \"refactor\" | ... 8 more ... | undefined'.": 2
-    },
-    "src/components/TaskDetailDrawer.test.tsx": {
-      "TS2322: Type '\"compute_experiment\"' is not assignable to type '\"create\" | \"review\" | \"fix\" | \"plan\" | \"research\" | \"strategic_review\" | \"design_doc_update\" | \"security_audit\" | \"qa\" | \"deps\" | \"docs\" | \"migrate\" | \"smoketest\" | \"refactor\" | ... 8 more ... | undefined'.": 2
-    },
     "src/components/TaskDetailDrawerDiagnostics.viewport.test.tsx": {
       "TS2493: Tuple type '[]' of length '0' has no element at index '0'.": 1
     },
-    "src/components/TaskDetailDrawerFailureDetail.viewport.test.tsx": {
-      "TS2322: Type '\"compute_experiment\"' is not assignable to type '\"create\" | \"review\" | \"fix\" | \"plan\" | \"research\" | \"strategic_review\" | \"design_doc_update\" | \"security_audit\" | \"qa\" | \"deps\" | \"docs\" | \"migrate\" | \"smoketest\" | \"refactor\" | ... 8 more ... | undefined'.": 3
-    },
-    "src/components/TaskDetailDrawerMeta.test.tsx": {
-      "TS2353: Object literal may only specify known properties, and 'parent_strategic_task_id' does not exist in type '{ direction: { id: string; text?: string | null | undefined; priority?: string | null | undefined; status?: string | null | undefined; } | null; cycle: { id: string; phase: string | null; outcome: string; } | null; }'.": 1,
-      "TS2739: Type '{ id: string; project_id: string; task_id: string; backend: string; external_compute_id: string; machine_type: string; status: \"SUCCEEDED\"; terminal_reason: string; outcome: \"SUCCESS\"; spend_cap_usd: number; ... 10 more ...; task_type: string; }' is missing the following properties from type 'ComputeJob': accelerator_type, accelerator_count": 1,
-      "TS2739: Type '{ id: string; project_id: string; task_id: string; backend: string; external_compute_id: string; machine_type: string; status: \"SUCCEEDED\"; terminal_reason: string; outcome: \"SUCCESS\"; spend_cap_usd: number; ... 12 more ...; task_type: string; }' is missing the following properties from type 'ComputeJob': accelerator_type, accelerator_count": 3,
-      "TS2322: Type '\"compute_experiment\"' is not assignable to type '\"create\" | \"review\" | \"fix\" | \"plan\" | \"research\" | \"strategic_review\" | \"design_doc_update\" | \"security_audit\" | \"qa\" | \"deps\" | \"docs\" | \"migrate\" | \"smoketest\" | \"refactor\" | ... 8 more ... | undefined'.": 14
-    },
     "src/components/TaskDetailDrawerMeta.viewport.test.tsx": {
-      "TS2353: Object literal may only specify known properties, and 'branch' does not exist in type 'Task'.": 1,
-      "TS2353: Object literal may only specify known properties, and 'parent_strategic_task_id' does not exist in type '{ direction: { id: string; text?: string | null | undefined; priority?: string | null | undefined; status?: string | null | undefined; } | null; cycle: { id: string; phase: string | null; outcome: string; } | null; }'.": 1
+      "TS2353: Object literal may only specify known properties, and 'branch' does not exist in type 'Task'.": 1
     },
     "src/components/TaskDetailDrawerSelfReview.viewport.test.tsx": {
       "TS2493: Tuple type '[]' of length '0' has no element at index '0'.": 1,

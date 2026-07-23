@@ -134,7 +134,7 @@ function mockFetch(responses: Record<string, unknown>) {
   });
 }
 
-const TEST_PROJECTS = [{ id: 'proj1', name: 'Project 1' }];
+const TEST_PROJECTS = [{ id: 'proj1', name: 'Project 1', status: 'active', github_owner: 'test', github_repo: 'test-repo', autonomous_enabled: false, created_at: '2024-01-01T00:00:00Z' }];
 
 const baseResponses = {
   '/api/admin/projects/proj1/directions/task-counts': { counts: {} },

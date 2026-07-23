@@ -137,6 +137,7 @@ export interface TaskSideboardContext {
       phase: 'design_doc_update' | 'strategic_review' | string | null;
       outcome: string;
     } | null;
+    parent_strategic_task_id?: string | null;
   };
   pipeline: {
     parent_task_id?: string | null;

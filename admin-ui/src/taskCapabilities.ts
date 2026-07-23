@@ -201,6 +201,15 @@ export const TASK_CAPABILITIES = [
     filterVisible: true,
     synthetic: true,
   },
+  {
+    id: 'compute_experiment',
+    label: 'Compute Experiment',
+    description: 'Run a budgeted compute job',
+    userLaunchable: false,
+    providerConfigurable: false,
+    filterVisible: true,
+    synthetic: false,
+  },
 ] as const;
 
 type TaskCapability = (typeof TASK_CAPABILITIES)[number];
