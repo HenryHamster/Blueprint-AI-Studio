@@ -42,13 +42,19 @@
       ]
     },
     {
-      "path": "backend/testing/test_admin_routers.py",
-      "reason": "Covers the operator message-create endpoint (POST /api/admin/projects/{id}/strategic-session/messages), session settings persistence, and workbench-state session_started_at decay — all live conversational-Workday contracts.",
+      "path": "backend/testing/test_admin_routers__messages.py",
+      "reason": "Covers the operator message-create endpoint (POST /api/admin/projects/{id}/strategic-session/messages) and workbench-state session_started_at decay — all live conversational-Workday contracts. Split from test_admin_routers.py.",
       "test_ids": [
         "test_strategic_session_message_idempotency_preserves_response_shape_and_broadcast",
         "test_strategic_session_message_persists_workbench_snapshot_and_arms",
         "test_strategic_session_message_allows_attachment_only_content",
-        "test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at",
+        "test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at"
+      ]
+    },
+    {
+      "path": "backend/testing/test_admin_routers.py",
+      "reason": "Covers strategic session settings persistence — live conversational-Workday contracts remaining in the main admin_routers test file.",
+      "test_ids": [
         "test_strategic_session_settings",
         "test_strategic_session_settings_persist_across_sync"
       ]

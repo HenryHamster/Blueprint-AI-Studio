@@ -680,7 +680,6 @@
   "testing/test_admin_routers.py::TestDeriveSaturation::test_healthy_when_util_avg_below_threshold": 6.6,
   "testing/test_admin_routers.py::TestDeriveSaturation::test_none_when_util_avg_is_none": 0.12,
   "testing/test_admin_routers.py::TestDeriveSaturation::test_saturated_when_util_avg_at_or_above_upper_threshold": 0.39,
-  "testing/test_admin_routers.py::TestMessagesSavedViews::test_sanitizer_handles_corrupt_non_list_rows": 3.65,
   "testing/test_admin_routers.py::TestResetProjectStateHelper::test_reset_project_state_clears_only_target": 0.11,
   "testing/test_admin_routers.py::TestStrategistSpawnableRegistry::test_allowlist_equals_expected_knowledge_types": 0.17,
   "testing/test_admin_routers.py::TestStrategistSpawnableRegistry::test_allowlist_is_derived_from_capability_flag": 2.05,
@@ -18685,5 +18684,6 @@
   "testing/test_workbench_events.py::test_compute_job_feed_item_criterion_met_uses_active_tone": 0.93,
   "testing/test_workbench_events.py::test_compute_job_feed_item_unmet_criterion_uses_warning_tone": 2.45,
   "testing/test_workbench_events.py::test_payload_task_type_reads_first_payload": 14.7,
-  "testing/test_workbench_events.py::test_workbench_event_envelope_is_v1_and_dedupes_refetch_surfaces": 0.058
+  "testing/test_workbench_events.py::test_workbench_event_envelope_is_v1_and_dedupes_refetch_surfaces": 0.058,
+  "testing/test_admin_routers__messages.py::TestMessagesSavedViews::test_sanitizer_handles_corrupt_non_list_rows": 3.65
 }
