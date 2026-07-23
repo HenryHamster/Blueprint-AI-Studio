@@ -205,6 +205,26 @@ async def test_amended_chain_from_0640_preserves_workday_and_telemetry():
                     "updated_at": authoritative_time,
                 },
             )
+            await connection.execute(
+                sa.text(
+                    "INSERT INTO project_lane_baseline "
+                    "(project_id, data, updated_at) VALUES "
+                    "(CAST(:project_id AS uuid), CAST(:data AS jsonb), :updated_at)"
+                ),
+                {
+                    "project_id": project_ids["object"],
+                    "data": json.dumps(
+                        {
+                            "7": {
+                                "captured_at": authoritative_time.isoformat(),
+                                "baseline_def_version": "lane-legacy",
+                                "score": 11,
+                            }
+                        }
+                    ),
+                    "updated_at": authoritative_time,
+                },
+            )
 
         await _upgrade(engine, "head")
 
@@ -245,6 +265,32 @@ async def test_amended_chain_from_0640_preserves_workday_and_telemetry():
                 "metric_def_version": "v-legacy",
                 "score": 7,
             }
+
+            lane_row = (
+                (
+                    await connection.execute(
+                        sa.text(
+                            "SELECT project_id, version_number, captured_at, "
+                            "baseline_def_version, blob "
+                            "FROM project_lane_baseline"
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert lane_row["project_id"] == project_ids["object"]
+            assert lane_row["version_number"] == 7
+            assert lane_row["captured_at"] == authoritative_time
+            assert lane_row["baseline_def_version"] == "lane-legacy"
+            assert lane_row["blob"] == {
+                "captured_at": authoritative_time.isoformat(),
+                "baseline_def_version": "lane-legacy",
+                "score": 11,
+            }
+            assert await connection.scalar(
+                sa.text("SELECT to_regclass('project_lane_baseline_legacy_0681')")
+            ) is None
 
             rows = (
                 (
