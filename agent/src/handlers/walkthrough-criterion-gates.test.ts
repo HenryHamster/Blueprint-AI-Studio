@@ -130,6 +130,81 @@ describe('SHA validity guard', () => {
   });
 });
 
+// ── c-workday-session-lifecycle ────────────────────────────────────────────────
+
+describe('c-workday-session-lifecycle gate', () => {
+  it('fails when only 5b and 5c pass (missing 5d, 5e, 5f)', () => {
+    const { workdaySessionPassed } = computeGates(makeResults(['5b.', '5c.']), true);
+    expect(workdaySessionPassed).toBe(false);
+  });
+
+  it('fails when 5b-5d pass but 5e (clean stop) is absent', () => {
+    const { workdaySessionPassed } = computeGates(makeResults(['5b.', '5c.', '5d.']), true);
+    expect(workdaySessionPassed).toBe(false);
+  });
+
+  it('fails when 5b-5e pass but 5f (click-to-talk) is absent', () => {
+    const { workdaySessionPassed } = computeGates(
+      makeResults(['5b.', '5c.', '5d.', '5e.']),
+      true,
+    );
+    expect(workdaySessionPassed).toBe(false);
+  });
+
+  it('passes when all five required steps pass: 5b, 5c, 5d, 5e, 5f', () => {
+    const { workdaySessionPassed } = computeGates(
+      makeResults(['5b.', '5c.', '5d.', '5e.', '5f.']),
+      true,
+    );
+    expect(workdaySessionPassed).toBe(true);
+  });
+
+  it('CRITERION_STEP_REQUIREMENTS declares all session steps for c-workday-session-lifecycle', () => {
+    const steps = CRITERION_STEP_REQUIREMENTS['c-workday-session-lifecycle'];
+    for (const s of ['5b.', '5c.', '5d.', '5e.', '5f.']) {
+      expect(steps).toContain(s);
+    }
+  });
+
+  it('workday session fails when shaValid is false even with all steps passing', () => {
+    const { workdaySessionPassed } = computeGates(
+      makeResults(['5b.', '5c.', '5d.', '5e.', '5f.']),
+      false,
+    );
+    expect(workdaySessionPassed).toBe(false);
+  });
+});
+
+// ── Flow-to-criterion registry completeness ────────────────────────────────────
+
+describe('CRITERION_STEP_REQUIREMENTS registry completeness', () => {
+  it('registers exactly the three known walkthrough criterion keys', () => {
+    const keys = Object.keys(CRITERION_STEP_REQUIREMENTS);
+    expect(keys).toContain('c-dfdc9d82');
+    expect(keys).toContain('c-f52fd975');
+    expect(keys).toContain('c-workday-session-lifecycle');
+    expect(keys).toHaveLength(3);
+  });
+
+  it('every registered criterion has at least one non-empty step requirement string', () => {
+    for (const [, steps] of Object.entries(CRITERION_STEP_REQUIREMENTS)) {
+      expect(Array.isArray(steps)).toBe(true);
+      expect(steps.length).toBeGreaterThan(0);
+      for (const s of steps) {
+        expect(typeof s).toBe('string');
+        expect(s.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('ALL_STEPS aggregates at least one step per criterion (no orphaned criterion)', () => {
+    for (const [, steps] of Object.entries(CRITERION_STEP_REQUIREMENTS)) {
+      const hasOverlap = steps.some((s) => ALL_STEPS.includes(s));
+      expect(hasOverlap).toBe(true);
+    }
+  });
+});
+
 // ── Meta criterion ─────────────────────────────────────────────────────────────
 
 describe('meta criterion (c-5214996f)', () => {
@@ -147,6 +222,12 @@ describe('meta criterion (c-5214996f)', () => {
   it('fails when iframe token fails (missing 7e) even if others pass', () => {
     const withoutNoPlacement = ALL_STEPS.filter((s) => s !== '7e.');
     const { walkthroughMetaPassed } = computeGates(makeResults(withoutNoPlacement), true);
+    expect(walkthroughMetaPassed).toBe(false);
+  });
+
+  it('fails when workday session fails (missing 5f) even if enrollment and iframe pass', () => {
+    const withoutClickToTalk = ALL_STEPS.filter((s) => s !== '5f.');
+    const { walkthroughMetaPassed } = computeGates(makeResults(withoutClickToTalk), true);
     expect(walkthroughMetaPassed).toBe(false);
   });
 });

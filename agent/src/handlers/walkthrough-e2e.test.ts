@@ -113,6 +113,17 @@ function lastStatus(): Record<string, unknown> {
   return calls[calls.length - 1][1];
 }
 
+/** All three criterion keys the harness emits, one entry per flow. */
+const ALL_CRITERIA_RESULT = {
+  git_sha: CANDIDATE_SHA,
+  run_timestamp: '2026-07-22T00:00:00Z',
+  results: [
+    { criterion_key: 'c-dfdc9d82', passed: true, notes: 'runner enrolled and heartbeat confirmed' },
+    { criterion_key: 'c-f52fd975', passed: true, notes: 'tools lifecycle completed end-to-end' },
+    { criterion_key: 'c-workday-session-lifecycle', passed: true, notes: 'workday session lifecycle complete' },
+  ],
+};
+
 describe('handleWalkthroughE2e — candidate-SHA stack targeting', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -165,6 +176,170 @@ describe('handleWalkthroughE2e — candidate-SHA stack targeting', () => {
     expect(statusCall.failure_category).toBe('candidate_stack_boot_failed');
 
     // Teardown still runs on the failure path.
+    expect(teardownMock).toHaveBeenCalled();
+  });
+});
+
+// ── Flow-to-criterion mapping ───────────────────────────────────────────────────
+
+describe('handleWalkthroughE2e — flow-to-criterion mapping', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    teardownMock.mockResolvedValue(undefined);
+    vi.mocked(apiPost).mockResolvedValue({ recorded: 3, skipped_not_passed: 0 });
+    process.env.ORCHESTRATOR_URL = DEPLOYED_URL;
+    process.env.ADMIN_API_KEY = 'agent-vm-admin-key';
+  });
+
+  it('all three criterion keys from harness results appear in the evidence POST body', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue(ALL_CRITERIA_RESULT);
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCalls).toHaveLength(1);
+
+    const body = evidenceCalls[0][1] as {
+      results: Array<{ criterion_key: string; passed: boolean; notes: string | null }>;
+    };
+    const postedKeys = body.results.map((r) => r.criterion_key);
+    expect(postedKeys).toContain('c-dfdc9d82');
+    expect(postedKeys).toContain('c-f52fd975');
+    expect(postedKeys).toContain('c-workday-session-lifecycle');
+    expect(postedKeys).toHaveLength(3);
+  });
+
+  it('absent notes field is normalised to null in the evidence body', async () => {
+    bootMock.mockResolvedValue(STACK);
+    const resultMixedNotes = {
+      git_sha: CANDIDATE_SHA,
+      run_timestamp: '2026-07-22T00:00:00Z',
+      results: [
+        { criterion_key: 'c-dfdc9d82', passed: true },                                // no notes
+        { criterion_key: 'c-f52fd975', passed: false, notes: 'step 7e failed' },     // string notes
+      ],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(resultMixedNotes);
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    const body = evidenceCalls[0][1] as {
+      results: Array<{ criterion_key: string; passed: boolean; notes: string | null }>;
+    };
+
+    const dfdc = body.results.find((r) => r.criterion_key === 'c-dfdc9d82');
+    expect(dfdc?.passed).toBe(true);
+    expect(dfdc?.notes).toBeNull();
+
+    const f52 = body.results.find((r) => r.criterion_key === 'c-f52fd975');
+    expect(f52?.passed).toBe(false);
+    expect(f52?.notes).toBe('step 7e failed');
+  });
+
+  it('qualification_attempt_id is forwarded to the evidence POST body when provided', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+    const payloadWithAttemptId = { ...PAYLOAD, qualification_attempt_id: 'qa-attempt-123' };
+
+    await handleWalkthroughE2e(TASK_ID, payloadWithAttemptId, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    const body = evidenceCalls[0][1] as Record<string, unknown>;
+    expect(body.qualification_attempt_id).toBe('qa-attempt-123');
+  });
+
+  it('qualification_attempt_id is absent from evidence body when not in payload', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    const body = evidenceCalls[0][1] as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(body, 'qualification_attempt_id')).toBe(false);
+  });
+});
+
+// ── Error paths ────────────────────────────────────────────────────────────────
+
+describe('handleWalkthroughE2e — error paths', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    teardownMock.mockResolvedValue(undefined);
+    vi.mocked(apiPost).mockResolvedValue({ recorded: 1, skipped_not_passed: 0 });
+    // Reset execFileSync to its module-level default so per-test overrides
+    // from sibling tests (mockImplementation) do not bleed across.
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    process.env.ORCHESTRATOR_URL = DEPLOYED_URL;
+    process.env.ADMIN_API_KEY = 'agent-vm-admin-key';
+  });
+
+  it('harness exits non-zero AND result file absent: FAILED with walkthrough_harness_failed', async () => {
+    bootMock.mockResolvedValue(STACK);
+    // Make only the walkthrough harness invocation throw; git commands succeed.
+    vi.mocked(execFileSync).mockImplementation((_cmd, args) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      if (a.some((x) => typeof x === 'string' && x.includes('v26-live-walkthrough'))) {
+        throw new Error('harness exit code 1');
+      }
+      return Buffer.from('');
+    });
+    // No result file written.
+    vi.mocked(readHandlerOutput).mockReturnValue(undefined);
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    const status = lastStatus();
+    expect(status.status).toBe('FAILED');
+    expect(status.failure_category).toBe('walkthrough_harness_failed');
+    expect(teardownMock).toHaveBeenCalled();
+  });
+
+  it('harness succeeds but result file is missing/unparseable: FAILED with walkthrough_result_unparseable', async () => {
+    bootMock.mockResolvedValue(STACK);
+    // Harness command returns successfully (default mock), but no result file.
+    vi.mocked(readHandlerOutput).mockReturnValue(undefined);
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    const status = lastStatus();
+    expect(status.status).toBe('FAILED');
+    expect(status.failure_category).toBe('walkthrough_result_unparseable');
+    expect(teardownMock).toHaveBeenCalled();
+  });
+
+  it('evidence POST throws: task still COMPLETED (evidence failure is non-fatal)', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+    vi.mocked(apiPost).mockRejectedValue(new Error('network error posting evidence'));
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    const status = lastStatus();
+    expect(status.status).toBe('COMPLETED');
+    expect(teardownMock).toHaveBeenCalled();
+  });
+
+  it('stack teardown is always called even when evidence POST and result parsing both fail', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue(undefined);
+    vi.mocked(apiPost).mockRejectedValue(new Error('should never be called'));
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    // Teardown guaranteed even on the no-result failure path.
     expect(teardownMock).toHaveBeenCalled();
   });
 });
