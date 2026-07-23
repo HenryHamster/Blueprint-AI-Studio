@@ -14067,6 +14067,102 @@ async def test_decay_stale_open_resolves_ordinary_note_with_operator_fyi(reaper_
     assert msg.resolution == "auto-decayed (stale)"
 
 
+@pytest.mark.asyncio
+async def test_decay_stale_open_messages_reduces_operator_counts(reaper_db):
+    """End-to-end: after ``sweep_decay_stale_open_messages`` decays aged operator-
+    visible messages, ``get_operator_message_counts`` reflects the decrease.
+
+    Today decay and counts are tested independently (each mocks the other's
+    read-model or write-model).  This test runs both in sequence with real
+    DB rows to prove the write-model decay actually moves the read-model
+    needle.
+    """
+    from app.operator_attention import get_operator_message_counts
+
+    project = await _make_project(reaper_db)
+
+    # Two operator-visible messages old enough to decay — one FEEDBACK (counted
+    # directly by get_operator_message_counts) and one NOTE with operator-fyi
+    # audience (contributes to unread).
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+
+    # FEEDBACK with explicit operator-fyi audience.
+    feedback_msg = await _make_conversational_message(
+        reaper_db, project,
+        msg_type=MessageType.FEEDBACK,
+        created_at=old,
+        context={"audience": "operator-fyi", "event_type": "cycle_summary"},
+    )
+
+    # NOTE with operator-fyi audience (decayable).
+    note_msg = await _make_conversational_message(
+        reaper_db, project,
+        msg_type=MessageType.NOTE,
+        created_at=old,
+        context={"audience": "operator-fyi", "event_type": "cycle_summary"},
+    )
+
+    # A CONTROL: operator-action-needed NOTE that should NOT decay at this age
+    # (it survives past 14d up to the 60d OAN threshold).
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+    control_msg = await _make_conversational_message(
+        reaper_db, project,
+        msg_type=MessageType.NOTE,
+        created_at=old,
+        context={"audience": OPERATOR_ACTION_NEEDED, "event_type": "auto_fix_escalated"},
+    )
+
+    # Pre-decay count: FEEDBACK and operator-fyi NOTE are operator-visible,
+    # so they appear in the operator attention read model.
+    pre_counts = await get_operator_message_counts(reaper_db, project.id)
+
+    # Run the decay sweep.
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 2, (
+        f"Expected 2 aged messages decayed (FEEDBACK + NOTE), got {acted}"
+    )
+
+    # Post-decay count: the two aged operator-visibles are now resolved,
+    # so the read model must show fewer operator-visible messages.
+    post_counts = await get_operator_message_counts(reaper_db, project.id)
+
+    # The FEEDBACK count must decrease by 1 (our decayed FEEDBACK was open
+    # and operator-visible, now resolved).
+    assert post_counts["feedback"] == pre_counts["feedback"] - 1, (
+        f"FEEDBACK count did not decrease: "
+        f"pre={pre_counts['feedback']}, post={post_counts['feedback']}"
+    )
+
+    # The control OAN message must NOT have been decayed (it stays open and
+    # operator-visible, so the needs_operator count still includes it).
+    await reaper_db.refresh(control_msg)
+    assert control_msg.status == "open", (
+        "operator-action-needed NOTE must survive 14-day decay window"
+    )
+
+    # Unread count: both decayed messages were of types counted in unread
+    # (FEEDBACK is in _HIGH_SIGNAL_MESSAGE_TYPES; the NOTE contributes to
+    # the unread note query).  After decay both are resolved, so unread
+    # should be stable or decrease (it can increase if other messages were
+    # created by sweep machinery, but it must not increase due to decayed
+    # messages remaining visible).
+    assert post_counts["unread"] <= pre_counts["unread"], (
+        f"unread count increased after sweeping aged operator-visible messages: "
+        f"pre={pre_counts['unread']}, post={post_counts['unread']}"
+    )
+
+    # Verify the decayed messages are resolved.
+    await reaper_db.refresh(feedback_msg)
+    assert feedback_msg.status == "resolved", (
+        "FEEDBACK must be resolved after sweep"
+    )
+    await reaper_db.refresh(note_msg)
+    assert note_msg.status == "resolved", (
+        "NOTE must be resolved after sweep"
+    )
+
+
 # ── Step 18d: stale-open bug-class decay ─────────────────────────────────────
 
 from app.reaper_bug_message_sweeps import (  # noqa: E402

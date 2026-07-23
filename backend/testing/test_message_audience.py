@@ -806,6 +806,101 @@ def test_strategist_agent_output_reply_audience():
         )
 
 
+def test_strategist_agent_output_reply_audience_with_message_type():
+    """strategic_completion.py passes ``message_type=msg_type.value`` (typically
+    ``NOTE``) to ``stamp_message_audience``.  A reply with ``reply_to`` present
+    and no explicit ``event_type`` resolves to ``question_answer`` / ``OPERATOR_FYI``
+    regardless of the ``message_type`` parameter.
+
+    This pins the exact ``strategic_completion.py`` call pattern (lines ~6470-6472)
+    so a future default change cannot silently make strategist replies invisible
+    to the operator: the ``message_type`` fallback in ``route_event`` only upgrades
+    ``STRATEGIST_INTERNAL`` → ``OPERATOR_ACTION_NEEDED`` for ``BUG_REPORT`` /
+    ``BLOCKER`` / ``QUESTION``, and ``question_answer`` already resolves to
+    ``OPERATOR_FYI`` directly, so the fallback never fires.
+    """
+    test_cases: list[tuple[dict, str, str, str, str | None]] = [
+        # (context, expected_audience, expected_event_type, message_type, scenario)
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            "NOTE",
+            "reply_to present, event_type=None, message_type=NOTE → question_answer / OPERATOR_FYI",
+        ),
+        (
+            {"reply_to": "m1", "event_type": "question_answer"},
+            OPERATOR_FYI,
+            "question_answer",
+            "NOTE",
+            "reply_to + explicit question_answer, message_type=NOTE preserved",
+        ),
+        (
+            {},
+            STRATEGIST_INTERNAL,
+            "strategic_message",
+            "NOTE",
+            "no reply_to, no event_type, message_type=NOTE → strategic_message / STRATEGIST_INTERNAL",
+        ),
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            "FEEDBACK",
+            "reply_to present, event_type=None, message_type=FEEDBACK → still question_answer / OPERATOR_FYI",
+        ),
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            None,
+            "reply_to present, event_type=None, message_type=None → still question_answer / OPERATOR_FYI",
+        ),
+    ]
+
+    for ctx_dict, expected_audience, expected_event_type, msg_type_str, scenario in test_cases:
+        _event_type = ctx_dict.get("event_type")
+        _default_event_type = (
+            "question_answer"
+            if _event_type is None and ctx_dict.get("reply_to") is not None
+            else "strategic_message"
+        )
+        result = stamp_message_audience(
+            dict(ctx_dict),
+            _event_type or _default_event_type,
+            message_type=msg_type_str,
+        )
+        assert result["audience"] == expected_audience, (
+            f"audience mismatch — {scenario}: "
+            f"expected={expected_audience}, got={result['audience']}"
+        )
+        assert result["event_type"] == expected_event_type, (
+            f"event_type mismatch — {scenario}: "
+            f"expected={expected_event_type}, got={result['event_type']}"
+        )
+
+    # Non-regression: BUG_REPORT/BLOCKER message_type upgrades a fallback
+    # STRATEGIST_INTERNAL event_type but must NOT override the registered
+    # question_answer audience.
+    result = stamp_message_audience(
+        {"reply_to": "m1"},
+        "question_answer",
+        message_type="BUG_REPORT",
+    )
+    assert result["audience"] == OPERATOR_FYI, (
+        "BUG_REPORT message_type must NOT override registered question_answer → OPERATOR_FYI"
+    )
+    result = stamp_message_audience(
+        {},
+        "strategic_message",
+        message_type="BUG_REPORT",
+    )
+    assert result["audience"] == OPERATOR_ACTION_NEEDED, (
+        "BUG_REPORT message_type must upgrade strategist-internal → OPERATOR_ACTION_NEEDED "
+        "when event_type is strategic_message (fallback-only)"
+    )
+
+
 # ── post_event_message audience gating (via notification_dispatch) ──────
 
 
@@ -1748,17 +1843,39 @@ def test_alert_scan_mixed_gated_and_ungated():
 # ── Structural guard: every Alert event_type must be registered ──────────
 
 
+def _resolve_module_constant(
+    tree: ast.Module, name: str
+) -> str | None:
+    """Resolve a module-level ``ast.Name`` reference to its string literal value.
+
+    Searches the module body for ``NAME = "string"`` assignments and returns the
+    string value when the name is a simple constant string, or ``None`` when the
+    name cannot be resolved (non-constant value, not found, or the only match is
+    a non-string constant).
+    """
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id == name:
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    return node.value.value
+    return None
+
+
 def _collect_alert_constructors_with_unregistered_event_type(
     source: str, *, filename: str, rel: str, registered: frozenset[str]
 ) -> list[str]:
     """Return offender strings for Alert(...) calls whose event_type= value is
     either not present in the audience registry or not statically verifiable.
 
-    Handles three patterns:
+    Handles four patterns:
     - ``ast.Constant`` literals: checked directly against the registry.
     - ``ast.IfExp`` (ternary): all string literal leaves are extracted and each
       is verified against the registry.  A non-literal leaf that appears outside
       ``create_project_alert_if_allowed`` is flagged as non-verifiable.
+    - ``ast.Name`` (module-level constant reference): resolved via
+      :func:`_resolve_module_constant`; the resolved string is checked against
+      the registry.
     - All other non-literals: flagged as non-verifiable unless the enclosing
       function is ``create_project_alert_if_allowed``, which validates the value
       at runtime via ``should_emit_project_alert``.
@@ -1826,6 +1943,30 @@ def _collect_alert_constructors_with_unregistered_event_type(
                             f"  {rel}:{node.lineno} — Alert(event_type=<non-verifiable ternary>) "
                             "contains a non-literal branch that cannot be verified at scan time; "
                             "use only literal string values or route through "
+                            "create_project_alert_if_allowed"
+                        )
+            elif isinstance(val, ast.Name):
+                # Module-level constant reference — try to resolve to a string
+                # literal and check against the registry.  When the reference
+                # cannot be resolved (non-string value, not found) the generic
+                # non-literal rules apply below.
+                resolved = _resolve_module_constant(tree, val.id)
+                if isinstance(resolved, str):
+                    if resolved not in registered:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type={resolved!r} "
+                            f"[resolved from {val.id}]) is not registered in "
+                            "_EVENT_AUDIENCE_REGISTRY; "
+                            "add it to backend/app/message_audience.py with its intended audience"
+                        )
+                else:
+                    # Unresolvable Name — safe only inside the gate function.
+                    enclosing = _enclosing_func_name(node.lineno)
+                    if enclosing != _ALERT_GATE_CALL:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type=<non-literal: {val.id}>) "
+                            "uses a module-level name that cannot be resolved to a string "
+                            "constant at scan time; use a literal string value or route through "
                             "create_project_alert_if_allowed"
                         )
             else:
@@ -1915,6 +2056,135 @@ def test_alert_scan_flags_dynamic_call_event_type_outside_gate():
     assert len(offenders) == 1
     assert "non-literal" in offenders[0]
     assert "create_project_alert_if_allowed" in offenders[0]
+
+
+def test_alert_scan_resolves_name_to_registered_constant():
+    """An Alert whose event_type is an ast.Name referencing a registered module-
+    level constant passes (no offender)."""
+    source = dedent(
+        """
+        _MY_EVENT_TYPE = "direction_milestone"
+
+        def emit_alert(session, project_id):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=_MY_EVENT_TYPE,
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "_MY_EVENT_TYPE resolves to 'direction_milestone' which IS registered — "
+        "expected no offenders, got: " + "\n".join(offenders)
+    )
+
+
+def test_alert_scan_resolves_name_to_unregistered_constant():
+    """An Alert whose event_type is an ast.Name referencing an unregistered
+    module-level constant is flagged."""
+    source = dedent(
+        """
+        _UNREGISTERED_EVENT = "my.brand.new.event"
+
+        def emit_alert(session, project_id):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=_UNREGISTERED_EVENT,
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "my.brand.new.event" in offenders[0]
+    assert "_UNREGISTERED_EVENT" in offenders[0] or "resolved from" in offenders[0]
+
+
+def test_alert_scan_flags_irresolvable_name_outside_gate():
+    """An Alert whose event_type is an ast.Name that does NOT resolve to a
+    module-level string constant is flagged as non-verifiable when outside
+    create_project_alert_if_allowed."""
+    source = dedent(
+        """
+        def emit_alert(session, project_id, event_type_var):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=event_type_var,
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "event_type_var" in offenders[0]
+    assert "create_project_alert_if_allowed" in offenders[0]
+
+
+def test_alert_scan_accepts_irresolvable_name_inside_gate():
+    """An Alert whose event_type is an irresolvable ast.Name inside
+    create_project_alert_if_allowed is exempted (runtime validation)."""
+    source = dedent(
+        """
+        async def create_project_alert_if_allowed(session, *, project_id, event_type, decision):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=decision.event_type,
+            )
+            session.add(alert)
+            return alert
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "Inside create_project_alert_if_allowed, unresolvable names must be exempted; "
+        "got: " + "\n".join(offenders)
+    )
+
+
+def test_alert_scan_resolve_module_constant_picks_first_assignment():
+    """_resolve_module_constant returns the first module-level string assignment
+    matching the target name."""
+    source = dedent(
+        """
+        _MY_TYPE = "pr_merged"
+        # Duplicate (shouldn't happen in practice) — first wins.
+        _MY_TYPE = "registration.beta"
+
+        def emit(session, pid):
+            alert = Alert(project_id=pid, severity="WARNING", message="m",
+                          event_type=_MY_TYPE)
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert not offenders, (
+        "'pr_merged' (first assignment) IS registered — expected no offenders, "
+        "got: " + "\n".join(offenders)
+    )
 
 
 def test_alert_scan_exempts_attribute_event_type_inside_gate_function():
