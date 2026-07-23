@@ -122,6 +122,10 @@ def scan_file(filepath: Path) -> dict:
         if cfg["pattern"] is None:
             continue
         for lineno, line in enumerate(lines, 1):
+            stripped = line.strip()
+            # Skip comment lines to avoid false positives on documentation comments.
+            if stripped.startswith("//") or stripped.startswith("*") or stripped.startswith("/*"):
+                continue
             matches = re.findall(cfg["pattern"], line)
             if matches:
                 findings.append({

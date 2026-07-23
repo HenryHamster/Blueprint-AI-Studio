@@ -429,13 +429,17 @@ vi.mock('../utils/time.js', async (importOriginal) => {
   return { ...actual };
 });
 
-vi.mock('../utils/design-doc-presence.js', () => ({
-  ...Object.fromEntries(DESIGN_DOC_PRESENCE_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  reconcileDesignDocPresence: (doc: unknown) => doc,
-  // Identity stub: the handler now reconciles the compact index. Return it
-  // unchanged so the overview-rendering assertions see the payload's index.
-  reconcileDesignDocIndex: (index: unknown) => index,
-}));
+vi.mock('../utils/design-doc-presence.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/design-doc-presence.js')>();
+  return {
+    ...actual,
+    ...Object.fromEntries(DESIGN_DOC_PRESENCE_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+    reconcileDesignDocPresence: (doc: unknown) => doc,
+    // Identity stub: the handler now reconciles the compact index. Return it
+    // unchanged so the overview-rendering assertions see the payload's index.
+    reconcileDesignDocIndex: (index: unknown) => index,
+  };
+});
 
 vi.mock('./research-direction-context.js', () => ({
   ...Object.fromEntries(RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES.map((name) => [name, vi.fn()])),

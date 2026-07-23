@@ -1938,12 +1938,6 @@
       "portfolioOperationFingerprint",
       "writeFetchHelper"
     ],
-    "../utils/design-doc-presence.js": [
-      "extractEntryPaths",
-      "reconcileEntry",
-      "reconcileMissingCapabilities",
-      "reconcileSystemEntry"
-    ],
     "./research-plan.js": [
       "aggregateDirectionStats",
       "buildCapabilityVerificationSection",
