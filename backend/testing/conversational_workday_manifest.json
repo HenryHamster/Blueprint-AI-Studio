@@ -195,7 +195,9 @@
         "test_handoff_does_not_treat_user_child_as_answer_evidence",
         "test_handoff_rejects_task_bearing_reply_without_explicit_task_match",
         "test_resident_reaper_uses_own_heartbeat_window",
-        "test_heartbeat_handled_ids_only_affect_own_session"
+        "test_heartbeat_handled_ids_only_affect_own_session",
+        "test_stop_handoff_is_atomic_with_session_end",
+        "test_unattended_cap_handoff_is_atomic_with_cap_end"
       ]
     },
     {

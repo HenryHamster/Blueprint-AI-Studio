@@ -12165,6 +12165,7 @@ def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
 _API_URL_RE = re.compile(r'["\'](/api/[a-z][^"\'\s?#{]*)["\']')
 
 _TEST_FUNC_DEF_RE = re.compile(r"^(?:async )?def (test_\w+)", re.MULTILINE)
+_CLASS_DEF_RE = re.compile(r"^class (Test\w+)", re.MULTILINE)
 
 def _validate_route_contract_registry(
     testing_dir: Path,
@@ -13284,11 +13285,11 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 840): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 4795): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 4796): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 4843): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 4844): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 6174): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 6175): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1088): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
@@ -13539,4 +13540,89 @@ def test_no_callers_pass_raise_on_size_limit_false():
         "add the call site to the allowlist in this test with a reviewed "
         "rationale.\n\n"
         + "\n".join(offenders)
+    )
+
+
+def _collect_companion_test_duplicates(testing_dir: Path) -> list[str]:
+    """Return duplicate test-ID descriptions for companion-file pairs.
+
+    A companion file follows the pattern ``test_<prefix>__<suffix>.py`` and is
+    paired with the base file ``test_<prefix>.py``.  This function reports any
+    ``test_*`` function or ``Test*`` class that appears at module level in both
+    the base file and a companion — the "split-monolith-without-delete"
+    pathology that previously caused every test to run twice.
+    """
+    all_test_files = sorted(testing_dir.glob("test_*.py"))
+    errors: list[str] = []
+
+    # Build a mapping from base prefix (e.g. "admin_routers") to base Path + companion Paths.
+    base_to_companions: dict[str, dict[str, Path]] = {}
+    for f in all_test_files:
+        stem = f.stem  # e.g. test_admin_routers or test_admin_routers__messages
+        if "__" in stem:
+            # Companion: test_<prefix>__<suffix> → prefix = <prefix>
+            base_prefix = stem.split("__", 1)[0][5:]  # strip "test_" prefix
+            if base_prefix not in base_to_companions:
+                base_to_companions[base_prefix] = {"companions": [], "base": None}
+            base_to_companions[base_prefix]["companions"].append(f)
+        else:
+            # Base: test_<prefix> → prefix = <prefix>
+            base_prefix = stem[5:]  # strip "test_" prefix
+            if base_prefix not in base_to_companions:
+                base_to_companions[base_prefix] = {"companions": [], "base": None}
+            base_to_companions[base_prefix]["base"] = f
+
+    for prefix, group in base_to_companions.items():
+        base_path = group["base"]
+        companions = group["companions"]
+        if not companions or base_path is None:
+            continue
+
+        base_content = base_path.read_text(encoding="utf-8")
+        base_funcs = set(_TEST_FUNC_DEF_RE.findall(base_content))
+        base_classes = set(_CLASS_DEF_RE.findall(base_content))
+
+        base_name = base_path.name
+        for comp_path in companions:
+            comp_content = comp_path.read_text(encoding="utf-8")
+            comp_funcs = set(_TEST_FUNC_DEF_RE.findall(comp_content))
+            comp_classes = set(_CLASS_DEF_RE.findall(comp_content))
+
+            dup_funcs = base_funcs & comp_funcs
+            dup_classes = base_classes & comp_classes
+
+            comp_name = comp_path.name
+            if dup_funcs:
+                errors.append(
+                    f"{comp_name} shares test function(s) with {base_name}: "
+                    + ", ".join(sorted(dup_funcs))
+                )
+            if dup_classes:
+                errors.append(
+                    f"{comp_name} shares test class(es) with {base_name}: "
+                    + ", ".join(sorted(dup_classes))
+                )
+
+    return errors
+
+
+def test_no_duplicate_test_ids_across_backend_modules() -> None:
+    """Every companion test file uses test IDs (function/class names) not present
+    in its base file.
+
+    A companion file (``test_<prefix>__<suffix>.py``) that shadows a ``test_*``
+    function or ``Test*`` class from its base file (``test_<prefix>.py``) causes
+    the fixture to run twice — once from each file.  This is the
+    "split-monolith-without-delete" pathology that created the release_qualifier
+    'trio' failures.
+
+    The guard is a tripwire: a new collision fails CI immediately rather than
+    causing silent double-execution.
+    """
+    errors = _collect_companion_test_duplicates(BACKEND_ROOT / "testing")
+    assert not errors, (
+        "Companion files share test IDs with their base file:\n"
+        + "\n".join(errors)
+        + "\n\nRemove the duplicate from the base or the companion — both files "
+        "must not define the same test function or class name."
     )
