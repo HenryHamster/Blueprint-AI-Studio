@@ -1338,3 +1338,123 @@ class TestApiKeyCompletionHeadersPopulateUsageMeter:
             "runtime_secret": None,
         }
         assert _account_meter_eligible(acct) is False
+
+
+# ── Executed end-to-end: API_KEY headers → meter → auto-arm loop ──────────────
+
+
+@pytest.mark.asyncio
+class TestApiKeyMeterExecutesAutoArmLoop:
+    """End-to-end test: live-completion rate-limit headers flow through the
+    usage meter and trigger the auto-arm gate decision.
+
+    Named test: test_api_key_meter_executes_auto_arm_loop
+
+    Does NOT mock get_meter_reliability_stats. Feeds synthetic rate-limit
+    headers from a mocked messages.create response through _refresh_usage_snapshot
+    (the API_KEY probe path), asserts the pool account gains a known snapshot
+    with correct values, then runs the real reliability-stats + reconciler
+    pipeline and confirms the gate arms after the observation window elapses.
+    """
+
+    async def test_api_key_meter_executes_auto_arm_loop(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        import app.max_plan_pool as mpp
+        import app.shared_state as shared_state
+
+        # Config: 1-minute observation window so the test can advance time cheaply.
+        _set_config(monkeypatch, usage_headroom_auto_arm_observation_minutes=1)
+
+        # Single API_KEY pool account with a runtime_secret.
+        acct: dict = {
+            "id": "aaa-111",
+            "provider": "anthropic",
+            "auth_mode": "api_key",
+            "enabled": True,
+            "runtime_secret": "sk-ant-key-1",
+            "oauth_token": None,
+        }
+        monkeypatch.setattr(mpp, "_account_by_id", {"aaa-111": acct})
+        monkeypatch.setattr(mpp, "_usage_persist_failing_accounts", set())
+
+        # Synthetic rate-limit response that simulates a live-completion header payload.
+        # Both remaining_tokens and limit_tokens present so utilization is computable.
+        rate_limit_data = {
+            "source": "messages_api_header",
+            "updated_at": "2026-07-22T10:00:00+00:00",
+            "unified_5h": {
+                "remaining_tokens": 80_000,
+                "limit_tokens": 100_000,
+                "status": "live",
+                "resets_at": "2026-07-22T15:00:00Z",
+                "utilization": 20.0,
+            },
+        }
+
+        async def fake_call_direct_llm(api_key, *, messages, max_tokens, timeout, **kw):
+            assert api_key == "sk-ant-key-1"
+            assert max_tokens == 1
+            return ("1", rate_limit_data)
+
+        monkeypatch.setattr(
+            "app.direct_llm_client.call_direct_llm", fake_call_direct_llm
+        )
+
+        # Bypass DB writes so the test is standalone (no Postgres needed).
+        async def _noop_persist(acct_id, snapshot):
+            pass
+
+        monkeypatch.setattr(mpp, "_persist_rate_limit_usage_to_db", _noop_persist)
+
+        async def _no_persisted_blobs():
+            return {}
+
+        monkeypatch.setattr(mpp, "_load_persisted_usage_blobs", _no_persisted_blobs)
+
+        # DeploymentState mock for reconcile_usage_headroom_arming writes.
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        # ── Step 1: feed rate-limit headers through _refresh_usage_snapshot ──
+        await mpp._refresh_usage_snapshot("aaa-111")
+
+        snap = acct.get("usage_snapshot")
+        assert snap is not None, "probe must populate usage_snapshot"
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 20.0
+        assert snap.resets_at.get("five_hour") == "2026-07-22T15:00:00Z"
+        # raw_rate_limit_blob carries provider-reported remaining/limit counts.
+        assert snap.raw_rate_limit_blob is not None
+        assert snap.raw_rate_limit_blob["unified_5h"]["remaining_tokens"] == 80_000
+        assert snap.raw_rate_limit_blob["unified_5h"]["limit_tokens"] == 100_000
+
+        # Use the actual snapshot timestamp as the reference clock so freshness
+        # checks are deterministic (snapshot_at < now+2min < stale threshold 900s).
+        now = acct["usage_snapshot_at"]
+
+        # ── Step 2: get_meter_reliability_stats (REAL) → armable ─────────────
+        stats = await mpp.get_meter_reliability_stats(now=now)
+        assert stats["armable"] is True, f"expected armable; got {stats}"
+        assert stats["meters_known"] == 1
+        assert stats["meters_eligible"] == 1
+        assert stats["coverage_ratio"] == 1.0
+
+        # ── Step 3: reconcile (REAL) → waiting (window not yet elapsed) ──────
+        res = await reconcile_usage_headroom_arming(now=now)
+        assert res["action"] == "waiting"
+        assert res["gate_enabled"] is False
+        # armable_since is persisted on first observation so the window survives
+        # leader restarts (4d310c8/#16242).
+        assert commits == [{"usage_headroom_armable_since": now.isoformat()}]
+
+        # ── Step 4: 2 minutes later → window elapsed, snapshot still fresh ───
+        # (2 min = 120s < _USAGE_METER_DISPLAY_STALE_SECONDS 900s, so known=1)
+        res = await reconcile_usage_headroom_arming(now=now + timedelta(minutes=2))
+        assert res["action"] == "armed"
+        assert res["gate_enabled"] is True
+        assert commits == [
+            {"usage_headroom_armable_since": now.isoformat()},
+            {"usage_headroom_armable_since": now.isoformat(), "usage_headroom_gate_enabled": True},
+        ]
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is True

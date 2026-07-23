@@ -2996,7 +2996,14 @@ async def _persist_rate_limit_usage_to_db(
     """
     if not snapshot.known:
         return
-    usage_dict = snapshot.to_dict()
+    # When the probe carried a raw messages_api_header blob (API_KEY probe path),
+    # persist it directly so remaining_tokens and limit_tokens survive the round-
+    # trip. The blob's updated_at is overwritten with the actual write time.
+    raw = getattr(snapshot, "raw_rate_limit_blob", None)
+    if isinstance(raw, dict) and raw.get("source") == "messages_api_header":
+        usage_dict = dict(raw)
+    else:
+        usage_dict = snapshot.to_dict()
     usage_dict["updated_at"] = _utcnow().isoformat()
     from app.models import MaxPlanAccount
 

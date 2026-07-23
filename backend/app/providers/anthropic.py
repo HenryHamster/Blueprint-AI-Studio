@@ -55,6 +55,7 @@ def _snapshot_from_rate_limit_data(
         window_utilizations={"five_hour": float(util)},
         resets_at=resets,
         probed_at=probed_at,
+        raw_rate_limit_blob=rate_limit_data,
     )
 
 

@@ -112,6 +112,13 @@ class UsageSnapshot:
     window_utilizations: Mapping[str, float] = field(default_factory=dict)
     resets_at: Mapping[str, str | None] = field(default_factory=dict)
     probed_at: str | None = None
+    # Raw provider blob (messages_api_header format) carried through the probe
+    # pipeline so the persist layer can store full remaining/limit counts, not
+    # just the derived utilization percentage. Not serialized by to_dict(), not
+    # considered in equality, hash, or repr — purely a pipeline transport slot.
+    raw_rate_limit_blob: dict | None = field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
     @classmethod
     def unknown(cls, probed_at: str | None = None) -> UsageSnapshot:
