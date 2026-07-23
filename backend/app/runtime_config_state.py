@@ -2533,6 +2533,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "promotion_enabled",
                         bool(config_json["promotion_enabled"]),
                     )
+                if "env_preflight_enabled" in config_json:
+                    _set(
+                        "env_preflight_enabled",
+                        bool(config_json["env_preflight_enabled"]),
+                    )
                 if "smoketest_enabled" in config_json:
                     _set(
                         "smoketest_enabled",

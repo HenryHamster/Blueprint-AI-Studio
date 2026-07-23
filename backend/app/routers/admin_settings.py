@@ -188,6 +188,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_audit_defer_escalation_threshold",
         "residual_remediation_cooldown_hours",
         "rollup_merge_queue_enabled",
+        "env_preflight_enabled",
         "smoketest_enabled",
         "walkthrough_e2e_enabled_by_project",
         "spend_approval_timeout_hours",
@@ -803,6 +804,7 @@ async def get_settings(
                 _runtime_config.get("promotion_enabled_by_project") or {}
             ).items()
         },
+        "env_preflight_enabled": bool(_runtime_config.get("env_preflight_enabled", True)),
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
         "walkthrough_e2e_enabled_by_project": {
             str(k): bool(v)
@@ -1492,6 +1494,8 @@ async def _apply_settings(
         _runtime_config["ci_backstop_timeout_minutes"] = val
     if "promotion_enabled" in payload:
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
+    if "env_preflight_enabled" in payload:
+        _runtime_config["env_preflight_enabled"] = bool(payload["env_preflight_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
     if "walkthrough_e2e_enabled_by_project" in payload:
@@ -3760,6 +3764,13 @@ async def _apply_settings(
                     },
                     "smoketest_enabled": bool(
                         _runtime_config.get("smoketest_enabled", False)
+                    ),
+                    # Persist the env-preflight dimension kill-switch so an operator
+                    # toggle survives a Cloud Run restart (config-sync reads this
+                    # key back on boot; without it the in-memory value reverts to
+                    # the _RUNTIME_CONFIG_DEFAULTS default — True).
+                    "env_preflight_enabled": bool(
+                        _runtime_config.get("env_preflight_enabled", True)
                     ),
                     # Persist the no-CI verify_tests merge-gate kill-switch so an
                     # operator toggle survives a Cloud Run restart (config-sync

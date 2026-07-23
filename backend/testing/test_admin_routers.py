@@ -5090,6 +5090,65 @@ class TestNotificationConfigSettings:
         await client.patch("/api/admin/settings", json={"promotion_enabled": False})
 
     @pytest.mark.asyncio
+    async def test_env_preflight_enabled_round_trip_and_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """env_preflight_enabled is settable via PATCH /api/admin/settings,
+        visible on GET, persists into DeploymentState.runtime_config_json,
+        and lands in the in-memory runtime_config — so an operator can disable
+        the env_preflight dimension via the admin API to break a promotion
+        deadlock without requiring a redeploy.
+
+        Regression: the env_preflight_enabled was previously excluded from the
+        runtime_config_json persist dict in _apply_settings, which meant an
+        operator toggle survived only in-memory and was lost on any Cloud Run
+        restart (reverting to the True default and re-creating the deadlock).
+        This test guards the four wiring points (GET, PATCH apply, persist
+        dict, config-sync restore key) to ensure the toggle is durable.
+        """
+        from app.models import DeploymentState
+        from app.shared_state import runtime_config as _rc
+
+        original = _rc.get("env_preflight_enabled", True)
+        db_session.add(DeploymentState())
+        await db_session.commit()
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"env_preflight_enabled": False},
+            )
+            assert resp.status_code == 200, resp.text
+
+            # Round-trips on GET.
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["env_preflight_enabled"] is False
+
+            # Lands in the in-memory runtime_config the orchestrator reads.
+            assert _rc.get("env_preflight_enabled") is False
+
+            # Persists into the JSONB column so it survives a restart /
+            # config-sync restore (not just one in-memory instance).
+            row = await db_session.get(DeploymentState, 1)
+            assert row is not None
+            assert row.runtime_config_json is not None
+            assert row.runtime_config_json["env_preflight_enabled"] is False
+
+            # Re-enabling round-trips the other way too.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"env_preflight_enabled": True},
+            )
+            assert resp.status_code == 200, resp.text
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["env_preflight_enabled"] is True
+        finally:
+            # Restore the default so the flag does not leak to other tests.
+            await client.patch(
+                "/api/admin/settings",
+                json={"env_preflight_enabled": bool(original)},
+            )
+
+    @pytest.mark.asyncio
     async def test_no_ci_test_gate_enabled_round_trip_and_persist(
         self, client: AsyncClient, db_session
     ):
