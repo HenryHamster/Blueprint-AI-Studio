@@ -182,6 +182,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "release.qualification_crash_loop": AlertEventPolicy(
         "release.qualification_crash_loop", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
+    "release.walkthrough_key_unmatched": AlertEventPolicy(
+        "release.walkthrough_key_unmatched", domain=CORE_ALERT_DOMAIN
+    ),
     "sr.catch_rate_below_target": AlertEventPolicy(
         "sr.catch_rate_below_target", domain=DOMAIN_SR_QUALITY
     ),

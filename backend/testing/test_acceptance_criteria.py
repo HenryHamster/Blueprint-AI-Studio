@@ -32,6 +32,7 @@ from app import acceptance_criteria as ac
 from app.operator_attention import build_operator_attention
 from app.time_utils import _utcnow
 from app.models import (
+    Alert,
     CriterionEvidence,
     Direction,
     Project,
@@ -11267,6 +11268,200 @@ async def test_record_executed_named_test_evidence_blank_sha_records_nothing(db_
     )
     assert n == 0
     assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+# ---------------------------------------------------------------------------
+# Alert on unmatched walkthrough criterion keys
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_alerts_on_unmatched_key(db_session):
+    """A passing walkthrough result under a key that no active criterion has
+    creates exactly one operator-visible Alert row while still returning the key
+    in summary['unmatched_keys']."""
+    project = await _make_project_with_member(db_session, name="Walk-Unmatched-Alert")
+    sha = "a" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    real_crit = await ac.create_criterion(db_session, project.id, version.id, "Real criterion")
+    phantom_key = "c-deadbeef"  # never registered as a criterion
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": real_crit.criterion_key, "passed": True, "notes": "green"},
+            {"criterion_key": phantom_key, "passed": True, "notes": "phantom"},
+        ],
+        qualification_attempt_id="attempt-alert-1",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == [phantom_key]
+
+    # An operator-visible Alert row must have been created for the dropped key.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 alert, got {len(alerts)}: {alerts}"
+    alert = alerts[0]
+    assert alert.event_type == "release.walkthrough_key_unmatched"
+    assert phantom_key in alert.message
+    assert alert.dedupe_key is not None
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_alerts_on_unmatched_key(db_session):
+    """record_operator_walkthrough_evidence creates an Alert when a passing result's
+    key resolves to no active criterion, while still returning the key in unmatched_keys."""
+    project = await _make_project_with_member(db_session, name="OpWalk-Unmatched-Alert")
+    sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    real_crit = await ac.create_criterion(db_session, project.id, version.id, "Op real criterion")
+    phantom_key = "c-workday-session-lifecycle"  # the canonical phantom key from the bug
+
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": real_crit.criterion_key, "passed": True, "notes": "ok"},
+            {"criterion_key": phantom_key, "passed": True, "notes": "phantom"},
+        ],
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == [phantom_key]
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 alert, got {len(alerts)}: {alerts}"
+    alert = alerts[0]
+    assert alert.event_type == "release.walkthrough_key_unmatched"
+    assert phantom_key in alert.message
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_no_alert_when_all_keys_match(db_session):
+    """When every passing key resolves to an active criterion, no Alert is created."""
+    project = await _make_project_with_member(db_session, name="Walk-AllMatch-NoAlert")
+    sha = "c" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "All-match criterion")
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": crit.criterion_key, "passed": True},
+        ],
+        qualification_attempt_id="attempt-no-alert",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == []
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts, got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_unmatched_alert_is_deduped(db_session):
+    """Calling the function twice with the same unmatched key coalesces into one Alert row."""
+    project = await _make_project_with_member(db_session, name="Walk-Dedup-Alert")
+    sha = "d" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    phantom_key = "c-phantom-dedup"
+    results = [{"criterion_key": phantom_key, "passed": True, "notes": "ghost"}]
+
+    await ac.record_walkthrough_e2e_evidence(
+        db_session, version, candidate_sha=sha, results=results, qualification_attempt_id="attempt-dedup-1"
+    )
+    await ac.record_walkthrough_e2e_evidence(
+        db_session, version, candidate_sha=sha, results=results, qualification_attempt_id="attempt-dedup-2"
+    )
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 deduped alert, got {len(alerts)}"
+    assert alerts[0].occurrence_count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_fail_open_on_alert_error(db_session):
+    """If alert creation fails, the function still returns the normal summary and does not raise."""
+    from unittest.mock import patch, AsyncMock
+
+    project = await _make_project_with_member(db_session, name="Walk-FailOpen")
+    sha = "e" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    phantom_key = "c-fail-open-test"
+    results = [{"criterion_key": phantom_key, "passed": True}]
+
+    with patch(
+        "app.alert_policy.create_project_alert_if_allowed",
+        new=AsyncMock(side_effect=RuntimeError("simulated alert failure")),
+    ):
+        summary = await ac.record_walkthrough_e2e_evidence(
+            db_session, version, candidate_sha=sha, results=results
+        )
+
+    assert summary["status"] == "recorded"
+    assert summary["unmatched_keys"] == [phantom_key]
+    assert summary["recorded"] == 0
 
 
 # ---------------------------------------------------------------------------

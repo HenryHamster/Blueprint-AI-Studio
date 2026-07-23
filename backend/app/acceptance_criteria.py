@@ -2974,15 +2974,55 @@ async def record_walkthrough_e2e_evidence(
                 getattr(version, "id", None),
             )
 
-    logger.info(
-        "record_walkthrough_e2e_evidence: version=%s candidate_sha=%s recorded=%d "
-        "skipped_not_passed=%d unmatched=%s",
-        getattr(version, "id", None),
-        posted_sha[:12],
-        recorded,
-        skipped_not_passed,
-        unmatched_keys,
-    )
+    if unmatched_keys:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: version=%s candidate_sha=%s recorded=%d "
+            "skipped_not_passed=%d unmatched=%s — passing keys dropped, no evidence written",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
+        try:
+            from app.alert_policy import create_project_alert_if_allowed
+            from app.models import AlertSeverity
+
+            sorted_keys = sorted(unmatched_keys)
+            dedupe_key = f"walkthrough_key_unmatched:{project_id}:{release_version_id}:{','.join(sorted_keys)}"
+            title = "Walkthrough evidence dropped: unrecognised criterion key(s)"
+            message = (
+                f"record_walkthrough_e2e_evidence posted passing results for "
+                f"{len(unmatched_keys)} key(s) that resolve to no active criterion "
+                f"on version {release_version_id} (sha {posted_sha[:12]}): "
+                f"{sorted_keys}. Evidence was NOT recorded."
+            )
+            await create_project_alert_if_allowed(
+                session,
+                project_id=project_id,
+                event_type="release.walkthrough_key_unmatched",
+                severity=AlertSeverity.WARNING,
+                title=title,
+                message=message,
+                dedupe_key=dedupe_key,
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "record_walkthrough_e2e_evidence: failed to create unmatched-key alert "
+                "for version %s — continuing",
+                getattr(version, "id", None),
+            )
+    else:
+        logger.info(
+            "record_walkthrough_e2e_evidence: version=%s candidate_sha=%s recorded=%d "
+            "skipped_not_passed=%d unmatched=%s",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
     return {
         "status": "recorded",
         "rejected_reason": None,
@@ -3123,15 +3163,55 @@ async def record_operator_walkthrough_evidence(
                 getattr(version, "id", None),
             )
 
-    logger.info(
-        "record_operator_walkthrough_evidence: version=%s candidate_sha=%s "
-        "recorded=%d skipped_not_passed=%d unmatched=%s",
-        getattr(version, "id", None),
-        posted_sha[:12],
-        recorded,
-        skipped_not_passed,
-        unmatched_keys,
-    )
+    if unmatched_keys:
+        logger.warning(
+            "record_operator_walkthrough_evidence: version=%s candidate_sha=%s "
+            "recorded=%d skipped_not_passed=%d unmatched=%s — passing keys dropped, no evidence written",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
+        try:
+            from app.alert_policy import create_project_alert_if_allowed
+            from app.models import AlertSeverity
+
+            sorted_keys = sorted(unmatched_keys)
+            dedupe_key = f"walkthrough_key_unmatched:{project_id}:{release_version_id}:{','.join(sorted_keys)}"
+            title = "Operator walkthrough evidence dropped: unrecognised criterion key(s)"
+            message = (
+                f"record_operator_walkthrough_evidence posted passing results for "
+                f"{len(unmatched_keys)} key(s) that resolve to no active criterion "
+                f"on version {release_version_id} (sha {posted_sha[:12]}): "
+                f"{sorted_keys}. Evidence was NOT recorded."
+            )
+            await create_project_alert_if_allowed(
+                session,
+                project_id=project_id,
+                event_type="release.walkthrough_key_unmatched",
+                severity=AlertSeverity.WARNING,
+                title=title,
+                message=message,
+                dedupe_key=dedupe_key,
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "record_operator_walkthrough_evidence: failed to create unmatched-key alert "
+                "for version %s — continuing",
+                getattr(version, "id", None),
+            )
+    else:
+        logger.info(
+            "record_operator_walkthrough_evidence: version=%s candidate_sha=%s "
+            "recorded=%d skipped_not_passed=%d unmatched=%s",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
     return {
         "status": "recorded",
         "rejected_reason": None,

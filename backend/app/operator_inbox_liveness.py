@@ -660,6 +660,7 @@ async def run_operator_inbox_liveness_check(
         OPERATOR_FYI,
         _NON_OPERATOR_AUDIENCES,
         operator_visible_alert_filter,
+        operator_visible_audience_filter,
         operator_visible_message_audience_filter,
     )
     from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action

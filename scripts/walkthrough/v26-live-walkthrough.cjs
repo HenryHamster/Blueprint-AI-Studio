@@ -1599,6 +1599,18 @@ async function writeJsonResult(startTs, projectId) {
       const body = resp.body || {};
       console.log(`\n[EVIDENCE] Operator walkthrough evidence POSTed → ${endpoint}`);
       console.log(`  recorded=${body.recorded} skipped=${body.skipped_not_passed} unmatched=${JSON.stringify(body.unmatched_keys || [])}`);
+      const unmatchedKeys = body.unmatched_keys || [];
+      if (unmatchedKeys.length > 0) {
+        console.error(`\n[ERROR] PASSING walkthrough results were DROPPED — criterion key(s) not registered:`);
+        console.error(`  unmatched_keys=${JSON.stringify(unmatchedKeys)}`);
+        console.error(`  These keys do not resolve to any active criterion. Evidence was NOT recorded.`);
+        console.error(`  Fix: ensure the walkthrough posts criterion_keys that match active VersionAcceptanceCriterion rows.`);
+        step('Evidence key mismatch — passing results dropped', 'FAIL', [
+          `${unmatchedKeys.length} passing result(s) posted under unrecognised criterion key(s): ${JSON.stringify(unmatchedKeys)}`,
+          'Evidence was NOT recorded for these keys.',
+          'Fix the criterion_key in the walkthrough script or register the key as an active criterion.',
+        ]);
+      }
     } else {
       console.warn(`\n[WARN] Operator walkthrough evidence POST returned ${resp.status}: ${JSON.stringify(resp.body)}`);
     }
