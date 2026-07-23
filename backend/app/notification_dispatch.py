@@ -1131,6 +1131,41 @@ async def post_operator_decision_capture_low_message(
     )
 
 
+async def post_operator_decision_summary_absent_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    last_summary_at: str,
+    session_id: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Strategist-internal notice that operator_decision_summary stopped arriving.
+
+    Fired by the strategic-session heartbeat when heartbeats keep arriving but the
+    operator_decision_summary telemetry blob has stopped refreshing for longer than
+    the staleness window, despite the session having enough historical data to judge
+    it. Routes strategist-internal so the strategist can investigate without
+    creating operator-visible noise. The caller de-dupes so it fires at most once
+    per absent crossing; recovery (agent resumes sending) clears the dedup flag.
+    """
+    summary = (
+        f"operator_decision_summary absent this session: heartbeats are arriving "
+        f"but the telemetry blob stopped refreshing (last received: {last_summary_at}). "
+        f"Check the agent's decision-capture bookkeeping path."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="operator_decision.summary_absent",
+        summary=summary,
+        context={
+            "session_id": session_id,
+            "last_summary_at": last_summary_at,
+        },
+        task_id=task_id,
+    )
+
+
 async def post_direction_milestone_message(
     session: AsyncSession,
     project_id: uuid.UUID,

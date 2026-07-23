@@ -41,8 +41,11 @@ from app.session_message_handoff import (
 )
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
+    OPERATOR_DECISION_ABSENT_NOTIFIED_KEY,
+    OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
     RESIDENT_SESSION_KEY,
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
+    _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
     new_session_id,
     read_resident_session,
     renew_resident_session_lease,
@@ -1360,4 +1363,383 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
     )
     assert other_session_msg.status == "open", (
         "Message from a different session must NOT be marked handled"
+    )
+
+
+# ---------------------------------------------------------------------------
+# operator_decision_summary absence/staleness gap tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_absent_decision_summary_fires_alert_after_stale_window(
+    db_session, monkeypatch
+):
+    """A heartbeat with operator_decision_summary=None fires a strategist-internal
+    absence notice when the prior summary timestamp is older than
+    _OPERATOR_DECISION_SUMMARY_STALE_SECONDS and total >= OPERATOR_DECISION_CAPTURE_MIN_SAMPLE.
+    """
+    monkeypatch.setattr(
+        "app.strategic_trigger.maybe_arm_operator_refresh",
+        AsyncMock(return_value="steering"),
+    )
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # First heartbeat: report a valid summary with enough sample count so the
+    # staleness detector has prior data to reference.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=True,
+        operator_decision_summary={
+            "total": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "captured": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "missed": 0,
+            "capture_rate": 100,
+        },
+    )
+
+    # Artificially age the _operator_decision_summary_at so it looks stale.
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["_operator_decision_summary_at"] = (
+        _utcnow() - timedelta(seconds=_OPERATOR_DECISION_SUMMARY_STALE_SECONDS + 60)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Second heartbeat: agent stops sending the summary (None). Should fire notice.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        operator_decision_summary=None,
+    )
+
+    # Verify the dedup flag was set.
+    project = await db_session.get(Project, project.id)
+    blob = read_resident_session(project.vision)
+    assert blob.get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY) is True, (
+        "Absence dedup flag must be set after notice fires"
+    )
+
+    # Verify a strategist-internal notice message was posted.
+    from sqlmodel import select as _sel
+    msgs = (
+        await db_session.execute(
+            _sel(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.context["event_type"].as_string()
+                == "operator_decision.summary_absent",
+            )
+        )
+    ).scalars().all()
+    assert len(msgs) == 1, (
+        "Exactly one absence notice must be posted on the first stale absent heartbeat"
+    )
+    assert "stopped refreshing" in msgs[0].content
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_absent_decision_summary_no_alert_before_stale_window(
+    db_session, monkeypatch
+):
+    """No absence notice fires when the prior summary timestamp is within the
+    staleness window (recent gap, not a sustained absence).
+    """
+    monkeypatch.setattr(
+        "app.strategic_trigger.maybe_arm_operator_refresh",
+        AsyncMock(return_value="steering"),
+    )
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # First heartbeat with a valid summary.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=True,
+        operator_decision_summary={
+            "total": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "captured": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "missed": 0,
+            "capture_rate": 100,
+        },
+    )
+
+    # Leave the _operator_decision_summary_at fresh (just now) and send None.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        operator_decision_summary=None,
+    )
+
+    project = await db_session.get(Project, project.id)
+    blob = read_resident_session(project.vision)
+    assert not blob.get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY), (
+        "Absence dedup flag must NOT be set when gap is within the stale window"
+    )
+
+    from sqlmodel import select as _sel
+    count = (
+        await db_session.execute(
+            _sel(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.context["event_type"].as_string()
+                == "operator_decision.summary_absent",
+            )
+        )
+    ).scalars().all()
+    assert count == [], "No absence notice must fire within the staleness window"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_absent_decision_summary_no_alert_below_min_sample(
+    db_session, monkeypatch
+):
+    """No absence notice fires when the prior summary's total is below
+    OPERATOR_DECISION_CAPTURE_MIN_SAMPLE (session too new to judge).
+    """
+    monkeypatch.setattr(
+        "app.strategic_trigger.maybe_arm_operator_refresh",
+        AsyncMock(return_value="steering"),
+    )
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # First heartbeat: summary with total below the minimum sample threshold.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=True,
+        operator_decision_summary={
+            "total": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE - 1,
+            "captured": 0,
+            "missed": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE - 1,
+            "capture_rate": 0,
+        },
+    )
+
+    # Age the timestamp past the stale window.
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["_operator_decision_summary_at"] = (
+        _utcnow() - timedelta(seconds=_OPERATOR_DECISION_SUMMARY_STALE_SECONDS + 60)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        operator_decision_summary=None,
+    )
+
+    project = await db_session.get(Project, project.id)
+    blob = read_resident_session(project.vision)
+    assert not blob.get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY), (
+        "Absence dedup flag must NOT be set when prior total < OPERATOR_DECISION_CAPTURE_MIN_SAMPLE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_absent_decision_summary_dedup_second_heartbeat(
+    db_session, monkeypatch
+):
+    """A second absent heartbeat after the dedup flag is set must NOT re-emit the
+    notice.
+    """
+    monkeypatch.setattr(
+        "app.strategic_trigger.maybe_arm_operator_refresh",
+        AsyncMock(return_value="steering"),
+    )
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Seed a stale summary.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=True,
+        operator_decision_summary={
+            "total": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "captured": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "missed": 0,
+            "capture_rate": 100,
+        },
+    )
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["_operator_decision_summary_at"] = (
+        _utcnow() - timedelta(seconds=_OPERATOR_DECISION_SUMMARY_STALE_SECONDS + 60)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # First absent heartbeat — notice fires.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        operator_decision_summary=None,
+    )
+
+    # Second absent heartbeat — dedup flag already set, no second notice.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        operator_decision_summary=None,
+    )
+
+    from sqlmodel import select as _sel
+    msgs = (
+        await db_session.execute(
+            _sel(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.context["event_type"].as_string()
+                == "operator_decision.summary_absent",
+            )
+        )
+    ).scalars().all()
+    assert len(msgs) == 1, (
+        "Absence notice must fire exactly once even across multiple absent heartbeats"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_absent_decision_summary_recovery_clears_dedup(
+    db_session, monkeypatch
+):
+    """When the agent resumes sending a valid operator_decision_summary, the
+    absence dedup flag is cleared so a future absence episode can re-fire.
+    """
+    monkeypatch.setattr(
+        "app.strategic_trigger.maybe_arm_operator_refresh",
+        AsyncMock(return_value="steering"),
+    )
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Seed a stale summary and trigger the absence notice.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=True,
+        operator_decision_summary={
+            "total": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "captured": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
+            "missed": 0,
+            "capture_rate": 100,
+        },
+    )
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["_operator_decision_summary_at"] = (
+        _utcnow() - timedelta(seconds=_OPERATOR_DECISION_SUMMARY_STALE_SECONDS + 60)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        operator_decision_summary=None,
+    )
+    project = await db_session.get(Project, project.id)
+    assert read_resident_session(project.vision).get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY) is True
+
+    # Recovery heartbeat: agent sends a valid summary → dedup flag cleared.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        operator_decision_summary={
+            "total": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE + 1,
+            "captured": OPERATOR_DECISION_CAPTURE_MIN_SAMPLE + 1,
+            "missed": 0,
+            "capture_rate": 100,
+        },
+    )
+
+    project = await db_session.get(Project, project.id)
+    blob = read_resident_session(project.vision)
+    assert blob.get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY) is False, (
+        "Absence dedup flag must be cleared when agent resumes sending a valid summary"
     )

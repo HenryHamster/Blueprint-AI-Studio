@@ -8,6 +8,19 @@
       "audience": "strategist-internal"
     },
     {
+      "name": "operator_decision.summary_absent",
+      "classification": "routine",
+      "message_type": "NOTE",
+      "source_fn": "post_operator_decision_summary_absent_message",
+      "audience": "strategist-internal"
+    },
+    {
+      "name": "notification.dead_letter_lost",
+      "classification": "routine",
+      "source_fn": "_write_dead_letter",
+      "audience": "operator-action-needed"
+    },
+    {
       "name": "pr_merged",
       "classification": "routine",
       "message_type": "NOTE",

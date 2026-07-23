@@ -254,6 +254,15 @@ OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT = 60
 # low-capture crossing.
 OPERATOR_DECISION_LOW_CAPTURE_NOTIFIED_KEY = "_operator_decision_low_capture_notified"
 
+# Seconds without a refreshed operator_decision_summary before an absence/staleness
+# notice fires. At the ~30s heartbeat cadence this is ≥10 consecutive absent
+# heartbeats — enough to distinguish a silent agent from a transient gap.
+_OPERATOR_DECISION_SUMMARY_STALE_SECONDS = 300  # 5 min
+
+# Dedup flag persisted on the session blob so the absence notice fires at most once
+# per absent crossing; a recovery (agent resumes sending a valid summary) clears it.
+OPERATOR_DECISION_ABSENT_NOTIFIED_KEY = "_operator_decision_absent_notified"
+
 
 def _operator_decision_capture_chronically_low(summary: Any) -> bool:
     """True when the operator-decision capture rate is chronically low.
@@ -3208,6 +3217,10 @@ async def renew_resident_session_lease(
         # decision capture and no prior notice was posted; drives the single
         # strategist-internal emit after the lease commits.
         "emit_low_capture_notice": False,
+        # Set in-lock when operator_decision_summary has been absent for longer
+        # than _OPERATOR_DECISION_SUMMARY_STALE_SECONDS; drives a distinct
+        # strategist-internal notice after the lease commits.
+        "emit_absent_notice": False,
     }
 
     def _end_session(vision: dict[str, Any], current: dict[str, Any]) -> None:
@@ -3355,6 +3368,9 @@ async def renew_resident_session_lease(
         # visibility into capture rate across a full session.
         if isinstance(operator_decision_summary, dict):
             updated["_operator_decision_summary"] = operator_decision_summary
+            # Stamp the time of the most recent valid summary so absence
+            # detection can measure elapsed time on future heartbeats.
+            updated["_operator_decision_summary_at"] = now_iso
             # Enforce: cross into a strategist-internal notice when the capture
             # rate is chronically low. De-dupe on a persisted flag so the notice
             # fires at most once per low-capture crossing; a genuine recovery
@@ -3373,6 +3389,30 @@ async def renew_resident_session_lease(
                 and already_notified
             ):
                 updated[OPERATOR_DECISION_LOW_CAPTURE_NOTIFIED_KEY] = False
+            # Recovery from absence: agent resumed sending — clear dedup flag.
+            if bool(fresh.get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY)):
+                updated[OPERATOR_DECISION_ABSENT_NOTIFIED_KEY] = False
+        else:
+            # operator_decision_summary is None — check if the telemetry blob
+            # has stopped refreshing long enough to warrant an absence notice.
+            prior_summary = fresh.get("_operator_decision_summary")
+            last_summary_at = _parse_iso_naive(
+                fresh.get("_operator_decision_summary_at")
+            )
+            already_absent_notified = bool(
+                fresh.get(OPERATOR_DECISION_ABSENT_NOTIFIED_KEY)
+            )
+            if (
+                not already_absent_notified
+                and isinstance(prior_summary, dict)
+                and last_summary_at is not None
+                and (now - last_summary_at).total_seconds()
+                > _OPERATOR_DECISION_SUMMARY_STALE_SECONDS
+                and isinstance(prior_summary.get("total"), int)
+                and prior_summary["total"] >= OPERATOR_DECISION_CAPTURE_MIN_SAMPLE
+            ):
+                updated[OPERATOR_DECISION_ABSENT_NOTIFIED_KEY] = True
+                holder["emit_absent_notice"] = True
         # Persist compaction metadata reported by the agent. These are
         # opaque agent-reported values — the backend never derives them.
         if isinstance(compaction_count, int) and compaction_count > 0:
@@ -3516,6 +3556,36 @@ async def renew_resident_session_lease(
         except Exception:
             logger.warning(
                 "[RESIDENT_SESSION] operator-decision low-capture notice failed for session %s — ignored",
+                session_id,
+                exc_info=True,
+            )
+    # Emit the strategist-internal absence notice decided in-lock. Posts the ledger
+    # row into THIS transaction so it commits atomically with the dedup flag; failure
+    # is non-fatal (the flag is already set so the notice simply won't repeat).
+    if holder["emit_absent_notice"]:
+        try:
+            from app.notification_dispatch import (
+                post_operator_decision_summary_absent_message,
+            )
+
+            _refreshed_blob = read_resident_session(project.vision) or {}
+            _last_summary_at = str(
+                _refreshed_blob.get("_operator_decision_summary_at") or ""
+            )
+            try:
+                _absent_task_id: uuid.UUID | None = uuid.UUID(str(task_id))
+            except (ValueError, TypeError):
+                _absent_task_id = None
+            await post_operator_decision_summary_absent_message(
+                session,
+                project.id,
+                last_summary_at=_last_summary_at,
+                session_id=session_id,
+                task_id=_absent_task_id,
+            )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] operator-decision absent notice failed for session %s — ignored",
                 session_id,
                 exc_info=True,
             )

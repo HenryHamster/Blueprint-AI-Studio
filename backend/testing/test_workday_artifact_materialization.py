@@ -887,3 +887,91 @@ async def test_required_images_progress_oldest_first_across_poll_batches(
         str(first.id),
         str(second.id),
     ]
+
+
+@pytest.mark.asyncio
+async def test_single_message_exceeding_image_budget_is_quarantined_not_starved(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """A message with >8 whiteboard refs raises PermanentWorkdayArtifactError
+    (not WorkdayArtifactBatchLimit), gets quarantined, and does not block
+    delivery of neighboring messages."""
+    project = await _project(db_session)
+    task = await _task(db_session, project)
+
+    # 9 whiteboard refs on a single message — exceeds _WORKDAY_MAX_REQUIRED_IMAGES=8
+    refs = [
+        (await _whiteboard_ref(db_session, project, revision=r))[0]
+        for r in range(1, 10)
+    ]
+    before = await _message(
+        db_session,
+        project,
+        {"artifact_refs": [{"artifact_ref_id": str(refs[0].id)}]},
+    )
+    overloaded = await _message(
+        db_session,
+        project,
+        {
+            "artifact_refs": [
+                {"artifact_ref_id": str(ref.id)} for ref in refs
+            ]
+        },
+    )
+    after = await _message(
+        db_session,
+        project,
+        {"artifact_refs": [{"artifact_ref_id": str(refs[0].id)}]},
+    )
+
+    monkeypatch.setattr(
+        "app.storage.artifact_object_matches_receipt",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.storage.generate_download_signed_url",
+        AsyncMock(
+            return_value=(
+                "https://storage.googleapis.com/bucket/board.png"
+                "?X-Goog-Signature=sig"
+            )
+        ),
+    )
+
+    first_poll = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        headers=_headers(task),
+    )
+    # Overloaded message is permanently quarantined; poll retries so agent is not starved
+    assert first_poll.status_code == 503
+    assert first_poll.headers["Retry-After"] == "1"
+
+    await db_session.refresh(overloaded)
+    assert overloaded.status == "resolved"
+    assert overloaded.handling_state == MessageHandlingState.SUPERSEDED
+    assert (
+        "required image attachment limit exceeded"
+        in overloaded.context["artifact_handoff_failure"]["reason"]
+    )
+
+    notice = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.idempotency_key
+                == f"artifact-handoff-failed:{overloaded.id}"
+            )
+        )
+    ).scalar_one()
+    assert notice.reply_to_message_id == overloaded.id
+    assert notice.context["audience"] == "operator-action-needed"
+
+    # On retry, before and after messages are delivered without the overloaded one
+    retry = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        headers=_headers(task),
+    )
+    assert retry.status_code == 200
+    delivered_ids = [item["id"] for item in retry.json()["messages"]]
+    assert str(overloaded.id) not in delivered_ids
+    assert str(before.id) in delivered_ids
+    assert str(after.id) in delivered_ids

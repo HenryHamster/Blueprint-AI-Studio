@@ -106,12 +106,6 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # _deletions directive (merged non-destructively). The operator should
     # investigate recent problem_model writes → operator-action-needed.
     "problem_model.wipe_risk": OPERATOR_ACTION_NEEDED,
-    # alert_dispatch._raise_live_core_over_budget_alert: the problem model's live
-    # core (active gaps, capabilities, friction) alone exceeds the byte budget,
-    # making byte eviction futile — this is the precondition for the rev-1367
-    # agent-view truncation/wipe cycle.  Operator-fyi so the condition is visible
-    # without requiring immediate action (the strategic agent acts on budget).
-    "problem_model.live_core_over_budget": OPERATOR_FYI,
     # Directly-authored operator escalations (previously unregistered → landed
     # with a NULL audience that both read filters fail OPEN on).  Registering
     # them with their intended, operator-facing audience makes the audience gate
@@ -346,6 +340,11 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # strategist acts on it (re-emit the marker) but it must NEVER reach the
     # operator chat or the alert channel.
     "operator_decision.capture_rate_low": STRATEGIST_INTERNAL,
+    # operator_decision.summary_absent: the resident agent's heartbeats stopped
+    # carrying operator_decision_summary for longer than the staleness window
+    # despite the session having enough historical data to judge it. Strategist-
+    # internal so the strategist can investigate without creating operator noise.
+    "operator_decision.summary_absent": STRATEGIST_INTERNAL,
     # operator_inbox_leak_persistent: durable persistent-leak escalation from the
     # operator-inbox liveness audit.  Strategist-internal so a persistent
     # forward-leak / alert-noise signal reaches the strategist surface without
