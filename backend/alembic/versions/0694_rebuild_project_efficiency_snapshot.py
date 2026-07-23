@@ -511,7 +511,9 @@ def downgrade() -> None:
         positions = {}
         for index, snapshot in enumerate(snapshots):
             if isinstance(snapshot, Mapping):
-                positions[_utc_datetime(snapshot.get("captured_at")) or source_at] = index
+                positions[
+                    _utc_datetime(snapshot.get("captured_at")) or source_at
+                ] = index
         for row in project_rows:
             captured_at = _utc_datetime(row["captured_at"])
             assert captured_at is not None

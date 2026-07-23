@@ -1581,8 +1581,9 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     still succeed as long as the AGENT-OWNED content stays under the ceiling.
 
     Steps:
-    1. Seed design_doc with reserved keys (efficiency_baseline, lane_baselines,
-       etc.) whose SERIALIZED SIZE alone exceeds DESIGN_DOC_MAX_BYTES.
+    1. Seed design_doc with non-migrated reserved keys whose SERIALIZED SIZE
+       alone exceeds DESIGN_DOC_MAX_BYTES, plus generic telemetry keys that
+       have migrated to project_telemetry.
     2. Write a small agent-owned key — must succeed (reserved blobs excluded
        from the size check).
     3. Write an agent-owned key that would push agent-owned content over the
@@ -1590,14 +1591,16 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     """
     import json as _json
 
-    # Build large reserved blobs: a single 600KB string under a reserved key.
-    # Use cochange_index and playbook_archive — both remain in _RESERVED_DESIGN_DOC_KEYS
-    # after the 0656 migration moved efficiency/lane/sr telemetry to separate tables.
+    # Build large blobs under truly non-migrated reserved keys. Generic
+    # telemetry keys are included separately to verify that the dedicated-store
+    # cutover strips their legacy design_doc copies before persistence.
     huge_blob = "z" * 600_000
     project = Project(name="reserved-ceiling-regression", user_id="user")
     project.design_doc = {
-        "cochange_index": huge_blob,
-        "playbook_archive": huge_blob,
+        "repo_overview": huge_blob,
+        "review_effectiveness": huge_blob,
+        "cochange_index": {"legacy": True},
+        "playbook_archive": {"legacy": True},
     }
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
 
@@ -1625,9 +1628,12 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     assert project.design_doc.get("agent_key") == "small_value", (
         "agent-owned write must be persisted"
     )
-    # Reserved blobs must be preserved (mutate_fn only added a new key).
-    assert project.design_doc.get("cochange_index") == huge_blob
-    assert project.design_doc.get("playbook_archive") == huge_blob
+    # Non-migrated reserved blobs remain; migrated generic telemetry is now
+    # authoritative in project_telemetry and must not be persisted here.
+    assert project.design_doc.get("repo_overview") == huge_blob
+    assert project.design_doc.get("review_effectiveness") == huge_blob
+    assert "cochange_index" not in project.design_doc
+    assert "playbook_archive" not in project.design_doc
 
     # Step 3: grow agent-owned content over the ceiling — must be rejected.
     def _grow_agent_over_ceiling(doc: dict) -> None:

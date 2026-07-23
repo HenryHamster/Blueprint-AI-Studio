@@ -494,6 +494,8 @@ Findings covered here (18-finding release-qualification salvage bundle, task 8d2
 
 from __future__ import annotations
 
+import pytest
+
 
 # --------------------------------------------------------------------------- #
 # Findings #3 and #12 — infra-failure signature does NOT use child failures

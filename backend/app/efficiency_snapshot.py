@@ -82,7 +82,6 @@ from app.project_telemetry import (
     read_recent_efficiency_snapshots,
 )
 from app.task_capabilities import is_pr_eligible_task_type
-from app.task_locking import project_lock
 from app.vm_cost_rates import idle_cost_usd
 
 router = APIRouter()

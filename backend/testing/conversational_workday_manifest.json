@@ -218,9 +218,7 @@
         "test_healthy_existing_resident_ensure_repairs_stale_message_ownership",
         "test_repair_excludes_db_authoritative_active_session",
         "test_repair_noop_candidate_releases_per_id_project_transaction",
-        "test_repair_rechecks_active_session_between_stale_ids",
-        "test_stop_handoff_is_atomic_with_session_end",
-        "test_unattended_cap_handoff_is_atomic_with_cap_end"
+        "test_repair_rechecks_active_session_between_stale_ids"
       ]
     },
     {

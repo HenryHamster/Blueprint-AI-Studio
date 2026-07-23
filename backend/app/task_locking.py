@@ -44,6 +44,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import resolve_dialect_name
 from app.models import DeploymentState, Project, Task
+from app.sr_analytics_store import LEGACY_SR_ANALYTICS_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +84,10 @@ class DesignDocSizeLimitExceeded(Exception):
 # admin_agent_ops.py (which imports from here). Keep in sync with the set/delete
 # guard in that module so the two never diverge.
 #
-# Keys that have been migrated to dedicated tables (ProjectSRAnalytics,
-# ProjectEfficiencySnapshot, ProjectLaneBaseline) are NOT listed here — they
-# no longer live in design_doc and therefore neither need nor may keep the
-# write-cap exemption. The ProjectSRAnalytics-resident set includes:
-# sr_reviewer_disagreements, sr_catch_rate_trends_alert/floor_alert/quadrant_alert/
-# pass_engagement_alert, sr_blind_spot_signal_last_computed_at,
-# fix_loop_divergence_*, and viewport_coverage_snapshot.
+# Specialized stores are authoritative for efficiency, lane, and SR analytics,
+# but their legacy design_doc values remain as per-key/rollback fallbacks during
+# the rolling cutover. Those retained code-owned values stay exempt from the
+# agent-write cap until the fallbacks are intentionally removed.
 _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
     {
         # Originally reserved
@@ -110,7 +108,11 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
+        # Retained specialized-store fallbacks.
+        "efficiency_baseline",
+        "lane_baselines",
     }
+    | LEGACY_SR_ANALYTICS_KEYS
 )
 
 

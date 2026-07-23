@@ -587,7 +587,6 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for name in _LLM_CLI_NAMES:
         path = _which(name)
-        executable_found = path is not None
         if path is None:
             result[name] = _unavailable_llm_cli("not_found")
             continue
