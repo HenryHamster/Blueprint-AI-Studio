@@ -429,6 +429,18 @@ async def _redrive_infra_failure_qualification(
             if _dim_streak is not None
             else int(qual.get("consecutive_infra_errors") or 0)
         )
+        # Unconditional deadlock backstop for legacy-smoke lineage.
+        # _legacy_smoke_infra_lineage zeroes effective_streak (via _dim_streak=0
+        # above), so consecutive_infra_errors never accumulates and the cap below
+        # never fires for smoke-lineage failures.  When retry_episode has reached
+        # the declared cap, forcibly override effective_streak so the existing
+        # Alert + halt path fires and the operator is notified.  Guard on
+        # _episode_cap > 0 so versions with no declared cap are not affected.
+        if _legacy_smoke_failure:
+            _episode = int(qual.get("retry_episode") or 0)
+            _episode_cap = int(qual.get("retry_episode_cap") or 0)
+            if _episode_cap > 0 and _episode >= _episode_cap:
+                effective_streak = _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
         if effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
             # Raise an operator Alert (once) so the cap is visible.  Guard
             # against duplicate alerts with a flag on last_qualification.

@@ -5254,6 +5254,110 @@ async def test_calcification_alert_refires_on_blocker_change(db_session):
 
 
 @pytest.mark.asyncio
+async def test_legacy_smoke_deadlock_escalates_when_episode_at_cap(db_session):
+    """Legacy-smoke infra_failure with retry_episode >= retry_episode_cap fires
+    an operator Alert and halts re-drive — the unconditional deadlock backstop.
+
+    This is the acceptance evidence for the fix: the deployed v26 qualifier
+    burned 64 attempts / retry_episode=8 (cap=3) with
+    smoketest_task_failed_claude_code_failed errors but no operator escalation,
+    because _legacy_smoke_infra_lineage zeroes consecutive_infra_errors and the
+    streak cap never fires.  The backstop adds an episode-based override for the
+    smoke lineage so a stuck qualifier does alert.
+    """
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.release_qualifier_redrive import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Set up infra_failure with legacy-smoke lineage: infra_failure_signature
+    # starts with "smoketest" so _legacy_smoke_infra_lineage returns True,
+    # zeroing the streak.  retry_episode=3 at cap=3 → deadlock backstop fires.
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "smoke123" * 5,
+        "infra_failure_signature": "smoketest_task_failed_claude_code_failed",
+        "error": "smoketest_task_failed_claude_code_failed",
+        "retry_episode": 3,
+        "retry_episode_cap": 3,
+        "consecutive_infra_errors": 0,  # zeroed by legacy-smoke path
+    }
+    _flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False, (
+        "legacy-smoke infra_failure at episode cap must NOT re-drive — "
+        "deadlock backstop must halt it"
+    )
+
+    # An operator Alert must have been raised.
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) >= 1, "deadlock backstop must raise an operator Alert"
+    assert any("infra-failure" in a.title.lower() for a in alerts), (
+        f"Alert title must mention infra-failure; got: {[a.title for a in alerts]}"
+    )
+
+    # infra_failure_loop_escalated flag must be set to prevent duplicate alerts.
+    await db_session.refresh(version)
+    assert version.last_qualification.get("infra_failure_loop_escalated") is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_smoke_redrive_allowed_when_episode_below_cap(db_session, mocker):
+    """Legacy-smoke infra_failure with retry_episode < retry_episode_cap still
+    re-drives normally — deadlock backstop only fires at/above cap.
+    """
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.release_qualifier_redrive import _redrive_infra_failure_qualification
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "smoke456" * 5,
+        "infra_failure_signature": "smoketest_task_failed_claude_code_failed",
+        "error": "smoketest_task_failed_claude_code_failed",
+        "retry_episode": 2,  # below cap=3 — backstop must not fire
+        "retry_episode_cap": 3,
+        "consecutive_infra_errors": 0,
+    }
+    _flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is True, (
+        "legacy-smoke infra_failure below episode cap must still re-drive"
+    )
+    mock_run_qual.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_calcification_not_fired_below_attempt_threshold(db_session):
     """Fewer than _MIN_CALCIFICATION_ATTEMPTS hard-blocker failures do not
     trigger an alert — the stall may still be transient."""
