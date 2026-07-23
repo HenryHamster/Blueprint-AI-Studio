@@ -70,6 +70,7 @@ from app.reaper import (
 )
 from app.reaper_orphan_classify import (
     _RUNNER_REPORT_CLAIM_GRACE_SECONDS,
+    _classify_resident_session,
     _runner_report_excludes_task,
 )
 from app.retry_prompt import _build_retry_prompt_suffix
@@ -7556,6 +7557,29 @@ def test_classify_orphan_resident_session_exempt_from_progress_staleness():
     )
     # Fresh heartbeat → resident session is live, must NOT be reaped.
     assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_resident_session_warm_idle_not_reaped():
+    """Direct positive test: _classify_resident_session is exempt from
+    progress-staleness reaping.
+
+    A warm-idle resident session has a fresh heartbeat but a stale
+    last_tool_use_at (no tool calls for much longer than the 1500s
+    thinking-heavy budget).  _classify_resident_session must return False
+    (NOT reaped) because being idle between operator turns is normal for a
+    Workday session.  The function must never consult last_tool_use_at —
+    only last_heartbeat vs the resident heartbeat window matters."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),   # fresh
+        last_tool_use_at=now - timedelta(minutes=60), # far past 1500s budget
+        started_at=now - timedelta(hours=3),
+        context={"_resident_session": True},
+        first_payload={"type": "strategic_review"},
+    )
+    # Warm-idle: fresh heartbeat overrides stale tool-use → must NOT be reaped.
+    assert _classify_resident_session(t, now, None) is False
 
 
 def test_classify_orphan_step1_and_step2_predicate_agree():

@@ -174,7 +174,8 @@
       "test_ids": [
         "test_start_adopts_task_and_liveness_heartbeat_preserves_lease",
         "test_stop_ends_task_releases_continuation_and_hands_off_messages",
-        "test_handoff_releases_unanswered_and_resolves_answered"
+        "test_handoff_releases_unanswered_and_resolves_answered",
+        "test_heartbeat_handled_ids_only_affect_own_session"
       ]
     },
     {

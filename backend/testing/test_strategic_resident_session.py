@@ -862,3 +862,90 @@ def test_resident_reaper_uses_own_heartbeat_window():
             runtime_config.pop("resident_session_heartbeat_stale_seconds", None)
         else:
             runtime_config["resident_session_heartbeat_stale_seconds"] = previous
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeypatch):
+    """handled_message_ids in renew_resident_session_lease must ONLY mark messages
+    as 'handled' when their resident_session_id matches the active session.
+
+    Legacy / cadence messages (resident_session_id IS NULL) and messages pinned
+    to a different session must remain untouched even when their IDs appear in
+    handled_message_ids.  This is the invariant enforced at
+    strategic_resident_session.py::L3425 (WHERE resident_session_id == session_id).
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+
+    monkeypatch.setattr(
+        "app.strategic_trigger.maybe_arm_operator_refresh",
+        AsyncMock(return_value="steering"),
+    )
+
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    session_id = started["session_id"]
+
+    # Own-session message: must be marked handled.
+    own_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="This operator turn belongs to the active session.",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        resident_session_id=session_id,
+    )
+    # NULL-session (legacy/cadence): must NOT be touched.
+    null_session_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Standing project message (BUG_REPORT style) — no session.",
+        status="open",
+        resident_session_id=None,
+    )
+    # Different session: must NOT be touched.
+    other_session_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="From an earlier or parallel session.",
+        status="open",
+        resident_session_id="ss-other-entirely",
+    )
+    db_session.add_all([own_msg, null_session_msg, other_session_msg])
+    await db_session.commit()
+    for m in (own_msg, null_session_msg, other_session_msg):
+        await db_session.refresh(m)
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=session_id,
+        task_id=started["task_id"],
+        progress=False,
+        handled_message_ids=[
+            str(own_msg.id),
+            str(null_session_msg.id),
+            str(other_session_msg.id),
+        ],
+    )
+
+    await db_session.refresh(own_msg)
+    await db_session.refresh(null_session_msg)
+    await db_session.refresh(other_session_msg)
+
+    assert own_msg.status == "handled", (
+        "Own-session message must be marked handled by the heartbeat"
+    )
+    assert null_session_msg.status == "open", (
+        "NULL-session (legacy/cadence) message must NOT be marked handled"
+    )
+    assert other_session_msg.status == "open", (
+        "Message from a different session must NOT be marked handled"
+    )
