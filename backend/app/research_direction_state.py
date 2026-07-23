@@ -1143,10 +1143,14 @@ async def apply_post_spawn_state(
 
                 # Pre-read current archive from telemetry so the lock callback
                 # sees the canonical data (migrated keys are stripped from
-                # design_doc at write time by strip_migrated_doc_keys).
+                # design_doc at write time by strip_migrated_doc_keys, so the
+                # telemetry KV row is authoritative and a design_doc fallback can
+                # only ever be empty). Passing project.design_doc here would read
+                # the attribute just expired one line above, forcing a sync
+                # lazy-reload outside the async greenlet on Postgres (MissingGreenlet).
                 _existing_archive = await _get_project_telemetry(
                     session, task.project_id, "retired_diagnoses_archive",
-                    design_doc_fallback=project.design_doc,
+                    design_doc_fallback=None,
                 )
                 _captured_diagnoses_archive: dict = {}
 

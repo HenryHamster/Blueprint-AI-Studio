@@ -6719,6 +6719,15 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
         ),
     )
     mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={}))
+    # The reconciler harvests _auto_remediation via read_telemetry_or_doc; the
+    # minimal _FakeSession below cannot model that select(ProjectTelemetry.value)
+    # query (it returns a ReleaseVersion for every execute()). Stub the harvest
+    # to the same empty-config value a real session yields when the project never
+    # customized auto-remediation, so the test exercises the expire/re-read path.
+    mocker.patch(
+        "app.project_telemetry.read_telemetry_or_doc",
+        new=AsyncMock(return_value={}),
+    )
 
     candidate_sha = "abcd" * 10
     version_id = uuid4()

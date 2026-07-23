@@ -1298,12 +1298,10 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
             f"Backfill key {key!r} not referenced in 0707 migration body"
         )
 
-    # EXPECTED_SCHEMA_REVISION in main.py must have been bumped to at least 0707
-    # when this migration landed. Accept any later revision (a subsequent
-    # migration bumped it past 0707).
+    # EXPECTED_SCHEMA_REVISION in main.py must be bumped to 0707.
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION >= "0707", (
-        f"Expected EXPECTED_SCHEMA_REVISION >= '0707', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0707", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0707', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

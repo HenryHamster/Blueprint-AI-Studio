@@ -49,7 +49,7 @@ from app.runtime_config_state import (
     resolve_project_compute_job_concurrency_cap,
     runtime_config as _runtime_config,
 )
-from app.project_telemetry import read_telemetry_or_doc, set_project_telemetry, strip_migrated_doc_keys
+from app.project_telemetry import read_telemetry_or_doc, set_project_telemetry
 from app.schemas import ResourceEnvelope as ResourceEnvelopeSchema
 from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.playbook_storage import archive_playbook_entry
@@ -336,9 +336,6 @@ async def update_auto_remediation_config(
     )
     stored.update(body)
     design_doc["_auto_remediation"] = stored
-    # Strip migrated telemetry keys before persist — _auto_remediation is now
-    # written exclusively via the project_telemetry table.
-    strip_migrated_doc_keys(design_doc)
     project.design_doc = design_doc
     flag_modified(project, "design_doc")
     session.add(project)

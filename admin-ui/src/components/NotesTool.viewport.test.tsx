@@ -3,6 +3,12 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { registerToolKind } from '../toolRegistry';
 import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+// Preload MarkdownContentInner so the React.lazy import in MarkdownContent
+// (mounted by NotesTool preview mode) resolves immediately from the module
+// cache. Without it the lazy chunk load never settles within the test's wait
+// window and the rendered <strong> never appears. Mirrors the same preload in
+// MessagesPanel.viewport.test.tsx.
+import './MarkdownContentInner';
 
 vi.mock('../api/projectTools', async () => {
   const actual = await vi.importActual<typeof import('../api/projectTools')>('../api/projectTools');
@@ -54,6 +60,9 @@ describe('NotesTool — viewport regression', () => {
   // -----------------------------------------------------------------------
 
   test('renders with sample notes without overflow at 375px', async () => {
+    // Viewport helpers settle layout via requestAnimationFrame (and page.viewport),
+    // which the global fake clock freezes — use real timers for helper-driven tests.
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { text: SAMPLE_TEXT },
       content_revision: 2,
@@ -66,7 +75,7 @@ describe('NotesTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => { await vi.runAllTimersAsync(); });
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('textarea')).toBeTruthy();
@@ -74,6 +83,7 @@ describe('NotesTool — viewport regression', () => {
   });
 
   test('renders with sample notes without overflow at 1280px', async () => {
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { text: SAMPLE_TEXT },
       content_revision: 2,
@@ -87,7 +97,7 @@ describe('NotesTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => { await vi.runAllTimersAsync(); });
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('textarea')).toBeTruthy();
@@ -141,6 +151,10 @@ describe('NotesTool — viewport regression', () => {
   // -----------------------------------------------------------------------
 
   test('edit mode shows a textarea; preview mode renders markdown', async () => {
+    // Preview mode mounts MarkdownContentInner via React.lazy, whose dynamic
+    // import only resolves on a real macrotask — the global fake clock never
+    // settles it. Use real timers for this test.
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { text: '**bold text**' },
       content_revision: 1,
@@ -152,7 +166,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => { await vi.runAllTimersAsync(); });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     if (!host) throw new Error('host not mounted');
 
     // Edit mode by default: textarea present, no rendered markdown <strong>.
@@ -166,7 +180,7 @@ describe('NotesTool — viewport regression', () => {
     expect(previewBtn).not.toBeNull();
     await act(async () => {
       previewBtn!.click();
-      await vi.runAllTimersAsync();
+      await new Promise(resolve => setTimeout(resolve, 100));
     });
     expect(host.querySelector('textarea')).toBeNull();
     const strong = host.querySelector('strong');

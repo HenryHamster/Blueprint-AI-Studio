@@ -658,13 +658,6 @@ async def extract_review_feedback_to_playbook(
     )
     if existing_dfa is not None:
         doc["direction_first_attempt_feedback"] = dict(existing_dfa)
-    # Hydrate playbook_deleted_keys so _is_auto_playbook_suppressed sees
-    # operator-deletion tombstones (strip_migrated_doc_keys strips this key).
-    existing_deleted_keys = await get_project_telemetry(
-        session, task.project_id, "playbook_deleted_keys", design_doc_fallback=doc
-    )
-    if existing_deleted_keys is not None:
-        doc["playbook_deleted_keys"] = list(existing_deleted_keys)
 
     buckets = _categorize_review_issues(review_history)
     related_files: list[str] = list((task.context or {}).get("related_files") or [])
@@ -779,8 +772,13 @@ async def extract_review_feedback_to_playbook(
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "review-playbook"
         doc["_meta"] = meta
-        # Capture archive before strip_migrated_doc_keys removes it from doc.
+        # Capture the migrated telemetry blobs BEFORE strip_migrated_doc_keys
+        # removes them from doc — the set_project_telemetry writes below read
+        # these values, and reading them after the strip persists empty dicts
+        # (silent data loss for downstream telemetry consumers).
         updated_archive = list(doc.get("playbook_archive") or [])
+        module_feedback_blob = dict(doc.get(_MODULE_FEEDBACK_KEY) or {})
+        direction_tally_blob = dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {})
         doc = strip_migrated_doc_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
@@ -798,7 +796,7 @@ async def extract_review_feedback_to_playbook(
                 session,
                 task.project_id,
                 _MODULE_FEEDBACK_KEY,
-                dict(doc.get(_MODULE_FEEDBACK_KEY) or {}),
+                module_feedback_blob,
             )
 
         if direction_tally_updated:
@@ -806,7 +804,7 @@ async def extract_review_feedback_to_playbook(
                 session,
                 task.project_id,
                 _DIRECTION_FIRST_ATTEMPT_KEY,
-                dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {}),
+                direction_tally_blob,
             )
 
         if created_keys:
@@ -1005,11 +1003,6 @@ async def compute_review_effectiveness(
         "persistent_issues": persistent_issues,
     }
     doc["review_effectiveness"] = result
-    # Dual-write to project_telemetry (design_doc copy kept for rollback compat
-    # during the God-column cutover; strip_migrated_doc_keys removes the
-    # design_doc leg before persist).
-    await set_project_telemetry(session, project_id, "review_effectiveness", result)
-    strip_migrated_doc_keys(doc)
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)

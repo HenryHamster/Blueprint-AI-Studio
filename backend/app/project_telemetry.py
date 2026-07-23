@@ -67,19 +67,15 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         "systems/completion-debt-ledger",
         # Generic-KV telemetry blobs migrated in the final God-column tranche.
         # Writers dual-write to both design_doc and this table; readers fall
-        # back to design_doc.  repo_overview: bootstrap repo summary (task_completion).
+        # back to design_doc.  These are NOT in _TELEMETRY_MIGRATED_KEYS because
+        # the design_doc write leg is intentionally KEPT during the rolling
+        # cutover (an older serving engine still reads design_doc); the strip is
+        # a later cleanup.  repo_overview: bootstrap repo summary (task_completion).
         # _broadcast_limit: per-project broadcast cap (admin_project_config).
         # _auto_remediation: per-branch auto-recovery config (auto_remediation).
         "repo_overview",
         "_broadcast_limit",
         "_auto_remediation",
-        # Review effectiveness computed by review_learning.py; migrated during
-        # the final God-column cutover.  Writer dual-writes to this table;
-        # readers prefer the table with design_doc fallback.
-        "review_effectiveness",
-        # Playbook operator-deletion tombstones written by playbook_storage.py.
-        # Migrated during the final God-column cutover.
-        "playbook_deleted_keys",
     }
 )
 
@@ -99,18 +95,6 @@ _TELEMETRY_MIGRATED_KEYS: frozenset[str] = frozenset(
         "proposed_changes",
         "direction_first_attempt_feedback",
         "systems/completion-debt-ledger",
-        # Generic-KV telemetry blobs fully cut over in the final God-column
-        # tranche.  Writers dual-write to both stores; strip_migrated_doc_keys
-        # removes the design_doc leg before persist.  Readers use
-        # read_telemetry_or_doc with design_doc fallback for rollback safety.
-        "repo_overview",
-        "_broadcast_limit",
-        "_auto_remediation",
-        # Review effectiveness and playbook tombstones — migrated during the
-        # final God-column cutover.  Design_doc write leg cut; telemetry is
-        # authoritative with design_doc fallback for pre-migration values.
-        "review_effectiveness",
-        "playbook_deleted_keys",
     }
 )
 
