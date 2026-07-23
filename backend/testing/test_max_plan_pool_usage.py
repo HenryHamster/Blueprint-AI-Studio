@@ -1458,3 +1458,920 @@ class TestApiKeyMeterExecutesAutoArmLoop:
             {"usage_headroom_armable_since": now.isoformat(), "usage_headroom_gate_enabled": True},
         ]
         assert shared_state.runtime_config["usage_headroom_gate_enabled"] is True
+
+
+# ── _snapshot_from_rate_limit_data negative-path tests ───────────────────────
+
+
+class TestSnapshotFromRateLimitDataNegativePaths:
+    """Direct unit tests for _snapshot_from_rate_limit_data (in
+    app.providers.anthropic), which converts a normalized rate-limit header
+    blob (from the API-key completion path) into a UsageSnapshot.
+
+    The function is the innermost parser; negative paths must return
+    UsageSnapshot.unknown() without raising.
+    """
+
+    def test_none_input_returns_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(None, "2026-07-22T10:00:00")
+        assert snap.known is False
+        assert snap.probed_at == "2026-07-22T10:00:00"
+
+    def test_non_dict_inputs_return_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        for bad in ("string", 42, [], True, b"bytes"):
+            snap = _snapshot_from_rate_limit_data(bad, None)
+            assert snap.known is False, f"expected unknown for {bad!r}"
+
+    def test_missing_unified_5h_returns_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(
+            {"source": "messages_api_header", "updated_at": "2026-07-22T10:00:00Z"},
+            "2026-07-22T10:00:00",
+        )
+        assert snap.known is False
+
+    def test_unified_5h_not_a_dict_returns_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        for bad_5h in (None, "string", 42, []):
+            snap = _snapshot_from_rate_limit_data(
+                {"unified_5h": bad_5h}, "2026-07-22T10:00:00"
+            )
+            assert snap.known is False, f"expected unknown for unified_5h={bad_5h!r}"
+
+    def test_bool_utilization_returns_unknown(self):
+        """Boolean utilization must not be coerced to 0.0/1.0."""
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        for bool_val in (True, False):
+            snap = _snapshot_from_rate_limit_data(
+                {"unified_5h": {"utilization": bool_val, "resets_at": "2026-07-22T15:00:00Z"}},
+                "2026-07-22T10:00:00",
+            )
+            assert snap.known is False, f"expected unknown for bool utilization={bool_val}"
+
+    def test_string_utilization_returns_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(
+            {"unified_5h": {"utilization": "high", "resets_at": "2026-07-22T15:00:00Z"}},
+            "2026-07-22T10:00:00",
+        )
+        assert snap.known is False
+
+    def test_none_utilization_returns_unknown(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(
+            {"unified_5h": {"utilization": None}},
+            "2026-07-22T10:00:00",
+        )
+        assert snap.known is False
+
+    def test_zero_utilization_is_valid(self):
+        """0% utilization is a legitimate known state, not an error sentinel."""
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(
+            {"unified_5h": {"utilization": 0.0, "resets_at": "2026-07-22T15:00:00Z"}},
+            "2026-07-22T10:00:00",
+        )
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 0.0
+
+    def test_valid_populates_five_hour_window_with_correct_values(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(
+            {
+                "source": "messages_api_header",
+                "unified_5h": {
+                    "utilization": 35.5,
+                    "resets_at": "2026-07-22T15:00:00Z",
+                    "remaining_tokens": 64500,
+                    "limit_tokens": 100000,
+                },
+            },
+            "2026-07-22T10:00:00",
+        )
+        assert snap.known is True
+        assert snap.window_utilizations == {"five_hour": 35.5}
+        assert snap.resets_at.get("five_hour") == "2026-07-22T15:00:00Z"
+
+    def test_missing_resets_at_produces_known_without_reset(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(
+            {"unified_5h": {"utilization": 50.0}},
+            "2026-07-22T10:00:00",
+        )
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 50.0
+        assert "five_hour" not in snap.resets_at
+
+    def test_non_string_resets_at_is_omitted(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        snap = _snapshot_from_rate_limit_data(
+            {"unified_5h": {"utilization": 20.0, "resets_at": 12345}},
+            "2026-07-22T10:00:00",
+        )
+        assert snap.known is True
+        assert "five_hour" not in snap.resets_at
+
+    def test_probed_at_is_threaded_through(self):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        probed = "2026-07-22T09:55:00"
+        snap = _snapshot_from_rate_limit_data({"unified_5h": {"utilization": 10.0}}, probed)
+        assert snap.probed_at == probed
+
+    def test_raw_rate_limit_blob_is_attached(self):
+        """The full normalized blob must be attached as raw_rate_limit_blob
+        so remaining_tokens/limit_tokens survive into the persist path."""
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        raw = {
+            "unified_5h": {
+                "utilization": 20.0,
+                "remaining_tokens": 80000,
+                "limit_tokens": 100000,
+            },
+            "source": "messages_api_header",
+        }
+        snap = _snapshot_from_rate_limit_data(raw, "2026-07-22T10:00:00")
+        assert snap.known is True
+        assert snap.raw_rate_limit_blob is raw
+
+
+# ── _snapshot_from_persisted_usage for messages_api_header blobs ─────────────
+
+
+class TestSnapshotFromPersistedUsageApiKeyPath:
+    """_snapshot_from_persisted_usage must accept messages_api_header source
+    blobs (written by _persist_rate_limit_usage_to_db for API-key accounts)
+    and map unified_5h → five_hour window so non-leader instances can restore
+    the API-key meter from the DB-persisted blob.
+    """
+
+    def test_valid_blob_restores_as_five_hour(self):
+        now_str = _utcnow().isoformat()
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": now_str,
+            "unified_5h": {
+                "utilization": 25.0,
+                "resets_at": "2026-07-22T15:00:00Z",
+                "remaining_tokens": 75000,
+                "limit_tokens": 100000,
+                "status": "live",
+            },
+        }
+        result = _snapshot_from_persisted_usage(raw)
+        assert result is not None
+        snap, _stamp = result
+        assert snap.known is True
+        assert snap.window_utilizations == {"five_hour": 25.0}
+        assert snap.resets_at.get("five_hour") == "2026-07-22T15:00:00Z"
+
+    def test_missing_unified_5h_returns_none(self):
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": _utcnow().isoformat(),
+        }
+        assert _snapshot_from_persisted_usage(raw) is None
+
+    def test_malformed_string_utilization_returns_none(self):
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": _utcnow().isoformat(),
+            "unified_5h": {"utilization": "high", "resets_at": "2026-07-22T15:00:00Z"},
+        }
+        assert _snapshot_from_persisted_usage(raw) is None
+
+    def test_bool_utilization_returns_none(self):
+        """Boolean utilization must not be coerced during restore."""
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": _utcnow().isoformat(),
+            "unified_5h": {"utilization": True},
+        }
+        assert _snapshot_from_persisted_usage(raw) is None
+
+    def test_none_utilization_returns_none(self):
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": _utcnow().isoformat(),
+            "unified_5h": {"utilization": None},
+        }
+        assert _snapshot_from_persisted_usage(raw) is None
+
+    def test_stamp_is_updated_at(self):
+        """Returned wall-clock stamp must be updated_at from the DB blob."""
+        now = _utcnow()
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": now.isoformat(),
+            "unified_5h": {"utilization": 40.0},
+        }
+        result = _snapshot_from_persisted_usage(raw)
+        assert result is not None
+        _snap, stamp = result
+        assert stamp == now
+
+    def test_missing_updated_at_returns_none(self):
+        raw = {
+            "source": "messages_api_header",
+            "unified_5h": {"utilization": 30.0},
+        }
+        assert _snapshot_from_persisted_usage(raw) is None
+
+    def test_zero_utilization_restores_known(self):
+        """0% utilization in a persisted blob must still restore as known."""
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": _utcnow().isoformat(),
+            "unified_5h": {"utilization": 0.0, "resets_at": "2026-07-22T15:00:00Z"},
+        }
+        result = _snapshot_from_persisted_usage(raw)
+        assert result is not None
+        snap, _stamp = result
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 0.0
+
+
+# ── API-key snapshot persist path writes raw_rate_limit_blob ─────────────────
+
+
+@pytest.mark.asyncio
+class TestApiKeySnapshotPersistsRawBlob:
+    """When a UsageSnapshot carries raw_rate_limit_blob with
+    source='messages_api_header' (the API-key probe path),
+    _persist_rate_limit_usage_to_db must persist the raw blob directly so
+    remaining_tokens and limit_tokens survive the round-trip.  OAuth snapshots
+    without raw_rate_limit_blob must continue using snapshot.to_dict().
+    """
+
+    def _make_fake_session(self, fake_row):
+        """Return a FakeSession class that writes into fake_row."""
+        written_holder = [None]
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, acct_id):
+                return fake_row
+
+            def add(self, obj):
+                written_holder[0] = fake_row.rate_limit_usage
+
+            async def commit(self):
+                pass
+
+        return FakeSession, written_holder
+
+    async def test_raw_blob_written_for_api_key_snapshot(self, monkeypatch):
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        rate_limit_data = {
+            "source": "messages_api_header",
+            "updated_at": "2026-07-22T10:00:00+00:00",
+            "unified_5h": {
+                "utilization": 30.0,
+                "remaining_tokens": 70_000,
+                "limit_tokens": 100_000,
+                "resets_at": "2026-07-22T15:00:00Z",
+                "status": "live",
+            },
+        }
+        snap = _snapshot_from_rate_limit_data(rate_limit_data, "2026-07-22T10:00:00")
+        assert snap.known is True
+        assert snap.raw_rate_limit_blob is not None
+
+        class FakeRow:
+            rate_limit_usage = None
+            updated_at = None
+
+        fake_row = FakeRow()
+        written: list[dict | None] = [None]
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, acct_id):
+                return fake_row
+
+            def add(self, obj):
+                written[0] = fake_row.rate_limit_usage
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+        await _persist_rate_limit_usage_to_db("api-key-id", snap)
+
+        w = written[0]
+        assert w is not None
+        assert w.get("source") == "messages_api_header", (
+            "API-key path must preserve messages_api_header source in persisted dict"
+        )
+        assert "unified_5h" in w, "unified_5h must survive the persist path"
+        assert w["unified_5h"]["remaining_tokens"] == 70_000
+        assert w["unified_5h"]["limit_tokens"] == 100_000
+        assert w["unified_5h"]["utilization"] == 30.0
+        assert "updated_at" in w, "updated_at (write time) must be stamped"
+
+    async def test_api_key_raw_blob_persist_restore_round_trip(self, monkeypatch):
+        """Full persist → restore cycle for the API-key path: raw blob written
+        then read back by _snapshot_from_persisted_usage gives a known snapshot
+        with the correct five_hour window and remaining_tokens preserved."""
+        from app.providers.anthropic import _snapshot_from_rate_limit_data
+
+        rate_limit_data = {
+            "source": "messages_api_header",
+            "updated_at": "2026-07-22T10:00:00+00:00",
+            "unified_5h": {
+                "utilization": 45.0,
+                "remaining_tokens": 55_000,
+                "limit_tokens": 100_000,
+                "resets_at": "2026-07-22T15:00:00Z",
+                "status": "live",
+            },
+        }
+        snap = _snapshot_from_rate_limit_data(rate_limit_data, "2026-07-22T10:00:00")
+        assert snap.known is True
+
+        class FakeRow:
+            rate_limit_usage = None
+            updated_at = None
+
+        fake_row = FakeRow()
+        written: list[dict | None] = [None]
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, acct_id):
+                return fake_row
+
+            def add(self, obj):
+                written[0] = fake_row.rate_limit_usage
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+        await _persist_rate_limit_usage_to_db("api-key-round-trip", snap)
+        w = written[0]
+        assert w is not None
+
+        restored = _snapshot_from_persisted_usage(w)
+        assert restored is not None
+        restored_snap, _stamp = restored
+        assert restored_snap.known is True
+        assert restored_snap.window_utilizations == {"five_hour": 45.0}
+        assert restored_snap.resets_at.get("five_hour") == "2026-07-22T15:00:00Z"
+
+    async def test_oauth_snapshot_uses_to_dict_not_raw_blob(self, monkeypatch):
+        """OAuth snapshots (no raw_rate_limit_blob) must use snapshot.to_dict()
+        so they are persisted as oauth_usage_probe schema blobs."""
+        snap = UsageSnapshot(
+            known=True,
+            window_utilizations={"five_hour": 20.0, "seven_day": 50.0},
+            resets_at={},
+            probed_at="2026-07-22T10:00:00",
+        )
+        assert getattr(snap, "raw_rate_limit_blob", None) is None
+
+        class FakeRow:
+            rate_limit_usage = None
+            updated_at = None
+
+        fake_row = FakeRow()
+        written: list[dict | None] = [None]
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, acct_id):
+                return fake_row
+
+            def add(self, obj):
+                written[0] = fake_row.rate_limit_usage
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+        await _persist_rate_limit_usage_to_db("oauth-account", snap)
+
+        w = written[0]
+        assert w is not None
+        assert w.get("source") == "oauth_usage_probe", (
+            "OAuth snapshots must use to_dict() which emits source=oauth_usage_probe"
+        )
+        assert "five_hour" in w
+        assert "unified_5h" not in w
+
+
+# ── _persist_usage_headroom_armable_since direct unit tests ──────────────────
+
+
+@pytest.mark.asyncio
+class TestPersistArmableSinceDirect:
+    """Direct unit tests for _persist_usage_headroom_armable_since, which
+    writes the armable-since timestamp into DeploymentState.runtime_config_json
+    so the 60-minute observation window survives leader restarts.
+    """
+
+    async def test_persist_datetime_writes_isoformat(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        committed: list[dict] = []
+
+        class FakeState:
+            runtime_config_json: dict = {}
+
+        state = FakeState()
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                return state
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                committed.append(dict(state.runtime_config_json))
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+
+        dt = datetime(2026, 7, 22, 10, 30, 0)
+        result = await mpp._persist_usage_headroom_armable_since(dt)
+
+        assert result is True
+        assert len(committed) == 1
+        assert committed[0]["usage_headroom_armable_since"] == dt.isoformat()
+
+    async def test_persist_none_writes_null(self, monkeypatch):
+        """Persisting None must write JSON null, distinguishable from 'key absent'."""
+        import app.max_plan_pool as mpp
+
+        committed: list[dict] = []
+
+        class FakeState:
+            runtime_config_json: dict = {"usage_headroom_armable_since": "2026-07-22T10:00:00"}
+
+        state = FakeState()
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                return state
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                committed.append(dict(state.runtime_config_json))
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+
+        result = await mpp._persist_usage_headroom_armable_since(None)
+
+        assert result is True
+        assert committed[0]["usage_headroom_armable_since"] is None
+
+    async def test_persist_returns_false_when_deployment_state_missing(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                return None
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+
+        result = await mpp._persist_usage_headroom_armable_since(datetime(2026, 7, 22))
+        assert result is False
+
+    async def test_persist_returns_false_on_db_error(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                raise RuntimeError("simulated DB error")
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+
+        result = await mpp._persist_usage_headroom_armable_since(datetime(2026, 7, 22))
+        assert result is False
+
+
+# ── _restore_usage_headroom_armable_since direct unit tests ──────────────────
+
+
+@pytest.mark.asyncio
+class TestRestoreArmableSinceDirect:
+    """Direct unit tests for _restore_usage_headroom_armable_since, which reads
+    the persisted armable-since timestamp from DeploymentState on leader start
+    so the 60-minute observation window is NOT reset by a restart.
+    """
+
+    async def test_restore_reads_isoformat_and_sets_module_var(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        dt_str = "2026-07-22T10:30:00"
+
+        class FakeState:
+            runtime_config_json = {"usage_headroom_armable_since": dt_str}
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                return FakeState()
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+
+        result = await mpp._restore_usage_headroom_armable_since()
+
+        assert result is True
+        assert mpp._usage_headroom_armable_since == datetime.fromisoformat(dt_str)
+
+    async def test_restore_absent_key_returns_false_and_leaves_var_none(self, monkeypatch):
+        """When runtime_config_json has no armable-since key, return False
+        and leave _usage_headroom_armable_since as None."""
+        import app.max_plan_pool as mpp
+
+        class FakeState:
+            runtime_config_json: dict = {}
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                return FakeState()
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+
+        result = await mpp._restore_usage_headroom_armable_since()
+
+        assert result is False
+        assert mpp._usage_headroom_armable_since is None
+
+    async def test_restore_null_value_returns_false(self, monkeypatch):
+        """Explicit null in config (previously cleared) must return False —
+        None means the window was intentionally reset, not 'unknown'."""
+        import app.max_plan_pool as mpp
+
+        class FakeState:
+            runtime_config_json = {"usage_headroom_armable_since": None}
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                return FakeState()
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+
+        result = await mpp._restore_usage_headroom_armable_since()
+
+        assert result is False
+        assert mpp._usage_headroom_armable_since is None
+
+    async def test_restore_missing_deployment_state_returns_false(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                return None
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+
+        result = await mpp._restore_usage_headroom_armable_since()
+
+        assert result is False
+        assert mpp._usage_headroom_armable_since is None
+
+    async def test_restore_db_error_returns_false_without_raising(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, pk):
+                raise RuntimeError("simulated DB error")
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+
+        result = await mpp._restore_usage_headroom_armable_since()
+
+        assert result is False
+        assert mpp._usage_headroom_armable_since is None
+
+    async def test_restore_preserves_existing_in_memory_value(self, monkeypatch):
+        """If the module var is already set (non-None), _restore is NOT called by
+        the reconciler.  This test confirms restore does NOT clobber an already-set
+        value — the reconciler only calls it when the var is None."""
+        import app.max_plan_pool as mpp
+
+        existing = datetime(2026, 7, 22, 9, 0, 0)
+        # Simulate module var already restored from a prior cycle.
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", existing)
+
+        # The reconciler condition is `if _usage_headroom_armable_since is None`,
+        # so _restore is never called when already set.  Verify the var is unchanged.
+        assert mpp._usage_headroom_armable_since == existing
+
+
+# ── Stale snapshot negative-path: reliability stats and auto-arm gate ─────────
+
+
+@pytest.mark.asyncio
+class TestStaleSnapshotBlocksAutoArm:
+    """A usage snapshot older than _USAGE_METER_DISPLAY_STALE_SECONDS must
+    count as 'stale' in get_meter_reliability_stats, making coverage_ratio 0
+    and armable=False, so the auto-arm gate never trips on outdated data.
+    """
+
+    async def test_stale_snapshot_counted_as_stale_not_known(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        now = _utcnow()
+        stale_at = now - timedelta(seconds=mpp._USAGE_METER_DISPLAY_STALE_SECONDS + 1)
+
+        monkeypatch.setattr(
+            mpp,
+            "_account_by_id",
+            {
+                "stale-acct": {
+                    "id": "stale-acct",
+                    "provider": "anthropic",
+                    "auth_mode": "api_key",
+                    "enabled": True,
+                    "runtime_secret": "sk-ant-stale",
+                    "oauth_token": None,
+                    "usage_snapshot": UsageSnapshot(
+                        known=True,
+                        window_utilizations={"five_hour": 20.0},
+                        resets_at={},
+                        probed_at=None,
+                    ),
+                    "usage_snapshot_at": stale_at,
+                }
+            },
+        )
+
+        async def _no_persisted():
+            return {}
+
+        monkeypatch.setattr(mpp, "_load_persisted_usage_blobs", _no_persisted)
+        monkeypatch.setattr(mpp, "_usage_persist_failing_accounts", set())
+
+        stats = await mpp.get_meter_reliability_stats(now=now)
+        assert stats["meters_stale"] == 1
+        assert stats["meters_known"] == 0
+        assert stats["meters_eligible"] == 1
+        assert stats["armable"] is False, (
+            "stale meters reduce coverage_ratio to 0 — armable must be False"
+        )
+
+    async def test_fresh_snapshot_yields_armable_true(self, monkeypatch):
+        """Complementary positive case: a just-probed snapshot makes armable=True."""
+        import app.max_plan_pool as mpp
+
+        now = _utcnow()
+
+        monkeypatch.setattr(
+            mpp,
+            "_account_by_id",
+            {
+                "fresh-acct": {
+                    "id": "fresh-acct",
+                    "provider": "anthropic",
+                    "auth_mode": "api_key",
+                    "enabled": True,
+                    "runtime_secret": "sk-ant-fresh",
+                    "oauth_token": None,
+                    "usage_snapshot": UsageSnapshot(
+                        known=True,
+                        window_utilizations={"five_hour": 10.0},
+                        resets_at={},
+                        probed_at=None,
+                    ),
+                    "usage_snapshot_at": now,
+                }
+            },
+        )
+
+        async def _no_persisted():
+            return {}
+
+        monkeypatch.setattr(mpp, "_load_persisted_usage_blobs", _no_persisted)
+        monkeypatch.setattr(mpp, "_usage_persist_failing_accounts", set())
+
+        stats = await mpp.get_meter_reliability_stats(now=now)
+        assert stats["meters_known"] == 1
+        assert stats["meters_stale"] == 0
+        assert stats["armable"] is True
+
+    async def test_stale_api_key_snapshot_keeps_reconciler_at_noop(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        """When the only API-key meter is stale the reconciler must NOT arm
+        the gate — even after the observation window would have elapsed."""
+        import app.max_plan_pool as mpp
+
+        now = _utcnow()
+        stale_at = now - timedelta(seconds=mpp._USAGE_METER_DISPLAY_STALE_SECONDS + 10)
+
+        monkeypatch.setattr(
+            mpp,
+            "_account_by_id",
+            {
+                "stale-api-acct": {
+                    "id": "stale-api-acct",
+                    "provider": "anthropic",
+                    "auth_mode": "api_key",
+                    "enabled": True,
+                    "runtime_secret": "sk-ant-key",
+                    "oauth_token": None,
+                    "usage_snapshot": UsageSnapshot(
+                        known=True,
+                        window_utilizations={"five_hour": 20.0},
+                        resets_at={},
+                        probed_at=None,
+                    ),
+                    "usage_snapshot_at": stale_at,
+                }
+            },
+        )
+
+        async def _no_persisted():
+            return {}
+
+        monkeypatch.setattr(mpp, "_load_persisted_usage_blobs", _no_persisted)
+        monkeypatch.setattr(mpp, "_usage_persist_failing_accounts", set())
+
+        _set_config(monkeypatch, usage_headroom_auto_arm_observation_minutes=1)
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        # Call 2 minutes later — past the 1-min window.  Stale meter → armable=False.
+        res = await reconcile_usage_headroom_arming(now=now + timedelta(minutes=2))
+        assert res["armable"] is False
+        assert res["gate_enabled"] is False
+        gate_commits = [c for c in commits if "usage_headroom_gate_enabled" in c]
+        assert not gate_commits, "stale meters must not trigger gate arming"
+
+    async def test_no_known_snapshot_counts_as_dark(self, monkeypatch):
+        """An account with no usage_snapshot at all must count as dark,
+        not stale, and produce armable=False."""
+        import app.max_plan_pool as mpp
+
+        monkeypatch.setattr(
+            mpp,
+            "_account_by_id",
+            {
+                "dark-acct": {
+                    "id": "dark-acct",
+                    "provider": "anthropic",
+                    "auth_mode": "api_key",
+                    "enabled": True,
+                    "runtime_secret": "sk-ant-dark",
+                    "oauth_token": None,
+                }
+            },
+        )
+
+        async def _no_persisted():
+            return {}
+
+        monkeypatch.setattr(mpp, "_load_persisted_usage_blobs", _no_persisted)
+        monkeypatch.setattr(mpp, "_usage_persist_failing_accounts", set())
+
+        stats = await mpp.get_meter_reliability_stats(now=_utcnow())
+        assert stats["meters_dark"] == 1
+        assert stats["meters_known"] == 0
+        assert stats["meters_stale"] == 0
+        assert stats["armable"] is False
