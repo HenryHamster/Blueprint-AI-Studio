@@ -660,7 +660,6 @@ async def run_operator_inbox_liveness_check(
         OPERATOR_FYI,
         _NON_OPERATOR_AUDIENCES,
         operator_visible_alert_filter,
-        operator_visible_audience_filter,
         operator_visible_message_audience_filter,
     )
     from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action
@@ -753,7 +752,7 @@ async def run_operator_inbox_liveness_check(
                             ProjectMessage.reply_to_message_id.isnot(None),
                             ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
                         ),
-                        operator_visible_audience_filter(ProjectMessage.context),
+                        operator_visible_message_audience_filter(ProjectMessage.context),
                     )
                 )
             ).scalar()
@@ -1047,7 +1046,9 @@ async def compute_undelivered_strategist_replies(
     """
     try:
         from app.models import ProjectMessage
-        from app.message_audience import operator_visible_audience_filter
+        from app.message_audience import (
+            operator_visible_message_audience_filter,
+        )
         from app.time_utils import _utcnow
 
         now = _utcnow()
@@ -1067,7 +1068,7 @@ async def compute_undelivered_strategist_replies(
                         ProjectMessage.reply_to_message_id.isnot(None),
                         ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
                     ),
-                    operator_visible_audience_filter(ProjectMessage.context),
+                    operator_visible_message_audience_filter(ProjectMessage.context),
                 )
             )
         ).one_or_none()
@@ -1096,7 +1097,7 @@ async def compute_undelivered_strategist_replies(
                         ProjectMessage.reply_to_message_id.isnot(None),
                         ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
                     ),
-                    operator_visible_audience_filter(ProjectMessage.context),
+                    operator_visible_message_audience_filter(ProjectMessage.context),
                 )
                 .group_by(ProjectMessage.project_id)
                 .limit(max_projects)

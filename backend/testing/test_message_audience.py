@@ -2657,3 +2657,589 @@ def test_no_operator_reply_resolves_to_non_operator_audience():
         "present, or use another registered operator-visible event_type explicitly:\n"
         + "\n".join(all_offenders)
     )
+
+
+# ── Event-type registration guard: stamp_message_audience / route_event ──
+#
+# The fail-closed structural guard (_collect_ungated_emitters) ensures every
+# operator-reaching ProjectMessage/build_project_message site routes through
+# stamp_message_audience or route_event, but it does NOT verify that the
+# event_type argument itself is registered in _EVENT_AUDIENCE_REGISTRY.
+# An emitter that passes an unregistered or dynamic event_type to these
+# functions silently fails closed to strategist-internal — the operator never
+# sees the message, and no CI gate catches it.
+#
+# This scanner is the second ratchet: it verifies that every statically
+# determinable event_type passed to stamp_message_audience or route_event
+# is registered.  Unresolvable dynamic event_types are flagged unless the
+# enclosing function is in the runtime-validating gate allowlist.
+
+_EVENT_TYPE_GATE_ALLOWLIST: frozenset[str] = frozenset({
+    # === Core gate functions ==============================================
+    # stamp_message_audience itself — passes its event_type parameter through
+    # route_event.  Every caller's stamp/route call is checked; the gate
+    # function itself is exempt.
+    "stamp_message_audience",
+    # post_event_message — takes event_type as parameter; every caller's
+    # invocation of post_event_message with an unregistered literal is caught
+    # by their own file's scan (or the caller's own stamp/route check).
+    "post_event_message",
+    # Accepts event_type as parameter with default ("feedback_acknowledgment",
+    # registered); delegates to stamp_message_audience.
+    "post_feedback_acknowledgment",
+    # Takes event_type as parameter for per-lane event messages.
+    "emit_lane_event_message",
+    # === Runtime validators ===============================================
+    # Routes event_type parameter through route_event inside
+    # should_emit_project_alert — verifies at runtime.
+    "should_emit_project_alert",
+    # === General-purpose message handlers =================================
+    # Handles any event_type from the operator/strategist message context;
+    # default fallbacks (question_answer / strategic_message) are registered.
+    "strategic_operation",
+    "_handle_strategic_completion",
+    # === Verification / remediation paths =================================
+    # Re-derives audience from existing message event_types for sweep
+    # verification — does not introduce new event_types.
+    "check_audience_routing_attestation",
+    # Uses imported module-level constant _CHECK_IN_EVENT_TYPE ("strategic_check_in",
+    # registered) which cannot be resolved from module_constants alone.
+    "create_project_strategic_session_check_in",
+    # Re-stamps existing messages with their own event_type read from
+    # ctx["event_type"] — no new event_type is introduced.
+    "_remediate_forward_leaked_messages",
+})
+
+
+def _get_module_string_constants(tree: ast.AST) -> dict[str, str]:
+    """Map simple module-level ``NAME = "literal"`` assignments to their values.
+
+    Only captures top-level assignments where the target is a bare name
+    and the value is a string constant.  Ignores type-annotated assignments
+    (``NAME: str = "value"`` — those are ``ast.AnnAssign``, not ``ast.Assign``).
+    """
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            constants[node.targets[0].id] = node.value.value
+    return constants
+
+
+def _resolve_event_type(
+    node: ast.expr,
+    module_constants: dict[str, str] | None = None,
+) -> tuple[list[str], bool]:
+    """Try to resolve an event_type expression to concrete string values.
+
+    Returns ``(concrete_values, all_resolved)``.  ``all_resolved`` is True
+    only when EVERY possible value the expression can produce is a known
+    string constant — the caller can safely check all values against the
+    registry and conclude the call site is covered.
+
+    Handles:
+    - ``ast.Constant`` str literals
+    - ``ast.Name`` references resolved via *module_constants*
+    - ``ast.IfExp`` (ternary): both branches resolved and combined
+    - ``ast.BoolOp`` with ``ast.Or``: all sub-operands resolved and combined
+
+    Everything else (``ast.Call``, ``ast.Attribute``, unresolvable
+    ``ast.Name``, etc.) returns ``([], False)``.
+    """
+    consts: dict[str, str] = module_constants or {}
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value], True
+
+    if isinstance(node, ast.Name):
+        value = consts.get(node.id)
+        if value is not None:
+            return [value], True
+        return [], False
+
+    if isinstance(node, ast.IfExp):
+        body_lits, body_all = _resolve_event_type(node.body, consts)
+        orelse_lits, orelse_all = _resolve_event_type(node.orelse, consts)
+        return body_lits + orelse_lits, body_all and orelse_all
+
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        all_values: list[str] = []
+        all_ok = True
+        for val_node in node.values:
+            lits, ok = _resolve_event_type(val_node, consts)
+            all_values.extend(lits)
+            all_ok = all_ok and ok
+        return all_values, all_ok
+
+    return [], False
+
+
+def _collect_unregistered_event_type_invocations(
+    source: str, *, filename: str, rel: str, registered: frozenset[str]
+) -> list[str]:
+    """Return offender strings for ``stamp_message_audience()`` or
+    ``route_event()`` calls whose event_type argument is either not registered
+    in ``_EVENT_AUDIENCE_REGISTRY`` or not statically verifiable (unless the
+    enclosing function is in the gate allowlist).
+
+    Handles four patterns:
+    - **Literal constants**: checked directly against the registry.
+    - **Name references** to module-level string constants: resolved and checked.
+    - **IfExp** (ternary): all literal branches extracted and each checked
+      against the registry.
+    - **BoolOp** with ``Or`` (e.g. ``event_type or "default"``): constant
+      leaves extracted and each checked against the registry; any unregistered
+      value is flagged.
+    - **Other non-literals**: flagged unless the enclosing function is in
+      ``_EVENT_TYPE_GATE_ALLOWLIST``.
+    """
+    tree = ast.parse(source, filename=filename)
+    module_consts = _get_module_string_constants(tree)
+
+    funcs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def _enclosing_func_name(lineno: int) -> str | None:
+        best = None
+        for fn in funcs:
+            if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno):
+                if best is None or fn.lineno > best.lineno:
+                    best = fn
+        return best.name if best is not None else None
+
+    def _get_event_type_node(call: ast.Call, callee: str) -> ast.expr | None:
+        """Extract the event_type expression from a stamp/route call."""  # noqa: DOC201
+        if callee == "route_event":
+            if call.args:
+                return call.args[0]
+            for kw in call.keywords:
+                if kw.arg == "event_type":
+                    return kw.value
+        elif callee == "stamp_message_audience":
+            if len(call.args) >= 2:
+                return call.args[1]
+            for kw in call.keywords:
+                if kw.arg == "event_type":
+                    return kw.value
+        return None
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = _ast_called_name(node)
+        if callee not in ("stamp_message_audience", "route_event"):
+            continue
+
+        et_node = _get_event_type_node(node, callee)
+        if et_node is None:
+            enclosing = _enclosing_func_name(node.lineno)
+            if enclosing not in _EVENT_TYPE_GATE_ALLOWLIST:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}() called without recognizable "
+                    "event_type argument; add a literal event_type or route through "
+                    "a gate function in _EVENT_TYPE_GATE_ALLOWLIST"
+                )
+            continue
+
+        resolved, all_resolved = _resolve_event_type(et_node, module_consts)
+
+        if all_resolved:
+            # Every possible value is known — check against registry.
+            missing = sorted(set(v for v in resolved if v not in registered))
+            if missing:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}({', '.join(repr(m) for m in missing)}) "
+                    "uses unregistered event_type(s); add to _EVENT_AUDIENCE_REGISTRY in "
+                    "backend/app/message_audience.py with its intended audience"
+                )
+        else:
+            # Partially or fully unresolvable dynamic value.
+            unregistered_known = sorted(set(v for v in resolved if v not in registered))
+            enclosing = _enclosing_func_name(node.lineno)
+            if enclosing in _EVENT_TYPE_GATE_ALLOWLIST:
+                continue
+            if unregistered_known:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}() uses known but unregistered "
+                    f"event_type(s) ({', '.join(repr(m) for m in unregistered_known)}) "
+                    "plus unresolvable dynamic values; register the known types or route "
+                    "through a gate function in _EVENT_TYPE_GATE_ALLOWLIST"
+                )
+            else:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}() uses a non-verifiable dynamic "
+                    "event_type argument; use a literal string or route through a gate "
+                    "function in _EVENT_TYPE_GATE_ALLOWLIST"
+                )
+
+    return offenders
+
+
+# ── Unit tests for _resolve_event_type ──────────────────────────────────
+
+
+def test_resolve_literal_constant():
+    """A literal string constant resolves to [value], True."""
+    values, all_ok = _resolve_event_type(ast.Constant(value="task.failed"))
+    assert values == ["task.failed"]
+    assert all_ok is True
+
+
+def test_resolve_name_reference():
+    """A Name reference resolvable via module constants returns [value], True."""
+    values, all_ok = _resolve_event_type(
+        ast.Name(id="MY_EVENT", ctx=ast.Load()),
+        module_constants={"MY_EVENT": "task.failed"},
+    )
+    assert values == ["task.failed"]
+    assert all_ok is True
+
+
+def test_resolve_name_not_found():
+    """A Name reference missing from module_constants returns [], False."""
+    values, all_ok = _resolve_event_type(
+        ast.Name(id="unknown_var", ctx=ast.Load()),
+        module_constants={},
+    )
+    assert values == []
+    assert all_ok is False
+
+
+def test_resolve_ternary_both_literals():
+    """A ternary with both branches as literals resolves both."""
+    node = ast.IfExp(
+        test=ast.Name(id="cond", ctx=ast.Load()),
+        body=ast.Constant(value="event.a"),
+        orelse=ast.Constant(value="event.b"),
+    )
+    values, all_ok = _resolve_event_type(node)
+    assert sorted(values) == ["event.a", "event.b"]
+    assert all_ok is True
+
+
+def test_resolve_ternary_one_literal_one_name():
+    """A ternary with one literal and one resolvable Name resolves both."""
+    node = ast.IfExp(
+        test=ast.Name(id="cond", ctx=ast.Load()),
+        body=ast.Constant(value="event.a"),
+        orelse=ast.Name(id="FALLBACK", ctx=ast.Load()),
+    )
+    values, all_ok = _resolve_event_type(
+        node,
+        module_constants={"FALLBACK": "event.b"},
+    )
+    assert sorted(values) == ["event.a", "event.b"]
+    assert all_ok is True
+
+
+def test_resolve_boolop_or_with_literals():
+    """A BoolOp(Or) with resolvable branches resolves all values."""
+    node = ast.BoolOp(
+        op=ast.Or(),
+        values=[
+            ast.Name(id="evt", ctx=ast.Load()),
+            ast.Constant(value="fallback.event"),
+        ],
+    )
+    values, all_ok = _resolve_event_type(
+        node,
+        module_constants={"evt": "primary.event"},
+    )
+    assert sorted(values) == ["fallback.event", "primary.event"]
+    assert all_ok is True
+
+
+def test_resolve_boolop_or_partial():
+    """A BoolOp with a known constant and an unresolvable Name returns
+    partially resolved values but all_resolved=False."""
+    node = ast.BoolOp(
+        op=ast.Or(),
+        values=[
+            ast.Constant(value="known.event"),
+            ast.Name(id="unknown_var", ctx=ast.Load()),
+        ],
+    )
+    values, all_ok = _resolve_event_type(node, module_constants={})
+    assert values == ["known.event"]
+    assert all_ok is False
+
+
+def test_resolve_call_expression():
+    """A Call node (e.g., str(event_type)) cannot be statically resolved."""
+    node = ast.Call(
+        func=ast.Name(id="str", ctx=ast.Load()),
+        args=[ast.Name(id="x", ctx=ast.Load())],
+        keywords=[],
+    )
+    values, all_ok = _resolve_event_type(node)
+    assert values == []
+    assert all_ok is False
+
+
+def test_resolve_attribute_access():
+    """An Attribute node (e.g., obj.event_type) cannot be statically resolved."""
+    node = ast.Attribute(
+        value=ast.Name(id="obj", ctx=ast.Load()),
+        attr="event_type",
+        ctx=ast.Load(),
+    )
+    values, all_ok = _resolve_event_type(node)
+    assert values == []
+    assert all_ok is False
+
+
+# ── Unit tests for _collect_unregistered_event_type_invocations ─────────
+
+
+def test_et_scan_accepts_registered_literal_route_event():
+    """A route_event call with a registered literal event_type passes."""
+    source = dedent("""
+        def emit(session, project_id):
+            audience = route_event("task.failed")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_unregistered_literal_route_event():
+    """A route_event call with an unregistered literal event_type is flagged."""
+    source = dedent("""
+        def emit(session, project_id):
+            audience = route_event("completely.unregistered.event")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "completely.unregistered.event" in offenders[0]
+    assert "unregistered" in offenders[0]
+
+
+def test_et_scan_accepts_registered_literal_stamp():
+    """A stamp_message_audience call with a registered literal event_type passes."""
+    source = dedent("""
+        def emit(session, project_id):
+            ctx = stamp_message_audience({}, "task.failed")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_unregistered_literal_stamp():
+    """A stamp_message_audience call with an unregistered literal is flagged."""
+    source = dedent("""
+        def emit(session, project_id):
+            ctx = stamp_message_audience({}, "unregistered.event")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.event" in offenders[0]
+
+
+def test_et_scan_accepts_module_constant_event_type():
+    """A stamp_message_audience call with a module-level constant event_type
+    that resolves to a registered value passes."""
+    source = dedent("""
+        MY_EVENT = "task.failed"
+        def emit(session, project_id):
+            ctx = stamp_message_audience({}, MY_EVENT)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_accepts_gate_function_dynamic():
+    """A stamp_message_audience call with a dynamic event_type inside an
+    allowlisted gate function passes."""
+    source = dedent("""
+        async def post_event_message(session, project_id, event_type, summary):
+            audience = route_event(event_type)
+            ctx = stamp_message_audience({}, event_type)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_dynamic_outside_gate():
+    """A stamp_message_audience call with a dynamic event_type outside an
+    allowlisted gate function is flagged."""
+    source = dedent("""
+        def emit(session, project_id, event_type):
+            ctx = stamp_message_audience({}, event_type)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "non-verifiable" in offenders[0] or "dynamic" in offenders[0]
+
+
+def test_et_scan_accepts_ternary_both_registered():
+    """A ternary event_type where both branches are registered literals passes."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            ctx = stamp_message_audience(
+                {},
+                "deployment.flapping_resume" if condition else "deployment.auto_resume",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_ternary_with_unregistered():
+    """A ternary event_type where one branch is unregistered is flagged."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            ctx = stamp_message_audience(
+                {},
+                "deployment.flapping_resume" if condition else "unregistered.branch",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.branch" in offenders[0]
+
+
+def test_et_scan_accepts_route_event_with_registered_ternary():
+    """A route_event call with a ternary whose branches are registered passes."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            audience = route_event(
+                "deployment.flapping_resume" if condition else "deployment.auto_resume",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_unregistered_ternary_in_route_event():
+    """A route_event call with a ternary whose one branch is unregistered."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            audience = route_event(
+                "deployment.flapping_resume" if condition else "unregistered.event",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.event" in offenders[0]
+
+
+def test_et_scan_missing_event_type_argument():
+    """A stamp_message_audience call with no recognizable event_type argument
+    is flagged unless inside an allowlisted gate."""
+    source = dedent("""
+        def emit(session, project_id):
+            ctx = stamp_message_audience({})
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "without recognizable" in offenders[0]
+
+
+def test_et_scan_accepts_boolop_all_registered_inside_gate():
+    """A BoolOp event_type inside an allowlisted gate function passes."""
+    source = dedent("""
+        async def _remediate_forward_leaked_messages(session, msgs):
+            for msg in msgs:
+                event_type = "task.failed"
+                new_ctx = stamp_message_audience({}, event_type)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+# ── Whole-app invariant: every event_type used in stamp/route is registered ──
+
+
+def test_no_event_type_invocation_uses_unregistered_event_type():
+    """Whole-app invariant: every ``stamp_message_audience()`` and
+    ``route_event()`` call under ``backend/app/`` uses an event_type that is
+    either registered in ``_EVENT_AUDIENCE_REGISTRY`` or routed through an
+    allowlisted gate function that validates at runtime.
+
+    This is the structural ratchet that prevents a new emitter from passing a
+    dynamic or unregistered event_type through the audience gate without CI
+    noticing.  The companion tests ``_collect_ungated_emitters`` (enforces that
+    every operator-reaching ProjectMessage site has a stamp call) and
+    ``_collect_alert_constructors_with_unregistered_event_type`` (enforces that
+    every ``Alert(event_type=...)`` literal is registered) cover the other two
+    dimensions of the fail-closed guarantee.
+
+    Fix: use a literal registered event_type, or add the enclosing function to
+    ``_EVENT_TYPE_GATE_ALLOWLIST`` if it validates the event_type at runtime
+    before passing it through the stamp gate.
+    """
+    import glob
+
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    registered = get_registered_event_types()
+    all_offenders: list[str] = []
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        all_offenders.extend(
+            _collect_unregistered_event_type_invocations(
+                source, filename=fpath, rel=rel, registered=registered
+            )
+        )
+
+    assert not all_offenders, (
+        "Found stamp_message_audience() or route_event() call(s) under "
+        "backend/app/ that use an unregistered or non-verifiable dynamic "
+        "event_type.\n"
+        "A new emitter that passes an unregistered event_type through the "
+        "audience gate will silently fail closed to strategist-internal — "
+        "the operator never sees the message but no CI gate catches it.\n"
+        "Fix: use a literal registered event_type, or add the enclosing "
+        "function to _EVENT_TYPE_GATE_ALLOWLIST in this test file if it "
+        "validates the event_type at runtime before passing it through the "
+        "stamp gate:\n"
+        + "\n".join(all_offenders)
+    )
