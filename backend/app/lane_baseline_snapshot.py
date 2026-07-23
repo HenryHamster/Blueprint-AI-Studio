@@ -2,9 +2,10 @@
 
 When a ReleaseVersion reaches a terminal status (promoted or abandoned), this
 module captures the version's lane-diagnostic aggregates and persists them
-durably as one row per version in the dedicated ``project_lane_baseline`` table
-(the former ``project.design_doc["lane_baselines"]`` blob is no longer the
-canonical store; the dedicated table is the sole source of truth).
+durably as one row per version in the dedicated ``project_lane_baseline``
+table. Historical ``project.design_doc["lane_baselines"]`` values remain as a
+read fallback until a future backfill-and-strip migration explicitly retires
+them.
 
 The stored blob is a subset of the lane-diag response plus per-PR relay medians
 for the v10 lane-pilot comparison.
@@ -313,10 +314,10 @@ async def persist_version_lane_baseline(
 
     # First-write-wins: if a baseline already exists for this version in the
     # dedicated project_lane_baseline table, leave it untouched and return it.
-    # The dedicated project_lane_baseline table is the sole store; existence is
-    # checked there (this replaces the former with_design_doc_locked
-    # read-modify-write, which also means no Project row lock is taken — the
-    # row-scoped upsert below is enough).
+    # New writes use the table exclusively, while readers retain a legacy
+    # design_doc fallback for historical rows. Existence for this new write is
+    # checked in the table; no Project row lock is needed because the row-scoped
+    # upsert below is sufficient.
     existing = await _read_table_lane_baseline(session, project_id, version_number)
     if existing is not None:
         logger.info(
@@ -395,12 +396,19 @@ async def backfill_missing_lane_baselines(
         if project_row is None:
             return []
 
-        # Existing versions now live in the dedicated project_lane_baseline table;
-        # read the gap set from there rather than the design_doc blob.
+        # The sweep fills missing recent versions in the dedicated table. It is
+        # not a migration of the retained historical design_doc fallback.
         existing_keys = {
             str(row.version_number)
             for row in await read_all_lane_baselines(session, project_id)
         }
+        legacy_baselines = (project_row.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+        if isinstance(legacy_baselines, dict):
+            existing_keys.update(
+                str(key)
+                for key, value in legacy_baselines.items()
+                if isinstance(value, dict)
+            )
 
         versions = list(
             (

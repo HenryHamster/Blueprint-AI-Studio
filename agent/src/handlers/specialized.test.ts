@@ -135,17 +135,31 @@ vi.mock('./code-change.js', async (importOriginal) => {
 // docker/vite/fetch — boot() resolves a fake stack, teardown() is a no-op. The
 // module's own boot/teardown/fail-closed behavior is unit-tested in
 // walkthrough-stack.test.ts; here we only exercise the handler wiring.
-const { walkthroughBootMock, walkthroughTeardownMock } = vi.hoisted(() => ({
-  walkthroughBootMock: vi.fn(),
-  walkthroughTeardownMock: vi.fn().mockResolvedValue(undefined),
-}));
-vi.mock('./walkthrough-stack.js', () => ({
-  CandidateStackController: vi.fn().mockImplementation(function CandidateStackControllerMock() {
+const {
+  walkthroughBootMock,
+  walkthroughTeardownMock,
+  walkthroughControllerMock,
+  deriveComposeProjectMock,
+} = vi.hoisted(() => {
+  const walkthroughBootMock = vi.fn();
+  const walkthroughTeardownMock = vi.fn().mockResolvedValue(undefined);
+  const walkthroughControllerMock = vi.fn(function CandidateStackControllerMock() {
     return {
       boot: walkthroughBootMock,
       teardown: walkthroughTeardownMock,
     };
-  }),
+  });
+  const deriveComposeProjectMock = vi.fn();
+  return {
+    walkthroughBootMock,
+    walkthroughTeardownMock,
+    walkthroughControllerMock,
+    deriveComposeProjectMock,
+  };
+});
+vi.mock('./walkthrough-stack.js', () => ({
+  CandidateStackController: walkthroughControllerMock,
+  deriveComposeProject: deriveComposeProjectMock,
 }));
 
 // fs is consumed by both default + namespace imports across the modules under

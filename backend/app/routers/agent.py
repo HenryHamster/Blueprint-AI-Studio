@@ -29,7 +29,6 @@ from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
 from app.landed_signal import is_merged_completion
 from app.models import (
     Project,
-    ProjectSRAnalytics,
     Task,
     TaskStatus,
     TaskHistory,
@@ -82,6 +81,7 @@ from app.sr_blind_spots import (
     safe_check_results,
 )
 from app.pipeline_health import compute_pipeline_health_summary
+from app.sr_analytics_store import read_project_sr_analytics
 from app.knowledge_query import (
     get_knowledge_document as kq_get_knowledge_document,
     list_knowledge_documents as kq_list_knowledge_documents,
@@ -751,7 +751,7 @@ async def _stamp_reviewer_recovery_count(
     high_iter_rows,
 ) -> None:
     """Count tasks tagged as reviewer-recovery-after-incomplete-SR and stamp the
-    aggregate onto ``sr_catch_rate_trends`` (prefers ``ProjectSRAnalytics.data`` with ``design_doc`` fallback).
+    aggregate onto ``ProjectSRAnalytics.data['sr_catch_rate_trends']``.
 
     Detection scans both the top-level ``reviewer_recovery_origin`` marker and
     per-category ``check_results[*].origin`` entries — the marker can land in
@@ -776,24 +776,14 @@ async def _stamp_reviewer_recovery_count(
     )
     if recovery_count <= 0:
         return
-    from app.task_locking import project_lock
+    from app.task_locking import with_sr_analytics_locked
 
-    async with project_lock(session, project_id, skip_locked=True) as proj:
-        if proj is None:
-            return
-        doc = dict(proj.design_doc or {})
-        # Prefer ProjectSRAnalytics for sr_catch_rate_trends, with
-        # design_doc fallback — the canonical data lives in the dedicated
-        # table, so the design_doc copy may be stale.
-        _sr_row = await session.get(ProjectSRAnalytics, project_id)
-        _sr_data = _sr_row.data if _sr_row else None
-        _source = _sr_data or doc
-        trends = dict(_source.get("sr_catch_rate_trends") or {})
+    def _update(data: dict) -> None:
+        trends = dict(data.get("sr_catch_rate_trends") or {})
         trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
-        doc["sr_catch_rate_trends"] = trends
-        proj.design_doc = doc
-        flag_modified(proj, "design_doc")
-        session.add(proj)
+        data["sr_catch_rate_trends"] = trends
+
+    await with_sr_analytics_locked(session, project_id, _update)
 
 
 async def _refresh_sr_catch_rate(
@@ -3602,17 +3592,21 @@ async def claim_task(
                     module_warnings
                 )
 
+    _sr_analytics_data: dict = {}
+    if project_for_playbook and task_type in CODE_REVIEW_GATED_TASK_TYPES:
+        try:
+            _sr_analytics_data = await read_project_sr_analytics(
+                session, project_for_playbook
+            )
+        except Exception:
+            _sr_analytics_data = dict(project_for_playbook.design_doc or {})
+            logger.exception("[AGENT] Failed to load SR analytics (non-critical)")
+
     # Inject SR catch-rate blind spots for every code-review-gated task type
     # (create/fix/refactor/migrate/qa/docs/deps) — all ship reviewed code.
     if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
         try:
-            _sr_row = await session.get(ProjectSRAnalytics, _claimed_project_id)
-            _sr_data = _sr_row.data if _sr_row else None
-            _design = project_for_playbook.design_doc or {}
-            _source = _sr_data or _design
-            sr_trends = _source.get(
-                "sr_catch_rate_trends"
-            )
+            sr_trends = _sr_analytics_data.get("sr_catch_rate_trends")
             if sr_trends and isinstance(sr_trends.get("categories"), dict):
 
                 def _cat_entry(data: dict) -> dict:
@@ -3845,13 +3839,7 @@ async def claim_task(
     # when the direction has no qualifying data in by_direction.
     if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
         try:
-            _sr_row_miss = await session.get(ProjectSRAnalytics, _claimed_project_id)
-            _sr_data_miss = _sr_row_miss.data if _sr_row_miss else None
-            _design_miss = project_for_playbook.design_doc or {}
-            _source_miss = _sr_data_miss or _design_miss
-            _miss_trends = _source_miss.get(
-                "sr_catch_rate_trends"
-            )
+            _miss_trends = _sr_analytics_data.get("sr_catch_rate_trends")
             if _miss_trends and isinstance(_miss_trends.get("categories"), dict):
                 # Resolve candidate categories: prefer direction-scoped when available.
                 _direction_id = _claimed_context.get("direction_id")
@@ -3916,20 +3904,13 @@ async def claim_task(
                 "[AGENT] Failed to inject sr_recent_miss_examples (non-critical)"
             )
 
-    # Inject pre-computed SR vs fresh-reviewer disagreements. Stored by
-    # compute_sr_reviewer_disagreements into ProjectSRAnalytics.data["sr_reviewer_disagreements"]
-    # (with design_doc fallback).
+    # Inject pre-computed SR vs fresh-reviewer disagreements from the dedicated
+    # SR analytics row.
     # Shape: project_context.sr_reviewer_disagreements =
     #   {window_days, disagreements: [{category, task_type, count, examples?}]}
     if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
         try:
-            _sr_row_d = await session.get(ProjectSRAnalytics, _claimed_project_id)
-            _sr_data_d = _sr_row_d.data if _sr_row_d else None
-            _design_d = project_for_playbook.design_doc or {}
-            _source_d = _sr_data_d or _design_d
-            _disagreements_raw = _source_d.get(
-                "sr_reviewer_disagreements"
-            )
+            _disagreements_raw = _sr_analytics_data.get("sr_reviewer_disagreements")
             if (
                 isinstance(_disagreements_raw, dict)
                 and isinstance(_disagreements_raw.get("disagreements"), list)

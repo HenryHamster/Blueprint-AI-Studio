@@ -1581,8 +1581,9 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     still succeed as long as the AGENT-OWNED content stays under the ceiling.
 
     Steps:
-    1. Seed design_doc with reserved keys (efficiency_baseline, lane_baselines,
-       etc.) whose SERIALIZED SIZE alone exceeds DESIGN_DOC_MAX_BYTES.
+    1. Seed design_doc with non-migrated reserved keys whose SERIALIZED SIZE
+       alone exceeds DESIGN_DOC_MAX_BYTES, plus generic telemetry keys that
+       have migrated to project_telemetry.
     2. Write a small agent-owned key — must succeed (reserved blobs excluded
        from the size check).
     3. Write an agent-owned key that would push agent-owned content over the
@@ -1590,14 +1591,16 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     """
     import json as _json
 
-    # Build large reserved blobs: a single 600KB string under a reserved key.
-    # Use cochange_index and playbook_archive — both remain in _RESERVED_DESIGN_DOC_KEYS
-    # after the 0656 migration moved efficiency/lane/sr telemetry to separate tables.
+    # Build large blobs under truly non-migrated reserved keys. Generic
+    # telemetry keys are included separately to verify that the dedicated-store
+    # cutover strips their legacy design_doc copies before persistence.
     huge_blob = "z" * 600_000
     project = Project(name="reserved-ceiling-regression", user_id="user")
     project.design_doc = {
-        "cochange_index": huge_blob,
-        "playbook_archive": huge_blob,
+        "repo_overview": huge_blob,
+        "review_effectiveness": huge_blob,
+        "cochange_index": {"legacy": True},
+        "playbook_archive": {"legacy": True},
     }
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
 
@@ -1625,9 +1628,12 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     assert project.design_doc.get("agent_key") == "small_value", (
         "agent-owned write must be persisted"
     )
-    # Reserved blobs must be preserved (mutate_fn only added a new key).
-    assert project.design_doc.get("cochange_index") == huge_blob
-    assert project.design_doc.get("playbook_archive") == huge_blob
+    # Non-migrated reserved blobs remain; migrated generic telemetry is now
+    # authoritative in project_telemetry and must not be persisted here.
+    assert project.design_doc.get("repo_overview") == huge_blob
+    assert project.design_doc.get("review_effectiveness") == huge_blob
+    assert "cochange_index" not in project.design_doc
+    assert "playbook_archive" not in project.design_doc
 
     # Step 3: grow agent-owned content over the ceiling — must be rejected.
     def _grow_agent_over_ceiling(doc: dict) -> None:
@@ -1860,27 +1866,29 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
     # Audit additions: background analytics/sweep keys still written to design_doc
     # (keys moved to project_efficiency_snapshot, project_lane_baseline, and
     # project_sr_analytics in migration 0656 are no longer listed here)
-    # NOTE: fresh_reviewer_trend, edges_trend, sr_regression_risk_test_signal_trends
-    # and sr_false_attestation_trends were REMOVED here by migration 0678, which
-    # moved them into project_telemetry and stripped the design_doc copy — see
-    # test_migrated_telemetry_keys_dropped_from_reserved_set below.
+    # Rolling-cutover values remain reserved while their legacy design_doc copy
+    # is retained for fallback and rollback safety.
     audit_keys = {
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
-        # NOTE: sr_reviewer_disagreements, sr_catch_rate_trends_alert/floor_alert/
-        # quadrant_alert/pass_engagement_alert, sr_blind_spot_signal_last_computed_at,
-        # fix_loop_divergence_*, and viewport_coverage_snapshot have been migrated to
-        # ProjectSRAnalytics and are no longer stored in design_doc — they were
-        # removed from _RESERVED_DESIGN_DOC_KEYS accordingly.
+        "sr_reviewer_disagreements",
+        "sr_catch_rate_trends_alert",
+        "sr_catch_rate_floor_alert",
+        "sr_quadrant_alert",
+        "sr_pass_engagement_alert",
+        "sr_blind_spot_signal_last_computed_at",
+        "fix_loop_divergence_signal_last_computed_at",
+        "fix_loop_divergence_alerted_window",
+        "fix_loop_divergence_regressions",
+        "fix_loop_divergence_detected_at",
+        "viewport_coverage_snapshot",
     }
     missing = audit_keys - _RESERVED_DESIGN_DOC_KEYS
     assert not missing, f"code-written keys not yet reserved: {sorted(missing)}"
 
 
-# Keys migrated to dedicated telemetry tables by migration 0678 and stripped
-# from design_doc — they no longer need (or may keep) the write-cap exemption.
-_MIGRATED_STRIPPED_KEYS = (
+_ROLLING_CUTOVER_KEYS = (
     "lane_baselines",
     "fresh_reviewer_trend",
     "edges_trend",
@@ -1889,48 +1897,31 @@ _MIGRATED_STRIPPED_KEYS = (
 )
 
 
-def test_migrated_telemetry_keys_dropped_from_reserved_set():
-    """Migration 0678 strips these keys from design_doc, so they MUST NOT remain
-    in the reserved set (a key that no longer lives in design_doc must not keep
-    the write-cap exemption). Keys still transitional in design_doc stay reserved.
+def test_rolling_cutover_keys_remain_reserved():
+    """Dedicated-store cutovers retain legacy fallback values in design_doc.
+
+    No migration has stripped these values, so agents must not mutate them and
+    they must not consume the agent-owned size budget.
     """
     from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
 
-    still_reserved = {
-        k for k in _MIGRATED_STRIPPED_KEYS if k in _RESERVED_DESIGN_DOC_KEYS
-    }
-    assert not still_reserved, (
-        f"stripped keys must be removed from _RESERVED_DESIGN_DOC_KEYS: "
-        f"{sorted(still_reserved)}"
-    )
-
-    # Keys that still live in design_doc keep their exemption.
-    # efficiency_baseline and sr_catch_rate_trends were never added to the
-    # reserved set — they are excluded from the agent-size cap via their
-    # dedicated table path (ProjectEfficiencySnapshot / ProjectSRAnalytics).
-    for key in (
+    expected = set(_ROLLING_CUTOVER_KEYS) | {
+        "efficiency_baseline",
+        "sr_catch_rate_trends",
         "cochange_index",
         "cochange_applied_prs",
-    ):
-        assert key in _RESERVED_DESIGN_DOC_KEYS, (
-            f"{key} still lives in design_doc and must keep its exemption"
-        )
+    }
+    missing = expected - _RESERVED_DESIGN_DOC_KEYS
+    assert not missing, f"rolling-cutover keys must remain reserved: {sorted(missing)}"
 
 
 @pytest.mark.asyncio
-async def test_stripped_key_counts_toward_agent_ceiling(db_session):
-    """Behavioral coverage of the reserved-set shrink: because migration 0678
-    removed ``lane_baselines`` from ``_RESERVED_DESIGN_DOC_KEYS``, a large
-    ``lane_baselines`` blob now COUNTS toward the agent-owned ceiling (the
-    ``_agent_owned_size`` computation in ``with_design_doc_locked`` no longer
-    excludes it), so an agent write that pushes the total over the ceiling is
-    rejected. Before the shrink the same blob was exempt and the write succeeded.
-    """
+async def test_legacy_lane_baseline_does_not_consume_agent_ceiling(db_session):
+    """A retained system-owned lane fallback cannot block a small agent write."""
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
 
-    # A lane_baselines blob on its own over the ceiling — now agent-owned.
     over_ceiling_blob = "z" * (DESIGN_DOC_MAX_BYTES + 50_000)
-    project = Project(name="stripped-key-counts", user_id="user")
+    project = Project(name="lane-fallback-reserved", user_id="user")
     project.design_doc = {"lane_baselines": over_ceiling_blob}
     _flag_modified(project, "design_doc")
     db_session.add(project)
@@ -1945,13 +1936,8 @@ async def test_stripped_key_counts_toward_agent_ceiling(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    assert result is False, (
-        "lane_baselines is no longer reserved, so it counts toward the agent "
-        "ceiling and an over-ceiling agent write must be rejected"
-    )
-    assert "agent_key" not in project.design_doc, (
-        "rejected agent write must not be persisted"
-    )
+    assert result is True
+    assert project.design_doc["agent_key"] == "small"
 
 
 # ── raise_on_size_limit: opt-in exception path ──────────────────────────────

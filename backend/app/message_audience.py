@@ -63,6 +63,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "direction_outcome_scaffolding_escalation": OPERATOR_ACTION_NEEDED,
     "direction_churn_pause": OPERATOR_ACTION_NEEDED,
     # High-signal → operator-fyi
+    "artifact_handoff_failed": OPERATOR_ACTION_NEEDED,
     "failure_alert": OPERATOR_FYI,
     "rollback_recommended": OPERATOR_FYI,
     "fix_loop_divergence_regressed": OPERATOR_FYI,

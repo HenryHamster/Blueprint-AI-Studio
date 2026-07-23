@@ -9,9 +9,9 @@ The ``project.design_doc`` JSONB column had accreted ~10 unrelated telemetry
 blobs, bloating the row to 500 KB+ and forcing every background telemetry
 writer to serialize through a single ``Project`` row lock
 (``with_design_doc_locked`` rewrites the entire blob on each write). Migration
-0659 introduced three dedicated tables; this module is the shared accessor the
-follow-on writer subtasks consume so each caller does NOT re-implement the
-upsert / retention logic:
+0658 created the dedicated tables, 0659 added the generic KV table, and later
+rebuild migrations established the time-series shapes. This module is the
+shared accessor so callers do not re-implement upsert and retention logic:
 
 * ``project_telemetry`` — latest-value KV store, keyed by (project_id, key)
 * ``project_efficiency_snapshot`` — rolling time-series (retention-pruned)
@@ -48,10 +48,8 @@ pg_insert = _pg_insert
 
 TELEMETRY_KEYS: frozenset[str] = frozenset(
     {
-        # efficiency_baseline, lane_baselines, and sr_catch_rate_trends were moved
-        # to dedicated tables (project_efficiency_snapshot, project_lane_baseline,
-        # project_sr_analytics) as of migration 0656 and are no longer stored in
-        # design_doc, so they are excluded from this set.
+        # Specialized stores own efficiency, lane, and SR analytics. Their retained
+        # design_doc fallbacks remain reserved, but are not generic KV inventory.
         "cochange_index",
         "cochange_applied_prs",
         "module_feedback",
@@ -180,8 +178,10 @@ async def set_project_telemetry(
             updated_at=now,
         )
         .on_conflict_do_update(
-            index_elements=None,
-            constraint="uq_project_telemetry_project_key",
+            index_elements=[
+                ProjectTelemetry.project_id,
+                ProjectTelemetry.key,
+            ],
             set_={"value": value, "updated_at": now},
         )
     )
@@ -201,13 +201,17 @@ async def upsert_telemetry(
     Caller commits.
     """
     stmt = _pg_insert(ProjectTelemetry).values(
+        id=uuid.uuid4(),
         project_id=project_id,
         key=key,
         value=blob,
         updated_at=func.now(),
     )
     stmt = stmt.on_conflict_do_update(
-        constraint="uq_project_telemetry_project_key",
+        index_elements=[
+            ProjectTelemetry.project_id,
+            ProjectTelemetry.key,
+        ],
         set_={
             "value": stmt.excluded.value,
             "updated_at": func.now(),
@@ -296,13 +300,17 @@ async def insert_efficiency_snapshot(
     ``design_doc``. Caller commits.
     """
     stmt = _pg_insert(ProjectEfficiencySnapshot).values(
+        id=uuid.uuid4(),
         project_id=project_id,
         captured_at=captured_at,
         metric_def_version=metric_def_version,
         blob=blob,
     )
     stmt = stmt.on_conflict_do_update(
-        constraint="uq_proj_efficiency_snap",
+        index_elements=[
+            ProjectEfficiencySnapshot.project_id,
+            ProjectEfficiencySnapshot.captured_at,
+        ],
         set_={
             "metric_def_version": stmt.excluded.metric_def_version,
             "blob": stmt.excluded.blob,
@@ -368,6 +376,7 @@ async def upsert_lane_baseline(
     commits.
     """
     stmt = _pg_insert(ProjectLaneBaseline).values(
+        id=uuid.uuid4(),
         project_id=project_id,
         version_number=version_number,
         captured_at=captured_at,
@@ -375,7 +384,10 @@ async def upsert_lane_baseline(
         blob=blob,
     )
     stmt = stmt.on_conflict_do_update(
-        constraint="uq_proj_lane_baseline",
+        index_elements=[
+            ProjectLaneBaseline.project_id,
+            ProjectLaneBaseline.version_number,
+        ],
         set_={
             "captured_at": stmt.excluded.captured_at,
             "baseline_def_version": stmt.excluded.baseline_def_version,

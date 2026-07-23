@@ -477,6 +477,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         content="A blocker is owned by a direction." + (" extra" * 200),
         status="linked",
         context={
+            "audience": "operator-action-needed",
             "_convergence_link": {"kind": "direction", "id": "d-high"},
             "event_type": "blocker_linked",
             "strategic_session": {
@@ -3130,6 +3131,7 @@ async def test_strategic_session_command_executes_attention_housekeeping(
         from_type="strategic",
         content="Need operator input.",
         status="open",
+        context={"audience": "operator-action-needed"},
         created_at=message_created_at,
     )
     alert = Alert(
@@ -5923,6 +5925,7 @@ async def test_strategic_state_includes_operator_attention(
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Should the local Strategic runner stay enabled during the workday?",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=now,
     )
@@ -5931,6 +5934,7 @@ async def test_strategic_state_includes_operator_attention(
         message_type=MessageType.BLOCKER,
         from_type="system",
         content="Runner registration failed for the local device.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=now - timedelta(minutes=10),
     )
@@ -6237,6 +6241,7 @@ async def test_operator_attention_message_counts_are_not_capped_by_preview_limit
                 message_type=MessageType.FEEDBACK,
                 from_type="agent",
                 content=f"Recent feedback {idx}",
+                context={"audience": "operator-fyi"},
                 status="open",
                 created_at=_utcnow() + timedelta(minutes=idx),
             )
@@ -6246,6 +6251,7 @@ async def test_operator_attention_message_counts_are_not_capped_by_preview_limit
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Older open question must still count.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=_utcnow() - timedelta(days=1),
     )
@@ -6289,6 +6295,7 @@ async def test_operator_attention_cap_prioritizes_non_message_operator_items(
                 message_type=MessageType.QUESTION,
                 from_type="agent",
                 content=f"Open question {idx}",
+                context={"audience": "operator-action-needed"},
                 status="open",
                 created_at=now - timedelta(minutes=idx),
             )
@@ -6340,6 +6347,7 @@ async def test_operator_attention_needs_preview_preserves_older_blockers(
                 message_type=MessageType.QUESTION,
                 from_type="agent",
                 content=f"Newer open question {idx}",
+                context={"audience": "operator-action-needed"},
                 status="open",
                 created_at=now - timedelta(minutes=idx),
             )
@@ -6349,6 +6357,7 @@ async def test_operator_attention_needs_preview_preserves_older_blockers(
         message_type=MessageType.BLOCKER,
         from_type="agent",
         content="Older blocker must still stay visible.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=now - timedelta(days=1),
     )
@@ -6381,6 +6390,7 @@ async def test_operator_attention_cap_prioritizes_local_runner_holds(
                 message_type=MessageType.QUESTION,
                 from_type="agent",
                 content=f"Open question before local runner hold {idx}",
+                context={"audience": "operator-action-needed"},
                 status="open",
                 created_at=now - timedelta(minutes=idx),
             )
@@ -6421,6 +6431,7 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
         message_type=MessageType.BUG_REPORT,
         from_type="agent",
         content="The pipeline chart failed to render.",
+        context={"audience": "operator-fyi"},
         status="open",
     )
     feedback = ProjectMessage(
@@ -6428,6 +6439,7 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
         message_type=MessageType.FEEDBACK,
         from_type="strategic",
         content="Strategic suggests watching runtime health.",
+        context={"audience": "operator-fyi"},
         status="open",
     )
     db_session.add_all([bug, feedback])
@@ -6518,7 +6530,8 @@ async def test_operator_attention_excludes_internal_messages_and_tasks_everywher
         project_id=project.id,
         message_type=MessageType.QUESTION,
         from_type="system",
-        content="legacy visible question",
+        content="operator-visible question",
+        context={"audience": "operator-action-needed"},
         status="open",
     )
     internal_approval = Task(
@@ -6598,6 +6611,7 @@ async def test_operator_attention_same_priority_items_use_newest_tie_break(
             message_type=MessageType.FEEDBACK,
             from_type="strategic",
             content=f"Feedback item {idx}",
+            context={"audience": "operator-fyi"},
             status="open",
             created_at=now - timedelta(minutes=idx),
         )
@@ -6962,6 +6976,7 @@ async def test_operator_attention_no_last_seen_all_messages_unread(
             message_type=MessageType.QUESTION,
             from_type="agent",
             content=f"Open question {i}",
+            context={"audience": "operator-action-needed"},
             status="open",
         ))
     db_session.add(ProjectMessage(
@@ -6969,6 +6984,7 @@ async def test_operator_attention_no_last_seen_all_messages_unread(
         message_type=MessageType.BLOCKER,
         from_type="system",
         content="System blocker",
+        context={"audience": "operator-action-needed"},
         status="open",
     ))
     await db_session.commit()
@@ -6997,6 +7013,7 @@ async def test_operator_attention_last_seen_boundary_exact_created_at_is_not_unr
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Created exactly at boundary — should not be unread.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=boundary_time,
     )
@@ -7005,6 +7022,7 @@ async def test_operator_attention_last_seen_boundary_exact_created_at_is_not_unr
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Created strictly after boundary — should be unread.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=boundary_time + timedelta(seconds=1),
     )
@@ -7041,6 +7059,7 @@ async def test_operator_attention_first_visit_all_messages_unread(
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Does the operator need to review this on first visit?",
+        context={"audience": "operator-action-needed"},
         status="open",
     )
     context_direction = {
@@ -7081,6 +7100,7 @@ async def test_admin_messages_accepts_linked_status_filter(
         message_type=MessageType.BLOCKER,
         from_type="system",
         content="Linked issue",
+        context={"audience": "operator-action-needed"},
         status="linked",
     )
     open_msg = ProjectMessage(

@@ -159,7 +159,10 @@ describe('NotesTool — viewport regression', () => {
       b => b.getAttribute('aria-label') === 'Preview mode',
     ) as HTMLButtonElement | null;
     expect(previewBtn).not.toBeNull();
-    await act(async () => { previewBtn!.click(); });
+    await act(async () => {
+      previewBtn!.click();
+      await new Promise(resolve => setTimeout(resolve, 100));
+    });
     expect(host.querySelector('textarea')).toBeNull();
     const strong = host.querySelector('strong');
     expect(strong).toBeTruthy();

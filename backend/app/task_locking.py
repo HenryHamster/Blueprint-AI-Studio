@@ -44,6 +44,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import resolve_dialect_name
 from app.models import DeploymentState, Project, Task
+from app.sr_analytics_store import LEGACY_SR_ANALYTICS_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +84,10 @@ class DesignDocSizeLimitExceeded(Exception):
 # admin_agent_ops.py (which imports from here). Keep in sync with the set/delete
 # guard in that module so the two never diverge.
 #
-# Keys that have been migrated to dedicated tables (ProjectSRAnalytics,
-# ProjectEfficiencySnapshot, ProjectLaneBaseline) are NOT listed here — they
-# no longer live in design_doc and therefore neither need nor may keep the
-# write-cap exemption. The ProjectSRAnalytics-resident set includes:
-# sr_reviewer_disagreements, sr_catch_rate_trends_alert/floor_alert/quadrant_alert/
-# pass_engagement_alert, sr_blind_spot_signal_last_computed_at,
-# fix_loop_divergence_*, and viewport_coverage_snapshot.
+# Specialized stores are authoritative for efficiency, lane, and SR analytics,
+# but their legacy design_doc values remain as per-key/rollback fallbacks during
+# the rolling cutover. Those retained code-owned values stay exempt from the
+# agent-write cap until the fallbacks are intentionally removed.
 _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
     {
         # Originally reserved
@@ -110,7 +108,11 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
+        # Retained specialized-store fallbacks.
+        "efficiency_baseline",
+        "lane_baselines",
     }
+    | LEGACY_SR_ANALYTICS_KEYS
 )
 
 
@@ -759,41 +761,87 @@ async def with_design_doc_locked(
     return True
 
 
-async def with_efficiency_snapshot_locked(
+@asynccontextmanager
+async def project_telemetry_value_lock(
     session: AsyncSession,
     project_id,
+    key: str,
+    *,
+    design_doc_fallback: dict | None = None,
+    skip_locked: bool = False,
+) -> AsyncIterator[dict | None]:
+    """Lock and yield one mutable ``project_telemetry`` value.
+
+    Missing rows are seeded from the legacy design-doc value. The updated
+    dictionary is written back before the context exits; the database row lock
+    remains held until the caller commits or rolls back.
+    """
+    from app.models import ProjectTelemetry
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    seed: dict = {}
+    if design_doc_fallback is not None:
+        seed = dict(design_doc_fallback.get(key) or {})
+
+    await session.execute(
+        pg_insert(ProjectTelemetry)
+        .values(
+            id=uuid.uuid4(),
+            project_id=project_id,
+            key=key,
+            value=seed,
+            updated_at=func.now(),
+        )
+        .on_conflict_do_nothing(index_elements=["project_id", "key"])
+    )
+    result = await session.execute(
+        select(ProjectTelemetry)
+        .where(
+            ProjectTelemetry.project_id == project_id,
+            ProjectTelemetry.key == key,
+        )
+        .with_for_update(skip_locked=skip_locked)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        yield None
+        return
+
+    value = dict(row.value or {})
+    yield value
+    row.value = value
+    row.updated_at = func.now()
+    flag_modified(row, "value")
+    session.add(row)
+
+
+async def with_project_telemetry_locked(
+    session: AsyncSession,
+    project_id,
+    key: str,
     mutate_fn: Callable[[dict], None],
     *,
+    design_doc_fallback: dict | None = None,
     skip_locked: bool = False,
 ) -> bool:
-    """Atomic read-modify-write of the efficiency-baseline container.
+    """Atomic read-modify-write of a ``project_telemetry`` value.
 
-    Acquires SELECT FOR UPDATE on the Project row, reads the container from
-    ``project.design_doc[DESIGN_DOC_KEY]``, calls *mutate_fn* with the
-    container dict, then writes the result back to ``project.design_doc``.
-
-    Migration 0694 converted ProjectEfficiencySnapshot from a one-row-per-
-    project container to a multi-row time-series table, so the efficiency
-    container now lives directly under ``design_doc``.
+    The row is keyed by ``(project_id, key)``. If it does not exist, seed it
+    from ``design_doc_fallback[key]`` so the first post-migration mutation
+    preserves a legacy container instead of replacing it with an empty dict.
+    Caller commits.
     """
-    from app.efficiency_snapshot import DESIGN_DOC_KEY
-
-    async with project_lock(
+    async with project_telemetry_value_lock(
         session,
         project_id,
+        key,
+        design_doc_fallback=design_doc_fallback,
         skip_locked=skip_locked,
-        load_columns=[Project.id, Project.design_doc],
-    ) as project:
-        if project is None:
+    ) as value:
+        if value is None:
             return False
-        doc = dict(project.design_doc or {})
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
-        mutate_fn(container)
-        doc[DESIGN_DOC_KEY] = container
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
-        return True
+        mutate_fn(value)
+    return True
 
 
 async def with_sr_analytics_locked(
@@ -805,18 +853,26 @@ async def with_sr_analytics_locked(
 ) -> bool:
     """Atomic read-modify-write of ProjectSRAnalytics.data.
 
-    Mirrors with_design_doc_locked but targets the dedicated SR analytics
-    row. Acquires SELECT FOR UPDATE on the ProjectSRAnalytics row (inserting
-    an empty row first if none exists), calls mutate_fn with the data dict,
-    then writes the result back.
+    Mirrors with_design_doc_locked but targets the dedicated SR analytics row.
+    During a rolling cutover, a missing or empty dedicated row is seeded from
+    documented legacy ``design_doc`` SR keys before mutation so a new write
+    cannot mask data that has not been backfilled yet.
     """
-    from app.models import ProjectSRAnalytics
+    from app.models import Project, ProjectSRAnalytics
+    from app.sr_analytics_store import legacy_sr_analytics_payload
     from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    legacy_seed: dict = {}
+    project = await session.get(Project, project_id)
+    if project is not None:
+        legacy_seed = legacy_sr_analytics_payload(project.design_doc)
 
     await session.execute(
         pg_insert(ProjectSRAnalytics)
-        .values(project_id=project_id, data={}, updated_at=func.now())
-        .on_conflict_do_nothing()
+        .values(project_id=project_id, data=legacy_seed, updated_at=func.now())
+        .on_conflict_do_nothing(
+            index_elements=[ProjectSRAnalytics.project_id]
+        )
     )
 
     stmt = (
@@ -830,6 +886,8 @@ async def with_sr_analytics_locked(
         return False
 
     data = dict(sr_row.data or {})
+    for key, value in legacy_seed.items():
+        data.setdefault(key, value)
     mutate_fn(data)
     sr_row.data = data
     sr_row.updated_at = func.now()

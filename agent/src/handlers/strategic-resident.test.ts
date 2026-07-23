@@ -108,6 +108,10 @@ import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
   ResidentSessionEvent, ResidentTurnResult,
 } from '../providers/resident-session.js';
+import {
+  ATTACHMENT_FETCH_TIMEOUT_MS,
+  MAX_IMAGES_PER_TURN,
+} from './strategic-resident-lib.js';
 
 // The coalescing drain emits at most one frame per this window (see
 // STREAM_FLUSH_MS in strategic-resident.ts); mirrored here for the timing math.
@@ -2088,6 +2092,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
@@ -2139,6 +2144,264 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(0);
     expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
     expect(session.close).toHaveBeenCalled();
+  });
+
+  it('re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply', async () => {
+    vi.useFakeTimers();
+    const signedUrl = 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig';
+    const operatorMessage = {
+      id: 'msg-required-artifact-retry',
+      content: 'Review this exact revision',
+      created_at: '2026-07-22T12:00:00.000Z',
+      from_type: 'user',
+      context: {
+        attachments: [{
+          type: 'image',
+          mime_type: 'image/png',
+          name: 'board.png',
+          url: signedUrl,
+          artifact_ref_id: 'artifact-ref-1',
+          image_checksum: 'ab'.repeat(32),
+        }],
+      },
+    };
+    let alive = true;
+    const messagePollUrls: string[] = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        messagePollUrls.push(url);
+        if (messagePollUrls.length === 2) alive = false;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      return Promise.resolve(null);
+    });
+    const posts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body) posts.push(body);
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const attachmentFetch = vi.fn(() => Promise.resolve({
+      ok: false,
+      status: 503,
+      headers: { get: (_name: string) => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+    vi.stubGlobal('fetch', attachmentFetch);
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'must never run' })),
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    const done = handleStrategicResident(
+      'task-required-artifact-retry',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+        strategic_session_message_poll_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-required-artifact-retry' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(6_000);
+    await done;
+
+    expect(messagePollUrls).toHaveLength(2);
+    expect(messagePollUrls[1]).toBe(messagePollUrls[0]);
+    expect(attachmentFetch).toHaveBeenCalledTimes(2);
+    expect(session.sendTurn).not.toHaveBeenCalled();
+    expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(0);
+    expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+  });
+
+  it.each(['headers', 'body'] as const)(
+    'retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects',
+    async (stallAt) => {
+      vi.useFakeTimers();
+      try {
+        const signedUrl = 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig';
+        const operatorMessage = {
+          id: `msg-required-artifact-${stallAt}-timeout`,
+          content: 'Review this exact revision',
+          created_at: '2026-07-22T12:00:00.000Z',
+          from_type: 'user',
+          context: {
+            attachments: [{
+              type: 'image',
+              mime_type: 'image/png',
+              name: 'board.png',
+              url: signedUrl,
+              artifact_ref_id: `artifact-${stallAt}-timeout`,
+              image_checksum: 'ab'.repeat(32),
+            }],
+          },
+        };
+        let alive = true;
+        const messagePollUrls: string[] = [];
+        mockApiGet.mockImplementation((url: string) => {
+          if (url.includes('/messages?')) {
+            messagePollUrls.push(url);
+            if (messagePollUrls.length === 2) alive = false;
+            return Promise.resolve({ messages: [operatorMessage] });
+          }
+          return Promise.resolve(null);
+        });
+        const posts: Array<Record<string, unknown>> = [];
+        mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+          if (body) posts.push(body);
+          return Promise.resolve({ authority_held: true, stop_requested: false });
+        });
+        const signals: AbortSignal[] = [];
+        const attachmentFetch = vi.fn((
+          _url: string | URL | Request,
+          init?: RequestInit,
+        ) => {
+          if (init?.signal) signals.push(init.signal);
+          if (stallAt === 'headers') {
+            return new Promise<never>(() => {});
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: { get: (_name: string) => null },
+            arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+          });
+        });
+        vi.stubGlobal('fetch', attachmentFetch);
+        const session = makeSession(
+          () => Promise.resolve(turnResult({ resultText: 'must never run' })),
+          () => alive,
+        );
+        mockStartSession.mockReturnValue(session);
+
+        const done = handleStrategicResident(
+          `task-required-artifact-${stallAt}-timeout`,
+          {
+            project_name: 'P',
+            open_messages: [],
+            strategic_session_operator_ack_threshold_seconds: 0,
+            strategic_session_message_poll_seconds: 0,
+          },
+          {
+            project_metadata: { project_id: `proj-required-artifact-${stallAt}-timeout` },
+            context: {},
+          },
+          'ghtok', 'owner', 'repo', null, { value: '' },
+        );
+        await vi.advanceTimersByTimeAsync((ATTACHMENT_FETCH_TIMEOUT_MS * 2) + 10_000);
+        await done;
+
+        expect(messagePollUrls).toHaveLength(2);
+        expect(messagePollUrls[1]).toBe(messagePollUrls[0]);
+        expect(attachmentFetch).toHaveBeenCalledTimes(2);
+        expect(signals).toHaveLength(2);
+        expect(signals.every(signal => signal.aborted)).toBe(true);
+        expect(session.sendTurn).not.toHaveBeenCalled();
+        expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(0);
+        expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it('splits an aggregate required-image overflow into bounded same-timestamp model turns', async () => {
+    const sharedCreatedAt = '2026-07-22T12:00:00.000Z';
+    const emptySha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    const makeRequiredMessage = (id: string, prefix: string) => ({
+      id,
+      content: `Review ${prefix}`,
+      created_at: sharedCreatedAt,
+      from_type: 'user',
+      context: {
+        attachments: Array.from({ length: 5 }, (_, index) => ({
+          type: 'image',
+          mime_type: 'image/png',
+          name: `${prefix}-${index}.png`,
+          url: `https://storage.googleapis.com/bucket/${prefix}-${index}.png?X-Goog-Signature=sig`,
+          artifact_ref_id: `${prefix}-artifact-${index}`,
+          image_checksum: emptySha256,
+        })),
+      },
+    });
+    const open = [
+      makeRequiredMessage('required-batch-one', 'one'),
+      makeRequiredMessage('required-batch-two', 'two'),
+    ];
+    const pollUrls: string[] = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        pollUrls.push(url);
+        return Promise.resolve({ messages: [...open] });
+      }
+      return Promise.resolve(null);
+    });
+    const replyBatches: string[][] = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body?.op === 'create_message') {
+        const data = body.data as Record<string, unknown>;
+        const covered = [...(data.covered_message_ids as string[])];
+        replyBatches.push(covered);
+        for (const id of covered) {
+          const index = open.findIndex(message => message.id === id);
+          if (index >= 0) open.splice(index, 1);
+        }
+      }
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const attachmentFetch = vi.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: (_name: string) => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+    vi.stubGlobal('fetch', attachmentFetch);
+    const modelTurns: Array<Array<Record<string, unknown>>> = [];
+    const session = makeSession(
+      (input) => {
+        if (Array.isArray(input)) modelTurns.push(input);
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the exact revisions.',
+          sentOperatorMessage: false,
+        }));
+      },
+      () => open.length > 0,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    try {
+      await handleStrategicResident(
+        'task-required-artifact-split',
+        {
+          project_name: 'P',
+          open_messages: [],
+          strategic_session_operator_ack_threshold_seconds: 0,
+        },
+        {
+          project_metadata: { project_id: 'proj-required-artifact-split' },
+          context: { message_cursor: sharedCreatedAt },
+        },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(replyBatches).toEqual([
+      ['required-batch-one'],
+      ['required-batch-two'],
+    ]);
+    expect(modelTurns).toHaveLength(2);
+    const imageCounts = modelTurns.map(turn => turn.filter(block => block.type === 'image').length);
+    expect(imageCounts).toEqual([5, 5]);
+    expect(imageCounts.every(count => count <= MAX_IMAGES_PER_TURN)).toBe(true);
+    expect(attachmentFetch).toHaveBeenCalledTimes(10);
+    expect(pollUrls.length).toBeGreaterThanOrEqual(2);
+    expect(pollUrls[1]).toBe(pollUrls[0]);
+    expect(open).toHaveLength(0);
   });
 
   it('does not start the model turn when the stable idempotency key cannot be installed', async () => {

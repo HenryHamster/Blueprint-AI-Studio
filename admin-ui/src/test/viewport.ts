@@ -254,6 +254,9 @@ export async function expectNoTextTruncationAt(
   const truncated: { tag: string; overflow: number; html: string }[] = [];
   const all = document.querySelectorAll<HTMLElement>(selector);
   for (const el of all) {
+    // Screen-reader-only content is intentionally clipped to a 1px box and is
+    // not visible text. Treating it as viewport debt produces false positives.
+    if (el.closest('.sr-only')) continue;
     if (el.closest('[data-viewport-allow-truncation]')) continue;
     // Skip hidden/zero-sized elements (display:none collapses to 0×0)
     const rect = el.getBoundingClientRect();

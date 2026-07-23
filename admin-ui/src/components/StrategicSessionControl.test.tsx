@@ -64,6 +64,27 @@ describe('StrategicSessionControl lifecycle authority', () => {
     expect(screen.queryByTitle('Start Workday session')).not.toBeInTheDocument();
   });
 
+  test('renders the backend retry-wait lifecycle as Waiting', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="waiting"
+        sessionReason="Rate limited; waiting for recovery"
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('Waiting');
+    expect(status).toHaveAttribute('title', 'Rate limited; waiting for recovery');
+    expect(status.querySelector('.animate-spin')).not.toBeNull();
+    expect(screen.getByTitle('Stop Workday session')).toBeEnabled();
+    expect(screen.queryByTitle('Start Workday session')).not.toBeInTheDocument();
+  });
+
   test('keeps the legacy active fallback when lifecycle state is absent', () => {
     render(
       <StrategicSessionControl

@@ -187,6 +187,41 @@ class TestMessages:
         assert "id" in data
 
     @pytest.mark.asyncio
+    async def test_create_message_without_audience_remains_visible(
+        self, client: AsyncClient, db_session
+    ):
+        """A POST-created user row remains readable without an audience tag."""
+        project = await _make_project(db_session)
+        content = "Operator message without an audience tag."
+
+        create_resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": content,
+            },
+        )
+        assert create_resp.status_code == 200, create_resp.text
+        message_id = uuid.UUID(create_resp.json()["id"])
+
+        created = await db_session.get(ProjectMessage, message_id)
+        assert created is not None
+        assert created.from_type == "user"
+        assert "audience" not in (created.context or {})
+
+        list_resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=open"
+        )
+        assert list_resp.status_code == 200, list_resp.text
+        listed = list_resp.json()
+        assert listed["total"] == 1
+        assert [message["id"] for message in listed["messages"]] == [
+            str(message_id)
+        ]
+        assert listed["messages"][0]["content"] == content
+
+    @pytest.mark.asyncio
     async def test_create_message_viewer_forbidden(
         self, client: AsyncClient, db_session
     ):

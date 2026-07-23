@@ -183,6 +183,7 @@ from app.pipeline_health import (  # noqa: E402
     _evaluate_sr_catch_rate_targets,  # noqa: F401
     _evaluate_lone_checker_alert,  # noqa: F401
     compute_pipeline_health_summary,  # noqa: F401
+    read_project_sr_analytics,
 )
 
 
@@ -1525,27 +1526,16 @@ async def _compute_digest(
         )
         memo_ever_cited = await _strategic_cycle.ever_cited_memo(session, project_id)
         if _proj:
-            _sr_trends = (
-                await _read_telemetry_or_doc(
-                    session, _proj.id, _proj.design_doc, "sr_catch_rate_trends"
-                )
-                or {}
-            )
+            _sr_data = await read_project_sr_analytics(session, _proj)
+            _sr_trends = _sr_data.get("sr_catch_rate_trends") or {}
             if _sr_trends:
                 self_review_prediction_accuracy_trends = (
                     _serialize_sr_catch_rate_trends(_sr_trends)
                 )
-            _sr_rrts = await _read_telemetry_or_doc(
-                session,
-                _proj.id,
-                _proj.design_doc,
-                "sr_regression_risk_test_signal_trends",
-            )
+            _sr_rrts = _sr_data.get("sr_regression_risk_test_signal_trends")
             if _sr_rrts:
                 sr_regression_risk_test_signal_trends = _sr_rrts
-            _sft = await _read_telemetry_or_doc(
-                session, _proj.id, _proj.design_doc, "sr_false_attestation_trends"
-            )
+            _sft = _sr_data.get("sr_false_attestation_trends")
             if _sft:
                 sr_false_attestation_trends = _sft
             # Read the newest terminal cycle from the StrategicCycle table.

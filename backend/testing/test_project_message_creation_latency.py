@@ -73,14 +73,14 @@ def test_sequence_critical_section_contains_only_atomic_acceptance_work():
     source = inspect.getsource(create_operator_project_message)
     workbench_at = source.index("await persist_strategic_workbench_update")
     workbench_flush_at = source.index("await session.flush()", workbench_at)
-    project_fence_at = source.index(
-        "# Fence the arming decision on the locked Project",
+    locked_project_at = source.index(
+        "locked_project = await session.scalar(",
         workbench_flush_at,
     )
-    arming_at = source.index("arming = await maybe_arm_operator_refresh", project_fence_at)
+    arming_at = source.index("arming = await maybe_arm_operator_refresh", locked_project_at)
     identity_lock_at = source.index(
         "await _lock_operator_idempotency_key",
-        project_fence_at,
+        locked_project_at,
     )
     reply_at = source.index("if reply_to_message_id is not None:", identity_lock_at)
     precommit_at = source.index("if precommit_validate is not None:", reply_at)
@@ -95,7 +95,7 @@ def test_sequence_critical_section_contains_only_atomic_acceptance_work():
     assert (
         workbench_at
         < workbench_flush_at
-        < project_fence_at
+        < locked_project_at
         < arming_at
         < identity_lock_at
         < reply_at

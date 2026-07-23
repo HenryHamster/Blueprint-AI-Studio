@@ -139,7 +139,7 @@ class TestPersistVersionLaneBaseline:
     @pytest.mark.asyncio
     async def test_persist_writes_baseline_to_table(self, db_session):
         """persist_version_lane_baseline stores a non-None dict in the dedicated
-        project_lane_baseline table (migration 0678 moved it off design_doc)."""
+        project_lane_baseline table without adding a new design_doc copy."""
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -400,10 +400,10 @@ class TestPersistVersionLaneBaseline:
         assert "chains" not in lw
 
     # NOTE: the former test_persist_self_heals_existing_bloated_entries was
-    # removed with migration 0678: baselines now live one-per-row in the
-    # dedicated project_lane_baseline table and each row is slimmed at write
-    # time, so there is no shared design_doc dict to re-slim on subsequent
-    # writes. The per-write slimming is still covered by
+    # removed with the table-writer cutover: new baselines live one-per-row in
+    # project_lane_baseline and each row is slimmed at write time, so there is
+    # no shared design_doc dict to re-slim on subsequent writes. The per-write
+    # slimming is still covered by
     # test_persist_bounds_entry_bytes_preserving_readback above.
 
 
@@ -483,6 +483,37 @@ class TestBackfillMissingLaneBaselines:
         # Original entry must be unchanged (first-write-wins).
         stored = await _read_lane_baseline_row(db_session, project.id, 9)
         assert stored["captured_at"] == "2026-01-01T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_backfill_preserves_legacy_design_doc_version(self, db_session):
+        """A retained historical fallback is data, not a recomputation gap."""
+        legacy = {
+            "version_number": 9,
+            "captured_at": "2026-01-01T00:00:00",
+            "terminal_status": "promoted",
+        }
+        project = make_project(design_doc={DESIGN_DOC_KEY: {"9": legacy}})
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        db_session.add(
+            ReleaseVersion(
+                project_id=project.id,
+                version_number=9,
+                status="promoted",
+                opened_at=now - timedelta(days=14),
+                promoted_at=now - timedelta(days=7),
+            )
+        )
+        await db_session.commit()
+
+        backfilled = await backfill_missing_lane_baselines(project_id=project.id)
+
+        assert backfilled == []
+        assert await _read_lane_baseline_row(db_session, project.id, 9) is None
+        await db_session.refresh(project)
+        assert project.design_doc[DESIGN_DOC_KEY]["9"] == legacy
 
     @pytest.mark.asyncio
     async def test_backfill_respects_max_versions_cap(self, db_session):
@@ -829,7 +860,8 @@ class TestLaneBaselineDualWrite:
     @pytest.mark.asyncio
     async def test_persist_writes_only_to_lane_baseline_table(self, db_session):
         """persist_version_lane_baseline upserts a row into project_lane_baseline
-        and no longer copies it into design_doc (migration 0678 = a move)."""
+        and no longer copies new rows into design_doc; historical fallback data
+        remains readable until a future explicit migration retires it."""
         from testing.conftest import USE_POSTGRES
 
         if not USE_POSTGRES:

@@ -10,14 +10,24 @@ the next cursor.
 """
 
 from datetime import datetime, timedelta, timezone
+import uuid
 
 import pytest
 from httpx import AsyncClient
+from starlette.requests import Request
 
 from app.auth import create_agent_token
 from app.main import app
 from app.models import MessageType, Project, ProjectMessage, Task
-from app.routers.agent_strategic_messages import router as _messages_router
+from app.routers.agent_strategic_messages import (
+    _RESIDENT_POLL_EXPECTED_PER_MINUTE,
+    _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE,
+    _RESIDENT_POLL_REPLACEMENT_OVERLAP,
+    _resident_poll_rate_limit_key,
+    agent_poll_messages,
+    router as _messages_router,
+)
+from app.shared_state import limiter
 
 # The inbound-poll router is intentionally NOT wired into app.main here — that
 # registration line is reported to the operator, not committed by the plumbing
@@ -55,6 +65,65 @@ def _headers(task, vm="agent-vm-msgpoll"):
 
 # Fixed base clock (naive UTC — the column stores naive-UTC values).
 _BASE = datetime(2026, 7, 2, 12, 0, 0)
+
+
+def _rate_limit_request(
+    project_id: uuid.UUID,
+    *,
+    remote: str = "203.0.113.10",
+    token: str = "token-a",
+) -> Request:
+    path = f"/api/agent/projects/{project_id}/messages"
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": "https",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": [(b"x-agent-token", token.encode())],
+            "client": (remote, 4242),
+            "server": ("blueprint.test", 443),
+            "path_params": {"project_id": str(project_id)},
+        }
+    )
+
+
+def test_resident_poll_route_limit_supports_cadence_and_project_isolation():
+    endpoint_key = (
+        f"{agent_poll_messages.__module__}.{agent_poll_messages.__name__}"
+    )
+    registered = [
+        route_limit
+        for route_limit in limiter._route_limits[endpoint_key]
+        if route_limit.key_func is _resident_poll_rate_limit_key
+    ]
+    assert len(registered) == 1
+    assert registered[0].limit.amount == _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE
+    assert registered[0].limit.get_expiry() == 60
+
+    replacement_capacity = (
+        _RESIDENT_POLL_EXPECTED_PER_MINUTE
+        * _RESIDENT_POLL_REPLACEMENT_OVERLAP
+    )
+    assert _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE >= replacement_capacity
+    assert (
+        _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE - replacement_capacity
+        >= _RESIDENT_POLL_EXPECTED_PER_MINUTE
+    )
+
+    project_a = uuid.uuid4()
+    project_b = uuid.uuid4()
+    key_a = _resident_poll_rate_limit_key(_rate_limit_request(project_a))
+    key_b = _resident_poll_rate_limit_key(_rate_limit_request(project_b))
+    assert key_a != key_b
+    assert key_a != _resident_poll_rate_limit_key(
+        _rate_limit_request(project_a, remote="203.0.113.11")
+    )
+    assert key_a == _resident_poll_rate_limit_key(
+        _rate_limit_request(project_a, token="rotated-token")
+    )
 
 
 @pytest.mark.asyncio
@@ -465,6 +534,67 @@ async def test_resident_poll_uses_authenticated_session_scope(
     )
     assert response.status_code == 200, response.text
     assert [row["id"] for row in response.json()["messages"]] == [str(own.id)]
+
+
+@pytest.mark.asyncio
+async def test_resident_final_fence_orders_equal_timestamps_deterministically(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    equal_time = _BASE
+    seq_four = await _add_message(
+        db_session,
+        project,
+        id=uuid.UUID("00000000-0000-0000-0000-000000000040"),
+        from_type="user",
+        status="open",
+        content="sequence four inserted first",
+        sequence=4,
+        created_at=equal_time,
+    )
+    seq_two = await _add_message(
+        db_session,
+        project,
+        id=uuid.UUID("00000000-0000-0000-0000-000000000020"),
+        from_type="user",
+        status="open",
+        content="sequence two inserted second",
+        sequence=2,
+        created_at=equal_time,
+    )
+    seq_one = await _add_message(
+        db_session,
+        project,
+        id=uuid.UUID("00000000-0000-0000-0000-000000000010"),
+        from_type="user",
+        status="open",
+        content="sequence one inserted third",
+        sequence=1,
+        created_at=equal_time,
+    )
+    seq_three = await _add_message(
+        db_session,
+        project,
+        id=uuid.UUID("00000000-0000-0000-0000-000000000030"),
+        from_type="user",
+        status="open",
+        content="sequence three inserted last",
+        sequence=3,
+        created_at=equal_time,
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+
+    assert response.status_code == 200, response.text
+    assert [row["id"] for row in response.json()["messages"]] == [
+        str(seq_one.id),
+        str(seq_two.id),
+        str(seq_three.id),
+        str(seq_four.id),
+    ]
 
 
 @pytest.mark.asyncio

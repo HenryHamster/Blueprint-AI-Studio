@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderHook, cleanup, waitFor } from '@testing-library/react';
+import { act, renderHook, cleanup, waitFor } from '@testing-library/react';
 import { useStrategicSession } from './useStrategicSession';
-import { startStrategicSession } from '../strategicStateApi';
+import { startStrategicSession, stopStrategicSession } from '../strategicStateApi';
 import type {
   StrategicLivenessResponse,
   StrategicSessionStartResponse,
@@ -46,6 +46,19 @@ function makeLiveness(): StrategicLivenessResponse {
     resident_session_runners: [
       { id: 'r-1', name: 'desk', online: true, agent_ready: true, eligible: true },
     ],
+  };
+}
+
+function successfulStartResponse(): StrategicSessionStartResponse {
+  return {
+    project_id: 'proj-1',
+    ensure_outcome: 'ensured',
+    session: {
+      session_id: 'ss-live',
+      status: 'active',
+      worker_state: 'ready',
+      started_at: new Date().toISOString(),
+    },
   };
 }
 
@@ -125,8 +138,7 @@ describe('useStrategicSession liveness fallback', () => {
   });
 
   it('idempotently ensures Workday once when reload hydrates directly into continuous mode', async () => {
-    const response: StrategicSessionStartResponse = { project_id: 'proj-1', session: null };
-    vi.mocked(startStrategicSession).mockResolvedValue(response);
+    vi.mocked(startStrategicSession).mockResolvedValue(successfulStartResponse());
     const readModel = makeReadModel(null);
     const { rerender } = renderHook(() =>
       useStrategicSession({
@@ -148,10 +160,9 @@ describe('useStrategicSession liveness fallback', () => {
   });
 
   it('retries a transient Workday ensure failure and stops after recovery', async () => {
-    const response: StrategicSessionStartResponse = { project_id: 'proj-1', session: null };
     vi.mocked(startStrategicSession)
       .mockRejectedValueOnce(new Error('temporary conflict'))
-      .mockResolvedValue(response);
+      .mockResolvedValue(successfulStartResponse());
     const readModel = makeReadModel(null);
     renderHook(() =>
       useStrategicSession({
@@ -176,9 +187,7 @@ describe('useStrategicSession liveness fallback', () => {
         ensure_outcome: 'mode_changed',
       })
       .mockResolvedValue({
-        project_id: 'proj-1',
-        session: null,
-        ensure_outcome: 'ensured',
+        ...successfulStartResponse(),
       });
     const readModel = makeReadModel(null);
     renderHook(() =>
@@ -193,6 +202,34 @@ describe('useStrategicSession liveness fallback', () => {
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(readModel.refresh).toHaveBeenCalledTimes(1));
     await new Promise(resolve => window.setTimeout(resolve, 350));
+    expect(startStrategicSession).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['null session', null],
+    ['all-empty session', {}],
+  ])('retries a 200 response with %s instead of completing the ensure epoch', async (_label, session) => {
+    vi.mocked(startStrategicSession)
+      .mockResolvedValueOnce({
+        project_id: 'proj-1',
+        session: session as StrategicSessionStartResponse['session'],
+        ensure_outcome: 'ensured',
+      })
+      .mockResolvedValue(successfulStartResponse());
+    const readModel = makeReadModel(null);
+    const { rerender } = renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1',
+        addToast: vi.fn(),
+        strategicReadModel: readModel,
+        strategicLiveness: makeLiveness(),
+      }),
+    );
+
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(readModel.refresh).toHaveBeenCalledTimes(1));
+    rerender();
+    await new Promise(resolve => window.setTimeout(resolve, 600));
     expect(startStrategicSession).toHaveBeenCalledTimes(2);
   });
 
@@ -219,7 +256,7 @@ describe('useStrategicSession liveness fallback', () => {
     rerender({ loading: false });
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
 
-    resolveStart({ project_id: 'proj-1', session: null });
+    resolveStart(successfulStartResponse());
     await waitFor(() => expect(stableReadModel.refresh).toHaveBeenCalledTimes(1));
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
   });
@@ -291,6 +328,112 @@ describe('useStrategicSession liveness fallback', () => {
     expect(readModel.refresh).not.toHaveBeenCalled();
   });
 
+  it('keeps an explicitly stopped Workday stopped until the operator explicitly starts it', async () => {
+    vi.mocked(startStrategicSession).mockResolvedValue(successfulStartResponse());
+    vi.mocked(stopStrategicSession).mockResolvedValue({
+      project_id: 'proj-1',
+      session: {
+        session_id: 'ss-live',
+        status: 'ended',
+        stop_requested: true,
+      },
+    });
+    const readModel = makeReadModel(null);
+    const initial = makeLiveness();
+    const { result, rerender } = renderHook(
+      ({ liveness }: { liveness: StrategicLivenessResponse }) =>
+        useStrategicSession({
+          selectedProjectId: 'proj-1',
+          addToast: vi.fn(),
+          strategicReadModel: readModel,
+          strategicLiveness: liveness,
+        }),
+      { initialProps: { liveness: initial } },
+    );
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      await result.current.handleStopStrategicSession();
+    });
+    expect(stopStrategicSession).toHaveBeenCalledWith('proj-1');
+    rerender({
+      liveness: {
+        ...initial,
+        resident_session: {
+          ...initial.resident_session,
+          status: 'ended',
+          stop_requested: true,
+          ended_at: new Date().toISOString(),
+        },
+        resident_session_availability: {
+          available: false,
+          state: 'off',
+          reason: 'Stopped by operator',
+        },
+      },
+    });
+    await new Promise(resolve => window.setTimeout(resolve, 600));
+    expect(startStrategicSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await result.current.handleStartStrategicSession();
+    });
+    expect(startStrategicSession).toHaveBeenCalledTimes(2);
+    expect(startStrategicSession).toHaveBeenLastCalledWith('proj-1', {});
+  });
+
+  it('allows Workday auto-ensure again after leaving and explicitly re-entering continuous mode', async () => {
+    vi.mocked(startStrategicSession).mockResolvedValue(successfulStartResponse());
+    vi.mocked(stopStrategicSession).mockResolvedValue({
+      project_id: 'proj-1',
+      session: { session_id: 'ss-live', status: 'ended', stop_requested: true },
+    });
+    const initial = makeLiveness();
+    const { result, rerender } = renderHook(
+      ({ liveness }: { liveness: StrategicLivenessResponse }) =>
+        useStrategicSession({
+          selectedProjectId: 'proj-1',
+          addToast: vi.fn(),
+          strategicReadModel: makeReadModel(null),
+          strategicLiveness: liveness,
+        }),
+      { initialProps: { liveness: initial } },
+    );
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await result.current.handleStopStrategicSession();
+    });
+
+    rerender({
+      liveness: {
+        ...initial,
+        interaction_mode: 'chat',
+        resident_session: {
+          ...initial.resident_session,
+          status: 'ended',
+          stop_requested: true,
+        },
+      },
+    });
+    await new Promise(resolve => window.setTimeout(resolve, 50));
+    expect(startStrategicSession).toHaveBeenCalledTimes(1);
+
+    rerender({
+      liveness: {
+        ...initial,
+        resident_session: {
+          ...initial.resident_session,
+          status: 'ended',
+          stop_requested: true,
+        },
+      },
+    });
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
+    expect(startStrategicSession).toHaveBeenLastCalledWith('proj-1', {
+      expected_interaction_mode: 'continuous',
+    });
+  });
+
   it('treats retry_wait as healthy dormant state and does not restart it on reload', async () => {
     const liveness = makeLiveness();
     liveness.resident_session = {
@@ -323,7 +466,7 @@ describe('useStrategicSession liveness fallback', () => {
       worker_retry_reason: 'Provider rate limit',
     };
     vi.mocked(startStrategicSession).mockResolvedValue(
-      { project_id: 'proj-1', session: null },
+      successfulStartResponse(),
     );
     renderHook(() =>
       useStrategicSession({
@@ -345,7 +488,7 @@ describe('useStrategicSession liveness fallback', () => {
       updated_at: '2026-06-01T10:00:00Z',
     };
     vi.mocked(startStrategicSession).mockResolvedValue(
-      { project_id: 'proj-1', session: null },
+      successfulStartResponse(),
     );
     renderHook(() =>
       useStrategicSession({
@@ -357,5 +500,186 @@ describe('useStrategicSession liveness fallback', () => {
     );
 
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+  });
+
+  it('re-ensures a terminal worker generation on the same page exactly once', async () => {
+    vi.mocked(startStrategicSession).mockResolvedValue(
+      successfulStartResponse(),
+    );
+    const readModel = makeReadModel(null);
+    const healthy = makeLiveness();
+    healthy.resident_session = {
+      ...healthy.resident_session,
+      worker_generation: 3,
+      worker_state: 'ready',
+      updated_at: new Date().toISOString(),
+    };
+    const { rerender } = renderHook(
+      ({ liveness }: { liveness: StrategicLivenessResponse }) =>
+        useStrategicSession({
+          selectedProjectId: 'proj-1',
+          addToast: vi.fn(),
+          strategicReadModel: readModel,
+          strategicLiveness: liveness,
+        }),
+      { initialProps: { liveness: healthy } },
+    );
+
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+
+    const terminal: StrategicLivenessResponse = {
+      ...healthy,
+      resident_session: {
+        ...healthy.resident_session,
+        status: 'ended',
+        worker_state: 'restart_failed',
+        ended_at: new Date().toISOString(),
+      },
+      resident_session_availability: {
+        available: true,
+        state: 'error',
+        reason: 'start_failed: worker exited',
+      },
+    };
+    rerender({ liveness: terminal });
+
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
+    rerender({ liveness: { ...terminal } });
+    await new Promise(resolve => window.setTimeout(resolve, 50));
+    expect(startStrategicSession).toHaveBeenCalledTimes(2);
+
+    const recovered: StrategicLivenessResponse = {
+      ...healthy,
+      resident_session: {
+        ...healthy.resident_session,
+        session_id: 'ss-recovered',
+        worker_generation: 4,
+      },
+    };
+    rerender({ liveness: recovered });
+    await new Promise(resolve => window.setTimeout(resolve, 50));
+    expect(startStrategicSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-ensures when backend exposes start_failed error before the active blob clears', async () => {
+    vi.mocked(startStrategicSession).mockResolvedValue(
+      successfulStartResponse(),
+    );
+    const readModel = makeReadModel(null);
+    const healthy = makeLiveness();
+    healthy.resident_session = {
+      ...healthy.resident_session,
+      worker_generation: 9,
+      worker_state: 'ready',
+      updated_at: new Date().toISOString(),
+    };
+    const { rerender } = renderHook(
+      ({ liveness }: { liveness: StrategicLivenessResponse }) =>
+        useStrategicSession({
+          selectedProjectId: 'proj-1',
+          addToast: vi.fn(),
+          strategicReadModel: readModel,
+          strategicLiveness: liveness,
+        }),
+      { initialProps: { liveness: healthy } },
+    );
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+
+    const failedButNotYetCleared: StrategicLivenessResponse = {
+      ...healthy,
+      resident_session: {
+        ...healthy.resident_session,
+        status: 'active',
+        worker_state: 'ready',
+      },
+      resident_session_availability: {
+        available: true,
+        state: 'error',
+        reason: 'start_failed: terminal worker could not restart',
+      },
+    };
+    rerender({ liveness: failedButNotYetCleared });
+
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
+    rerender({ liveness: { ...failedButNotYetCleared } });
+    await new Promise(resolve => window.setTimeout(resolve, 50));
+    expect(startStrategicSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-ensures an observed wedged starting worker without repeating the epoch', async () => {
+    vi.mocked(startStrategicSession).mockResolvedValue(
+      successfulStartResponse(),
+    );
+    const readModel = makeReadModel(null);
+    const healthy = makeLiveness();
+    const { rerender } = renderHook(
+      ({ liveness }: { liveness: StrategicLivenessResponse }) =>
+        useStrategicSession({
+          selectedProjectId: 'proj-1',
+          addToast: vi.fn(),
+          strategicReadModel: readModel,
+          strategicLiveness: liveness,
+        }),
+      { initialProps: { liveness: healthy } },
+    );
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+
+    const wedged: StrategicLivenessResponse = {
+      ...healthy,
+      resident_session: {
+        ...healthy.resident_session,
+        worker_generation: 7,
+        worker_state: 'starting',
+        started_at: '2020-01-01T00:00:00Z',
+        updated_at: '2020-01-01T00:00:00Z',
+      },
+      resident_session_availability: {
+        available: true,
+        state: 'starting',
+        reason: null,
+      },
+    };
+    rerender({ liveness: wedged });
+
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(2));
+    rerender({ liveness: { ...wedged } });
+    await new Promise(resolve => window.setTimeout(resolve, 50));
+    expect(startStrategicSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('wakes itself when an unchanged starting snapshot crosses the stale deadline', async () => {
+    vi.mocked(startStrategicSession).mockResolvedValue(
+      successfulStartResponse(),
+    );
+    const readModel = makeReadModel(null);
+    const nearDeadline = makeLiveness();
+    const startedAt = new Date(Date.now() - 5 * 60_000 + 100).toISOString();
+    nearDeadline.resident_session = {
+      ...nearDeadline.resident_session,
+      worker_generation: 11,
+      worker_state: 'starting',
+      started_at: startedAt,
+      updated_at: startedAt,
+    };
+    nearDeadline.resident_session_availability = {
+      available: true,
+      state: 'starting',
+      reason: null,
+    };
+
+    renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1',
+        addToast: vi.fn(),
+        strategicReadModel: readModel,
+        strategicLiveness: nearDeadline,
+      }),
+    );
+
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+    await waitFor(
+      () => expect(startStrategicSession).toHaveBeenCalledTimes(2),
+      { timeout: 1_000 },
+    );
   });
 });

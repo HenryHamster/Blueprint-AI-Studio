@@ -1677,6 +1677,33 @@ def _arm_and_finalize_vision(
     return True
 
 
+async def _repair_stale_message_handoffs_after_ensure(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Best-effort retry for a prior session's interrupted message handoff."""
+    try:
+        from app.session_message_handoff import (
+            repair_stale_session_message_handoffs,
+        )
+
+        await repair_stale_session_message_handoffs(
+            session,
+            project_id,
+        )
+    except Exception:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "[RESIDENT_SESSION] stale message handoff repair failed for project %s; "
+            "a later ensure will retry",
+            project_id,
+            exc_info=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -1790,9 +1817,13 @@ async def start_resident_session(
             expected_interaction_mode is None
             and _resident_worker_task_is_healthy(live, existing, now)
         ):
-            return (
+            snapshot = (
                 resident_session_snapshot_for_task(project.vision, live, now=now) or {}
             )
+            await _repair_stale_message_handoffs_after_ensure(
+                session, project.id
+            )
+            return snapshot
         # Snapshot the complete predecessor identity so a delayed repair can
         # replace only this exact worker generation.
         try:
@@ -2051,8 +2082,10 @@ async def start_resident_session(
             "Resident recovery identity was stopped, requeued, or superseded"
         )
     if decision["mode"] == "existing":
+        snapshot = await authoritative_resident_session_snapshot(session, project) or {}
         # A concurrent start owns (or is mid-starting) the session — return it.
-        return await authoritative_resident_session_snapshot(session, project) or {}
+        await _repair_stale_message_handoffs_after_ensure(session, project.id)
+        return snapshot
 
     if decision["mode"] == "blocked":
         # The selected/auto-picked device is unavailable and we are not backing
@@ -2302,7 +2335,11 @@ async def start_resident_session(
         task_id_str,
         project.id,
     )
-    return resident_session_snapshot(project.vision) or {}
+    snapshot = resident_session_snapshot(project.vision) or {}
+    await _repair_stale_message_handoffs_after_ensure(
+        session, project.id
+    )
+    return snapshot
 
 
 async def _run_resident_completion_on_stop(

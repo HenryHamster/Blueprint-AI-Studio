@@ -27372,10 +27372,12 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
     keys = resp.json()["keys"]
     assert "normal-key" in keys
     assert "playbook/lint-rules" not in keys
-    # NOTE: lane_baselines, sr_catch_rate_trends, and efficiency_baseline were
-    # moved out of design_doc into dedicated tables (migration 0658) and removed
-    # from _RESERVED_DESIGN_DOC_KEYS — they are no longer reserved design-doc keys.
+    # Dedicated-store values remain hidden while their retained design_doc
+    # fallback is available for rolling deploys and rollback.
     for reserved in (
+        "lane_baselines",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
         "playbook_archive",
         "proposed_changes",
         "module_feedback",
@@ -27411,9 +27413,10 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
     assert "playbook" in resp.json()["error"]["message"].lower()
 
     # set/delete on each exact reserved key must return 400
-    # (lane_baselines/sr_catch_rate_trends/efficiency_baseline are no longer
-    # reserved — moved to dedicated tables in migration 0658.)
     for reserved in (
+        "lane_baselines",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
         "playbook_archive",
         "proposed_changes",
         "module_feedback",

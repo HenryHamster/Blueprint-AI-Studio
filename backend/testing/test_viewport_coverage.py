@@ -107,11 +107,13 @@ class TestComputeViewportCoverageSnapshot:
         assert snap["new_escape_hatch_count"] == 0
 
     @pytest.mark.asyncio
-    async def test_update_writes_to_design_doc(self, db_session):
-        """update_viewport_coverage_snapshot_from_diff writes to project.design_doc."""
+    async def test_update_writes_to_dedicated_sr_analytics(self, db_session):
+        """Viewport coverage writes only to the dedicated SR analytics row."""
+        from app.models import ProjectSRAnalytics
         from app.viewport_coverage import update_viewport_coverage_snapshot_from_diff
 
         project = make_project()
+        project.design_doc = {"architectural_context": {"keep": True}}
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -123,8 +125,10 @@ class TestComputeViewportCoverageSnapshot:
         await db_session.commit()
         await db_session.refresh(project)
 
-        snap = (project.design_doc or {}).get("viewport_coverage_snapshot")
-        assert snap is not None
+        row = await db_session.get(ProjectSRAnalytics, project.id)
+        assert row is not None
+        snap = row.data["viewport_coverage_snapshot"]
+        assert project.design_doc == {"architectural_context": {"keep": True}}
         assert snap["assertion_count_before"] == 8
         assert snap["assertion_count_after"] == 6
         assert snap["merged_pr"] == 123

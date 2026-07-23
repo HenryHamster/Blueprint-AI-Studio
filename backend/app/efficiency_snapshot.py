@@ -31,7 +31,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.admin_helpers import _get_user_project_with_role
@@ -83,7 +82,6 @@ from app.project_telemetry import (
     read_recent_efficiency_snapshots,
 )
 from app.task_capabilities import is_pr_eligible_task_type
-from app.task_locking import project_lock
 from app.vm_cost_rates import idle_cost_usd
 
 router = APIRouter()
@@ -296,6 +294,24 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
 
 DESIGN_DOC_KEY = "efficiency_baseline"
 
+
+async def _persist_container_to_design_doc(
+    session: AsyncSession, project_id: uuid.UUID, container: Dict[str, Any]
+) -> None:
+    """Keep the rollback-safe design-doc copy aligned with telemetry."""
+    from app.task_locking import with_design_doc_locked
+
+    def _store(doc: Dict[str, Any]) -> None:
+        doc[DESIGN_DOC_KEY] = container
+
+    await with_design_doc_locked(
+        session,
+        project_id,
+        _store,
+        skip_locked=False,
+        raise_on_size_limit=False,
+    )
+
 # Sub-key under the efficiency_baseline container recording the last warm-pool
 # payoff verdict state we raised an operator alert for. The per-project
 # transition check (:func:`maybe_alert_pool_payoff_transition`) compares the
@@ -402,9 +418,9 @@ async def _read_snapshot_history(
     ``captured_at`` (table rows win on conflict), sorted oldest-first and
     truncated to the newest ``_SNAPSHOT_HISTORY_MAX`` entries.
 
-    The current implementation deliberately leaves ``efficiency_baseline``
-    dual-written and does NOT backfill the table, so on a mature project the
-    table starts empty while design_doc still holds up to ``_SNAPSHOT_HISTORY_MAX`` historical
+    The rolling cutover leaves ``efficiency_baseline`` dual-written and does
+    not backfill historical snapshots, so on a mature project the table starts empty
+    while design_doc still holds up to ``_SNAPSHOT_HISTORY_MAX`` historical
     snapshots. A prefer-table-exclusive read would drop those older design_doc
     snapshots until the table naturally refills (~7 daily cycles), transiently
     truncating operator-facing trend arrays and hiding a ``serving_sha`` whose
@@ -3034,15 +3050,24 @@ async def write_snapshot(
         **axes,
     }
 
-    # Lock the project row for the read-modify-write so concurrent background
-    # writers (e.g. sr_blind_spots, playbook_learning) cannot clobber each
-    # other's keys with stale reads.  skip_locked=False: background callers
-    # should wait rather than silently skip (no 429 to surface).
-    async with project_lock(session, project_id, skip_locked=False) as project:
-        if project is None:
-            raise ValueError(f"Project {project_id} not found")
+    project = await session.get(Project, project_id, populate_existing=True)
+    if project is None:
+        raise ValueError(f"Project {project_id} not found")
 
-        container = dict((project.design_doc or {}).get(DESIGN_DOC_KEY) or {})
+    from app.task_locking import project_telemetry_value_lock
+
+    # Serialize snapshot/container and alert-marker writers on the same keyed
+    # telemetry row. This avoids lost markers and keeps a single lock order:
+    # telemetry first, then the rollback-safe Project design-doc copy.
+    async with project_telemetry_value_lock(
+        session,
+        project_id,
+        DESIGN_DOC_KEY,
+        design_doc_fallback=project.design_doc,
+        skip_locked=False,
+    ) as container:
+        if container is None:
+            raise RuntimeError("efficiency telemetry row could not be locked")
 
         if not container.get("baseline"):
             container["baseline"] = dict(snapshot)
@@ -3204,14 +3229,7 @@ async def write_snapshot(
         container["snapshots"] = snapshots
         container["last_run_at"] = captured_at
 
-        doc = dict(project.design_doc or {})
-        doc[DESIGN_DOC_KEY] = container
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
-
-    from app.project_telemetry import set_project_telemetry
-    await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, container)
+    await _persist_container_to_design_doc(session, project_id, container)
 
     # Dual-write the snapshot time-series to the dedicated
     # project_efficiency_snapshot table. Done OUTSIDE the project_lock block so
@@ -3543,7 +3561,17 @@ async def read_baseline_with_drift(
     _pool_amortization_windowed_idle_usd = _windowed_idle_result["total"]
     _pool_amortization_windowed_by_account = _windowed_idle_result["by_account"]
 
-    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    from app.project_telemetry import get_project_telemetry
+
+    container = dict(
+        await get_project_telemetry(
+            session,
+            project_id,
+            DESIGN_DOC_KEY,
+            design_doc_fallback=project.design_doc,
+        )
+        or {}
+    )
     baseline = container.get("baseline") or {}
     snapshots = await _read_snapshot_history(session, project_id, container)
     latest = snapshots[-1] if snapshots else {}
@@ -4038,7 +4066,17 @@ async def maybe_write_daily_snapshot(
     if project is None:
         return None
 
-    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    from app.project_telemetry import get_project_telemetry
+
+    container = dict(
+        await get_project_telemetry(
+            session,
+            project_id,
+            DESIGN_DOC_KEY,
+            design_doc_fallback=project.design_doc,
+        )
+        or {}
+    )
     if not _last_run_due(container.get("last_run_at"), now):
         return None
     return await write_snapshot(session, project_id)
@@ -4076,7 +4114,7 @@ async def maybe_alert_pool_payoff_transition(
     from app.alert_dispatch import _maybe_create_pool_payoff_alert
     from app.alert_policy import alert_policy_allows
     from app.models import AlertSeverity
-    from app.task_locking import with_efficiency_snapshot_locked
+    from app.task_locking import with_project_telemetry_locked
     from app.warm_pool import is_project_warm_pool_scoped
 
     if not is_project_warm_pool_scoped(project_id):
@@ -4114,10 +4152,20 @@ async def maybe_alert_pool_payoff_transition(
     # last state we have a durable alert for. The marker is advanced only after
     # an active alert row exists; otherwise a policy race could record "alerted"
     # without any operator-visible alert.
+    from app.project_telemetry import get_project_telemetry
+
     _proj = await session.get(Project, project_id)
     if _proj is None:
         return None
-    container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
+    container_read = dict(
+        await get_project_telemetry(
+            session,
+            project_id,
+            DESIGN_DOC_KEY,
+            design_doc_fallback=_proj.design_doc,
+        )
+        or {}
+    )
     should_fire = container_read.get(LAST_ALERTED_PAYOFF_KEY) != state
 
     if not should_fire:
@@ -4143,13 +4191,19 @@ async def maybe_alert_pool_payoff_transition(
         changed["fire"] = True
         changed["container"] = container
 
-    wrote_marker = await with_efficiency_snapshot_locked(
-        session, project_id, _advance_marker, skip_locked=False
+    wrote_marker = await with_project_telemetry_locked(
+        session,
+        project_id,
+        DESIGN_DOC_KEY,
+        _advance_marker,
+        design_doc_fallback=_proj.design_doc,
+        skip_locked=False,
     )
     if wrote_marker and changed["fire"]:
-        from app.project_telemetry import set_project_telemetry
         if "container" in changed:
-            await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
+            await _persist_container_to_design_doc(
+                session, project_id, changed["container"]
+            )
         await session.commit()
     else:
         await session.rollback()
@@ -4194,7 +4248,7 @@ async def maybe_alert_unpriced_models_coverage(
     """
     from app.alert_dispatch import _maybe_create_unpriced_models_alert
     from app.models import AlertSeverity
-    from app.task_locking import with_efficiency_snapshot_locked
+    from app.task_locking import with_project_telemetry_locked
 
     tasks = await _load_recent_tasks(session, project_id)
     coverage = _compute_llm_cost_pricing_coverage(tasks)
@@ -4222,12 +4276,19 @@ async def maybe_alert_unpriced_models_coverage(
         changed["fire"] = degraded  # only the degraded crossing raises an alert
         changed["container"] = container
 
-    await with_efficiency_snapshot_locked(
-        session, project_id, _advance_marker, skip_locked=False
+    _proj = await session.get(Project, project_id)
+    await with_project_telemetry_locked(
+        session,
+        project_id,
+        DESIGN_DOC_KEY,
+        _advance_marker,
+        design_doc_fallback=(_proj.design_doc if _proj is not None else None),
+        skip_locked=False,
     )
     if changed.get("container") is not None:
-        from app.project_telemetry import set_project_telemetry
-        await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
+        await _persist_container_to_design_doc(
+            session, project_id, changed["container"]
+        )
     if not changed["fire"]:
         return None
 
@@ -4274,7 +4335,7 @@ async def maybe_alert_self_repair_burn_share(
     """
     from app.alert_dispatch import _maybe_create_self_repair_burn_share_alert
     from app.models import AlertSeverity
-    from app.task_locking import with_efficiency_snapshot_locked
+    from app.task_locking import with_project_telemetry_locked
 
     from app.digest_metrics import _accumulate_format_compliance
 
@@ -4312,12 +4373,19 @@ async def maybe_alert_self_repair_burn_share(
         changed["fire"] = elevated  # only the elevated crossing raises an alert
         changed["container"] = container
 
-    await with_efficiency_snapshot_locked(
-        session, project_id, _advance_marker, skip_locked=False
+    _proj = await session.get(Project, project_id)
+    await with_project_telemetry_locked(
+        session,
+        project_id,
+        DESIGN_DOC_KEY,
+        _advance_marker,
+        design_doc_fallback=(_proj.design_doc if _proj is not None else None),
+        skip_locked=False,
     )
     if changed.get("container") is not None:
-        from app.project_telemetry import set_project_telemetry
-        await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
+        await _persist_container_to_design_doc(
+            session, project_id, changed["container"]
+        )
     if not changed["fire"]:
         return None
 
@@ -4359,7 +4427,7 @@ async def maybe_alert_provider_routing_transition(
     from app.alert_dispatch import _maybe_create_provider_routing_alert
     from app.alert_policy import alert_policy_allows
     from app.models import AlertSeverity
-    from app.task_locking import with_efficiency_snapshot_locked
+    from app.task_locking import with_project_telemetry_locked
 
     drift = await read_baseline_with_drift(session, project_id)
     verdict = drift.get("provider_routing_verdict") or {}
@@ -4390,10 +4458,20 @@ async def maybe_alert_provider_routing_transition(
 
     # Transition edge: only fire when the alert-worthy state differs from the
     # last state we have a durable alert for.
+    from app.project_telemetry import get_project_telemetry
+
     _proj = await session.get(Project, project_id)
     if _proj is None:
         return None
-    container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
+    container_read = dict(
+        await get_project_telemetry(
+            session,
+            project_id,
+            DESIGN_DOC_KEY,
+            design_doc_fallback=_proj.design_doc,
+        )
+        or {}
+    )
     should_fire = container_read.get(LAST_ALERTED_ROUTING_KEY) != state
 
     if not should_fire:
@@ -4421,13 +4499,19 @@ async def maybe_alert_provider_routing_transition(
         changed["fire"] = True
         changed["container"] = container
 
-    wrote_marker = await with_efficiency_snapshot_locked(
-        session, project_id, _advance_marker, skip_locked=False
+    wrote_marker = await with_project_telemetry_locked(
+        session,
+        project_id,
+        DESIGN_DOC_KEY,
+        _advance_marker,
+        design_doc_fallback=_proj.design_doc,
+        skip_locked=False,
     )
     if wrote_marker and changed["fire"]:
-        from app.project_telemetry import set_project_telemetry
         if "container" in changed:
-            await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
+            await _persist_container_to_design_doc(
+                session, project_id, changed["container"]
+            )
         await session.commit()
     else:
         await session.rollback()

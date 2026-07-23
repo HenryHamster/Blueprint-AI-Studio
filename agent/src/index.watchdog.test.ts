@@ -1,5 +1,20 @@
 import { vi, describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest';
 
+// Vitest's fake-timer teardown can remove Node's inherited setImmediate after a
+// test spies on it. Preserve the real implementation at file scope and restore
+// it before every case so later retry/clone tests cannot inherit timer pollution.
+const nativeSetImmediate = globalThis.setImmediate;
+beforeEach(() => {
+  if (globalThis.setImmediate !== nativeSetImmediate) {
+    Object.defineProperty(globalThis, 'setImmediate', {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: nativeSetImmediate,
+    });
+  }
+});
+
 // ── Pre-import setup (hoisted before any module loads) ───────────────────────
 // index.ts guards main() and process event handlers behind an isMain check,
 // so they do NOT run when the file is imported by vitest. The hoisted block
@@ -1088,6 +1103,7 @@ describe('drainJsonChunks within-chunk yielding', () => {
     // WITHIN_CHUNK_YIELD_LINES=50: a 200-line chunk yields at line 51, 101, 151 => >=3.
     // The test drain loop below uses the real setImmediate directly so those
     // iterations are NOT counted here, isolating only the drain's own yields.
+    const originalSetImmediateDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'setImmediate');
     const realSetImmediate = globalThis.setImmediate.bind(globalThis);
     let drainYieldCount = 0;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1095,14 +1111,20 @@ describe('drainJsonChunks within-chunk yielding', () => {
       drainYieldCount++;
       return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
     });
-    emitData(Buffer.from(lines.join('\n') + '\n'));
+    try {
+      emitData(Buffer.from(lines.join('\n') + '\n'));
 
-    // Drain microtasks/immediates so drainJsonChunks completes fully.
-    // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => realSetImmediate(r as () => void));
+      // Drain microtasks/immediates so drainJsonChunks completes fully.
+      // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => realSetImmediate(r as () => void));
+      }
+    } finally {
+      siSpy.mockRestore();
+      if (originalSetImmediateDescriptor) {
+        Object.defineProperty(globalThis, 'setImmediate', originalSetImmediateDescriptor);
+      }
     }
-    siSpy.mockRestore();
 
     // Assert the drain yielded to the event loop >= 3 times (WITHIN_CHUNK_YIELD_LINES=50).
     expect(drainYieldCount).toBeGreaterThanOrEqual(3);
@@ -1136,6 +1158,7 @@ describe('drainJsonChunks within-chunk yielding', () => {
     // WITHIN_CHUNK_YIELD_LINES=50: a 121-line chunk yields at line 51, 101 => >=2.
     // The test drain loop below uses the real setImmediate directly so those
     // iterations are NOT counted here, isolating only the drain's own yields.
+    const originalSetImmediateDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'setImmediate');
     const realSetImmediate = globalThis.setImmediate.bind(globalThis);
     let drainYieldCount = 0;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1143,14 +1166,20 @@ describe('drainJsonChunks within-chunk yielding', () => {
       drainYieldCount++;
       return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
     });
-    emitData(Buffer.from(lines.join('\n') + '\n'));
+    try {
+      emitData(Buffer.from(lines.join('\n') + '\n'));
 
-    // Drain microtasks
-    // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => realSetImmediate(r as () => void));
+      // Drain microtasks
+      // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => realSetImmediate(r as () => void));
+      }
+    } finally {
+      siSpy.mockRestore();
+      if (originalSetImmediateDescriptor) {
+        Object.defineProperty(globalThis, 'setImmediate', originalSetImmediateDescriptor);
+      }
     }
-    siSpy.mockRestore();
 
     // Assert the drain yielded to the event loop >= 2 times (WITHIN_CHUNK_YIELD_LINES=50).
     expect(drainYieldCount).toBeGreaterThanOrEqual(2);

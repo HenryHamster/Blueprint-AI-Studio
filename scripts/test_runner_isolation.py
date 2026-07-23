@@ -162,8 +162,7 @@ class TestDecisionTable(unittest.TestCase):
     def test_agent_docker_types_membership(self):
         # The MUST-include read-only slice is present.
         for t in (
-            "strategic_resident_turn", "strategic_review", "research",
-            "web_research", "plan", "design",
+            "strategic_review", "research", "web_research", "plan", "design",
             "memo", "investigate", "design_doc_update",
         ):
             self.assertIn(t, iso.AGENT_DOCKER_TYPES)
@@ -171,8 +170,8 @@ class TestDecisionTable(unittest.TestCase):
         # ``docs`` is a WRITE/PR type (agent_mode="write", output_kind="pr") and
         # must NOT run in the read-only image.
         for t in (
-            "create", "fix", "refactor", "verify_tests", "smoketest",
-            "compute_experiment", "qa", "migrate", "docs",
+            "strategic_resident_turn", "create", "fix", "refactor",
+            "verify_tests", "smoketest", "compute_experiment", "qa", "migrate", "docs",
         ):
             self.assertNotIn(t, iso.AGENT_DOCKER_TYPES)
 

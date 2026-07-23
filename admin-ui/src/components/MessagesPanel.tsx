@@ -50,6 +50,14 @@ import { finalizeLastAttachmentRemoval, type ConversationComposerIntent, updateC
 import { ComposerRequestOwnershipGuard } from '../utils/composerRequestOwnership';
 import { ConversationAttachmentUploadError, uploadConversationAttachments } from '../utils/conversationAttachmentUpload';
 import {
+  acknowledgeQueuedResidentToolHandoffs,
+  isResidentToolHandoffEvent,
+  isResidentToolHandoffQueueStorageKey,
+  loadQueuedResidentToolHandoffEntries,
+  RESIDENT_TOOL_HANDOFF_EVENT,
+  type ResidentToolHandoffQueueEntry,
+} from '../utils/residentToolHandoff';
+import {
   clearPendingAttachments as clearStoredPendingAttachments,
   deletePendingAttachment as deleteStoredPendingAttachment,
   listPendingAttachments as listStoredPendingAttachments,
@@ -565,6 +573,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [newContent, setNewContent] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.content ?? '');
   const [draftSourceRefs, setDraftSourceRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.source_refs ?? []);
   const [draftArtifactRefs, setDraftArtifactRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.artifact_refs ?? []);
+  const [toolHandoffDrainTick, setToolHandoffDrainTick] = useState(0);
+  const activeToolHandoffPromptRef = useRef<{
+    identity: string;
+    prompt: string;
+    insertedIntoEmptyDraft: boolean;
+  } | null>(null);
   const composerDraftWriteIdRef = useRef(loadComposerDraft(currentActorUserId, selectedProjectId)?.write_id ?? null);
   const [submitting, setSubmitting] = useState(false);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
@@ -705,6 +719,166 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     });
     saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
   }, [currentActorUserId, saveComposerDraftSnapshot, selectedProjectId, updateComposerIntent]);
+  const applyToolHandoffs = useCallback((entries: ResidentToolHandoffQueueEntry[]) => {
+    if (!conversationMode || !currentActorUserId || !selectedProjectId || entries.length === 0) return false;
+    // One composer envelope carries one operator intent. Drain one immutable
+    // handoff at a time so a later revision cannot be acknowledged under the
+    // first handoff's prompt.
+    const entry = entries[0];
+    const handoff = entry.detail;
+    const current = composerIntentRef.current;
+    if (current.operator_intent && current.artifact_refs.length > 0) return false;
+    const insertedIntoEmptyDraft = !current.content.trim();
+    const artifactRefs = mergeArtifactRefs(
+      current.artifact_refs,
+      [handoff.artifactRef as unknown as Record<string, unknown>],
+    );
+    const content = current.content.trim() ? current.content : handoff.prompt;
+    const operatorIntent: Record<string, unknown> = {
+      kind: handoff.intent,
+      expected_revision: handoff.artifactRef.revision,
+      artifact_ref_id: artifactRefIdentity(handoff.artifactRef as unknown as Record<string, unknown>),
+    };
+    const patch: Partial<ConversationComposerIntent> = {
+      content,
+      artifact_refs: artifactRefs,
+      operator_intent: operatorIntent,
+    };
+    const next = updateConversationComposerIntent(current, patch);
+    const persisted = saveComposerDraftSnapshot(
+      currentActorUserId,
+      selectedProjectId,
+      next,
+    );
+    if (persisted) {
+      activeToolHandoffPromptRef.current = {
+        identity: artifactRefIdentity(handoff.artifactRef as unknown as Record<string, unknown>),
+        prompt: handoff.prompt,
+        insertedIntoEmptyDraft,
+      };
+      updateComposerIntent(patch);
+      setNewContent(content);
+      setDraftArtifactRefs(artifactRefs);
+      acknowledgeQueuedResidentToolHandoffs(
+        currentActorUserId,
+        selectedProjectId,
+        [entry],
+      );
+      focusComposerTextarea();
+    }
+    return persisted;
+  }, [
+    conversationMode,
+    currentActorUserId,
+    focusComposerTextarea,
+    saveComposerDraftSnapshot,
+    selectedProjectId,
+    updateComposerIntent,
+  ]);
+
+  useEffect(() => {
+    const blocked = () => (
+      submitting || sendState === 'sending' || sendState === 'needs_retry'
+    );
+    const applyQueued = () => {
+      if (!currentActorUserId || !selectedProjectId || blocked()) return false;
+      return applyToolHandoffs(
+        loadQueuedResidentToolHandoffEntries(
+          currentActorUserId,
+          selectedProjectId,
+        ),
+      );
+    };
+    const onToolHandoff = (event: Event) => {
+      if (
+        !conversationMode
+        || !isResidentToolHandoffEvent(event)
+        || event.detail.projectId !== selectedProjectId
+        || !currentActorUserId
+        || event.detail.artifactRef.author !== currentActorUserId
+      ) return;
+      // dispatchResidentToolHandoff persists before emitting. Never enqueue a
+      // second immutable entry here: the event is only a wake-up signal.
+      if (
+        blocked()
+        || (
+          composerIntentRef.current.operator_intent
+          && composerIntentRef.current.artifact_refs.length > 0
+        )
+      ) {
+        addToastRef.current(
+          'Exact tool revision queued for your next conversation message',
+          'info',
+        );
+        return;
+      }
+      if (applyQueued()) {
+        addToastRef.current(
+          'Exact tool revision attached to the conversation',
+          'success',
+        );
+      }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (
+        currentActorUserId
+        && selectedProjectId
+        && isResidentToolHandoffQueueStorageKey(
+          event.key,
+          currentActorUserId,
+          selectedProjectId,
+        )
+        && applyQueued()
+      ) {
+        addToastRef.current(
+          'Tool revision from another tab is ready in your next conversation message',
+          'success',
+        );
+      }
+    };
+    window.addEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, [
+    applyToolHandoffs,
+    conversationMode,
+    currentActorUserId,
+    selectedProjectId,
+    sendState,
+    submitting,
+  ]);
+
+  useEffect(() => {
+    if (
+      !currentActorUserId
+      || !selectedProjectId
+      || !conversationMode
+      || submitting
+      || sendState === 'sending'
+      || sendState === 'needs_retry'
+    ) return;
+    const queued = loadQueuedResidentToolHandoffEntries(
+      currentActorUserId,
+      selectedProjectId,
+    );
+    if (queued.length > 0 && applyToolHandoffs(queued)) {
+      addToastRef.current(
+        'Queued tool revision is ready in your next conversation message',
+        'success',
+      );
+    }
+  }, [
+    applyToolHandoffs,
+    conversationMode,
+    currentActorUserId,
+    selectedProjectId,
+    sendState,
+    submitting,
+    toolHandoffDrainTick,
+  ]);
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
   // them to one logical message; cleared after a successful send so the next
@@ -1837,6 +2011,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // launch two requests.
     if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active || restoringPendingAttachments) return;
     const submitOwner = submittingGuardRef.current.begin(submitActorUserId, submitProjectId);
+    const releaseSubmittedComposer = () => {
+      if (submittingGuardRef.current.finish(submitOwner)) {
+        setSubmitting(false);
+        setUploading(false);
+      }
+    };
     setSubmitting(true);
     try {
       // The activity inbox retains its legacy operational-resolution endpoint.
@@ -2134,6 +2314,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           void refreshStrategicState?.();
           didRefreshStrategicState = true;
         }
+        // The receipt is durable and the old draft has been cleared. Release
+        // composer ownership before the best-effort refresh so the operator can
+        // immediately begin the next turn, including selecting attachments.
+        releaseSubmittedComposer();
         await fetchMessages().catch(() => undefined);
         if (!didRefreshStrategicState) void refreshStrategicState?.();
         recordStrategicInteraction();
@@ -2209,10 +2393,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         if (submitStillCurrent() && !attachmentUploadFailed) addToast('Failed to send message', 'error');
       }
     } finally {
-      if (submittingGuardRef.current.finish(submitOwner)) {
-        setSubmitting(false);
-        setUploading(false);
-      }
+      releaseSubmittedComposer();
     }
   }
 
@@ -2550,16 +2731,40 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const current = composerIntentRef.current;
     const artifactRefs = current.artifact_refs.filter(ref => artifactRefIdentity(ref) !== identity);
     const sourceRefs = current.source_refs.filter(ref => artifactRefIdentity(ref) !== identity);
-    const next = updateComposerIntent({
+    const activePrompt = activeToolHandoffPromptRef.current;
+    const content = activePrompt?.identity === identity
+      && activePrompt.insertedIntoEmptyDraft
+      && current.content === activePrompt.prompt
+      ? ''
+      : current.content;
+    const intentArtifactIdentity = String(current.operator_intent?.artifact_ref_id ?? '');
+    const removingIntentArtifact = activePrompt?.identity === identity
+      || intentArtifactIdentity === identity
+      || (!intentArtifactIdentity
+        && Boolean(current.operator_intent)
+        && current.artifact_refs.length === 1);
+    const next = updateConversationComposerIntent(current, {
+      content,
       artifact_refs: artifactRefs,
       source_refs: sourceRefs,
-      operator_intent: undefined,
+      operator_intent: removingIntentArtifact ? undefined : current.operator_intent,
     });
+    if (
+      currentActorUserId
+      && selectedProjectId
+      && !saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next)
+    ) return;
+    updateComposerIntent({
+      content,
+      artifact_refs: artifactRefs,
+      source_refs: sourceRefs,
+      operator_intent: removingIntentArtifact ? undefined : current.operator_intent,
+    });
+    if (activePrompt?.identity === identity) activeToolHandoffPromptRef.current = null;
+    setNewContent(content);
     setDraftArtifactRefs(artifactRefs);
     setDraftSourceRefs(sourceRefs);
-    if (currentActorUserId && selectedProjectId) {
-      saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
-    }
+    setToolHandoffDrainTick(value => value + 1);
   }, [currentActorUserId, saveComposerDraftSnapshot, selectedProjectId, sendState, updateComposerIntent]);
 
   async function handleAbandonPendingSend() {

@@ -126,6 +126,149 @@ export interface ToolContentSaveResult {
   content_revision: number;
 }
 
+export interface ResidentToolArtifactRef {
+  id: string;
+  artifact_ref_id: string;
+  tool_id: string;
+  project_id: string;
+  kind: 'notes' | 'whiteboard';
+  revision: number;
+  checksum: string;
+  author: string;
+  timestamp: string;
+  retrieval: {
+    capability: 'inline_bounded_text' | 'project_tool_rendered_image';
+    href: string;
+  };
+}
+
+export interface ResidentRenderedImageReceipt {
+  attachment_id: string;
+  storage_uri: string;
+  checksum: string;
+  mime_type?: string;
+  width?: number;
+  height?: number;
+}
+
+export interface ResidentToolArtifactReadyResponse {
+  state: 'ready';
+  artifact_ref: ResidentToolArtifactRef;
+}
+
+export interface ResidentToolArtifactPendingResponse {
+  state: 'pending';
+  promotion_intent_id: string;
+  receipt_id: string;
+  retry_after_ms: number;
+}
+
+export type ResidentToolArtifactCreateResponse =
+  | ResidentToolArtifactReadyResponse
+  | ResidentToolArtifactPendingResponse;
+
+export class ToolArtifactRequestError extends Error {
+  readonly status: number | null;
+  readonly retryable: boolean;
+
+  constructor(message: string, status: number | null, retryable: boolean) {
+    super(message);
+    this.name = 'ToolArtifactRequestError';
+    this.status = status;
+    this.retryable = retryable;
+  }
+}
+
+export class ToolArtifactConflictError extends Error {
+  readonly currentRevision: number | null;
+  readonly action: string;
+
+  constructor(currentRevision: number | null, action = 'reload_or_rebase') {
+    super('Tool changed before it could be shared. Reload or rebase your edits.');
+    this.name = 'ToolArtifactConflictError';
+    this.currentRevision = currentRevision;
+    this.action = action;
+  }
+}
+
+export async function createResidentToolArtifactRef(
+  projectId: string,
+  toolId: string,
+  expectedRevision: number,
+  renderedImage?: ResidentRenderedImageReceipt,
+): Promise<ResidentToolArtifactCreateResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/tools/${encodeURIComponent(toolId)}/artifact-refs`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...(renderedImage ? { rendered_image: renderedImage } : {}),
+      }),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as {
+      detail?: string | { current_revision?: number; action?: string };
+      error?: { message?: string | { current_revision?: number; action?: string } };
+      current_revision?: number;
+      action?: string;
+    };
+    if (res.status === 409) {
+      const wrapped = body.error?.message;
+      const detail = typeof body.detail === 'object' && body.detail
+        ? body.detail
+        : typeof wrapped === 'object' && wrapped
+          ? wrapped
+          : body;
+      throw new ToolArtifactConflictError(
+        typeof detail.current_revision === 'number' ? detail.current_revision : null,
+        typeof detail.action === 'string' ? detail.action : undefined,
+      );
+    }
+    const detail = typeof body.detail === 'string'
+      ? body.detail
+      : typeof body.error?.message === 'string'
+        ? body.error.message
+        : `Failed to share tool revision: ${res.status}`;
+    throw new ToolArtifactRequestError(
+      detail,
+      res.status,
+      res.status === 401
+        || res.status === 408
+        || res.status === 425
+        || res.status === 429
+        || res.status >= 500,
+    );
+  }
+  const body = await res.json() as Partial<ResidentToolArtifactCreateResponse>;
+  if (body.state === 'ready' && body.artifact_ref) {
+    return { state: 'ready', artifact_ref: body.artifact_ref };
+  }
+  if (
+    body.state === 'pending'
+    && typeof body.promotion_intent_id === 'string'
+    && body.promotion_intent_id.length > 0
+    && typeof body.receipt_id === 'string'
+    && body.receipt_id.length > 0
+    && typeof body.retry_after_ms === 'number'
+    && Number.isFinite(body.retry_after_ms)
+    && body.retry_after_ms >= 0
+  ) {
+    return {
+      state: 'pending',
+      promotion_intent_id: body.promotion_intent_id,
+      receipt_id: body.receipt_id,
+      retry_after_ms: body.retry_after_ms,
+    };
+  }
+  throw new ToolArtifactRequestError(
+    'Artifact reference response was not recognized.',
+    res.status,
+    false,
+  );
+}
+
 export async function fetchToolContent<T = Record<string, unknown>>(
   projectId: string,
   toolId: string,

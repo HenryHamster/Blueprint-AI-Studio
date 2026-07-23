@@ -1305,6 +1305,11 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     const projectId = 'proj-overlap-reply';
     let conversationItems: ReturnType<typeof makeMsg>[] = [];
     let messagePostCount = 0;
+    let acceptedRefreshHeld = false;
+    let releaseAcceptedRefresh!: () => void;
+    const acceptedRefresh = new Promise<void>((resolve) => {
+      releaseAcceptedRefresh = resolve;
+    });
     (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
       const urlStr = String(url);
       const method = (init as RequestInit | undefined)?.method ?? 'GET';
@@ -1336,6 +1341,13 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
         throw new Error('response lost after second commit');
       }
       if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        // Keep the first send's post-acceptance refresh in flight. The accepted
+        // receipt is already durable, so selecting the next draft's attachment
+        // must not be discarded by the old submit guard.
+        if (messagePostCount === 1 && !acceptedRefreshHeld) {
+          acceptedRefreshHeld = true;
+          await acceptedRefresh;
+        }
         return new Response(JSON.stringify({
           conversation: { limit: 100, has_more: false, order: 'oldest_first', items: conversationItems },
           matched_message: null,
@@ -1365,12 +1377,17 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
 
     const file = new File(['next draft bytes'], 'next.txt', { type: 'text/plain' });
     const transfer = new DataTransfer();
+    await waitFor(() => {
+      const attachButton = view.container.querySelector('button[aria-label="Attach file"]') as HTMLButtonElement;
+      expect(attachButton.disabled).toBe(false);
+    });
     transfer.items.add(file);
     const fileInput = view.container.querySelector<HTMLInputElement>('input[type="file"]');
     if (!fileInput) throw new Error('expected attachment input');
     Object.defineProperty(fileInput, 'files', { value: transfer.files, configurable: true });
     fireEvent.change(fileInput);
     await waitFor(() => expect(view.container.textContent).toContain('next.txt'));
+    releaseAcceptedRefresh();
     const identityKey = `conversationDraftSend:test-user%40example.com:${projectId}`;
     const nextIdentity = await waitFor(() => {
       const value = sessionStorage.getItem(identityKey);

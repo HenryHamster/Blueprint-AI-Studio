@@ -3872,8 +3872,8 @@ def test_record_retired_direction_memory_text_tokens_ordered():
     vision: dict = {}
     direction = {
         "id": "d-tok-order",
-        # "improve" and "auth" are content words; "the" and "for" are stopwords
-        "text": "improve the authentication flow for users",
+        # "strengthen" is a content word; "the" and "for" are stopwords.
+        "text": "strengthen the authentication flow for users",
     }
     record_retired_direction_memory(vision, direction, reason="saturation")
 
@@ -3881,6 +3881,6 @@ def test_record_retired_direction_memory_text_tokens_ordered():
     assert len(entries) == 1
     tokens = entries[0]["text_tokens"]
     # Stopwords "the", "for" removed; remaining words in original order
-    assert tokens == ["improve", "authentication", "flow", "users"], (
+    assert tokens == ["strengthen", "authentication", "flow", "users"], (
         f"Expected ordered tokens, got {tokens!r}"
     )

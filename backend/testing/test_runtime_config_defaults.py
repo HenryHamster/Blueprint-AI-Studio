@@ -6,6 +6,7 @@ registered default should govern, not an arbitrary fallback literal.
 """
 
 import ast
+from collections import Counter
 import pathlib
 from typing import ClassVar
 
@@ -20,7 +21,7 @@ _SIMPLE_TYPES = (bool, int, float, str, type(None))
 
 def _collect_get_fallbacks(filepath: pathlib.Path, key: str) -> list[tuple]:
     """Return list of (lineno, fallback_value) for .get("<key>", <default>) calls in source."""
-    source = filepath.read_text()
+    source = filepath.read_text(encoding="utf-8")
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -47,7 +48,7 @@ def _collect_get_fallbacks(filepath: pathlib.Path, key: str) -> list[tuple]:
 
 def _all_get_fallbacks_in_file(filepath: pathlib.Path) -> dict[str, list[tuple]]:
     """Return dict mapping key -> [(lineno, fallback)] for all .get('key', fallback) calls."""
-    source = filepath.read_text()
+    source = filepath.read_text(encoding="utf-8")
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -205,6 +206,54 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
         ("app/warm_pool_maintainer.py", 1136, "max_concurrent_vms"),
     }
 
+    # Line numbers are deliberately excluded: deletions elsewhere in a module
+    # must not turn known fallback debt into a false-positive. The literal
+    # fallback and occurrence count remain pinned so new or changed debt fails.
+    _KNOWN_STALE_FALLBACK_COUNTS: ClassVar[Counter] = Counter({
+        ("app/anomaly_detection.py", "max_concurrent_vms", 0): 1,
+        ("app/autonomous_research.py", "evaluating_pipeline_timeout_minutes", 240): 1,
+        ("app/blocked_task_unblock_sweeps.py", "capability_proof_gate_mode", "off"): 2,
+        ("app/capability_execution_fence.py", "capability_proof_gate_mode", "off"): 1,
+        ("app/capability_proof.py", "capability_proof_execution_trials_enabled", False): 3,
+        ("app/compute_experiment_contract.py", "compute_experiment_spend_threshold_usd", 0.0): 1,
+        ("app/deploy_health.py", "max_concurrent_vms", 0): 1,
+        ("app/evergreen_backlog.py", "max_global_autonomous_tasks_per_hour", 500): 1,
+        ("app/main.py", "max_concurrent_vms", 0): 1,
+        ("app/metrics_integrity_sweep.py", "capability_proof_gate_mode", "off"): 1,
+        ("app/orchestrator.py", "warm_backlog_reuse_enabled", False): 1,
+        ("app/plan_completion.py", "capability_proof_gate_mode", "off"): 1,
+        ("app/qualification_state_resolver.py", "smoketest_enabled", True): 1,
+        ("app/release_promotion.py", "smoketest_enabled", True): 1,
+        ("app/release_qualifier.py", "capability_proof_gate_mode", "off"): 2,
+        ("app/research_completion.py", "capability_proof_gate_mode", "off"): 2,
+        ("app/routers/admin_debug.py", "max_concurrent_vms", 5): 1,
+        ("app/routers/admin_health.py", "warm_backlog_reuse_enabled", False): 2,
+        ("app/routers/admin_health.py", "warm_continuity_enabled", False): 2,
+        ("app/routers/admin_settings.py", "capability_proof_execution_trials_enabled", False): 2,
+        ("app/routers/admin_settings.py", "capability_proof_gate_mode", "off"): 2,
+        ("app/routers/admin_settings.py", "completion_debt_weight_mode", "observe"): 2,
+        ("app/routers/admin_settings.py", "max_global_autonomous_tasks_per_hour", 500): 1,
+        ("app/routers/admin_settings.py", "metrics_integrity_sweep_max_checks", 30): 1,
+        ("app/routers/admin_settings.py", "structural_health_audit_mode", "off"): 1,
+        ("app/routers/admin_settings.py", "warm_backlog_reuse_enabled", False): 2,
+        ("app/routers/admin_settings.py", "warm_continuity_enabled", False): 2,
+        ("app/routers/admin_warm_pool.py", "max_concurrent_vms", 0): 1,
+        ("app/routers/agent.py", "affected_consumers_holdback_fraction", 0.0): 1,
+        ("app/routers/agent.py", "module_interfaces_holdback_fraction", 0.0): 1,
+        ("app/routers/agent.py", "related_tests_holdback_fraction", 0.0): 1,
+        ("app/routers/agent.py", "repo_map_holdback_fraction", 0.0): 1,
+        ("app/routers/agent_status.py", "warm_backlog_reuse_enabled", False): 1,
+        ("app/routers/agent_status.py", "warm_continuity_enabled", False): 1,
+        ("app/routers/agent_warm_continuity.py", "warm_backlog_reuse_enabled", False): 1,
+        ("app/services.py", "auto_archive_max_terminal_tasks_per_project", 0): 2,
+        ("app/services.py", "max_retained_images", 10): 1,
+        ("app/strategic_spawning.py", "max_concurrent_vms", 0): 1,
+        ("app/task_completion.py", "capability_proof_execution_trials_enabled", False): 1,
+        ("app/warm_pool.py", "warm_pool_target_size", 0): 1,
+        ("app/warm_pool_maintainer.py", "max_concurrent_vms", 0): 1,
+        ("app/warm_pool_maintainer.py", "warm_pool_target_size", 0): 1,
+    })
+
     def test_all_registered_key_fallbacks_match(self):
         """Scan every registered key across all read-sites and assert fallbacks match."""
         import app.runtime_config_state as _rcs
@@ -221,7 +270,7 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
         for pyfile in _all_py_files():
             if pyfile.name.startswith("test_"):
                 continue
-            rel = str(pyfile.relative_to(BACKEND_APP.parent))
+            rel = pyfile.relative_to(BACKEND_APP.parent).as_posix()
             # Skip runtime_config_state.py: its internal reads already use
             # config_get() (registry-sourced), and the .get() calls in
             # sync_runtime_config_from_state are validation-specific, not
@@ -238,21 +287,21 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
 
         # Assert every read-site fallback matches the registered default,
         # excluding known pre-existing staleness.
-        mismatches: list[str] = []
+        observed_stale: Counter = Counter()
         for key in sorted(site_fallbacks):
             expected = simple_defaults[key]
             for relpath, lineno, actual in site_fallbacks[key]:
                 if actual == expected:
                     continue
-                if (relpath, lineno, key) in self._KNOWN_STALE_FALLBACKS:
-                    continue
-                mismatches.append(
-                    f"  {relpath}:{lineno}: .get({key!r}, {actual!r}) "
-                    f"≠ registered default {expected!r}"
-                )
+                observed_stale[(relpath, key, actual)] += 1
 
-        assert not mismatches, (
-            "Read-site fallbacks that diverge from registered defaults "
-            "(expected registered default), NOT in known-stale allowlist:\n"
-            + "\n".join(mismatches)
+        unexpected = observed_stale - self._KNOWN_STALE_FALLBACK_COUNTS
+        resolved_without_baseline_update = (
+            self._KNOWN_STALE_FALLBACK_COUNTS - observed_stale
+        )
+        assert not unexpected and not resolved_without_baseline_update, (
+            "Runtime-config fallback debt changed. New or increased mismatches: "
+            f"{dict(unexpected)}; resolved/decreased entries that should be "
+            "removed from the pinned baseline: "
+            f"{dict(resolved_without_baseline_update)}"
         )

@@ -209,7 +209,12 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
             "artifact_refs": [
                 {"kind": "whiteboard", "id": "board-1", "checksum": "abc123"}
             ],
-            "operator_intent": {"kind": "verify", "lane_owner": "operator"},
+            "operator_intent": {
+                "kind": "verify",
+                "lane_owner": "operator",
+                "artifact_ref_id": "artifact-ref-1",
+                "expected_revision": 7,
+            },
             "huge": "not returned",
         }
     )
@@ -223,6 +228,8 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
     assert data["context"]["operator_intent"] == {
         "kind": "verify",
         "lane_owner": "operator",
+        "artifact_ref_id": "artifact-ref-1",
+        "expected_revision": 7,
     }
     assert "huge" not in data["context"]
 
@@ -551,6 +558,7 @@ async def test_activity_endpoint_excludes_conversation_projection(
             sequence=activity_sequence,
             surface=MessageSurface.ACTIVITY,
             content="activity only",
+            context={"audience": "operator-fyi"},
         ),
         # Non-operator (strategic) conversation projection: the activity list
         # excludes it. Operator-signal rows (user / FEEDBACK-BLOCKER-BUG_REPORT /
@@ -839,7 +847,11 @@ async def test_admin_messages_list_strips_large_context_keys(
         message_type=MessageType.BUG_REPORT,
         from_type="system",
         content="Message with large context",
-        context={"event_type": "task_failed", "strategic_session": {"version": 1, "huge": "x" * 10_000}},
+        context={
+            "event_type": "task_failed",
+            "audience": "operator-fyi",
+            "strategic_session": {"version": 1, "huge": "x" * 10_000},
+        },
         status="open",
     )
     db_session.add(msg)

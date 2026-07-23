@@ -127,7 +127,7 @@ def test_durations_coverage_fraction_within_threshold() -> None:
     files_in_durations = {k.split("::")[0] for k in data}
 
     all_test_files = {
-        str(Path(p).relative_to(BACKEND_ROOT))
+        Path(p).relative_to(BACKEND_ROOT).as_posix()
         for p in glob.glob(TEST_FILE_GLOB)
     }
 
@@ -303,7 +303,7 @@ def _extract_valid_test_ids(filepath: Path) -> set:
     variants — callers must strip the "[param]" suffix before lookup.
     """
     try:
-        tree = ast.parse(filepath.read_text())
+        tree = ast.parse(filepath.read_text(encoding="utf-8"))
     except (SyntaxError, OSError):
         return set()
 

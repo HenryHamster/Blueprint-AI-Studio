@@ -797,3 +797,61 @@ async def test_ui_load_timing_pinned_baseline_survives_sample_cap(
     assert bl["p90"] == 910
     assert bl["label"] == "Before cap test"
     assert bl["id"] == baseline_id
+
+@pytest.mark.asyncio
+async def test_pipeline_regressions_reads_sr_alerts_from_dedicated_store(
+    client,
+    db_session,
+):
+    from app.models import ProjectSRAnalytics
+
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends_alert": {
+            "categories": ["legacy-category"],
+            "computed_at": "2026-07-01T00:00:00",
+        }
+    }
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        ProjectSRAnalytics(
+            project_id=project.id,
+            data={
+                "sr_catch_rate_trends_alert": {
+                    "categories": ["correctness"],
+                    "computed_at": "2026-07-22T01:02:03",
+                },
+                "sr_catch_rate_trends": {
+                    "categories": {
+                        "correctness": {
+                            "current_hit_rate": 0.4,
+                            "previous_hit_rate": 0.8,
+                        }
+                    }
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/pipeline-regressions?project_id={project.id}"
+    )
+
+    assert resp.status_code == 200
+    sr_rows = [
+        row
+        for row in resp.json()["regressions"]
+        if row["regression_class"].startswith("sr_catch_rate:")
+    ]
+    assert sr_rows == [
+        {
+            **sr_rows[0],
+            "signal_name": "SR catch-rate regression: correctness",
+            "regression_class": "sr_catch_rate:correctness",
+            "detected_at": "2026-07-22T01:02:03",
+            "current_rate": 0.4,
+            "prior_rate": 0.8,
+        }
+    ]

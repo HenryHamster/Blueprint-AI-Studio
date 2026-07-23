@@ -51,6 +51,7 @@ from app.sr_analytics_common import (
     _is_trend_significant,
     _sr_skip_stats,
 )
+from app.sr_analytics_store import legacy_sr_analytics_payload
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +463,12 @@ async def _compute_sr_catch_rate_trends_impl(
     )
     project = proj_row.scalar_one_or_none()
 
-    doc = dict(sr_row.data or {})
+    # Preserve per-key rolling-cutover fallback semantics even when an already
+    # created dedicated row is only partially populated. Dedicated values are
+    # authoritative, while documented legacy design_doc keys seed gaps until
+    # every project has passed through the forward backfill.
+    doc = legacy_sr_analytics_payload(project.design_doc)
+    doc.update(sr_row.data or {})
     existing: dict = dict(doc.get("sr_catch_rate_trends") or {})
     existing_computed_at: str | None = existing.get("computed_at")
 

@@ -454,6 +454,7 @@ describe('HeaderBar — viewport regression', () => {
       'Pipeline5',
       'Project',
       'Runtime',
+      'Fleet',
     ]);
     await act(async () => { buttons[1].click(); });
     expect(onTabChange).toHaveBeenCalledWith('pipeline');

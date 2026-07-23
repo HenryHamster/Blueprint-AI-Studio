@@ -19,7 +19,12 @@
         "test_poll_server_time_round_trips_as_next_cursor",
         "test_poll_since_is_inclusive_of_boundary",
         "test_poll_max_created_at_cursor_redelivers_boundary",
-        "test_poll_session_id_scopes_to_session_plus_legacy_rows"
+        "test_poll_session_id_scopes_to_session_plus_legacy_rows",
+        "test_resident_poll_route_limit_supports_cadence_and_project_isolation",
+        "test_resident_poll_uses_authenticated_session_scope",
+        "test_resident_final_fence_orders_equal_timestamps_deterministically",
+        "test_resident_poll_rejects_query_identity_spoof",
+        "test_stale_resident_poll_is_rejected_without_generation_query"
       ]
     },
     {
@@ -97,7 +102,20 @@
       "reason": "Covers the useStrategicSession hook — primary React hook for conversational Workday session state. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
         "resolves mode + session fields from the liveness probe before the read model lands",
-        "lets the heavy read model take precedence once it hydrates"
+        "lets the heavy read model take precedence once it hydrates",
+        "idempotently ensures Workday once when reload hydrates directly into continuous mode",
+        "retries a transient Workday ensure failure and stops after recovery",
+        "retries a 200 response with %s instead of completing the ensure epoch",
+        "does not duplicate an in-flight ensure when the read-model wrapper changes",
+        "treats retry_wait as healthy dormant state and does not restart it on reload",
+        "does not let a retained retry_wait field suppress restart of an ended session",
+        "ensures a stale non-retry worker so the backend can replace it",
+        "re-ensures a terminal worker generation on the same page exactly once",
+        "re-ensures when backend exposes start_failed error before the active blob clears",
+        "re-ensures an observed wedged starting worker without repeating the epoch",
+        "wakes itself when an unchanged starting snapshot crosses the stale deadline",
+        "keeps an explicitly stopped Workday stopped until the operator explicitly starts it",
+        "allows Workday auto-ensure again after leaving and explicitly re-entering continuous mode"
       ]
     },
     {
@@ -196,8 +214,11 @@
         "test_handoff_rejects_task_bearing_reply_without_explicit_task_match",
         "test_resident_reaper_uses_own_heartbeat_window",
         "test_heartbeat_handled_ids_only_affect_own_session",
-        "test_stop_handoff_is_atomic_with_session_end",
-        "test_unattended_cap_handoff_is_atomic_with_cap_end"
+        "test_new_resident_start_repairs_stale_message_ownership_without_cadence",
+        "test_healthy_existing_resident_ensure_repairs_stale_message_ownership",
+        "test_repair_excludes_db_authoritative_active_session",
+        "test_repair_noop_candidate_releases_per_id_project_transaction",
+        "test_repair_rechecks_active_session_between_stale_ids"
       ]
     },
     {
@@ -249,7 +270,10 @@
         "leaves inbound messages open when the reply backstop POST fails",
         "folds the checkpoint into the first operator turn after bounded wedged preemption",
         "restarts after prompt SIGINT process exit and answers the queued operator message",
-        "does not restart or mask a queued-message child close classified as %s"
+        "does not restart or mask a queued-message child close classified as %s",
+        "re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
+        "retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects",
+        "splits an aggregate required-image overflow into bounded same-timestamp model turns"
       ]
     },
     {
@@ -289,7 +313,11 @@
       "test_ids": [
         "loads the next triage page from the reachable load-older control",
         "uses server total when guaranteed high-signal rows make the response longer than the requested page",
-        "keeps a terminal expanded window terminal when the capped newest-window poll runs"
+        "keeps a terminal expanded window terminal when the capped newest-window poll runs",
+        "opens a durable tool handoff as an exact conversation draft",
+        "sends a queued tool revision with operator intent and preserves exact identity across retry",
+        "removing an unrelated artifact preserves the queued handoff operator intent",
+        "drains only one queued handoff and immediately shows the next after chip removal"
       ]
     },
     {
@@ -553,7 +581,20 @@
         "handles missing text gracefully",
         "renders multiple directions separated by newlines",
         "truncates text beyond 120 characters",
-        "retains the review for %s markers"
+        "retains the review for %s markers",
+        "ignores seen boundary rows when budgeting required images and defers the first overflowing unseen row",
+        "carries the remaining required-image budget from one poll page to the next",
+        "rolls back required-artifact admission so the same message can retry",
+        "preserves required ArtifactRef identity and checksum for strict download",
+        "reserves an image slot for a required ArtifactRef after ordinary images",
+        "fails required ArtifactRefs before fetch when checksum or URL is invalid",
+        "verifies a required ArtifactRef image checksum before model delivery",
+        "rejects a required ArtifactRef download instead of degrading to text",
+        "rejects a declared-oversize required ArtifactRef without reading its body",
+        "rejects a required ArtifactRef checksum mismatch",
+        "caps aggregate ordinary images while preserving required images across a combined batch",
+        "bounds a required ArtifactRef download when %s never resolves",
+        "degrades an ordinary image to an unavailable block when %s never resolves"
       ]
     },
     {
@@ -584,21 +625,103 @@
         "drops a stale response whose project no longer matches (generation guard)",
         "swallows a failed probe and leaves data null"
       ]
-    }
-  ],
-
-  "deleted_frontend": [
+    },
+    {
+      "path": "admin-ui/src/api/projectTools.residentArtifact.test.ts",
+      "reason": "Protects the authenticated admin API contract that freezes an exact Notes or Whiteboard revision, including receipt replay and typed pending/conflict/auth responses.",
+      "test_ids": [
+        "posts the exact expected revision and adopts the canonical nested response",
+        "sends the durable rendered-image receipt for Whiteboard references",
+        "returns a typed pending response for 202",
+        "surfaces a 409 as a revision-aware conflict",
+        "treats 401 as retryable so replay reuses the same receipt"
+      ]
+    },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",
-      "status": "SAFE-TO-CUT",
-      "deleted_in": "#15949 (cut(resident): remove all resident strategic code)",
-      "reason": "Covered ToolResidentHandoffControls — UI for handing off control to the autonomous resident agent. The resident subsystem is fully removed and will not be restored; this test is permanently dead."
+      "reason": "Protects the supported Notes/Whiteboard-to-conversation controls. These queue immutable revisions for the current Workday conversation and are not autonomous shadow-Resident controls.",
+      "test_ids": [
+        "associates the disabled explanation with both handoff actions",
+        "announces busy and draft-queue completion",
+        "coalesces a double click into one handoff operation"
+      ]
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx",
-      "status": "SAFE-TO-CUT",
-      "deleted_in": "#15949 (cut(resident): remove all resident strategic code)",
-      "reason": "Viewport snapshot test for ToolResidentHandoffControls. Permanently dead — the resident subsystem is fully removed."
+      "reason": "Protects the supported conversation-handoff controls at narrow operator viewports.",
+      "test_ids": [
+        "renders handoff controls without overflow, clipped text, or small targets at 375px",
+        "renders disabled-reason and preparing states without overflow at 375px"
+      ]
+    },
+    {
+      "path": "admin-ui/src/utils/residentToolHandoff.test.ts",
+      "reason": "Protects durable actor/project-scoped handoff queue persistence, truthful failure, cross-tab wakeup, snapshot-safe acknowledgement, and expiry cleanup.",
+      "test_ids": [
+        "persists the canonical actor/project handoff without a mounted listener",
+        "keeps actor and project queues isolated in durable storage",
+        "persists before notifying the mounted conversation fast path",
+        "fails truthfully and emits nothing when durable storage is unavailable",
+        "rejects a mismatched project or missing author before persistence",
+        "acknowledges only the snapshot and preserves an interleaved later event",
+        "removes malformed and expired scoped entries during maintenance"
+      ]
+    },
+    {
+      "path": "admin-ui/src/utils/pendingWhiteboardArtifactRef.test.ts",
+      "reason": "Protects crash/reload-safe Whiteboard promotion with exact receipt replay, coalescing, bounded retry pacing, and terminal intent preservation.",
+      "test_ids": [
+        "polls 202 to ready with the exact same receipt and rendered payload",
+        "recovers a lost ready response by replaying the same identity",
+        "loads the full operation after remount and resumes exact receipt",
+        "coalesces duplicate settlement attempts for one operation identity",
+        "persists an exponential next retry so repeated Resume clicks stay below 30/minute",
+        "terminal rejection preserves user intent and receipt for a fresh render"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/NotesTool.test.tsx",
+      "reason": "Protects save-before-freeze Notes handoff and fail-closed behavior when an exact revision cannot be durably saved.",
+      "test_ids": [
+        "Share in conversation flushes the exact dirty revision before creating its reference",
+        "an unresolved conflict refuses conversation handoff",
+        "a failed flush never creates a conversation reference"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/WhiteboardTool.test.tsx",
+      "reason": "Protects save-render-upload-freeze ordering, durable receipt recovery, bounded Resume, and fresh-render recovery while preserving the operator's Share/Ask intent.",
+      "test_ids": [
+        "Share in conversation saves before rendering and referencing the exact Whiteboard revision",
+        "remount resumes a durable receipt without rerendering or reuploading",
+        "a failed Whiteboard flush refuses rendering, upload, and conversation reference creation",
+        "pending preparation becomes waiting and Resume reaches ready with the same receipt",
+        "terminal preparation retries with a fresh render while preserving Share/Ask intent",
+        "cross-tab removal clears stale Resume only when the exact durable operation disappeared"
+      ]
+    },
+    {
+      "path": "backend/testing/test_workday_artifact_materialization.py",
+      "reason": "Protects exact Notes/Whiteboard materialization, immutable receipt validation, transient retry without cursor loss, permanent poison-message quarantine, authority/page final fences, and bounded image delivery.",
+      "test_ids": [
+        "test_materializes_exact_notes_snapshot",
+        "test_notes_snapshot_surfaces_bounded_truncation_to_the_model",
+        "test_materializes_whiteboard_as_short_lived_signed_image",
+        "test_fails_closed_when_promised_revision_is_missing",
+        "test_rejects_non_hex_revision_checksum",
+        "test_poll_quarantines_missing_grant_and_delivers_valid_neighbors_once",
+        "test_poll_retries_when_signed_whiteboard_url_is_not_agent_compatible",
+        "test_legacy_whiteboard_without_generation_remains_deliverable",
+        "test_missing_whiteboard_object_is_permanent_and_never_signed",
+        "test_repaired_source_aborts_page_without_superseding_or_cursor_skip",
+        "test_resident_authority_replacement_during_materialization_is_rejected",
+        "test_resident_page_mutation_during_materialization_trips_final_fence",
+        "test_transient_whiteboard_metadata_failure_preserves_source",
+        "test_whiteboard_receipt_mismatch_is_permanently_quarantined",
+        "test_required_images_progress_oldest_first_across_poll_batches"
+      ]
     }
-  ]
+  ],
+
+  "deleted_frontend": []
 }

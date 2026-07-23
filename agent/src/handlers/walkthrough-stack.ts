@@ -6,7 +6,7 @@
  * straight from the checked-out candidate source tree:
  *
  *   - a candidate backend via `docker compose` (postgres:15 `db` + `app`
- *     built from `./backend` at the candidate SHA, listening on a host port),
+ *     built from the candidate `backend/` directory, listening on a host port),
  *   - alembic migrations applied to head against that DB,
  *   - a health/version gate that reads the SHA the backend is ACTUALLY serving,
  *   - the walkthrough fixture project seeded against the local DB,
