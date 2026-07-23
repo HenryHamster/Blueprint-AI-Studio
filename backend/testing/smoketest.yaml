@@ -2,17 +2,19 @@
 # This file defines WHAT to test and HOW to interpret results.
 #
 # ── HARD CONSTRAINT: this runs on a READ-ONLY AGENT VM (2 vCPU / 8 GB, no DB) ──
-# The qualifier smoketest clones the candidate commit onto a plain agent VM and
-# drives pytest from an LLM session. That VM has **no PostgreSQL**, and per
+# The ordinary operational smoketest clones the deployed commit onto a plain
+# agent VM and drives pytest from an LLM session. It is available for explicit
+# post-promotion/deployment health checks; it is not part of the automain→main
+# qualifier. That VM has **no PostgreSQL**, and per
 # CLAUDE.md the full DB-backed suite must NEVER run there: it takes 45-60+ min
 # and is OOM-prone on 2 vCPU / 8 GB.
 #
 # Until 2026-07-21 the `regression` suite was literally `testing/` — the entire
 # DB-backed suite. It could never pass: the session ran past its limit or OOM'd
 # on EVERY candidate, the task died `claude_code_failed` (CODE_ERROR), and the
-# qualifier recorded that as the NON-CONCLUSIVE status `infra_failure` and
-# re-drove forever (54 attempts on v26). It was never a candidate signal — it
-# was the harness eating itself.
+# retired qualifier lane recorded that as the NON-CONCLUSIVE status
+# `infra_failure` and re-drove forever (54 attempts on v26). It was never a
+# candidate signal — it was the harness eating itself.
 #
 # So every suite below MUST be:
 #   * no-DB     — run with `--noconftest`, exactly like the CI standalone gate

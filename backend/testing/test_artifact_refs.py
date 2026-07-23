@@ -1417,7 +1417,7 @@ async def test_detached_promotion_shutdown_fences_late_database_resume(mocker):
 
 @pytest.mark.asyncio
 async def test_message_context_accepts_exact_tool_ref_and_rejects_stale_checksum(
-    db_session,
+    client: AsyncClient, db_session,
 ):
     project = await _project(db_session)
     tool = ProjectTool(
@@ -1459,13 +1459,47 @@ async def test_message_context_accepts_exact_tool_ref_and_rejects_stale_checksum
         content="Use these notes",
         idempotency_key="share-1",
         artifact_refs=[canonical],
+        operator_intent={
+            "kind": "ask_resident",
+            "artifact_ref_id": str(ref.id),
+            "expected_revision": 1,
+        },
     )
     context, _ = await _validated_message_scoped_context(
         db_session, project_id=project.id, payload=payload
     )
     assert context["artifact_refs"][0]["artifact_ref_id"] == str(ref.id)
     assert context["artifact_refs"][0] == artifact_ref_projection(ref)
+    assert context["operator_intent"] == {
+        "kind": "ask_resident",
+        "artifact_ref_id": str(ref.id),
+        "expected_revision": 1,
+    }
 
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=payload.model_dump(mode="json"),
+    )
+    assert response.status_code == 200, response.text
+    sent_context = response.json()["message"]["context"]
+    assert sent_context["operator_intent"] == context["operator_intent"]
+
+    payload.operator_intent["expected_revision"] = 0
+    with pytest.raises(Exception) as caught:
+        await _validated_message_scoped_context(
+            db_session, project_id=project.id, payload=payload
+        )
+    assert getattr(caught.value, "status_code", None) == 409
+
+    payload.operator_intent["expected_revision"] = 1
+    payload.operator_intent["artifact_ref_id"] = str(uuid.uuid4())
+    with pytest.raises(Exception) as caught:
+        await _validated_message_scoped_context(
+            db_session, project_id=project.id, payload=payload
+        )
+    assert getattr(caught.value, "status_code", None) == 400
+
+    payload.operator_intent["artifact_ref_id"] = str(ref.id)
     payload.artifact_refs[0]["checksum"] = "0" * 64
     with pytest.raises(Exception) as caught:
         await _validated_message_scoped_context(

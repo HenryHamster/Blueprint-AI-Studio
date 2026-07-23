@@ -98,7 +98,7 @@ _STRUCTURED_FIELD_ALLOWLISTS: dict[str, frozenset[str]] = {
     }),
     "operator_intent": frozenset({
         "kind", "action", "lane_owner", "summary", "target", "priority",
-        "approval", "operation_id", "expected_revision",
+        "approval", "operation_id", "artifact_ref_id", "expected_revision",
     }),
     "reply_preview": frozenset({
         "id", "message_id", "from_type", "actor_user_id", "sequence", "content",

@@ -332,6 +332,7 @@ async def create_tool_artifact_ref(
             "image_checksum": declared_checksum,
             "mime_type": receipt.content_type or "image/png",
             "size_bytes": receipt.expected_size_bytes,
+            "generation": int(promotion_intent.destination_generation),
             "width": image.get("width") if isinstance(image.get("width"), int) else None,
             "height": image.get("height") if isinstance(image.get("height"), int) else None,
         }

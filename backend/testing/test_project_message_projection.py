@@ -209,7 +209,12 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
             "artifact_refs": [
                 {"kind": "whiteboard", "id": "board-1", "checksum": "abc123"}
             ],
-            "operator_intent": {"kind": "verify", "lane_owner": "operator"},
+            "operator_intent": {
+                "kind": "verify",
+                "lane_owner": "operator",
+                "artifact_ref_id": "artifact-ref-1",
+                "expected_revision": 7,
+            },
             "huge": "not returned",
         }
     )
@@ -223,6 +228,8 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
     assert data["context"]["operator_intent"] == {
         "kind": "verify",
         "lane_owner": "operator",
+        "artifact_ref_id": "artifact-ref-1",
+        "expected_revision": 7,
     }
     assert "huge" not in data["context"]
 

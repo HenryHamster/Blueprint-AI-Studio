@@ -193,6 +193,8 @@ async def _run_handoff_rearm(
     project_id: uuid.UUID,
     resident_session_id: str | None,
     rearm_request: tuple[MessageType, str] | None,
+    *,
+    replacement_resident_active: bool = False,
 ) -> None:
     """Best-effort cadence arm after the handoff mutations have been committed.
 
@@ -211,7 +213,7 @@ async def _run_handoff_rearm(
             project_id,
             candidate_type,
             message_content=candidate_content,
-            resident_session_active=False,
+            resident_session_active=replacement_resident_active,
         )
         logger.info(
             "[SESSION_HANDOFF] re-arm outcome %s for released session %s (project %s)",
@@ -238,6 +240,8 @@ async def handoff_session_messages(
     session: AsyncSession,
     project_id: uuid.UUID,
     resident_session_id: str | None,
+    *,
+    replacement_resident_active: bool = False,
 ) -> int:
     """Hand open messages from an ended resident session to the next owner.
 
@@ -266,5 +270,129 @@ async def handoff_session_messages(
         # session.rollback() after bounded lock contention; cadence failure must
         # not restore the ended session's claims on unanswered messages.
         await session.commit()
-    await _run_handoff_rearm(session, project_id, resident_session_id, rearm_request)
+    await _run_handoff_rearm(
+        session,
+        project_id,
+        resident_session_id,
+        rearm_request,
+        replacement_resident_active=replacement_resident_active,
+    )
     return changed_count
+
+
+async def repair_stale_session_message_handoffs(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Retry handoff for open rows still owned by an older resident session.
+
+    A session-ending transition normally commits its message release atomically.
+    This repair remains necessary for rows stranded by older deployments and for
+    a stop/cap transition that deliberately commits after a caught staging error.
+    Every ensure excludes the DB-authoritative active session, then rechecks that
+    authority around each stale id so a replacement cannot lose its own rows.
+    """
+    if not hasattr(ProjectMessage, "resident_session_id"):
+        return 0
+
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_session_is_active,
+    )
+
+    locked_project = (
+        (
+            await session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .one_or_none()
+    )
+    authoritative_active_id: str | None = None
+    if locked_project is not None:
+        active_blob = read_resident_session(locked_project.vision)
+        if resident_session_is_active(active_blob):
+            authoritative_active_id = (
+                str(active_blob.get("session_id") or "") or None
+            )
+
+    stale_ids_query = select(ProjectMessage.resident_session_id).where(
+        ProjectMessage.project_id == project_id,
+        ProjectMessage.status == "open",
+        ProjectMessage.resident_session_id.is_not(None),
+    )
+    if authoritative_active_id:
+        stale_ids_query = stale_ids_query.where(
+            ProjectMessage.resident_session_id != authoritative_active_id
+        )
+    stale_session_ids = (
+        (
+            await session.execute(
+                stale_ids_query.distinct().order_by(
+                    ProjectMessage.resident_session_id.asc()
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Candidate discovery is only a snapshot. Release its lock, then establish
+    # a fresh Project authority boundary per handoff because each handoff commits.
+    await session.commit()
+
+    repaired = 0
+    for stale_session_id in stale_session_ids:
+        if not stale_session_id:
+            continue
+        try:
+            current_project = (
+                (
+                    await session.execute(
+                        select(Project)
+                        .where(Project.id == project_id)
+                        .execution_options(populate_existing=True)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .one_or_none()
+            )
+            current_active_id: str | None = None
+            if current_project is not None:
+                current_blob = read_resident_session(current_project.vision)
+                if resident_session_is_active(current_blob):
+                    current_active_id = (
+                        str(current_blob.get("session_id") or "") or None
+                    )
+            if str(stale_session_id) == current_active_id:
+                await session.commit()
+                continue
+            changed_count = await handoff_session_messages(
+                session,
+                project_id,
+                str(stale_session_id),
+                replacement_resident_active=bool(current_active_id),
+            )
+            repaired += changed_count
+            if changed_count == 0:
+                # The handoff helper intentionally leaves a no-op transaction
+                # to its caller. This repair loop owns the per-ID project lock,
+                # so release it before checking the next stale candidate.
+                await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "[SESSION_HANDOFF] repair failed for stale session %s "
+                "(project %s); a later resident ensure will retry",
+                stale_session_id,
+                project_id,
+                exc_info=True,
+            )
+    return repaired

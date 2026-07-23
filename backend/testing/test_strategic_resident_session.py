@@ -35,7 +35,10 @@ from app.routers.admin_project_strategic_session import (
     start_project_strategic_resident_session,
 )
 from app.reaper_orphan_classify import _classify_resident_session
-from app.session_message_handoff import handoff_session_messages
+from app.session_message_handoff import (
+    handoff_session_messages,
+    repair_stale_session_message_handoffs,
+)
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
@@ -335,6 +338,94 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
     )
     assert liveness["authority_held"] is True
     assert liveness["leased_until"] == lease
+
+
+@pytest.mark.asyncio
+async def test_new_resident_start_repairs_stale_message_ownership_without_cadence(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    stale = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="Release me when the replacement resident starts.",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        resident_session_id="ss-ended-before-start",
+    )
+    db_session.add(stale)
+    await db_session.commit()
+    rearm = AsyncMock(return_value="resident_active")
+    monkeypatch.setattr("app.strategic_trigger.maybe_arm_operator_refresh", rearm)
+
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert started["status"] == "active"
+    await db_session.refresh(stale)
+    assert stale.status == "open"
+    assert stale.resident_session_id is None
+    assert stale.handling_state == MessageHandlingState.PENDING
+    rearm.assert_awaited_once()
+    assert rearm.await_args.kwargs["resident_session_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_healthy_existing_resident_ensure_repairs_stale_message_ownership(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    rearm = AsyncMock(return_value="resident_active")
+    monkeypatch.setattr("app.strategic_trigger.maybe_arm_operator_refresh", rearm)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    rearm.reset_mock()
+    stale = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.FEEDBACK,
+        from_type="user",
+        content="A prior handoff failed after the current worker became healthy.",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        resident_session_id="ss-ended-after-current-start",
+    )
+    current = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="Keep current ownership isolated.",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=started["session_id"],
+    )
+    db_session.add_all([stale, current])
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    ensured = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert ensured["session_id"] == started["session_id"]
+    assert ensured["worker_generation"] == started["worker_generation"]
+    await db_session.refresh(stale)
+    assert stale.status == "open"
+    assert stale.resident_session_id is None
+    assert stale.handling_state == MessageHandlingState.PENDING
+    await db_session.refresh(current)
+    assert current.status == "open"
+    assert current.resident_session_id == started["session_id"]
+    assert current.handling_state == MessageHandlingState.PENDING
+    rearm.assert_awaited_once()
+    assert rearm.await_args.kwargs["resident_session_active"] is True
+
 
 @pytest.mark.asyncio
 async def test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears(
@@ -751,6 +842,204 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
     assert other_session.resident_session_id == "ss-other"
     rearm.assert_awaited_once()
     assert rearm.await_args.kwargs["resident_session_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_repair_excludes_db_authoritative_active_session(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "ss-current",
+            "task_id": str(task.id),
+            "worker_generation": 2,
+            "worker_state": "ready",
+            "status": "active",
+            "stop_requested": False,
+            "started_at": _utcnow().isoformat(),
+            "updated_at": _utcnow().isoformat(),
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    stale = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="This survived an interrupted end-session handoff.",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        resident_session_id="ss-ended-before-handoff",
+    )
+    current = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="This belongs only to the current resident.",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id="ss-current",
+    )
+    db_session.add_all([stale, current])
+    await db_session.commit()
+
+    rearm = AsyncMock(return_value="resident_active")
+    monkeypatch.setattr("app.strategic_trigger.maybe_arm_operator_refresh", rearm)
+
+    changed = await repair_stale_session_message_handoffs(
+        db_session,
+        project.id,
+    )
+
+    assert changed == 1
+    await db_session.refresh(stale)
+    assert stale.status == "open"
+    assert stale.resident_session_id is None
+    assert stale.handling_state == MessageHandlingState.PENDING
+    assert stale.handled_by_task_id is None
+    await db_session.refresh(current)
+    assert current.status == "open"
+    assert current.resident_session_id == "ss-current"
+    assert current.handling_state == MessageHandlingState.PENDING
+    rearm.assert_awaited_once()
+    assert rearm.await_args.kwargs["resident_session_active"] is True
+
+    # A later ensure is idempotent after the repair has committed.
+    assert (
+        await repair_stale_session_message_handoffs(
+            db_session,
+            project.id,
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_candidate_releases_per_id_project_transaction(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    stale = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="A competing repair releases this after discovery.",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id="ss-already-repaired",
+    )
+    db_session.add(stale)
+    await db_session.commit()
+
+    handoff_calls: list[tuple[str, bool]] = []
+
+    async def already_repaired_before_application(
+        session,
+        project_id,
+        resident_session_id,
+        *,
+        replacement_resident_active=False,
+    ):
+        del project_id
+        assert session.in_transaction() is True
+        handoff_calls.append(
+            (resident_session_id, replacement_resident_active)
+        )
+        return 0
+
+    monkeypatch.setattr(
+        "app.session_message_handoff.handoff_session_messages",
+        already_repaired_before_application,
+    )
+
+    changed = await repair_stale_session_message_handoffs(
+        db_session,
+        project.id,
+    )
+
+    assert changed == 0
+    assert handoff_calls == [("ss-already-repaired", False)]
+    assert db_session.in_transaction() is False
+
+
+@pytest.mark.asyncio
+async def test_repair_rechecks_active_session_between_stale_ids(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    first = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="This belongs to the first ended resident.",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        resident_session_id="ss-a",
+    )
+    replacement = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="This becomes owned by the replacement resident.",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id="ss-b",
+    )
+    db_session.add_all([first, replacement])
+    await db_session.commit()
+
+    repaired_ids: list[str] = []
+
+    async def activate_replacement_during_first_handoff(
+        session,
+        project_id,
+        resident_session_id,
+        *,
+        replacement_resident_active=False,
+    ):
+        del replacement_resident_active
+        repaired_ids.append(resident_session_id)
+        assert resident_session_id == "ss-a"
+        current_project = await session.get(Project, project_id)
+        now = _utcnow().isoformat()
+        current_project.vision = {
+            **(current_project.vision or {}),
+            RESIDENT_SESSION_KEY: {
+                "session_id": "ss-b",
+                "task_id": str(task.id),
+                "worker_generation": 2,
+                "worker_state": "ready",
+                "status": "active",
+                "stop_requested": False,
+                "started_at": now,
+                "updated_at": now,
+            },
+        }
+        flag_modified(current_project, "vision")
+        session.add(current_project)
+        await session.commit()
+        return 1
+
+    monkeypatch.setattr(
+        "app.session_message_handoff.handoff_session_messages",
+        activate_replacement_during_first_handoff,
+    )
+
+    changed = await repair_stale_session_message_handoffs(
+        db_session,
+        project.id,
+    )
+
+    assert changed == 1
+    assert repaired_ids == ["ss-a"]
+    await db_session.refresh(replacement)
+    assert replacement.resident_session_id == "ss-b"
+    assert replacement.status == "open"
 
 
 @pytest.mark.asyncio

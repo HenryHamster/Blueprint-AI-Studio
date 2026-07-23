@@ -306,6 +306,50 @@ async def generate_download_signed_url(
         raise
 
 
+async def artifact_object_matches_receipt(
+    storage_uri: str,
+    *,
+    expected_size_bytes: int,
+    expected_generation: int | None,
+) -> bool:
+    """Check durable GCS metadata without downloading the rendered image.
+
+    ``False`` means the object is permanently absent. Receipt corruption raises
+    ``StorageUriError``; transport, quota, and service failures propagate so the
+    caller can retry without mutating message state.
+    """
+    bucket_name, object_name = parse_artifact_uri(storage_uri)
+    from google.api_core import exceptions as _gexc
+    from google.cloud.storage.retry import DEFAULT_RETRY
+
+    def _inspect() -> bool:
+        blob = (
+            storage.Client(project=GCP_PROJECT_ID)
+            .bucket(bucket_name)
+            .blob(object_name)
+        )
+        blob.reload(
+            timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS,
+            retry=DEFAULT_RETRY.with_deadline(
+                ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS
+            ),
+        )
+        if int(blob.size or -1) != int(expected_size_bytes):
+            raise StorageUriError(
+                "rendered image size does not match its receipt"
+            )
+        if expected_generation is not None and int(blob.generation or -1) != int(expected_generation):
+            raise StorageUriError(
+                "rendered image generation does not match its receipt"
+            )
+        return True
+
+    try:
+        return await asyncio.to_thread(_inspect)
+    except _gexc.NotFound:
+        return False
+
+
 async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
     """Delete one validated in-bucket object without masking caller errors."""
 

@@ -738,7 +738,6 @@ def detect_capabilities() -> Capabilities:
 # with the registry when a new light read-only type is added.
 AGENT_DOCKER_TYPES: frozenset[str] = frozenset(
     {
-        "strategic_resident_turn",
         "strategic_review",
         "design_doc_update",
         "research",

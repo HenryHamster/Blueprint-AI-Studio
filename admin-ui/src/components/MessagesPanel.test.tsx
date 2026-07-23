@@ -5,6 +5,11 @@ import { waitFor } from '@testing-library/react';
 import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import type { ProjectMessage } from './MessageBubble';
 import type { StrategicStateResponse, StrategicStateAttentionItem } from '../strategicStateApi';
+import {
+  enqueueResidentToolHandoff,
+  loadQueuedResidentToolHandoffs,
+} from '../utils/residentToolHandoff';
+import { saveComposerDraft } from '../utils/conversationDraftState';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -448,6 +453,251 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(textarea.value).toBe('What should I research next?');
     expect(el.textContent).toContain('What should I research next?');
+  });
+
+  test('opens a durable tool handoff as an exact conversation draft', async () => {
+    const artifactRef = {
+      id: 'tool-ref-7',
+      artifact_ref_id: 'tool-ref-7',
+      tool_id: 'notes-1',
+      project_id: 'proj-1',
+      kind: 'notes' as const,
+      revision: 7,
+      checksum: 'a'.repeat(64),
+      author: 'test-user@example.com',
+      timestamp: '2026-07-17T00:00:00Z',
+      retrieval: {
+        capability: 'inline_bounded_text' as const,
+        href: '/artifact-refs/tool-ref-7',
+      },
+    };
+    expect(enqueueResidentToolHandoff(
+      'test-user@example.com',
+      'proj-1',
+      {
+        projectId: 'proj-1',
+        artifactRef,
+        intent: 'ask',
+        prompt: 'Review Notes revision 7.',
+      },
+    )).toBe(true);
+
+    const el = await renderPanel({ filterChrome: 'minimal' });
+
+    await waitFor(() => expect(
+      (el.querySelector('textarea') as HTMLTextAreaElement).value,
+    ).toBe('Review Notes revision 7.'));
+    expect(el.querySelector('[aria-label="Remove Notes revision 7"]')).not.toBeNull();
+    expect(loadQueuedResidentToolHandoffs(
+      'test-user@example.com',
+      'proj-1',
+    )).toEqual([]);
+  });
+
+  test('sends a queued tool revision with operator intent and preserves exact identity across retry', async () => {
+    const artifactRef = {
+      id: 'tool-ref-retry',
+      artifact_ref_id: 'tool-ref-retry',
+      tool_id: 'notes-retry',
+      project_id: 'proj-1',
+      kind: 'notes' as const,
+      revision: 12,
+      checksum: 'b'.repeat(64),
+      author: 'test-user@example.com',
+      timestamp: '2026-07-17T00:00:00Z',
+      retrieval: {
+        capability: 'inline_bounded_text' as const,
+        href: '/artifact-refs/tool-ref-retry',
+      },
+    };
+    expect(enqueueResidentToolHandoff('test-user@example.com', 'proj-1', {
+      projectId: 'proj-1',
+      artifactRef,
+      intent: 'ask',
+      prompt: 'Review Notes revision 12.',
+    })).toBe(true);
+    const el = await renderPanel({ filterChrome: 'minimal' });
+    await waitFor(() => expect(
+      (el.querySelector('textarea') as HTMLTextAreaElement).value,
+    ).toBe('Review Notes revision 12.'));
+
+    const baseline = vi.mocked(apiFetch).getMockImplementation();
+    if (!baseline) throw new Error('Expected URL-aware apiFetch mock');
+    let failFirstSend = true;
+    vi.mocked(apiFetch).mockImplementation(async (...args: Parameters<typeof apiFetch>) => {
+      const [url, init] = args;
+      if (
+        failFirstSend
+        && /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(String(url))
+        && init?.method === 'POST'
+      ) {
+        failFirstSend = false;
+        return new Response(JSON.stringify({ detail: 'temporarily unavailable' }), { status: 503 });
+      }
+      return baseline(...args);
+    });
+
+    const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
+    if (!send) throw new Error('Expected send button');
+    await act(async () => { send.click(); });
+    await waitFor(() => expect(
+      el.querySelector<HTMLButtonElement>('button[aria-label="Retry message"]'),
+    ).not.toBeNull());
+    const firstBody = JSON.parse(String(
+      (_strategicSessionMessagePostCalls()[0][1] as RequestInit).body ?? '{}',
+    ));
+    expect(firstBody).toMatchObject({
+      content: 'Review Notes revision 12.',
+      artifact_refs: [expect.objectContaining({
+        artifact_ref_id: 'tool-ref-retry',
+        revision: 12,
+      })],
+      operator_intent: {
+        kind: 'ask',
+        expected_revision: 12,
+      },
+    });
+
+    const retry = el.querySelector<HTMLButtonElement>('button[aria-label="Retry message"]');
+    if (!retry) throw new Error('Expected retry button');
+    await act(async () => { retry.click(); });
+    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(2));
+    const secondBody = JSON.parse(String(
+      (_strategicSessionMessagePostCalls()[1][1] as RequestInit).body ?? '{}',
+    ));
+    expect(secondBody).toEqual(firstBody);
+  });
+
+  test('removing an unrelated artifact preserves the queued handoff operator intent', async () => {
+    const unrelated = {
+      id: 'ordinary-artifact',
+      kind: 'artifact',
+      title: 'Run log',
+      revision: 3,
+    };
+    expect(saveComposerDraft('test-user@example.com', 'proj-1', {
+      type: 'FEEDBACK',
+      content: '',
+      reply_to: null,
+      source_refs: [],
+      artifact_refs: [unrelated],
+      attachment_send_key: null,
+    })).toBeTruthy();
+    const artifactRef = {
+      id: 'tool-ref-mixed',
+      artifact_ref_id: 'tool-ref-mixed',
+      tool_id: 'notes-mixed',
+      project_id: 'proj-1',
+      kind: 'notes' as const,
+      revision: 4,
+      checksum: 'e'.repeat(64),
+      author: 'test-user@example.com',
+      timestamp: '2026-07-17T00:00:00Z',
+      retrieval: {
+        capability: 'inline_bounded_text' as const,
+        href: '/artifact-refs/tool-ref-mixed',
+      },
+    };
+    expect(enqueueResidentToolHandoff('test-user@example.com', 'proj-1', {
+      projectId: 'proj-1',
+      artifactRef,
+      intent: 'ask',
+      prompt: 'Review Notes revision 4.',
+    })).toBe(true);
+
+    const el = await renderPanel({ filterChrome: 'minimal' });
+    await waitFor(() => expect(
+      el.querySelector('[aria-label="Remove Notes revision 4"]'),
+    ).not.toBeNull());
+    const removeUnrelated = el.querySelector<HTMLButtonElement>(
+      '[aria-label="Remove Run log revision 3"]',
+    );
+    if (!removeUnrelated) throw new Error('Expected unrelated artifact chip');
+    await act(async () => { removeUnrelated.click(); });
+
+    expect(el.querySelector('[aria-label="Remove Notes revision 4"]')).not.toBeNull();
+    const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
+    if (!send) throw new Error('Expected send button');
+    await act(async () => { send.click(); });
+    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(1));
+
+    const body = JSON.parse(String(
+      (_strategicSessionMessagePostCalls()[0][1] as RequestInit).body ?? '{}',
+    ));
+    expect(body).toMatchObject({
+      artifact_refs: [expect.objectContaining({
+        artifact_ref_id: 'tool-ref-mixed',
+      })],
+      operator_intent: {
+        kind: 'ask',
+        expected_revision: 4,
+        artifact_ref_id: 'tool-ref-mixed',
+      },
+    });
+    expect(body.artifact_refs).toHaveLength(1);
+  });
+
+  test('drains only one queued handoff and immediately shows the next after chip removal', async () => {
+    const first = {
+      id: 'tool-ref-first',
+      artifact_ref_id: 'tool-ref-first',
+      tool_id: 'notes-first',
+      project_id: 'proj-1',
+      kind: 'notes' as const,
+      revision: 1,
+      checksum: 'c'.repeat(64),
+      author: 'test-user@example.com',
+      timestamp: '2026-07-17T00:00:00Z',
+      retrieval: {
+        capability: 'inline_bounded_text' as const,
+        href: '/artifact-refs/tool-ref-first',
+      },
+    };
+    const second = {
+      ...first,
+      id: 'tool-ref-second',
+      artifact_ref_id: 'tool-ref-second',
+      tool_id: 'notes-second',
+      revision: 2,
+      checksum: 'd'.repeat(64),
+      retrieval: {
+        capability: 'inline_bounded_text' as const,
+        href: '/artifact-refs/tool-ref-second',
+      },
+    };
+    expect(enqueueResidentToolHandoff('test-user@example.com', 'proj-1', {
+      projectId: 'proj-1',
+      artifactRef: first,
+      intent: 'share',
+      prompt: 'Share Notes revision 1.',
+    })).toBe(true);
+    expect(enqueueResidentToolHandoff('test-user@example.com', 'proj-1', {
+      projectId: 'proj-1',
+      artifactRef: second,
+      intent: 'ask',
+      prompt: 'Review Notes revision 2.',
+    })).toBe(true);
+
+    const el = await renderPanel({ filterChrome: 'minimal' });
+    await waitFor(() => expect(el.querySelector(
+      '[aria-label="Remove Notes revision 1"]',
+    )).not.toBeNull());
+    expect(el.querySelector('[aria-label="Remove Notes revision 2"]')).toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', 'proj-1'))
+      .toEqual([expect.objectContaining({ artifactRef: second })]);
+
+    const remove = el.querySelector<HTMLButtonElement>(
+      '[aria-label="Remove Notes revision 1"]',
+    );
+    if (!remove) throw new Error('Expected first handoff chip');
+    await act(async () => { remove.click(); });
+
+    await waitFor(() => expect(el.querySelector(
+      '[aria-label="Remove Notes revision 2"]',
+    )).not.toBeNull());
+    expect((el.querySelector('textarea') as HTMLTextAreaElement).value)
+      .toBe('Review Notes revision 2.');
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', 'proj-1')).toEqual([]);
   });
 
   test('legacy onClose usage keeps full controls and close action', async () => {

@@ -37,6 +37,7 @@ function statusView(state: string | null | undefined, active: boolean, reason: s
     : null;
   if (normalized === 'active') return { label: 'Active', detail, tone: 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10' };
   if (normalized === 'starting' || normalized === 'stopping') return { label: normalized === 'starting' ? 'Starting' : 'Stopping', detail, tone: 'text-cyan-300 border-cyan-500/30 bg-cyan-500/10' };
+  if (normalized === 'waiting') return { label: 'Waiting', detail, tone: 'text-cyan-300 border-cyan-500/30 bg-cyan-500/10' };
   if (normalized === 'blocked' || normalized === 'error') return { label: normalized === 'blocked' ? 'Blocked' : 'Error', detail, tone: 'text-amber-300 border-amber-500/30 bg-amber-500/10' };
   return { label: 'Ready', detail, tone: 'text-neutral-300 border-neutral-700 bg-neutral-950/80' };
 }
@@ -108,7 +109,7 @@ export function StrategicSessionControl({
       {selectedMode === 'continuous' && (
         <>
           <span className={`hidden min-h-7 min-w-0 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${view.tone}`} role="status" title={view.detail ?? view.label}>
-            {(sessionBusy || saving) ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : normalizedSessionState === 'blocked' || normalizedSessionState === 'error' ? <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> : <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />}
+            {(sessionBusy || saving || normalizedSessionState === 'waiting') ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : normalizedSessionState === 'blocked' || normalizedSessionState === 'error' ? <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> : <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />}
             <span className="truncate">{view.label}</span>
           </span>
 

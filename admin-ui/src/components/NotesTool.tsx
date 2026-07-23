@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ToolComponentProps } from '../toolRegistry';
 import {
+  createResidentToolArtifactRef,
   fetchToolContent,
   saveToolContent,
   ConflictError,
   type ToolContent,
 } from '../api/projectTools';
+import { dispatchResidentToolHandoff } from '../utils/residentToolHandoff';
+import {
+  ToolResidentHandoffControls,
+  type ToolResidentHandoffIntent,
+} from './ToolResidentHandoffControls';
 import { MarkdownContent } from './MarkdownContent';
 
 // ---------------------------------------------------------------------------
@@ -201,6 +207,37 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
     }
   }, [projectId, tool.id]);
 
+  const handoffToConversation = useCallback(async (
+    intent: ToolResidentHandoffIntent,
+  ) => {
+    if (conflictRef.current) throw new Error('Resolve the Notes conflict before sharing.');
+    let saved = await flush();
+    if (saved && serialize(textRef.current) !== lastSavedRef.current) saved = await flush();
+    if (!saved || serialize(textRef.current) !== lastSavedRef.current) {
+      throw new Error('Notes changed while saving. Wait for Saved, then retry.');
+    }
+    const response = await createResidentToolArtifactRef(
+      projectId,
+      tool.id,
+      revisionRef.current,
+    );
+    if (response.state !== 'ready') {
+      throw new Error('Notes reference is still preparing. Retry in a moment.');
+    }
+    const artifactRef = response.artifact_ref;
+    const handedOff = dispatchResidentToolHandoff({
+      projectId,
+      artifactRef,
+      intent,
+      prompt: intent === 'ask'
+        ? `Review Notes "${tool.title}" revision ${artifactRef.revision} and answer my question.`
+        : `Use Notes "${tool.title}" revision ${artifactRef.revision} as exact project context.`,
+    });
+    if (!handedOff) {
+      throw new Error('Notes revision was saved, but the conversation handoff could not be stored. Retry Share/Ask.');
+    }
+  }, [flush, projectId, tool.id, tool.title]);
+
   // Keep my local text; overwrite the server with it (base revision was already
   // advanced to the server's during conflict handling, so this retry lands).
   const resolveKeepMine = useCallback(() => {
@@ -309,6 +346,12 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
           {saving ? 'Saving…' : conflict ? 'Conflict' : saveError ? 'Save failed' : dirty ? 'Unsaved changes' : 'Saved'}
         </span>
       </div>
+
+      <ToolResidentHandoffControls
+        toolLabel="Notes"
+        disabledReason={conflict ? 'Resolve the edit conflict before sharing this revision.' : saving ? 'Wait for the current save to finish.' : null}
+        onHandoff={handoffToConversation}
+      />
 
       {/* Conflict banner: another viewer saved a newer revision. Local edits
           are preserved above; the operator explicitly picks a resolution. */}

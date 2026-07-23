@@ -651,7 +651,7 @@ _VISIBLE_MESSAGE_RECORD_KEYS = {
     }),
     "operator_intent": frozenset({
         "kind", "action", "lane_owner", "summary", "target", "priority",
-        "approval", "operation_id", "expected_revision",
+        "approval", "operation_id", "artifact_ref_id", "expected_revision",
     }),
 }
 
@@ -1049,6 +1049,24 @@ async def _validated_message_scoped_context(
                 checksum_value=row.commit_hash,
                 detail="Artifact",
             )
+    intent_artifact_ref_id: uuid.UUID | None = None
+    operator_intent = context.get("operator_intent")
+    if (
+        isinstance(operator_intent, dict)
+        and "artifact_ref_id" in operator_intent
+    ):
+        intent_artifact_ref_id = _message_ref_uuid(
+            operator_intent.get("artifact_ref_id"),
+            prefix="artifact-ref",
+        )
+        if (
+            intent_artifact_ref_id is None
+            or intent_artifact_ref_id not in artifact_ref_ids
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="operator_intent ArtifactRef must match a message artifact_ref",
+            )
     if artifact_ref_ids:
         stmt = select(ArtifactRef).where(
             ArtifactRef.id.in_(artifact_ref_ids),
@@ -1061,6 +1079,22 @@ async def _validated_message_scoped_context(
         if valid_ids != artifact_ref_ids:
             raise HTTPException(status_code=400, detail="Invalid tool ArtifactRef")
         canonical_refs = {row.id: artifact_ref_projection(row) for row in rows}
+        if intent_artifact_ref_id is not None:
+            expected_revision = operator_intent.get("expected_revision")
+            if isinstance(expected_revision, bool) or not isinstance(
+                expected_revision, int
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="operator_intent expected_revision must be an integer",
+                )
+            bound_revision = canonical_refs[intent_artifact_ref_id].get("revision")
+            if expected_revision != bound_revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail="operator_intent ArtifactRef revision mismatch",
+                )
+            operator_intent["artifact_ref_id"] = str(intent_artifact_ref_id)
         for row in rows:
             claim = reference_claims.get(("artifact_ref", str(row.id)))
             if claim and str(claim.get("kind") or "").lower() != row.kind:

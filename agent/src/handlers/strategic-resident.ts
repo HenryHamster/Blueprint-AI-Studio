@@ -30,9 +30,11 @@ import {
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
   BoundedSeenSet, admitMessageBatchPage, combineOperatorMessages,
-  materializeContentBlocks, buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
+  materializeContentBlocks, rollbackMessageBatchAdmission,
+  isRetryableArtifactAttachmentError,
+  buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
-  MESSAGE_POLL_LIMIT, MAX_POLL_PAGES, OPERATOR_MESSAGE_BATCH_CAP,
+  MESSAGE_POLL_LIMIT, MAX_POLL_PAGES, OPERATOR_MESSAGE_BATCH_CAP, MAX_IMAGES_PER_TURN,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
@@ -708,6 +710,11 @@ export async function handleStrategicResident(
   // Bounded set of message ids already handled — with `created_at >= since` poll
   // semantics the boundary message re-appears each poll and is dropped here.
   const seen = new BoundedSeenSet();
+  let pendingOperatorAdmission: {
+    cursorBefore: string;
+    messages: ResidentInboundMessage[];
+  } | null = null;
+  let artifactRetryFailures = 0;
 
   // ── Evidence-gated autonomous tick: examination ledger + rotating focus ──────
   // Code-owned cross-tick memory the model cannot be trusted to keep. The catalog
@@ -1233,6 +1240,8 @@ export async function handleStrategicResident(
 
   const pollMessages = async (): Promise<ResidentInboundMessage[]> => {
     const collected: ResidentInboundMessage[] = [];
+    let collectedRequiredImages = 0;
+    const cursorBefore = cursor;
     try {
       for (let page = 0; page < MAX_POLL_PAGES; page++) {
         const prevCursor = cursor;
@@ -1244,9 +1253,13 @@ export async function handleStrategicResident(
         const resp = await apiGet(`/api/agent/projects/${projectId}/messages?${q}`) as MessagesPollResponse;
         const raw = Array.isArray(resp.messages) ? resp.messages : [];
         const admission = admitMessageBatchPage(
-          raw, seen, OPERATOR_MESSAGE_BATCH_CAP - collected.length,
+          raw,
+          seen,
+          OPERATOR_MESSAGE_BATCH_CAP - collected.length,
+          MAX_IMAGES_PER_TURN - collectedRequiredImages,
         );
         collected.push(...admission.admitted);
+        collectedRequiredImages += admission.requiredImagesAdmitted;
         // Advance across the whole page only when every unseen row was admitted.
         // If the atomic turn cap cut the page, advancing across deferred rows (or
         // marking them seen) would suppress them forever on the next poll.
@@ -1265,7 +1278,23 @@ export async function handleStrategicResident(
     } catch (e) {
       sendLog(ws, `[resident] message poll failed (non-fatal): ${String(e)}\n`);
     }
+    if (collected.length > 0) {
+      pendingOperatorAdmission = {
+        cursorBefore,
+        messages: [...collected],
+      };
+    }
     return collected;
+  };
+
+  const rollbackPendingOperatorAdmission = () => {
+    if (!pendingOperatorAdmission) return;
+    cursor = rollbackMessageBatchAdmission(
+      seen,
+      pendingOperatorAdmission.cursorBefore,
+      pendingOperatorAdmission.messages,
+    );
+    pendingOperatorAdmission = null;
   };
 
   // progress=true renews the authority lease (applied op / operator interaction);
@@ -1467,6 +1496,24 @@ export async function handleStrategicResident(
       sendLog(ws, '[resident] operator batch has no stable message id; leaving it open for retry\n');
       return 'stop';
     }
+    let operatorBlocks: ContentBlock[];
+    try {
+      operatorBlocks = await materializeContentBlocks(combineOperatorMessages(msgs));
+      artifactRetryFailures = 0;
+    } catch (error) {
+      if (!isRetryableArtifactAttachmentError(error)) throw error;
+      rollbackPendingOperatorAdmission();
+      streamer.status('required Whiteboard revision temporarily unavailable — retrying');
+      sendLog(ws, `[resident] ${error.message}; restored operator message admission for retry\n`);
+      const retryMs = Math.min(
+        30_000,
+        Math.max(cfg.messagePollMs, 1_500)
+          * (2 ** Math.min(artifactRetryFailures, 4)),
+      );
+      artifactRetryFailures += 1;
+      await sleep(retryMs);
+      return 'continue';
+    }
     const replyReceipt: ResidentReplyReceipt = {
       idempotency_key: residentMessageKey('reply', replyAnchorId),
       covered_message_ids: coveredMessageIds,
@@ -1517,7 +1564,7 @@ export async function handleStrategicResident(
       return 'stop';
     }
     try {
-      r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
+      r = await runTurn(operatorBlocks, true, pickupLagMs);
     } finally {
       if (ackTimer !== null) clearTimeout(ackTimer);
       try {
@@ -1584,6 +1631,7 @@ export async function handleStrategicResident(
       stopReason = 'operator_reply_not_persisted';
       return 'stop';
     }
+    pendingOperatorAdmission = null;
     // The create_message transaction already marked exactly this receipt's
     // covered IDs handled and persisted the restart-critical turn metadata.
     // The heartbeat only renews authority and reports ancillary session state;

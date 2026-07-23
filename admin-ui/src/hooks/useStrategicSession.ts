@@ -45,11 +45,16 @@ export function useStrategicSession({
   const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
   const [checkingInStrategicSession, setCheckingInStrategicSession] = useState(false);
   const [strategicSessionBusy, setStrategicSessionBusy] = useState(false);
+  const [strategicWorkdayRecoveryTick, setStrategicWorkdayRecoveryTick] = useState(0);
   const strategicWorkbenchStateRef = useRef<StrategicWorkbenchState | null>(null);
   const strategicWorkbenchSaveSeqRef = useRef(0);
   const strategicWorkbenchSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const strategicCheckInIdempotencyKeyRef = useRef<string | null>(null);
-  const strategicWorkdayEnsureKeyRef = useRef<string | null>(null);
+  const strategicWorkdayEnsuredKeysRef = useRef<Set<string>>(new Set());
+  const strategicWorkdayEnsureInflightRef = useRef<
+    Map<string, ReturnType<typeof startStrategicSession>>
+  >(new Map());
+  const strategicWorkdayExplicitlyStoppedProjectRef = useRef<string | null>(null);
   const strategicWorkbenchOperatorSurfaceTouchedRef = useRef(false);
   const strategicWorkbenchRestoreProjectRef = useRef<string | null>(null);
 
@@ -62,7 +67,8 @@ export function useStrategicSession({
     strategicWorkbenchOperatorSurfaceTouchedRef.current = false;
     strategicWorkbenchRestoreProjectRef.current = null;
     strategicCheckInIdempotencyKeyRef.current = null;
-    strategicWorkdayEnsureKeyRef.current = null;
+    strategicWorkdayEnsuredKeysRef.current.clear();
+    strategicWorkdayExplicitlyStoppedProjectRef.current = null;
     setCheckingInStrategicSession(false);
     setStrategicSessionBusy(false);
   }, [selectedProjectId]);
@@ -125,6 +131,35 @@ export function useStrategicSession({
     ?? null;
   const refreshStrategicReadModel = strategicReadModel.refresh;
 
+  // Polling snapshots can remain byte-for-byte unchanged while a provisional
+  // worker crosses the backend's five-minute stale-claim threshold. Schedule a
+  // single local wake-up at that boundary so recovery does not depend on a
+  // reload or on some unrelated read-model field changing.
+  useEffect(() => {
+    if (
+      !selectedProjectId
+      || strategicInteractionMode !== 'continuous'
+      || strategicSessionState?.trim().toLowerCase() !== 'starting'
+    ) return;
+    const workerTimestamp = parseTimestamp(
+      residentStrategicSession?.started_at
+      ?? null,
+    ).getTime();
+    if (!Number.isFinite(workerTimestamp)) return;
+    const delayMs = 5 * 60_000 - (Date.now() - workerTimestamp);
+    if (delayMs <= 0) return;
+    const timer = window.setTimeout(
+      () => setStrategicWorkdayRecoveryTick(tick => tick + 1),
+      delayMs + 25,
+    );
+    return () => window.clearTimeout(timer);
+  }, [
+    selectedProjectId,
+    strategicInteractionMode,
+    strategicSessionState,
+    residentStrategicSession?.started_at,
+  ]);
+
   // Entering Workday is not the only time the resident must be ensured. A full
   // page reload can hydrate directly into continuous mode, bypassing the mode
   // transition handler entirely. Ensure once per project/mode hydration so the
@@ -133,31 +168,104 @@ export function useStrategicSession({
   useEffect(() => {
     const projectId = selectedProjectId;
     if (!projectId || strategicInteractionMode !== 'continuous') {
-      strategicWorkdayEnsureKeyRef.current = null;
+      // Leaving Workday is an explicit re-entry boundary. A later transition
+      // back to continuous may start the resident again.
+      strategicWorkdayExplicitlyStoppedProjectRef.current = null;
+      strategicWorkdayEnsuredKeysRef.current.clear();
       return;
     }
+    if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
     // Retry-wait is dormant/healthy only while the session itself is active.
     // End/stop paths may preserve the last worker fields, and that stale value
     // must not suppress the idempotent start that restores Workday on reload.
     if (strategicSessionActive && residentStrategicSession?.worker_state === 'retry_wait') return;
-    const ensureKey = `${projectId}:continuous`;
-    if (strategicWorkdayEnsureKeyRef.current === ensureKey) return;
+    const workerState = residentStrategicSession?.worker_state?.trim().toLowerCase() ?? null;
+    const lifecycleState = strategicSessionState?.trim().toLowerCase() ?? null;
+    const workerTimestamp = parseTimestamp(
+      residentStrategicSession?.started_at
+      ?? null,
+    ).getTime();
+    const startingIsWedged = lifecycleState === 'starting'
+      && (!Number.isFinite(workerTimestamp) || Date.now() - workerTimestamp > 5 * 60_000);
+    const needsRecovery = !strategicSessionActive
+      || workerState === 'restart_failed'
+      || lifecycleState === 'error'
+      || lifecycleState === 'blocked'
+      || startingIsWedged;
+    // Hydration is ensured once, while each observed failed worker generation
+    // gets one independent recovery attempt. Keeping the completed epochs in a
+    // set prevents a stale polling snapshot from causing a restart loop, but a
+    // later generation can still recover on the same page.
+    const ensureEpoch = needsRecovery
+      ? [
+          'recover',
+          residentStrategicSession?.session_id ?? 'none',
+          residentStrategicSession?.worker_generation ?? 0,
+          residentStrategicSession?.status ?? 'none',
+          workerState ?? lifecycleState ?? 'unknown',
+        ].join(':')
+      : 'hydrate';
+    const ensureKey = `${projectId}:continuous:${ensureEpoch}`;
+    if (strategicWorkdayEnsuredKeysRef.current.has(ensureKey)) return;
     const preferredRunnerId = strategicSessionSelectedRunnerId;
     let cancelled = false;
     let retryTimer: number | null = null;
     let retryAttempt = 0;
     const ensureWorkday = async () => {
+      if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
       try {
-        const response = await startStrategicSession(
-          projectId,
-          {
+        let request = strategicWorkdayEnsureInflightRef.current.get(ensureKey);
+        if (!request) {
+          request = startStrategicSession(projectId, {
             ...(preferredRunnerId ? { runner_id: preferredRunnerId } : {}),
             expected_interaction_mode: 'continuous',
-          },
-        );
+          });
+          strategicWorkdayEnsureInflightRef.current.set(ensureKey, request);
+          void request.finally(() => {
+            if (strategicWorkdayEnsureInflightRef.current.get(ensureKey) === request) {
+              strategicWorkdayEnsureInflightRef.current.delete(ensureKey);
+            }
+          }).catch(() => undefined);
+        }
+        const response = await request;
         if (response.ensure_outcome === 'mode_changed') {
           if (cancelled || selectedProjectIdRef.current !== projectId) return;
           const retryDelayMs = Math.min(250 * (2 ** retryAttempt), 10_000);
+          retryAttempt += 1;
+          retryTimer = window.setTimeout(() => {
+            retryTimer = null;
+            if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
+            void ensureWorkday();
+          }, retryDelayMs);
+          return;
+        }
+        if (cancelled || selectedProjectIdRef.current !== projectId) return;
+        const returnedSession = response.session;
+        const returnedWorker = returnedSession?.worker_state?.trim().toLowerCase();
+        const returnedStatus = returnedSession?.status?.trim().toLowerCase();
+        const returnedSessionId = returnedSession?.session_id?.trim();
+        const returnedStartedAtValue = returnedSession?.started_at?.trim();
+        const returnedStartedAt = parseTimestamp(returnedStartedAtValue ?? null).getTime();
+        // A successful HTTP response is not a successful ensure unless it
+        // carries an actual session snapshot. During a replacement race the
+        // backend may briefly return null (or an all-empty compatibility
+        // object); marking that epoch complete would strand Workday until a
+        // reload.
+        const returnedSessionIsEmpty = !returnedSession
+          || !(returnedSessionId || returnedWorker || returnedStatus || returnedStartedAtValue);
+        const returnedStartingIsWedged = returnedWorker === 'starting'
+          && (
+            !Number.isFinite(returnedStartedAt)
+            || Date.now() - returnedStartedAt > 5 * 60_000
+          );
+        const returnedNeedsRetry = returnedSessionIsEmpty
+          || returnedWorker === 'restart_failed'
+          || returnedStatus === 'blocked'
+          || returnedStatus === 'error'
+          || returnedStatus === 'ended'
+          || returnedStartingIsWedged;
+        if (returnedNeedsRetry) {
+          const retryDelayMs = Math.min(500 * (2 ** retryAttempt), 10_000);
           retryAttempt += 1;
           retryTimer = window.setTimeout(() => {
             retryTimer = null;
@@ -165,8 +273,7 @@ export function useStrategicSession({
           }, retryDelayMs);
           return;
         }
-        if (cancelled || selectedProjectIdRef.current !== projectId) return;
-        strategicWorkdayEnsureKeyRef.current = ensureKey;
+        strategicWorkdayEnsuredKeysRef.current.add(ensureKey);
         void refreshStrategicReadModel();
       } catch {
         if (cancelled || selectedProjectIdRef.current !== projectId) return;
@@ -174,6 +281,7 @@ export function useStrategicSession({
         retryAttempt += 1;
         retryTimer = window.setTimeout(() => {
           retryTimer = null;
+          if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
           void ensureWorkday();
         }, retryDelayMs);
       }
@@ -188,8 +296,14 @@ export function useStrategicSession({
     strategicInteractionMode,
     strategicSessionActive,
     residentStrategicSession?.worker_state,
+    residentStrategicSession?.worker_generation,
+    residentStrategicSession?.session_id,
+    residentStrategicSession?.status,
+    residentStrategicSession?.started_at,
+    strategicSessionState,
     strategicSessionSelectedRunnerId,
     refreshStrategicReadModel,
+    strategicWorkdayRecoveryTick,
   ]);
 
   const chatComposerContextDescriptor = useMemo(
@@ -295,6 +409,7 @@ export function useStrategicSession({
   const handleStartStrategicSession = useCallback(async () => {
     const projectId = selectedProjectId;
     if (!projectId || strategicSessionBusy) return;
+    strategicWorkdayExplicitlyStoppedProjectRef.current = null;
     setStrategicSessionBusy(true);
     try {
       const preferredRunnerId = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.preferred_runner_id ?? null;
@@ -314,6 +429,9 @@ export function useStrategicSession({
   const handleStopStrategicSession = useCallback(async () => {
     const projectId = selectedProjectId;
     if (!projectId || strategicSessionBusy) return;
+    // Suppress auto-ensure immediately so an already-scheduled recovery cannot
+    // undo the operator's explicit Stop while the request is in flight.
+    strategicWorkdayExplicitlyStoppedProjectRef.current = projectId;
     setStrategicSessionBusy(true);
     try {
       await stopStrategicSession(projectId);
@@ -321,6 +439,9 @@ export function useStrategicSession({
       addToast('Strategic session stopping', 'success');
       void strategicReadModel.refresh();
     } catch (err) {
+      if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) {
+        strategicWorkdayExplicitlyStoppedProjectRef.current = null;
+      }
       if (selectedProjectIdRef.current === projectId) {
         addToast(err instanceof Error ? err.message : 'Could not stop Strategic session', 'error');
       }
