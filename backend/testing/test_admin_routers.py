@@ -14746,6 +14746,178 @@ class TestStrategicPendingConfirmDedup:
         assert resp.json()["removed"] is True
 
 
+class TestSetProblemModelWithPoisonedStoredModel:
+    """set_problem_model op: stored problem_model containing legacy unknown keys (e.g.
+    truncated:true from the rev-1367 wipe) must NOT permanently wedge all subsequent
+    agent writes; the write path must fail loudly for real oversize, not silently
+    truncate or swallow the error.
+
+    Regression guard for the rev-1367 problem-model write wedge: the stored model
+    had a stale "truncated": true top-level key (packer marker) that apply_agent_update
+    now strips before parsing (sanitize_problem_model_raw on current_raw).
+    """
+
+    async def _setup(self, db_session, pm: dict | None = None):
+        from app.auth import create_agent_token
+        from app import strategic_cycle
+        from app.models import Task, TaskStatus
+
+        project = Project(
+            name="PM Poison Test",
+            user_id=TEST_USER_ID,
+            vision={"purpose": "test", "revision": 1},
+            problem_model=pm or {},
+            directions=[],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        cycle = await strategic_cycle.create(db_session, project_id=project.id)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="vm-pm-poison-test",
+            payloads=[
+                {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+            ],
+            context={"strategic_cycle_id": cycle.id},
+            strategic_cycle_id=cycle.id,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(
+            str(task.id), "vm-pm-poison-test", task_type="strategic_review"
+        )
+        return project, task, token
+
+    @pytest.mark.asyncio
+    async def test_set_problem_model_with_poisoned_stored_model_succeeds(self, db_session):
+        """set_problem_model op succeeds when the stored problem_model contains legacy
+        unknown keys (truncated:true).  apply_agent_update strips unknown top-level
+        keys from current_raw before parsing so a poisoned stored row does NOT block
+        every subsequent agent write with HTTP 400.
+
+        Regression for the rev-1367 write wedge: the problem model was wiped to
+        constraints-only plus a stale "truncated": true key, causing every agent
+        set_problem_model to fail because ProblemModel(extra="forbid") rejected the
+        key when current_raw was passed unfiltered to parse_problem_model."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        poisoned_pm = {
+            "revision": 5,
+            "truncated": True,  # legacy packer marker — should be stripped before parse
+            "intent": {"purpose": "Old purpose.", "current_focus": ""},
+        }
+        project, task, token = await self._setup(db_session, pm=poisoned_pm)
+        # Force-write the poisoned model (above _setup already sets it, but
+        # flag_modified ensures SQLAlchemy flushes it to the DB).
+        project.problem_model = poisoned_pm
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "set_problem_model",
+                    "data": {
+                        "intent": {
+                            "purpose": "Updated purpose after wedge heal.",
+                            "current_focus": "Resumed work.",
+                        },
+                    },
+                },
+            )
+        # apply_agent_update strips "truncated" so write succeeds — not wedged to 400
+        assert resp.status_code == 200, (
+            f"Expected 200 (wedge healed by sanitization), got {resp.status_code}: {resp.text}"
+        )
+        # The revision must advance past the poisoned model's revision (5)
+        body = resp.json()
+        assert body.get("revision", 0) > 5, (
+            f"Expected revision > 5 to prove the write went through; got {body.get('revision')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_problem_model_oversize_live_core_fails_loudly(self, db_session):
+        """set_problem_model op returns HTTP 400 naming the oversize section when the
+        merged model's live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET — proving
+        the write path fails loudly rather than silently truncating or returning 200.
+
+        The payload is kept under the 100KB incoming-request guard (admin_agent_ops
+        line ~1190) while still exceeding the 90KB PROBLEM_MODEL_BYTE_BUDGET used by
+        gc_problem_model, so the oversize is caught at the model-merge layer (not the
+        raw-payload gate)."""
+        import json
+
+        from app.problem_model import PROBLEM_MODEL_BYTE_BUDGET
+
+        # 23 gaps × 4 000-char descriptions ≈ 94 KB — above the 90 KB model budget
+        # but below the 100 KB raw-payload check, so apply_agent_update's live-core
+        # check fires and the op must return 400 with an actionable error message.
+        big = "x" * 4_000
+        oversized_gaps = [
+            {"id": f"g-huge-{i}", "name": f"gap {i}", "status": "active", "description": big}
+            for i in range(23)
+        ]
+        oversized_pm = {"gaps": oversized_gaps}
+        payload_bytes = len(json.dumps(oversized_pm))
+        assert payload_bytes > PROBLEM_MODEL_BYTE_BUDGET, (
+            f"test setup: proposed payload ({payload_bytes} bytes) must exceed "
+            f"PROBLEM_MODEL_BYTE_BUDGET ({PROBLEM_MODEL_BYTE_BUDGET})"
+        )
+        assert payload_bytes < 100_000, (
+            f"test setup: proposed payload ({payload_bytes} bytes) must be under "
+            "the 100 KB raw-payload gate so the model-merge oversize check fires"
+        )
+
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "set_problem_model",
+                    "data": oversized_pm,
+                },
+            )
+        # Must fail loudly with 400, naming the oversize section — NOT 200 (silent pass)
+        # and NOT 500 (opaque crash).
+        # The strategic API endpoint returns {"error": {"code": N, "message": "..."}}
+        # (via the app's error-handler middleware) rather than FastAPI's default
+        # {"detail": "..."} shape.
+        assert resp.status_code == 400, (
+            f"Expected 400 for oversize live core, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        error_msg = (
+            body.get("error", {}).get("message")
+            or body.get("detail")
+            or ""
+        )
+        assert (
+            "oversize section" in error_msg
+            or "live core" in error_msg
+            or "byte budget" in error_msg
+        ), (
+            f"Expected error to name the oversize section; got message: {error_msg!r}, "
+            f"full body: {body!r}"
+        )
+
+
 class TestRecordFindingResolutionViaStrategicOp:
     """POST /api/agent/strategic op=record_finding_resolution — finding ledger write."""
 
