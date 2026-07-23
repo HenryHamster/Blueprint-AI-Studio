@@ -3436,6 +3436,73 @@ def get_usage_headroom_armable_since() -> datetime | None:
     return _usage_headroom_armable_since
 
 
+async def _persist_usage_headroom_armable_since(dt: datetime | None) -> bool:
+    """Persist the armable-since timestamp into DeploymentState.runtime_config_json.
+
+    Modeled after ``_persist_usage_headroom_gate_enabled`` — the same JSONB config
+    row, different key. None values are persisted as JSON null so the restore
+    path can distinguish ``never-set`` from ``explicitly-reset``.
+    """
+    from app.models import DeploymentState
+
+    value = dt.isoformat() if dt is not None else None
+    try:
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            if state is None:
+                logger.warning(
+                    "[POOL] usage_headroom persist armable-since: "
+                    "DeploymentState id=1 missing; skipped"
+                )
+                return False
+            config_json = dict(getattr(state, "runtime_config_json", None) or {})
+            config_json["usage_headroom_armable_since"] = value
+            state.runtime_config_json = config_json
+            session.add(state)
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "[POOL] usage_headroom persist armable-since: failed to persist %s",
+            value,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+async def _restore_usage_headroom_armable_since() -> bool:
+    """Restore armable-since from DB on leader start.
+
+    Called from ``reconcile_usage_headroom_arming`` when the module variable is
+    None (process restart / module reload). Reads the previously-persisted ISO
+    string from DeploymentState.runtime_config_json and sets the module variable
+    so the sustained-observation window is **not** reset by a restart.
+
+    Returns True if a value was restored.
+    """
+    global _usage_headroom_armable_since
+
+    try:
+        from app.models import DeploymentState
+
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            if state is None:
+                return False
+            config_json = getattr(state, "runtime_config_json", None) or {}
+            raw = config_json.get("usage_headroom_armable_since")
+            if raw is not None and isinstance(raw, str):
+                _usage_headroom_armable_since = datetime.fromisoformat(raw)
+                return True
+    except Exception:
+        logger.warning(
+            "[POOL] usage_headroom restore armable-since: failed; "
+            "window will start fresh",
+            exc_info=True,
+        )
+    return False
+
+
 async def _persist_usage_headroom_gate_enabled(value: bool) -> bool:
     """Persist ``usage_headroom_gate_enabled`` into DeploymentState.runtime_config_json
     (id=1) BEFORE mutating in-memory ``runtime_config``.
@@ -3507,9 +3574,22 @@ async def reconcile_usage_headroom_arming(
     Flips are persisted to DeploymentState BEFORE the in-memory mutation and are
     idempotent (only written when the value actually changes). A persist failure
     leaves state unchanged and never crashes the caller.
+
+    Persistence: the armable-since marker is written to
+    ``DeploymentState.runtime_config_json`` on every transition (non-None to None
+    on reset, or None to a timestamp on first observation).  On process restart
+    the marker is restored on the first reconciler tick so the observation window
+    is **not** reset by a restart — only a genuine meter-health regression
+    (armable=False) discards it.
     """
     global _usage_headroom_armable_since
     now = now or _utcnow()
+
+    # After a process restart the module variable is None (module reload). Restore
+    # any previously-persisted marker so the observation window survives restarts.
+    # Only a genuine metering-health regression (armable=False below) discards it.
+    if _usage_headroom_armable_since is None:
+        await _restore_usage_headroom_armable_since()
 
     cfg = _runtime_config_snapshot()
     mode = str(cfg.get("usage_headroom_auto_arm_mode", "auto") or "auto").strip().lower()
@@ -3519,9 +3599,13 @@ async def reconcile_usage_headroom_arming(
 
     # manual: reconciler is a no-op; the operator owns the gate. Reset the window
     # so a later switch to auto starts a fresh observation rather than arming on a
-    # marker that accrued while manual.
+    # marker that accrued while manual. Persist the reset so the next leader also
+    # starts fresh.
     if mode == "manual":
+        had_marker = _usage_headroom_armable_since is not None
         _usage_headroom_armable_since = None
+        if had_marker:
+            await _persist_usage_headroom_armable_since(None)
         return {
             "mode": "manual",
             "action": "noop",
@@ -3530,9 +3614,13 @@ async def reconcile_usage_headroom_arming(
             "armable_since": None,
         }
 
-    # off: force-disarm kill switch. Hold the gate False.
+    # off: force-disarm kill switch. Hold the gate False. Persist the marker
+    # reset so a subsequent "auto" mode restart doesn't inherit the stale window.
     if mode == "off":
+        had_marker = _usage_headroom_armable_since is not None
         _usage_headroom_armable_since = None
+        if had_marker:
+            await _persist_usage_headroom_armable_since(None)
         if not current_enabled:
             return {
                 "mode": "off",
@@ -3583,9 +3671,13 @@ async def reconcile_usage_headroom_arming(
         observation_minutes = 1
 
     # Fail-safe: the instant armable regresses, reset the window and disarm now
-    # (no observation window on the way down).
+    # (no observation window on the way down). Persist the reset so a subsequent
+    # restart doesn't inherit the stale window.
     if not armable:
+        had_marker = _usage_headroom_armable_since is not None
         _usage_headroom_armable_since = None
+        if had_marker:
+            await _persist_usage_headroom_armable_since(None)
         if not current_enabled:
             return {
                 "mode": "auto",
@@ -3618,8 +3710,11 @@ async def reconcile_usage_headroom_arming(
         }
 
     # armable is True — track the sustained-observation window.
+    # If this is a fresh observation (never held or restored), mark the start
+    # and persist it so the window survives a restart.
     if _usage_headroom_armable_since is None:
         _usage_headroom_armable_since = now
+        await _persist_usage_headroom_armable_since(now)
     since = _usage_headroom_armable_since
     elapsed_seconds = (now - since).total_seconds()
     window_seconds = observation_minutes * 60

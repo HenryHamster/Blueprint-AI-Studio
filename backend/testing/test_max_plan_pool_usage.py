@@ -783,15 +783,18 @@ class TestReconcileUsageHeadroomArming:
         res = await reconcile_usage_headroom_arming(now=now0)
         assert res["action"] == "waiting"
         assert res["gate_enabled"] is False
-        assert commits == [], "must NOT persist before the window elapses"
+        # Marker persisted (not the gate) on the first observation.
+        assert len(commits) == 1
+        assert commits[0].get("usage_headroom_armable_since") == now0.isoformat()
         assert get_usage_headroom_armable_since() == now0
 
         # Second cycle past the 60-minute window → arm.
         res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
         assert res["action"] == "armed"
         assert res["gate_enabled"] is True
-        # Persisted to DeploymentState BEFORE the in-memory mutation.
-        assert commits == [{"usage_headroom_gate_enabled": True}]
+        # Both the armable-since marker AND the gate were persisted.
+        assert len(commits) == 2
+        assert commits[1].get("usage_headroom_gate_enabled") is True
         assert state.runtime_config_json["usage_headroom_gate_enabled"] is True
         # In-memory config mirrored after the durable commit.
         assert shared_state.runtime_config["usage_headroom_gate_enabled"] is True
@@ -806,11 +809,13 @@ class TestReconcileUsageHeadroomArming:
 
         now0 = _utcnow()
         await reconcile_usage_headroom_arming(now=now0)
+        assert len(commits) == 1  # armable-since marker persisted
         # 30 minutes < 60-minute window.
         res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=30))
         assert res["action"] == "waiting"
         assert res["gate_enabled"] is False
-        assert commits == []
+        # No additional commits — gate unchanged, marker unchanged.
+        assert len(commits) == 1
 
     async def test_auto_failsafe_disarms_on_regression(
         self, monkeypatch, _reset_arm_marker
@@ -835,7 +840,9 @@ class TestReconcileUsageHeadroomArming:
         )
         assert res["action"] == "disarmed"
         assert res["gate_enabled"] is False
-        assert commits[-1] == {"usage_headroom_gate_enabled": False}
+        # Both the armable-since reset and the gate-disarm are persisted.
+        assert commits[-1].get("usage_headroom_gate_enabled") is False
+        assert commits[-1].get("usage_headroom_armable_since") is None
         assert shared_state.runtime_config["usage_headroom_gate_enabled"] is False
         assert get_usage_headroom_armable_since() is None
 
@@ -850,22 +857,26 @@ class TestReconcileUsageHeadroomArming:
 
         now0 = _utcnow()
         await reconcile_usage_headroom_arming(now=now0)
+        assert len(commits) == 1  # armable-since marker persisted
         # Regress before arming — marker resets, gate never armed.
         holder["armable"] = False
         res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=30))
         assert res["action"] == "noop"
         assert get_usage_headroom_armable_since() is None
-        assert commits == []
+        # The armable-since reset was persisted.
+        assert len(commits) == 2
+        assert commits[1].get("usage_headroom_armable_since") is None
 
         # Recover — the window restarts from the recovery instant, not now0.
         holder["armable"] = True
         recover_at = now0 + timedelta(minutes=40)
         await reconcile_usage_headroom_arming(now=recover_at)
         assert get_usage_headroom_armable_since() == recover_at
+        assert len(commits) == 3  # fresh marker persisted
         # 61 min after now0 is only 21 min into the restarted window → still off.
         res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
         assert res["action"] == "waiting"
-        assert commits == []
+        assert len(commits) == 3  # no new commit — marker and gate unchanged
 
     async def test_manual_mode_never_touches_gate(
         self, monkeypatch, _reset_arm_marker
@@ -935,12 +946,13 @@ class TestReconcileUsageHeadroomArming:
         now0 = _utcnow()
         await reconcile_usage_headroom_arming(now=now0)
         await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
-        assert len(commits) == 1
+        # First commit: armable-since marker. Second commit: gate + marker.
+        assert len(commits) == 2
         # Subsequent cycles with the gate already armed must not re-persist.
         res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=120))
         assert res["action"] == "noop"
         assert res["gate_enabled"] is True
-        assert len(commits) == 1, "armed gate must not be re-committed each cycle"
+        assert len(commits) == 2, "armed gate must not be re-committed each cycle"
 
     async def test_persist_failure_leaves_memory_unchanged(
         self, monkeypatch, _reset_arm_marker
@@ -974,6 +986,142 @@ class TestReconcileUsageHeadroomArming:
         res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
         assert res["action"] == "persist_failed"
         assert shared_state.runtime_config["usage_headroom_gate_enabled"] is False
+
+    # ── armable-since persistence + restart survival ─────────────────────────────
+
+    async def test_auto_persists_armable_since_marker(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        """The armable-since marker is persisted to DB when first set."""
+
+        _set_config(monkeypatch)
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+        res = await reconcile_usage_headroom_arming(now=now0)
+        assert res["action"] == "waiting"
+        assert get_usage_headroom_armable_since() == now0
+        # Must be persisted in the last commit.
+        assert len(commits) >= 1
+        last_commit = commits[-1]
+        assert last_commit.get("usage_headroom_armable_since") == now0.isoformat()
+
+    async def test_auto_restores_armable_since_after_restart(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        """Simulate leader restart: the persisted marker is restored so the
+        observation window is NOT reset by a restart."""
+        import app.max_plan_pool as mpp
+
+        _set_config(monkeypatch)
+        holder = {"armable": True}
+        _install_fake_stats(monkeypatch, holder)
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+
+        # Cycle 1: armable True, marker set to now0 and persisted.
+        res = await reconcile_usage_headroom_arming(now=now0)
+        assert res["action"] == "waiting"
+        assert get_usage_headroom_armable_since() == now0
+
+        # Simulate leader restart: module variable reverts to None.
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+        assert get_usage_headroom_armable_since() is None
+
+        # Cycle 2 (armable still True after restart): restore from DB.
+        at = now0 + timedelta(minutes=31)
+        res = await reconcile_usage_headroom_arming(now=at)
+        assert res["action"] == "waiting"
+        # The marker was restored from DB (now0), not set to `at`.
+        assert get_usage_headroom_armable_since() == now0
+        assert res["armable_since"] == now0.isoformat()
+
+    async def test_auto_restart_does_not_reset_observation_window(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        """The full observation window survives a restart: a window that would
+        have elapsed at T+60min still arms the gate after a mid-window restart."""
+        import app.max_plan_pool as mpp
+        import app.shared_state as shared_state
+
+        _set_config(monkeypatch)
+        holder = {"armable": True}
+        _install_fake_stats(monkeypatch, holder)
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+
+        # Cycle 1: marker set at now0.
+        res = await reconcile_usage_headroom_arming(now=now0)
+        assert get_usage_headroom_armable_since() == now0
+
+        # Simulate restart right after cycle 1.
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+
+        # Cycle 2: 31 min later, within window, marker restored.
+        mid = now0 + timedelta(minutes=31)
+        res = await reconcile_usage_headroom_arming(now=mid)
+        assert res["action"] == "waiting"
+        assert get_usage_headroom_armable_since() == now0
+
+        # Cycle 3: 61 min from original → window elapsed, gate arms.
+        arm_time = now0 + timedelta(minutes=61)
+        res = await reconcile_usage_headroom_arming(now=arm_time)
+        assert res["action"] == "armed"
+        assert res["gate_enabled"] is True
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is True
+
+    async def test_regression_after_restart_discards_persisted_marker(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        """A genuine meter-health regression after restart correctly discards the
+        persisted marker and starts a fresh observation from the recovery time."""
+        import app.max_plan_pool as mpp
+
+        _set_config(monkeypatch)
+        holder = {"armable": True}
+        _install_fake_stats(monkeypatch, holder)
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+
+        # Cycle 1: armable True, marker persisted at now0.
+        res = await reconcile_usage_headroom_arming(now=now0)
+        assert get_usage_headroom_armable_since() == now0
+
+        # Simulate restart AND regression: meters are now unhealthy.
+        monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+        holder["armable"] = False
+
+        # Cycle 2 after restart: armable=False → restore then reset.
+        regressed_at = now0 + timedelta(minutes=10)
+        res = await reconcile_usage_headroom_arming(now=regressed_at)
+        assert res["action"] == "noop"  # gate already False
+        assert get_usage_headroom_armable_since() is None
+
+        # Meters recover.
+        holder["armable"] = True
+        recovered_at = now0 + timedelta(minutes=20)
+        res = await reconcile_usage_headroom_arming(now=recovered_at)
+        # Fresh observation from recovery time, NOT from now0.
+        assert get_usage_headroom_armable_since() == recovered_at
+        assert res["action"] == "waiting"
+
+        # 61 min after original now0 is only 41 min into fresh window.
+        still_too_early = now0 + timedelta(minutes=61)
+        res = await reconcile_usage_headroom_arming(now=still_too_early)
+        assert res["action"] == "waiting"
+
+        # 61 min after recovery → arms.
+        arm_at = recovered_at + timedelta(minutes=61)
+        res = await reconcile_usage_headroom_arming(now=arm_at)
+        assert res["action"] == "armed"
 
 
 # ── config plumbing: sync + PATCH validation for the auto-arm knobs ──────────
