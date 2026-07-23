@@ -203,6 +203,65 @@ def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
     )
 
 
+def _resolve_quality_path() -> Path | None:
+    """
+    Return the path to scripts/durations_quality.py or None if not found.
+
+    The standalone Docker image mounts the repo at /app (the backend dir) but
+    also bind-mounts the repo root at /repo, so we try both layouts.
+    """
+    candidates = [
+        BACKEND_ROOT.parent / "scripts" / "durations_quality.py",
+        Path("/repo/scripts/durations_quality.py"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def test_outlier_cap_matches_durations_quality() -> None:
+    """
+    The outlier cap here must match the authoritative definition in
+    scripts/durations_quality.py (OUTLIER_CAP).  They cannot share a Python
+    import because this guard runs standalone under --noconftest where scripts/
+    is not in the load path, so an explicit cross-check prevents silent drift.
+
+    If this test fails, update _IMPLAUSIBLE_OUTLIER_CAP above to match
+    the value in scripts/durations_quality.py.
+    """
+    quality_path = _resolve_quality_path()
+    assert quality_path is not None, (
+        "Cannot locate scripts/durations_quality.py. "
+        "Tried: "
+        + str(BACKEND_ROOT.parent / "scripts" / "durations_quality.py")
+        + " (local) and /repo/scripts/durations_quality.py (Docker mount)."
+    )
+
+    tree = ast.parse(quality_path.read_text())
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "OUTLIER_CAP"
+            and isinstance(node.value, ast.Constant)
+        ):
+            canonical = node.value.value
+            assert canonical == _IMPLAUSIBLE_OUTLIER_CAP, (
+                f"Outlier cap mismatch: scripts/durations_quality.py defines "
+                f"OUTLIER_CAP = {canonical}, but this guard uses "
+                f"_IMPLAUSIBLE_OUTLIER_CAP = {_IMPLAUSIBLE_OUTLIER_CAP}. "
+                f"Update _IMPLAUSIBLE_OUTLIER_CAP to match."
+            )
+            return
+
+    assert False, (
+        "Could not locate OUTLIER_CAP assignment in "
+        "scripts/durations_quality.py"
+    )
+
+
 def test_durations_no_implausible_outliers() -> None:
     """
     Reject fixture-setup cost misattributed to individual tests.
