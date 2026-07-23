@@ -218,7 +218,12 @@
         "test_healthy_existing_resident_ensure_repairs_stale_message_ownership",
         "test_repair_excludes_db_authoritative_active_session",
         "test_repair_noop_candidate_releases_per_id_project_transaction",
-        "test_repair_rechecks_active_session_between_stale_ids"
+        "test_repair_rechecks_active_session_between_stale_ids",
+        "test_heartbeat_absent_decision_summary_dedup_second_heartbeat",
+        "test_heartbeat_absent_decision_summary_fires_alert_after_stale_window",
+        "test_heartbeat_absent_decision_summary_no_alert_before_stale_window",
+        "test_heartbeat_absent_decision_summary_no_alert_below_min_sample",
+        "test_heartbeat_absent_decision_summary_recovery_clears_dedup"
       ]
     },
     {
@@ -726,7 +731,8 @@
         "test_resident_page_mutation_during_materialization_trips_final_fence",
         "test_transient_whiteboard_metadata_failure_preserves_source",
         "test_whiteboard_receipt_mismatch_is_permanently_quarantined",
-        "test_required_images_progress_oldest_first_across_poll_batches"
+        "test_required_images_progress_oldest_first_across_poll_batches",
+        "test_single_message_exceeding_image_budget_is_quarantined_not_starved"
       ]
     }
   ],
