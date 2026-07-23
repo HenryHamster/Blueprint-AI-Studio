@@ -2,7 +2,7 @@
   "_doc": "Per-file occurrence-count ratchet for direct attribute assignments to project.design_doc, project.directions, project.vision, and project.running_update. Read by TestDesignDocLockInvariant, TestDirectionsLockInvariant, TestVisionLockInvariant, and TestRunningUpdateLockInvariant in test_invariants.py. Counts are derived from AST-based scanning (ast.Assign / ast.AugAssign nodes), so docstrings, comments, and string literals are excluded. Counts should only decrease over time as write sites are migrated to canonical helpers (with_design_doc_locked / with_directions_locked / with_vision_locked in task_locking.py; reconcile_running_update / apply_reconciled_running_update in running_update_merge.py for running_update). Never increase a count \u2014 that widens the tripwire hole. When a site is migrated to the canonical helper, lower the count by 1. Remove the entry when the count reaches 0.",
   "design_doc": {
     "direction_outcomes.py": 0,
-    "efficiency_snapshot.py": 1,
+    "efficiency_snapshot.py": 0,
     "playbook_learning.py": 0,
     "playbook_lifecycle.py": 0,
     "playbook_sr_metrics.py": 0,

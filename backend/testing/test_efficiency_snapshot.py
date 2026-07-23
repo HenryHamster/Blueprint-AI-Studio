@@ -11438,8 +11438,8 @@ async def test_load_recent_tasks_is_terminal_time_ordered(db_session):
     not USE_POSTGRES,
     reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
 )
-async def test_write_snapshot_dual_writes_to_efficiency_table(db_session):
-    """write_snapshot appends a row to project_efficiency_snapshot alongside design_doc."""
+async def test_write_snapshot_writes_to_efficiency_table(db_session):
+    """write_snapshot appends a row to project_efficiency_snapshot and project_telemetry."""
     from app.project_telemetry import read_recent_efficiency_snapshots
 
     project = make_project(design_doc={})
@@ -11459,11 +11459,6 @@ async def test_write_snapshot_dual_writes_to_efficiency_table(db_session):
     assert rows[0].blob["captured_at"] == snap["captured_at"]
     assert rows[0].metric_def_version == METRIC_DEF_VERSION
     assert rows[0].blob[AXIS_COST_PER_MERGED_PR] == snap[AXIS_COST_PER_MERGED_PR]
-
-    # design_doc still carries the same snapshot (dual-write, not a move).
-    await db_session.refresh(project)
-    container = project.design_doc[DESIGN_DOC_KEY]
-    assert container["snapshots"][-1]["captured_at"] == snap["captured_at"]
 
 
 @pytest.mark.asyncio

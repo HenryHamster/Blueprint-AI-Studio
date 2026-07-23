@@ -295,23 +295,6 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
 DESIGN_DOC_KEY = "efficiency_baseline"
 
 
-async def _persist_container_to_design_doc(
-    session: AsyncSession, project_id: uuid.UUID, container: Dict[str, Any]
-) -> None:
-    """Keep the rollback-safe design-doc copy aligned with telemetry."""
-    from app.task_locking import with_design_doc_locked
-
-    def _store(doc: Dict[str, Any]) -> None:
-        doc[DESIGN_DOC_KEY] = container
-
-    await with_design_doc_locked(
-        session,
-        project_id,
-        _store,
-        skip_locked=False,
-        raise_on_size_limit=False,
-    )
-
 # Sub-key under the efficiency_baseline container recording the last warm-pool
 # payoff verdict state we raised an operator alert for. The per-project
 # transition check (:func:`maybe_alert_pool_payoff_transition`) compares the
@@ -3229,14 +3212,10 @@ async def write_snapshot(
         container["snapshots"] = snapshots
         container["last_run_at"] = captured_at
 
-    await _persist_container_to_design_doc(session, project_id, container)
-
-    # Dual-write the snapshot time-series to the dedicated
-    # project_efficiency_snapshot table. Done OUTSIDE the project_lock block so
-    # the row-scoped ON CONFLICT upsert never takes the Project row lock; the
-    # accessor enforces the same _SNAPSHOT_HISTORY_MAX retention the design_doc
-    # container used. The design_doc write above stays authoritative for safe
-    # rollback until the read path is fully cut over. Caller commits.
+    # Write snapshot to the dedicated project_efficiency_snapshot table outside
+    # the project_lock block so the row-scoped ON CONFLICT upsert never takes
+    # the Project row lock; the accessor enforces the same _SNAPSHOT_HISTORY_MAX
+    # retention cap. Caller commits.
     await insert_efficiency_snapshot(
         session,
         project_id,
@@ -4200,10 +4179,6 @@ async def maybe_alert_pool_payoff_transition(
         skip_locked=False,
     )
     if wrote_marker and changed["fire"]:
-        if "container" in changed:
-            await _persist_container_to_design_doc(
-                session, project_id, changed["container"]
-            )
         await session.commit()
     else:
         await session.rollback()
@@ -4285,10 +4260,6 @@ async def maybe_alert_unpriced_models_coverage(
         design_doc_fallback=(_proj.design_doc if _proj is not None else None),
         skip_locked=False,
     )
-    if changed.get("container") is not None:
-        await _persist_container_to_design_doc(
-            session, project_id, changed["container"]
-        )
     if not changed["fire"]:
         return None
 
@@ -4382,10 +4353,6 @@ async def maybe_alert_self_repair_burn_share(
         design_doc_fallback=(_proj.design_doc if _proj is not None else None),
         skip_locked=False,
     )
-    if changed.get("container") is not None:
-        await _persist_container_to_design_doc(
-            session, project_id, changed["container"]
-        )
     if not changed["fire"]:
         return None
 
@@ -4508,10 +4475,6 @@ async def maybe_alert_provider_routing_transition(
         skip_locked=False,
     )
     if wrote_marker and changed["fire"]:
-        if "container" in changed:
-            await _persist_container_to_design_doc(
-                session, project_id, changed["container"]
-            )
         await session.commit()
     else:
         await session.rollback()

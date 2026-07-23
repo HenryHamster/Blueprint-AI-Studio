@@ -1865,7 +1865,7 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
 
     # Audit additions: background analytics/sweep keys still written to design_doc
     # (keys moved to project_efficiency_snapshot, project_lane_baseline, and
-    # project_sr_analytics in migration 0656 are no longer listed here)
+    # project_sr_analytics in migration 0658 are no longer listed here)
     # Rolling-cutover values remain reserved while their legacy design_doc copy
     # is retained for fallback and rollback safety.
     audit_keys = {

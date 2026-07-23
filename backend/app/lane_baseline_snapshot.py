@@ -481,7 +481,7 @@ def read_version_lane_baseline(
     When ``lane_baseline_data`` is provided (pre-loaded from the
     ``project_lane_baseline`` table), it takes precedence. Falls back to
     ``project.design_doc["lane_baselines"]`` for data written before
-    migration 0656.  Zero additional DB queries in either case — the caller
+    migration 0681.  Zero additional DB queries in either case — the caller
     must pre-load the appropriate row.
     """
     if lane_baseline_data is not None:
