@@ -62,9 +62,16 @@ const STREAM_FLUSH_MS = 100;
 // session is considered wedged and stopped as FAILED rather than spun forever.
 const MAX_CONSECUTIVE_STALLS = 3;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
-const RESIDENT_REPLY_KEY_PATH = `${WORKSPACE}/.resident-reply-idempotency-key`;
-const RESIDENT_REPLY_RECEIPT_PATH = `${WORKSPACE}/.resident-reply-receipt.json`;
-const RESIDENT_STAGED_REPLY_PATH = `${WORKSPACE}/.resident-reply-staged-message.json`;
+// Resolve the workspace root from env here rather than from the imported
+// WORKSPACE binding: these are MODULE-LEVEL const initializers, so referencing
+// the ../index.js WORKSPACE export at import time hits a circular-import TDZ
+// ("Cannot access 'WORKSPACE' before initialization") when this module is
+// evaluated before index.ts finishes initializing its export. The value is
+// identical to WORKSPACE (index.ts: process.env.AGENT_WORKSPACE || '/tmp/workspace').
+const RESIDENT_WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+const RESIDENT_REPLY_KEY_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-idempotency-key`;
+const RESIDENT_REPLY_RECEIPT_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-receipt.json`;
+const RESIDENT_STAGED_REPLY_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-staged-message.json`;
 
 export interface ResidentReplyReceipt {
   idempotency_key: string;

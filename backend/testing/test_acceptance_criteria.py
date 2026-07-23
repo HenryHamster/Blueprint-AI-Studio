@@ -10403,6 +10403,47 @@ async def test_walkthrough_e2e_endpoint_happy_path(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_records_exercised_engine_sha(
+    client: AsyncClient, db_session
+):
+    """The optional ``exercised_engine_sha`` is persisted onto each evidence row.
+
+    This is the additive seam a later guard enforces against ``candidate_sha``:
+    it records the SHA the candidate stack ACTUALLY served, proving the
+    walkthrough exercised the candidate engine (not the deployed one). It must
+    never weaken the existing candidate_sha match — a matching SHA still writes
+    covered evidence, now carrying the exercised SHA in ``detail``.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint-Sha")
+    sha = "a" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": sha,
+            "exercised_engine_sha": sha,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["recorded"] == 1
+
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert evidence[0].detail.get("exercised_engine_sha") == sha
+
+
+@pytest.mark.asyncio
 async def test_walkthrough_e2e_endpoint_rejects_mismatched_sha(
     client: AsyncClient, db_session
 ):
@@ -10429,6 +10470,132 @@ async def test_walkthrough_e2e_endpoint_rejects_mismatched_sha(
     assert resp.status_code == 409, resp.text
     # The app reshapes HTTPException into {"error": {"code", "message": detail}}.
     assert resp.json()["error"]["message"]["reason"] == "candidate_sha_mismatch"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_evidence_rejects_engine_sha_mismatch(db_session):
+    """A mismatched exercised_engine_sha rejects the whole batch — zero rows written.
+
+    This is the named acceptance test for the engine-SHA genuineness guard.
+    When the harness reports exercised_engine_sha != candidate_sha the function
+    must return rejected/exercised_engine_sha_mismatch and write nothing, even
+    though the candidate_sha itself matches the qualifying SHA.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-EngSha-Mismatch")
+    sha = "a" * 40
+    other_sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+        exercised_engine_sha=other_sha,  # harness drove a different engine
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "exercised_engine_sha_mismatch"
+    assert summary["recorded"] == 0
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_evidence_accepts_matching_exercised_engine_sha(db_session):
+    """A matching exercised_engine_sha records evidence and stamps the SHA in detail."""
+    project = await _make_project_with_member(db_session, name="Walk-EngSha-Match")
+    sha = "c" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+        exercised_engine_sha=sha,  # harness confirmed the right engine
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert evidence[0].detail.get("exercised_engine_sha") == sha
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_evidence_accepts_absent_exercised_engine_sha(db_session):
+    """Absent exercised_engine_sha is accepted for backward compatibility."""
+    project = await _make_project_with_member(db_session, name="Walk-EngSha-Absent")
+    sha = "d" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+        # exercised_engine_sha intentionally omitted
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) != []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_rejects_mismatched_exercised_engine_sha(
+    client: AsyncClient, db_session
+):
+    """POST with exercised_engine_sha != candidate_sha returns 409 and writes nothing."""
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint-EngSha")
+    sha = "e" * 40
+    other_sha = "f" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": sha,
+            "exercised_engine_sha": other_sha,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["message"]["reason"] == "exercised_engine_sha_mismatch"
     assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
 
 

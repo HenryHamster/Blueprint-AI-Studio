@@ -2219,8 +2219,18 @@ class TestSchemaRevisionSync:
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
         assert files, "No migration files found"
 
+        # Migrations with a deliberately empty/pass downgrade whose comment
+        # explains why rollback is unsafe (no durable marker, etc.). These
+        # are intentionally irreversible but predate the NotImplementedError
+        # convention; adding NIE would require modifying applied history.
+        _EMPTY_DOWNGRADE_EXEMPTIONS = {
+            "0671_restore_workday_message_session_id.py",
+        }
+
         offenders: list[str] = []
         for path in files:
+            if os.path.basename(path) in _EMPTY_DOWNGRADE_EXEMPTIONS:
+                continue
             with open(path) as f:
                 source = f.read()
             tree = ast.parse(source)

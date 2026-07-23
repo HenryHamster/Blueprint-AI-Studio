@@ -409,6 +409,7 @@ async function main() {
                 ...process.env,
                 BLUEPRINT_RUNNER_TOKEN: token,
                 BLUEPRINT_ORCHESTRATOR_URL: BACKEND_URL,
+                ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || 'sk-ant-walkthrough-stub',
                 PATH: process.env.PATH,
               },
               timeout: 20000,
@@ -458,6 +459,7 @@ async function main() {
                 BLUEPRINT_RUNNER_TOKEN: token,
                 BLUEPRINT_ORCHESTRATOR_URL: BACKEND_URL,
                 BLUEPRINT_RUNNER_SUPERVISED: '1',
+                ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || 'sk-ant-walkthrough-stub',
                 PATH: process.env.PATH,
               },
               stdio: ['ignore', 'pipe', 'pipe'],
@@ -547,23 +549,30 @@ async function main() {
       `Available kinds: ${Object.keys(kindsResp.body || {}).join(', ')}`,
     ]);
 
-    // 2b. Asset token mint (404 expected — no manifest without GitHub repo)
+    // 2b. Asset token mint — use the seeded walkthrough tool slug.
+    // Returns 200 + token when BLUEPRINT_LOCAL_TOOLS_ROOT is set and the fixture
+    // is present (seed_test_data.py creates it); returns 404 when not configured.
+    // Auth-check: any status other than 401/403 means auth passed.
+    const TOOL_SLUG = 'walkthrough-iframe-tool';
     const mintResp = await apiPost(
-      `/api/admin/projects/${PROJECT_ID}/tools/my-tool/asset-token`, {}
+      `/api/admin/projects/${PROJECT_ID}/tools/${TOOL_SLUG}/asset-token`, {}
     );
     const mintAuthOk = mintResp.status !== 401 && mintResp.status !== 403;
+    const realAssetToken = mintResp.status === 200 ? (mintResp.body?.token ?? null) : null;
     step('2b. Asset-token endpoint — auth passes', mintAuthOk ? 'PASS' : 'FAIL', [
-      `POST /api/admin/projects/${PROJECT_ID}/tools/my-tool/asset-token → ${mintResp.status}`,
+      `POST /api/admin/projects/${PROJECT_ID}/tools/${TOOL_SLUG}/asset-token → ${mintResp.status}`,
       `Auth result: ${mintAuthOk ? 'PASS (not 401/403)' : 'FAIL (auth rejected)'}`,
       `Detail: ${JSON.stringify(mintResp.body).slice(0, 200)}`,
-      mintResp.status === 404
-        ? '404 = auth passed, tool not found in manifest (GitHub repo not connected on local stack)'
-        : '',
+      mintResp.status === 200
+        ? `✓ Real asset token minted (${(realAssetToken || '').length} chars)`
+        : mintResp.status === 404
+          ? '404 = auth passed, tool not found — set BLUEPRINT_LOCAL_TOOLS_ROOT=/tmp/walkthrough-tools and re-run seed_test_data.py'
+          : '',
     ]);
 
     // 2c. Path-embedded token route (PR #15163 — the critical fix)
     // Route: GET /api/admin/projects/{pid}/tools/{slug}/t/{token}/assets/{path}
-    const pathTokenUrl = `${BACKEND_URL}/api/admin/projects/${PROJECT_ID}/tools/my-tool/t/fake.jwt.token/assets/index.html`;
+    const pathTokenUrl = `${BACKEND_URL}/api/admin/projects/${PROJECT_ID}/tools/${TOOL_SLUG}/t/fake.jwt.token/assets/index.html`;
     const pathTokenResp = await fetch(pathTokenUrl).catch(() => null);
     const pathTokenStatus = pathTokenResp?.status ?? 0;
     // 401 = route exists, token invalid. 404 = route not registered.
@@ -578,8 +587,40 @@ async function main() {
       '(app.js, styles.css, images) inherit the token without query-string loss',
     ]);
 
+    // 2g. Valid JWT → 200 from seeded tool asset (c-f52fd975 proof).
+    // Requires: (a) BLUEPRINT_LOCAL_TOOLS_ROOT=/tmp/walkthrough-tools set in backend env,
+    // (b) seed_test_data.py has been run to write the tool fixture files.
+    // A 200 here proves the full token-to-asset path works end-to-end.
+    // A DEAD_END means the fixture/env is absent — not a code defect.
+    let assetWith200Status = 0;
+    if (realAssetToken) {
+      const validAssetUrl = `${BACKEND_URL}/api/admin/projects/${PROJECT_ID}/tools/${TOOL_SLUG}/t/${realAssetToken}/assets/index.html`;
+      const validAssetResp = await fetch(validAssetUrl).catch(() => null);
+      assetWith200Status = validAssetResp?.status ?? 0;
+    }
+    const assetTokenVerified = assetWith200Status === 200;
+    step(
+      '2g. Valid JWT → 200 from tool asset endpoint (c-f52fd975 proof)',
+      realAssetToken
+        ? (assetTokenVerified ? 'PASS' : 'FAIL')
+        : 'DEAD_END',
+      [
+        realAssetToken
+          ? `GET /t/{token}/assets/index.html → ${assetWith200Status}`
+          : 'Token mint returned non-200 — BLUEPRINT_LOCAL_TOOLS_ROOT not set or fixture missing',
+        assetTokenVerified
+          ? '✓ 200 — valid minted JWT grants access to seeded walkthrough-iframe-tool/index.html'
+          : realAssetToken
+            ? `✗ ${assetWith200Status} ≠ 200 — valid JWT should yield 200 for seeded tool asset`
+            : 'Run seed_test_data.py and set BLUEPRINT_LOCAL_TOOLS_ROOT=/tmp/walkthrough-tools in backend env',
+        pathRouteExists
+          ? '✓ fake JWT → 401 confirmed (route-exists guard holds)'
+          : `⚠ fake JWT → ${pathTokenStatus} (expected 401)`,
+      ],
+    );
+
     // 2d. Query-param (legacy) route still present
-    const legacyUrl = `${BACKEND_URL}/api/admin/projects/${PROJECT_ID}/tools/my-tool/assets/index.html?token=fake`;
+    const legacyUrl = `${BACKEND_URL}/api/admin/projects/${PROJECT_ID}/tools/${TOOL_SLUG}/assets/index.html?token=fake`;
     const legacyResp = await fetch(legacyUrl).catch(() => null);
     const legacyStatus = legacyResp?.status ?? 0;
     const legacyRouteExists = legacyStatus === 401;
@@ -1504,30 +1545,42 @@ async function writeJsonResult(startTs, projectId) {
 
   // Map step results to per-criterion pass/fail.
   // Flow 1 → c-dfdc9d82 (Runner Enrollment)
+  // PASS requires: registration (1a) + fleet visible (1b) + live heartbeat (1d).
+  // Merely registering and listing back is insufficient — the daemon must connect
+  // and set last_seen_at/current_token_heartbeat_confirmed on the fleet record.
   const runnerReg = results.find(r => r.name.includes('1a.'));
   const fleetVisible = results.find(r => r.name.includes('1b.'));
+  const heartbeatStep = results.find(r => r.name.includes('1d.'));
   const runnerEnrollmentPassed = shaValid
     && (runnerReg?.verdict === 'PASS')
-    && (fleetVisible?.verdict === 'PASS');
+    && (fleetVisible?.verdict === 'PASS')
+    && (heartbeatStep?.verdict === 'PASS');
   const runnerNotes = runnerEnrollmentPassed
-    ? 'Runner registration API succeeded and runner visible in fleet list'
+    ? 'Runner registration, fleet visibility, and live daemon heartbeat all confirmed'
     : [
         runnerReg?.verdict !== 'PASS' ? `runner registration: ${runnerReg?.verdict || 'NOT RUN'}` : '',
         fleetVisible?.verdict !== 'PASS' ? `fleet visibility: ${fleetVisible?.verdict || 'NOT RUN'}` : '',
+        heartbeatStep?.verdict !== 'PASS' ? `daemon heartbeat: ${heartbeatStep?.verdict || 'NOT RUN'}` : '',
         !shaValid ? 'SHA integrity check failed' : '',
       ].filter(Boolean).join('; ') || 'Runner enrollment not evaluated';
 
   // Flow 2 → c-f52fd975 (iframe subresource token)
+  // PASS requires: auth (2b) + route exists/fake-401 (2c) + valid-JWT 200 (2g).
+  // A 401 from a fake token (2c) proves the route is registered, but is NOT
+  // sufficient evidence of the fix — a valid minted JWT must return 200 (2g).
   const mintAuth = results.find(r => r.name.includes('2b.'));
   const pathRoute = results.find(r => r.name.includes('2c.'));
+  const assetGet = results.find(r => r.name.includes('2g.'));
   const iframeTokenPassed = shaValid
     && (mintAuth?.verdict === 'PASS')
-    && (pathRoute?.verdict === 'PASS');
+    && (pathRoute?.verdict === 'PASS')
+    && (assetGet?.verdict === 'PASS');
   const iframeNotes = iframeTokenPassed
-    ? 'Asset-token endpoint auth passes and path-embedded token route registered'
+    ? 'Asset-token minted, path-embedded route registered (fake → 401), and valid JWT returned 200 from seeded tool asset'
     : [
         mintAuth?.verdict !== 'PASS' ? `asset-token auth: ${mintAuth?.verdict || 'NOT RUN'}` : '',
         pathRoute?.verdict !== 'PASS' ? `path-embedded route: ${pathRoute?.verdict || 'NOT RUN'}` : '',
+        assetGet?.verdict !== 'PASS' ? `valid-JWT 200 assertion: ${assetGet?.verdict || 'NOT RUN'}` : '',
         !shaValid ? 'SHA integrity check failed' : '',
       ].filter(Boolean).join('; ') || 'iframe subresource token check not evaluated';
 

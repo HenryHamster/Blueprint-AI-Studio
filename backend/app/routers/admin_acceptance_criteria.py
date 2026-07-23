@@ -473,6 +473,12 @@ class WalkthroughE2EEvidenceRequest(BaseModel):
     candidate_sha: str = Field(..., max_length=64)
     results: List[WalkthroughE2EResult] = Field(..., max_length=50)
     qualification_attempt_id: str | None = Field(default=None, max_length=64)
+    # SHA the candidate stack ACTUALLY served (from its GET /api/version), as
+    # observed by the agent that booted the ephemeral candidate stack. Additive
+    # and optional for backward compatibility; recorded on each evidence row so a
+    # later guard can enforce exercised_engine_sha == candidate_sha (the seam that
+    # proves the walkthrough exercised the candidate engine, not the deployed one).
+    exercised_engine_sha: str | None = Field(default=None, max_length=64)
 
 
 @router.post("/projects/{project_id}/acceptance-criteria/walkthrough-e2e-evidence")
@@ -510,6 +516,7 @@ async def ingest_walkthrough_e2e_evidence(
         candidate_sha=body.candidate_sha,
         results=[r.model_dump() for r in body.results],
         qualification_attempt_id=body.qualification_attempt_id,
+        exercised_engine_sha=body.exercised_engine_sha,
     )
     if summary.get("status") == "rejected":
         # SHA-mismatch / missing SHA: reject loudly so a walkthrough against the

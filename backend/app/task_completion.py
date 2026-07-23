@@ -4292,12 +4292,14 @@ async def _handle_walkthrough_e2e_completion(
             )
             return
 
+        exercised_engine_sha = str(result.get("exercised_engine_sha") or "").strip() or None
         summary = await record_walkthrough_e2e_evidence(
             session,
             version=open_version,
             candidate_sha=candidate_sha,
             results=results,
             qualification_attempt_id=None,
+            exercised_engine_sha=exercised_engine_sha,
         )
         logger.info(
             "[WALKTHROUGH_E2E] ingestion for task %s: status=%s recorded=%s",

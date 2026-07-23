@@ -2832,6 +2832,7 @@ async def record_walkthrough_e2e_evidence(
     candidate_sha: str,
     results: list[dict[str, Any]],
     qualification_attempt_id: str | None = None,
+    exercised_engine_sha: str | None = None,
 ) -> dict[str, Any]:
     """Map per-criterion ``walkthrough_e2e`` results into covered-tier evidence.
 
@@ -2840,7 +2841,7 @@ async def record_walkthrough_e2e_evidence(
     ACTIVE criterion on ``version`` and writes one covering
     :data:`WALKTHROUGH_E2E_EVIDENCE_KIND` :class:`CriterionEvidence` row with
     ``detail = {candidate_sha, evaluated_at, criterion_key, passed[, notes,
-    qualification_attempt_id]}`` and a ``source_id`` keyed on the qualification
+    qualification_attempt_id, exercised_engine_sha]}`` and a ``source_id`` keyed on the qualification
     attempt + criterion (so a re-run against the same attempt is an idempotent
     no-op via the dedup unique index).
 
@@ -2895,6 +2896,30 @@ async def record_walkthrough_e2e_evidence(
             "unmatched_keys": [],
             "candidate_sha": posted_sha,
         }
+
+    exercised_sha = str(exercised_engine_sha or "").strip()
+    if exercised_sha and exercised_sha != posted_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: exercised_engine_sha %s does not "
+            "match candidate_sha %s for version %s — rejecting (harness ran against wrong stack)",
+            exercised_sha[:12],
+            posted_sha[:12],
+            getattr(version, "id", None),
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "exercised_engine_sha_mismatch",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+    if not exercised_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: exercised_engine_sha absent for version %s "
+            "— accepting unverified-engine evidence (provenance gap)",
+            getattr(version, "id", None),
+        )
 
     project_id = version.project_id
     release_version_id = version.id
@@ -2955,6 +2980,11 @@ async def record_walkthrough_e2e_evidence(
             detail["notes"] = notes
         if qualification_attempt_id:
             detail["qualification_attempt_id"] = str(qualification_attempt_id)
+        # Additive: record the SHA the candidate stack actually served so a later
+        # guard can enforce it equals the qualifying candidate SHA. Never gates
+        # here — the existing candidate_sha match above is the safety boundary.
+        if exercised_sha:
+            detail["exercised_engine_sha"] = exercised_sha
         source_id = f"walkthrough_e2e:{attempt_token}:{key}"
         try:
             await record_evidence(

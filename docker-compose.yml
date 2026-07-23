@@ -8,7 +8,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD?}
       POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
+      # Host port is overridable so parallel ephemeral stacks (e.g. the
+      # walkthrough_e2e candidate stack) do not collide on 5432.
+      - "${WALKTHROUGH_DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +23,9 @@ services:
     build:
       context: ./backend
     ports:
-      - "8080:8080"
+      # Host port is overridable so parallel ephemeral stacks (e.g. the
+      # walkthrough_e2e candidate stack) do not collide on 8080.
+      - "${WALKTHROUGH_APP_PORT:-8080}:8080"
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD?}@db:5432/postgres
       - AGENT_JWT_SECRET=${AGENT_JWT_SECRET?}
@@ -34,6 +38,10 @@ services:
       - LOCAL_MODE=${LOCAL_MODE:-false}
       - ADMIN_API_KEY=${ADMIN_API_KEY:-dev-admin-key}
       - MAX_CONCURRENT_VMS=${MAX_CONCURRENT_VMS:-5}
+      # Reported verbatim by GET /api/version as the engine SHA the stack serves.
+      # The walkthrough_e2e lane labels its candidate stack with the candidate SHA
+      # and reads it back as exercised_engine_sha (the SHA-integrity seam).
+      - DEPLOY_SHA=${DEPLOY_SHA:-}
     depends_on:
       db:
         condition: service_healthy

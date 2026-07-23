@@ -130,6 +130,22 @@ vi.mock('./code-change.js', async (importOriginal) => {
   return { ...actual, runCodeChangeTask: vi.fn().mockResolvedValue(undefined) };
 });
 
+// The walkthrough_e2e handler boots an ephemeral candidate stack via
+// CandidateStackController. Mock it so the handler tests below never touch
+// docker/vite/fetch — boot() resolves a fake stack, teardown() is a no-op. The
+// module's own boot/teardown/fail-closed behavior is unit-tested in
+// walkthrough-stack.test.ts; here we only exercise the handler wiring.
+const { walkthroughBootMock, walkthroughTeardownMock } = vi.hoisted(() => ({
+  walkthroughBootMock: vi.fn(),
+  walkthroughTeardownMock: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock('./walkthrough-stack.js', () => ({
+  CandidateStackController: vi.fn().mockImplementation(() => ({
+    boot: walkthroughBootMock,
+    teardown: walkthroughTeardownMock,
+  })),
+}));
+
 // fs is consumed by both default + namespace imports across the modules under
 // test. Mock both shapes so vitest doesn't reject either access pattern.
 vi.mock('fs', () => {
@@ -2717,11 +2733,22 @@ describe('handleWalkthroughE2e — live-stack walkthrough evidence lane', () => 
     ],
   };
 
+  const FAKE_STACK = {
+    backendUrl: 'http://127.0.0.1:8080',
+    frontendUrl: 'http://localhost:3001',
+    adminToken: 'wt-admin-token',
+    databaseUrl: 'postgresql+asyncpg://postgres:pw@127.0.0.1:5432/postgres',
+    exercisedEngineSha: CANDIDATE_SHA,
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(apiPost).mockResolvedValue({ recorded: 3, skipped_not_passed: 0 });
     // Default execFileSync: succeed for git/python/node calls
     vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    // Candidate stack boots cleanly by default; teardown is a no-op.
+    walkthroughBootMock.mockResolvedValue(FAKE_STACK);
+    walkthroughTeardownMock.mockResolvedValue(undefined);
   });
 
   it('clones with full history (depth=0) and pins to the candidate SHA', async () => {
@@ -2888,7 +2915,10 @@ describe('handleWalkthroughE2e — live-stack walkthrough evidence lane', () => 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('WALKTHROUGH_E2E_REPORT');
-    expect(call.logs).toBe(JSON.stringify(VALID_RESULT));
+    // Logs carry the walkthrough result plus the SHA the candidate stack served.
+    expect(call.logs).toBe(
+      JSON.stringify({ ...VALID_RESULT, exercised_engine_sha: CANDIDATE_SHA }),
+    );
   });
 
   it('persists FAILED with walkthrough_result_unparseable when result file is missing', async () => {
@@ -2970,5 +3000,63 @@ describe('handleWalkthroughE2e — live-stack walkthrough evidence lane', () => 
     // captured in the artifact for the backend completion handler.
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('WALKTHROUGH_E2E_REPORT');
+  });
+
+  it('posts c-dfdc9d82 as passed=false when heartbeat step yielded not-passed', async () => {
+    // Simulates the strengthened predicate: step 1d (daemon heartbeat) failed
+    // so the walkthrough script emits passed=false for c-dfdc9d82.
+    const resultWithFailedHeartbeat = {
+      ...VALID_RESULT,
+      results: [
+        { criterion_key: 'c-dfdc9d82', passed: false, notes: 'daemon heartbeat: DEAD_END' },
+        { criterion_key: 'c-f52fd975', passed: true, notes: 'iframe token OK' },
+        { criterion_key: 'c-5214996f', passed: true, notes: 'Walkthrough completed' },
+      ],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(resultWithFailedHeartbeat);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const evidenceCall = vi.mocked(apiPost).mock.calls.find(c =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCall).toBeDefined();
+    const body = (evidenceCall as unknown[])[1] as Record<string, unknown>;
+    const enrollmentResult = (body.results as Array<Record<string, unknown>>)
+      .find(r => r.criterion_key === 'c-dfdc9d82');
+    // Handler faithfully propagates passed=false — heartbeat absence is not-passed.
+    expect(enrollmentResult?.passed).toBe(false);
+  });
+
+  it('posts c-f52fd975 as passed=false when valid-JWT 200 assertion (step 2g) not passed', async () => {
+    // Simulates the strengthened predicate: step 2g (real token → 200) failed
+    // so the walkthrough script emits passed=false for c-f52fd975.
+    const resultWithFailedAssetFetch = {
+      ...VALID_RESULT,
+      results: [
+        { criterion_key: 'c-dfdc9d82', passed: true, notes: 'Runner enrollment OK' },
+        { criterion_key: 'c-f52fd975', passed: false, notes: 'valid-JWT 200 assertion: DEAD_END' },
+        { criterion_key: 'c-5214996f', passed: true, notes: 'Walkthrough completed' },
+      ],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(resultWithFailedAssetFetch);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const evidenceCall = vi.mocked(apiPost).mock.calls.find(c =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCall).toBeDefined();
+    const body = (evidenceCall as unknown[])[1] as Record<string, unknown>;
+    const iframeResult = (body.results as Array<Record<string, unknown>>)
+      .find(r => r.criterion_key === 'c-f52fd975');
+    // Handler faithfully propagates passed=false — 401-only (no 200) is not-passed.
+    expect(iframeResult?.passed).toBe(false);
   });
 });

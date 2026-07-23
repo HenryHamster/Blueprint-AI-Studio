@@ -27,6 +27,7 @@ import {
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { resolveCandidateSha } from './specialized.js';
+import { CandidateStackController } from './walkthrough-stack.js';
 
 /**
  * Map a per-criterion result entry to the shape expected by the
@@ -128,111 +129,148 @@ export async function handleWalkthroughE2e(
     return;
   }
 
-  // ── Seed walkthrough test data (best-effort; harness still runs if it fails) ──
-  statusRef.value = 'Seeding walkthrough test data...';
-  sendLog(ws, 'Seeding walkthrough test data...\n');
+  // ── Boot an ephemeral candidate-SHA stack (FAIL-CLOSED) ────────────────────
+  // The harness MUST exercise the candidate commit, not the deployed engine.
+  // Boot a throwaway backend + migrated DB + served frontend built from THIS
+  // checked-out tree, then drive the harness against it. If the stack cannot be
+  // booted / migrated / health-checked, we fail closed: post ZERO evidence and
+  // FAIL the task — never silently fall back to ORCHESTRATOR_URL. The
+  // controller's teardown is guaranteed on every exit path below.
+  statusRef.value = 'Booting candidate-SHA stack...';
+  sendLog(ws, `Booting ephemeral candidate stack @ ${candidateSha.slice(0, 12)}...\n`);
+  const stackController = new CandidateStackController({
+    workspace: WORKSPACE,
+    candidateSha,
+    adminToken: process.env.ADMIN_API_KEY || undefined,
+    log: (m) => { sendLog(ws, m); },
+  });
+
+  let stack;
   try {
-    execFileSync('python3', ['scripts/walkthrough/seed_test_data.py'], {
-      cwd: WORKSPACE,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 60_000,
-    });
-    sendLog(ws, 'Walkthrough test data seeded.\n');
+    stack = await stackController.boot();
   } catch (e) {
-    sendLog(ws, `[warn] Seed test data failed (non-fatal): ${sanitizeError(e)}\n`);
-  }
-
-  // ── Run the walkthrough harness ────────────────────────────────────────────
-  statusRef.value = 'Running live-stack walkthrough...';
-  sendLog(ws, 'Running live-stack walkthrough harness...\n');
-
-  const resultFile = `/tmp/walkthrough_result_${taskId}.json`;
-  let harnessFailed = false;
-  try {
-    const harnessEnv: Record<string, string> = {
-      ...(process.env as Record<string, string>),
-      WALKTHROUGH_ADMIN_TOKEN: process.env.ADMIN_API_KEY || '',
-      WALKTHROUGH_BACKEND_URL: process.env.ORCHESTRATOR_URL || 'http://localhost:8080',
-      WALKTHROUGH_FRONTEND_URL: process.env.WALKTHROUGH_FRONTEND_URL || 'http://localhost:3001',
-      WALKTHROUGH_PROJECT_ID: projectId,
-      GIT_SHA: candidateSha,
-      WALKTHROUGH_RESULT_FILE: resultFile,
-    };
-    execFileSync('node', ['scripts/walkthrough/v26-live-walkthrough.cjs'], {
-      cwd: WORKSPACE,
-      env: harnessEnv,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 300_000, // 5 minutes
-    });
-    sendLog(ws, 'Walkthrough harness completed.\n');
-  } catch (e) {
-    harnessFailed = true;
-    sendLog(ws, `[ERROR] Walkthrough harness exited with error: ${sanitizeError(e)}\n`);
-    // Fall through — the harness may still have written a partial result file.
-  }
-
-  // ── Read the JSON result ───────────────────────────────────────────────────
-  const rawResult = readHandlerOutput(taskId, 'walkthrough_result', ws);
-  const walkthroughResult = isValidWalkthroughResult(rawResult) ? rawResult : null;
-
-  if (!walkthroughResult) {
-    const detail = harnessFailed
-      ? 'walkthrough_e2e harness failed and no parseable result file was written'
-      : 'walkthrough_e2e result file missing or unparseable';
-    sendLog(ws, `[ERROR] ${detail}\n`);
+    const detail = sanitizeError(e);
+    sendLog(ws, `[ERROR] Candidate stack failed to boot: ${detail}\n`);
+    // Fail closed: release any partially-provisioned resources and post NO
+    // evidence so the criterion stays uncovered and the qualifier gate closed.
+    await stackController.teardown();
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'FAILED',
       artifact_type: 'ERROR_LOG',
-      logs: sanitize(detail),
-      failure_category: harnessFailed ? 'walkthrough_harness_failed' : 'walkthrough_result_unparseable',
+      logs: sanitize(
+        `walkthrough_e2e aborted: the candidate-SHA stack could not be booted, ` +
+        `migrated, or health-checked at commit ${candidateSha}. Failing closed ` +
+        `with zero evidence — the walkthrough never ran against a genuine ` +
+        `candidate engine, so no SHA-pinned coverage may be minted. Detail: ${detail}`,
+      ),
+      failure_category: 'candidate_stack_boot_failed',
     });
     return;
   }
 
-  // ── Post per-criterion evidence to the ingestion endpoint ─────────────────
-  const results = (walkthroughResult.results as unknown[]).map((r) =>
-    normalizeResultEntry(r as Record<string, unknown>),
-  );
-
-  const evidenceBody: Record<string, unknown> = {
-    candidate_sha: candidateSha,
-    results: results.map((r) => ({
-      criterion_key: r.criterion_key,
-      passed: r.passed,
-      notes: r.notes,
-    })),
-  };
-  if (qualificationAttemptId) {
-    evidenceBody.qualification_attempt_id = qualificationAttemptId;
-  }
-
-  let evidenceSummary = '';
   try {
-    const resp = (await apiPost(
-      `/api/admin/projects/${projectId}/acceptance-criteria/walkthrough-e2e-evidence`,
-      evidenceBody,
-    )) as Record<string, unknown>;
-    const recorded = typeof resp.recorded === 'number' ? resp.recorded : Number(resp.recorded) || 0;
-    const skipped = typeof resp.skipped_not_passed === 'number' ? resp.skipped_not_passed : Number(resp.skipped_not_passed) || 0;
-    evidenceSummary = `recorded=${recorded}, skipped_not_passed=${skipped}`;
-    sendLog(ws, `Walkthrough evidence posted: ${evidenceSummary}\n`);
-  } catch (e) {
-    sendLog(ws, `[ERROR] Failed to post walkthrough evidence: ${sanitizeError(e)}\n`);
-    // Evidence posting failure is non-fatal for the task — the result is still
-    // captured in the WALKTHROUGH_E2E_REPORT artifact.
-  }
+    // ── Run the walkthrough harness against the CANDIDATE stack ──────────────
+    statusRef.value = 'Running live-stack walkthrough...';
+    sendLog(ws, `Running live-stack walkthrough harness against ${stack.backendUrl}...\n`);
 
-  // ── Persist final status ───────────────────────────────────────────────────
-  // Post COMPLETED regardless of pass/fail — the evidence itself records which
-  // criteria passed. Negative results are still valid machine-verified evidence.
-  await persistAndPostStatus(taskId, {
-    task_id: taskId,
-    status: 'COMPLETED',
-    artifact_type: 'WALKTHROUGH_E2E_REPORT',
-    logs: JSON.stringify(walkthroughResult),
-    repo_url: `https://github.com/${owner}/${repo}`,
-  });
+    const resultFile = `/tmp/walkthrough_result_${taskId}.json`;
+    let harnessFailed = false;
+    try {
+      const harnessEnv: Record<string, string> = {
+        ...(process.env as Record<string, string>),
+        // Drive the harness at the LOCAL candidate stack — NOT ORCHESTRATOR_URL.
+        WALKTHROUGH_ADMIN_TOKEN: stack.adminToken,
+        WALKTHROUGH_BACKEND_URL: stack.backendUrl,
+        WALKTHROUGH_FRONTEND_URL: stack.frontendUrl,
+        WALKTHROUGH_PROJECT_ID: projectId,
+        GIT_SHA: candidateSha,
+        WALKTHROUGH_RESULT_FILE: resultFile,
+      };
+      execFileSync('node', ['scripts/walkthrough/v26-live-walkthrough.cjs'], {
+        cwd: WORKSPACE,
+        env: harnessEnv,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 300_000, // 5 minutes
+      });
+      sendLog(ws, 'Walkthrough harness completed.\n');
+    } catch (e) {
+      harnessFailed = true;
+      sendLog(ws, `[ERROR] Walkthrough harness exited with error: ${sanitizeError(e)}\n`);
+      // Fall through — the harness may still have written a partial result file.
+    }
+
+    // ── Read the JSON result ─────────────────────────────────────────────────
+    const rawResult = readHandlerOutput(taskId, 'walkthrough_result', ws);
+    const walkthroughResult = isValidWalkthroughResult(rawResult) ? rawResult : null;
+
+    if (!walkthroughResult) {
+      const detail = harnessFailed
+        ? 'walkthrough_e2e harness failed and no parseable result file was written'
+        : 'walkthrough_e2e result file missing or unparseable';
+      sendLog(ws, `[ERROR] ${detail}\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'FAILED',
+        artifact_type: 'ERROR_LOG',
+        logs: sanitize(detail),
+        failure_category: harnessFailed ? 'walkthrough_harness_failed' : 'walkthrough_result_unparseable',
+      });
+      return;
+    }
+
+    // ── Post per-criterion evidence to the REAL orchestrator ingestion endpoint ──
+    // apiPost targets ORCHESTRATOR_URL (the live orchestrator), NOT the local
+    // candidate stack: the harness EXERCISES the candidate stack, but the
+    // evidence is RECORDED against the live release version. exercised_engine_sha
+    // carries the SHA the candidate stack actually served — the seam a backend
+    // guard enforces against candidate_sha.
+    const results = (walkthroughResult.results as unknown[]).map((r) =>
+      normalizeResultEntry(r as Record<string, unknown>),
+    );
+
+    const evidenceBody: Record<string, unknown> = {
+      candidate_sha: candidateSha,
+      exercised_engine_sha: stack.exercisedEngineSha,
+      results: results.map((r) => ({
+        criterion_key: r.criterion_key,
+        passed: r.passed,
+        notes: r.notes,
+      })),
+    };
+    if (qualificationAttemptId) {
+      evidenceBody.qualification_attempt_id = qualificationAttemptId;
+    }
+
+    let evidenceSummary = '';
+    try {
+      const resp = (await apiPost(
+        `/api/admin/projects/${projectId}/acceptance-criteria/walkthrough-e2e-evidence`,
+        evidenceBody,
+      )) as Record<string, unknown>;
+      const recorded = typeof resp.recorded === 'number' ? resp.recorded : Number(resp.recorded) || 0;
+      const skipped = typeof resp.skipped_not_passed === 'number' ? resp.skipped_not_passed : Number(resp.skipped_not_passed) || 0;
+      evidenceSummary = `recorded=${recorded}, skipped_not_passed=${skipped}`;
+      sendLog(ws, `Walkthrough evidence posted: ${evidenceSummary}\n`);
+    } catch (e) {
+      sendLog(ws, `[ERROR] Failed to post walkthrough evidence: ${sanitizeError(e)}\n`);
+      // Evidence posting failure is non-fatal for the task — the result is still
+      // captured in the WALKTHROUGH_E2E_REPORT artifact.
+    }
+
+    // ── Persist final status ─────────────────────────────────────────────────
+    // Post COMPLETED regardless of pass/fail — the evidence itself records which
+    // criteria passed. Negative results are still valid machine-verified evidence.
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'COMPLETED',
+      artifact_type: 'WALKTHROUGH_E2E_REPORT',
+      logs: JSON.stringify({ ...walkthroughResult, exercised_engine_sha: stack.exercisedEngineSha }),
+      repo_url: `https://github.com/${owner}/${repo}`,
+    });
+  } finally {
+    // Guaranteed teardown of the ephemeral stack on every exit path.
+    await stackController.teardown();
+  }
 }
