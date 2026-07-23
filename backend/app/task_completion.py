@@ -57,8 +57,6 @@ from app.compute_jobs import (
 from app.artifact_prerequisites import (
     ARTIFACT_PREREQUISITES_KEY,
     _artifact_pointer,
-    deliver_artifact_to_dependents,
-    stamp_artifact_logical_key,
 )
 from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
@@ -4848,21 +4846,16 @@ def _apply_synthesized_memo(
     memo: Dict[str, Any],
     session: AsyncSession,
 ) -> None:
-    """Persist a synthesized memo artifact and mark the task COMPLETED immediately.
+    """Record a synthesized memo into ``plan_output`` and mark it COMPLETED.
 
     Called at spawn time for dispatcher memos whose full reasoning is already
     known — avoids provisioning a VM solely to reformat known text.
-    """
-    from app.models import Artifact, ArtifactType
 
+    The memo text lives solely in ``memo_task.plan_output['memo']``; no separate
+    MEMO ``Artifact`` row is written. Every memo consumer reads plan_output (see
+    ``query_recent_memo_citations``), so the artifact was a write-only shadow copy.
+    """
     normalized = _normalize_memo(memo)
-    artifact = Artifact(
-        task_id=memo_task.id,
-        artifact_type=ArtifactType.MEMO,
-        logs=json.dumps(normalized),
-    )
-    stamp_artifact_logical_key(artifact, memo_task)
-    session.add(artifact)
     po = dict(memo_task.plan_output) if isinstance(memo_task.plan_output, dict) else {}
     po["memo"] = normalized
     memo_task.plan_output = po
@@ -4877,31 +4870,28 @@ def _apply_synthesized_memo(
 
 
 async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
-    """Persist a memo task's reasoning artifact.
+    """Record a memo task's reasoning into ``plan_output`` and mark it terminal.
 
-    Memo tasks are terminal — they produce a single ``Artifact`` row of
-    type ``MEMO`` and do NOT spawn child tasks or open a PR. Strategic
-    review and downstream reasoning consumers can cite the artifact by id.
+    Memo tasks are terminal — they do NOT spawn child tasks or open a PR.
+    The reasoning is stored in ``task.plan_output['memo']``; strategic review
+    and downstream reasoning consumers cite it from there via
+    ``query_recent_memo_citations``. No separate MEMO ``Artifact`` row is
+    written — it was a write-only shadow copy that no reader ever queried by
+    type, so it is not created.
 
     Behaviour:
-      * On parseable output: create one ``Artifact`` (artifact_type=MEMO,
-        task_id=task.id, logs=serialized JSON), mirror the parsed object
-        into ``task.plan_output['memo']``, and mark the task ``COMPLETED``.
+      * On parseable output: mirror the parsed object into
+        ``task.plan_output['memo']`` and mark the task ``COMPLETED``.
         Memo tasks spawn no children and open no PR, so no lifecycle path
         promotes a childless, PR-less ``EVALUATING`` memo to ``COMPLETED`` —
         it must be marked terminal here directly, like the other terminal
         read-only handlers. ``query_recent_memo_citations`` reads only
         ``COMPLETED`` memos, so this is also the reader/writer contract.
-      * On unparseable output: leave the task without an artifact, set
+      * On unparseable output: leave ``plan_output`` untouched, set
         ``latest_status_message`` so the operator sees why, and mark it
         ``COMPLETED`` (terminal, uncitable) rather than raising — failing
         here would re-queue an inherently invalid agent output.
     """
-    # Local import keeps the module-level import surface stable and
-    # avoids pulling Artifact into the strategic-completion re-export
-    # chain (other handlers use the same lazy-import pattern).
-    from app.models import Artifact, ArtifactType
-
     # Forward evaluation gate (registry-resolved 'forward-quality' strategy):
     # an unparseable or empty memo must NOT complete clean. Marking it FAILED
     # (terminal) is the honest outcome — a memo spawns no children and opens no
@@ -4941,15 +4931,6 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
         return
 
     memo = _normalize_memo(parsed)
-    serialized = json.dumps(memo)
-
-    artifact = Artifact(
-        task_id=task.id,
-        artifact_type=ArtifactType.MEMO,
-        logs=serialized,
-    )
-    stamp_artifact_logical_key(artifact, task)
-    session.add(artifact)
 
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
     plan_output = dict(plan_output)
@@ -4963,16 +4944,13 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
     )
     session.add(task)
     await session.commit()
-    await session.refresh(artifact)
-
-    await deliver_artifact_to_dependents(task, artifact, session, commit=True)
 
     await broadcast_to_project(
         str(task.project_id),
         "task_updated",
         {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
     )
-    logger.info(f"[MEMO] Persisted memo artifact {artifact.id} for task {task.id}")
+    logger.info(f"[MEMO] Recorded memo into plan_output for task {task.id}")
 
 
 _RECOVERED_AGENT_MESSAGE_MARKER = "--- recovered-agent-message-text ---"

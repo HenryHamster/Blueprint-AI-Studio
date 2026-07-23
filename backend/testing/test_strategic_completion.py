@@ -13131,14 +13131,15 @@ async def test_spawn_retirement_memo_api_path(db_session, mocker):
     # Memo with rationale is synthesized at spawn time → immediately COMPLETED
     assert memo.status == TaskStatus.COMPLETED
     assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
-    from app.models import Artifact, ArtifactType
+    from app.models import Artifact
 
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+    assert artifacts == []
 
 
 @pytest.mark.asyncio
@@ -13225,14 +13226,15 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
     # Memo with rationale is synthesized at spawn time → immediately COMPLETED
     assert memo.status == TaskStatus.COMPLETED
     assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
-    from app.models import Artifact, ArtifactType
+    from app.models import Artifact
 
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+    assert artifacts == []
 
 
 @pytest.mark.asyncio
@@ -16644,11 +16646,11 @@ async def test_retirement_memo_carries_direction_snapshot(db_session):
 async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
     """A no-rationale retirement with snapshot context produces a COMPLETED memo at spawn.
 
-    Verifies: memo is COMPLETED (not QUEUED), has a MEMO artifact, reasoning includes
-    recent history and metrics, citations include direction:<id> and task:<id>.
-    No QUEUED VM-bearing task is left behind.
+    Verifies: memo is COMPLETED (not QUEUED), records the memo to plan_output
+    (no Artifact row), reasoning includes recent history and metrics, citations
+    include direction:<id> and task:<id>. No QUEUED VM-bearing task is left behind.
     """
-    from app.models import TaskStatus, Artifact, ArtifactType
+    from app.models import TaskStatus, Artifact
     from app.models import Task as TaskModel
     from sqlmodel import select
 
@@ -16738,13 +16740,13 @@ async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
         f"expected COMPLETED (synthesized at spawn), got {memo.status}"
     )
 
-    # Must have a MEMO artifact
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+    assert artifacts == []
 
     # plan_output must carry the memo
     assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
@@ -16847,21 +16849,21 @@ async def test_spawn_retirement_memo_empty_snapshot_completes_inline_no_vm(db_se
         f"expected COMPLETED (inline synthesis with minimal memo), got {memo.status}"
     )
 
-    # A MEMO artifact must be created at spawn time
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1, (
-        "empty-snapshot memo must have exactly one pre-baked artifact"
+    assert artifacts == [], (
+        "empty-snapshot memo must not create an Artifact row"
     )
-    import json
 
-    artifact_data = json.loads(artifacts[0].logs)
-    assert artifact_data.get("summary"), "memo artifact must have a non-empty summary"
     assert memo.plan_output and memo.plan_output.get("memo"), (
         "plan_output['memo'] must be set for inline-completed memo"
+    )
+    assert memo.plan_output["memo"].get("summary"), (
+        "plan_output memo must have a non-empty summary"
     )
 
 

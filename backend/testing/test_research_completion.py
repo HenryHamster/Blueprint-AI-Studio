@@ -3834,8 +3834,8 @@ class TestReproduceOnHeadGate:
         assert memo.status == TaskStatus.COMPLETED, (
             f"expected COMPLETED (fallback inline synthesis), got {memo.status}"
         )
-        # Must carry a MEMO artifact
-        from app.models import Artifact, ArtifactType
+        # No MEMO Artifact row is written — the memo lives only in plan_output.
+        from app.models import Artifact
 
         artifacts = (
             (
@@ -3846,9 +3846,7 @@ class TestReproduceOnHeadGate:
             .scalars()
             .all()
         )
-        assert len(artifacts) == 1
-        memo_artifact = artifacts[0]
-        assert memo_artifact.artifact_type == ArtifactType.MEMO
+        assert artifacts == []
         assert memo.plan_output and memo.plan_output.get("memo"), (
             "plan_output['memo'] must be set for inline-completed memo"
         )

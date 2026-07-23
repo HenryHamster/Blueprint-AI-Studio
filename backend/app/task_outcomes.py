@@ -249,13 +249,13 @@ def _evaluate_audit(task: Task) -> TaskOutcome:
 
 
 def _evaluate_memo(task: Task) -> TaskOutcome:
-    """Outcome for a memo task — judged on the reasoning artifact's presence.
+    """Outcome for a memo task — judged on the recorded reasoning's presence.
 
-    The memo handler mirrors the normalized memo into ``plan_output['memo']``
-    when it persists the MEMO artifact, so a present, non-empty ``memo`` is the
-    honest success signal without a DB round-trip. A memo task that completed
-    with no parseable reasoning is ``neutral``; a FAILED/CANCELLED one is a
-    ``failure``.
+    The memo handler records the normalized memo into ``plan_output['memo']``
+    (its canonical, sole store — no separate MEMO Artifact row is written), so a
+    present, non-empty ``memo`` is the honest success signal without a DB
+    round-trip. A memo task that completed with no parseable reasoning is
+    ``neutral``; a FAILED/CANCELLED one is a ``failure``.
     """
     if _counts_as_failure(task):
         return TaskOutcome("failure", KIND_MEMO_ARTIFACT)

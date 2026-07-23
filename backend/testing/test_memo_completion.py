@@ -1,9 +1,10 @@
 """Tests for the memo task completion handler.
 
 Memo is a terminal reasoning-artifact task type: parses the agent's
-structured JSON output, persists exactly one Artifact row with
-artifact_type=MEMO, mirrors the parsed object into task.plan_output['memo'],
-and does NOT spawn any child tasks or open a PR.
+structured JSON output, records the parsed object into task.plan_output['memo'],
+and does NOT spawn any child tasks or open a PR. No separate MEMO ``Artifact``
+row is written — the memo text lives solely in plan_output, which is what every
+memo consumer reads (see query_recent_memo_citations).
 """
 
 import json
@@ -107,11 +108,11 @@ def _quiet_broadcast(mocker):
 
 
 @pytest.mark.asyncio
-async def test_memo_completion_persists_artifact_and_no_children(
+async def test_memo_completion_records_plan_output_and_no_children(
     db_session, _quiet_broadcast
 ):
-    """A well-formed memo: persists ONE MEMO Artifact, mirrors to plan_output,
-    spawns ZERO child tasks, and does not produce a PR artifact."""
+    """A well-formed memo: records the memo into plan_output, writes NO Artifact
+    row, spawns ZERO child tasks, and does not produce a PR artifact."""
     project = make_project(name="MemoProj")
     db_session.add(project)
     await db_session.commit()
@@ -138,25 +139,21 @@ async def test_memo_completion_persists_artifact_and_no_children(
 
     await _handle_memo_completion(task, logs, db_session)
 
-    # 1) Exactly one Artifact row of type MEMO
+    # 1) No Artifact row is written — the memo lives only in plan_output. The
+    #    MEMO Artifact was a write-only shadow copy no reader queried by type.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1
-    art = artifacts[0]
-    assert art.artifact_type == ArtifactType.MEMO
-    assert art.pr_url is None
-    persisted = json.loads(art.logs)
-    assert persisted["summary"] == memo["summary"]
-    assert persisted["citations"] == memo["citations"]
-    assert persisted["tags"] == memo["tags"]
+    assert artifacts == []
 
-    # 2) task.plan_output mirrors the parsed memo
+    # 2) task.plan_output carries the full parsed memo — the canonical store.
     await db_session.refresh(task)
     assert isinstance(task.plan_output, dict)
     assert task.plan_output["memo"]["summary"] == memo["summary"]
+    assert task.plan_output["memo"]["reasoning"] == memo["reasoning"]
+    assert task.plan_output["memo"]["citations"] == memo["citations"]
     assert task.plan_output["memo"]["tags"] == memo["tags"]
 
     # 3) No child tasks spawned
@@ -166,10 +163,6 @@ async def test_memo_completion_persists_artifact_and_no_children(
         .all()
     )
     assert children == []
-
-    # 4) No PULL_REQUEST artifact created
-    pr_arts = [a for a in artifacts if a.artifact_type == ArtifactType.PULL_REQUEST]
-    assert pr_arts == []
 
     # 5) Task is marked COMPLETED directly. Memo tasks spawn no children and
     #    open no PR, so no lifecycle path would promote a childless, PR-less
@@ -299,22 +292,27 @@ def test_memo_capability_registered_and_read_only():
 
 
 def test_artifact_type_memo_exists():
-    """ArtifactType.MEMO must exist for the completion handler to use it."""
+    """ArtifactType.MEMO is retained for read-model compatibility.
+
+    New memo completions no longer write MEMO Artifact rows, but the enum value
+    must remain so historical MEMO rows (a plain String column) still load and
+    coerce back to ArtifactType.MEMO without a validation error.
+    """
     assert ArtifactType.MEMO.value == "MEMO"
 
 
-# ── Endpoint-path regression: single MEMO artifact, no double creation ───────
+# ── Endpoint-path regression: no Artifact row, memo recorded to plan_output ──
 #
 # The agent's memo success post deliberately OMITS artifact_type (see
 # agent/src/handlers/memo.ts). The status endpoint's generic Artifact-creation
-# block is gated on `if payload.artifact_type:`, so omitting it means the ONLY
-# writer of the MEMO Artifact is _handle_memo_completion (dispatched on
-# task_type=="memo", independent of artifact_type). This test drives the real
-# /api/agent/status endpoint to lock in that exactly-one invariant — the
-# earlier unit tests call _handle_memo_completion directly and would miss a
-# regression that re-introduced artifact_type='MEMO' on the agent side.
+# block is gated on `if payload.artifact_type:`, so omitting it means the memo
+# path (dispatched on task_type=="memo") writes NO Artifact row at all — the
+# memo is recorded into plan_output by _handle_memo_completion. This test drives
+# the real /api/agent/status endpoint to lock in the no-artifact invariant — a
+# regression that re-introduced artifact_type='MEMO' on the agent side would
+# create a stray Artifact row and fail here.
 @pytest.mark.asyncio
-async def test_memo_status_endpoint_creates_exactly_one_artifact(
+async def test_memo_status_endpoint_writes_no_artifact(
     client: AsyncClient, db_session, mocker
 ):
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
@@ -365,26 +363,30 @@ async def test_memo_status_endpoint_creates_exactly_one_artifact(
     resp = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp.status_code == 200
 
+    # No Artifact row is created by the memo path.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1
-    assert artifacts[0].artifact_type == ArtifactType.MEMO
-    persisted = json.loads(artifacts[0].logs)
-    assert persisted["summary"] == memo["summary"]
+    assert artifacts == []
+
+    # The memo is recorded into plan_output — the canonical store consumers read.
+    await db_session.refresh(task)
+    assert isinstance(task.plan_output, dict)
+    assert task.plan_output["memo"]["summary"] == memo["summary"]
 
 
 # ── _apply_synthesized_memo (spawn-time completion) ─────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_apply_synthesized_memo_creates_completed_task_with_artifact(
+async def test_apply_synthesized_memo_creates_completed_task_no_artifact(
     db_session, _quiet_broadcast
 ):
-    """Dispatcher memos whose reasoning is known at spawn time are persisted as
-    COMPLETED with a MEMO artifact immediately — never entering QUEUED."""
+    """Dispatcher memos whose reasoning is known at spawn time are recorded to
+    plan_output and marked COMPLETED immediately — never entering QUEUED, and
+    without writing an Artifact row."""
     project = make_project(name="SynthMemoProj")
     db_session.add(project)
     await db_session.commit()
@@ -414,22 +416,18 @@ async def test_apply_synthesized_memo_creates_completed_task_with_artifact(
     # Task is COMPLETED immediately — never lingered in QUEUED
     assert task.status == TaskStatus.COMPLETED
 
-    # Exactly one MEMO artifact
+    # No Artifact row is written.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1
-    art = artifacts[0]
-    assert art.artifact_type == ArtifactType.MEMO
-    persisted = json.loads(art.logs)
-    assert persisted["summary"] == "Synthesized at spawn"
-    assert persisted["citations"] == [f"task:{task.id}"]
+    assert artifacts == []
 
-    # plan_output mirrors the memo
+    # plan_output carries the full memo — the canonical store.
     assert isinstance(task.plan_output, dict)
     assert task.plan_output["memo"]["summary"] == "Synthesized at spawn"
+    assert task.plan_output["memo"]["citations"] == [f"task:{task.id}"]
     assert task.plan_output["memo"]["tags"] == ["regression-false-positive"]
 
 
@@ -605,7 +603,7 @@ def _make_codex_jsonl(memo: dict) -> str:
 async def test_recover_memo_from_parse_failure_success(db_session, _quiet_broadcast):
     """Recovery succeeds when the JSONL error log contains a valid memo JSON
     inside an item.completed agent_message envelope; task is promoted to
-    COMPLETED with a MEMO Artifact."""
+    COMPLETED with the memo recorded to plan_output (no Artifact row)."""
     project = make_project(name="RecoveryProj")
     db_session.add(project)
     await db_session.commit()
@@ -639,21 +637,18 @@ async def test_recover_memo_from_parse_failure_success(db_session, _quiet_broadc
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
 
-    # Exactly one MEMO Artifact written
+    # No Artifact row written — the recovered memo lives in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1
-    assert artifacts[0].artifact_type == ArtifactType.MEMO
-    persisted = json.loads(artifacts[0].logs)
-    assert persisted["summary"] == memo["summary"]
-    assert persisted["citations"] == memo["citations"]
-    assert persisted["tags"] == memo["tags"]
+    assert artifacts == []
 
-    # plan_output mirrors the memo
+    # plan_output carries the recovered memo.
     assert task.plan_output["memo"]["summary"] == memo["summary"]
+    assert task.plan_output["memo"]["citations"] == memo["citations"]
+    assert task.plan_output["memo"]["tags"] == memo["tags"]
 
 
 @pytest.mark.asyncio
@@ -811,13 +806,10 @@ async def test_recover_memo_from_incomplete_failure(db_session, _quiet_broadcast
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1
-    assert artifacts[0].artifact_type == ArtifactType.MEMO
-    persisted = json.loads(artifacts[0].logs)
-    assert persisted["summary"] == memo["summary"]
-    assert persisted["citations"] == memo["citations"]
+    assert artifacts == []
 
     assert task.plan_output["memo"]["summary"] == memo["summary"]
+    assert task.plan_output["memo"]["citations"] == memo["citations"]
 
 
 # ── Strategy 1: recovered-agent-message-text marker blocks ──────────────────
@@ -872,11 +864,9 @@ async def test_recover_memo_from_recovered_marker_block(db_session, _quiet_broad
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1
-    assert artifacts[0].artifact_type == ArtifactType.MEMO
-    persisted = json.loads(artifacts[0].logs)
-    assert persisted["summary"] == memo["summary"]
-    assert persisted["citations"] == memo["citations"]
+    assert artifacts == []
+    assert task.plan_output["memo"]["summary"] == memo["summary"]
+    assert task.plan_output["memo"]["citations"] == memo["citations"]
     assert task.plan_output["memo"]["tags"] == memo["tags"]
 
 
@@ -991,7 +981,6 @@ async def test_recover_memo_from_escaped_tail(db_session, _quiet_broadcast):
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1
-    persisted = json.loads(artifacts[0].logs)
-    assert persisted["summary"] == memo["summary"]
-    assert persisted["citations"] == memo["citations"]
+    assert artifacts == []
+    assert task.plan_output["memo"]["summary"] == memo["summary"]
+    assert task.plan_output["memo"]["citations"] == memo["citations"]
