@@ -2610,6 +2610,18 @@ async def claim_task(
                 ) as _pb_proj:
                     if _pb_proj is not None:
                         doc = dict(_pb_proj.design_doc or {})
+
+                        # Hydrate playbook_archive from telemetry —
+                        # strip_migrated_doc_keys removes this key from
+                        # design_doc at write time, so the retire functions
+                        # below see the real archive data.
+                        from app.project_telemetry import get_project_telemetry as _get_pb_archive
+
+                        _pb_archive = await _get_pb_archive(
+                            session, _pb_proj.id, "playbook_archive",
+                        )
+                        if _pb_archive is not None:
+                            doc["playbook_archive"] = list(_pb_archive)
                         for short_key in playbook_entries:
                             full_key = f"playbook/{short_key}"
                             if full_key in doc and isinstance(doc[full_key], dict):

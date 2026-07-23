@@ -1668,6 +1668,16 @@ async def update_playbook_entry(
     # Lock project row before read-modify-write to prevent lost updates.
     project = await lock_project_or_429(session, project_id)
     doc = dict(project.design_doc or {})
+
+    # Hydrate playbook_archive from telemetry — strip_migrated_doc_keys
+    # removes this key from design_doc at write time, so the archive
+    # capture below sees the real data.
+    from app.project_telemetry import get_project_telemetry as _get_pb_archive
+
+    _hydrated_archive = await _get_pb_archive(session, project_id, "playbook_archive")
+    if _hydrated_archive is not None:
+        doc["playbook_archive"] = list(_hydrated_archive)
+
     full_key = f"playbook/{key}"
     if full_key not in doc or not isinstance(doc[full_key], dict):
         raise HTTPException(status_code=404, detail=f"Playbook entry '{key}' not found")

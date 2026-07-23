@@ -36,7 +36,10 @@ from app.models import (
     AlertSeverity,
     _utcnow,
 )
-from app.project_telemetry import read_telemetry_many
+from app.project_telemetry import (
+    get_project_telemetry as _get_project_telemetry,
+    read_telemetry_many,
+)
 from app.sr_analytics_store import read_project_sr_analytics
 from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
@@ -1077,11 +1080,21 @@ async def compute_pipeline_health_summary(
             count_low_success_retired_within,
         )
 
+        # Hydrate playbook_archive from telemetry — strip_migrated_doc_keys
+        # removes this key from design_doc at write time, so the count
+        # functions see the real archive data.
+        _hydrated_doc = dict(project.design_doc)
+        _archive = await _get_project_telemetry(
+            session, project.id, "playbook_archive",
+        )
+        if _archive is not None:
+            _hydrated_doc["playbook_archive"] = list(_archive)
+
         auto_playbook_idle_retired_24h = count_idle_auto_retired_within(
-            project.design_doc, hours=24
+            _hydrated_doc, hours=24
         )
         auto_playbook_low_success_retired_24h = count_low_success_retired_within(
-            project.design_doc, hours=24
+            _hydrated_doc, hours=24
         )
 
     # Self-review prediction accuracy: compare self-review check_results

@@ -52,6 +52,10 @@ from app.task_evaluators import (
     CHALLENGE_INDETERMINATE,
 )
 from app.shared_state import runtime_config as _runtime_config
+from app.project_telemetry import (
+    get_project_telemetry as _get_project_telemetry,
+    set_project_telemetry as _set_project_telemetry,
+)
 from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.task_evaluators import QUALITY_GRADER_VERDICT_KEY
 from app.time_utils import _utcnow
@@ -1137,9 +1141,21 @@ async def apply_post_spawn_state(
             if _pending_archived_diagnoses:
                 session.expire(project, ["design_doc"])
 
+                # Pre-read current archive from telemetry so the lock callback
+                # sees the canonical data (migrated keys are stripped from
+                # design_doc at write time by strip_migrated_doc_keys).
+                _existing_archive = await _get_project_telemetry(
+                    session, task.project_id, "retired_diagnoses_archive",
+                    design_doc_fallback=project.design_doc,
+                )
                 _captured_diagnoses_archive: dict = {}
 
                 def _apply_archived_diagnoses(doc: dict) -> None:
+                    # Hydrate doc from telemetry before mutation so
+                    # _append_archived_diagnosis does not start from empty after
+                    # strip_migrated_doc_keys removed this key on the prior write.
+                    if _existing_archive is not None:
+                        doc["retired_diagnoses_archive"] = list(_existing_archive)
                     for _d_snap, _did in _pending_archived_diagnoses:
                         _append_archived_diagnosis(doc, _d_snap, _did)
                     _captured_diagnoses_archive["value"] = doc.get("retired_diagnoses_archive")
@@ -1148,8 +1164,7 @@ async def apply_post_spawn_state(
                     session, task.project_id, _apply_archived_diagnoses
                 )
                 if _captured_diagnoses_archive.get("value") is not None:
-                    from app.project_telemetry import set_project_telemetry
-                    await set_project_telemetry(
+                    await _set_project_telemetry(
                         session,
                         task.project_id,
                         "retired_diagnoses_archive",

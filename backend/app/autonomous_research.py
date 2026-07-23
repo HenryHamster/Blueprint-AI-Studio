@@ -2540,10 +2540,21 @@ async def _spawn_research_task_inner(
         # Inject failure-mode coaching derived from direction's first-attempt rejection history
         if chosen_direction:
             from app.spawn_calibration import _get_failure_coaching_suffix
+            from app.project_telemetry import get_project_telemetry
+
+            # Hydrate from telemetry — strip_migrated_doc_keys removes this
+            # key from project.design_doc at write time.
+            _telemetry_dfa = await get_project_telemetry(
+                session, project.id, "direction_first_attempt_feedback",
+                design_doc_fallback=project.design_doc,
+            )
+            _hydrated_doc = dict(project.design_doc or {})
+            if _telemetry_dfa is not None:
+                _hydrated_doc["direction_first_attempt_feedback"] = _telemetry_dfa
 
             _dir_id = chosen_direction.get("id")
             _coaching = (
-                _get_failure_coaching_suffix(str(_dir_id), project.design_doc or {})
+                _get_failure_coaching_suffix(str(_dir_id), _hydrated_doc)
                 if _dir_id
                 else None
             )

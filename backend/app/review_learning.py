@@ -645,6 +645,20 @@ async def extract_review_feedback_to_playbook(
     )
     doc["playbook_archive"] = list(existing_archive or [])
 
+    # Hydrate migrated telemetry keys that strip_migrated_doc_keys removes
+    # from design_doc at write time. Without this, _update_module_feedback_profiles
+    # and _accumulate_direction_first_attempt would start from empty data.
+    existing_module_feedback = await get_project_telemetry(
+        session, task.project_id, "module_feedback", design_doc_fallback=doc
+    )
+    if existing_module_feedback is not None:
+        doc["module_feedback"] = dict(existing_module_feedback)
+    existing_dfa = await get_project_telemetry(
+        session, task.project_id, "direction_first_attempt_feedback", design_doc_fallback=doc
+    )
+    if existing_dfa is not None:
+        doc["direction_first_attempt_feedback"] = dict(existing_dfa)
+
     buckets = _categorize_review_issues(review_history)
     related_files: list[str] = list((task.context or {}).get("related_files") or [])
     module_profiles_updated = bool(related_files and buckets)

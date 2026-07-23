@@ -630,28 +630,27 @@ def _apply_cochange_to_doc(
 
 
 async def read_cochange_index(session: AsyncSession, project: Project) -> dict:
-    """Return the co-change affinity index, preferring the KV table.
+    """Return the co-change affinity index from the KV table.
 
-    Prefers the ``project_telemetry`` ``cochange_state`` row (shape
+    Reads from the ``project_telemetry`` ``cochange_state`` row (shape
     ``{"index": {...}, "applied_prs": [...]}``) written by
-    :func:`_update_direction_research_outcomes`, reconstructing the index from
-    it; falls back to the legacy ``design_doc['cochange_index']`` when no row
-    exists (pre-backfill or post-rollback).
+    :func:`_update_direction_research_outcomes`.  Returns ``{}`` when the row
+    has not been backfilled yet.
     """
     state = await read_telemetry(session, project.id, "cochange_state")
     if state is not None:
         return dict(state.get("index") or {})
-    return dict((project.design_doc or {}).get("cochange_index") or {})
+    return {}
 
 
 async def read_cochange_applied_prs(
     session: AsyncSession, project: Project
 ) -> list:
-    """Return the co-change applied-PR dedup list, preferring the KV table."""
+    """Return the co-change applied-PR dedup list from the KV table."""
     state = await read_telemetry(session, project.id, "cochange_state")
     if state is not None:
         return list(state.get("applied_prs") or [])
-    return list((project.design_doc or {}).get("cochange_applied_prs") or [])
+    return []
 
 
 # ---------------------------------------------------------------------------

@@ -170,6 +170,10 @@ from app.task_locking import (
     with_problem_model_locked,
     with_vision_locked,
 )
+from app.project_telemetry import (
+    get_project_telemetry as _get_project_telemetry,
+    set_project_telemetry as _set_project_telemetry,
+)
 from app.plan_completion import (
     _validate_plan_dependencies,
     _break_dependency_cycles,
@@ -3747,6 +3751,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Pre-load project for scope calibration (SQLAlchemy identity map — no extra query if already loaded)
     _scope_cal_project = await session.get(Project, task.project_id)
 
+    # Pre-load telemetry data for migrated design_doc keys that
+    # strip_migrated_doc_keys removes at write time. Passed to
+    # _calibrate_scope and predict_spawn_success so they read canonical
+    # telemetry values instead of the stripped design_doc copy.
+    _telemetry_module_feedback = await _get_project_telemetry(
+        session, task.project_id, "module_feedback",
+    )
+    _telemetry_dfa = await _get_project_telemetry(
+        session, task.project_id, "direction_first_attempt_feedback",
+    )
+
     # Default a child compute_experiment's container_image to the project's
     # declared, digest-pinned baked image. Shared with the dispatch path via
     # resolve_project_default_container_image so the two cannot drift (fail-open).
@@ -3962,8 +3977,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
             _captured_proposals: dict = {}
 
+            # Pre-read current proposals from telemetry so the lock callback
+            # sees the canonical data after strip_migrated_doc_keys removed
+            # this key from design_doc.
+            _existing_proposals = await _get_project_telemetry(
+                session, task.project_id, "proposed_changes",
+                design_doc_fallback=None,
+            )
+
             def _add_obs_proposal(doc: dict) -> None:
-                proposals = doc.get("proposed_changes", [])
+                nonlocal _captured_proposals  # noqa: F841 — closure binding
+                # Hydrate from telemetry before mutation.
+                proposals = list(_existing_proposals or doc.get("proposed_changes", []))
                 # Dedup: skip if identical observation already exists
                 existing = next(
                     (p for p in proposals
@@ -3977,8 +4002,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
             await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
             if _captured_proposals.get("value") is not None:
-                from app.project_telemetry import set_project_telemetry
-                await set_project_telemetry(
+                await _set_project_telemetry(
                     session, task.project_id, "proposed_changes", _captured_proposals["value"]
                 )
             type_filtered_count += 1
@@ -4258,7 +4282,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 else:
                     _prelim_task_type = "create"
                 scope, scope_calibrated_from = _calibrate_scope(
-                    scope, _direction, _scope_cal_project, _prelim_task_type
+                    scope, _direction, _scope_cal_project, _prelim_task_type,
+                    _dfa=_telemetry_dfa,
                 )
                 _history_calibration_fired = scope_calibrated_from is not None
 
@@ -4519,6 +4544,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _scope_cal_project,
             related_files=related_files,
             complexity_score=finding.get("_complexity_score"),
+            _module_feedback=_telemetry_module_feedback,
+            _dfa=_telemetry_dfa,
         )
         _low_confidence = _pred_p < _confidence_threshold
         if _low_confidence:
