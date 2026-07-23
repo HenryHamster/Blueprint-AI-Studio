@@ -167,6 +167,35 @@ def test_no_protect_path_is_also_safe_to_cut():
     )
 
 
+def test_no_duplicate_test_ids_in_protect_entry():
+    """No protect entry may list the same test_id more than once.
+
+    Duplicate test_ids create an illusion of coverage breadth without adding
+    any actual guard — a test deleted once still appears to be listed in the
+    manifest. Duplicates also mask count-mismatch errors in the per-file
+    completeness checks (test_workday_invariant_suite_is_protected_with_all_tests
+    and siblings) that compare len(actual) vs len(listed).
+    """
+    manifest = _load_manifest()
+    duplicates = []
+    for entry in manifest["protect"]:
+        seen: set[str] = set()
+        dupes: list[str] = []
+        for tid in entry["test_ids"]:
+            if tid in seen:
+                dupes.append(tid)
+            seen.add(tid)
+        if dupes:
+            duplicates.append(
+                f"{entry['path']}: {dupes}"
+            )
+    assert not duplicates, (
+        "The following protect entries contain duplicate test_ids. "
+        "Duplicates weaken the manifest completeness guarantee — remove them:\n"
+        + "\n".join(f"  - {d}" for d in duplicates)
+    )
+
+
 def test_all_protect_test_ids_exist_in_their_files():
     """Every test_id listed in a protect entry must exist in its test file.
 
@@ -194,13 +223,24 @@ def test_all_protect_test_ids_exist_in_their_files():
                 if not pattern.search(source):
                     missing.append(f"{entry['path']}::{test_id}")
         elif entry["path"].endswith((".ts", ".tsx")):
-            # TypeScript test suites use describe()/it()/test() with string
-            # labels. Validate each test_id by searching for it as a quoted
-            # string literal anywhere in the file.
+            # TypeScript test suites use describe()/it()/test() with string labels.
+            # Collect actual labels via the quote-aware helpers (all three JS/TS
+            # quote styles) rather than a plain substring search — a substring match
+            # would allow test_id "foo" to pass even if only "foobar" exists in
+            # the file, silently weakening the anti-deletion guarantee.
+            actual_labels = _extract_ts_it_labels(source)
+            actual_labels |= _extract_ts_it_each_labels(source)
+            # Also collect test('...') labels; some files use test() not it().
+            for m in re.finditer(
+                r"""^\s*test\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)""",
+                source,
+                re.MULTILINE,
+            ):
+                label = m.group(1) or m.group(2) or m.group(3)
+                if label:
+                    actual_labels.add(label)
             for test_id in entry["test_ids"]:
-                # Match the label inside single or double quotes
-                pattern = re.compile(re.escape(test_id))
-                if not pattern.search(source):
+                if test_id not in actual_labels:
                     missing.append(f"{entry['path']}::{test_id}")
 
     assert not missing, (
@@ -1101,6 +1141,72 @@ def test_ts_label_extraction_single_quote_only_regex_misses_backtick():
     fixed_result = _extract_ts_it_labels(source)
     assert fixed_result == {"unlisted backtick test"}, (
         f"Fixed helper should find the backtick label, got {fixed_result!r}"
+    )
+
+
+def test_reaper_resident_exemption_seam_is_guarded():
+    """The resident reaper-exemption seam in reaper_orphan_classify.py must remain intact.
+
+    _classify_resident_session exempts conversational Workday sessions from
+    progress-staleness reaping — a warm-idle session between operator turns must
+    not be reaped. This test verifies:
+    (a) _classify_resident_session is still defined in reaper_orphan_classify.py
+        (the production seam that enforces the carve-out),
+    (b) both resident-exemption tests exist in test_reaper.py, and
+    (c) both tests are listed in the protect manifest so deletion is caught.
+    """
+    import re
+
+    # (a) Production seam must still exist.
+    classify_path = REPO_ROOT / "backend" / "app" / "reaper_orphan_classify.py"
+    assert classify_path.exists(), (
+        "backend/app/reaper_orphan_classify.py not found — this file hosts the "
+        "resident reaper-exemption logic (_classify_resident_session)."
+    )
+    classify_source = classify_path.read_text(encoding="utf-8")
+    assert re.search(
+        r"^\s*def\s+_classify_resident_session\s*\(",
+        classify_source,
+        re.MULTILINE,
+    ), (
+        "_classify_resident_session is no longer defined in reaper_orphan_classify.py. "
+        "This function exempts conversational Workday sessions from progress-staleness "
+        "reaping — restore it or update this guard with operator sign-off."
+    )
+
+    # (b) Both resident tests must exist in test_reaper.py.
+    RESIDENT_REAPER_TESTS = (
+        "test_classify_orphan_resident_session_exempt_from_progress_staleness",
+        "test_classify_resident_session_warm_idle_not_reaped",
+    )
+    test_reaper_path = REPO_ROOT / "backend" / "testing" / "test_reaper.py"
+    assert test_reaper_path.exists(), (
+        "backend/testing/test_reaper.py not found — this file covers the reaper exemption seam."
+    )
+    reaper_source = test_reaper_path.read_text(encoding="utf-8")
+    missing_tests = [
+        t for t in RESIDENT_REAPER_TESTS
+        if not re.search(r"^\s*def\s+" + re.escape(t) + r"\s*\(", reaper_source, re.MULTILINE)
+    ]
+    assert not missing_tests, (
+        "The following resident reaper-exemption tests no longer exist in test_reaper.py. "
+        "Restore them or update this guard with operator sign-off:\n"
+        + "\n".join(f"  - {t}" for t in missing_tests)
+    )
+
+    # (c) Both tests must be listed in the manifest protect entry for test_reaper.py.
+    manifest = _load_manifest()
+    reaper_entries = [e for e in manifest["protect"] if e["path"] == "backend/testing/test_reaper.py"]
+    assert reaper_entries, (
+        "backend/testing/test_reaper.py is not in the protect section of the manifest. "
+        "Add it with the resident reaper-exemption test_ids."
+    )
+    listed = set(reaper_entries[0]["test_ids"])
+    not_listed = [t for t in RESIDENT_REAPER_TESTS if t not in listed]
+    assert not not_listed, (
+        "The following resident reaper-exemption tests exist in test_reaper.py but "
+        "are not listed in the protect manifest:\n"
+        + "\n".join(f"  - {t}" for t in not_listed)
     )
 
 

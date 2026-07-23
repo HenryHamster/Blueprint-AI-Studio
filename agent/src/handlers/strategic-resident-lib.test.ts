@@ -895,8 +895,7 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     const images = blocks.filter(block => block.type === 'image');
     expect(images).toHaveLength(MAX_IMAGES_PER_TURN);
     expect(images.filter(block => (
-      block.type === 'image'
-      && block.source.type === 'url'
+      block.source.type === 'url'
       && block.source.artifact_ref_id
     ))).toHaveLength(2);
   });

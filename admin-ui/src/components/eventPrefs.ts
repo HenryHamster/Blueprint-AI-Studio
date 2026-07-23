@@ -63,6 +63,9 @@ export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
   criterion_superseded: 'Criterion Superseded',
   capability_proof_gate_graduated_observe: 'Proof Gate → Observe',
   capability_proof_gate_graduated_enforce: 'Proof Gate → Enforce',
+  mode_knob_graduated_observe: 'Mode → Observe',
+  mode_knob_graduated_enforce: 'Mode → Enforce',
+  mode_knob_cut_recommended: 'Mode Cut Recommended',
 };
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
@@ -74,6 +77,7 @@ export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'capability_trial_ambiguous_lift_escalation',
   'question_answer', 'criterion_retracted', 'criterion_superseded',
   'capability_proof_gate_graduated_observe', 'capability_proof_gate_graduated_enforce',
+  'mode_knob_graduated_observe', 'mode_knob_graduated_enforce', 'mode_knob_cut_recommended',
   ...ESCALATION_EVENT_TYPES,
 ]);
 

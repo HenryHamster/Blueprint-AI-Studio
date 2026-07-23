@@ -638,6 +638,14 @@
       ]
     },
     {
+      "path": "backend/testing/test_reaper.py",
+      "reason": "Covers the resident reaper-exemption seam: a warm-idle conversational Workday session with a fresh heartbeat must not be reaped due to progress-staleness. _classify_resident_session in reaper_orphan_classify.py exempts resident sessions from the tool-use staleness check; these two tests are the only direct coverage of that carve-out.",
+      "test_ids": [
+        "test_classify_orphan_resident_session_exempt_from_progress_staleness",
+        "test_classify_resident_session_warm_idle_not_reaped"
+      ]
+    },
+    {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",
       "reason": "Protects the supported Notes/Whiteboard-to-conversation controls. These queue immutable revisions for the current Workday conversation and are not autonomous shadow-Resident controls.",
       "test_ids": [
