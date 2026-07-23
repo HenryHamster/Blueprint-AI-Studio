@@ -377,6 +377,10 @@
     "test_max_plan_pool_usage.py": 2750,
     "test_shard_balance.py": 100,
     "test_admin_routers__messages.py": 5250,
-    "test_admin_routers__version_lifecycle.py": 4800
+    "test_admin_routers__version_lifecycle.py": 4800,
+    "test_admin_routers__runners.py": 1600,
+    "test_admin_routers__users.py": 750,
+    "test_compute__experiments.py": 1600,
+    "test_release_qualifier__retry_episode_cap.py": 750
   }
 }

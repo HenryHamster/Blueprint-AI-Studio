@@ -10,14 +10,12 @@ const {
   PROMPT_MOCK_EXPORTS,
   CODE_CHANGE_MOCK_EXPORTS,
   PRIOR_KNOWLEDGE_MOCK_EXPORTS,
-  BUILD_CONFIG_MOCK_EXPORTS,
 } = vi.hoisted(() => {
   type IndexExportKey = keyof typeof import('../index.js');
   type TestFixLoopExportKey = keyof typeof import('../utils/test-fix-loop.js');
   type PromptExportKey = keyof typeof import('../prompt.js');
   type CodeChangeExportKey = keyof typeof import('./code-change.js');
   type PriorKnowledgeExportKey = keyof typeof import('./prior-knowledge.js');
-  type BuildConfigExportKey = keyof typeof import('../build-config.js');
 
   return {
     INDEX_MOCK_EXPORTS: [
@@ -42,13 +40,11 @@ const {
     PRIOR_KNOWLEDGE_MOCK_EXPORTS: [
       'fetchKnowledgeDocumentById', 'fetchArtifactDownloadUrl',
     ] satisfies readonly PriorKnowledgeExportKey[],
-    BUILD_CONFIG_MOCK_EXPORTS: [
-    ] satisfies readonly BuildConfigExportKey[],
   };
 });
 
 // Used for type checking only; suppress "unused" warnings
-void INDEX_MOCK_EXPORTS; void TEST_FIX_LOOP_MOCK_EXPORTS; void PROMPT_MOCK_EXPORTS; void CODE_CHANGE_MOCK_EXPORTS; void PRIOR_KNOWLEDGE_MOCK_EXPORTS; void BUILD_CONFIG_MOCK_EXPORTS;
+void INDEX_MOCK_EXPORTS; void TEST_FIX_LOOP_MOCK_EXPORTS; void PROMPT_MOCK_EXPORTS; void CODE_CHANGE_MOCK_EXPORTS; void PRIOR_KNOWLEDGE_MOCK_EXPORTS;
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // 2026-05-04: standard.ts no longer drives lint/test/push/PR via wrapper helpers
@@ -156,11 +152,6 @@ vi.mock('./prior-knowledge.js', async (importOriginal) => {
     fetchKnowledgeDocumentById: vi.fn().mockResolvedValue(null),
     fetchArtifactDownloadUrl: vi.fn().mockResolvedValue(null),
   };
-});
-
-vi.mock('../build-config.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../build-config.js')>();
-  return { ...actual };
 });
 
 vi.mock('../workspacePrep.js', async (importOriginal) => {
