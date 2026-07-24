@@ -32,6 +32,10 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     # this pricing row after retirement so historical fable runs stay priced
     # in cost dashboards. ($10/$50 per MTok list, platform.claude.com 2026-06.)
     ("anthropic", "claude-fable-5"): (10e-6, 50e-6),
+    # Opus 5 is a drop-in upgrade at Opus 4.8's rates ($5/$25 per MTok list,
+    # platform.claude.com 2026-07). Fast mode ($10/$50) is Claude-API-only and
+    # not reachable from the CLI path we bill through.
+    ("anthropic", "claude-opus-5"): (5e-6, 25e-6),
     ("anthropic", "claude-opus-4-8"): (5e-6, 25e-6),
     ("anthropic", "claude-opus-4-7"): (5e-6, 25e-6),
     ("anthropic", "claude-opus-4-6"): (5e-6, 25e-6),

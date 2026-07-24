@@ -844,6 +844,13 @@ RATE_LIMIT_PATTERNS = list(
 #     so haiku tracking normalizes to opus via _normalize_rl_model().
 _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-8": ("claude-opus-4-8",),
+    # Opus 5 is the opus-tier default but still books against the opus-4-8
+    # meter head. The API gives Opus 5 its own rate-limit bucket, but this pool
+    # tracks the *Max-plan session* quota, which is shared across tiers — and
+    # opus-4-8 is the single head (_OPUS_MODEL) that health_check_primitives,
+    # fleet_utilization, and deploy_health_alerts summarize. Giving Opus 5 its
+    # own head would make those blind to opus-5 429s.
+    "claude-opus-5": ("claude-opus-4-8",),
     # Sonnet shares the Max-plan session bucket with Opus (see note above), so
     # a Sonnet 5 429 books against the shared opus-4-8 meter like sonnet-4-6.
     "claude-sonnet-5": ("claude-opus-4-8",),
