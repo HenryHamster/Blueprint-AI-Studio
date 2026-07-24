@@ -16,6 +16,8 @@ vi.mock('../telemetry.js', () => ({
 vi.mock('../prompt.js', () => ({
   DEFAULT_TOOL_GUIDANCE: '',
   SHARED_LIFECYCLE_REMAINDER: '',
+  BUILD_WITH_INTENT_GUIDANCE: '',
+  BUILD_ORDER_GUIDANCE: '',
   formatSkills: vi.fn(() => ''),
   formatProjectTools: vi.fn(() => ''),
   writeSkillHelpers: vi.fn(),

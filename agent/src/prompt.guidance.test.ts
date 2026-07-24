@@ -571,6 +571,17 @@ describe('assembleFailureGuidanceBlocks — structural invariants', () => {
     expect(padIdx).toBeLessThan(bsrIdx);
     expect(bsrIdx).toBeLessThan(ecIdx);
   });
+
+  it('appends the build-discipline blocks after EDGES (intent then order)', () => {
+    const blocks = assembleFailureGuidanceBlocks();
+    expect(blocks).toContain('Build With Intent: Decide Before You Draft'); // BUILD_WITH_INTENT_GUIDANCE
+    expect(blocks).toContain('Build Order: Design');                        // BUILD_ORDER_GUIDANCE
+    const ecIdx  = blocks.indexOf('Edges-Considered Field in Self-Review');
+    const bwiIdx = blocks.indexOf('Build With Intent: Decide Before You Draft');
+    const boIdx  = blocks.indexOf('Build Order: Design');
+    expect(ecIdx).toBeLessThan(bwiIdx);
+    expect(bwiIdx).toBeLessThan(boIdx);
+  });
 });
 
 // ── formatSelfReviewCalibrationSection ───────────────────────────────────────

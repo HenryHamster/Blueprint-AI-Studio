@@ -570,12 +570,82 @@ If the change is correct, ship it on. If it is unsafe without a flag, the task s
 too broad — narrow the scope and ship the safe portion, then file a follow-up.
 `;
 
+// Decision discipline: spend cheap self-critique tokens BEFORE proposing so the
+// first answer is the simplest thing that works, not a plausible draft that needs
+// rounds of correction. Front-loads the decider's real intent + selection criteria
+// and an adversarial self-pushback pass. Bias is against UNJUSTIFIED building —
+// a genuinely earned system is the simplest-that-works and should be built.
+export const BUILD_WITH_INTENT_GUIDANCE = `
+## Build With Intent: Decide Before You Draft
+
+Before proposing a solution, design, or fix — especially one that adds a system,
+tool, gate, or detector — spend cheap self-critique tokens so your FIRST answer is
+the simplest thing that actually works, not a plausible draft that needs rounds of
+correction. Every round of pushback you would get is usually a criterion you already
+knew and failed to apply; apply it yourself first.
+
+1. **Name the target before drafting.** State the real intent behind the request
+   (not the literal ask) and the known selection criteria — simpler wins, don't add
+   a system without cause, don't make a human the dependency, fix at root not just
+   here — then optimize against them from draft one.
+2. **Be your own pushback.** Write the obvious answer, then attack it before anyone
+   sees it: What is the simplest thing that could actually work? What can I REMOVE
+   instead of add? What would the decider reject, and why? Present only the survivor.
+3. **Defaults are filters, not suggestions:**
+   - **Subtractive first, not subtractive-only.** Prefer changing behavior or
+     removing a system over adding one, and make any new system earn its place by
+     naming its maintenance and human-attention cost out loud — you do not feel
+     complexity cost the way a human does. Cut unjustified additions; but a
+     genuinely justified system IS the simplest-that-works, so build it without
+     flinching. The bias is against unjustified building, not against building.
+   - **Un-gameable over policing.** One objective check that cannot be gamed beats
+     a detector that pattern-matches surface smells and just gets routed around.
+   - **Never route through the human.** A solution that reintroduces the operator as
+     a dependency or bottleneck is a non-answer — design that out.
+
+Three critique passes is discipline; ten is token-burn in a costume. Stop when the
+answer stops changing.
+`;
+
+// Build-order discipline: ground the design skeleton first, write tests that
+// capture INTENDED behavior against that skeleton, THEN implement that behavior
+// (tests confirm it — green is evidence, not the target). Designed out: tests
+// written against already-finished code (which mirror the implementation and catch
+// nothing) and the "edit the test until it passes" reflex that silently neuters the
+// assertion that was catching the defect.
+export const BUILD_ORDER_GUIDANCE = `
+## Build Order: Design → Tests-Against-Design → Implement
+
+Build in this order — it is what makes the tests catch real defects instead of
+echoing whatever the code already does:
+
+1. **Ground the design first** — lay down the skeleton (interfaces, signatures,
+   contracts, the shape of the thing) before filling in the bodies. Stubs that throw
+   or return a placeholder are fine at this step; you are fixing the SHAPE, not the
+   behavior.
+2. **Write tests against that grounded design** — assert what it SHOULD do (intended
+   inputs, outputs, error cases), not how today's code happens to do it. Tests
+   written against finished code mirror the implementation and catch nothing; tests
+   written against the design capture intent.
+3. **Then implement the intended behavior** — the design is the target; the tests
+   only confirm you hit it. Build the real behavior, not the minimum that turns the
+   tests green: code that passes only the exact asserted cases has overfit the check,
+   not implemented the design.
+
+**Test-edit rule:** you MAY change a test after writing it — the design legitimately
+shifts as you learn. But before you do, be able to name the concrete, real defect the
+edited test still catches. If your only reason for the edit is "to make it pass,"
+stop: silently weakening, neutering, or deleting an assertion to go green is the exact
+failure mode this ordering exists to prevent. Change the code, or change the test
+because the intended behavior genuinely changed — never to dodge a red.
+`;
+
 // Canonical concatenation of the cross-cutting failure-guidance blocks
 // shared by code-change handlers (standard.ts, review-fix.ts fix path).
 // Centralized so block order, inclusion, and future additions only need
 // to change in one place.
 export function assembleFailureGuidanceBlocks(includeRetryGuidance = true): string {
-  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + (includeRetryGuidance ? PRIOR_ATTEMPT_DIVERGENCE : '') + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE + ANTI_HEDGING_GUIDANCE;
+  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + (includeRetryGuidance ? PRIOR_ATTEMPT_DIVERGENCE : '') + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE + ANTI_HEDGING_GUIDANCE + BUILD_WITH_INTENT_GUIDANCE + BUILD_ORDER_GUIDANCE;
 }
 
 // Compute a stable 12-hex-char fingerprint of the static prompt guidance for

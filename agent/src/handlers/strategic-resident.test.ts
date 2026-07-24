@@ -53,6 +53,8 @@ vi.mock('../prompt.js', () => ({
   formatSkills: vi.fn(),
   formatProjectTools: vi.fn(),
   SHARED_LIFECYCLE_REMAINDER: '',
+  BUILD_WITH_INTENT_GUIDANCE: '',
+  BUILD_ORDER_GUIDANCE: '',
 }));
 vi.mock('./strategic-helpers.js', () => ({
   writeStrategicHelpers: vi.fn(),
