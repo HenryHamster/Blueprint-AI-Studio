@@ -8739,13 +8739,30 @@ async def test_claim_injects_direction_successful_analysis(
     assert len(_json.dumps(dsa)) <= 1500
 
 
+async def _seed_cochange_index(db_session, project_id, index: dict) -> None:
+    """Seed the co-change affinity index where the claim endpoint actually reads it.
+
+    ``read_cochange_index()`` resolves the ``project_telemetry`` ``cochange_state``
+    row only. These tests used to seed ``project.design_doc["cochange_index"]``,
+    which that reader has never consulted since migration 0698 made the KV row the
+    sole store — so the index came back empty and no co-change context was injected.
+    """
+    from app.project_telemetry import upsert_telemetry
+
+    await upsert_telemetry(
+        db_session,
+        project_id,
+        "cochange_state",
+        {"index": index, "applied_prs": []},
+    )
+    await db_session.commit()
+
+
 @pytest.mark.asyncio
 async def test_claim_injects_cochange_files_for_create_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint injects cochange_files in project_context for create tasks when related_files match index."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {
             "backend/app/schemas.py": 3.0,
@@ -8756,12 +8773,16 @@ async def test_claim_injects_cochange_files_for_create_task(
     project = Project(
         name="Cochange Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # read_cochange_index() reads the project_telemetry "cochange_state" row and
+    # has NO design_doc fallback (migration 0698 made the KV row the sole store).
+    # Seeding design_doc instead leaves the index empty, so the injection never
+    # runs and the assertions below pass or fail for the wrong reason.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -8794,20 +8815,20 @@ async def test_claim_does_not_inject_cochange_files_for_review_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint does NOT inject cochange_files for review tasks."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {"backend/app/schemas.py": 3.0},
     }
     project = Project(
         name="Cochange Review Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Seeded on purpose: the exclusion below must be earned by the task-type
+    # gate, not granted for free by an index the reader never finds.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -8835,8 +8856,6 @@ async def test_claim_injects_cochange_hints_for_plan_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint injects cochange_hints in direction_context for plan tasks restricted to related_files."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {
             "backend/app/schemas.py": 3.0,
@@ -8854,12 +8873,12 @@ async def test_claim_injects_cochange_hints_for_plan_task(
     project = Project(
         name="Cochange Plan Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -8901,8 +8920,6 @@ async def test_claim_omits_cochange_hints_when_below_threshold(
     client: AsyncClient, db_session
 ):
     """Claim endpoint omits cochange_hints when no within-set pairs meet the >= 1.0 threshold."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/a.py": {"backend/app/b.py": 0.7},  # below threshold
         "backend/app/b.py": {"backend/app/a.py": 0.7},
@@ -8910,12 +8927,14 @@ async def test_claim_omits_cochange_hints_when_below_threshold(
     project = Project(
         name="Cochange Plan Threshold Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Seeded on purpose: the omission below must be earned by the >= 1.0
+    # threshold, not by an index the reader never finds.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -8941,8 +8960,6 @@ async def test_claim_does_not_inject_cochange_hints_for_create_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint does NOT inject cochange_hints (a plan-only signal) into direction_context for create tasks."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {"backend/app/schemas.py": 3.0},
         "backend/app/schemas.py": {"backend/app/models.py": 3.0},
@@ -8950,12 +8967,16 @@ async def test_claim_does_not_inject_cochange_hints_for_create_task(
     project = Project(
         name="Cochange Hint Skip Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Seeded on purpose: cochange_hints must be absent because the task is a
+    # create, not because the index was unreadable. This test is the guard that
+    # the create path still gets cochange_files while skipping the plan-only
+    # hints, so the index has to be genuinely present.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,

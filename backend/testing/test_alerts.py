@@ -50,6 +50,40 @@ async def _undismissed_alerts(db_session, **filters):
     return (await db_session.execute(stmt)).scalars().all()
 
 
+async def _sr_doc(db_session, project) -> dict:
+    """Read SR analytics the way the production reader does.
+
+    The SR analytics keys moved out of ``project.design_doc`` into the dedicated
+    ``project_sr_analytics`` row. ``compute_sr_catch_rate_trends`` now writes only
+    ``sr_row.data``; ``project.design_doc`` survives as a per-key *read* fallback
+    for projects not yet backfilled, and dedicated values win the merge. Asserting
+    against ``project.design_doc`` therefore never observes a freshly written alert.
+    """
+    from app.sr_analytics_store import read_project_sr_analytics
+
+    return await read_project_sr_analytics(db_session, project)
+
+
+async def _set_sr_trends(db_session, project, trends: dict) -> None:
+    """Overwrite the stored ``sr_catch_rate_trends`` blob in the dedicated row.
+
+    Mutating ``design_doc`` cannot restage these tests any more: the impl merges
+    ``doc.update(sr_row.data)``, so a dedicated value written by an earlier phase
+    shadows whatever design_doc says.
+    """
+    from app.models import ProjectSRAnalytics
+    from sqlalchemy.orm.attributes import flag_modified
+
+    row = await db_session.get(ProjectSRAnalytics, project.id)
+    assert row is not None, "expected compute_sr_catch_rate_trends to create the row"
+    data = dict(row.data or {})
+    data["sr_catch_rate_trends"] = trends
+    row.data = data
+    flag_modified(row, "data")
+    db_session.add(row)
+    await db_session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Task failure alerts
 # ---------------------------------------------------------------------------
@@ -1299,7 +1333,7 @@ class TestSRCatchRateFloorAlert:
             await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
         await db_session.refresh(project)
-        assert "sr_catch_rate_floor_alert" in (project.design_doc or {})
+        assert "sr_catch_rate_floor_alert" in await _sr_doc(db_session, project)
         assert len(_floor_dispatch_calls(d1)) == 1
 
         # Second call in same window — should be deduped
@@ -1584,25 +1618,20 @@ class TestSRCatchRateFloorAlertRow:
             await compute_sr_catch_rate_trends(project.id, db_session, firing_tasks)
         await db_session.commit()
         await db_session.refresh(project)
-        assert "sr_catch_rate_floor_alert" in (project.design_doc or {})
+        assert "sr_catch_rate_floor_alert" in await _sr_doc(db_session, project)
         rows = await _undismissed_alerts(db_session, project_id=project.id)
         assert any(r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX) for r in rows)
 
         # Phase 2: clear (history above floor → no longer below_floor).
-        # Update design_doc rate_history to above-floor values so the next
-        # computation does not register below_floor for this category.
-        doc = dict(project.design_doc)
-        trends = dict(doc["sr_catch_rate_trends"])
+        # Rewrite rate_history to above-floor values in the dedicated row so the
+        # next computation does not register below_floor for this category.
+        # Phase 1 already wrote sr_catch_rate_trends there, and the dedicated row
+        # wins the merge, so editing design_doc here would have no effect.
+        trends = dict((await _sr_doc(db_session, project))["sr_catch_rate_trends"])
         cats = dict(trends.get("categories") or {})
         cats["security"] = {"rate_history": [0.80, 0.85]}
         trends["categories"] = cats
-        doc["sr_catch_rate_trends"] = trends
-        project.design_doc = doc
-        from sqlalchemy.orm.attributes import flag_modified
-
-        flag_modified(project, "design_doc")
-        db_session.add(project)
-        await db_session.commit()
+        await _set_sr_trends(db_session, project, trends)
 
         clearing_tasks = self._tasks(project.id, current_hits=4, current_misses=1)
         for t in clearing_tasks:
@@ -1625,7 +1654,7 @@ class TestSRCatchRateFloorAlertRow:
         await db_session.commit()
         await db_session.refresh(project)
 
-        assert "sr_catch_rate_floor_alert" not in (project.design_doc or {})
+        assert "sr_catch_rate_floor_alert" not in await _sr_doc(db_session, project)
         rows = await _undismissed_alerts(db_session, project_id=project.id)
         floor_rows = [
             r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)
@@ -1812,7 +1841,7 @@ class TestSRCatchRateRegressionAlertRow:
             await compute_sr_catch_rate_trends(project.id, db_session, firing_tasks)
         await db_session.commit()
         await db_session.refresh(project)
-        assert "sr_catch_rate_trends_alert" in (project.design_doc or {})
+        assert "sr_catch_rate_trends_alert" in await _sr_doc(db_session, project)
 
         # Phase 2: a fresh stable dataset — both windows hit-rate 1.00, trend stable.
         # compute_sr_catch_rate_trends operates on the explicitly-passed list, so
@@ -1857,7 +1886,7 @@ class TestSRCatchRateRegressionAlertRow:
         await db_session.commit()
         await db_session.refresh(project)
 
-        assert "sr_catch_rate_trends_alert" not in (project.design_doc or {})
+        assert "sr_catch_rate_trends_alert" not in await _sr_doc(db_session, project)
         rows = await _undismissed_alerts(db_session, project_id=project.id)
         reg_rows = [
             r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)
