@@ -584,6 +584,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                 f"— children may be stuck"
                             ),
                             task_id=task.id,
+                            event_type="task.blocked",
                         )
                         session.add(alert)
                         await session.commit()

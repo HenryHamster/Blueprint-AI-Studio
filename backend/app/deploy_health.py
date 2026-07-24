@@ -363,6 +363,7 @@ async def _check_monitoring_window():
                             f"Deploy monitoring detected degraded performance. "
                             f"Rollback to previous revision is recommended. Reason: {reason}"
                         ),
+                        event_type="deployment.rollback_recommended",
                     )
                     session.add(alert)
                     await broadcast_to_project(

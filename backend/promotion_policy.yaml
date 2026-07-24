@@ -9,14 +9,13 @@
 # qualify; a human owns the definition of "qualified".
 #
 # Composite confidence is a weighted sum of normalised sub-scores in [0,1],
-# gated by hard blockers (CI red, smoketest startup-suite failure, or a
-# deleted test file force confidence to 0). Promote when confidence is at or
-# above `threshold`.
+# gated by hard blockers (CI red or a deleted test file forces confidence to
+# 0). Promotion PR CI remains the deterministic test gate. Qualifier VM
+# smoketests are retired; ordinary post-promotion smoke is separate.
 
 weights:
-  audit: 0.40          # main-version audit of the main...automain diff
-  test_erosion: 0.30   # did automain delete tests or weaken coverage vs main
-  smoketest: 0.30      # qualify-time smoketest pass ratio
+  audit: 0.5714285714285714  # main-version audit of the main...automain diff
+  test_erosion: 0.4285714285714286 # did automain delete tests or weaken coverage vs main
 
 threshold: 0.90        # composite confidence required to promote.
 # Raised back to the conservative 0.90 calibration bar.

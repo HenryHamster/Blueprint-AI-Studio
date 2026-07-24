@@ -45,6 +45,11 @@ DEFAULT_ORCHESTRATOR_URL = "https://blueprint-orchestrator-mmtfi5aysa-uc.a.run.a
 # own fail-closed preflight.
 MIN_NODE_MAJOR = 22
 MIN_CODEX_VERSION = (0, 144, 1)
+
+# Canonical first-launch subcommands documented in docs/RUNNER_RUNBOOK.md.
+# Keep this tuple in sync with the "Enroll and start" section of the runbook.
+# test_docs_runbook_drift.py::test_first_launch_matches_shipped_cli guards the alignment.
+FIRST_LAUNCH_COMMANDS: tuple[str, ...] = ("start", "check", "install")
 PINNED_CODEX_VERSION = "0.144.1"
 _CODEX_REPAIR = (
     f"Reinstall Codex with optional native packages: npm install -g "
@@ -1319,7 +1324,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="blueprint-runner",
         description=(
             "Start a Blueprint self-hosted runner. The orchestrator URL is baked in; "
-            "you only need a token from the Blueprint console (Fleet -> Enroll runner)."
+            "you only need a token from the Blueprint console (Runtime -> Devices and runners -> Enroll runner)."
         ),
     )
     sub = parser.add_subparsers(
@@ -1531,7 +1536,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         print(
-            "Enroll a runner in the Blueprint console (Fleet -> Enroll runner) to get one.",
+            "Enroll a runner in the Blueprint console (Runtime -> Devices and runners -> Enroll runner) to get one.",
             file=sys.stderr,
         )
         return 2

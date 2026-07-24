@@ -11,7 +11,7 @@ describe('workbench target helpers', () => {
       section: ' devices ',
       runner_id: ' runner-1 ',
       secret: 'drop-me',
-    })).toEqual({
+    } as unknown as Parameters<typeof normalizeWorkbenchTarget>[0])).toEqual({
       surface: 'runtime',
       section: 'devices',
       runner_id: 'runner-1',

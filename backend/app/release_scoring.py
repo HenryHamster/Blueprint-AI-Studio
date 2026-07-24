@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # malformed.  MUST match the documented defaults in promotion_policy.yaml so a
 # parse failure degrades to the intended rubric rather than a silent surprise.
 _DEFAULT_POLICY: dict[str, Any] = {
-    "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+    "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
     "threshold": 0.90,
 }
 
@@ -39,7 +39,7 @@ _DEFAULT_POLICY: dict[str, Any] = {
 _DEBT_PRESSURE_CEIL = 20
 
 # Hard cap on the completion_debt blend factor.  completion_debt is a SEPARATE
-# blend weight, NOT part of the audit + test_erosion + smoketest core-weight sum
+# blend weight, NOT part of the audit + test_erosion core-weight sum
 # (see ``compute_composite``): the existing sub-scores are scaled by
 # ``(1 - w_debt)`` and the debt term is added, so the total stays in [0, 1].
 # Bounded at 0.5 so the debt signal can never dominate the quality sub-scores.
@@ -740,7 +740,15 @@ def _score_env_preflight(
         else None
     )
     if not isinstance(required, list):
-        # No usable manifest — nothing to judge (None sub_score, never a block).
+        # No parseable required_env list in the artifact — return None so the
+        # caller (compute_composite) can distinguish "evidence absent / malformed"
+        # from "evidence present but prerequisites missing".  When
+        # env_preflight_enabled is True, compute_composite maps None → the
+        # boot_prereq_evidence_missing hard blocker.  External repos that have
+        # no required_runtime_env.py at all are handled upstream:
+        # build_env_preflight_from_source returns {required_env: []} (empty list,
+        # vacuously satisfied → 1.0) so score never reaches None for a genuinely
+        # manifest-free tree.
         return None, [], deploy_target_scope
 
     missing: set[str] = set()
@@ -876,21 +884,24 @@ def compute_composite(
         prerequisite ABSENT from the deploy-target env (``"boot_prereq_missing"``).
         Presence-only: ``env_preflight_missing`` carries NAMES, never values.
         ``sub_scores["env_preflight_missing"]`` records the names for operators.
-        This entire dimension is DARK by default: when ``env_preflight_enabled``
-        is False the block is skipped, ``sub_scores["env_preflight"]`` is not
-        recorded, and the composite is byte-for-byte identical to the pre-Slice-3
-        behaviour (the judge contributes NO weight to the audit + test_erosion +
-        smoketest sum — it is a pure hard gate, like the migration gates).
+        When ``env_preflight_enabled`` is False the block is skipped,
+        ``sub_scores["env_preflight"]`` is not recorded, and the composite is
+        byte-for-byte identical to the pre-Slice-3 behaviour (the judge
+        contributes NO weight to the audit + test_erosion sum — it
+        is a pure hard gate, like the migration gates).  Note: the
+        ``runtime_config`` default is ``True`` (Armed), so at runtime the gate
+        is active unless the operator explicitly disables it.  The function
+        parameter default is ``False`` for backward-compatibility with callers
+        that do not pass the flag.
         ``env_preflight_ack_override`` (Slice 4) is the OWNER-only escape valve:
         when True it suppresses ONLY this ``boot_prereq_missing`` block (for the
         same-deploy-binding case where the deployed environ does not yet reflect
         the pending secret) and records ``sub_scores["env_preflight_ack_override"]
         = True``.  It touches no other gate — an ordered blocker above still wins
         and a blocker below still fires; the missing NAMES are still recorded.
-      * ``smoketest_score`` is None — the smoketest never produced a usable
-        score, treated as a startup-suite failure
-        (``"smoketest_startup_failed"``).  ONLY checked when
-        ``smoketest_enabled`` is True (see below).
+      * Legacy ``smoketest_score`` / ``smoketest_enabled`` arguments are
+        accepted for caller compatibility but are inert; qualifier VM smoke is
+        retired.
       * ``audit_score`` is None     — the release_audit report is missing or
         unusable (``"audit_missing"``).  Checked before test-erosion because a
         missing audit report nulls both inputs.
@@ -898,19 +909,10 @@ def compute_composite(
         (``"test_file_deleted"``); a real deletion, only meaningful when the
         audit report itself was present.
 
-    ``smoketest_enabled`` (audit H3): the qualifier-smoketest subsystem is
-    gated by ``runtime_config["smoketest_enabled"]``, which defaults False.
-    When the qualifying run had it disabled it spawned NO qualifier-smoketest
-    child and there is no SMOKETEST_RESULT artifact — so ``smoketest_score``
-    is unconditionally None.  Treating that None as the
-    ``smoketest_startup_failed`` hard blocker would make EVERY candidate fail
-    while the subsystem is off.  Therefore, when ``smoketest_enabled`` is
-    False this function: (a) skips the smoketest hard blocker, (b) drops the
-    smoketest dimension from the weighted sum, and (c) renormalizes the
-    remaining ``audit`` + ``test_erosion`` weights so they sum to 1.0.  When
-    True it behaves exactly as the design-doc rubric specifies.
+    Historical three-key policies are accepted, their retired smoke weight is
+    discarded, and the active audit + test-erosion weights are renormalized.
 
-    The numeric inputs are clamped to [0,1] before weighting.  When no hard
+    The numeric inputs are clamped to [0,1] before weighting. When no hard
     blocker fires, ``confidence`` is the policy-weighted sum of the active
     sub-scores.  ``promote`` is True iff ``confidence >= threshold``.
 
@@ -919,32 +921,27 @@ def compute_composite(
     """
     weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
     threshold = float(policy.get("threshold", _DEFAULT_POLICY["threshold"]))
-    w_audit = float(weights.get("audit", 0.40))
-    w_test = float(weights.get("test_erosion", 0.30))
-    w_smoke = float(weights.get("smoketest", 0.30))
+    # Qualifier VM smoke is retired. Accept legacy three-key policies, ignore
+    # their smoke weight, and renormalize the two active deterministic signals.
+    w_audit = float(weights.get("audit", _DEFAULT_POLICY["weights"]["audit"]))
+    w_test = float(
+        weights.get("test_erosion", _DEFAULT_POLICY["weights"]["test_erosion"])
+    )
+    from decimal import Decimal
 
-    if not smoketest_enabled:
-        # Audit H3: drop the smoketest dimension and renormalize audit +
-        # test_erosion so the two remaining weights sum to 1.0.  A degenerate
-        # policy where audit + test_erosion both round to 0 falls back to the
-        # documented 0.40/0.30 default split so confidence is never NaN.
-        audit_test_sum = w_audit + w_test
-        if audit_test_sum > 0:
-            w_audit = w_audit / audit_test_sum
-            w_test = w_test / audit_test_sum
-        else:
-            default_sum = (
-                _DEFAULT_POLICY["weights"]["audit"]
-                + _DEFAULT_POLICY["weights"]["test_erosion"]
-            )
-            w_audit = _DEFAULT_POLICY["weights"]["audit"] / default_sum
-            w_test = _DEFAULT_POLICY["weights"]["test_erosion"] / default_sum
-        w_smoke = 0.0
+    active_audit = Decimal(str(w_audit))
+    active_test = Decimal(str(w_test))
+    active_sum = active_audit + active_test
+    if active_sum <= 0:
+        w_audit = _DEFAULT_POLICY["weights"]["audit"]
+        w_test = _DEFAULT_POLICY["weights"]["test_erosion"]
+    else:
+        w_audit = float(active_audit / active_sum)
+        w_test = float(active_test / active_sum)
 
-    # Hard blockers — checked before any weighting.  ``None`` is the sentinel
-    # for "this dimension hit an irrecoverable blocker"; the caller passes None
-    # for test_erosion on a deleted test file and None for smoketest on a
-    # startup-suite failure.
+    # Hard blockers — checked before any weighting. ``None`` is the sentinel
+    # for "this active dimension hit an irrecoverable blocker"; the caller
+    # passes None for test_erosion when a test file was deleted.
     #
     # Ordering matters when several inputs are None at once.  A FAILED
     # release_audit posts no RELEASE_AUDIT_REPORT, so _score_audit(None)
@@ -992,8 +989,8 @@ def compute_composite(
         # certify the boot gate at all — individual prerequisite presence is moot.
         blocker = "boot_prereq_evidence_missing"
     elif env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
-        # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
-        # default (env_preflight_enabled defaults False).  A candidate-declared,
+        # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4).
+        # runtime_config default: True (Armed).  A candidate-declared,
         # in-scope boot prerequisite is ABSENT from the deploy-target env — the
         # v25 class where a new startup gate crashes prod because its secret is
         # unbound.  Presence-only: env_preflight_missing carries NAMES, never
@@ -1038,14 +1035,10 @@ def compute_composite(
         # block dependents that name them.  Block promotion until the unproven
         # capabilities are either proven or the gate is dialled back to observe.
         blocker = "capability_proof_gate_blocked"
-    elif smoketest_enabled and smoketest_score is None:
-        # Only a hard blocker when the smoketest subsystem was actually
-        # enabled — a disabled subsystem legitimately produces no score.
-        blocker = "smoketest_startup_failed"
     elif audit_score is None:
         # An audit that produced no usable score is a soft signal, but without
         # it the composite is meaningless — treat as a blocker so a missing
-        # audit can never promote on smoketest + test_erosion alone.  Reported
+        # audit can never promote on test_erosion alone.  Reported
         # ahead of test_file_deleted because a missing report nulls both.
         blocker = "audit_missing"
     elif test_erosion is None:
@@ -1056,14 +1049,13 @@ def compute_composite(
     sub_scores = {
         "audit": _clamp01(audit_score) if audit_score is not None else 0.0,
         "test_erosion": _clamp01(test_erosion) if test_erosion is not None else 0.0,
-        "smoketest": _clamp01(smoketest_score) if smoketest_score is not None else 0.0,
     }
     # Debt-pressure sub-score: always recorded when provided (observe mode);
     # only blended into confidence when completion_debt_weight > 0 in policy.
     if debt_pressure_score is not None:
         sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
 
-    # Env-preflight sub-score + missing names (Slice 3, DARK by default).  Only
+    # Env-preflight sub-score + missing names (Slice 3).  Only
     # recorded when the judge is enabled, so a disabled subsystem leaves the
     # sub_scores dict byte-for-byte unchanged.  env_preflight is a pure hard gate
     # (block on any missing) — it never contributes a weight to the composite sum,
@@ -1126,12 +1118,9 @@ def compute_composite(
     w_debt = float((policy.get("weights") or {}).get("completion_debt", 0.0))
     w_debt = max(0.0, min(w_debt, 0.5))  # cap at 50% to bound disruption
 
-    # When the smoketest dimension is dropped its weight is 0.0, so the term
-    # contributes nothing regardless of the (unused) smoketest sub-score.
     existing_confidence = (
         w_audit * sub_scores["audit"]
         + w_test * sub_scores["test_erosion"]
-        + w_smoke * sub_scores["smoketest"]
     )
     if w_debt > 0.0 and debt_pressure_score is not None:
         # Enforce mode: scale existing confidence down by (1 - w_debt) and
@@ -1176,7 +1165,7 @@ def compute_composite(
 #                 automain is INERT until it is itself promoted (release-machinery
 #                 self-reference): the divergence self-clears only on promotion.
 #   "candidate" — the check runs against CANDIDATE content (the merged diff, the
-#                 candidate's CI, a smoketest executing candidate code).  A fix on
+#                 candidate's CI, or a candidate-side grade).  A fix on
 #                 automain resolves the blocker on the NEXT qualification, no
 #                 redeploy required.
 EXECUTION_SITE_DEPLOYED = "deployed"
@@ -1204,10 +1193,9 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # next qualification — no deploy or operator action required.
     "boot_prereq_evidence_missing": EXECUTION_SITE_CANDIDATE,
     # Candidate-side: resolvable by an automain fix that lands in the next
-    # candidate tree — CI, the merged diff, or a smoketest running candidate code.
+    # candidate tree — CI or the merged diff.
     "ci_not_green": EXECUTION_SITE_CANDIDATE,
     "ci_unresolved": EXECUTION_SITE_CANDIDATE,
-    "smoketest_startup_failed": EXECUTION_SITE_CANDIDATE,
     "audit_missing": EXECUTION_SITE_CANDIDATE,
     "test_file_deleted": EXECUTION_SITE_CANDIDATE,
     # Deployed-side: the category verdict ledger is composed and rendered by
@@ -2228,11 +2216,10 @@ def _audit_findings_carry_meta(report: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-# Caps on the test-erosion / smoketest detail carried into last_qualification.
+# Caps on the test-erosion detail carried into last_qualification.
 # Kept small (mirroring _MAX_CARRIED_FINDINGS) so the version_phase block stays
 # under the strategic pack budget while still naming the specific blocker.
 _MAX_DELETED_TEST_FILES = 8
-_MAX_FAILED_SMOKE_TESTS = 8
 _DETAIL_NAME_MAX = 200
 
 
@@ -2300,116 +2287,25 @@ def _extract_test_erosion_detail(
     return detail or None
 
 
-def _extract_smoketest_detail(result: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Pull a compact smoketest-failure detail from a SMOKETEST_RESULT.
-
-    ``_score_smoketest`` knows which suite failed startup and which named tests
-    failed, but reduces them to a pass-ratio.  When smoketest is the binding
-    constraint the strategic agent then sees only the number, not WHICH suite or
-    tests failed.  This carries the actionable detail into ``last_qualification``
-    so the agent can scope a targeted fix (repair the failing startup suite,
-    fix the named failing tests).
-
-    Returns ``None`` when nothing is failing (clean run adds nothing to the
-    payload).  ``failed_tests`` is capped at ``_MAX_FAILED_SMOKE_TESTS``.
-    """
-    if not isinstance(result, dict):
-        return None
-
-    detail: dict[str, Any] = {}
-
-    suites = result.get("suites")
-    if isinstance(suites, dict):
-        startup = suites.get("startup")
-        if isinstance(startup, dict) and startup.get("passed") is False:
-            detail["startup_failed"] = True
-            detail["failed_suite"] = "startup"
-        elif "failed_suite" not in detail:
-            for suite_name, suite in suites.items():
-                if isinstance(suite, dict) and suite.get("passed") is False:
-                    detail["failed_suite"] = str(suite_name).strip()[:_DETAIL_NAME_MAX]
-                    break
-
-    tests = result.get("tests")
-    if isinstance(tests, list) and tests:
-        failed = [
-            str(t.get("name") or "").strip()[:_DETAIL_NAME_MAX]
-            for t in tests
-            if isinstance(t, dict)
-            and t.get("status") == "fail"
-            and str(t.get("name") or "").strip()
-        ]
-        total = len(tests)
-        passed = sum(
-            1 for t in tests if isinstance(t, dict) and t.get("status") == "pass"
-        )
-        if failed:
-            detail["failed_tests"] = failed[:_MAX_FAILED_SMOKE_TESTS]
-            if len(failed) > _MAX_FAILED_SMOKE_TESTS:
-                detail["failed_tests_truncated"] = len(failed) - _MAX_FAILED_SMOKE_TESTS
-            detail["passed"] = passed
-            detail["total"] = total
-
-    return detail or None
-
-
-def _score_smoketest(result: dict[str, Any] | None) -> float | None:
-    """Derive a ``smoketest_score`` in [0,1] from a SMOKETEST_RESULT.
-
-    The smoketest emits ``{passed, tests: [{status}], suites: {startup:
-    {passed}, ...}}`` (agent/src + routers/agent_status.py).
-
-    Returns the pass ratio (passed tests / total tests).  Returns None — the
-    hard-blocker sentinel — when the startup suite failed or no result is
-    available, since a failed startup suite means the candidate can't even
-    boot.
-    """
-    if not isinstance(result, dict):
-        return None
-
-    suites = result.get("suites")
-    if isinstance(suites, dict):
-        startup = suites.get("startup")
-        if isinstance(startup, dict) and startup.get("passed") is False:
-            # Startup suite failed — hard blocker.
-            return None
-
-    tests = result.get("tests")
-    if not isinstance(tests, list) or not tests:
-        # No tests ran: if the overall result claims passed, treat as a full
-        # score; otherwise as zero (but not a hard blocker — startup is the
-        # blocker, handled above).
-        return 1.0 if result.get("passed") is True else 0.0
-
-    total = len(tests)
-    # Only status=="pass" counts toward the score — a "skip" (or any non-pass
-    # status) contributes 0.  This is intentionally conservative: a skipped
-    # qualifier test is unverified coverage, so it should pull the score down
-    # rather than be treated as a pass.
-    passed = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "pass")
-    return _clamp01(passed / total) if total else 0.0
-
-
 def _fmt_sub_scores(
     sub_scores: dict[str, Any] | None,
     *,
     smoketest_enabled: bool = True,
 ) -> str:
-    """Render sub-scores as ``audit 0.95 · test 1.00 · smoke 0.80`` for messages.
+    """Render the active audit and test-erosion scores for messages.
 
-    The smoketest term is omitted when the subsystem was disabled for the run —
-    its sub-score is a meaningless 0.0 placeholder in that case.
+    ``smoketest_enabled`` remains in the signature for old callers but is
+    intentionally ignored. Archived smoke scores never appear in a current
+    qualification summary.
     """
     if not sub_scores:
         return "n/a"
-    parts = [
-        f"audit {float(sub_scores.get('audit', 0.0)):.2f}",
-        f"test {float(sub_scores.get('test_erosion', 0.0)):.2f}",
-    ]
-    if smoketest_enabled:
-        parts.append(f"smoke {float(sub_scores.get('smoketest', 0.0)):.2f}")
-    return " · ".join(parts)
-
+    return " · ".join(
+        [
+            f"audit {float(sub_scores.get('audit', 0.0)):.2f}",
+            f"test {float(sub_scores.get('test_erosion', 0.0)):.2f}",
+        ]
+    )
 
 # ---------------------------------------------------------------------------
 # Challenge-verdict reconciliation — fail-closed audit challenge gate.

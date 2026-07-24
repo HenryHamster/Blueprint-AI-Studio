@@ -5,7 +5,6 @@ import {
   executeStrategicWorkSessionCommand,
   fetchStrategicStateWithRevision,
   fetchStrategicConversation,
-  fetchResidentEngineHealth,
   findStrategicMessageByClientIdentity,
   deleteMessageAttachmentUpload,
   getMessageAttachmentUploadUrl,
@@ -142,23 +141,6 @@ describe('fetchStrategicConversation', () => {
       });
     },
   );
-});
-
-describe('fetchResidentEngineHealth', () => {
-  beforeEach(() => apiFetchMock.mockReset());
-
-  test('fetches the owner rollout projection without waking the Resident', async () => {
-    apiFetchMock.mockResolvedValue(jsonResponse({ project_id: 'proj-1', resident_initialized: true }));
-    await expect(fetchResidentEngineHealth('proj-1')).resolves.toMatchObject({ resident_initialized: true });
-    expect(apiFetchMock).toHaveBeenCalledWith(
-      '/api/admin/projects/proj-1/resident-engine/health', undefined, 1, 15000, undefined,
-    );
-  });
-
-  test.each([403, 404])('quietly omits the owner-only projection on %s', async status => {
-    apiFetchMock.mockResolvedValue(new Response(null, { status }));
-    await expect(fetchResidentEngineHealth('proj-1')).resolves.toBeNull();
-  });
 });
 
 describe('message attachment download URL cache', () => {

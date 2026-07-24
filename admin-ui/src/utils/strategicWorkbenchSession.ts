@@ -1,8 +1,13 @@
 import type { PrimaryTab } from '../hooks/useUIState';
-import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { StrategicWorkbenchState } from '../strategicStateApi';
 import { SESSION_IDLE_TTL_MS } from './strategicContextDescriptor';
 import { parseTimestamp } from './time';
+
+/**
+ * Operator-facing strategic interaction mode. The vocabulary collapsed to
+ * Chat + Workday (`continuous`); retired values coerce to `chat`.
+ */
+export type StrategicInteractionMode = 'chat' | 'continuous';
 
 export const MAX_STRATEGIC_SELECTED_REFS = 12;
 export type StrategicSelectedRef = StrategicWorkbenchState['selected_refs'][number];
@@ -19,6 +24,7 @@ export function workbenchSurfaceForTab(tab: PrimaryTab): StrategicWorkbenchState
   if (tab === 'pipeline') return 'pipeline';
   if (tab === 'project') return 'project';
   if (tab === 'runtime') return 'runtime';
+  // 'fleet' has no strategic workbench surface
   return null;
 }
 

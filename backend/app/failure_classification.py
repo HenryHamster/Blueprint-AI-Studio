@@ -361,6 +361,22 @@ ADMIN_CANCEL = "ADMIN_CANCEL"
 CO_DEFERRED_SHELVED = "_co_deferred_shelved"
 
 
+# Task types that are deployment-health checks, not candidate-code-authoring.
+# When these tasks fail with a generic code-error label (claude_code_failed),
+# the cause is typically an infrastructure condition (stale engine, deployment
+# deadlock) rather than a code defect in the candidate — route to an INFRA
+# class so the CODE_ERROR count in pipeline health dashboards is not inflated.
+_DEPLOYMENT_CHECK_TASK_TYPES: frozenset[str] = frozenset({"smoketest"})
+
+
+def _is_deployment_check_task(task: "Task") -> bool:
+    """True when the task is a post-deployment health check (smoketest)."""
+    payload = getattr(task, "first_payload", None)
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("type") in _DEPLOYMENT_CHECK_TASK_TYPES
+
+
 def is_non_death_cancellation(task: "Task") -> bool:
     """True if ``task`` is a terminal-but-NOT-genuinely-dead cancellation.
 
@@ -701,6 +717,18 @@ def _is_repo_uninitialized(combined: str) -> bool:
     also matches the branch-gone patterns, and the more specific cause wins.
     """
     return any(kw in combined for kw in _REPO_UNINITIALIZED_PATTERNS)
+
+
+def is_repo_uninitialized(combined: str) -> bool:
+    """True when the failure text shows the remote repo has zero commits.
+
+    Public alias for :func:`_is_repo_uninitialized`.  Used by
+    ``agent_status.py`` to route the commitless-repo clone-failure signature to
+    the self-heal path.  Case-insensitive; safe on empty/None.
+    """
+    if not combined:
+        return False
+    return _is_repo_uninitialized(combined.lower())
 
 
 def _is_branch_gone(combined: str) -> bool:
@@ -1076,13 +1104,6 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # spawning agent and operator panels.
     "compute_unmeasured_criterion": CODE_ERROR,
     "compute_preflight_smoke_failed": CODE_ERROR,
-    # ``panel_review_lens_failed`` — the panel_review task posted a failure because
-    # a lens subprocess exited non-zero. Normally an infra-level failure (→
-    # PROVISION_FAILURE) but requires a dead-auth text check first: when a Codex
-    # lens dies with a consumed refresh token the dead-auth pattern appears in the
-    # logs (not in a structured error_report), so we must inspect the text before
-    # returning the mapped PROVISION_FAILURE class. See fast-path check below.
-    "panel_review_lens_failed": PROVISION_FAILURE,
 }
 
 
@@ -2064,28 +2085,11 @@ def normalize_agent_failure_category(
                 return override
             if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
                 return PROVISION_FAILURE
-        # panel_review_lens_failed maps to PROVISION_FAILURE in the category
-        # table, but the lens subprocess stderr (stored in latest_status_message
-        # via failPanelClosed) may contain dead-auth or rate-limit signals that
-        # must be detected HERE — before the category is persisted as
-        # failure_class — because agent_status.py persists failure_class at the
-        # write boundary and the later classify_failure call short-circuits on
-        # that persisted value, never reaching _classify_failure_class.
-        if label_lower == "panel_review_lens_failed":
-            _prlf_status = (task.latest_status_message or "").lower()
-            # Only scan for dead-auth when the status is short; long output
-            # means the lens authenticated and ran, so any dead-auth phrase
-            # would be from the reviewed diff content, not a real auth death.
-            if len(_prlf_status) < 4096:
-                for _dp in _task_dead_auth_patterns(task):
-                    if _dp and _dp in _prlf_status:
-                        _persist_dead_auth_context(task, _dp)
-                        return DEAD_AUTH
-            _prlf_text = _text_provider_failure_override(task, _prlf_status)
-            if _prlf_text:
-                return _prlf_text
-            if "overloaded" in _prlf_status:
-                return EXTERNAL_API
+            # Deployment check tasks (smoketest): a generic code error is an
+            # infrastructure condition (stale engine, deployment deadlock),
+            # not a code defect in the candidate.
+            if _is_deployment_check_task(task):
+                return PROVISION_FAILURE
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
         return label
@@ -2647,6 +2651,11 @@ def _classify_failure_class(
                     report_class = _agent_error_report_reclass(task)
                     if report_class:
                         return report_class
+                    # Deployment check tasks (smoketest): a generic code
+                    # error is an infrastructure condition (stale engine,
+                    # deployment deadlock), not a code defect in candidate.
+                    if _is_deployment_check_task(task):
+                        return PROVISION_FAILURE
                 combined = (
                     (task.latest_status_message or "").lower()
                     + " "
@@ -2660,36 +2669,6 @@ def _classify_failure_class(
                     return PROVISION_FAILURE
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
-            # panel_review_lens_failed: the task logs contain the raw lens
-            # subprocess stderr (via failPanelClosed's detail string). A dead
-            # OAuth session in a Codex lens runner appears there instead of in a
-            # structured error_report, so we must check text patterns here before
-            # returning the PROVISION_FAILURE fallback.
-            if agent_lower == "panel_review_lens_failed":
-                _prlf_status = (task.latest_status_message or "").lower()
-                # Guard: only scan for dead-auth when the status message is
-                # short.  The backend stores the last 8000 chars of the lens
-                # output in latest_status_message; a startup-auth-death
-                # produces a brief error block (< 4096 chars), while a lens
-                # that authenticated, ran, then failed for another reason
-                # produces kilobytes of model output filling the cap.
-                # Scanning that model output for dead-auth substrings risks a
-                # false positive if the reviewed diff mentions those literals.
-                if len(_prlf_status) < 4096:
-                    for _dp in _task_dead_auth_patterns(task):
-                        if _dp and _dp in _prlf_status:
-                            _persist_dead_auth_context(task, _dp)
-                            return DEAD_AUTH
-                # Check for provider rate-limit / overload signals before
-                # returning PROVISION_FAILURE.  A 429-throttled or 529-
-                # overloaded lens must classify as RATE_LIMIT / EXTERNAL_API
-                # (no-burn cooldown requeue) rather than PROVISION_FAILURE
-                # (which burns attempt_count — the anti-pattern at line 2276).
-                _prlf_text = _text_provider_failure_override(task, _prlf_status)
-                if _prlf_text:
-                    return _prlf_text
-                if "overloaded" in _prlf_status:
-                    return EXTERNAL_API
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
             return agent_category

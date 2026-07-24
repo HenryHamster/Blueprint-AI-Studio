@@ -1805,6 +1805,23 @@ async def _check_and_trigger_rollup(
             for _art in _pr_arts_result.scalars().all():
                 if _art.task_id not in _pr_art_by_task:
                     _pr_art_by_task[_art.task_id] = _art
+            # A completed plan with persisted subtasks but zero spawned children
+            # is a stranded post-commit parent, not a no-op completion.
+            _plan_ids = [
+                c.id
+                for c in unmerged
+                if (c.first_payload or {}).get("type") == "plan"
+                and isinstance(c.plan_output, dict)
+                and bool(c.plan_output.get("subtasks"))
+            ]
+            _spawned_child_count: dict = {}
+            if _plan_ids:
+                _child_counts_result = await session.execute(
+                    select(Task.parent_task_id, _func.count(Task.id))
+                    .where(Task.parent_task_id.in_(_plan_ids))
+                    .group_by(Task.parent_task_id)
+                )
+                _spawned_child_count = dict(_child_counts_result.all())
             # Batch-fetch all projects needed by unmerged children in one query.
             _unmerged_project_ids = {c.project_id for c in unmerged}
             _projects_result = await session.execute(
@@ -1818,6 +1835,18 @@ async def _check_and_trigger_rollup(
                 # Look up PR artifact to get pr_number and branch
                 pr_art = _pr_art_by_task.get(c.id)
                 if not pr_art or not pr_art.pr_url:
+                    if c.id in _plan_ids and not _spawned_child_count.get(c.id, 0):
+                        parent.latest_status_message = (
+                            "Recovering: completed plan has persisted subtasks "
+                            "but no spawned children"
+                        )
+                        session.add(parent)
+                        logger.warning(
+                            "[ROLLUP] Child %s is a childless plan with persisted "
+                            "subtasks - preserving it for post-commit recovery",
+                            str(c.id)[:8],
+                        )
+                        continue
                     # No PR artifact — _verify_pr_merged should have handled this.
                     # Force-set pr_merged so next cycle picks it up.
                     mark_unblocked_non_merge(c, reason="rollup_no_pr_artifact")

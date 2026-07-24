@@ -173,8 +173,8 @@ async def test_get_project_tasks_hides_backend_managed_but_keeps_payloadless(
     normal = Task(project_id=project.id, title="normal parent", payloads=[])
     shadow = Task(
         project_id=project.id,
-        title="Resident operator turn (shadow)",
-        payloads=[{"type": "strategic_resident_turn"}],
+        title="Archived research turn",
+        payloads=[{"type": "research"}],
         archived=True,
     )
     db_session.add(normal)
@@ -183,13 +183,12 @@ async def test_get_project_tasks_hides_backend_managed_but_keeps_payloadless(
 
     response = await client.get(f"/api/projects/{project.id}/tasks")
     assert response.status_code == 200
-    # BACKEND_MANAGED_TASK_TYPES is now empty (M4 flipped strategic_resident_turn
-    # to execution_owner=agent), so the default listing no longer hides the
-    # archived resident-turn shadow row — it matches the include_backend_managed
-    # view below. Compare as a set (PG created_at ties make ordering nondeterministic).
+    # BACKEND_MANAGED_TASK_TYPES is now empty, so the default listing does not hide
+    # any typed row — it matches the include_backend_managed view below. Compare as a
+    # set (PG created_at ties make ordering nondeterministic).
     assert {row["title"] for row in response.json()["tasks"]} == {
         "normal parent",
-        "Resident operator turn (shadow)",
+        "Archived research turn",
     }
 
     debug = await client.get(
@@ -197,7 +196,7 @@ async def test_get_project_tasks_hides_backend_managed_but_keeps_payloadless(
     )
     assert {row["title"] for row in debug.json()["tasks"]} == {
         "normal parent",
-        "Resident operator turn (shadow)",
+        "Archived research turn",
     }
 
 

@@ -104,6 +104,9 @@ export interface ProjectMessageReplyPreview {
 export type ProjectMessageContext = Record<string, unknown> & {
   event_type?: string;
   user_event_type?: string;
+  /** Server-stamped audience class from backend/app/message_audience.py. Authoritative
+   *  classifier: operator-action-needed | operator-fyi | strategist-internal | pipeline-log */
+  audience?: string;
   reply_to?: string;
   reply_preview?: string | ProjectMessageReplyPreview;
   answer?: string;
@@ -131,6 +134,7 @@ export interface ProjectMessage {
   status: MessageStatus;
   resolution: string | null;
   resolved_at: string | null;
+  delivered_at?: string | null;
   created_at: string | null;
   actor_user_id?: string | null;
   sequence?: number | null;

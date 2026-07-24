@@ -49,15 +49,8 @@ const execFileAsync = promisify(execFile);
 // the role-loop finally block in index.ts import this constant so the two
 // cleanup paths can never diverge.
 //
-// panel_review writes one scratch file per declared lens
-// (panelReviewLensOutputType in handlers/panel-review.ts → PANEL_REVIEW_LENSES);
-// keep those in sync with that lens set.
 export const TMP_OUTPUT_NAMES = [
   'review_verdict',
-  'panel_review_lens_correctness',
-  'panel_review_lens_security',
-  'panel_review_lens_code_quality',
-  'panel_review_lens_test_coverage',
   'plan_output',
   'research_findings',
   'security_findings',
@@ -74,6 +67,7 @@ export const TMP_OUTPUT_NAMES = [
   'release_audit_report',
   'release_audit_challenge',
   'release_merge_grade',
+  'walkthrough_e2e_result',
   'self_audit_findings',
   'self_review',
   'symbols',
@@ -242,10 +236,10 @@ export async function resetForNextRole(opts: ResetOptions): Promise<void> {
         console.error(`[reset] step 2 unlink ${p}: ${String(err)}`);
       }
     }
-    // review-fix.ts / panel-review.ts download implementer screenshots into
-    // per-task directories (directories, not flat files), so they cannot be
-    // handled by the unlink loop above. handleReview/panel_review use
-    // /tmp/viewport_review_<task>; handleFix uses /tmp/viewport_fix_<task>.
+    // review-fix.ts downloads implementer screenshots into per-task directories
+    // (directories, not flat files), so they cannot be handled by the unlink
+    // loop above. handleReview uses /tmp/viewport_review_<task>; handleFix
+    // uses /tmp/viewport_fix_<task>.
     for (const dir of [`/tmp/viewport_review_${priorTaskId}`, `/tmp/viewport_fix_${priorTaskId}`]) {
       try {
         await fs.promises.rm(dir, { recursive: true, force: true });

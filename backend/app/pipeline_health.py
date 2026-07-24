@@ -36,6 +36,11 @@ from app.models import (
     AlertSeverity,
     _utcnow,
 )
+from app.project_telemetry import (
+    get_project_telemetry as _get_project_telemetry,
+    read_telemetry_many,
+)
+from app.sr_analytics_store import read_project_sr_analytics
 from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
 from app.sr_blind_spots import has_reviewer_confirmed_categories, safe_check_results
@@ -74,7 +79,7 @@ async def _evaluate_sr_catch_rate_targets(
     targets: Dict[str, Any] = project.sr_catch_rate_targets or {}
     if not targets:
         return
-    doc = project.design_doc or {}
+    doc = await read_project_sr_analytics(session, project)
     sr_trends = doc.get("sr_catch_rate_trends") or {}
     if sr_trends.get("prompt_version_changed"):
         return
@@ -138,6 +143,7 @@ async def _evaluate_sr_catch_rate_targets(
                 severity=AlertSeverity.WARNING,
                 title=title,
                 message=message[:1000],
+                event_type="sr.catch_rate_below_target",
             )
         )
         await session.commit()
@@ -157,7 +163,7 @@ async def _evaluate_lone_checker_alert(
     project = await session.get(Project, project_id)
     if not project:
         return
-    doc = project.design_doc or {}
+    doc = await read_project_sr_analytics(session, project)
     categories = (doc.get("sr_catch_rate_trends") or {}).get("categories") or {}
     lone_cats = [
         cat
@@ -199,6 +205,7 @@ async def _evaluate_lone_checker_alert(
             severity=AlertSeverity.WARNING,
             title=_LONE_CHECKER_ALERT_TITLE,
             message=message[:1000],
+            event_type="sr.lone_checker",
         )
     )
     await session.commit()
@@ -990,27 +997,42 @@ async def compute_pipeline_health_summary(
         if recurrence:
             review_recurrence_by_category = recurrence
 
-    # SR catch-rate trends from compute_sr_catch_rate_trends stored in project.design_doc.
+    # SR analytics live in their dedicated row. Generic project telemetry is
+    # still used for direction-first-attempt feedback only.
+    _sr_data: Dict[str, Any] = {}
+    _tel_blobs: Dict[str, Any] = {}
+    if project:
+        _sr_data = await read_project_sr_analytics(session, project)
+        _tel_blobs = await read_telemetry_many(
+            session, project_id, ["direction_first_attempt_feedback"]
+        )
+    _design_doc: Dict[str, Any] = (project.design_doc or {}) if project else {}
+
+    def _generic_telemetry_blob(key: str) -> Any:
+        blob = _tel_blobs.get(key)
+        return blob if blob is not None else _design_doc.get(key)
+
+    # SR catch-rate trends from compute_sr_catch_rate_trends.
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     sr_false_attestation_trends: Optional[Dict[str, Any]] = None
-    if project and project.design_doc:
-        sr_trends = project.design_doc.get("sr_catch_rate_trends") or {}
+    if project:
+        sr_trends = _sr_data.get("sr_catch_rate_trends") or {}
         if sr_trends:
             self_review_prediction_accuracy_trends = _serialize_sr_catch_rate_trends(
                 sr_trends
             )
-        sr_rrts = project.design_doc.get("sr_regression_risk_test_signal_trends")
+        sr_rrts = _sr_data.get("sr_regression_risk_test_signal_trends")
         if sr_rrts:
             sr_regression_risk_test_signal_trends = sr_rrts
-        sft = project.design_doc.get("sr_false_attestation_trends")
+        sft = _sr_data.get("sr_false_attestation_trends")
         if sft:
             sr_false_attestation_trends = sft
 
-    # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend stored in project.design_doc.
+    # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend.
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
-    if project and project.design_doc:
-        fr_trends = project.design_doc.get("fresh_reviewer_trend") or {}
+    if project:
+        fr_trends = _sr_data.get("fresh_reviewer_trend") or {}
         if fr_trends:
             fresh_reviewer_trend = {
                 "computed_at": fr_trends.get("computed_at"),
@@ -1024,10 +1046,10 @@ async def compute_pipeline_health_summary(
                 "approval_rate_lift": fr_trends.get("approval_rate_lift") or {},
             }
 
-    # Edges-considered cycle-over-cycle trend from compute_edges_trend stored in project.design_doc.
+    # Edges-considered cycle-over-cycle trend from compute_edges_trend.
     edges_trend: Optional[Dict[str, Any]] = None
-    if project and project.design_doc:
-        et = project.design_doc.get("edges_trend") or {}
+    if project:
+        et = _sr_data.get("edges_trend") or {}
         if et:
             edges_trend = {
                 "computed_at": et.get("computed_at"),
@@ -1042,8 +1064,8 @@ async def compute_pipeline_health_summary(
             }
 
     direction_first_attempt_feedback: Optional[Dict[str, Any]] = None
-    if project and project.design_doc:
-        dfa = project.design_doc.get("direction_first_attempt_feedback")
+    if project:
+        dfa = _generic_telemetry_blob("direction_first_attempt_feedback")
         if dfa:
             direction_first_attempt_feedback = dfa
 
@@ -1058,11 +1080,21 @@ async def compute_pipeline_health_summary(
             count_low_success_retired_within,
         )
 
+        # Hydrate playbook_archive from telemetry — strip_migrated_doc_keys
+        # removes this key from design_doc at write time, so the count
+        # functions see the real archive data.
+        _hydrated_doc = dict(project.design_doc)
+        _archive = await _get_project_telemetry(
+            session, project.id, "playbook_archive",
+        )
+        if _archive is not None:
+            _hydrated_doc["playbook_archive"] = list(_archive)
+
         auto_playbook_idle_retired_24h = count_idle_auto_retired_within(
-            project.design_doc, hours=24
+            _hydrated_doc, hours=24
         )
         auto_playbook_low_success_retired_24h = count_low_success_retired_within(
-            project.design_doc, hours=24
+            _hydrated_doc, hours=24
         )
 
     # Self-review prediction accuracy: compare self-review check_results

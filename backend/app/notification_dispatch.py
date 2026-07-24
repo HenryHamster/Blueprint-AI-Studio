@@ -102,6 +102,9 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "question_answer",  # post_question_answer
         "capability_proof_gate_graduated_observe",  # post_capability_proof_gate_graduated_message
         "capability_proof_gate_graduated_enforce",  # post_capability_proof_gate_graduated_message
+        "mode_knob_graduated_observe",  # post_mode_knob_graduated_message
+        "mode_knob_graduated_enforce",  # post_mode_knob_graduated_message
+        "mode_knob_cut_recommended",  # post_mode_knob_cut_recommendation_message
     }
 )
 
@@ -194,13 +197,39 @@ async def _write_dead_letter(
                 )
             )
             await session.commit()
-    except Exception as exc:  # noqa: BLE001 — durability write must not raise
-        logger.warning(
-            "[NOTIFY] Failed to persist dead-letter for %s (%s): %s",
+    except Exception as exc:
+        logger.exception(
+            "[NOTIFY] Dead-letter write FAILED for %s/%s (%s) — notification unrecoverable",
+            entry.project_id,
             entry.event_type,
             reason,
-            exc,
         )
+        # Best-effort: surface the double-failure (delivery failed + dead-letter
+        # write failed) as an operator-visible Alert so it is not silently lost.
+        try:
+            from app.database import closing_session as _cs
+            from app.models import Alert as _Alert, AlertSeverity as _Sev
+            async with _cs() as _alert_session:
+                _alert_session.add(
+                    _Alert(
+                        project_id=str(entry.project_id),
+                        severity=_Sev.WARNING,
+                        title="Notification delivery permanently lost",
+                        message=(
+                            f"A {entry.event_type!r} notification exhausted retries "
+                            f"({reason}) but the dead-letter record could not be "
+                            f"persisted: {exc}. The notification is unrecoverable."
+                        )[:1000],
+                        event_type="notification.dead_letter_lost",
+                    )
+                )
+                await _alert_session.commit()
+        except Exception:
+            logger.exception(
+                "[NOTIFY] Could not surface dead-letter loss as alert for %s/%s",
+                entry.project_id,
+                entry.event_type,
+            )
 
 
 async def _enqueue_retry_durable(entry: _RetryEntry) -> None:
@@ -504,7 +533,7 @@ async def notification_retry_drain_service() -> None:
                 await _drain_retry_queue()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — background loop must survive transient failures
+        except Exception as exc:
             logger.warning("[NOTIFY] Retry drain loop error: %s", exc)
 
 
@@ -725,13 +754,13 @@ async def post_event_message(
             event_type,
         )
         return None
-    ctx: dict[str, Any] = {"event_type": event_type}
-    if context:
-        ctx.update(context)
-    # Stamp the resolved audience so operator-facing surfaces can exclude
-    # non-operator (strategist-internal) rows. Canonical value wins over any
-    # audience the caller may have placed in ``context``.
-    ctx["audience"] = audience
+    # Stamp the resolved audience via the shared helper so the message carries
+    # a fail-closed audience classification consistent with every other
+    # operator-reaching emitter. ``stamp_message_audience`` sets event_type
+    # (preserving any existing value via setdefault) and always overwrites
+    # audience with the canonical registry resolution — a caller-supplied
+    # audience in ``context`` never wins over the registry.
+    ctx = stamp_message_audience(context, event_type, message_type=MessageType.NOTE.value)
     msg = await build_project_message(
         session,
         project_id=project_id,
@@ -892,6 +921,99 @@ async def post_capability_proof_gate_graduated_message(
     )
 
 
+async def post_mode_knob_graduated_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    config_key: str,
+    from_mode: str,
+    to_mode: str,
+    signal: float,
+    threshold: float,
+    measurements: dict[str, Any],
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL system NOTE when a dormant mode-knob auto-graduates.
+
+    The generalization of :func:`post_capability_proof_gate_graduated_message` to
+    every knob driven by the shared mode-knob graduation harness
+    (:mod:`app.mode_knob_graduation`). The knob advances ``off → observe → enforce``
+    autonomously once its measured counterfactual signal crosses the configured
+    threshold. The event type (and hence audience) is split by target mode:
+
+    * ``→ observe`` → ``mode_knob_graduated_observe`` (``operator-fyi``): the knob
+      now records its would-be decisions but does not enforce them.
+    * ``→ enforce`` → ``mode_knob_graduated_enforce`` (``operator-action-needed``):
+      the knob's real blocking branch is now live.
+    """
+    to_mode_norm = (to_mode or "").strip().lower()
+    if to_mode_norm == "enforce":
+        event_type = "mode_knob_graduated_enforce"
+        impact = "the knob's enforce branch is now live and can block"
+    else:
+        event_type = "mode_knob_graduated_observe"
+        impact = "the knob now records its would-be decisions (no blocking yet)"
+
+    summary = (
+        f"Mode-knob {config_key} auto-graduated {from_mode} → {to_mode_norm} "
+        f"(measured signal={signal:.3f} ≥ threshold={threshold:.3f}) — {impact}."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type=event_type,
+        summary=summary,
+        context={
+            "config_key": config_key,
+            "from_mode": from_mode,
+            "to_mode": to_mode_norm,
+            "signal": round(float(signal), 4),
+            "threshold": round(float(threshold), 4),
+            "measurements": measurements,
+        },
+        task_id=task_id,
+    )
+
+
+async def post_mode_knob_cut_recommendation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    config_key: str,
+    signal: float,
+    measurements: dict[str, Any],
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL system NOTE recommending a dormant mode-knob be CUT.
+
+    Fired by the shared mode-knob graduation harness when a knob's measured
+    counterfactual shows its enforce branch would never bind (no lift) over a
+    representative window — the default-off PRINCIPLE's "cut, with numbers"
+    disposition. Carries the measured signal so the operator can act (remove the
+    knob) rather than let it age as completion debt indefinitely. FYI-class: it
+    changes nothing on its own.
+    """
+    would_have_blocked = measurements.get("would_have_blocked")
+    summary = (
+        f"Mode-knob {config_key} shows NO measured lift "
+        f"(signal={signal:.3f}, would-have-blocked={would_have_blocked}) — "
+        "recommend CUT: the enforce branch would never bind. Remove the knob "
+        "rather than carry it as dormant completion debt."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="mode_knob_cut_recommended",
+        summary=summary,
+        context={
+            "config_key": config_key,
+            "signal": round(float(signal), 4),
+            "measurements": measurements,
+        },
+        task_id=task_id,
+    )
+
+
 async def post_strategic_steering_deferred_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -977,7 +1099,7 @@ async def post_operator_decision_capture_low_message(
 ) -> Optional[ProjectMessage]:
     """Strategist-internal notice that operator-decision capture is chronically low.
 
-    Fired by the resident-session heartbeat when a session accumulates enough
+    Fired by the strategic-session heartbeat when a session accumulates enough
     operator turns and its capture rate stays below the low-rate floor — a signal
     that the OPERATOR-DECISION marker is being systematically forgotten and that
     operator corrections may not be reaching the durable decisions register. The
@@ -1004,6 +1126,41 @@ async def post_operator_decision_capture_low_message(
             "captured": captured,
             "missed": missed,
             "capture_rate": capture_rate,
+        },
+        task_id=task_id,
+    )
+
+
+async def post_operator_decision_summary_absent_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    last_summary_at: str,
+    session_id: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Strategist-internal notice that operator_decision_summary stopped arriving.
+
+    Fired by the strategic-session heartbeat when heartbeats keep arriving but the
+    operator_decision_summary telemetry blob has stopped refreshing for longer than
+    the staleness window, despite the session having enough historical data to judge
+    it. Routes strategist-internal so the strategist can investigate without
+    creating operator-visible noise. The caller de-dupes so it fires at most once
+    per absent crossing; recovery (agent resumes sending) clears the dedup flag.
+    """
+    summary = (
+        f"operator_decision_summary absent this session: heartbeats are arriving "
+        f"but the telemetry blob stopped refreshing (last received: {last_summary_at}). "
+        f"Check the agent's decision-capture bookkeeping path."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="operator_decision.summary_absent",
+        summary=summary,
+        context={
+            "session_id": session_id,
+            "last_summary_at": last_summary_at,
         },
         task_id=task_id,
     )
@@ -1340,6 +1497,8 @@ async def post_auto_fix_result_message(
 
             # Mutable cell to capture side-effects from inside the lock closure.
             _escalation: dict = {}
+            # Captures the final config for the project_telemetry dual-write.
+            _persisted: dict = {}
 
             def _mutate(doc: dict) -> None:
                 ar_config = dict(doc.get("_auto_remediation", {}))
@@ -1386,6 +1545,7 @@ async def post_auto_fix_result_message(
                 ar_config["suspended_branches"] = suspended
                 ar_config["suspension_metadata"] = suspension_meta
                 doc["_auto_remediation"] = ar_config
+                _persisted["config"] = ar_config
 
             # expire_on_commit=False means an already-identity-mapped Project
             # carries a stale design_doc; expire it so the lock's SELECT FOR
@@ -1395,6 +1555,17 @@ async def post_auto_fix_result_message(
             if _proj is not None:
                 session.expire(_proj, ["design_doc"])
             await with_design_doc_locked(session, project_id, _mutate)
+
+            if _persisted.get("config") is not None:
+                # Dual-write to project_telemetry (design_doc copy kept for
+                # rollback compatibility with older serving engines).
+                from app.project_telemetry import (
+                    set_project_telemetry,
+                )
+
+                await set_project_telemetry(
+                    session, project_id, "_auto_remediation", _persisted["config"]
+                )
 
             if _escalation:
                 count = _escalation["count"]
@@ -2458,6 +2629,7 @@ async def post_feedback_acknowledgment(
     task_id: Optional[uuid.UUID] = None,
     *,
     from_type: str = "strategic",
+    resident_session_id: Optional[str] = None,
     actor_user_id: Optional[str] = None,
     event_type: str = "feedback_acknowledgment",
     content_override: str | None = None,
@@ -2512,10 +2684,6 @@ async def post_question_answer(
     a first-class strategist response; pass from_type="user" for operator replies.
     The event_type "question_answer" is a cross-component contract consumed
     by the frontend threading logic — use it verbatim.
-
-    ``resident_session_id`` stamps the reply with the resident session it belongs
-    to (NULL/None when none is active), matching the session-identity scoping on
-    the operator-send surface so the reply is addressed to the same conversation.
     """
     # Route the context through the shared audience gate so the reply carries a
     # fail-closed audience classification instead of an unstamped context dict.

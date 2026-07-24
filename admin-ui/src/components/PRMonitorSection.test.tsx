@@ -400,52 +400,6 @@ describe('PRMonitorSection', () => {
     expect(container.querySelector('span.font-mono')?.textContent).toBe('1');
   });
 
-  it('renders a Panel review button on every PR row when onPanelReviewPr is provided', () => {
-    const orphan = makeOpenPR({ pr_number: 20, is_orphaned: true, tasks: [] });
-    const linked = makeOpenPR({
-      pr_number: 21,
-      is_orphaned: false,
-      tasks: [makeOpenPRTask({ task_id: 'task-y' })],
-    });
-    render(
-      <PRMonitorSection
-        {...baseProps}
-        openPRs={[orphan, linked]}
-        onPanelReviewPr={vi.fn()}
-      />,
-    );
-    // Both the orphaned and linked rows get a Panel review button.
-    expect(screen.getAllByTitle('Panel review')).toHaveLength(2);
-  });
-
-  it('hides the Panel review button when onPanelReviewPr is omitted', () => {
-    const pr = makeOpenPR({ pr_number: 22, tasks: [makeOpenPRTask()] });
-    render(<PRMonitorSection {...baseProps} openPRs={[pr]} />);
-    expect(screen.queryByTitle('Panel review')).toBeNull();
-  });
-
-  it('clicking Panel review invokes onPanelReviewPr with the full PR object', async () => {
-    const user = userEvent.setup();
-    const pr = makeOpenPR({
-      pr_number: 55,
-      pr_branch: 'feature/panel',
-      pr_base_branch: 'automain',
-      is_orphaned: false,
-      tasks: [makeOpenPRTask({ task_id: 'task-z' })],
-    });
-    const onPanelReviewPr = vi.fn();
-    render(
-      <PRMonitorSection
-        {...baseProps}
-        openPRs={[pr]}
-        onPanelReviewPr={onPanelReviewPr}
-      />,
-    );
-    await user.click(screen.getByTitle('Panel review'));
-    expect(onPanelReviewPr).toHaveBeenCalledTimes(1);
-    expect(onPanelReviewPr).toHaveBeenCalledWith(pr);
-  });
-
   it('does not render an anchor for an unsafe javascript: pr_url', () => {
     const pr = makeOpenPR({ pr_url: 'javascript:alert(1)' });
     const { container } = render(

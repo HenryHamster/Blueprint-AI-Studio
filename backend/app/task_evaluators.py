@@ -91,25 +91,6 @@ ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES = frozenset(
     }
 )
 
-# Context key written on a spawned safeguard-challenge task, pointing at the
-# safeguard audit task whose merge-gate decision it challenges.
-# ``task_lifecycle._process_post_commit`` watches for this key to route the
-# challenge's completion back to the parked safeguard task.
-SAFEGUARD_CHALLENGE_SOURCE_KEY = "safeguard_challenge_for_task_id"
-
-# Context key written on the SAFEGUARD task once its challenge returns.  The
-# value is a dict with keys ``outcome`` ("confirmed" | "rejected" | "downgraded")
-# and ``reasoning``.  ``_maybe_release_safeguard_gate`` reads it on re-entry to
-# decide whether the merge gate is released or held.
-SAFEGUARD_CHALLENGE_VERDICT_KEY = "safeguard_challenge_verdict"
-
-# Context key written on the SAFEGUARD task when it operates in observe/shadow
-# mode. The value mirrors SAFEGUARD_CHALLENGE_VERDICT_KEY (same dict shape) but
-# the gate is NEVER released based on this key — it is a bounded, auditable
-# record of what the challenge WOULD have decided. Consumed by digest_metrics
-# to compute the false-positive-block rate without changing merge behavior.
-SAFEGUARD_OBSERVE_VERDICT_KEY = "safeguard_observe_verdict"
-
 
 # ---------------------------------------------------------------------------
 # Per-finding second-opinion CHALLENGE seam.
@@ -170,23 +151,6 @@ CHALLENGE_INDETERMINATE = "indeterminate"
 # key) pre-date versioning and should be treated as version 0 by consumers.
 FINDING_CHALLENGE_RECORD_SCHEMA_VERSION = 1
 
-# ── Review second-opinion gate (default-on adversarial challenge) ──────────
-# Context key written on the spawned panel_review CHALLENGER task, pointing at
-# the ordinary ``review`` task whose verdict it challenges. ``_process_post_commit``
-# watches for this key to route the challenger's completion back to the parked
-# review task (re-entrant resolution, exactly like the forward-quality grader).
-REVIEW_SECOND_OPINION_SOURCE_KEY = "review_second_opinion_for_task_id"
-
-# Context key set on the parked REVIEW task while a challenge is in flight.
-# Presence (single-shot guard) means a challenger has already been spawned and
-# the primary verdict must not act until the challenge resolves.
-REVIEW_SECOND_OPINION_AWAITING_KEY = "awaiting_review_second_opinion"
-
-# Context key on the parked REVIEW task holding the primary verdict + issue set
-# captured at park time, so the re-entrant resolution can reconcile against it
-# without re-parsing the original agent output.
-REVIEW_SECOND_OPINION_PARKED_KEY = "review_second_opinion_parked"
-
 
 def review_is_high_stakes(
     verdict: str,
@@ -216,7 +180,7 @@ def review_is_high_stakes(
 
     Trivially small diffs (non-test lines < ``review_second_opinion_min_lines``
     AND non-test file count <= ``review_second_opinion_min_files``) are also
-    exempted — a one-line typo fix does not need a full extra panel_review run.
+    exempted — a one-line typo fix does not need a full extra second-opinion run.
     Pass ``diff_non_test_lines`` and ``diff_non_test_file_count`` from the
     source task's ``_pr_diff_summary`` / ``_pr_changed_files`` context; when
     absent the size exemption is skipped (fail-open toward challenging).
@@ -252,145 +216,6 @@ def review_is_high_stakes(
             return False
 
     return True
-
-
-async def spawn_review_second_opinion(
-    review_task: Task,
-    session: AsyncSession,
-    *,
-    verdict: str,
-    issues: list | None,
-    feedback: str,
-    pr_number,
-    branch: str,
-    base_branch: str,
-    original_task_id: str,
-    original_prompt: str,
-    investigated_files: list | None,
-) -> Task | None:
-    """Spawn an independent ``panel_review`` challenger and park the review task.
-
-    Mirrors :func:`spawn_forward_quality_grader`: parks ``review_task`` in
-    EVALUATING with a single-shot guard, captures the primary verdict + issue
-    set under ``REVIEW_SECOND_OPINION_PARKED_KEY``, and spawns a side-car
-    ``panel_review`` task (NOT a rollup child) carrying a back-reference under
-    ``REVIEW_SECOND_OPINION_SOURCE_KEY``. The challenger's completion returns
-    through the re-entrant path (``_resolve_review_second_opinion``).
-
-    Returns the challenger ``Task``, or ``None`` when a challenge is already in
-    flight or has already resolved (single-shot — never double-spawn, and the
-    challenger itself never re-triggers the gate because its completion routes
-    to the resolver, not the review-finalization branch).
-    """
-    # Lazy import to avoid a module-level cycle with task_completion.
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    ctx = dict(review_task.context or {})
-    _recon = ctx.get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
-    # A reconciliation record only suppresses the gate when THIS review task
-    # owns it. A record carrying another task's id leaked in via a context copy
-    # (requeue clone, pipeline propagation) — honoring it would silently skip
-    # the challenge for a high-stakes verdict. Non-dict records are malformed;
-    # refuse spawning on them (fail toward single-shot, matching pre-ownership
-    # behavior).
-    _own_record = _recon is not None and (
-        not isinstance(_recon, dict)
-        or _recon.get("review_task_id") == str(review_task.id)
-    )
-    if ctx.get(REVIEW_SECOND_OPINION_AWAITING_KEY) or _own_record:
-        # Challenge already in flight or already reconciled — never double-spawn.
-        return None
-
-    _review_payload = review_task.first_payload
-    _viewport_shots = _review_payload.get("viewport_shot_entries")
-    _viewport_source = _review_payload.get("viewport_source_task_id")
-
-    challenger = Task(
-        project_id=review_task.project_id,
-        title=f"[CHALLENGE] second-opinion panel review for PR #{pr_number}",
-        description=(
-            "Independent multi-lens panel review challenging a primary "
-            "code-review verdict before it commits to merge or fix."
-        ),
-        # Side-car, not a rollup child (mirrors the grader): the back-reference
-        # lives in context, so the challenger never entangles the review task's
-        # parent-rollup accounting.
-        parent_task_id=None,
-        payloads=[
-            {
-                "type": "panel_review",
-                "pr_number": pr_number,
-                "branch": branch,
-                "base_branch": base_branch,
-                "original_prompt": original_prompt,
-                "is_challenge": True,
-                "primary_verdict": verdict,
-                "primary_issues": list(issues or []),
-                **(
-                    {
-                        "viewport_shot_entries": _viewport_shots,
-                        "viewport_source_task_id": _viewport_source,
-                    }
-                    if _viewport_shots
-                    else {}
-                ),
-            }
-        ],
-        context={
-            REVIEW_SECOND_OPINION_SOURCE_KEY: str(review_task.id),
-            "pr_number": pr_number,
-            "branch": branch,
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        priority=review_task.priority,
-    )
-    session.add(challenger)
-
-    # Park the review task awaiting the challenge verdict. Overrides the
-    # COMPLETED status the orchestrator set pre-handler — the verdict is NOT
-    # final until reconciled.
-    review_task.status = TaskStatus.EVALUATING
-    review_task.latest_status_message = (
-        f"Awaiting independent second-opinion panel review before committing "
-        f"{verdict} verdict on PR #{pr_number}"
-    )[:500]
-    ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = True
-    ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
-        "verdict": verdict,
-        "issues": list(issues or []),
-        "feedback": (feedback or "")[:5000],
-        "pr_number": pr_number,
-        "branch": branch,
-        "base_branch": base_branch,
-        "original_task_id": original_task_id,
-        "original_prompt": original_prompt,
-        "investigated_files": list(investigated_files or []),
-    }
-    review_task.context = ctx
-    flag_modified(review_task, "context")
-    session.add(review_task)
-    await session.commit()
-    await session.refresh(challenger)
-
-    # Record the concrete challenger id for observability.
-    ctx2 = dict(review_task.context or {})
-    ctx2[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(challenger.id)
-    review_task.context = ctx2
-    flag_modified(review_task, "context")
-    session.add(review_task)
-    await session.commit()
-
-    logger.info(
-        "[REVIEW SECOND-OPINION] Spawned challenger %s for review task %s "
-        "(PR #%s, primary verdict %s); review parked EVALUATING",
-        challenger.id,
-        review_task.id,
-        pr_number,
-        verdict,
-    )
-    return challenger
 
 
 @dataclass(frozen=True)
@@ -668,16 +493,6 @@ class StructuredVerdictStrategy:
             return EvaluationVerdict(
                 False,
                 "empty terminal artifact — no structured verdict produced",
-                self.key,
-            )
-
-        from app.task_completion import _parse_panel_review_output
-
-        parsed = _parse_panel_review_output(artifact_text)
-        if parsed is None:
-            return EvaluationVerdict(
-                False,
-                "structured verdict output is unparseable or missing required fields",
                 self.key,
             )
         return EvaluationVerdict(
@@ -1633,103 +1448,7 @@ async def spawn_forward_quality_grader(
     return grader
 
 
-async def spawn_safeguard_challenge(
-    safeguard_task: Task,
-    findings_text: str,
-    session: AsyncSession,
-) -> Task | None:
-    """Spawn an independent challenge task for a safeguard security-audit finding.
-
-    Returns the spawned challenge ``Task``, or ``None`` when a challenge is
-    already in flight or already resolved (single-shot guard).
-
-    The safeguard task is moved to EVALUATING and will NOT finalize the
-    merge-gate decision until the challenger's verdict returns via
-    ``task_lifecycle._resolve_safeguard_challenge_completion``.
-    """
-    ctx = dict(safeguard_task.context or {})
-    if ctx.get(SAFEGUARD_CHALLENGE_VERDICT_KEY) is not None or ctx.get(
-        "awaiting_safeguard_challenge"
-    ):
-        return None
-
-    base_branch = (safeguard_task.first_payload or {}).get("base_branch", "main")
-    prompt = (
-        "You are an independent security reviewer. A security audit has flagged "
-        "the following finding(s) as critical or high severity, and the project's "
-        "merge gate is held pending your independent assessment.\n\n"
-        "Your task: read each finding carefully and determine whether it "
-        "constitutes a genuine critical or high severity vulnerability in the "
-        "codebase, or whether it is a false positive / over-stated severity.\n\n"
-        "-----8<----- FINDING(S) START -----8<-----\n"
-        f"{findings_text[:20000]}\n"
-        "-----8<----- FINDING(S) END -----8<-----\n\n"
-        "End your response with EXACTLY ONE JSON object on its own line, and "
-        "nothing after it:\n"
-        '{"outcome": "confirmed" | "rejected" | "downgraded", '
-        '"reasoning": "<one-sentence justification>"}\n'
-        "Where:\n"
-        "  confirmed  — the finding is a genuine critical/high severity issue\n"
-        "  rejected   — the finding is a false positive\n"
-        "  downgraded — the finding is real but severity is below critical/high\n"
-    )
-
-    challenge = Task(
-        project_id=safeguard_task.project_id,
-        title=(f"[CHALLENGE] safeguard gate for {str(safeguard_task.id)[:8]}"),
-        description=(
-            "Independent challenge of a safeguard security-audit finding before "
-            "the merge gate is maintained."
-        ),
-        parent_task_id=None,
-        payloads=[
-            {
-                "type": "investigate",
-                "prompt": prompt,
-                "base_branch": base_branch,
-                "scope": "small",
-                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
-                # not the final merge gate. Accepted finding; pinned by
-                # test_spawn_safeguard_challenge_sets_sonnet_quality_tier.
-                "quality_tier": "sonnet",
-            }
-        ],
-        context={
-            SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard_task.id),
-            "scope": "small",
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        priority=safeguard_task.priority,
-    )
-    session.add(challenge)
-
-    safeguard_task.status = TaskStatus.EVALUATING
-    safeguard_task.latest_status_message = (
-        "Awaiting independent challenge verdict before finalizing merge gate decision"
-    )[:500]
-    ctx["awaiting_safeguard_challenge"] = True
-    safeguard_task.context = ctx
-    flag_modified(safeguard_task, "context")
-    session.add(safeguard_task)
-    await session.commit()
-    await session.refresh(challenge)
-
-    ctx2 = dict(safeguard_task.context or {})
-    ctx2["awaiting_safeguard_challenge"] = str(challenge.id)
-    safeguard_task.context = ctx2
-    flag_modified(safeguard_task, "context")
-    session.add(safeguard_task)
-    await session.commit()
-
-    logger.info(
-        "[SAFEGUARD] Spawned challenge %s for safeguard %s; gate decision "
-        "parked EVALUATING awaiting verdict",
-        challenge.id,
-        safeguard_task.id,
-    )
-    return challenge
+# (safeguard_challenge lane removed — observe-only, no measured lift)
 
 
 def parse_grader_verdict(logs: str | None, completed: bool = True) -> EvaluationVerdict:
@@ -1783,42 +1502,6 @@ def parse_grader_verdict(logs: str | None, completed: bool = True) -> Evaluation
     return EvaluationVerdict(
         False, "grader verdict unparseable; failing closed", "forward-quality"
     )
-
-
-def parse_safeguard_challenge_outcome(logs: str | None, completed: bool = True) -> dict:
-    """Parse an independent safeguard-challenge outcome from its output.
-
-    Returns a dict with keys ``outcome`` and ``reasoning``.  FAIL-CLOSED on
-    every ambiguous case: a challenger that did not complete, emitted nothing,
-    or produced unparseable output yields ``outcome="confirmed"`` so the gate
-    is maintained rather than accidentally released on a bad response.
-    """
-    _fail_closed = {
-        "outcome": "confirmed",
-        "reasoning": "challenge did not resolve; gate maintained",
-    }
-
-    if not completed:
-        return _fail_closed
-
-    text = (logs or "").strip()
-    if not text:
-        return _fail_closed
-
-    obj = scan_balanced_json_objects(text, required_key="outcome")
-    if obj is not None:
-        outcome = str(obj.get("outcome", "")).strip().lower()
-        reasoning = str(obj.get("reasoning") or "")[:480]
-        if outcome in ("confirmed", "rejected", "downgraded"):
-            return {"outcome": outcome, "reasoning": reasoning}
-
-    # Fallback: anchored keyword scan.
-    low = text.lower()
-    for keyword in ("rejected", "downgraded", "confirmed"):
-        if f'"outcome": "{keyword}"' in low or f'"outcome":"{keyword}"' in low:
-            return {"outcome": keyword, "reasoning": "outcome keyword found (anchored)"}
-
-    return _fail_closed
 
 
 # ---------------------------------------------------------------------------
@@ -2163,133 +1846,3 @@ def parse_finding_challenge_verdict(
         finding_hash=finding_hash,
     )
 
-
-# ── Blind multi-reviewer redundancy ────────────────────────────────────────
-
-# Context key optionally set on a spawned blind multi-reviewer task, pointing at
-# the source task whose assessment is being independently re-evaluated.
-BLIND_REVIEW_SOURCE_KEY = "blind_review_for_task_id"
-
-
-async def spawn_blind_multi_reviewer(
-    source_task: Task,
-    session: AsyncSession,
-    *,
-    verdict: str,
-    issues: list | None,
-    feedback: str,
-    pr_number,
-    branch: str,
-    base_branch: str,
-    original_task_id: str,
-    original_prompt: str,
-    investigated_files: list | None,
-    reviewer_count: int = 3,
-) -> Task | None:
-    """Spawn a blind multi-reviewer ``panel_review`` task and park the source.
-
-    N=``reviewer_count`` redundant independent reviewers evaluate the same PR
-    blind to each other and to any self-assessment, with the aggregated gate
-    outcome determined by majority vote (2/3 threshold) inside the handler.
-
-    Reuses the ``REVIEW_SECOND_OPINION_SOURCE_KEY`` lifecycle so the blind
-    review's completion routes through the existing second-opinion
-    reconciliation path (``_resolve_review_second_opinion``). The source task
-    is parked EVALUATING until the blind review resolves.
-
-    Returns the spawned ``Task``, or ``None`` when a review is already in
-    flight or already resolved (single-shot guard).
-    """
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    ctx = dict(source_task.context or {})
-    _recon = ctx.get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
-    _own_record = _recon is not None and (
-        not isinstance(_recon, dict)
-        or _recon.get("review_task_id") == str(source_task.id)
-    )
-    if ctx.get(REVIEW_SECOND_OPINION_AWAITING_KEY) or _own_record:
-        return None
-
-    _viewport_shots = source_task.first_payload.get("viewport_shot_entries")
-    _viewport_source = source_task.first_payload.get("viewport_source_task_id")
-
-    reviewer = Task(
-        project_id=source_task.project_id,
-        title=f"[BLIND REVIEW] multi-reviewer redundancy for PR #{pr_number}",
-        description=(
-            "N redundant independent blind reviewers evaluate the same PR "
-            "without seeing each other's findings or the source assessment. "
-            "Majority vote (2/3 threshold) determines the gate outcome."
-        ),
-        parent_task_id=None,
-        payloads=[
-            {
-                "type": "panel_review",
-                "pr_number": pr_number,
-                "branch": branch,
-                "base_branch": base_branch,
-                "original_prompt": original_prompt,
-                "is_blind": True,
-                "blind_reviewer_count": reviewer_count,
-                **(
-                    {"viewport_shot_entries": _viewport_shots, "viewport_source_task_id": _viewport_source}
-                    if _viewport_shots
-                    else {}
-                ),
-            }
-        ],
-        context={
-            REVIEW_SECOND_OPINION_SOURCE_KEY: str(source_task.id),
-            BLIND_REVIEW_SOURCE_KEY: str(source_task.id),
-            "pr_number": pr_number,
-            "branch": branch,
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        priority=source_task.priority,
-    )
-    session.add(reviewer)
-
-    # Park the source task EVALUATING until the blind review resolves.
-    source_task.status = TaskStatus.EVALUATING
-    source_task.latest_status_message = (
-        f"Awaiting independent blind multi-reviewer verdict on PR #{pr_number} "
-        f"(N={reviewer_count} reviewers, 2/3 majority threshold)"
-    )[:500]
-    ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = True
-    ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
-        "verdict": verdict,
-        "issues": list(issues or []),
-        "feedback": (feedback or "")[:5000],
-        "pr_number": pr_number,
-        "branch": branch,
-        "base_branch": base_branch,
-        "original_task_id": original_task_id,
-        "original_prompt": original_prompt,
-        "investigated_files": list(investigated_files or []),
-    }
-    source_task.context = ctx
-    flag_modified(source_task, "context")
-    session.add(source_task)
-    await session.commit()
-    await session.refresh(reviewer)
-
-    ctx2 = dict(source_task.context or {})
-    ctx2[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(reviewer.id)
-    source_task.context = ctx2
-    flag_modified(source_task, "context")
-    session.add(source_task)
-    await session.commit()
-
-    logger.info(
-        "[BLIND REVIEW] Spawned multi-reviewer %s for task %s "
-        "(PR #%s, N=%d, primary verdict %s); source parked EVALUATING",
-        reviewer.id,
-        source_task.id,
-        pr_number,
-        reviewer_count,
-        verdict,
-    )
-    return reviewer

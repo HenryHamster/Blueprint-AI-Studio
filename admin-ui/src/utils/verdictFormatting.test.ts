@@ -5,14 +5,14 @@ import {
 } from './verdictFormatting';
 
 describe('formatVerdict', () => {
-  it('maps panel_review approve to a positive (success) badge with a human label', () => {
+  it('maps approve verdict to a positive (success) badge with a human label', () => {
     const { label, tone } = formatVerdict('approve');
     expect(label).toBe('Approve');
     expect(tone).toBe('positive');
     expect(verdictToneBadgeClass(tone)).toContain('status-success');
   });
 
-  it('maps panel_review request_changes to a blocking badge with a human label', () => {
+  it('maps request_changes verdict to a blocking badge with a human label', () => {
     const { label, tone } = formatVerdict('request_changes');
     expect(label).toBe('Request Changes');
     expect(tone).toBe('blocking');

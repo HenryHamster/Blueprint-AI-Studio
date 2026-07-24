@@ -776,6 +776,7 @@ describe('StrategicContextRail', () => {
       ...STATE,
       work_session: {
         ...workSession,
+        actions: [],
         events: {
           version: 1,
           limit: 24,
@@ -2277,7 +2278,7 @@ describe('StrategicContextRail', () => {
 
     const working = host.querySelector('[data-testid="rail-mini-canvas-working"]');
     expect(working).toBeTruthy();
-    expect(working?.textContent).toContain('Working…');
+    expect(working?.textContent).toContain('working…');
   });
 
   test('renders mini-canvas idle placeholder when canvas is absent and strategist is inactive', () => {

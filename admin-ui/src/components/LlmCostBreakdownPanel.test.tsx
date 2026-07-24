@@ -24,6 +24,7 @@ function makeResponse(overrides: Partial<LlmCostBreakdownResponse> = {}): LlmCos
         total_output_tokens: 10_000,
         total_cost_usd: 2.5,
         mean_cost_per_task: 0.5,
+        llm_call_count: 15,
         task_count: 5,
         merged_count: 3,
         merge_rate: 0.6,

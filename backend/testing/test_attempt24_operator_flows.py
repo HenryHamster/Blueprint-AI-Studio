@@ -213,46 +213,6 @@ class TestAttempt24SecondaryRunnerAndMultifileToolFlow:
         )
         assert denied.status_code == 404, denied.text
 
-    async def test_secondary_bound_runner_override_resolution(
-        self, db_session: AsyncSession
-    ):
-        """``_resolve_override_runner`` resolves a runner on a secondary project's allow-list.
-
-        Before the fix this required ``runner.project_id == project_id``, so
-        a runner bound via ``RunnerProjectBinding`` could not be selected as
-        a strategic-resident session override.
-        """
-        from app.strategic_resident_session import _resolve_override_runner
-
-        project_a = await _make_project(db_session, name="Override A")
-        project_b = await _make_project(db_session, name="Override B")
-
-        runner, _token = await _make_runner(db_session, project_a.id)
-        await add_binding(db_session, runner.id, project_b.id)
-
-        # Resolution for project A (enrollment) — always ok.
-        found_a = await _resolve_override_runner(
-            db_session, project_a.id, str(runner.id)
-        )
-        assert found_a is not None
-
-        # Resolution for project B (secondary binding) — must now succeed.
-        found_b = await _resolve_override_runner(
-            db_session, project_b.id, str(runner.id)
-        )
-        assert found_b is not None, (
-            "secondary-bound runner must resolve as override for project B"
-        )
-
-        # A deleted runner is never returned.
-        runner.status = "deleted"
-        db_session.add(runner)
-        await db_session.commit()
-        found_deleted = await _resolve_override_runner(
-            db_session, project_b.id, str(runner.id)
-        )
-        assert found_deleted is None
-
     async def test_secondary_bound_runner_hard_pin_uuid_hostname_and_unbound(
         self, db_session: AsyncSession
     ):
@@ -298,10 +258,6 @@ class TestAttempt24SecondaryRunnerAndMultifileToolFlow:
             _load_local_runner_status,
             _resolve_local_continuation_runner_affinity,
         )
-        from app.strategic_resident_session import (
-            _auto_select_local_runner,
-            build_resident_runner_options,
-        )
         from app.strategic_runtime_work import build_strategic_runtime_summary
         from app.workbench_state import (
             STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -336,12 +292,6 @@ class TestAttempt24SecondaryRunnerAndMultifileToolFlow:
         db_session.add(project_b)
         await db_session.commit()
 
-        assert await _auto_select_local_runner(
-            db_session, project_b.id
-        ) == str(runner.id)
-        options = await build_resident_runner_options(db_session, project_b.id)
-        assert [option["id"] for option in options] == [str(runner.id)]
-        assert options[0]["eligible"] is True
         assert await _valid_preferred_runner_ids(db_session, project_b.id) == {
             str(runner.id)
         }

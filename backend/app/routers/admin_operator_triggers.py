@@ -302,7 +302,7 @@ async def trigger_qualify(
     )
     await session.commit()
     # Promotion-in-flight: the audit passed and a promotion PR is open and
-    # auto-merging.  Re-qualifying would spawn a fresh heavy audit/smoketest pair
+    # auto-merging.  Re-qualifying would spawn a fresh heavy qualifier child set
     # and clobber the promotion-pending provenance, so run_qualification refuses
     # (no-op).  Surface that to the operator as a 409, mirroring the version-cut
     # lever, so all the levers over an in-flight promotion agree.

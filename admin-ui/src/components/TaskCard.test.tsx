@@ -855,9 +855,9 @@ describe('TaskCard evaluation verdict pill', () => {
     vi.clearAllMocks();
   });
 
-  it('renders a humanized blocking pill for a panel_review request_changes verdict', () => {
+  it('renders a humanized blocking pill for a review request_changes verdict', () => {
     const task = makeTask({
-      task_type: 'panel_review',
+      task_type: 'review',
       evaluation_summary: {
         status: 'COMPLETED',
         verdict: 'request_changes',
@@ -874,7 +874,7 @@ describe('TaskCard evaluation verdict pill', () => {
 
   it('renders a humanized positive pill for an approve verdict', () => {
     const task = makeTask({
-      task_type: 'panel_review',
+      task_type: 'review',
       evaluation_summary: { status: 'COMPLETED', verdict: 'approve' },
     });
     render(<TaskCard task={task} {...baseProps} />);
@@ -891,7 +891,7 @@ describe('TaskCard evaluation verdict pill', () => {
   it('does not render a verdict pill for a non-terminal task', () => {
     const task = makeTask({
       status: 'IN_PROGRESS',
-      task_type: 'panel_review',
+      task_type: 'review',
       evaluation_summary: { status: 'IN_PROGRESS', verdict: 'approve' },
     });
     render(<TaskCard task={task} {...baseProps} />);

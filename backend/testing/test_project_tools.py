@@ -386,41 +386,6 @@ async def test_seed_then_register_same_kind_succeeds(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_create_tool_rejects_invalid_placement(client: AsyncClient, db_session):
-    """POST /tools rejects a bogus placement string with 400."""
-    project = await _make_project_member(db_session)
-    resp = await client.post(
-        f"{_BASE}/projects/{project.id}/tools",
-        json={"kind": "whiteboard", "slug": "bad-placement", "placement": "floating_panel"},
-    )
-    assert resp.status_code == 400
-    msg = resp.json()["error"]["message"]
-    assert "placement" in msg.lower()
-    assert "floating_panel" in msg
-
-
-@pytest.mark.asyncio
-async def test_update_tool_rejects_invalid_placement(client: AsyncClient, db_session):
-    """PATCH /tools/{id} rejects a bogus placement string with 400."""
-    project = await _make_project_member(db_session)
-    created = (
-        await client.post(
-            f"{_BASE}/projects/{project.id}/tools",
-            json={"kind": "whiteboard", "slug": "upd-placement"},
-        )
-    ).json()
-    tool_id = created["id"]
-
-    resp = await client.patch(
-        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
-        json={"placement": "nowhere"},
-    )
-    assert resp.status_code == 400
-    msg = resp.json()["error"]["message"]
-    assert "placement" in msg.lower()
-
-
-@pytest.mark.asyncio
 async def test_register_tool_requires_owner(client: AsyncClient, db_session):
     """A member (below owner) cannot register a tool -> 403."""
     project = await _make_project_member(db_session, role="member")
@@ -788,27 +753,6 @@ async def test_update_tool_config(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_update_tool_placement_round_trips(client: AsyncClient, db_session):
-    """PATCH placement is accepted and echoed — the Configure UI relies on this."""
-    project = await _make_project_member(db_session)
-    created = (
-        await client.post(
-            f"{_BASE}/projects/{project.id}/tools",
-            json={"kind": "whiteboard", "slug": "place-upd"},
-        )
-    ).json()
-    tool_id = created["id"]
-    # Fresh summaries expose `config` (empty by default) for prefill.
-    assert created["config"] == {}
-
-    resp = await client.patch(
-        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
-        json={"placement": "sidebar"},
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["placement"] == "sidebar"
-
-
 @pytest.mark.asyncio
 async def test_update_tool_config_rejected_by_schema(
     client: AsyncClient, db_session
@@ -920,15 +864,14 @@ def test_validate_manifest_tool_path_traversal_entry():
     assert "relative" in err2.lower() or "absolute" in err2.lower() or "'/'" in err2
 
 
-def test_validate_manifest_tool_bad_placement():
-    """Unknown placement values are rejected."""
+def test_validate_manifest_tool_accepts_any_placement():
+    """Placement is no longer validated — any value is accepted (Phase 2 of custom-tools CUT)."""
     from app.routers.admin_project_tools import _validate_manifest_tool
 
     err = _validate_manifest_tool(
         {"slug": "ok", "title": "T", "entry": "e.html", "placement": "bad_spot"}, 0
     )
-    assert err is not None
-    assert "placement" in err
+    assert err is None
 
 
 def test_normalize_manifest_tool_shape():
@@ -3039,7 +2982,7 @@ async def test_research_claim_includes_project_skills(client, db_session):
 
 # ---------------------------------------------------------------------------
 # Agent-token fetch endpoint: GET /api/agent/projects/{id}/tools
-# (operator-facing strategic resident reads project tool content via ./fetch tools)
+# (operator-facing strategic agent reads project tool content via ./fetch tools)
 # ---------------------------------------------------------------------------
 
 
@@ -3257,6 +3200,35 @@ async def test_walkthrough_disable_enable_chain(client: AsyncClient, db_session)
     )
     assert "Walkthrough" in agent_tools_on["notes"]["text"]
 
+    # Step 7: permanently remove tool1 — DELETE wipes the row and its authored content.
+    # After delete the tool must not appear in the admin list or agent fetch.
+    del_resp = await client.delete(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}"
+    )
+    assert del_resp.status_code == 200, del_resp.text
+    assert del_resp.json()["status"] == "deleted"
+
+    list_after_delete = (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]
+    assert not any(t["id"] == tool1_id for t in list_after_delete), (
+        "deleted tool must not appear in the admin list"
+    )
+
+    agent_resp_after_delete = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": agent_token},
+    )
+    assert agent_resp_after_delete.status_code == 200
+    agent_slugs_after_delete = [t["slug"] for t in agent_resp_after_delete.json()["tools"]]
+    assert "notes" not in agent_slugs_after_delete, (
+        "deleted tool must not appear in agent-facing content fetch"
+    )
+
+    # A second DELETE on the same id returns 404 (idempotent-safe guard).
+    del_again = await client.delete(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}"
+    )
+    assert del_again.status_code == 404
+
 
 # ===========================================================================
 # Path-embedded token: subresource authentication fix (finding 37bc0b9c)
@@ -3450,3 +3422,5 @@ async def test_path_token_route_wrong_slug_rejected(
             f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
         )
         assert resp.status_code == 401
+
+

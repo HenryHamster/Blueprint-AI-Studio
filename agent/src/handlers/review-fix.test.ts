@@ -18,49 +18,54 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // directly with the review prompt — so the bulk of the existing handleReview
 // tests pass through unchanged.
 vi.mock('../index.js', () => ({
-  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
-  WORKSPACE: '/tmp/workspace',
-  strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
-  resolveBaseBranch: (payload: Record<string, unknown>, task: Record<string, unknown>, fallback = 'main') => {
-    if (typeof payload.base_branch === 'string' && payload.base_branch) return payload.base_branch;
-    const meta = task.project_metadata as Record<string, unknown> | undefined;
-    if (typeof meta?.integration_branch === 'string' && meta.integration_branch) return meta.integration_branch;
-    return fallback;
-  },
-  sanitize: (s: string) => s,
-  sendLog: vi.fn(),
-  log: vi.fn(),
-  getAgentToken: vi.fn().mockReturnValue(''),
-  apiPost: vi.fn(),
-  apiGet: vi.fn().mockResolvedValue({ data: { token: 'fresh' } }),
-  persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
-  readHandlerOutput: vi.fn(),
-  validateBranchName: vi.fn((b: string) => b),
-  git: vi.fn().mockReturnValue(''),
-  gitAsync: vi.fn().mockResolvedValue(''),
-  setupWorkspace: vi.fn(),
-  runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-  extractPytestSelectorsFromOutput: vi.fn((output: string) => {
-    const match = output.match(/FAILED\s+(backend\/testing\/\S+\.py::\S+)/);
-    return match ? [match[1].replace(/\s+-.*$/, '')] : [];
-  }),
-  snapshotToolTrace: vi.fn().mockReturnValue([]),
-  extractInvestigatedFiles: vi.fn().mockReturnValue([]),
-  cloneWithRetry: vi.fn(),
-  sendHeartbeatSync: vi.fn(),
-  setCurrentPromptFingerprint: vi.fn(),
+    normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
+    strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
+    resolveBaseBranch: (payload: Record<string, unknown>, task: Record<string, unknown>, fallback = 'main') => {
+      if (typeof payload.base_branch === 'string' && payload.base_branch) return payload.base_branch;
+      const meta = task.project_metadata as Record<string, unknown> | undefined;
+      if (typeof meta?.integration_branch === 'string' && meta.integration_branch) return meta.integration_branch;
+      return fallback;
+    },
+    sanitize: (s: string) => s,
+    WORKSPACE: '/tmp/workspace',
+    sendLog: vi.fn(),
+    log: vi.fn(),
+    getAgentToken: vi.fn().mockReturnValue(''),
+    apiPost: vi.fn(),
+    apiGet: vi.fn().mockResolvedValue({ data: { token: 'fresh' } }),
+    persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
+    readHandlerOutput: vi.fn(),
+    validateBranchName: vi.fn((b: string) => b),
+    git: vi.fn().mockReturnValue(''),
+    gitAsync: vi.fn().mockResolvedValue(''),
+    setupWorkspace: vi.fn(),
+    runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+    extractPytestSelectorsFromOutput: vi.fn((output: string) => {
+      const match = output.match(/FAILED\s+(backend\/testing\/\S+\.py::\S+)/);
+      return match ? [match[1].replace(/\s+-.*$/, '')] : [];
+    }),
+    snapshotToolTrace: vi.fn().mockReturnValue([]),
+    extractInvestigatedFiles: vi.fn().mockReturnValue([]),
+    cloneWithRetry: vi.fn(),
+    sendHeartbeatSync: vi.fn(),
+    setCurrentPromptFingerprint: vi.fn(),
 }));
 
 // The test verification loop now lives in utils/test-fix-loop.ts; handlers import
 // captureTestBaseline and testFixLoop from there.
-vi.mock('../utils/test-fix-loop.js', () => ({
-  captureTestBaseline: vi.fn().mockResolvedValue(null),
-  testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
-}));
+vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/test-fix-loop.js')>();
+  return {
+    ...actual,
+    captureTestBaseline: vi.fn().mockResolvedValue(null),
+    testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
+  };
+});
 
-vi.mock('../workspacePrep.js', () => ({
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
@@ -80,15 +85,17 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../build-config.js', () => ({
-  resolveBuildConfig: vi.fn().mockReturnValue({}),
-}));
+vi.mock('../build-config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../build-config.js')>();
+  return { ...actual, resolveBuildConfig: vi.fn().mockReturnValue({}) };
+});
 
 // Mock the code-change module so handleFix tests can assert on what was
 // passed to runCodeChangeTask without exercising marker-detection branches.
-vi.mock('./code-change.js', () => ({
-  runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('./code-change.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./code-change.js')>();
+  return { ...actual, runCodeChangeTask: vi.fn().mockResolvedValue(undefined) };
+});
 
 // Spy on the read-only ./fetch writer while keeping buildFetchGuidance and the
 // PLAN_FETCH_VERBS constant real, so prompt-guidance assertions exercise the

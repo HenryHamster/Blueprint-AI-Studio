@@ -41,7 +41,6 @@ describe('ConversationUtilityBar — viewport regression', () => {
           onSearchChange={() => {}}
           needsActionCount={props.needsActionCount ?? 0}
           alertCount={props.alertCount ?? 0}
-          residentHealth={<span className="inline-flex items-center rounded-full border px-2 py-1 text-xs">Resident shadowing</span>}
         />,
       );
     });

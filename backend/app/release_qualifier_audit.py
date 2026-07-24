@@ -71,6 +71,9 @@ def _task_failure_category(task: Task | None) -> str | None:
     return str(category) if category else None
 
 
+_CHILD_TAIL_MAX_CHARS = 500
+
+
 def _compact_infra_child_event(
     *,
     leg: str,
@@ -86,6 +89,9 @@ def _compact_infra_child_event(
         category = _task_failure_category(failed_task)
         if category:
             event["failure_category"] = category
+        tail = failed_task.latest_status_message
+        if tail:
+            event["child_tail"] = tail[-_CHILD_TAIL_MAX_CHARS:]
     if replacement_task_id:
         event["replacement_task_id"] = replacement_task_id
     if label:
@@ -220,8 +226,6 @@ async def _collect_terminal_infra_child_events(
     challenge_id = qual.get("challenge_task_id") or qual.get("audit_challenge_task_id")
     if challenge_id:
         terminal_ids.append(("challenge", str(challenge_id)))
-    if qual.get("smoketest_task_id"):
-        terminal_ids.append(("smoketest", str(qual.get("smoketest_task_id"))))
 
     seen_failed_ids = {
         str(row.get("failed_task_id"))
@@ -232,7 +236,7 @@ async def _collect_terminal_infra_child_events(
     # Collect valid UUIDs not yet in seen_failed_ids, then batch-fetch in one
     # query instead of one session.get per leg.
     valid_uuids: list[uuid.UUID] = []
-    for leg, task_id in terminal_ids:
+    for _leg, task_id in terminal_ids:
         if task_id in seen_failed_ids:
             continue
         try:
@@ -459,7 +463,7 @@ async def _spawn_release_audit_challenge_task(
     return task
 
 
-async def _spawn_qualifier_smoketest_task(
+async def _spawn_qualifier_walkthrough_task(
     session: AsyncSession,
     project_id: uuid.UUID,
     *,
@@ -467,42 +471,33 @@ async def _spawn_qualifier_smoketest_task(
     candidate_sha: str,
     qualification_attempt_id: uuid.UUID | str,
 ) -> Task:
-    """Create + queue a qualify-time ``smoketest`` task on the candidate commit."""
+    """Create + queue a qualify-time ``walkthrough_e2e`` task on the candidate commit."""
     project = await session.get(Project, project_id)
     integration_branch, _promotion_target = _lts_branch_names(project)
     payload: dict[str, Any] = {
-        "type": "smoketest",
+        "type": "walkthrough_e2e",
         "base_branch": integration_branch,
-        # Audit C4: pin the smoketest to the exact qualified commit.  The agent
-        # clones the integration branch then checks out this SHA.
         "candidate_sha": candidate_sha,
         "qualification_attempt_id": str(qualification_attempt_id),
     }
-    type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
-    if type_model:
-        payload["model"] = type_model
-    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get("smoketest")
-    if type_effort:
-        payload["effort"] = type_effort
-    health_check_urls = _runtime_config.get("health_check_urls") or []
-    if health_check_urls:
-        payload["health_check_urls"] = health_check_urls
     try:
-        payload = validate_internal_payload(payload, "release_qualifier:smoketest")
+        payload = validate_internal_payload(payload, "release_qualifier:walkthrough_e2e")
     except PayloadTooLargeError:
         raise
 
     task = Task(
         project_id=project_id,
-        title=f"Qualifier smoketest: candidate {candidate_sha[:8]}",
-        description=(f"Qualify-time smoketest of release candidate {candidate_sha}"),
+        title=f"Qualifier walkthrough e2e: candidate {candidate_sha[:8]}",
+        description=(
+            f"Qualify-time live-stack walkthrough of release candidate {candidate_sha}"
+        ),
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         context={
             "release_version_id": str(version_id),
-            "qualifier_smoketest": True,
+            "qualifier_walkthrough_e2e": True,
             "candidate_sha": candidate_sha,
             "qualification_attempt_id": str(qualification_attempt_id),
         },
@@ -515,8 +510,8 @@ async def _spawn_qualifier_smoketest_task(
             action="SPAWNED",
             details={
                 "spawned_by": "RELEASE_QUALIFIER",
-                "task_type": "smoketest",
-                "qualifier_smoketest": True,
+                "task_type": "walkthrough_e2e",
+                "qualifier_walkthrough_e2e": True,
                 "release_version_id": str(version_id),
                 "qualification_attempt_id": str(qualification_attempt_id),
             },
@@ -939,22 +934,22 @@ async def _handle_infra_failure(
     attempt_history = [*prior_history, attempt_entry][-_INFRA_ATTEMPT_HISTORY_LIMIT:]
 
     # Permanent gate-incapacity detection: count trailing same-signature entries
-    # in attempt_history.  When a migration_apply_check_unavailable error repeats
-    # with the exact same signature across _MIN_INFRA_ERROR_STREAK or more
-    # consecutive attempts, the condition is structural and will not self-resolve
-    # by retry — escalate with a different operator message.
+    # in attempt_history.  When ANY qualifier gate (smoketest, audit, challenge,
+    # merge_grade, migration_apply) repeats with the exact same signature across
+    # _MIN_INFRA_ERROR_STREAK or more consecutive attempts, the condition is
+    # structural and will not self-resolve by retry — escalate with a different
+    # operator message.
     is_permanent_gate_incapacity = False
     same_signature_streak = 0
-    if infra_error.startswith("migration_apply"):
-        cur_sig = signature
-        for entry in reversed(attempt_history):
-            if entry.get("signature") == cur_sig:
-                same_signature_streak += 1
-            else:
-                break
-        is_permanent_gate_incapacity = (
-            same_signature_streak >= _MIN_INFRA_ERROR_STREAK
-        )
+    cur_sig = signature
+    for entry in reversed(attempt_history):
+        if entry.get("signature") == cur_sig:
+            same_signature_streak += 1
+        else:
+            break
+    is_permanent_gate_incapacity = (
+        same_signature_streak >= _MIN_INFRA_ERROR_STREAK
+    )
 
 
     infra_evidence = {
@@ -983,7 +978,7 @@ async def _handle_infra_failure(
         "candidate_sha": qual.get("candidate_sha"),
         "engine_sha": engine_sha,
         "ci_green": qual.get("ci_green"),
-        "smoketest_enabled": qual.get("smoketest_enabled", True),
+        "smoketest_enabled": qual.get("smoketest_enabled", False),
         "status": "infra_failure",
         "error": infra_error,
         # Which single dimension this infra failure isolated to (the other
@@ -1040,11 +1035,14 @@ async def _handle_infra_failure(
         else None
     )
 
+    failing_leg = _infer_infra_leg(infra_error)
     hotfix_preview: dict[str, Any] | None = None
-    if is_permanent_gate_incapacity:
+    if is_permanent_gate_incapacity and infra_error.startswith("migration_apply"):
         # Make the sanctioned remediation concrete at the point incapacity is
         # declared.  This is read-only and deliberately best-effort: inability
         # to preview must not turn a held release into a promotion.
+        # Only migration_apply has a meaningful hotfix-scope preview; other legs
+        # (smoketest, audit, challenge) have no narrowed hotfix path.
         try:
             hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
                 session, version.project_id, candidate_sha=qual.get("candidate_sha")
@@ -1101,7 +1099,7 @@ async def _handle_infra_failure(
                 else "Hotfix scope preview unavailable or ineligible; inspect it before acting. "
             )
             alert_message = (
-                f"The migration-apply gate for v{version.version_number} is "
+                f"The {failing_leg} gate for v{version.version_number} is "
                 f"persistently incapable across {same_signature_streak} "
                 f"same-signature attempts ({infra_error!r}) — the underlying "
                 f"condition will not self-resolve by retry. "
@@ -1117,7 +1115,7 @@ async def _handle_infra_failure(
                 f"infrastructure errors ({infra_error!r}) — the qualifier "
                 f"agent VM or clone pipeline is broken. This is NOT a "
                 f"quality finding about the release candidate. Inspect the "
-                f"release_audit / qualifier-smoketest agent infrastructure "
+                f"release-audit, challenge, and goal-grade agent infrastructure "
                 f"and re-queue to retry once the issue is resolved. "
                 f"Signature: {signature}; same as previous: "
                 f"{same_error_as_prior}."
@@ -1131,6 +1129,7 @@ async def _handle_infra_failure(
                     f"failure: {current_streak} consecutive errors"
                 ),
                 message=alert_message,
+                event_type="release.qualification_crash_loop",
             )
         )
         logger.warning(
@@ -1150,7 +1149,7 @@ async def _handle_infra_failure(
             else " Hotfix scope preview is unavailable or ineligible; do not force-promote."
         )
         notify_message = (
-            f"v{version.version_number} migration-apply gate is persistently "
+            f"v{version.version_number} {failing_leg} gate is persistently "
             f"incapable across {same_signature_streak} same-signature attempts "
             f"({infra_error.replace('_', ' ')}) — the underlying condition "
             f"will not self-resolve by retry. "
@@ -1269,7 +1268,7 @@ async def _handle_independent_blocker(
         "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
         "ci_green": qual.get("ci_green"),
-        "smoketest_enabled": qual.get("smoketest_enabled", True),
+        "smoketest_enabled": qual.get("smoketest_enabled", False),
         "status": "not_promoted",
         "blocker": "audit_challenge_independent_blocker",
         "started_at": qual.get("started_at"),

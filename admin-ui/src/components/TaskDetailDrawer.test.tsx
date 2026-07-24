@@ -471,38 +471,6 @@ describe('TaskDetailDrawer', () => {
     expect(writeTextSpy).toHaveBeenCalledWith('line one\nline two');
   });
 
-  it('shows the Panel review button for a review task with PR context and invokes onPanelReview', async () => {
-    const user = userEvent.setup();
-    const onPanelReview = vi.fn();
-    const task = makeTask({
-      task_type: 'review',
-      payloads: [{ pr_number: 88, branch: 'feature/x', base_branch: 'automain' }],
-    });
-    render(
-      <TaskDetailDrawer task={task} logLines={[]} {...baseHandlers} onPanelReview={onPanelReview} />,
-    );
-    const btn = screen.getByTitle('Panel review this PR');
-    await user.click(btn);
-    expect(onPanelReview).toHaveBeenCalledTimes(1);
-    expect(onPanelReview).toHaveBeenCalledWith(task);
-  });
-
-  it('does not show the Panel review button for a non-review/fix task', () => {
-    const task = makeTask({ task_type: 'create', payloads: [{ pr_number: 5 }] });
-    render(
-      <TaskDetailDrawer task={task} logLines={[]} {...baseHandlers} onPanelReview={vi.fn()} />,
-    );
-    expect(screen.queryByTitle('Panel review this PR')).toBeNull();
-  });
-
-  it('does not show the Panel review button when a review task lacks PR context', () => {
-    const task = makeTask({ task_type: 'review', payloads: [{}] });
-    render(
-      <TaskDetailDrawer task={task} logLines={[]} {...baseHandlers} onPanelReview={vi.fn()} />,
-    );
-    expect(screen.queryByTitle('Panel review this PR')).toBeNull();
-  });
-
   it('resets transient form state when navigating between tasks', async () => {
     const user = userEvent.setup();
     const task1 = makeTask({

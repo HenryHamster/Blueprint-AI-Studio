@@ -599,8 +599,9 @@ def test_update_module_feedback_profiles_noop_on_empty_inputs():
 async def test_extract_review_feedback_updates_module_profiles(
     db_session: AsyncSession,
 ):
-    """extract_review_feedback_to_playbook also persists per-module profiles in design_doc."""
+    """extract_review_feedback_to_playbook persists per-module profiles to project_telemetry."""
     from app.playbook_learning import extract_review_feedback_to_playbook
+    from app.project_telemetry import read_telemetry
 
     project = await _make_project(db_session, design_doc={})
     review_history = [
@@ -639,9 +640,10 @@ async def test_extract_review_feedback_updates_module_profiles(
     )
     await db_session.flush()
 
-    doc = project.design_doc or {}
-    assert "module_feedback" in doc, "module_feedback should be written to design_doc"
-    feedback = doc["module_feedback"]
+    # module_feedback is a telemetry-migrated key — stripped from design_doc at
+    # write time and persisted only to the project_telemetry KV table.
+    feedback = await read_telemetry(db_session, project.id, "module_feedback")
+    assert feedback is not None, "module_feedback should be written to project_telemetry"
     assert "backend/app/routes.py" in feedback
     entry = feedback["backend/app/routes.py"]
     assert entry["total"] > 0
@@ -1007,14 +1009,124 @@ async def test_extract_review_feedback_accumulates_on_first_iteration(
         f"Should not create review-extracted entries at iteration 1, got {review_keys}"
     )
 
-    # Direction tally was accumulated
-    assert _DIRECTION_FIRST_ATTEMPT_KEY in doc, (
-        "direction_first_attempt_feedback should be written"
-    )
-    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY].get("dir-cafebabe-1234")
+    # Direction tally accumulated — persisted to project_telemetry now (the
+    # design_doc write leg for this migrated key is cut).
+    from app.project_telemetry import read_telemetry
+
+    dfa = await read_telemetry(db_session, project.id, _DIRECTION_FIRST_ATTEMPT_KEY)
+    assert dfa is not None, "direction_first_attempt_feedback should be written"
+    tally = dfa.get("dir-cafebabe-1234")
     assert tally is not None
     assert tally.get("test-coverage", 0) >= 1
     assert tally.get("total", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_dual_writes_direction_feedback_to_telemetry(
+    db_session: AsyncSession,
+):
+    """The direction first-attempt tally is persisted to project_telemetry.
+
+    The design_doc write leg for this migrated key is CUT: extract_review_feedback_to_playbook
+    upserts the tally only into the dedicated project_telemetry KV row (key
+    'direction_first_attempt_feedback'), and the telemetry-preferring reader
+    read_direction_first_attempt_feedback returns it.
+    """
+    from app.playbook_learning import (
+        extract_review_feedback_to_playbook,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
+    from app.project_telemetry import read_telemetry
+    from app.review_learning import read_direction_first_attempt_feedback
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "missing unit tests for the handler", "severity": "MAJOR"},
+                {"description": "no test coverage for edge cases", "severity": "MINOR"},
+            ],
+        },
+    ]
+    review_loop = {"iteration": 1, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="First-iter task",
+        payloads=[{"type": "create", "prompt": "add handler"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_summary": {"id": "dir-cafebabe-1234", "title": "Test direction"},
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=99, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    # design_doc write leg is CUT — the tally lives only in project_telemetry.
+    assert _DIRECTION_FIRST_ATTEMPT_KEY not in (project.design_doc or {}), (
+        "design_doc write leg for direction_first_attempt_feedback is cut"
+    )
+
+    # Telemetry row holds the tally.
+    tel_tally = await read_telemetry(
+        db_session, project.id, _DIRECTION_FIRST_ATTEMPT_KEY
+    )
+    assert tel_tally is not None
+    assert tel_tally.get("dir-cafebabe-1234", {}).get("test-coverage", 0) >= 1
+
+    # Reader prefers telemetry and returns the same tally.
+    read_back = await read_direction_first_attempt_feedback(db_session, project)
+    assert read_back == tel_tally
+
+
+@pytest.mark.asyncio
+async def test_read_direction_first_attempt_feedback_prefers_telemetry_only_value(
+    db_session: AsyncSession,
+):
+    """A value present ONLY in project_telemetry is read back (telemetry wins)."""
+    from app.review_learning import (
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        read_direction_first_attempt_feedback,
+    )
+    from app.project_telemetry import upsert_telemetry
+
+    # design_doc holds a STALE value; telemetry holds the fresh one.
+    project = await _make_project(
+        db_session,
+        design_doc={_DIRECTION_FIRST_ATTEMPT_KEY: {"dir-old": {"total": 1}}},
+    )
+    fresh = {"dir-new": {"total": 7, "test-coverage": 7}}
+    await upsert_telemetry(
+        db_session, project.id, _DIRECTION_FIRST_ATTEMPT_KEY, fresh
+    )
+    await db_session.flush()
+
+    read_back = await read_direction_first_attempt_feedback(db_session, project)
+    assert read_back == fresh, "telemetry row must take precedence over design_doc"
+
+
+@pytest.mark.asyncio
+async def test_read_direction_first_attempt_feedback_falls_back_to_design_doc(
+    db_session: AsyncSession,
+):
+    """With no telemetry row, the reader falls back to design_doc (instant rollback)."""
+    from app.review_learning import (
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        read_direction_first_attempt_feedback,
+    )
+
+    legacy = {"dir-legacy": {"total": 3, "correctness": 3}}
+    project = await _make_project(
+        db_session, design_doc={_DIRECTION_FIRST_ATTEMPT_KEY: legacy}
+    )
+
+    read_back = await read_direction_first_attempt_feedback(db_session, project)
+    assert read_back == legacy
 
 
 @pytest.mark.asyncio

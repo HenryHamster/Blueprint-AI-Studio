@@ -263,6 +263,97 @@ def _reset_observability_for_tests() -> None:
     _OBSERVABILITY = _StructuralHealthObservability()
 
 
+# --- Durable DB writer + reader (survive process restarts) -------------------
+
+_AUDIT_LANE = "structural_health"
+
+
+async def log_audit_cycle_to_db(
+    session,
+    *,
+    ts: datetime,
+    mode: str,
+    tripped: bool,
+    enrolled: int,
+    payload: Dict[str, Any],
+) -> None:
+    """Write one durable row per audit cycle into AuditLaneDecisionLog.
+
+    Best-effort: any DB error is logged and swallowed so it can never crash the
+    reaper cycle or cause a rollback that would undo a legitimately enrolled finding.
+    """
+    try:
+        from app.models import AuditLaneDecisionLog
+
+        row = AuditLaneDecisionLog(
+            ts=ts,
+            lane=_AUDIT_LANE,
+            mode=mode,
+            tripped=tripped,
+            enrolled=enrolled,
+            payload=payload,
+        )
+        session.add(row)
+        await session.flush()
+    except Exception:
+        logger.warning(
+            "[STRUCTURAL] log_audit_cycle_to_db failed — in-memory signal preserved",
+            exc_info=True,
+        )
+
+
+async def get_structural_health_observability_from_db(
+    session, *, window_hours: int = 24
+) -> Dict[str, Any]:
+    """Return aggregate observe-window stats from the durable AuditLaneDecisionLog.
+
+    Queries rows within the trailing ``window_hours`` for the structural_health
+    lane and returns: total cycles, tripped count (would-have-fired), and enrolled
+    count.  Falls back to an empty result rather than raising.
+    """
+    try:
+        from app.models import AuditLaneDecisionLog
+
+        cutoff = _utcnow() - timedelta(hours=window_hours)
+        rows = (
+            await session.execute(
+                select(AuditLaneDecisionLog)
+                .where(
+                    AuditLaneDecisionLog.lane == _AUDIT_LANE,
+                    AuditLaneDecisionLog.ts >= cutoff,
+                )
+                .order_by(AuditLaneDecisionLog.ts.desc())
+                .limit(500)
+            )
+        ).scalars().all()
+
+        total = len(rows)
+        tripped_count = sum(1 for r in rows if r.tripped)
+        enrolled_total = sum(r.enrolled for r in rows)
+        last_ts = rows[0].ts.isoformat() if rows else None
+        return {
+            "source": "db",
+            "window_hours": window_hours,
+            "cycles": total,
+            "tripped_count": tripped_count,
+            "enrolled_total": enrolled_total,
+            "last_cycle_at": last_ts,
+        }
+    except Exception:
+        logger.warning(
+            "[STRUCTURAL] get_structural_health_observability_from_db failed",
+            exc_info=True,
+        )
+        return {
+            "source": "db",
+            "window_hours": window_hours,
+            "cycles": 0,
+            "tripped_count": 0,
+            "enrolled_total": 0,
+            "last_cycle_at": None,
+        }
+
+
 # --- Enrollment (deduped, mode-gated) ----------------------------------------
 
 
@@ -836,10 +927,34 @@ async def run_structural_health_audit(
             fat_row["threshold_bytes"],
         )
 
-    return {
+    result = {
         "fat_row": fat_row,
         "jsonb_bloat": jsonb_bloat,
         "gin_overhead": gin_overhead,
         "pool_saturation": pool_sat,
         "total_enrolled": total_enrolled,
     }
+
+    tripped = bool(
+        fat_row.get("offenders", 0)
+        or jsonb_bloat.get("tripped")
+        or gin_overhead.get("offenders", 0)
+        or pool_sat.get("tripped")
+    )
+    payload = {
+        "fat_row_offenders": fat_row.get("offenders", 0),
+        "jsonb_bloat_tripped": bool(jsonb_bloat.get("tripped")),
+        "gin_overhead_offenders": gin_overhead.get("offenders", 0),
+        "pool_saturation_tripped": bool(pool_sat.get("tripped")),
+        "total_enrolled": total_enrolled,
+    }
+    await log_audit_cycle_to_db(
+        session,
+        ts=_now,
+        mode=mode,
+        tripped=tripped,
+        enrolled=total_enrolled,
+        payload=payload,
+    )
+
+    return result

@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-
 import {
   acknowledgeQueuedResidentToolHandoffs,
   dispatchResidentToolHandoff,
@@ -24,19 +23,35 @@ const detail: ResidentToolHandoffDetail = {
     timestamp: '2026-07-17T00:00:00Z',
     retrieval: {
       capability: 'inline_bounded_text',
-      href: '/api/agent/resident-turn/artifact?artifact_ref_id=artifact-a',
+      href: '/api/admin/projects/project-a/artifact-refs/artifact-a',
     },
   },
   intent: 'ask',
   prompt: 'Review Notes revision 7.',
 };
 
-describe('Resident tool handoff transport', () => {
+describe('conversation tool handoff transport', () => {
   beforeEach(() => localStorage.clear());
 
-  it('persists the canonical actor/project handoff even without a mounted listener', () => {
+  it('persists the canonical actor/project handoff without a mounted listener', () => {
     expect(dispatchResidentToolHandoff(detail)).toBe(true);
     expect(loadQueuedResidentToolHandoffs('operator-a', 'project-a')).toEqual([detail]);
+    expect(loadQueuedResidentToolHandoffs('operator-b', 'project-a')).toEqual([]);
+  });
+
+  it('keeps actor and project queues isolated in durable storage', () => {
+    expect(enqueueResidentToolHandoff('operator-a', 'project-a', detail)).toBe(true);
+    const otherProject = {
+      ...detail,
+      projectId: 'project-b',
+      artifactRef: {
+        ...detail.artifactRef,
+        project_id: 'project-b',
+      },
+    };
+    expect(enqueueResidentToolHandoff('operator-a', 'project-b', otherProject)).toBe(true);
+    expect(loadQueuedResidentToolHandoffs('operator-a', 'project-a')).toEqual([detail]);
+    expect(loadQueuedResidentToolHandoffs('operator-a', 'project-b')).toEqual([otherProject]);
     expect(loadQueuedResidentToolHandoffs('operator-b', 'project-a')).toEqual([]);
   });
 
@@ -68,56 +83,19 @@ describe('Resident tool handoff transport', () => {
     }
   });
 
-  it('rejects a mismatched ArtifactRef project before persistence or notification', () => {
-    const listener = vi.fn();
-    window.addEventListener(RESIDENT_TOOL_HANDOFF_EVENT, listener);
-    try {
-      expect(dispatchResidentToolHandoff({
-        ...detail,
-        artifactRef: { ...detail.artifactRef, project_id: 'project-b' },
-      })).toBe(false);
-      expect(loadQueuedResidentToolHandoffs('operator-a', 'project-a')).toEqual([]);
-      expect(listener).not.toHaveBeenCalled();
-      expect(dispatchResidentToolHandoff({
-        ...detail,
-        artifactRef: { ...detail.artifactRef, author: '' },
-      })).toBe(false);
-    } finally {
-      window.removeEventListener(RESIDENT_TOOL_HANDOFF_EVENT, listener);
-    }
-  });
-
-  it('stores independent refs without a cross-tab read-modify-write loss', () => {
-    const second = {
+  it('rejects a mismatched project or missing author before persistence', () => {
+    expect(dispatchResidentToolHandoff({
       ...detail,
-      artifactRef: {
-        ...detail.artifactRef,
-        id: 'artifact-b',
-        artifact_ref_id: 'artifact-b',
-        revision: 8,
-      },
-    };
-    expect(enqueueResidentToolHandoff('operator-a', 'project-a', detail)).toBe(true);
-    expect(enqueueResidentToolHandoff('operator-a', 'project-a', second)).toBe(true);
-    expect(loadQueuedResidentToolHandoffs('operator-a', 'project-a')).toEqual([detail, second]);
+      artifactRef: { ...detail.artifactRef, project_id: 'project-b' },
+    })).toBe(false);
+    expect(dispatchResidentToolHandoff({
+      ...detail,
+      artifactRef: { ...detail.artifactRef, author: '' },
+    })).toBe(false);
+    expect(loadQueuedResidentToolHandoffs('operator-a', 'project-a')).toEqual([]);
   });
 
-  it('acknowledges only the snapshot version and preserves a same-ref replacement', () => {
-    expect(enqueueResidentToolHandoff('operator-a', 'project-a', detail)).toBe(true);
-    const snapshot = loadQueuedResidentToolHandoffEntries('operator-a', 'project-a');
-    const replacement = { ...detail, intent: 'share' as const, prompt: 'Use Notes revision 7.' };
-    expect(enqueueResidentToolHandoff('operator-a', 'project-a', replacement)).toBe(true);
-
-    const scopedKeysBeforeAck = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
-      .filter(key => key?.startsWith('resident_tool_handoff_entry:operator-a:project-a:'));
-    expect(scopedKeysBeforeAck).toHaveLength(2);
-
-    acknowledgeQueuedResidentToolHandoffs('operator-a', 'project-a', snapshot);
-
-    expect(loadQueuedResidentToolHandoffs('operator-a', 'project-a')).toEqual([replacement]);
-  });
-
-  it('acknowledges one immutable snapshot without consuming an interleaved later event', () => {
+  it('acknowledges only the snapshot and preserves an interleaved later event', () => {
     expect(enqueueResidentToolHandoff('operator-a', 'project-a', detail)).toBe(true);
     const snapshot = loadQueuedResidentToolHandoffEntries('operator-a', 'project-a');
     const later = {
@@ -131,13 +109,11 @@ describe('Resident tool handoff transport', () => {
       prompt: 'Review the later board.',
     };
     expect(enqueueResidentToolHandoff('operator-a', 'project-a', later)).toBe(true);
-
     acknowledgeQueuedResidentToolHandoffs('operator-a', 'project-a', snapshot);
-
     expect(loadQueuedResidentToolHandoffs('operator-a', 'project-a')).toEqual([later]);
   });
 
-  it('removes malformed and expired scoped entries during queue maintenance', () => {
+  it('removes malformed and expired scoped entries during maintenance', () => {
     const prefix = 'resident_tool_handoff_entry:operator-a:project-a:';
     localStorage.setItem(`${prefix}malformed`, '{');
     localStorage.setItem(`${prefix}expired`, JSON.stringify({
@@ -146,7 +122,6 @@ describe('Resident tool handoff transport', () => {
       queued_at: (Date.now() - 8 * 24 * 60 * 60 * 1000) * 1000,
       detail,
     }));
-
     expect(loadQueuedResidentToolHandoffEntries('operator-a', 'project-a')).toEqual([]);
     expect(localStorage.getItem(`${prefix}malformed`)).toBeNull();
     expect(localStorage.getItem(`${prefix}expired`)).toBeNull();

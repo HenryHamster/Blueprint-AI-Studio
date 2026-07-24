@@ -7,8 +7,6 @@ block of metric fields describing the durable promotion-gate readiness verdict
 of what each emitted field means, the named ground-truth source it is computed
 from, and who consumes it (or a dated pending/retired reason).
 
-Mirrors ``test_panel_review_metric_manifest.py``:
-
 * Every top-level key emitted by ``compute_promotion_readiness`` MUST appear in
   the manifest with a named ``consumer`` OR a retired/pending annotation — so a
   new field cannot land without declaring who reads it.

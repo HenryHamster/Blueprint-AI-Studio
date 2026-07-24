@@ -500,9 +500,6 @@ class CompletionDebtEntry(SQLModel, table=True):
       * a no-CI merge gate that fell open to an UNVERIFIED merge (``no_ci_gate``);
       * a strategic retirement that left a residual handoff/deferral behind
         (``retirement_residual``);
-      * a standing backlog item seeded from the HEAD dormant-state inventory
-        (``seed_inventory``).
-
     Entries are IDEMPOTENT on ``dedupe_key`` (globally unique): repeated recorder
     or seed invocations upsert the same logical obligation rather than creating a
     duplicate row.  Recording is best-effort at every write site — a ledger
@@ -532,7 +529,7 @@ class CompletionDebtEntry(SQLModel, table=True):
     )
 
     # Debt family, e.g. 'dormant_knob' | 'capability_trial' | 'no_ci_gate' |
-    # 'retirement_residual' | 'seed_inventory'.
+    # 'retirement_residual' | 'capability_earn_obligation'.
     kind: str = Field(sa_column=Column(String(64), nullable=False))
 
     # Stable, globally-unique idempotency key for this obligation.

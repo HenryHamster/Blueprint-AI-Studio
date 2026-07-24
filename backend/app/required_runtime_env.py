@@ -1,6 +1,4 @@
-"""Declarative manifests of environment variables the app requires.
-
-Two manifests are maintained here:
+"""Declarative manifest of environment variables the app requires to boot.
 
 BOOT contract (:data:`REQUIRED_RUNTIME_ENV`)
     Hard requirements for the app to start.  :func:`_verify_required_env` walks
@@ -8,14 +6,6 @@ BOOT contract (:data:`REQUIRED_RUNTIME_ENV`)
     variable.  Historically these were scattered ``raise RuntimeError`` checks in
     the FastAPI lifespan; v25 unified them here so a pre-promotion gate can read
     the list from the candidate SHA before deploying it.
-
-QUALIFICATION prerequisites (:data:`QUALIFICATION_ENV`)
-    Variables that must be present for the release-qualification gate to run
-    fully.  Their absence degrades specific gate checks (e.g. the scratch-DB
-    migration-apply gate defers with an actionable verdict) but does NOT prevent
-    the app from booting.  The manifest is machine-readable by pre-promotion
-    gates and diagnostic tooling so missing variables surface before repeated
-    opaque deferrals accumulate.
 
 PRESENCE-ONLY HARD RULE: this module only ever calls ``bool(os.getenv(name))``.
 It never reads, compares, logs, or persists the env VALUE. Value-validity
@@ -74,46 +64,6 @@ REQUIRED_RUNTIME_ENV: list[EnvRequirement] = [
         ),
     ),
 ]
-
-# Env var name mirrored from migration_apply_gate to avoid a heavy import.
-_MIGRATION_APPLY_SCRATCH_ENV = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
-
-# Variables required for full release qualification but not for app boot.
-# Absent variables degrade specific gate checks rather than preventing startup.
-# Machine-readable so pre-promotion gates and diagnostic tooling can surface
-# missing vars before opaque per-attempt deferrals accumulate.
-QUALIFICATION_ENV: list[EnvRequirement] = [
-    EnvRequirement(
-        name=_MIGRATION_APPLY_SCRATCH_ENV,
-        scope="cloud_run",
-        reason=(
-            "Pre-promotion scratch-DB migration-apply gate requires a dedicated "
-            "PostgreSQL target whose user can CREATE and DROP databases.  Without "
-            "this, every release candidate defers indefinitely with "
-            "migration_apply_check_unavailable — a silent hold that only surfaces "
-            "after repeated failed qualification attempts.  Bind a scratch-capable "
-            "PostgreSQL URL (distinct from the production pool) to unblock "
-            "qualification."
-        ),
-    ),
-]
-
-
-def missing_qualification_env() -> list[EnvRequirement]:
-    """Return qualification prerequisites that are absent in the current runtime.
-
-    Non-fatal: missing qualification vars degrade specific gate checks (they do
-    NOT raise).  Call sites may log a warning or surface the list in diagnostics
-    to help operators discover configuration gaps before qualification is
-    attempted.
-    """
-    scopes = active_scopes()
-    return [
-        req
-        for req in QUALIFICATION_ENV
-        if req.scope in scopes and not bool(os.getenv(req.name))
-    ]
-
 
 def active_scopes() -> frozenset[str]:
     """Return the set of scopes in force for the current runtime."""

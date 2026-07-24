@@ -78,9 +78,12 @@ async def _try_auto_recover_suspension(
     """
     now = _utcnow()
     recovered = False
+    # Captures the final config so it can be dual-written to project_telemetry
+    # after the design_doc lock closure runs (None => no mutation occurred).
+    persisted_config: dict | None = None
 
     def _mutate(doc: dict) -> None:
-        nonlocal recovered
+        nonlocal recovered, persisted_config
         ar_config = dict(doc.get("_auto_remediation", {}))
         suspension_meta = dict(ar_config.get("suspension_metadata", {}))
         meta = dict(suspension_meta.get(branch) or {})
@@ -98,6 +101,7 @@ async def _try_auto_recover_suspension(
                 suspension_meta[branch] = meta
                 ar_config["suspension_metadata"] = suspension_meta
                 doc["_auto_remediation"] = ar_config
+                persisted_config = ar_config
             return
 
         # Cooldown elapsed — recover the branch: clear it from the suspended
@@ -115,6 +119,7 @@ async def _try_auto_recover_suspension(
         ar_config["branch_failure_counts"] = failure_counts
         ar_config["suspension_metadata"] = suspension_meta
         doc["_auto_remediation"] = ar_config
+        persisted_config = ar_config
         recovered = True
         logger.info(
             "[AUTO-REMEDIATION] Auto-recovering suspended branch %s (attempt %d/%d)",
@@ -124,6 +129,13 @@ async def _try_auto_recover_suspension(
         )
 
     await with_design_doc_locked(session, project_id, _mutate, skip_locked=False)
+    if persisted_config is not None:
+        # Dual-write to project_telemetry (design_doc copy kept for rollback).
+        from app.project_telemetry import set_project_telemetry
+
+        await set_project_telemetry(
+            session, project_id, "_auto_remediation", persisted_config
+        )
     return recovered
 
 

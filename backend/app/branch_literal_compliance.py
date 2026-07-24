@@ -162,7 +162,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         allowlist=(
             BranchLiteralAllowEntry(
                 path="prompts/review-prompt.ts",
-                line=330,
+                line=327,
                 pattern="fallback-main",
                 rationale=(
                     "buildRollupReviewGuidance is downstream of resolveBaseBranch; the "
@@ -189,7 +189,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         allowlist=(
             BranchLiteralAllowEntry(
                 path="components/NewTaskModal.tsx",
-                line=412,
+                line=411,
                 pattern="fallback-main",
                 rationale=(
                     "The resolved per-project integrationBranch is preferred; main is "

@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 
 
 # Audit H2: hard wall-clock bound on a single qualification.  A qualification
-# spawns two heavy agent-VM children (release_audit + qualifier-smoketest),
+# spawns the current audit / goal-grade agent children,
 # each of which may itself retry — but if a child heartbeats-but-hangs, gets
 # stuck in a recovery/requeue loop, or otherwise never reaches a terminal
 # state, the version wedges at last_qualification.status == "pending" forever
@@ -300,7 +300,7 @@ async def _cancel_qualifier_children(
 ) -> None:
     """Best-effort cancel of all qualifier child tasks for a force-finalized version.
 
-    Reads ``audit_task_id``, ``smoketest_task_id``, ``challenge_task_id``, and
+    Reads current child ids plus legacy ``smoketest_task_id`` for cleanup only, and
     ``merge_grade_task_id`` from ``version.last_qualification``, marks each
     non-terminal task as ``CANCELLED`` with ``vm_stopped_at`` set to now, and
     fire-and-forgets VM teardown.  Best-effort per child: a failure on one
@@ -468,11 +468,12 @@ async def _force_finalize_timed_out_qualification(
             message=(
                 f"Qualification for release v{version.version_number} was "
                 f"stuck pending for {age_minutes:.0f} minutes — a qualifier "
-                f"child (release_audit / qualifier-smoketest) never reached a "
+                f"required qualifier child never reached a "
                 f"terminal state. Force-finalized as a blocked qualification "
                 f"(blocker={blocker}); the version returns to the "
                 f"stabilize phase for the next strategic cycle."
             ),
+            event_type="release.qualification_timeout",
         )
     )
     logger.warning(
@@ -535,6 +536,7 @@ async def _force_finalize_sweep_crash_loop(
                 f"returns to the stabilize phase. Inspect the release_qualifier "
                 f"logs for the root cause."
             ),
+            event_type="release.qualification_crash_loop",
         )
     )
     await _notify_operator(
@@ -1233,6 +1235,18 @@ async def _promote_dry_run_pass_if_enabled(
         ):
             return False
 
+        # A historical dry-run pass that participated in the retired qualifier
+        # VM smoke gate is not a current-policy verdict.  Refuse the cheap
+        # direct-promote path; the sweep's following dry-run re-driver will
+        # clear the cached verdict and run the current qualification instead.
+        if release_qualifier._legacy_smoke_tainted_verdict(qual):
+            logger.info(
+                "[RELEASE_QUALIFIER] dry_run promote: v%d verdict includes "
+                "retired qualifier smoke — re-qualification required",
+                version.version_number,
+            )
+            return False
+
         # Only act when promotion is now enabled for this project.
         if not resolve_project_promotion_enabled(version.project_id):
             return False
@@ -1382,6 +1396,7 @@ async def _check_full_suite_drift_sentinel(
                             + " Harvest remediation spawning."
                         ),
                         dedupe_key=dedupe_key,
+                        event_type="release.ci_unresolved",
                     )
                 )
                 await session.commit()
@@ -1394,7 +1409,18 @@ async def _check_full_suite_drift_sentinel(
 
             # Harvest is best-effort and self-gating (per-hour/concurrent caps).
             integration_branch, _ = release_qualifier._lts_branch_names(project)
-            auto_rem = (project.design_doc or {}).get("_auto_remediation") or {}
+            from app.project_telemetry import read_telemetry_or_doc
+
+            auto_rem = (
+                await read_telemetry_or_doc(
+                    session,
+                    version.project_id,
+                    project.design_doc,
+                    "_auto_remediation",
+                    {},
+                )
+                or {}
+            )
             await _harvest_promotion_ci_failures(
                 project_id=version.project_id,
                 version_id=version.id,
@@ -1781,9 +1807,7 @@ async def sweep_stuck_qualifications(
     handles two situations:
 
       * **Both required children terminal** (``COMPLETED`` / ``FAILED`` /
-        ``CANCELLED``) — finalizes the version.  The qualifier-smoketest child
-        is optional (audit H3): when the qualifying run recorded
-        ``smoketest_enabled == False`` only the audit child gates this branch.
+        ``CANCELLED``) — finalizes the version.  Legacy qualifier-smoke ids never gate this branch.
 
       * **Pending longer than ``_MAX_QUALIFICATION_DURATION_SECONDS``** (audit
         H2) — force-finalizes the qualification as blocked (blocker

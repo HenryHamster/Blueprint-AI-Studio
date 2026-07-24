@@ -71,7 +71,6 @@ import {
   buildCompletionDebtSection,
   buildPendingFollowupsSection,
   buildPayloadStalenessSection,
-  buildResidentExamLeadsSection,
 } from './strategic-sections.js';
 
 /**
@@ -87,6 +86,28 @@ export function renderStrategicPromptSuffix(payload: Record<string, unknown>): s
   return payload.prompt_suffix
     ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}`
     : '';
+}
+
+export function resolveStrategicPurpose(
+  payload: Record<string, unknown>,
+  problemModel: Record<string, unknown> | undefined,
+): string | undefined {
+  const intent = problemModel?.intent as Record<string, unknown> | undefined;
+  const vision = payload.vision as Record<string, unknown> | undefined;
+  const candidates = [
+    payload.effective_purpose,
+    intent?.user_purpose,
+    intent?.purpose,
+    vision?.user_purpose,
+    vision?.purpose,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const normalized = candidate.trim();
+    if (normalized && normalized !== '...' && !/^<[^>]+>$/.test(normalized)) return normalized;
+  }
+  return undefined;
 }
 
 /**
@@ -457,14 +478,9 @@ export async function handleStrategic(
       ? payload.held_directions as Array<Record<string, unknown>>
       : [];
 
-    const residentExamLeads = Array.isArray(payload.resident_exam_leads)
-      ? payload.resident_exam_leads as Array<Record<string, unknown>>
-      : [];
-
     const systemMaturitySection = buildSystemMaturitySection(systemMaturity);
     const driftSection = buildDriftSection(driftSignals);
     const heldDirectionsSection = buildHeldDirectionsSection(heldDirections);
-    const residentExamLeadsSection = buildResidentExamLeadsSection(residentExamLeads);
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
@@ -580,22 +596,8 @@ export async function handleStrategic(
     const problemModelJson = problemModel && Object.keys(problemModel).length > 0
       ? JSON.stringify(problemModel, null, 2)
       : '';
-    // Extract the operator-set durable intent.purpose so it can be threaded
-    // into the thinker's repair/reopen prompt — without it, a repair session
-    // that runs fresh (no prior conversation) has no source-of-truth for the
-    // purpose string and may echo a schema placeholder, exhausting retries.
-    const intent = problemModel?.intent as Record<string, unknown> | undefined;
-    // When intent.purpose is blank/schema-placeholder but intent.user_purpose
-    // is populated, fall back to user_purpose — the backend's
-    // _preserve_operator_intent would heal the blank from user_purpose on
-    // write-back, but the agent-side thinker validation rejects before that
-    // healing runs. Pre-applying the fallback here lets the thinker's repair
-    // prompt supply the real ground truth.
-    const rawPurpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : '';
-    const isPlaceholder = rawPurpose === '' || rawPurpose === '...' || /^<[^>]+>$/.test(rawPurpose);
-    const currentPurpose = isPlaceholder
-      ? (typeof intent?.user_purpose === 'string' ? intent.user_purpose.trim() : undefined)
-      : rawPurpose;
+    // Use the backend-resolved value first, with legacy payload fallbacks.
+    const currentPurpose = resolveStrategicPurpose(payload, problemModel);
 
     // ── Problem-model size/health signal (soft) ──
     // Computed by the backend from the DURABLE pre-trim model (honest counts).
@@ -888,7 +890,6 @@ prompts, schemas, tools, or orchestration.` : '';
       systemMaturitySection,
       driftSection,
       heldDirectionsSection,
-      residentExamLeadsSection,
       recentWorkSection,
       feedbackSection,
       questionSection,
@@ -964,7 +965,6 @@ prompts, schemas, tools, or orchestration.` : '';
       ['system_maturity', thinkerParams.systemMaturitySection],
       ['drift', thinkerParams.driftSection],
       ['held_directions', thinkerParams.heldDirectionsSection || ''],
-      ['resident_exam_leads', thinkerParams.residentExamLeadsSection || ''],
       ['recent_work', thinkerParams.recentWorkSection],
       ['feedback', thinkerParams.feedbackSection],
       ['question', thinkerParams.questionSection],
@@ -1222,9 +1222,14 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       deadline_seconds; optional success_criterion {metric,
 #                       operator (<|>|<=|>=), threshold}, accelerator (T4|L4|V100
 #                       — requests ONE GPU, no machine_type needed), container_image
-#                       (run command INSIDE a docker image — REQUIRED for CUDA/NGC
-#                       stacks the repo cannot pip-install natively, else it runs
-#                       BARE and dies ModuleNotFoundError), container_registry_auth
+#                       (run command INSIDE a docker image — if a project-baked image
+#                       is listed in the Self-hosted compute section above, OMIT this
+#                       field and the platform defaults to that digest-pinned image;
+#                       only set it when you need a DIFFERENT NGC/CUDA stack the baked
+#                       image does not cover; for projects with no baked image it is
+#                       REQUIRED for CUDA/NGC stacks the repo cannot pip-install
+#                       natively, else the command runs BARE and dies
+#                       ModuleNotFoundError), container_registry_auth
 #                       {server,username,password} (private/gated registries only),
 #                       setup_step (host-level prep run as bare bash -lc OUTSIDE the
 #                       container; container-dependent installs go in command, NOT
@@ -1261,9 +1266,13 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable claim with a concrete threshold>", "command": "<command that writes the declared metric as JSON to $BLUEPRINT_RESULT_FILE>", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
 # GPU / containerized variant — accelerator requests one GPU; container_image runs
-# the command INSIDE a CUDA/NGC image (REQUIRED when the runtime is not pip-installable,
-# else the command runs bare and dies ModuleNotFoundError). Add container_registry_auth
-# only for a private registry; setup_step is host-level prep run OUTSIDE the container.
+# the command INSIDE a CUDA/NGC image. If a project-baked compute image is listed in
+# the "Self-hosted compute" section above, OMIT container_image — the platform
+# defaults to that digest-pinned image automatically. Only set container_image when
+# you need a DIFFERENT stack the baked image does not cover, or for projects with no
+# baked image where the runtime is not pip-installable (else the command runs bare
+# and dies ModuleNotFoundError). Add container_registry_auth only for a private
+# registry; setup_step is host-level prep run OUTSIDE the container.
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable GPU claim with a concrete threshold>", "command": "<command — installs+run go HERE, inside the image; must write the metric JSON to $BLUEPRINT_RESULT_FILE>", "accelerator": "T4", "container_image": "nvcr.io/nvidia/tensorflow:25.01", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
 # Multi-arm variant: use "arms" + "declared_metric" instead of a single "command".
 # Each arm writes its declared_metric key to $BLUEPRINT_RESULT_FILE as usual; the

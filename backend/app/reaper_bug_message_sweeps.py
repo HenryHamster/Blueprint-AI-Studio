@@ -1629,6 +1629,7 @@ async def sweep_wake_delivery_stall_alerts(
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
+            event_type="deployment.wake_delivery_stalled",
         )
         session.add(alert)
         new_alerts.append(alert)

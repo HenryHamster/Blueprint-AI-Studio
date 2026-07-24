@@ -135,6 +135,34 @@ describe('useMessageList', () => {
     expect(res.openMessages.map(m => m.id)).toEqual(['b']);
   });
 
+  it('criticalOnly retains server-flagged needsOperator messages', () => {
+    // A FEEDBACK with audience=operator-action-needed is flagged needs_operator by
+    // the server's derive_needs_action() but isCriticalSeverity() returns false for it.
+    // criticalOnly must not drop it from openMessages or highSignalOpen because the
+    // badge already counts it via the server attention model.
+    const blocker = makeMsg({ id: 'b', message_type: 'BLOCKER' });
+    const needsOpFeedback = makeMsg({
+      id: 'nof',
+      message_type: 'FEEDBACK',
+      context: { audience: 'operator-action-needed' },
+    });
+    const nonCriticalNote = makeMsg({ id: 'n', message_type: 'NOTE', context: { event_type: 'task_started' } });
+    const needsOperatorIds = new Set(['nof']);
+
+    const res = run({
+      messages: [blocker, needsOpFeedback, nonCriticalNote],
+      criticalOnly: true,
+      needsOperatorIds,
+    });
+
+    // needsOpFeedback must survive the criticalOnly gate because it is server-flagged
+    expect(res.openMessages.map(m => m.id).sort()).toEqual(['b', 'nof'].sort());
+    // non-critical NOTE without needsOperatorIds is still excluded
+    expect(res.openMessages.map(m => m.id)).not.toContain('n');
+    // needsOpFeedback is promoted to highSignalOpen by the attention model
+    expect(res.highSignalOpen.map(m => m.id)).toContain('nof');
+  });
+
   it('needsActionOnly=true narrows highSignalOpen to needsOperatorIds only and empties routineOpen', () => {
     const blocker = makeMsg({ id: 'b', message_type: 'BLOCKER' });
     const needsOp = makeMsg({ id: 'na', message_type: 'NOTE', from_type: 'system', context: { event_type: 'failure_alert' } });

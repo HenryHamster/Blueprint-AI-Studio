@@ -39,6 +39,8 @@ from app.task_locking import deployment_state_lock
 from app.auth import get_current_user, require_admin
 from app.github import generate_installation_access_token
 from app.max_plan_pool import (
+    get_meter_reliability_stats as _get_meter_reliability_stats,
+    get_usage_headroom_armable_since as _get_usage_headroom_armable_since,
     provider_selection_mode as _provider_selection_mode_from_config,
 )
 from app.providers.registry import get_provider, list_providers
@@ -113,6 +115,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "capability_proof_gate_auto_graduation_observe_threshold",
         "capability_proof_gate_auto_graduation_enforce_threshold",
         "capability_proof_execution_trials_enabled",
+        "acceptance_earn_execution_trials_enabled",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -185,16 +188,13 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_audit_defer_escalation_threshold",
         "residual_remediation_cooldown_hours",
         "rollup_merge_queue_enabled",
-        "review_second_opinion_gate_enabled",
-        "blind_multi_reviewer_gate_enabled",
-        "review_second_opinion_sample_rate",
+        "env_preflight_enabled",
         "smoketest_enabled",
+        "walkthrough_e2e_enabled_by_project",
         "spend_approval_timeout_hours",
-        "strategic_retirement_challenge_gate_mode",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
-        # Resident strategic session (dead-man's-switch safety + resident agent).
-        "strategic_session_enabled",
+        # Strategic session cadence and safety knobs.
         "strategic_continuation_ttl_seconds",
         "strategic_local_hold_timeout_seconds",
         "strategic_session_idle_tick_seconds",
@@ -203,14 +203,16 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "strategic_session_max_ops_per_turn",
         "strategic_session_autonomous_turn_timeout_seconds",
         "strategic_session_max_unattended_seconds",
-        "resident_session_heartbeat_stale_seconds",
         "task_type_categories",
         "task_type_model_preferences",
         "task_type_provider_overrides",
         "task_type_routing",
         # Proactive account-usage headroom (advisory; ships dark by default).
         "usage_headroom_gate_enabled",
+        "usage_headroom_auto_arm_mode",
+        "usage_headroom_auto_arm_observation_minutes",
         "usage_headroom_long_running_task_types",
+        "usage_headroom_min_coverage_pct",
         "usage_headroom_threshold_pct",
         # Side-effect-only key: fires a test webhook, never stored.
         "test_notification",
@@ -243,6 +245,21 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "direction_lifetime_non_merge_threshold",
         "direction_lifetime_min_merge_rate",
         "direction_review_recommendation_threshold",
+        # Runner health thresholds — govern liveness, degradation, resource-pressure
+        # detection, escalation, and data-retention windows.  All are configurable
+        # at runtime so operators with different hardware profiles can tune without
+        # a deploy.
+        "runner_liveness_seconds",
+        "runner_degraded_failure_threshold",
+        "runner_low_disk_threshold_bytes",
+        "runner_low_memory_threshold_bytes",
+        "runner_escalation_age_seconds",
+        "runner_idle_gpu_threshold_pct",
+        "runner_token_stale_days",
+        "runner_post_update_silence_seconds",
+        "runner_heartbeat_retention_days",
+        "vm_low_disk_threshold_bytes",
+        "vm_low_memory_threshold_bytes",
     }
 )
 
@@ -301,6 +318,7 @@ _VALID_NOTIFICATION_EVENTS = frozenset(
         "RUNNER_DEGRADED_ESCALATED",
         "RUNNER_FLEET_OFFLINE",
         "RUNNER_LOW_DISK",
+        "RUNNER_LOW_MEMORY",
         "RUNNER_OUTAGE_ESCALATED",
         "RUNNER_LOCAL_HOLD",
         "RUNNER_CONTAINER_HOLD",
@@ -414,6 +432,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "RUNNER_DEGRADED_ESCALATED",
                 "RUNNER_FLEET_OFFLINE",
                 "RUNNER_LOW_DISK",
+                "RUNNER_LOW_MEMORY",
                 "RUNNER_OUTAGE_ESCALATED",
                 "RUNNER_LOCAL_HOLD",
                 "RUNNER_CONTAINER_HOLD",
@@ -512,6 +531,35 @@ async def get_settings(
             exc_info=True,
         )
 
+    # Fleet-wide usage-meter reliability summary. Best-effort: a failure here
+    # must never break the settings load.
+    _min_coverage_pct = int(_runtime_config.get("usage_headroom_min_coverage_pct", 80))
+    meter_reliability: dict = {
+        "meters_eligible": 0,
+        "meters_known": 0,
+        "meters_stale": 0,
+        "meters_dark": 0,
+        "meters_ineligible": 0,
+        "dark_by_reason": {},
+        "coverage_ratio": None,
+        "persist_failure_count": 0,
+        "armable": False,
+    }
+    try:
+        meter_reliability = await _get_meter_reliability_stats(
+            min_coverage_pct=_min_coverage_pct
+        )
+    except Exception:
+        logger.warning(
+            "failed to compute meter reliability stats for settings",
+            exc_info=True,
+        )
+
+    # Leader-memory 'armable-since' marker for the auto-arm reconciler. None on
+    # non-leader instances (they do not run the reconciler) or when not holding.
+    _armable_since = _get_usage_headroom_armable_since()
+    _armable_since_iso = _armable_since.isoformat() if _armable_since else None
+
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -585,6 +633,9 @@ async def get_settings(
         "capability_proof_trial_projection": capability_proof_trial_projection,
         "capability_proof_execution_trials_enabled": bool(
             _runtime_config.get("capability_proof_execution_trials_enabled", False)
+        ),
+        "acceptance_earn_execution_trials_enabled": bool(
+            _runtime_config.get("acceptance_earn_execution_trials_enabled", False)
         ),
         "metrics_integrity_sweep_interval_minutes": int(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
@@ -663,12 +714,27 @@ async def get_settings(
         "usage_headroom_gate_enabled": bool(
             _runtime_config.get("usage_headroom_gate_enabled", False)
         ),
+        # Auto-arm reconciler state (closes the loop: usage_headroom_gate_enabled
+        # is now the reconciler-written EFFECTIVE state in auto mode). Additive —
+        # existing consumers keep their fields unchanged.
+        "usage_headroom_auto_arm_mode": str(
+            _runtime_config.get("usage_headroom_auto_arm_mode", "auto")
+        ),
+        "usage_headroom_auto_arm_observation_minutes": int(
+            _runtime_config.get("usage_headroom_auto_arm_observation_minutes", 60)
+        ),
+        # Leader-memory marker of when `armable` first became (and has since
+        # continuously held) True. None on non-leader instances or when not
+        # currently holding — the sustained-window clock the reconciler uses.
+        "usage_headroom_armable_since": _armable_since_iso,
+        "usage_headroom_min_coverage_pct": _min_coverage_pct,
         "usage_headroom_threshold_pct": _runtime_config.get(
             "usage_headroom_threshold_pct", 90
         ),
         "usage_headroom_long_running_task_types": _runtime_config.get(
             "usage_headroom_long_running_task_types", []
         ),
+        "meter_reliability": meter_reliability,
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get(
             "autonomous_periodic_tasks", {}
@@ -692,7 +758,7 @@ async def get_settings(
             * 2,
         ),
         "max_parallel_research_per_project": _runtime_config.get(
-            "max_parallel_research_per_project", 3
+            "max_parallel_research_per_project", 6
         ),
         "max_total_research_per_project": _runtime_config.get(
             "max_total_research_per_project", 5
@@ -706,9 +772,6 @@ async def get_settings(
         ),
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
-        ),
-        "strategic_session_enabled": bool(
-            _runtime_config.get("strategic_session_enabled", False)
         ),
         "strategic_continuation_ttl_seconds": _runtime_config.get(
             "strategic_continuation_ttl_seconds", 1500
@@ -734,9 +797,6 @@ async def get_settings(
         "strategic_session_max_unattended_seconds": _runtime_config.get(
             "strategic_session_max_unattended_seconds", 14400
         ),
-        "resident_session_heartbeat_stale_seconds": _runtime_config.get(
-            "resident_session_heartbeat_stale_seconds", 1500
-        ),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "promotion_enabled_by_project": {
             str(k): bool(v)
@@ -744,7 +804,14 @@ async def get_settings(
                 _runtime_config.get("promotion_enabled_by_project") or {}
             ).items()
         },
+        "env_preflight_enabled": bool(_runtime_config.get("env_preflight_enabled", True)),
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
+        "walkthrough_e2e_enabled_by_project": {
+            str(k): bool(v)
+            for k, v in (
+                _runtime_config.get("walkthrough_e2e_enabled_by_project") or {}
+            ).items()
+        },
         "merge_grade_block_threshold": float(
             _runtime_config.get("merge_grade_block_threshold", 0.0) or 0.0
         ),
@@ -761,19 +828,6 @@ async def get_settings(
         ),
         "rollup_merge_queue_enabled": bool(
             _runtime_config.get("rollup_merge_queue_enabled", True)
-        ),
-        "review_second_opinion_gate_enabled": bool(
-            _runtime_config.get("review_second_opinion_gate_enabled", True)
-        ),
-        "blind_multi_reviewer_gate_enabled": bool(
-            _runtime_config.get("blind_multi_reviewer_gate_enabled", True)
-        ),
-        "review_second_opinion_sample_rate": float(
-            _runtime_config.get("review_second_opinion_sample_rate", 1.0)
-        ),
-        "strategic_retirement_challenge_gate_mode": str(
-            _runtime_config.get("strategic_retirement_challenge_gate_mode", "observe")
-            or "observe"
         ),
         "cochange_decomposition_enabled": bool(
             _runtime_config.get("cochange_decomposition_enabled", False)
@@ -921,6 +975,7 @@ async def get_settings(
                         "RUNNER_DEGRADED_ESCALATED",
                         "RUNNER_FLEET_OFFLINE",
                         "RUNNER_LOW_DISK",
+                        "RUNNER_LOW_MEMORY",
                         "RUNNER_OUTAGE_ESCALATED",
                     ],
                     "throttle_seconds": 30,
@@ -968,6 +1023,40 @@ async def get_settings(
         ),
         "direction_review_recommendation_threshold": int(
             _runtime_config.get("direction_review_recommendation_threshold", 2)
+        ),
+        # Runner health thresholds
+        "runner_liveness_seconds": int(
+            _runtime_config.get("runner_liveness_seconds", 300)
+        ),
+        "runner_degraded_failure_threshold": int(
+            _runtime_config.get("runner_degraded_failure_threshold", 3)
+        ),
+        "runner_low_disk_threshold_bytes": int(
+            _runtime_config.get("runner_low_disk_threshold_bytes", 1_073_741_824)
+        ),
+        "runner_low_memory_threshold_bytes": int(
+            _runtime_config.get("runner_low_memory_threshold_bytes", 536_870_912)
+        ),
+        "runner_escalation_age_seconds": int(
+            _runtime_config.get("runner_escalation_age_seconds", 14_400)
+        ),
+        "runner_idle_gpu_threshold_pct": int(
+            _runtime_config.get("runner_idle_gpu_threshold_pct", 10)
+        ),
+        "runner_token_stale_days": int(
+            _runtime_config.get("runner_token_stale_days", 90)
+        ),
+        "runner_post_update_silence_seconds": int(
+            _runtime_config.get("runner_post_update_silence_seconds", 600)
+        ),
+        "runner_heartbeat_retention_days": int(
+            _runtime_config.get("runner_heartbeat_retention_days", 7)
+        ),
+        "vm_low_disk_threshold_bytes": int(
+            _runtime_config.get("vm_low_disk_threshold_bytes", 1_073_741_824)
+        ),
+        "vm_low_memory_threshold_bytes": int(
+            _runtime_config.get("vm_low_memory_threshold_bytes", 536_870_912)
         ),
     }
 
@@ -1329,6 +1418,14 @@ async def _apply_settings(
                 detail="capability_proof_execution_trials_enabled must be a boolean",
             )
         _runtime_config["capability_proof_execution_trials_enabled"] = val
+    if "acceptance_earn_execution_trials_enabled" in payload:
+        val = payload["acceptance_earn_execution_trials_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="acceptance_earn_execution_trials_enabled must be a boolean",
+            )
+        _runtime_config["acceptance_earn_execution_trials_enabled"] = val
     for _cap_grad_key, _cap_grad_default in (
         ("capability_proof_gate_auto_graduation_observe_threshold", 0.5),
         ("capability_proof_gate_auto_graduation_enforce_threshold", 0.95),
@@ -1397,8 +1494,33 @@ async def _apply_settings(
         _runtime_config["ci_backstop_timeout_minutes"] = val
     if "promotion_enabled" in payload:
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
+    if "env_preflight_enabled" in payload:
+        _runtime_config["env_preflight_enabled"] = bool(payload["env_preflight_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "walkthrough_e2e_enabled_by_project" in payload:
+        raw = payload["walkthrough_e2e_enabled_by_project"]
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "walkthrough_e2e_enabled_by_project must be a mapping of "
+                    "project-id strings to booleans"
+                ),
+            )
+        cleaned_walkthrough: dict[str, bool] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "walkthrough_e2e_enabled_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            cleaned_walkthrough[sid] = bool(value)
+        _runtime_config["walkthrough_e2e_enabled_by_project"] = cleaned_walkthrough
     if "no_ci_test_gate_enabled" in payload:
         _runtime_config["no_ci_test_gate_enabled"] = bool(
             payload["no_ci_test_gate_enabled"]
@@ -1411,6 +1533,36 @@ async def _apply_settings(
                 detail="usage_headroom_gate_enabled must be a boolean",
             )
         _runtime_config["usage_headroom_gate_enabled"] = val
+    if "usage_headroom_auto_arm_mode" in payload:
+        val = payload["usage_headroom_auto_arm_mode"]
+        if not isinstance(val, str) or val.strip().lower() not in (
+            "auto",
+            "manual",
+            "off",
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_auto_arm_mode must be one of "
+                "'auto', 'manual', 'off'",
+            )
+        _runtime_config["usage_headroom_auto_arm_mode"] = val.strip().lower()
+    if "usage_headroom_auto_arm_observation_minutes" in payload:
+        try:
+            val = int(payload["usage_headroom_auto_arm_observation_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_auto_arm_observation_minutes must be a number",
+            )
+        # A positive number of minutes with a sane upper bound (1 day). The
+        # window governs how long `armable` must hold before auto mode arms.
+        if not (1 <= val <= 1440):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_auto_arm_observation_minutes must be "
+                "between 1 and 1440",
+            )
+        _runtime_config["usage_headroom_auto_arm_observation_minutes"] = val
     if "usage_headroom_threshold_pct" in payload:
         try:
             val = int(payload["usage_headroom_threshold_pct"])
@@ -1427,6 +1579,20 @@ async def _apply_settings(
                 detail="usage_headroom_threshold_pct must be between 1 and 100",
             )
         _runtime_config["usage_headroom_threshold_pct"] = val
+    if "usage_headroom_min_coverage_pct" in payload:
+        try:
+            val = int(payload["usage_headroom_min_coverage_pct"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_min_coverage_pct must be a number",
+            )
+        if not (0 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_min_coverage_pct must be between 0 and 100",
+            )
+        _runtime_config["usage_headroom_min_coverage_pct"] = val
     if "usage_headroom_long_running_task_types" in payload:
         raw = payload["usage_headroom_long_running_task_types"]
         if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
@@ -1489,50 +1655,40 @@ async def _apply_settings(
             raise HTTPException(
                 status_code=400, detail="promotion_weights must be a dict"
             )
-        _PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
-        # ``completion_debt`` is an OPTIONAL, SEPARATE blend factor (NOT part of
-        # the three-core-weight sum) — accept it but require the three core keys.
-        _allowed_weight_keys = set(_PROMOTION_WEIGHT_KEYS) | {"completion_debt"}
-        missing_core = set(_PROMOTION_WEIGHT_KEYS) - set(val.keys())
+        _ACTIVE_WEIGHT_KEYS = ("audit", "test_erosion")
+        _allowed_weight_keys = set(_ACTIVE_WEIGHT_KEYS) | {"smoketest", "completion_debt"}
+        missing_core = set(_ACTIVE_WEIGHT_KEYS) - set(val.keys())
         extra_keys = set(val.keys()) - _allowed_weight_keys
         if missing_core or extra_keys:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "promotion_weights must have the keys "
-                    f"{sorted(_PROMOTION_WEIGHT_KEYS)} "
-                    "and may optionally include 'completion_debt'"
-                ),
+                detail="promotion_weights requires audit and test_erosion; legacy smoketest and completion_debt are optional",
             )
+        declared_keys = [*_ACTIVE_WEIGHT_KEYS]
+        if "smoketest" in val:
+            declared_keys.append("smoketest")
         cleaned_weights: Dict[str, float] = {}
-        for wk in _PROMOTION_WEIGHT_KEYS:
+        for wk in declared_keys:
             try:
                 wv = float(val[wk])
             except (ValueError, TypeError):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"promotion_weights[{wk}] must be a number",
-                )
+                raise HTTPException(status_code=400, detail=f"promotion_weights[{wk}] must be a number")
             if wv < 0.0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"promotion_weights[{wk}] must be non-negative",
-                )
+                raise HTTPException(status_code=400, detail=f"promotion_weights[{wk}] must be non-negative")
             cleaned_weights[wk] = wv
-        # Weights decide what reaches production main: a sum != 1.0 either
-        # saturates confidence (gate effectively disabled) or makes it
-        # unreachable (gate stuck closed). Reject a mis-weighted set rather than
-        # silently honour it — same invariant release_qualifier._load_policy
-        # enforces on the YAML file.  Only the THREE CORE weights participate in
-        # this sum; completion_debt is validated separately below.
-        weight_sum = sum(cleaned_weights.values())
-        if abs(weight_sum - 1.0) > 0.01:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"),
-            )
+        declared_sum = sum(cleaned_weights.values())
+        if abs(declared_sum - 1.0) > 0.01:
+            raise HTTPException(status_code=400, detail=f"promotion_weights must sum to ~1.0 (got {declared_sum:.4f})")
+        from decimal import Decimal
+
+        active_decimals = {
+            wk: Decimal(str(val[wk])) for wk in _ACTIVE_WEIGHT_KEYS
+        }
+        active_sum = sum(active_decimals.values(), Decimal("0"))
+        if active_sum <= 0:
+            raise HTTPException(status_code=400, detail="active promotion weights must be positive")
         stored_weights = {
-            wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
+            wk: float(active_decimals[wk] / active_sum) for wk in _ACTIVE_WEIGHT_KEYS
         }
         # Optional completion_debt blend factor: a number in [0.0, 0.5].
         if "completion_debt" in val:
@@ -1595,25 +1751,12 @@ async def _apply_settings(
                 detail="spend_approval_timeout_hours must be between 1 and 168",
             )
         _runtime_config["spend_approval_timeout_hours"] = val
-    if "strategic_session_enabled" in payload:
-        val = payload["strategic_session_enabled"]
-        if not isinstance(val, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="strategic_session_enabled must be a boolean",
-            )
-        _runtime_config["strategic_session_enabled"] = val
-        if val:
-            _debt_keys_to_resolve.append("dormant_knob:strategic_session_enabled")
-    # Resident strategic-session integer knobs. Each is clamped to a sane range:
+    # Strategic-session integer knobs. Each is clamped to a sane range:
     # the continuation TTL and local-hold timeout are the safety windows (min 60s
     # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
-    # operator can NEVER reintroduce a >12h local-pin wall — the exact regression
-    # the resident-session dead-man's switch removed); the idle tick and turn
-    # timeout bound the resident loop cadence; the unattended cap bounds total
-    # autonomous lifetime (ceiling 8h, still well under a 12h wall); the resident
-    # heartbeat-stale window is the reaper carve-out (<=2h so a dead runner is
-    # still reclaimed).
+    # operator can NEVER reintroduce a >12h local-pin wall); the idle tick and
+    # turn timeout bound the session loop cadence; the unattended cap bounds total
+    # autonomous lifetime (ceiling 8h, still well under a 12h wall).
     for _key, _lo, _hi in (
         ("strategic_continuation_ttl_seconds", 60, 7_200),
         ("strategic_local_hold_timeout_seconds", 60, 7_200),
@@ -1630,7 +1773,6 @@ async def _apply_settings(
         # 15-min absolute hard ceiling enforced agent-side.
         ("strategic_session_autonomous_turn_timeout_seconds", 30, 3_600),
         ("strategic_session_max_unattended_seconds", 60, 28_800),
-        ("resident_session_heartbeat_stale_seconds", 60, 7_200),
     ):
         if _key in payload:
             try:
@@ -1724,55 +1866,6 @@ async def _apply_settings(
                 detail="rollup_merge_queue_enabled must be a boolean",
             )
         _runtime_config["rollup_merge_queue_enabled"] = val
-    if "review_second_opinion_gate_enabled" in payload:
-        val = payload["review_second_opinion_gate_enabled"]
-        if not isinstance(val, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="review_second_opinion_gate_enabled must be a boolean",
-            )
-        _runtime_config["review_second_opinion_gate_enabled"] = val
-    if "blind_multi_reviewer_gate_enabled" in payload:
-        val = payload["blind_multi_reviewer_gate_enabled"]
-        if not isinstance(val, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="blind_multi_reviewer_gate_enabled must be a boolean",
-            )
-        _runtime_config["blind_multi_reviewer_gate_enabled"] = val
-    if "review_second_opinion_sample_rate" in payload:
-        try:
-            fval = float(payload["review_second_opinion_sample_rate"])
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=400,
-                detail="review_second_opinion_sample_rate must be a number",
-            )
-        if not (0.0 <= fval <= 1.0):
-            raise HTTPException(
-                status_code=400,
-                detail="review_second_opinion_sample_rate must be between 0.0 and 1.0",
-            )
-        _runtime_config["review_second_opinion_sample_rate"] = round(fval, 4)
-    if "strategic_retirement_challenge_gate_mode" in payload:
-        val = (
-            str(payload["strategic_retirement_challenge_gate_mode"] or "")
-            .strip()
-            .lower()
-        )
-        if val not in ("observe", "advisory", "enforce"):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "strategic_retirement_challenge_gate_mode must be one of: "
-                    "observe, advisory, enforce"
-                ),
-            )
-        _runtime_config["strategic_retirement_challenge_gate_mode"] = val
-        if val == "enforce":
-            _debt_keys_to_resolve.append(
-                "dormant_knob:strategic_retirement_challenge_gate_mode"
-            )
     if "cochange_decomposition_enabled" in payload:
         val = payload["cochange_decomposition_enabled"]
         if not isinstance(val, bool):
@@ -2356,6 +2449,42 @@ async def _apply_settings(
                 detail="direction_review_recommendation_threshold must be between 1 and 100",
             )
         _runtime_config["direction_review_recommendation_threshold"] = val
+    # ── Runner health thresholds ─────────────────────────────────────────────
+    for _rh_key, _rh_lo, _rh_hi in (
+        # Liveness window: 30s minimum (fast heartbeat cycle) to 3600s (1h).
+        ("runner_liveness_seconds", 30, 3_600),
+        # Degraded-failure threshold: 1 (any failure = degraded) to 50 (tolerant).
+        ("runner_degraded_failure_threshold", 1, 50),
+        # Resource-pressure floors: 1 MiB to 1 TiB.
+        ("runner_low_disk_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        ("runner_low_memory_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        ("vm_low_disk_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        ("vm_low_memory_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        # Escalation age: 60s to 7 days.
+        ("runner_escalation_age_seconds", 60, 604_800),
+        # Idle-GPU threshold: 0%–100%.
+        ("runner_idle_gpu_threshold_pct", 0, 100),
+        # Token staleness: 1–365 days.
+        ("runner_token_stale_days", 1, 365),
+        # Post-update silence window: 60s to 1h.
+        ("runner_post_update_silence_seconds", 60, 3_600),
+        # Heartbeat retention: 1–365 days.
+        ("runner_heartbeat_retention_days", 1, 365),
+    ):
+        if _rh_key in payload:
+            try:
+                _rh_val = int(payload[_rh_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_rh_key} must be a number",
+                )
+            if not (_rh_lo <= _rh_val <= _rh_hi):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_rh_key} must be between {_rh_lo} and {_rh_hi}",
+                )
+            _runtime_config[_rh_key] = _rh_val
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
@@ -3416,7 +3545,7 @@ async def _apply_settings(
                         "max_active_directions", 10
                     ),
                     "max_parallel_research_per_project": _runtime_config.get(
-                        "max_parallel_research_per_project", 3
+                        "max_parallel_research_per_project", 6
                     ),
                     "auto_debug_enabled": _runtime_config.get(
                         "auto_debug_enabled", True
@@ -3480,22 +3609,6 @@ async def _apply_settings(
                     # reverts to the True default).
                     "rollup_merge_queue_enabled": bool(
                         _runtime_config.get("rollup_merge_queue_enabled", True)
-                    ),
-                    # Persist the second-opinion gate flag so an operator
-                    # disable survives a Cloud Run restart (config-sync reads it
-                    # back on boot; otherwise the in-memory value reverts to the
-                    # True default).
-                    "review_second_opinion_gate_enabled": bool(
-                        _runtime_config.get("review_second_opinion_gate_enabled", True)
-                    ),
-                    "review_second_opinion_sample_rate": float(
-                        _runtime_config.get("review_second_opinion_sample_rate", 1.0)
-                    ),
-                    "strategic_retirement_challenge_gate_mode": str(
-                        _runtime_config.get(
-                            "strategic_retirement_challenge_gate_mode", "observe"
-                        )
-                        or "observe"
                     ),
                     "cochange_decomposition_enabled": bool(
                         _runtime_config.get("cochange_decomposition_enabled", False)
@@ -3652,6 +3765,13 @@ async def _apply_settings(
                     "smoketest_enabled": bool(
                         _runtime_config.get("smoketest_enabled", False)
                     ),
+                    # Persist the env-preflight dimension kill-switch so an operator
+                    # toggle survives a Cloud Run restart (config-sync reads this
+                    # key back on boot; without it the in-memory value reverts to
+                    # the _RUNTIME_CONFIG_DEFAULTS default — True).
+                    "env_preflight_enabled": bool(
+                        _runtime_config.get("env_preflight_enabled", True)
+                    ),
                     # Persist the no-CI verify_tests merge-gate kill-switch so an
                     # operator toggle survives a Cloud Run restart (config-sync
                     # reads this key back on boot; without it the in-memory value
@@ -3739,6 +3859,13 @@ async def _apply_settings(
                             "capability_proof_execution_trials_enabled", False
                         )
                     ),
+                    # Persist the dark acceptance earn-loop execution-trial flag so
+                    # an operator enable survives a Cloud Run restart.
+                    "acceptance_earn_execution_trials_enabled": bool(
+                        _runtime_config.get(
+                            "acceptance_earn_execution_trials_enabled", False
+                        )
+                    ),
                     "adversarial_spawn_gate_infra_failure_mode": str(
                         _runtime_config.get(
                             "adversarial_spawn_gate_infra_failure_mode", "observe"
@@ -3752,15 +3879,9 @@ async def _apply_settings(
                     "cloud_run_task_type_allowlist": sorted(
                         _runtime_config.get("cloud_run_task_type_allowlist") or []
                     ),
-                    # Persist the resident strategic-session settings so an operator
-                    # enable/tune survives a Cloud Run restart and propagates to the
-                    # leader across instances. runtime_config_state.sync_* reads these
-                    # keys back on boot / every sync cycle; without them an enable
-                    # reverts to the env default on restart and a multi-instance PATCH
-                    # never reaches the leader that owns the resident session.
-                    "strategic_session_enabled": bool(
-                        _runtime_config.get("strategic_session_enabled", False)
-                    ),
+                    # Persist Workday cadence and safety tuning so it survives a
+                    # Cloud Run restart and propagates to the leader across instances.
+                    # Workday mode itself is the on-switch; these are pacing knobs only.
                     "strategic_continuation_ttl_seconds": int(
                         _runtime_config.get("strategic_continuation_ttl_seconds", 1500)
                     ),
@@ -3791,11 +3912,6 @@ async def _apply_settings(
                     "strategic_session_max_unattended_seconds": int(
                         _runtime_config.get(
                             "strategic_session_max_unattended_seconds", 14400
-                        )
-                    ),
-                    "resident_session_heartbeat_stale_seconds": int(
-                        _runtime_config.get(
-                            "resident_session_heartbeat_stale_seconds", 1500
                         )
                     ),
                     "direction_gap_respawn_block_mode": str(
@@ -3830,6 +3946,53 @@ async def _apply_settings(
                             "direction_review_recommendation_threshold", 2
                         )
                     ),
+                    # Runner health thresholds — persist so operator overrides
+                    # survive Cloud Run restarts.
+                    "runner_liveness_seconds": int(
+                        _runtime_config.get("runner_liveness_seconds", 300)
+                    ),
+                    "runner_degraded_failure_threshold": int(
+                        _runtime_config.get("runner_degraded_failure_threshold", 3)
+                    ),
+                    "runner_low_disk_threshold_bytes": int(
+                        _runtime_config.get(
+                            "runner_low_disk_threshold_bytes", 1_073_741_824
+                        )
+                    ),
+                    "runner_low_memory_threshold_bytes": int(
+                        _runtime_config.get(
+                            "runner_low_memory_threshold_bytes", 536_870_912
+                        )
+                    ),
+                    "runner_escalation_age_seconds": int(
+                        _runtime_config.get("runner_escalation_age_seconds", 14_400)
+                    ),
+                    "runner_idle_gpu_threshold_pct": int(
+                        _runtime_config.get("runner_idle_gpu_threshold_pct", 10)
+                    ),
+                    "runner_token_stale_days": int(
+                        _runtime_config.get("runner_token_stale_days", 90)
+                    ),
+                    "runner_post_update_silence_seconds": int(
+                        _runtime_config.get(
+                            "runner_post_update_silence_seconds", 600
+                        )
+                    ),
+                    "runner_heartbeat_retention_days": int(
+                        _runtime_config.get(
+                            "runner_heartbeat_retention_days", 7
+                        )
+                    ),
+                    "vm_low_disk_threshold_bytes": int(
+                        _runtime_config.get(
+                            "vm_low_disk_threshold_bytes", 1_073_741_824
+                        )
+                    ),
+                    "vm_low_memory_threshold_bytes": int(
+                        _runtime_config.get(
+                            "vm_low_memory_threshold_bytes", 536_870_912
+                        )
+                    ),
                     # Preserve the operator-approved migration-divergence exemption
                     # store when persisting settings. This dict is rebuilt wholesale
                     # and overwrites state.runtime_config_json, so without echoing the
@@ -3838,6 +4001,28 @@ async def _apply_settings(
                     # restart. Managed by admin_migration_exemptions; only echoed here.
                     "migration_divergence_exemptions": _runtime_config.get(
                         "migration_divergence_exemptions", []
+                    ),
+                    # Preserve the usage-headroom selection gate and its auto-arm
+                    # controls across this wholesale rebuild. sync_runtime_config_from_state
+                    # reads all three keys back on boot / every sync cycle; without
+                    # echoing them here an unrelated settings PATCH silently drops
+                    # them, so on the next restart the module defaults
+                    # (gate off, mode "auto") take over — the reconciler then
+                    # re-arms the gate against an operator who set mode="off"
+                    # (documented force-disarm kill switch) or "manual". The gate
+                    # value itself is normally reconciler-managed (via a targeted
+                    # merge-persist), but echoing it here keeps the armed state
+                    # from being reverted by an operator settings PATCH.
+                    "usage_headroom_gate_enabled": bool(
+                        _runtime_config.get("usage_headroom_gate_enabled", False)
+                    ),
+                    "usage_headroom_auto_arm_mode": str(
+                        _runtime_config.get("usage_headroom_auto_arm_mode", "auto")
+                    ),
+                    "usage_headroom_auto_arm_observation_minutes": int(
+                        _runtime_config.get(
+                            "usage_headroom_auto_arm_observation_minutes", 60
+                        )
                     ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:

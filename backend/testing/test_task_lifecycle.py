@@ -1255,6 +1255,40 @@ async def test_fresh_attempt_payload_model_restore_survives_flush_and_expire(tl_
     assert "llm_model" not in task.context
 
 
+def test_fresh_attempt_preserves_resident_dispatch_identity():
+    """Rate/dead-auth retries must remain the same persistent Workday session."""
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "strategic_review", "research_mode": "strategic"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "session-123",
+            "_resident_worker_generation": 7,
+            "preferred_runner_target_id": "runner-preferred",
+            "strategic_local_runner_required": True,
+            "strategic_local_runner_reason": "workbench_continuous",
+            "llm_provider": "anthropic",
+            "llm_account_id": "acct-exhausted",
+            "agent_error_report": {"exit_code": 1},
+            "_previous_failure_class": "RATE_LIMIT",
+        },
+    )
+
+    reset_task_for_fresh_attempt(task)
+
+    assert task.context["_resident_session"] is True
+    assert task.context["strategic_session_id"] == "session-123"
+    assert task.context["_resident_worker_generation"] == 7
+    assert task.context["preferred_runner_target_id"] == "runner-preferred"
+    assert task.context["strategic_local_runner_required"] is True
+    assert task.context["strategic_local_runner_reason"] == "workbench_continuous"
+    assert "llm_provider" not in task.context
+    assert "llm_account_id" not in task.context
+    assert "agent_error_report" not in task.context
+
 def test_clear_blocker_metadata_allows_clean_reescalation():
     from app.task_blocked import (
         clear_blocker_metadata,
@@ -3554,6 +3588,195 @@ async def test_process_post_commit_locks_project_before_task_for_nonstrategic(
     assert calls["skip_locked"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lock_result", "expected_scope"),
+    [("project_busy", "project"), ("task_busy", "task")],
+)
+async def test_process_post_commit_attributes_pair_lock_contention(
+    tl_db, mocker, lock_result, expected_scope
+):
+    """The recovery ledger gets the actual contended half of the lock pair."""
+    from app.task_lifecycle import PostCommitLocked
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="plan", status=TaskStatus.EVALUATING
+    )
+
+    @contextlib.asynccontextmanager
+    async def _contended_pair(*args, **kwargs):
+        if lock_result == "project_busy":
+            yield (None, None)
+        else:
+            yield (project, None)
+
+    mocker.patch("app.task_locking.lock_project_then_task", _contended_pair)
+    mocker.patch("asyncio.sleep", new=AsyncMock())
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+
+    with pytest.raises(PostCommitLocked) as exc_info:
+        await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert exc_info.value.lock_scope == expected_scope
+    expected_id = project.id if expected_scope == "project" else task.id
+    assert exc_info.value.resource_id == expected_id
+
+
+@pytest.mark.asyncio
+async def test_childless_recovery_claim_cannot_revive_cancelled_plan(tl_db, mocker):
+    """Cancellation between claim and processing wins under the lifecycle lock."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    claim_token = "claim-before-cancel"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 1,
+                "claim_token": claim_token,
+            }
+        },
+    )
+    task.plan_output = {"subtasks": [{"type": "create", "prompt": "do x"}]}
+    await session.commit()
+
+    # This is the state change that raced after the recovery claim committed.
+    task.status = TaskStatus.CANCELLED
+    await session.commit()
+    handle_plan = mocker.patch(
+        "app.task_completion._handle_plan_completion", new=AsyncMock()
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps(task.plan_output),
+    )
+
+    result = await _process_post_commit(
+        task.id,
+        payload,
+        _session_factory=factory,
+        _expected_childless_recovery_token=claim_token,
+    )
+
+    assert result == {"status": "accepted", "recovery_skipped": True}
+    handle_plan.assert_not_awaited()
+    await session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    child_ids = (
+        await session.execute(select(Task.id).where(Task.parent_task_id == task.id))
+    ).scalars().all()
+    assert child_ids == []
+
+
+@pytest.mark.asyncio
+async def test_childless_recovery_preserves_cancel_during_handler(tl_db, mocker):
+    """Cancellation during the handler's unlocked window wins over recovery."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    claim_token = "claim-before-handler"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 1,
+                "claim_token": claim_token,
+            }
+        },
+    )
+    task.plan_output = {"subtasks": [{"type": "create", "prompt": "do x"}]}
+    await session.commit()
+
+    async def _cancel_in_unlocked_window(task_arg, logs, handler_session):
+        # Mirrors _ensure_branch's intentional mid-handler commit/release.
+        await handler_session.commit()
+        async with factory() as cancel_session:
+            cancelled = await cancel_session.get(Task, task.id)
+            cancelled.status = TaskStatus.CANCELLED
+            cancel_session.add(cancelled)
+            await cancel_session.commit()
+        raise RuntimeError("snapshot changed after cancellation")
+
+    handle_plan = mocker.patch(
+        "app.task_completion._handle_plan_completion",
+        new=AsyncMock(side_effect=_cancel_in_unlocked_window),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps(task.plan_output),
+    )
+
+    result = await _process_post_commit(
+        task.id,
+        payload,
+        _session_factory=factory,
+        _expected_childless_recovery_token=claim_token,
+    )
+
+    assert result == {"status": "accepted", "recovery_skipped": True}
+    handle_plan.assert_awaited_once()
+    await session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    child_ids = (
+        await session.execute(select(Task.id).where(Task.parent_task_id == task.id))
+    ).scalars().all()
+    assert child_ids == []
+
+
+@pytest.mark.asyncio
+async def test_childless_recovery_current_handler_failure_propagates(tl_db, mocker):
+    """The recovery ledger, not generic handler recovery, owns its retries."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    claim_token = "current-claim"
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 1,
+                "claim_token": claim_token,
+            }
+        },
+    )
+    task.plan_output = {"subtasks": [{"type": "create", "prompt": "do x"}]}
+    await session.commit()
+    mocker.patch(
+        "app.task_completion._handle_plan_completion",
+        new=AsyncMock(side_effect=RuntimeError("branch creation failed")),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps(task.plan_output),
+    )
+
+    with pytest.raises(RuntimeError, match="branch creation failed"):
+        await _process_post_commit(
+            task.id,
+            payload,
+            _session_factory=factory,
+            _expected_childless_recovery_token=claim_token,
+        )
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert (task.context or {})["_childless_post_commit_recovery"][
+        "claim_token"
+    ] == claim_token
+
+
 def test_strategic_completion_reserves_message_block_before_authority_locks():
     source = inspect.getsource(_process_post_commit)
     reserve_at = source.index("await reserve_project_message_sequences(")
@@ -4046,12 +4269,6 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
     the spawn must pass suppress_warm_handoff=True so no warm-target pin
     lands on the new task. We verify by patching _spawn_pipeline_task and
     asserting on the call kwargs."""
-    # This test asserts the synchronous APPROVE-CI-failure fix spawn; disable
-    # the default-on second-opinion gate so that path runs directly.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     # Skip rollup; we don't actually need it for this test.
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
 
@@ -4195,14 +4412,6 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
         captured_spawn_kwargs.append(kwargs)
         return (None, False)
 
-    # This helper drives the SYNCHRONOUS verification-only-downgrade /
-    # REQUEST_CHANGES-fix mechanics. The default-on second-opinion gate would
-    # park + challenge first; disable it so the synchronous path under test runs
-    # directly (the gate-off / operator-rollback path).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     # APPROVE-path merge cluster (only exercised when the verdict flips to
     # APPROVE on a verification-only + green-CI PR). Harmless for the
@@ -4838,13 +5047,6 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
     from app.models import ResidualRemediationCase, ResidualCaseStatus
     from datetime import datetime, timezone
 
-    # Asserts the synchronous APPROVE→merge path; disable the default-on
-    # second-opinion gate so the merge runs directly.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
-
     session, factory = tl_db
     project = await _make_project(session)
 
@@ -5040,14 +5242,6 @@ def payload_for(review_task):
 
 def _patch_approve_merge_env(mocker):
     """Mocks shared by the APPROVE inline-merge tests (CI green, PR open)."""
-    # These tests assert the SYNCHRONOUS review-finalization mechanics (inline
-    # merge, dual-head guard). The default-on second-opinion gate would instead
-    # park + spawn a challenger first; disable it so the synchronous path under
-    # test runs directly (it is exactly the operator-rollback / gate-off path).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -5227,7 +5421,7 @@ async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
     # Force the auto_approve_small gate open.
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(
@@ -5317,7 +5511,7 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(
@@ -5410,7 +5604,7 @@ async def test_small_scope_auto_approve_guard_defer_preserves_ci_wait(
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(
@@ -5502,7 +5696,7 @@ async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(
@@ -7210,7 +7404,7 @@ class TestCloseOrphanPrIfAny:
         assert close_mock.await_args.args[3] == 5983
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("payload_type", ["review", "panel_review"])
+    @pytest.mark.parametrize("payload_type", ["review"])
     async def test_review_cancel_does_not_close_reviewed_pr(
         self, tl_db, mocker, payload_type
     ):
@@ -8849,1187 +9043,6 @@ async def test_park_task_catches_up_already_terminal_compute_job(tl_db):
     assert reg_other.fired_at is None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _resolve_safeguard_challenge_completion
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-async def _make_safeguard_triplet(
-    session,
-    project_id,
-    *,
-    plan_output=None,
-):
-    """Return (orig, safeguard, challenge) set up for _resolve_safeguard_challenge_completion tests.
-
-    orig — EVALUATING, requires_approval=True (simulates review approved, safeguard pending).
-    safeguard — EVALUATING (parked awaiting challenge), with safeguard_for_task_id → orig.
-    challenge — COMPLETED, with SAFEGUARD_CHALLENGE_SOURCE_KEY → safeguard.
-    """
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-
-    orig = await _make_task(
-        session,
-        project_id,
-        task_type="create",
-        status=TaskStatus.EVALUATING,
-        context={"review_loop": {"review_approved": True}},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    orig.requires_approval = True
-    session.add(orig)
-    await session.commit()
-
-    safeguard = await _make_task(
-        session,
-        project_id,
-        task_type="security_audit",
-        status=TaskStatus.EVALUATING,
-        context={
-            "safeguard_for_task_id": str(orig.id),
-            "safeguard_pr_number": "88",
-            "awaiting_safeguard_challenge": str(uuid.uuid4()),
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    if plan_output is not None:
-        safeguard.plan_output = plan_output
-        session.add(safeguard)
-        await session.commit()
-
-    challenge = Task(
-        project_id=project_id,
-        payloads=[{"type": "investigate", "prompt": "assess finding"}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard.id)},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-    return orig, safeguard, challenge
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_writes_verdict_and_releases_gate(tl_db):
-    """A COMPLETED challenger with 'rejected' outcome:
-    (a) writes the verdict under SAFEGUARD_CHALLENGE_VERDICT_KEY,
-    (b) restores safeguard to COMPLETED,
-    (c) pops awaiting_safeguard_challenge,
-    (d) re-invokes the gate function, which releases the gate."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-    high_finding = {
-        "severity": "high",
-        "title": "Missing auth",
-        "description": "desc",
-        "fix_prompt": "fix it",
-        "file_path": "app/x.py",
-        "line_number": 1,
-    }
-    orig, safeguard, challenge = await _make_safeguard_triplet(
-        session, project.id, plan_output={"findings": [high_finding]}
-    )
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "rejected", "reasoning": "false positive confirmed"}',
-    )
-
-    import app.shared_state as shared_state
-
-    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-    await session.refresh(safeguard)
-    assert safeguard.status == TaskStatus.COMPLETED, (
-        "Safeguard must be restored to COMPLETED"
-    )
-    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
-    assert verdict is not None, "Verdict must be written to safeguard context"
-    assert verdict["outcome"] == "rejected"
-    assert verdict["reasoning"] == "false positive confirmed"
-    assert verdict["challenge_task_id"] == str(challenge.id)
-    assert "awaiting_safeguard_challenge" not in (safeguard.context or {}), (
-        "awaiting_safeguard_challenge must be popped after resolution"
-    )
-
-    await session.refresh(orig)
-    assert orig.requires_approval is False, (
-        "Gate must be released on 'rejected' verdict"
-    )
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_confirmed_maintains_gate(tl_db):
-    """A COMPLETED challenger with 'confirmed' outcome writes the verdict and
-    maintains the merge gate (orig.requires_approval stays True)."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-    critical_finding = {
-        "severity": "critical",
-        "title": "SQL injection",
-        "description": "Raw query.",
-        "fix_prompt": "Parameterize.",
-        "file_path": "app/db.py",
-        "line_number": 5,
-    }
-    orig, safeguard, challenge = await _make_safeguard_triplet(
-        session, project.id, plan_output={"findings": [critical_finding]}
-    )
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "confirmed", "reasoning": "genuine SQL injection"}',
-    )
-
-    import app.shared_state as shared_state
-
-    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-    await session.refresh(safeguard)
-    assert safeguard.status == TaskStatus.COMPLETED
-    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
-    assert verdict["outcome"] == "confirmed"
-
-    await session.refresh(orig)
-    assert orig.requires_approval is True, (
-        "Gate must remain closed on 'confirmed' verdict"
-    )
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_failed_challenger_fails_closed(tl_db):
-    """A FAILED challenger (payload.status != COMPLETED) produces outcome='confirmed'
-    so the merge gate is maintained rather than accidentally released."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-    high_finding = {
-        "severity": "high",
-        "title": "Auth bypass",
-        "description": "desc",
-        "fix_prompt": "fix it",
-        "file_path": "app/y.py",
-        "line_number": 2,
-    }
-    orig, safeguard, challenge = await _make_safeguard_triplet(
-        session, project.id, plan_output={"findings": [high_finding]}
-    )
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.FAILED,
-        logs=None,
-    )
-
-    import app.shared_state as shared_state
-
-    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-    await session.refresh(safeguard)
-    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
-    assert verdict is not None
-    assert verdict["outcome"] == "confirmed", (
-        "A failed challenger must produce 'confirmed' outcome (fail-closed)"
-    )
-    assert safeguard.status == TaskStatus.COMPLETED
-
-    await session.refresh(orig)
-    assert orig.requires_approval is True, (
-        "Gate must remain closed when challenger failed"
-    )
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_invalid_uuid_source_early_return(tl_db):
-    """When SAFEGUARD_CHALLENGE_SOURCE_KEY holds a non-UUID value, the function
-    commits the challenge status message and returns without error."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-
-    challenge = Task(
-        project_id=project.id,
-        payloads=[{"type": "investigate", "prompt": "assess"}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: "not-a-valid-uuid"},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "rejected", "reasoning": "fp"}',
-    )
-
-    # Must not raise even with an invalid source UUID.
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_source_gone_early_return(tl_db):
-    """When the safeguard task UUID is valid but not in the DB, the function
-    commits the challenge status message, logs a warning, and returns without error."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-
-    phantom_safeguard_id = uuid.uuid4()  # valid UUID but not in DB
-    challenge = Task(
-        project_id=project.id,
-        payloads=[{"type": "investigate", "prompt": "assess"}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(phantom_safeguard_id)},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "rejected", "reasoning": "fp"}',
-    )
-
-    # Must not raise even when the source safeguard is missing from the DB.
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-
-# Default-on second-opinion gate for ordinary review verdicts
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _panel_logs(overall, *, issues=None, lens_verdict=None):
-    """A full panel_review verdict JSON string (all four required lenses)."""
-    lv = lens_verdict or overall
-    return json.dumps(
-        {
-            "overall_verdict": overall,
-            "summary": "panel summary",
-            "issues": list(issues or []),
-            "lenses": {
-                "correctness": {"verdict": lv, "summary": "c", "issues": []},
-                "security": {"verdict": lv, "summary": "s", "issues": []},
-                "code_quality": {"verdict": lv, "summary": "q", "issues": []},
-                "test_coverage": {"verdict": lv, "summary": "t", "issues": []},
-            },
-        }
-    )
-
-
-async def _setup_review_gate(tl_db, mocker, *, pr_number=7777, base_branch="main"):
-    """Set up GitHub/merge mocks and an APPROVE-able review task. Returns handles."""
-    captured_spawn = []
-
-    async def _capture_spawn(*args, **kwargs):
-        captured_spawn.append(kwargs)
-        return (None, False)
-
-    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
-    merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
-        new_callable=AsyncMock,
-        return_value={"merged": True},
-    )
-    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
-    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
-    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
-    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
-    mocker.patch(
-        "app.routers.agent.get_github_token_for_task",
-        new_callable=AsyncMock,
-        return_value=("tok", "owner", "repo"),
-    )
-    mocker.patch(
-        "app.github.get_pull_request",
-        new_callable=AsyncMock,
-        return_value={
-            "head": {"sha": "deadbeef", "ref": "feat/x"},
-            "state": "open",
-            "merged": False,
-        },
-    )
-    mocker.patch(
-        "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
-    )
-    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        return_value=[{"filename": "app/x.py"}],
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new_callable=AsyncMock,
-        return_value={
-            "status": "completed",
-            "conclusion": "success",
-            "failed_logs": "",
-            "details": [],
-        },
-    )
-
-    session, factory = tl_db
-    project = await _make_project(session)
-    original = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "X", "base_branch": base_branch}],
-        status=TaskStatus.EVALUATING,
-        created_by="ORCHESTRATOR",
-        context={},
-    )
-    session.add(original)
-    await session.commit()
-    await session.refresh(original)
-
-    review_task = Task(
-        project_id=project.id,
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": pr_number,
-                "branch": "feat/x",
-                "base_branch": base_branch,
-                "original_task_id": str(original.id),
-            }
-        ],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={
-            "review_loop": {
-                "pr_number": pr_number,
-                "branch": "feat/x",
-                "base_branch": base_branch,
-                "original_task_id": str(original.id),
-                "iteration": 1,
-            },
-        },
-    )
-    session.add(review_task)
-    await session.commit()
-    await session.refresh(review_task)
-    return session, factory, project, original, review_task, merge_mock, captured_spawn
-
-
-async def _find_challenger(session, project_id, review_id):
-    """Locate the panel_review challenger spawned for review_id."""
-    from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
-
-    rows = (
-        (await session.execute(select(Task).where(Task.project_id == project_id)))
-        .scalars()
-        .all()
-    )
-    for t in rows:
-        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY) == str(review_id):
-            return t
-    return None
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_gate_blocks_approve_merge_until_reconciled(tl_db, mocker):
-    """Gate-on high-stakes APPROVE parks + spawns a panel challenger, does NOT
-    merge, and merges only after a confirming reconciliation."""
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        _spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7777)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        pr_url="https://github.com/o/r/pull/7777",
-        artifact_type=ArtifactType.PULL_REQUEST,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    # First pass: parked EVALUATING, challenger spawned, NO merge yet.
-    await session.refresh(review_task)
-    assert review_task.status == TaskStatus.EVALUATING
-    assert (review_task.context or {}).get("awaiting_review_second_opinion")
-    assert not merge_mock.called, "merge must NOT fire before reconciliation"
-
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None, "a panel_review challenger must be spawned"
-    assert challenger.first_payload.get("type") == "panel_review"
-
-    # Drive the challenger to completion with a confirming APPROVE panel verdict.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs=_panel_logs("APPROVE"),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None
-    assert rec["state"] == "challenged_confirmed"
-    assert rec["reconciled_verdict"] == "APPROVE"
-    assert rec["challenger_task_id"] == str(challenger.id)
-    assert merge_mock.called, "reconciled APPROVE must proceed into the merge path"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_challenge_rejected_approve_does_not_merge(tl_db, mocker):
-    """A challenge that overturns an APPROVE must NOT auto-merge."""
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7778)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    # Challenge overturns to REQUEST_CHANGES with a concrete defect.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs=_panel_logs(
-            "REQUEST_CHANGES",
-            issues=[{"description": "real defect", "severity": "critical"}],
-        ),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec["state"] == "challenged_rejected"
-    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
-    assert not merge_mock.called, "overturned APPROVE must not merge"
-    # Reconciled REQUEST_CHANGES spawns a fix with the surviving issues.
-    assert captured_spawn, "overturned APPROVE must spawn a fix with surviving issues"
-    assert captured_spawn[0].get("current_issues"), "fix must carry surviving issues"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_gate_request_changes_not_challenged(tl_db, mocker):
-    """REQUEST_CHANGES is not high-stakes: no park, no challenger — the fix
-    spawns synchronously and the outcome is recorded ``unchallenged`` (a wrong
-    rejection self-corrects through the fix loop's re-review)."""
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        _merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7779)
-
-    issues = [{"description": "off-by-one bug", "file": "app/x.py", "line": 3}]
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json=json.dumps({"verdict": "REQUEST_CHANGES", "issues": issues}),
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    assert review_task.status != TaskStatus.EVALUATING, "must not park"
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is None, "REQUEST_CHANGES must not spawn a challenger"
-    assert captured_spawn, "REQUEST_CHANGES must spawn the fix synchronously"
-    assert captured_spawn[0].get("current_issues") == issues
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None and rec["state"] == "unchallenged"
-    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_gate_non_trunk_approve_not_challenged(tl_db, mocker):
-    """An APPROVE on a PR targeting a non-trunk base (e.g. a research branch)
-    is not high-stakes: it merges synchronously without a challenger — the
-    rollup review re-covers it at the trunk boundary."""
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(
-        tl_db, mocker, pr_number=7780, base_branch="research/abc123"
-    )
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is None, "non-trunk APPROVE must not spawn a challenger"
-    assert merge_mock.called, "non-trunk APPROVE must merge synchronously"
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None and rec["state"] == "unchallenged"
-    assert rec["reconciled_verdict"] == "APPROVE"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_unparseable_challenge_escalates(tl_db, mocker):
-    """A failed/unparseable challenge fails closed: no merge, no fix, original
-    flagged requires_approval."""
-    (
-        session,
-        factory,
-        project,
-        original,
-        review_task,
-        merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7781)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    # Challenge output is not a parseable panel verdict.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs="the panel crashed and produced no structured verdict",
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    await session.refresh(original)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None and rec.get("escalated") is True
-    assert review_task.status == TaskStatus.COMPLETED
-    assert not merge_mock.called, "unparseable challenge must not merge"
-    assert not captured_spawn, "unparseable challenge must not spawn fix"
-    assert original.requires_approval is True
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_unparseable_challenge_gates_off_no_requires_approval(
-    tl_db, mocker
-):
-    """With require_approval_gates OFF, the fail-closed second-opinion escalation
-    must NOT set requires_approval on the original task — the advisory status
-    message still carries the signal but gates are intentionally off."""
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"require_approval_gates": False},
-    )
-    (
-        session,
-        factory,
-        project,
-        original,
-        review_task,
-        merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7789)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs="the panel crashed and produced no structured verdict",
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    await session.refresh(original)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None and rec.get("escalated") is True
-    assert review_task.status == TaskStatus.COMPLETED
-    assert not merge_mock.called, "unparseable challenge must not merge even with gates off"
-    assert not captured_spawn, "unparseable challenge must not spawn fix even with gates off"
-    assert not original.requires_approval, (
-        "with require_approval_gates OFF, fail-closed escalation must NOT set requires_approval"
-    )
-    assert "manual review required" in (original.latest_status_message or ""), (
-        "advisory status message must still be set even with gates off"
-    )
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_model_unavailable_fails_open(tl_db, mocker):
-    """A FAILED challenge caused by a provider model-config rejection (model
-    inaccessible) must degrade gracefully: the primary verdict is preserved,
-    requires_approval is NOT set, and the reconciliation record carries
-    state='degraded_model_unavailable'."""
-    (
-        session,
-        factory,
-        project,
-        original,
-        review_task,
-        _merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7782)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    # Challenger fails with a model-no-access error (OpenAI 404).
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.FAILED,
-        logs=(
-            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
-            "Error: 404 The model `o3-mini` does not exist or you do not have "
-            "access to it.\n"
-        ),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    await session.refresh(original)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None, "reconciliation record must be written"
-    assert rec.get("state") == "degraded_model_unavailable", (
-        f"expected degraded_model_unavailable, got {rec.get('state')!r}"
-    )
-    assert rec.get("reconciled_verdict") == "APPROVE", (
-        "primary verdict must be preserved on model-unavailable degradation"
-    )
-    assert review_task.status == TaskStatus.COMPLETED
-    assert not getattr(original, "requires_approval", False), (
-        "model-unavailable degradation must NOT set requires_approval"
-    )
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_generic_failed_challenge_still_fails_closed(
-    tl_db, mocker
-):
-    """A FAILED challenge without a model-config-rejection pattern (e.g. a plain
-    PROVISION_FAILURE) still fails closed and sets requires_approval."""
-    (
-        session,
-        factory,
-        project,
-        original,
-        review_task,
-        _merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7783)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    # Challenger fails with a generic infra error (not a model-config rejection).
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.FAILED,
-        logs="VM startup failed: SSH connection refused after 120s",
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    await session.refresh(original)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None and rec.get("escalated") is True, (
-        "generic FAILED challenge must still escalate (fail-closed)"
-    )
-    assert original.requires_approval is True
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_replayed_challenger_status_does_not_clobber(
-    tl_db, mocker
-):
-    """Regression (PRs #9303/#9308/#9319, 2026-06-10): a replayed terminal
-    status for an already-resolved challenger — an agent HTTP retry or the
-    post_commit_pending sweep re-firing while the first pass is still in (or
-    died during) the slow re-dispatch — carries no logs, so it fell into the
-    fail-closed branch and OVERWROTE the real reconciliation with a
-    "challenge unresolved — manual review required" escalation. The resolver
-    must treat the consumed AWAITING marker / durable reconciliation record
-    as authoritative and no-op any replay."""
-    (
-        session,
-        factory,
-        project,
-        original,
-        review_task,
-        merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7785)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    # First pass: confirming panel verdict reconciles and merges.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs=_panel_logs("APPROVE"),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-    await session.refresh(review_task)
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None and rec["state"] == "challenged_confirmed"
-    assert merge_mock.call_count == 1
-
-    # Replay 1: log-less COMPLETED (retry payloads carry no agent logs).
-    await _process_post_commit(
-        challenger.id,
-        AgentStatusPayload(task_id=challenger.id, status=TaskStatus.COMPLETED),
-        _session_factory=factory,
-    )
-    # Replay 2: a late FAILED (e.g. an agent shutdown self-terminate sync).
-    await _process_post_commit(
-        challenger.id,
-        AgentStatusPayload(task_id=challenger.id, status=TaskStatus.FAILED),
-        _session_factory=factory,
-    )
-
-    await session.refresh(review_task)
-    await session.refresh(original)
-    rec_after = (review_task.context or {}).get("review_second_opinion")
-    assert rec_after == rec, "replay must not rewrite the reconciliation record"
-    assert review_task.status == TaskStatus.COMPLETED
-    assert "manual review required" not in (review_task.latest_status_message or "")
-    assert not original.requires_approval, "replay must not flag manual approval"
-    assert merge_mock.call_count == 1, "replay must not re-merge"
-    assert not captured_spawn, "replay must not spawn anything"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_replay_commits_before_post_commit(tl_db, mocker):
-    """Regression (v10 release-audit HIGH): the pending_application REPLAY path of
-    _resolve_review_second_opinion must COMMIT (release the review row's FOR UPDATE
-    lock acquired at the top) BEFORE calling _process_post_commit, which re-acquires
-    FOR UPDATE SKIP LOCKED on the SAME review row in a separate session. Pre-fix the
-    releasing commit lived inside `if not pending_application:` and was skipped on
-    replay, so the inner acquire deadlocked (PostCommitLocked on PostgreSQL), the
-    marker cleanup was never reached, and the reconciled verdict was permanently
-    unapplied.
-
-    SQLite (tl_db) does not implement FOR UPDATE SKIP LOCKED, so the live deadlock is
-    not reproducible here; this asserts the commit-before-call ORDERING invariant the
-    fix establishes, and that the pending-application marker clears after the replay."""
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-    from app.task_evaluators import (
-        REVIEW_SECOND_OPINION_AWAITING_KEY,
-        REVIEW_SECOND_OPINION_PARKED_KEY,
-        REVIEW_SECOND_OPINION_SOURCE_KEY,
-    )
-    from app.task_lifecycle import (
-        _resolve_review_second_opinion,
-        _set_sidecar_application_pending,
-        _sidecar_application_pending,
-    )
-
-    (
-        session,
-        factory,
-        project,
-        original,
-        review_task,
-        merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=9301)
-
-    challenger = Task(
-        project_id=project.id,
-        payloads=[{"type": "panel_review", "pr_number": 9301}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={REVIEW_SECOND_OPINION_SOURCE_KEY: str(review_task.id)},
-    )
-    session.add(challenger)
-    await session.commit()
-    await session.refresh(challenger)
-
-    # Put the review into the "pending application" REPLAY state: reconciliation
-    # record persisted + the application-pending marker set + still parked — i.e. the
-    # first pass committed the marker, then its _process_post_commit died before
-    # clearing it.
-    ctx = dict(review_task.context or {})
-    ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = {
-        "state": "challenged_confirmed",
-        "reconciled_verdict": "APPROVE",
-        "surviving_issues": [],
-        "challenger_task_id": str(challenger.id),
-        "review_task_id": str(review_task.id),
-    }
-    ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(challenger.id)
-    ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
-        "verdict": "APPROVE",
-        "issues": [],
-        "original_task_id": str(original.id),
-    }
-    _set_sidecar_application_pending(
-        ctx,
-        lane="review_second_opinion",
-        sidecar_id=challenger.id,
-        verdict_key=REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-    )
-    review_task.context = ctx
-    session.add(review_task)
-    await session.commit()
-
-    # Record the relative order of session.commit vs the inner _process_post_commit.
-    order = []
-    real_commit = session.commit
-
-    async def _spy_commit(*a, **k):
-        order.append("commit")
-        return await real_commit(*a, **k)
-
-    mocker.patch.object(
-        session, "commit", new_callable=AsyncMock, side_effect=_spy_commit
-    )
-
-    async def _spy_ppc(task_id, payload, *a, **k):
-        order.append("post_commit")
-
-    mocker.patch(
-        "app.task_lifecycle._process_post_commit",
-        new_callable=AsyncMock,
-        side_effect=_spy_ppc,
-    )
-
-    payload = AgentStatusPayload(task_id=challenger.id, status=TaskStatus.COMPLETED)
-    await _resolve_review_second_opinion(challenger, payload, session)
-
-    assert "post_commit" in order, "replay must re-dispatch the reconciled review"
-    assert order.index("commit") < order.index("post_commit"), (
-        "the review row FOR UPDATE lock must be released (committed) BEFORE "
-        "_process_post_commit on the replay path — else PostCommitLocked deadlock"
-    )
-
-    await session.refresh(review_task)
-    assert not _sidecar_application_pending(
-        dict(review_task.context or {}),
-        lane="review_second_opinion",
-        sidecar_id=challenger.id,
-    ), "the pending-application marker must clear after a successful replay"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_gate_off_restores_synchronous_merge(tl_db, mocker):
-    """Gate disabled → today's synchronous behavior, recorded as unchallenged."""
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7782)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is None, "gate-off must not spawn a challenger"
-    assert merge_mock.called, "gate-off must merge synchronously"
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None and rec["state"] == "unchallenged"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_sample_rate_zero_never_spawns(tl_db, mocker):
-    """sample_rate=0.0 → no challenger spawned for any task; proceeds synchronously
-    with context state 'sampled_out'."""
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_sample_rate": 0.0},
-    )
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7784)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is None, "rate=0.0 must never spawn a challenger"
-    assert merge_mock.called, "rate=0.0 must merge synchronously"
-    rec = (review_task.context or {}).get("review_second_opinion")
-    assert rec is not None, "sampled_out record must be written"
-    assert rec["state"] == "sampled_out", f"expected sampled_out, got {rec['state']!r}"
-    assert rec["sample_rate"] == 0.0
-    assert rec["reconciled_verdict"] == "APPROVE"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_sample_rate_one_always_spawns(tl_db, mocker):
-    """sample_rate=1.0 (default) → challenger always spawned for high-stakes APPROVE."""
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_sample_rate": 1.0},
-    )
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7786)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None, "rate=1.0 must always spawn a challenger"
-    assert not merge_mock.called, "must not merge while challenge is pending"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_sample_rate_deterministic(tl_db, mocker):
-    """Sampling is deterministic: a task whose UUID slot falls above the configured
-    rate is skipped; one that falls below is challenged."""
-    import uuid
-
-    # Find a UUID whose slot is above 0.3 (sampled out)
-    above_uuid = None
-    for _ in range(10_000):
-        candidate = uuid.uuid4()
-        if candidate.int % 1_000_000 / 1_000_000.0 >= 0.3:
-            above_uuid = candidate
-            break
-    assert above_uuid is not None
-
-    # Find a UUID whose slot is below 0.3 (spawns challenger)
-    below_uuid = None
-    for _ in range(10_000):
-        candidate = uuid.uuid4()
-        if candidate.int % 1_000_000 / 1_000_000.0 < 0.3:
-            below_uuid = candidate
-            break
-    assert below_uuid is not None
-
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_sample_rate": 0.3},
-    )
-
-    # --- task with slot >= 0.3: no challenger ---
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task_above,
-        merge_mock_above,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7787)
-    # Override the task's UUID so the slot computation is deterministic.
-    review_task_above.id = above_uuid
-    session.add(review_task_above)
-    await session.commit()
-    await session.refresh(review_task_above)
-
-    payload_above = AgentStatusPayload(
-        task_id=review_task_above.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(
-        review_task_above.id, payload_above, _session_factory=factory
-    )
-    await session.refresh(review_task_above)
-    challenger_above = await _find_challenger(session, project.id, review_task_above.id)
-    assert challenger_above is None, "slot >= rate must not spawn challenger"
-    rec_above = (review_task_above.context or {}).get("review_second_opinion")
-    assert rec_above is not None and rec_above["state"] == "sampled_out"
-
-    # --- task with slot < 0.3: challenger spawned ---
-    (
-        session2,
-        factory2,
-        project2,
-        _original2,
-        review_task_below,
-        merge_mock_below,
-        _captured_spawn2,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7788)
-    review_task_below.id = below_uuid
-    session2.add(review_task_below)
-    await session2.commit()
-    await session2.refresh(review_task_below)
-
-    payload_below = AgentStatusPayload(
-        task_id=review_task_below.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(
-        review_task_below.id, payload_below, _session_factory=factory2
-    )
-    await session2.refresh(review_task_below)
-    challenger_below = await _find_challenger(
-        session2, project2.id, review_task_below.id
-    )
-    assert challenger_below is not None, "slot < rate must spawn challenger"
-    assert not merge_mock_below.called, "must not merge while challenge is pending"
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
-    """Single-shot guard: a second finalize while a challenge is in flight does
-    not spawn a second challenger, and the challenger never recurses."""
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        _merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7783)
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None
-
-    from app.task_evaluators import REVIEW_SECOND_OPINION_SOURCE_KEY
-
-    # Re-finalize the still-parked review task: must NOT spawn a second challenger.
-    payload2 = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload2, _session_factory=factory)
-    challengers = [
-        t
-        for t in (
-            await session.execute(select(Task).where(Task.project_id == project.id))
-        )
-        .scalars()
-        .all()
-        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY)
-        == str(review_task.id)
-    ]
-    assert len(challengers) == 1, "single-shot guard must prevent a second challenger"
-
-    # The challenger itself routes to the resolver, never re-entering the gate:
-    # completing it produces a reconciliation, not another challenger.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs=_panel_logs("APPROVE"),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-    challengers_after = [
-        t
-        for t in (
-            await session.execute(select(Task).where(Task.project_id == project.id))
-        )
-        .scalars()
-        .all()
-        if (t.context or {}).get(REVIEW_SECOND_OPINION_SOURCE_KEY)
-        == str(review_task.id)
-    ]
-    assert len(challengers_after) == 1, "challenger must not recursively spawn the gate"
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # _sweep_stranded_sidecar_sources / trigger_stranded_sidecar_resolution
@@ -10302,62 +9315,6 @@ async def test_resolver_uses_grader_hashes_when_source_hashes_are_missing(
     assert "awaiting_adversarial_grader" not in (source.context or {})
 
 
-@pytest.mark.asyncio
-async def test_sweep_stranded_safeguard_challenge_cancelled(tl_db, mocker):
-    """A CANCELLED safeguard challenge with no status POST must resolve the parked safeguard."""
-    from app.services import _sweep_stranded_sidecar_sources
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-
-    session, Session = tl_db
-    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
-    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.task_completion._maybe_release_safeguard_gate",
-        new=AsyncMock(return_value=None),
-    )
-    mocker.patch(
-        "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
-    )
-
-    project = await _make_project(session)
-
-    safeguard = Task(
-        project_id=project.id,
-        payloads=[{"type": "security_audit", "base_branch": "main"}],
-        status=TaskStatus.EVALUATING,
-        created_by="ORCHESTRATOR",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(safeguard)
-    await session.commit()
-    await session.refresh(safeguard)
-
-    challenge = Task(
-        project_id=project.id,
-        payloads=[{"type": "investigate", "prompt": "assess", "base_branch": "main"}],
-        status=TaskStatus.CANCELLED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard.id)},
-        latest_status_message="VM cancelled",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-
-    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
-
-    safeguard.context = {"awaiting_safeguard_challenge": str(challenge.id)}
-    _flag_modified(safeguard, "context")
-    session.add(safeguard)
-    await session.commit()
-
-    await _sweep_stranded_sidecar_sources()
-
-    await session.refresh(safeguard)
-    assert safeguard.status != TaskStatus.EVALUATING, (
-        "safeguard must not remain EVALUATING after sweep resolves the cancelled challenge"
-    )
 
 
 @pytest.mark.asyncio
@@ -10489,7 +9446,7 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     so sidecars_by_id.get() returned None and the source stayed EVALUATING forever.
     """
     from app.services import _sweep_stranded_sidecar_sources
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+    from app.task_evaluators import FINDING_CHALLENGE_SOURCE_KEY
 
     session, Session = tl_db
     mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
@@ -10530,13 +9487,13 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     await session.commit()
     await session.refresh(source)
 
-    # Create a FAILED sidecar for the SECOND awaiting key (safeguard_challenge).
+    # Create a FAILED sidecar for the SECOND awaiting key (finding_challenge).
     dead_challenge = Task(
         project_id=project.id,
         payloads=[{"type": "investigate", "prompt": "assess", "base_branch": "main"}],
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(source.id)},
+        context={FINDING_CHALLENGE_SOURCE_KEY: str(source.id)},
         latest_status_message="Reaper killed",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
@@ -10549,7 +9506,7 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
 
     source.context = {
         "awaiting_quality_grader": str(live_grader.id),
-        "awaiting_safeguard_challenge": str(dead_challenge.id),
+        "awaiting_finding_challenge": str(dead_challenge.id),
     }
     _flag_modified(source, "context")
     session.add(source)
@@ -10570,15 +9527,15 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     The stranded-sidecar recovery sweep must fire lane resolution once per terminal
     awaiting_* key. This test verifies the invariant: when a source carries two
     terminal sidecars in two different lanes (e.g., quality_grader and
-    safeguard_challenge), the sweep resolves both, and both lane verdicts are
+    finding_challenge), the sweep resolves both, and both lane verdicts are
     recorded in the source's context exactly once.
     """
     from app.services import _sweep_stranded_sidecar_sources
     from app.task_evaluators import (
         QUALITY_GRADER_SOURCE_KEY,
         QUALITY_GRADER_VERDICT_KEY,
-        SAFEGUARD_CHALLENGE_SOURCE_KEY,
-        SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        FINDING_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_VERDICT_KEY,
     )
 
     session, Session = tl_db
@@ -10624,7 +9581,7 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     await session.commit()
     await session.refresh(grader)
 
-    # Create second terminal sidecar for safeguard_challenge lane.
+    # Create second terminal sidecar for finding_challenge lane.
     challenge = Task(
         project_id=project.id,
         payloads=[
@@ -10632,7 +9589,7 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
         ],
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(source.id)},
+        context={FINDING_CHALLENGE_SOURCE_KEY: str(source.id)},
         latest_status_message="Challenge timed out",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
@@ -10645,7 +9602,7 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
 
     source.context = {
         "awaiting_quality_grader": str(grader.id),
-        "awaiting_safeguard_challenge": str(challenge.id),
+        "awaiting_finding_challenge": str(challenge.id),
     }
     _flag_modified(source, "context")
     session.add(source)
@@ -10665,16 +9622,16 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     assert QUALITY_GRADER_VERDICT_KEY in ctx, (
         "quality_grader verdict must be written on the source after resolution"
     )
-    assert SAFEGUARD_CHALLENGE_VERDICT_KEY in ctx, (
-        "safeguard_challenge verdict must be written on the source after resolution"
+    assert FINDING_CHALLENGE_VERDICT_KEY in ctx, (
+        "finding_challenge verdict must be written on the source after resolution"
     )
 
     # Verify both awaiting keys have been cleared.
     assert "awaiting_quality_grader" not in ctx, (
         "awaiting_quality_grader must be cleared after resolution"
     )
-    assert "awaiting_safeguard_challenge" not in ctx, (
-        "awaiting_safeguard_challenge must be cleared after resolution"
+    assert "awaiting_finding_challenge" not in ctx, (
+        "awaiting_finding_challenge must be cleared after resolution"
     )
 
 
@@ -10890,100 +9847,6 @@ async def test_adversarial_gate_provenance_lookup_failure_doesnt_prevent_verdict
     # Provenance fields may or may not be present, but absence is OK.
     # (The exception is caught and logged at debug level)
 
-
-@pytest.mark.asyncio
-async def test_second_opinion_inherited_record_does_not_clobber_verdict(tl_db, mocker):
-    """Regression (PR #9243): a reconciliation record inherited from an EARLIER
-    review iteration (leaked via the review→fix→review context copy) must NOT
-    override this review's fresh verdict. Pre-fix, the inherited iteration-1
-    REQUEST_CHANGES + issues clobbered a genuine APPROVE, the verbatim issue
-    set tripped the stuck-cycle detector, and the chain falsely parked. The
-    foreign record must be scrubbed and the gate must run fresh."""
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-    from app.task_evaluators import (
-        REVIEW_SECOND_OPINION_AWAITING_KEY,
-        REVIEW_SECOND_OPINION_PARKED_KEY,
-    )
-
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7784)
-
-    stale_issues = [
-        {"description": "stale issue from iteration 1", "file": "app/x.py", "line": 1}
-    ]
-    inherited_ctx = dict(review_task.context or {})
-    inherited_ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = {
-        "state": "unchallenged",
-        "primary_verdict": "REQUEST_CHANGES",
-        "reconciled_verdict": "REQUEST_CHANGES",
-        "surviving_issues": stale_issues,
-        "review_task_id": str(uuid.uuid4()),  # a DIFFERENT (earlier) review task
-    }
-    inherited_ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
-        "verdict": "REQUEST_CHANGES",
-        "issues": stale_issues,
-    }
-    inherited_ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(uuid.uuid4())
-    review_task.context = inherited_ctx
-    session.add(review_task)
-    await session.commit()
-
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    # The fresh APPROVE must survive: gate runs fresh (park + challenger), the
-    # inherited REQUEST_CHANGES must NOT spawn a fix or short-circuit to act.
-    await session.refresh(review_task)
-    assert review_task.status == TaskStatus.EVALUATING, (
-        "fresh high-stakes APPROVE must park awaiting a challenge — the "
-        "inherited record must not pre-empt the gate"
-    )
-    assert not captured_spawn, (
-        "inherited iteration-1 REQUEST_CHANGES must not clobber the fresh "
-        "APPROVE into spawning a fix"
-    )
-    assert not merge_mock.called
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None, (
-        "the gate must run fresh for this review despite the inherited record"
-    )
-    parked = (review_task.context or {}).get(REVIEW_SECOND_OPINION_PARKED_KEY) or {}
-    assert parked.get("verdict") == "APPROVE", (
-        "the parked snapshot must capture THIS review's verdict, not the "
-        "inherited stale one"
-    )
-
-    # Confirming challenge → the reconciled APPROVE merges, and the record now
-    # belongs to this review task.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.COMPLETED,
-        logs=_panel_logs("APPROVE"),
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    await session.refresh(review_task)
-    rec = (review_task.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
-    assert rec is not None
-    assert rec["reconciled_verdict"] == "APPROVE"
-    assert rec["review_task_id"] == str(review_task.id)
-    assert merge_mock.called, "reconciled APPROVE must proceed into the merge path"
-    assert REVIEW_SECOND_OPINION_PARKED_KEY not in (review_task.context or {}), (
-        "the consumed parked snapshot must not linger after reconciliation"
-    )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Stale-head guard (verdict-time head pin)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -11012,10 +9875,6 @@ async def _run_stale_head_branch(
         captured_spawn_calls.append((args, kwargs))
         return (None, False)
 
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     mocker.patch(
         "app.task_lifecycle._merge_with_retry",
@@ -11265,10 +10124,6 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
         captured_spawn_calls.append((args, kwargs))
         return (None, False)
 
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     mocker.patch(
         "app.task_lifecycle._merge_with_retry",
@@ -11816,96 +10671,3 @@ async def test_requeue_llm_cost_zero_for_unpriced_provider_model(tl_db, mocker):
         "Unpriced provider/model must contribute $0, not fail the requeue"
     )
 
-
-@pytest.mark.asyncio
-async def test_adversarial_gate_fail_open_emits_deduplicated_alert(tl_db, mocker):
-    """When the second-opinion challenger model is unavailable, the gate degrades
-    to the primary verdict and an operator-visible Alert is created. Re-entering
-    the degraded path does NOT create a duplicate alert."""
-    from app.failure_classification import (
-        EXTERNAL_API,
-        EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
-    )
-
-    (
-        session,
-        factory,
-        project,
-        _original,
-        review_task,
-        merge_mock,
-        _captured_spawn,
-    ) = await _setup_review_gate(tl_db, mocker, pr_number=7799)
-
-    # Mock classify helpers so the challenger's FAILED status looks like a
-    # provider model-config rejection (the exact condition that triggers fail-open).
-    mocker.patch(
-        "app.task_lifecycle.classify_failure", return_value=EXTERNAL_API
-    )
-    mocker.patch(
-        "app.task_lifecycle.classify_external_api_subtype",
-        return_value=EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
-    )
-
-    # Drive review to APPROVE — parks and spawns challenger.
-    payload = AgentStatusPayload(
-        task_id=review_task.id,
-        status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
-    )
-    await _process_post_commit(review_task.id, payload, _session_factory=factory)
-
-    challenger = await _find_challenger(session, project.id, review_task.id)
-    assert challenger is not None, "challenger must be spawned"
-
-    # Drive challenger to FAILED with the model-unavailable condition.
-    chal_payload = AgentStatusPayload(
-        task_id=challenger.id,
-        status=TaskStatus.FAILED,
-        logs="model does not exist or you do not have access",
-    )
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-
-    # Gate must have degraded and emitted the alert.
-    alerts = (
-        (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project.id,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title
-                    == "Adversarial gate failed open: second-opinion model unavailable",
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(alerts) == 1, (
-        "Exactly one fail-open alert must be created when the challenger model "
-        "is unavailable"
-    )
-    assert alerts[0].task_id == review_task.id, (
-        "Alert must be linked to the review task"
-    )
-    assert str(challenger.id)[:8] in alerts[0].message, (
-        "Alert message must reference the challenger task id"
-    )
-
-    # Deduplication: re-entering the same path must not create a second alert.
-    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
-    alerts2 = (
-        (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project.id,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title
-                    == "Adversarial gate failed open: second-opinion model unavailable",
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(alerts2) == 1, "Re-entering the path must not create a duplicate alert"

@@ -775,16 +775,9 @@ async def test_review_minor_only_verdict_marks_fix_skip_rereview(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    # This test asserts the synchronous REQUEST_CHANGES→fix spawn. A
-    # REQUEST_CHANGES carrying concrete issues is high-stakes, so the default-on
-    # second-opinion gate would park the review EVALUATING and spawn a panel
-    # challenger instead of the fix. Disable the gate so the fix-spawn path under
-    # test runs directly (gate behavior has dedicated coverage in
-    # test_task_lifecycle.py::test_second_opinion_*).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
+    # This test asserts the synchronous REQUEST_CHANGES→fix spawn: reviews
+    # finalize synchronously, so a concrete-issue REQUEST_CHANGES spawns the fix
+    # directly.
 
     project = Project(name="Minor-Only Verdict Test", user_id="test-user-123")
     db_session.add(project)
@@ -856,14 +849,8 @@ async def test_review_with_major_issue_does_not_mark_skip_rereview(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    # Synchronous REQUEST_CHANGES→fix spawn under test; disable the default-on
-    # second-opinion gate (a concrete-issue REQUEST_CHANGES is high-stakes and
-    # would otherwise park EVALUATING + spawn a panel challenger). Gate behavior
-    # is covered in test_task_lifecycle.py::test_second_opinion_*.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
+    # Synchronous REQUEST_CHANGES→fix spawn under test: reviews finalize
+    # synchronously, so a concrete-issue REQUEST_CHANGES spawns the fix directly.
 
     project = Project(name="Major Issue Verdict Test", user_id="test-user-123")
     db_session.add(project)
@@ -1013,15 +1000,8 @@ async def test_review_approve_does_not_spawn_fix(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    # This test asserts the synchronous APPROVE→merge path (no fix spawned). An
-    # APPROVE is always high-stakes, so the default-on second-opinion gate would
-    # park the review EVALUATING + spawn a panel challenger before the merge.
-    # Disable the gate so the synchronous APPROVE path under test runs directly
-    # (gate behavior is covered in test_task_lifecycle.py::test_second_opinion_*).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
+    # This test asserts the synchronous APPROVE→merge path (no fix spawned):
+    # reviews finalize synchronously, so the APPROVE reaches the merge directly.
 
     project = Project(name="Approve No Fix Test", user_id="test-user-123")
     db_session.add(project)
@@ -1685,14 +1665,8 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     # This test exercises synchronous stuck-cycle detection on a REQUEST_CHANGES
-    # verdict (concrete repeated CRITICAL issue → high-stakes). Disable the
-    # default-on second-opinion gate so the verdict reaches the stuck-cycle
-    # suppression path directly rather than parking EVALUATING for a panel
-    # challenge (gate coverage lives in test_task_lifecycle.py).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
+    # verdict (concrete repeated CRITICAL issue): reviews finalize synchronously,
+    # so the verdict reaches the stuck-cycle suppression path directly.
 
     project = Project(name="Stuck Cycle Test", user_id="test-user-123")
     db_session.add(project)
@@ -1819,13 +1793,8 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     # Synchronous stuck-cycle detection under test (concrete repeated MAJOR issue
-    # → high-stakes REQUEST_CHANGES). Disable the default-on second-opinion gate
-    # so the verdict reaches the stuck-cycle suppression path directly instead of
-    # parking EVALUATING for a panel challenge.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
+    # → REQUEST_CHANGES): reviews finalize synchronously, so the verdict reaches
+    # the stuck-cycle suppression path directly.
 
     project = Project(name="Stuck Cycle No-OrigID Test", user_id="test-user-123")
     db_session.add(project)
@@ -2550,13 +2519,7 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     # This test asserts the synchronous rollup-gate handoff for an APPROVE
-    # verdict (always high-stakes). Disable the default-on second-opinion gate so
-    # the handoff runs directly instead of parking the review EVALUATING for a
-    # panel challenge (gate coverage lives in test_task_lifecycle.py).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
+    # verdict: reviews finalize synchronously, so the handoff runs directly.
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "test-owner", "test-repo"),

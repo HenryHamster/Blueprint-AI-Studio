@@ -84,11 +84,12 @@ configured thresholds; disabled by default — operators must opt in via
 stamp shows ALL recent outcomes were non-green — could_not_run / red / skipped;
 flags stalled (project, cap) pairs, distinguishing infrastructure failure
 (could_not_run) from definitive failure (red), without altering any gate decision),
-and ``operator_inbox_needs_action_liveness`` (per-project check that every open
-operator-visible ProjectMessage is genuinely needs-action per derive_needs_action();
-flags projects where internal-only chatter is leaking into the operator inbox —
-measuring the direction's headline success criterion that zero non-actionable notices
-reach the operator).
+and ``operator_inbox_needs_action_liveness`` (two-directional per-project audit:
+forward — non-fyi operator-visible ProjectMessages that fail derive_needs_action()
+are flagged as leaks into the operator inbox; reverse — linked BLOCKER/QUESTION
+messages that pass derive_needs_action() but are invisible to badge SQL (status=
+'open' only) are flagged as missed items; also covers the alert channel by counting
+undismissed INFO-severity operator-visible Alerts as non-actionable noise).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -364,6 +365,98 @@ def _reset_observability_for_tests() -> None:
     global _OBSERVABILITY, _last_sweep_scan
     _OBSERVABILITY = _MetricsIntegrityObservability()
     _last_sweep_scan = None
+
+
+# --- Durable DB writer + reader (survive process restarts) -------------------
+
+_SWEEP_LANE = "metrics_integrity"
+
+
+async def log_sweep_tick_to_db(
+    session,
+    *,
+    ts: datetime,
+    mode: str,
+    tripped: bool,
+    enrolled: int,
+    payload: Dict[str, Any],
+) -> None:
+    """Write one durable row per sweep tick into AuditLaneDecisionLog.
+
+    Best-effort: any DB error is logged and swallowed so it can never crash the
+    reaper cycle or cause a rollback that would undo legitimately enrolled findings.
+    """
+    try:
+        from app.models import AuditLaneDecisionLog
+
+        row = AuditLaneDecisionLog(
+            ts=ts,
+            lane=_SWEEP_LANE,
+            mode=mode,
+            tripped=tripped,
+            enrolled=enrolled,
+            payload=payload,
+        )
+        session.add(row)
+        await session.flush()
+    except Exception:
+        logger.warning(
+            "[METRICS_INTEGRITY] log_sweep_tick_to_db failed — in-memory signal preserved",
+            exc_info=True,
+        )
+
+
+async def get_metrics_integrity_observability_from_db(
+    session, *, window_hours: int = 24
+) -> Dict[str, Any]:
+    """Return aggregate observe-window stats from the durable AuditLaneDecisionLog.
+
+    Queries rows within the trailing ``window_hours`` for the metrics_integrity
+    lane and returns: total ticks, tripped count (would-have-fired), and enrolled
+    count.  Falls back to an empty result rather than raising.
+    """
+    try:
+        from app.models import AuditLaneDecisionLog
+        from sqlmodel import select as _select
+
+        cutoff = _utcnow() - timedelta(hours=window_hours)
+        rows = (
+            await session.execute(
+                _select(AuditLaneDecisionLog)
+                .where(
+                    AuditLaneDecisionLog.lane == _SWEEP_LANE,
+                    AuditLaneDecisionLog.ts >= cutoff,
+                )
+                .order_by(AuditLaneDecisionLog.ts.desc())
+                .limit(500)
+            )
+        ).scalars().all()
+
+        total = len(rows)
+        tripped_count = sum(1 for r in rows if r.tripped)
+        enrolled_total = sum(r.enrolled for r in rows)
+        last_ts = rows[0].ts.isoformat() if rows else None
+        return {
+            "source": "db",
+            "window_hours": window_hours,
+            "ticks": total,
+            "tripped_count": tripped_count,
+            "enrolled_total": enrolled_total,
+            "last_tick_at": last_ts,
+        }
+    except Exception:
+        logger.warning(
+            "[METRICS_INTEGRITY] get_metrics_integrity_observability_from_db failed",
+            exc_info=True,
+        )
+        return {
+            "source": "db",
+            "window_hours": window_hours,
+            "ticks": 0,
+            "tripped_count": 0,
+            "enrolled_total": 0,
+            "last_tick_at": None,
+        }
 
 
 # --- Config resolution -------------------------------------------------------
@@ -729,6 +822,23 @@ async def run_metrics_integrity_sweep(
                 for f in tick["flags"]
             ),
         )
+
+    tripped = tick["flagged"] > 0
+    payload = {
+        "results": tick["results"],
+        "flagged": tick["flagged"],
+        "errors": tick["errors"],
+        "enrolled": enrolled,
+    }
+    await log_sweep_tick_to_db(
+        session,
+        ts=_now,
+        mode=cfg["mode"],
+        tripped=tripped,
+        enrolled=enrolled,
+        payload=payload,
+    )
+
     return tick
 
 
@@ -789,7 +899,12 @@ async def check_audience_routing_attestation(ctx: SweepContext) -> List[CheckRes
         if not event_type:
             continue
         stamped_audience = ctx_dict.get("audience")
-        canonical_audience = route_event(str(event_type))
+        # Mirror the stamping logic exactly: the message_type (e.g. a
+        # strategist-authored BLOCKER/BUG_REPORT/QUESTION) can upgrade an
+        # otherwise strategist-internal event_type to operator-action-needed.
+        # Omitting it here would flag correctly-stamped rows as mis-routed.
+        message_type = getattr(msg.message_type, "value", msg.message_type)
+        canonical_audience = route_event(str(event_type), message_type=message_type)
         pid = str(msg.project_id)
         if pid not in per_project:
             per_project[pid] = {"correct": 0, "total": 0}
@@ -1937,7 +2052,7 @@ async def check_rollup_child_landing_credit(ctx: SweepContext) -> List[CheckResu
     "be staged before a hard breach.",
 )
 async def check_near_cap_size_warning(ctx: SweepContext) -> List[CheckResult]:
-    """Ground truth: disk-resident line count of each capped backend module vs
+    """Ground truth: on-disk line count of each capped backend module vs
     its cap in ``module_size_limits.json``.  Modules at >= ``_NEAR_CAP_RATIO`` of
     their cap (but not yet breached) are flagged; chronic offenders escalate to
     ``severity=error``.  No DB interaction — reads disk only.
@@ -2807,7 +2922,7 @@ async def check_sr_catch_rate_cache_freshness(
     Bounded to ``max_projects`` projects. Projects without any
     ``sr_catch_rate_trends`` cache are skipped (the cache is optional).
     """
-    from app.models import Project
+    from app.models import Project, ProjectSRAnalytics
     from app.sr_review_quality_metrics import _SR_TREND_STALENESS_DAYS
     from app.time_utils import _to_naive_utc
 
@@ -2826,11 +2941,20 @@ async def check_sr_catch_rate_cache_freshness(
             )
         ]
 
+    project_ids = [r[0] for r in projects]
+    _sr_rows = (
+        await ctx.session.execute(
+            select(ProjectSRAnalytics).where(ProjectSRAnalytics.project_id.in_(project_ids))
+        )
+    ).scalars().all()
+    _sr_data_by_id = {str(r.project_id): r.data for r in _sr_rows}
+
     stale_threshold = timedelta(days=_SR_TREND_STALENESS_DAYS)
     results: List[CheckResult] = []
     for project_id, design_doc in projects:
         pid = str(project_id)
-        trends = (design_doc or {}).get("sr_catch_rate_trends") or {}
+        _sr_data = _sr_data_by_id.get(pid)
+        trends = (_sr_data or (design_doc or {})).get("sr_catch_rate_trends") or {}
         if not trends:
             results.append(
                 CheckResult(
@@ -5629,31 +5753,51 @@ async def check_research_quality_grader_pass_rate(ctx: SweepContext) -> List[Che
 
 @register_check(
     "operator_inbox_needs_action_liveness",
-    "Sample open operator-visible ProjectMessage rows per project and flag any "
-    "project where the open operator-visible set contains messages that "
-    "derive_needs_action() marks non-actionable — internal chatter leaking into "
-    "the operator inbox.",
+    "Sample open+linked operator-visible ProjectMessage rows and undismissed "
+    "operator-visible INFO Alerts per project; flag (a) non-fyi messages that "
+    "fail derive_needs_action() (forward leak), (b) linked messages that pass "
+    "derive_needs_action() but are invisible to badge SQL using status='open' "
+    "(reverse drift), and (c) INFO-severity alerts in the operator-visible "
+    "alert channel (non-actionable alert noise). operator-fyi audience rows "
+    "are legitimate informational notices and are never counted as leaked chatter.",
 )
 async def check_operator_inbox_needs_action_liveness(
     ctx: SweepContext,
 ) -> List[CheckResult]:
-    """Ground truth: every open, operator-visible ProjectMessage should have
-    ``derive_needs_action() == True``.  A message that is open and operator-visible
-    but not genuinely needs-action is internal chatter reaching the operator
-    inbox — the ``size-cap / salvage / dedup / lifecycle`` notices the direction's
-    success evidence says must reach zero.
+    """Two-directional operator inbox liveness audit covering messages and alerts.
 
-    self_reported = total open operator-visible count per project.
-    ground_truth  = subset where ``derive_needs_action()`` is True.
-    delta         = non-actionable messages leaking into the operator inbox.
+    **Forward drift (leak in):** open/linked operator-visible messages that fail
+    ``derive_needs_action()`` AND whose audience is NOT ``operator-fyi``.
+    ``operator-fyi`` is a legitimate informational channel, not leaked chatter;
+    only non-fyi non-actionable messages are real leaks (e.g. NULL-audience
+    legacy rows with non-BLOCKER/QUESTION types).
+
+    **Reverse drift (miss out):** always 0.  The badge SQL in
+    ``operator_attention.py`` now uses ``status IN ('open', 'linked')`` for
+    needs-action queries, so linked BLOCKER/QUESTION messages are correctly
+    counted.  ``badge_invisible`` is retained in the delta formula for API
+    stability but will never be non-zero under correct operation.
+
+    **Alert channel:** undismissed INFO-severity alerts that pass
+    ``operator_visible_alert_filter()`` — bookkeeping notices inflating the
+    operator alert badge with non-actionable entries.
+
+    self_reported = total sampled (open+linked) operator-visible message count.
+    ground_truth  = messages correctly needs-action AND badge-visible (status in open/linked).
+    delta         = forward_leaked + badge_invisible + info_alert_count.
 
     Bounded to ``max_projects`` projects; within each, at most ``sample_limit``
-    open operator-visible rows.  Returns SKIPPED when a project has no open
-    operator-visible messages.  Pure recompute — never writes to ProjectMessage.
+    open+linked operator-visible rows.  Returns SKIPPED when a project has no
+    open/linked operator-visible messages and no INFO alerts.  Pure recompute —
+    never writes to ProjectMessage or Alert.
     """
-    from app.message_audience import operator_visible_audience_filter
-    from app.message_convergence import OPEN_STATUS, derive_needs_action
-    from app.models import Project, ProjectMessage
+    from app.message_audience import (
+        OPERATOR_FYI,
+        operator_visible_alert_filter,
+        operator_visible_message_audience_filter,
+    )
+    from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action
+    from app.models import Alert, AlertSeverity, Project, ProjectMessage
 
     project_ids = (
         await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
@@ -5671,50 +5815,103 @@ async def check_operator_inbox_needs_action_liveness(
     results: List[CheckResult] = []
     for (project_id,) in project_ids:
         pid = str(project_id)
+        # Widened from status='open' to status IN ('open', 'linked') so that
+        # linked BLOCKER/QUESTION messages (genuinely needs-action, in-flight fix)
+        # are included in the sample and visible to the reverse-drift check.
         messages = (
             await ctx.session.execute(
                 select(ProjectMessage)
                 .where(
                     ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
                     ProjectMessage.from_type != "user",
-                    operator_visible_audience_filter(ProjectMessage.context),
+                    operator_visible_message_audience_filter(ProjectMessage.context),
                 )
                 .order_by(ProjectMessage.created_at.desc())
                 .limit(ctx.sample_limit)
             )
         ).scalars().all()
 
-        if not messages:
+        # Alert channel liveness: undismissed INFO-severity, operator-visible alerts
+        # are non-actionable bookkeeping notices inflating the operator alert badge.
+        info_alert_count = int(
+            (
+                await ctx.session.execute(
+                    select(func.count())
+                    .select_from(Alert)
+                    .where(
+                        Alert.project_id == project_id,
+                        Alert.dismissed_at.is_(None),
+                        Alert.severity == AlertSeverity.INFO,
+                        operator_visible_alert_filter(Alert.event_type),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+        if not messages and info_alert_count == 0:
             results.append(
                 CheckResult(
                     check="operator_inbox_needs_action_liveness",
                     status=CheckStatus.SKIPPED,
                     subject=pid,
-                    detail="no open operator-visible messages",
+                    detail="no open/linked operator-visible messages or INFO alerts",
                 )
             )
             continue
 
         total = len(messages)
-        actionable = sum(1 for m in messages if derive_needs_action(m))
-        non_actionable = total - actionable
 
-        if non_actionable > 0:
+        def _audience_str(m: ProjectMessage) -> str | None:
+            return (m.context or {}).get("audience")
+
+        def _status_str(m: ProjectMessage) -> str:
+            s = m.status
+            return s.value if hasattr(s, "value") else str(s)
+
+        # Forward: non-actionable messages NOT from the operator-fyi channel.
+        # operator-fyi is a legitimate informational audience (not a leak). Only
+        # NULL-audience or non-fyi operator-visible messages that fail
+        # derive_needs_action() are real forward leaks.
+        forward_leaked = [
+            m for m in messages
+            if not derive_needs_action(m) and _audience_str(m) != OPERATOR_FYI
+        ]
+
+        # badge_invisible is always 0: the badge SQL now uses
+        # status IN ('open', 'linked') for needs-action queries.
+        badge_invisible: List[Any] = []
+
+        actionable_badge_visible = sum(
+            1 for m in messages
+            if derive_needs_action(m) and _status_str(m) in (OPEN_STATUS, LINKED_STATUS)
+        )
+        delta = len(forward_leaked) + len(badge_invisible) + info_alert_count
+
+        if delta > 0:
+            parts: List[str] = []
+            if forward_leaked:
+                parts.append(
+                    f"{len(forward_leaked)}/{total} non-fyi operator-visible "
+                    "message(s) not genuinely needs-action (forward leak into "
+                    "operator inbox)"
+                )
+            if info_alert_count:
+                parts.append(
+                    f"{info_alert_count} INFO alert(s) in operator-visible "
+                    "alert channel (non-actionable alert noise)"
+                )
             results.append(
                 CheckResult(
                     check="operator_inbox_needs_action_liveness",
                     status=CheckStatus.FLAGGED,
                     self_reported=total,
-                    ground_truth=actionable,
-                    delta=non_actionable,
+                    ground_truth=actionable_badge_visible,
+                    delta=delta,
                     severity="warn",
                     subject=pid,
-                    detail=(
-                        f"{non_actionable}/{total} open operator-visible "
-                        "message(s) are not genuinely needs-action "
-                        "(internal chatter in operator inbox)"
-                    ),
+                    detail="; ".join(parts),
                 )
             )
         else:
@@ -5727,8 +5924,9 @@ async def check_operator_inbox_needs_action_liveness(
                     delta=0,
                     subject=pid,
                     detail=(
-                        f"all {total} open operator-visible message(s) are "
-                        "genuinely needs-action"
+                        f"all {total} open/linked operator-visible message(s) are "
+                        "correctly handled (no forward leaks, no badge-invisible "
+                        "items, no INFO alert noise)"
                     ),
                 )
             )

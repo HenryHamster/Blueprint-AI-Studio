@@ -17,6 +17,19 @@
 - Agent: `cd agent && npx tsc --noEmit`. `./check test` also runs `npx vitest run` (the agent unit suite) when agent/ files changed.
 - JS/TS unit suites: `./check test` runs both `cd agent && npx vitest run` and `cd admin-ui && npx vitest run` for their respective stacks. These match the blocking CI jobs at the promotion PR, so regressions surface at the merge gate instead of weeks later.
 
+## Release Qualification Boundaries
+- The automain to main qualifier must never spawn, wait for, respawn, score, or ledger-write a VM `smoketest` child.
+- Promotion PR CI is the hard deterministic test gate. CI red and unresolved/pending required CI remain blocking.
+- Ordinary post-promotion/deployment `smoketest` tasks are a separate operational check and must remain available.
+- Legacy `smoketest_task_id` and `smoketest_enabled` fields are read-model compatibility only; they never gate a current qualification.
+- Promotion weights use `audit` and `test_erosion`. Legacy three-key policies are accepted by ignoring and renormalizing the retired `smoketest` weight.
+
+## Strategic Resident Boundaries
+- **Protect the conversational Workday path.** The `/strategic-session` APIs, project-message acceptance and reply recovery, `StrategicSessionControl`, chat/Workday mode, runner selection, session continuity, and their persisted state are the supported operator conversation surface. Do not remove or replace them as part of Resident cleanup.
+- **Protect tool-to-conversation handoff.** Notes and Whiteboard freeze immutable `ArtifactRef` revisions, queue them into the conversation composer, and deliver their exact bounded snapshot/render through the current authenticated Workday message poll. This is part of the supported conversational path, not shadow/control-plane Resident machinery; preserve it when removing retired Resident code.
+- **Keep the shadow/control-plane Resident retired.** The separate `StrategicResident` ownership/checkpoint/receipt/rollout machinery and bounded `strategic_resident_turn` task type were an abandoned replacement architecture. Do not restore their models, migrations, task registration/routing, workers, APIs, or UI controls from historical plans.
+- **Do not conflate qualifier smoke with operational health.** Qualifier-spawned VM `smoketest` children stay removed. Deterministic promotion CI and ordinary post-promotion health/deployment checks (including separately requested operational `smoketest` tasks) stay available.
+
 ## Test Guidelines
 - When fixing test failures, first diagnose: is the failure in the CODE or the TEST?
 - Do NOT delete or skip tests just to make them pass

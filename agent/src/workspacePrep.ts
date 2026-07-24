@@ -41,10 +41,10 @@ import {
  */
 /**
  * List the top-level directory names of a prepared workspace — the
- * project-shape-agnostic seed for the resident strategist's `code:<dir>`
+ * project-shape-agnostic seed for the strategist's `code:<dir>`
  * examination surfaces (no hardcoded project types). Skips dotfiles/`.git` and
  * non-directories; returns [] on any fs error so a scan failure at session start
- * never breaks the resident loop.
+ * never breaks the strategic loop.
  */
 export function listWorkspaceTopDirs(workspace: string): string[] {
   try {
@@ -92,7 +92,7 @@ export interface PrepareWorkspaceOptions {
    * to DEFAULT_CLONE_DEPTH when depth is omitted. Pass `0` (or any non-
    * positive number) to perform a FULL clone (no --depth flag) — the
    * research handler relies on full git history, and the release qualifier
-   * (release_audit / qualifier-smoketest) needs the merge-base reachable.
+   * (release_audit) needs the merge-base reachable.
    * A non-positive depth is also honored on the WARM path: if the reused
    * workspace is shallow (a `.git/shallow` left by an earlier role's shallow
    * clone) the helper runs `git fetch --unshallow` so full history is
@@ -206,7 +206,7 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
       // `git fetch origin <branch>` keeps whatever shallow boundary role 1's
       // clone left behind (a `.git/shallow` file). Callers that pass depth 0
       // (release_audit's `main...<candidate_sha>` three-dot diff,
-      // qualifier-smoketest's candidate-SHA fetch+checkout) need the merge-base
+      // other SHA-pinned audit roles) need the merge-base
       // reachable, so unshallow the repo here. We only do this when the request
       // is a full clone AND the repo is actually shallow — a non-positive depth
       // on an already-complete repo is a no-op, and shallow (depth > 0) requests

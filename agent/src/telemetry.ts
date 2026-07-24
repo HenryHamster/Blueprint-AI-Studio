@@ -296,7 +296,6 @@ export type SchemaLabel =
   | 'specialized_result'
   | 'thinker'
   | 'review_verdict'
-  | 'panel_review_lens'
   | 'strategic'
   | 'unknown';
 

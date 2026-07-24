@@ -16,11 +16,11 @@ dimensions.  Keeping them apart let the facets fall out of sync — env prefligh
 and capability proof, in particular, are represented inconsistently across the
 writer, the promotion-required list, the blocker map, and the read model.
 
-This module declares every dimension ONCE, with all of its facets, and derives
-the concrete collections the two modules consume.  The derived collections are
-byte-for-byte equal to the legacy literals (locked by
-``test_qualification_dimensions``); this is a pure consolidation with no
-behavior change.
+This module declares every active dimension ONCE, with all of its facets, and
+derives the concrete collections the two modules consume.  The registry reflects
+the current smoke-retired qualification contract: qualifier VM smoke is archival
+metadata, not an active dimension.  ``test_qualification_dimensions`` locks the
+derived collections and routing to that contract.
 """
 
 from __future__ import annotations
@@ -41,9 +41,7 @@ class QualificationDimension:
             live from ``last_qualification``.
         promotion_required: Whether a terminal same-``candidate_sha`` fact for
             this dimension is required before a promotion may compose from the
-            ledger.  (``smoketest`` is required only when the run had it enabled
-            and is handled conditionally by the caller — it is therefore NOT
-            flagged here.)
+            ledger.
         mutable: Whether the dimension's live result is re-measured on every
             re-drive.  A reused ledger row for a mutable dimension must not
             overwrite the freshly-measured blob-derived state.
@@ -70,11 +68,6 @@ QUALIFICATION_DIMENSIONS: tuple[QualificationDimension, ...] = (
         "test_erosion", "Test Erosion",
         ledger_backed=True, promotion_required=True,
         blocker_codes=("test_file_deleted",),
-    ),
-    QualificationDimension(
-        "smoketest", "Smoketest",
-        ledger_backed=True,
-        blocker_codes=("smoketest_startup_failed",),
     ),
     QualificationDimension(
         "ci", "CI",
@@ -157,10 +150,8 @@ MUTABLE_DIMENSION_KEYS: frozenset[str] = frozenset(
 )
 
 # Gates that must each have a terminal same-``candidate_sha`` fact before a
-# promotion may compose from the ledger.  ``smoketest`` is required only when the
-# run had it enabled and is appended conditionally by the caller, so it is not
-# listed here.  Order preserves the legacy tuple so the ``missing`` diagnostic
-# list keeps its historical ordering.
+# promotion may compose from the ledger. Order preserves the established
+# diagnostic ordering.
 PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = (
     "ci",
     "audit",

@@ -1,65 +1,22 @@
 """Release qualifier — the automain → main promotion gate.
 
-Phase 3 of the automain LTS design (docs/plans/automain-lts-plan-v1.md).
+The qualifier is an asynchronous coordinator. ``run_qualification`` snapshots
+one candidate SHA, resolves CI, and spawns only the active audit, challenge,
+merge-grade, and evidence children. ``_finalize_qualification`` composes those
+active results with deterministic migration, environment, and promotion-PR
+gates, then either promotes the exact qualified commit or records the blocker.
 
-The qualifier is an **async coordinator**, not a blocking call.  It scores an
-``automain`` release candidate against ``main`` (the last known-good LTS branch)
-and, when confident, promotes it.  Confidence is *differential* (everything is
-measured as the ``main...automain`` diff) and *composite* (CI + audit +
-test-erosion + smoketest).
+Qualifier VM smoke is retired. Historical ``smoketest_enabled`` and
+``smoketest_task_id`` values remain readable as archival metadata, but no
+current attempt spawns, waits for, respawns, reads an artifact from, scores,
+ledgers, or blocks on that lane. Ordinary post-promotion deployment smoke is a
+separate task-lifecycle check and remains available.
 
-Two-phase flow:
-
-  run_qualification(session, project_id, version)
-      Snapshot the candidate SHA, check CI (cheap, orchestrator-side), lock the
-      ReleaseVersion row, spawn a ``release_audit`` agent task and — when the
-      smoketest subsystem is enabled — a qualify-time ``smoketest`` agent task,
-      stamp ``version.last_qualification = {status: "pending", ...}`` and bump
-      ``qualification_attempts``.  Both child payloads carry the exact
-      ``candidate_sha`` so the children check out the precise snapshot commit.
-      Returns immediately — does NOT block on the children.
-
-  _finalize_qualification(session, version)
-      Invoked later (by Phase 3 batch-3 completion handlers — not wired here)
-      once the release_audit child (and the qualify-smoketest child, when the
-      subsystem was enabled) for this version have terminated.  Reads the
-      RELEASE_AUDIT_REPORT and SMOKETEST_RESULT artifacts, computes the
-      composite, and either promotes or sets the version back to ``stabilize``.
-
-  promote(session, version, candidate_sha, ...)
-      Creates a release branch pinned to ``candidate_sha``, opens a PR from it
-      into ``main`` and merges it.  Promotes the EXACT qualified commit, so
-      ``automain`` advancing during qualification is harmless.
-
-Session ownership (the merge→main transaction boundary).  ``promote()`` merges
-to production ``main``; it MUST never commit a caller's unrelated transaction.
-``maybe_finalize_qualification`` therefore opens its OWN dedicated session (via
-``AsyncSessionLocal``) for the whole finalize→promote chain — fully decoupled
-from whatever session the task-completion handler / reaper passed.  Inside that
-dedicated session ``promote()``'s intermediate ``commit()`` (which releases the
-row lock before the 30-120s of GitHub I/O) only ever flushes qualifier state,
-because the dedicated session has nothing else dirty.  A fresh session also
-cannot self-deadlock: the completion handler holds a lock on the *Task* row, not
-the ``ReleaseVersion`` row, and the reaper sweep takes no lock on the version
-before delegating — so the dedicated session's ``SELECT ... FOR UPDATE SKIP LOCKED`` on the
-version row can never wait on a lock the caller still holds; if a peer holds it,
-the finalize attempt skips and the next completion/sweep retries.
-
-Hard blockers (CI red, smoketest startup-suite failure when the subsystem is
-enabled, any deleted test file) force confidence to 0.0 — those candidates
-never promote regardless of the other sub-scores.  When the smoketest
-subsystem is disabled the smoketest dimension is dropped and the remaining
-weights renormalize (see ``compute_composite``).
-
-Ships dark: actual promotion runs only when ``runtime_config["promotion_enabled"]``
-is True.  Otherwise the composite is computed and logged (dry-run) but no PR is
-opened.
-
-Public API: ``run_qualification``, ``maybe_finalize_qualification``,
-``sweep_stuck_qualifications``, ``_finalize_qualification``,
-``compute_composite``, ``_load_policy``, ``promote``.
+``maybe_finalize_qualification`` owns a dedicated database session for the
+finalize-to-promote chain so GitHub I/O and the promotion commit cannot flush a
+caller transaction. Actual promotion remains dark unless
+``runtime_config["promotion_enabled"]`` is true.
 """
-
 from __future__ import annotations
 
 import contextlib
@@ -80,6 +37,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import (
+    ADMIN_CANCEL,
     AGENT_TIMEOUT,
     PROVISION_FAILURE,
     RATE_LIMIT,
@@ -160,10 +118,10 @@ from app.release_qualifier_audit import (
     _handle_infra_failure,
     _latest_artifact_logs,
     _select_lifecycle_audit,  # noqa: F401 — re-exported for callers/tests
-    _spawn_qualifier_smoketest_task,
     _spawn_release_audit_challenge_task,
     _spawn_release_audit_task,
     _spawn_release_merge_grade_task,
+    _spawn_qualifier_walkthrough_task,
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
@@ -192,7 +150,6 @@ from app.release_scoring import (
     _FINDING_SUMMARY_MAX,
     _MAX_CARRIED_FINDINGS,  # noqa: F401
     _MAX_DELETED_TEST_FILES,  # noqa: F401 — re-exported for callers/tests
-    _MAX_FAILED_SMOKE_TESTS,  # noqa: F401 — re-exported for callers/tests
     _MIN_TELEMETRY_SAMPLE,  # noqa: F401 — re-exported for callers/tests
     _SEVERITY_RANK,
     _SEVERITIES_REQUIRING_VERIFICATION,
@@ -211,7 +168,6 @@ from app.release_scoring import (
     _compute_challenge_synthesis_from_binding_verdicts,
     _extract_audit_findings,
     _extract_excluded_audit_findings,
-    _extract_smoketest_detail,
     _extract_test_erosion_detail,
     _finding_subject_is_authorized_divergence,
     _finding_is_verified,
@@ -220,7 +176,6 @@ from app.release_scoring import (
     _score_audit,
     _score_completion_debt_pressure,
     _score_env_preflight,
-    _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
     evaluate_merge_grade,
@@ -298,6 +253,7 @@ from app.release_readiness import (
 from app.shared_state import (
     get_project_integration_branch,
     resolve_project_promotion_enabled,
+    resolve_project_walkthrough_e2e_enabled,
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
@@ -322,7 +278,7 @@ _DUAL_WRITE_SPEC_DIMENSIONS: frozenset[str] = frozenset({
     "ci",
     "audit",
     "test_erosion",
-    "smoketest",
+
     "challenge",
     "migration_identity",
     "migration_apply",
@@ -1060,6 +1016,35 @@ def _promotion_failed_reuse_eligible(
 # from this file (backend/app/release_qualifier.py).
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
 
+def _normalize_active_promotion_weights(weights_raw: Any) -> dict[str, float]:
+    """Accept current two-key and legacy three-key policies deterministically."""
+    from decimal import Decimal
+
+    if not isinstance(weights_raw, dict):
+        raise ValueError("promotion weights must be a mapping")
+    audit = float(weights_raw["audit"])
+    erosion = float(weights_raw["test_erosion"])
+    smoke = float(weights_raw.get("smoketest", 0.0))
+    if audit < 0 or erosion < 0 or smoke < 0:
+        raise ValueError("promotion weights must be non-negative")
+    declared_sum = audit + erosion + smoke
+    if abs(declared_sum - 1.0) > 0.01:
+        raise ValueError(f"promotion weights sum to {declared_sum:.4f}, expected ~1.0")
+    audit_decimal = Decimal(str(weights_raw["audit"]))
+    erosion_decimal = Decimal(str(weights_raw["test_erosion"]))
+    active_sum = audit_decimal + erosion_decimal
+    if active_sum <= 0:
+        raise ValueError("active promotion weights must be positive")
+    result = {
+        "audit": float(audit_decimal / active_sum),
+        "test_erosion": float(erosion_decimal / active_sum),
+    }
+    debt = coerce_completion_debt_weight(weights_raw)
+    if debt > 0.0:
+        result["completion_debt"] = debt
+    return result
+
+
 def _policy_from_runtime_config() -> dict[str, Any] | None:
     """Return the live promotion rubric from runtime_config, or None.
 
@@ -1070,33 +1055,17 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
 
     Returns the validated ``{"weights": {...}, "threshold": float}`` shape when
     runtime_config holds a usable rubric, else ``None`` so ``_load_policy``
-    falls back to re-reading the YAML file / hardcoded defaults.  Validates the
-    same invariants as the YAML loader (three float weights summing to ~1.0, a
-    float threshold) — a malformed in-memory value must never reach the gate.
+    falls back to re-reading the YAML file / hardcoded defaults. Current
+    two-key and archival three-key rubrics are normalized through the same
+    helper, so the retired smoke weight can never reach the active gate.
     """
     try:
         threshold_raw = _runtime_config.get("promotion_threshold")
         weights_raw = _runtime_config.get("promotion_weights")
         if threshold_raw is None or not isinstance(weights_raw, dict):
             return None
-        weights = {
-            "audit": float(weights_raw["audit"]),
-            "test_erosion": float(weights_raw["test_erosion"]),
-            "smoketest": float(weights_raw["smoketest"]),
-        }
+        weights = _normalize_active_promotion_weights(weights_raw)
         threshold = float(threshold_raw)
-        weight_sum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
-        if abs(weight_sum - 1.0) > 0.01:
-            raise ValueError(
-                f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
-            )
-        # completion_debt is an OPTIONAL, SEPARATE blend factor — NOT part of the
-        # three-core-weight sum above.  Read + preserve it (default 0.0, clamped
-        # to [0, 0.5]) so the mode gate in _resolve_policy_with_provenance can
-        # turn the debt-pressure signal on; absent => 0.0 = the legacy behaviour.
-        _cd = coerce_completion_debt_weight(weights_raw)
-        if _cd > 0.0:
-            weights["completion_debt"] = _cd
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
         for _k in ("merge_grade_block_threshold",):
             _v = _runtime_config.get(_k)
@@ -1151,16 +1120,7 @@ def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
         return None
     try:
         if weights_raw is not None:
-            weights = {
-                "audit": float(weights_raw["audit"]),
-                "test_erosion": float(weights_raw["test_erosion"]),
-                "smoketest": float(weights_raw["smoketest"]),
-            }
-            wsum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
-            if abs(wsum - 1.0) > 0.01:
-                raise ValueError(
-                    f"build_config promotion_weights sum to {wsum:.4f}, expected ~1.0"
-                )
+            weights = _normalize_active_promotion_weights(weights_raw)
             # Optional per-project completion_debt blend factor (separate from the
             # three-core-weight sum; default 0.0, clamped to [0, 0.5]).
             _cd = coerce_completion_debt_weight(weights_raw)
@@ -1203,18 +1163,21 @@ def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
         return None
 
 # The operator-facing graduation gate for the completion-debt pressure signal.
-# ``completion_debt_weight_mode`` is a real runtime_config key (default
-# "observe"); only "enforce" lets the configured completion_debt weight reach
-# the composite blend.
+# ``completion_debt_weight_mode`` is a real runtime_config key graduated to
+# "enforce" (three-state adjudication, decision #7); only "enforce" lets the
+# configured completion_debt weight reach the composite blend. An operator may
+# still pin "off"/"observe" per deployment to roll back.
 _COMPLETION_DEBT_WEIGHT_MODES: frozenset[str] = frozenset({"off", "observe", "enforce"})
 
 def _resolve_completion_debt_weight_mode() -> str:
-    """Return the live ``completion_debt_weight_mode`` (default "observe").
+    """Return the live ``completion_debt_weight_mode`` (shipped default "enforce").
 
-    Any unrecognised / unset value degrades to the safe "observe" default so a
-    malformed knob can never silently arm the enforce blend.
+    Any unrecognised / malformed value degrades to the conservative "observe"
+    fallback so a garbage knob can never silently arm the enforce blend — the
+    intended "enforce" state must be an explicit (or the shipped-default) value,
+    never a side effect of parsing junk.
     """
-    mode = str(_runtime_config.get("completion_debt_weight_mode", "observe")).strip().lower()
+    mode = str(_runtime_config.get("completion_debt_weight_mode", "enforce")).strip().lower()
     return mode if mode in _COMPLETION_DEBT_WEIGHT_MODES else "observe"
 
 def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]:
@@ -1305,26 +1268,10 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
         if not isinstance(weights_raw, dict):
             raise ValueError("promotion_policy.yaml missing 'weights' mapping")
 
-        # Coerce every weight + threshold to float; KeyError/TypeError/ValueError
-        # here drop us into the fallback branch.
-        weights = {
-            "audit": float(weights_raw["audit"]),
-            "test_erosion": float(weights_raw["test_erosion"]),
-            "smoketest": float(weights_raw["smoketest"]),
-        }
+        # Normalize current two-key and archival three-key policies through one
+        # path; KeyError/TypeError/ValueError here drops into the safe fallback.
+        weights = _normalize_active_promotion_weights(weights_raw)
         threshold = float(parsed["threshold"])
-
-        # Validate the weights sum to ~1.0.  This file decides what reaches
-        # production main: weights summing >1.0 saturate confidence at 1.0 so
-        # every candidate promotes (gate effectively disabled); <1.0 means
-        # nothing can clear the threshold (gate stuck closed).  A human-edited
-        # mistake here is silent and dangerous — fall back to the safe default
-        # rubric rather than honour a mis-weighted policy.
-        weight_sum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
-        if abs(weight_sum - 1.0) > 0.01:
-            raise ValueError(
-                f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
-            )
 
         # Optional completion_debt blend factor from the on-disk rubric (separate
         # from the three-core-weight sum; default 0.0, clamped to [0, 0.5]).
@@ -1381,8 +1328,8 @@ def _load_policy(project: Project | None = None) -> dict[str, Any]:
     gate; the caller still decides whether to act on the composite).
 
     The returned dict always has the shape
-    ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
-       "threshold": float}`` with every value coerced to float.  An OPTIONAL
+    ``{"weights": {"audit": float, "test_erosion": float},
+       "threshold": float}`` with every value coerced to float. An OPTIONAL
     ``weights["completion_debt"]`` blend factor is present only when the operator
     has graduated ``completion_debt_weight_mode`` to "enforce" (mode-gated in
     ``_resolve_policy_with_provenance``); in observe/off mode the key is absent
@@ -1437,48 +1384,64 @@ _INFRA_FAILURE_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
     }
 )
 
+def _legacy_smoke_tainted_verdict(qual: dict[str, Any]) -> bool:
+    """Return whether a conclusive verdict depended on retired qualifier smoke."""
+    if qual.get("status") not in _CONCLUSIVE_VERDICT_STATUSES:
+        return False
+    sub_scores = qual.get("sub_scores")
+    resolved = qual.get("resolved_dimensions")
+    return bool(
+        qual.get("smoketest_enabled") is True
+        or (isinstance(sub_scores, dict) and "smoketest" in sub_scores)
+        or (isinstance(resolved, dict) and "smoketest" in resolved)
+        or qual.get("blocker") == "smoketest_startup_failed"
+    )
+
+
+def _legacy_smoke_infra_lineage(qual: dict[str, Any]) -> bool:
+    def _row_is_smoke(row: Any) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("leg") or row.get("failing_leg") or "").lower() == "smoketest":
+            return True
+        signature = str(row.get("signature") or row.get("error") or "").lower()
+        if signature.startswith("smoketest"):
+            return True
+        children = row.get("child_failures")
+        return isinstance(children, list) and any(_row_is_smoke(child) for child in children)
+
+    failing_dimension = str(qual.get("failing_dimension") or "").lower()
+    if failing_dimension:
+        return failing_dimension == "smoketest"
+    direct = str(qual.get("infra_failure_signature") or qual.get("error") or "").lower()
+    if direct.startswith("smoketest"):
+        return True
+    history = qual.get("infra_attempt_history")
+    if isinstance(history, list) and history:
+        # The final row is the current attempt. Earlier smoke failures must not
+        # erase retry/backoff for a newer audit or challenge failure.
+        return _row_is_smoke(history[-1])
+    events = qual.get("infra_failure_child_events")
+    return bool(
+        isinstance(events, list)
+        and events
+        and all(_row_is_smoke(row) for row in events)
+    )
+
+
 async def _qualification_in_flight(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> bool:
-    """Return True iff ``version`` has a qualification *actively running*.
-
-    "In flight" = ``last_qualification.status == "pending"`` AND at least one
-    recorded child task (audit / smoketest) is still non-terminal.  This is the
-    in-flight guard for ``run_qualification``: it must distinguish a genuinely
-    running qualification (do not re-spawn) from a ``pending`` record whose
-    children have all already terminated (awaiting finalize — a fresh run is
-    still permitted; the stale record is harmless and gets overwritten).
-
-    The qualifier-smoketest child is optional (audit H3): when the qualifying
-    run recorded ``smoketest_enabled == False`` the smoketest subsystem was
-    disabled and ``smoketest_task_id`` is legitimately ``None`` — that absence
-    is NOT a parse failure, the qualification simply has a single child.
-
-    A ``pending`` record with a missing/unparseable *required* child task id
-    is treated as in flight (conservative — the run that stamped it may still
-    be spawning).
-    """
+    """Return whether an active non-smoke qualifier child is still running."""
     qual = version.last_qualification or {}
     if qual.get("status") != "pending":
         return False
-
-    # The audit child is always required.  The smoketest child is required
-    # only when the qualifying run had the smoketest subsystem enabled —
-    # records that predate the smoketest_enabled flag default to "required"
-    # so legacy pending records keep their original conservative behaviour.
-    # The challenge child is required when the qualifying run recorded a
-    # challenge_task_id — it must reach a terminal state before finalize can fire.
     required_keys = ["audit_task_id"]
-    if qual.get("smoketest_enabled", True):
-        required_keys.append("smoketest_task_id")
     if qual.get("challenge_task_id"):
         required_keys.append("challenge_task_id")
-    # The blind merge-grade child is required whenever it was spawned (a
-    # non-empty version goal) — finalize must wait for it like the audit child.
     if qual.get("merge_grade_task_id"):
         required_keys.append("merge_grade_task_id")
-
     child_ids: list[uuid.UUID] = []
     parse_failed = False
     for key in required_keys:
@@ -1490,24 +1453,15 @@ async def _qualification_in_flight(
             child_ids.append(uuid.UUID(str(raw)))
         except (ValueError, AttributeError):
             parse_failed = True
-
     if parse_failed:
-        # A pending record we cannot fully resolve — assume the prior run is
-        # still mid-spawn rather than risk a duplicate.
         return True
-
     rows = (
-        await session.execute(
-            select(Task.id, Task.status).where(Task.id.in_(child_ids))
-        )
+        await session.execute(select(Task.id, Task.status).where(Task.id.in_(child_ids)))
     ).all()
-    found_ids = {r.id for r in rows}
-    if any(cid not in found_ids for cid in child_ids):
-        # A child row is not (yet) persisted — the spawning run is still
-        # in progress; treat as in flight.
+    found_ids = {row.id for row in rows}
+    if any(task_id not in found_ids for task_id in child_ids):
         return True
-    # status == "pending" but every child already terminated → not in flight.
-    return any(r.status not in _TERMINAL_STATUSES for r in rows)
+    return any(row.status not in _TERMINAL_STATUSES for row in rows)
 
 def _promotion_in_flight_result(
     version: release_version.ReleaseVersion,
@@ -1519,21 +1473,8 @@ def _promotion_in_flight_result(
     The status echoes the blocking sub-state: ``promotion_in_flight`` (native
     GitHub auto-merge) or ``promotion_check_wait`` (the managed migration-
     carrying wait whose merge the reconciler retries after required checks pass).
-
-    A version whose audit PASSED and now has an open promotion PR auto-merging
-    (``last_qualification.status == "pending"`` + a ``promotion_pending``
-    sub-key) is mid-promotion. Re-qualifying in this state would spawn a fresh
-    audit/smoketest pair and clobber the promotion-pending record other parts of
-    the system rely on as provenance that the promotion is still legitimately
-    merging — so ``run_qualification`` refuses (no-op) just like the version-cut
-    lever does (``abandon_current_version`` raises ``VersionCutBlockedByPromotion``
-    on the same predicate). Reuses ``summarize_qualification_state`` so all the
-    operator levers agree by construction.
-
-    When ``latest_verdict`` is passed, applies finalized-verdict substitution
-    (via :func:`~app.qualification_state_resolver.apply_verdict_substitution`)
-    before classifying so stale-pending records with an already-finalized verdict
-    row are not misclassified as still-blocking.
+    Re-qualifying while either state is active would overwrite the durable
+    promotion-pending provenance, so every operator path uses this same guard.
     """
     from app.qualification_state_resolver import apply_verdict_substitution
 
@@ -1549,21 +1490,16 @@ def _promotion_in_flight_result(
         and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES
     ):
         result = {
-            # Echo the specific blocking sub-state (``promotion_in_flight`` for
-            # native auto-merge, ``promotion_check_wait`` for the managed
-            # migration-carrying wait) so callers can tell which hold fired.
             "status": qual_state["state"],
             "promotion_pr_number": qual_state.get("promotion_pr_number"),
             "promotion_pr_url": qual_state.get("promotion_pr_url"),
         }
-        # Carry the additive age / auto-timeout freshness keys so the qualify 409
-        # can surface elapsed age and near/past-timeout state (keys absent when
-        # promotion_pending had no usable enabled_at).
         for key in release_version._PROMOTION_FRESHNESS_KEYS:
             if key in qual_state:
                 result[key] = qual_state[key]
         return result
     return None
+
 
 def _coerce_qualification_attempt_id(value: Any) -> uuid.UUID | None:
     """Return a UUID attempt identity, accepting legacy string projections."""
@@ -1573,6 +1509,7 @@ def _coerce_qualification_attempt_id(value: Any) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (ValueError, TypeError, AttributeError):
         return None
+
 
 def _qualification_attempt_for_record(
     version: release_version.ReleaseVersion,
@@ -2287,8 +2224,8 @@ async def run_qualification(
     the *Project* row lock (``lock_project_then_task`` in the post-commit
     chain) but that does NOT cover the ``ReleaseVersion`` row, and the admin
     endpoint holds no lock at all.  Without serialization both callers would
-    pass the in-flight guard and each spawn an audit+smoketest pair (4
-    children, one orphaned pair) and clobber each other's
+    pass the in-flight guard and each spawn duplicate expensive children (
+    with one orphaned set) and clobber each other's
     ``last_qualification`` write.  So this function takes its OWN
     ``SELECT ... FOR UPDATE`` on the ``ReleaseVersion`` row and holds it across
     the in-flight check, the child spawns, and the ``last_qualification``
@@ -2304,15 +2241,9 @@ async def run_qualification(
          in ``_finalize_qualification`` applies it as a hard blocker.
       4. Lock the ``ReleaseVersion`` row, then re-check the in-flight /
          cached-verdict guards under the lock.
-      5. Spawn a ``release_audit`` task (clones ``main``, audits the
-         ``main...<candidate_sha>`` diff against main's standards) and — only
-         when ``smoketest_enabled`` is True — a qualify-time ``smoketest`` task.
-         Both child payloads carry the exact ``candidate_sha`` (audit C4) so
-         the children check out the precise commit that was snapshotted rather
-         than whatever ``automain`` drifts to by their runtime; both carry
-         ``context["release_version_id"]``; the smoketest also carries
-         ``context["qualifier_smoketest"] = True`` so its failure does not
-         spawn a fix task.
+      5. Spawn the active audit, merge-grade, and evidence children. Their
+         payloads carry the exact ``candidate_sha`` so every gate evaluates the
+         snapshotted tree rather than a later integration-branch head.
       6. Stamp ``version.last_qualification = {status: "pending", ...}`` and
          bump ``version.qualification_attempts``.
 
@@ -2358,8 +2289,8 @@ async def run_qualification(
 
     # Cheap pre-lock promotion-in-flight check (no I/O beyond verdict fetch).
     # A version whose audit passed and now has an open promotion PR auto-merging
-    # must not be re-qualified: doing so spawns a fresh heavy audit/smoketest
-    # pair and clobbers the promotion-pending record.  Consistent with the
+    # must not be re-qualified: doing so spawns fresh expensive qualifier
+    # children and clobbers the promotion-pending record.  Consistent with the
     # version-cut lever, which refuses in the same state.  Best-effort fast path
     # — the authoritative re-check happens under the row lock below.
     # Fetch the newest verdict so stale-pending+finalized-verdict is not
@@ -2495,6 +2426,7 @@ async def run_qualification(
     _same_sha_conclusive = (
         _pre_lock_qual.get("status") in _CONCLUSIVE_VERDICT_STATUSES
         and _pre_lock_qual.get("candidate_sha") == candidate_sha
+        and not _legacy_smoke_tainted_verdict(_pre_lock_qual)
     )
     candidate_tree_entries = (
         None
@@ -2602,7 +2534,7 @@ async def run_qualification(
     # 4. Take the ReleaseVersion row lock (audit C3).  The strategic
     #    qualify_request path and the admin POST /qualify endpoint can both
     #    reach here concurrently; without serializing them they each pass the
-    #    in-flight guard and spawn a duplicate audit+smoketest pair, and the
+    #    in-flight guard and spawn duplicate expensive children, and the
     #    later last_qualification write clobbers the earlier one.  FOR UPDATE
     #    mirrors maybe_finalize_qualification's pattern — held across the
     #    in-flight check, the spawns, and the last_qualification write.  The
@@ -2679,7 +2611,7 @@ async def run_qualification(
     # "pending" + a promotion_pending sub-key, children already terminal).  This
     # is NOT "in flight" by the child-task definition above, and "pending" is not
     # a conclusive verdict, so neither Guard 2 nor Guard 3 catches it.  Spawning
-    # a fresh audit/smoketest pair here and overwriting the promotion-pending
+    # fresh qualifier children here and overwriting the promotion-pending
     # record would discard the provenance the rest of the system relies on to
     # know the promotion is still legitimately merging — so refuse (no-op),
     # consistent with the version-cut lever.
@@ -2753,6 +2685,11 @@ async def run_qualification(
     # subsumes the old ``total - covered - attested - backfilled <= 0`` arithmetic
     # AND the residual leg in one sha-keyed read.  Mirrors the ``ci_unresolved``
     # narrow exception: relaxes caching for THIS blocker, on the SAME SHA only.
+    # Retiring qualifier VM smoke invalidates every conclusive verdict that
+    # participated in that gate.  This includes a historical passing dry_run:
+    # it must be re-qualified under the current two-dimension policy instead of
+    # being reused on the same SHA (or an identical audited surface).
+    legacy_smoke_tainted_verdict = _legacy_smoke_tainted_verdict(prior_qual)
     criterion_coverage_recovered_same_sha = False
     if (
         prior_status == "not_promoted"
@@ -2777,8 +2714,7 @@ async def run_qualification(
                     "verdict cached",
                     version.version_number,
                 )
-                criterion_coverage_recovered_same_sha = False
-    # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
+                criterion_coverage_recovered_same_sha = False    # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
     # to the prior conclusive candidate (differs only in excluded CI/fixture/
     # config files) carries the same verdict — reuse it instead of re-rolling the
     # audit.  This is the "fixing CI / regenerating a snapshot must not re-run the
@@ -2811,6 +2747,7 @@ async def run_qualification(
         )
         and not ci_unresolved_recovered_same_sha
         and not criterion_coverage_recovered_same_sha
+        and not legacy_smoke_tainted_verdict
     ):
         _reuse_reason = (
             "automain unchanged"
@@ -2835,30 +2772,29 @@ async def run_qualification(
     # Carry forward the infra-failure streak so _finalize_qualification can
     # detect a persistently broken qualifier pipeline.  The streak is the count
     # of consecutive infrastructure failures (FAILED/CANCELLED required child
-    # tasks) before the current pending run — it resets to 0 whenever a prior
-    # finalization wrote a non-infra_failure status OR when the candidate SHA
-    # changes (a new commit should not inherit infra failures from prior SHAs).
+    # tasks) before the current pending run — it resets to 0 only when a prior
+    # finalization wrote a non-infra_failure status.  It accumulates across
+    # advancing candidate SHAs so that repeated cancellations on a moving
+    # automain still trip the escalation cap and fire an operator Alert.
+    _legacy_smoke_infra = _legacy_smoke_infra_lineage(prior_qual)
     prior_infra_failure_candidate_sha = (
         prior_qual.get("candidate_sha")
-        if prior_qual.get("status") == "infra_failure"
+        if prior_qual.get("status") == "infra_failure" and not _legacy_smoke_infra
         else None
     )
     prior_infra_streak: int = (
         int(prior_qual.get("consecutive_infra_errors") or 0)
-        if (
-            prior_qual.get("status") == "infra_failure"
-            and prior_infra_failure_candidate_sha == candidate_sha
-        )
+        if prior_qual.get("status") == "infra_failure" and not _legacy_smoke_infra
         else 0
     )
     prior_infra_failure_signature = (
         prior_qual.get("infra_failure_signature")
-        if prior_qual.get("status") == "infra_failure"
+        if prior_qual.get("status") == "infra_failure" and not _legacy_smoke_infra
         else None
     )
     infra_attempt_history = (
         prior_qual.get("infra_attempt_history")
-        if prior_qual.get("status") == "infra_failure"
+        if prior_qual.get("status") == "infra_failure" and not _legacy_smoke_infra
         else []
     )
     # Carry forward the prior-superseded flag: when the reconciler previously
@@ -2884,19 +2820,19 @@ async def run_qualification(
     # children take to run, and an un-pinned diff would audit a different
     # changeset than was qualified.
     diff_range = f"{promotion_target}...{candidate_sha}"
-    # Audit H3: the qualifier-smoketest child is spawned only when the
-    # smoketest subsystem is enabled.  smoketest_enabled defaults False (the
-    # subsystem is deferred), in which case no qualifier-smoketest task is
-    # spawned and compute_composite drops the smoketest dimension entirely —
-    # see _finalize_qualification / compute_composite.  When True, behave as
-    # the design doc specifies (audit + test-erosion + smoketest).
-    # Per-project override on the build_config seam (a project may or may not
-    # have a smoke suite), falling back to the fleet-global runtime_config flag.
-    smoketest_enabled = bool(
-        (project.build_config or {}).get(
-            "smoketest_enabled", _runtime_config.get("smoketest_enabled")
-        )
-    )
+    # Qualifier VM smoketests are retired. Preserve explicit archival fields in
+    # qualification records, but never launch or score this legacy dimension.
+    smoketest_enabled = False
+    # walkthrough_e2e_enabled gates the qualifier-spawned live-stack walkthrough
+    # evidence lane.  Resolved with the SAME source precedence as the smoketest
+    # gate — per-project build_config override, then the fleet runtime_config
+    # flag (default True).  The spawned child produces SHA-pinned
+    # CriterionEvidence and NEVER cascades a fix on failure (evidence-only).
+    _walkthrough_build_override = (project.build_config or {}).get("walkthrough_e2e_enabled")
+    if _walkthrough_build_override is not None:
+        walkthrough_e2e_enabled = bool(_walkthrough_build_override)
+    else:
+        walkthrough_e2e_enabled = resolve_project_walkthrough_e2e_enabled(project.id)
     # Slice 3 (design 245212a4): the DEPLOYED-side env-preflight judge ships
     # DARK — env_preflight_enabled defaults False.  Resolve with the same source
     # precedence as the promotion rubric: per-project build_config override, then
@@ -2920,6 +2856,7 @@ async def run_qualification(
     audit_challenge_spawn_error: str | None = None
     audit_challenge_spawn_pending = True
     smoketest_task_id: str | None = None
+    walkthrough_e2e_task_id: str | None = None
     merge_grade_task_id: str | None = None
     # Blind merge-grade gate (dir d-c0fe439f): grade the merged diffs against the
     # frozen goal.  The goal is the ONLY narrative the grader sees — the spawn
@@ -3036,7 +2973,9 @@ async def run_qualification(
     )
     resolved_dims: dict[str, dict[str, Any]] = {}
     for dim, row in prior_dim_results.items():
-        # Mutable gates are re-measured on every same-SHA re-drive.  Their old
+        if dim not in LEDGER_DIMENSION_KEYS:
+            continue
+        # Mutable gates are re-measured on every same-SHA re-drive. Their old
         # ledger facts stay durable, but must not be composed or marked reused:
         # finalize writes the current measurement back to that one row.
         if dim in MUTABLE_DIMENSION_KEYS:
@@ -3127,17 +3066,95 @@ async def run_qualification(
         [row for dim, row in prior_dim_results.items() if dim in resolved_dims],
         attempt_id,
     )
+    # Pre-spawn deterministic migration-identity collision gate: cheap file-list
+    # comparison identical to the finalize-time gate, but run BEFORE incrementing
+    # qualification_attempts and BEFORE spawning expensive audit/merge-grade
+    # children.  A duplicate-revision or dual-head alembic chain is
+    # DETERMINISTIC: re-running the full pipeline cannot change the verdict, so
+    # burning an expensive attempt first is pure waste.  Skipped when the
+    # migration_identity dimension is already resolved for this candidate_sha from
+    # a prior finalize (the dimension was verified clean or blocked then; either
+    # way the live fetch is redundant).  Under the FOR UPDATE lock — safe to write.
+    if "migration_identity" not in resolved_dims:
+        try:
+            _pre_mi_verdict, _pre_mi_detail = (
+                await check_qualification_migration_identity(
+                    token,
+                    owner,
+                    repo,
+                    candidate_sha,
+                    promotion_target,
+                    project_id=str(project_id),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _pre_mi_verdict = "defer"
+            _pre_mi_detail = f"migration-identity pre-spawn check error: {exc}"
+        if _pre_mi_verdict == "block":
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s blocked "
+                "pre-spawn by migration-identity collision — NOT incrementing "
+                "qualification_attempts: %s",
+                version.version_number,
+                candidate_sha[:8],
+                _pre_mi_detail,
+            )
+            await _upsert_dimension_result(
+                session,
+                version,
+                candidate_sha,
+                "migration_identity",
+                status="blocked",
+                sub_score=None,
+                blocker="migration_identity_collision",
+                detail={
+                    "verdict": "block",
+                    "detail": _pre_mi_detail,
+                    "execution_site": "pre_spawn",
+                },
+                origin_attempt_id=attempt_id,
+            )
+            version.last_qualification = {
+                "status": "not_promoted",
+                "blocker": "migration_identity_collision",
+                "candidate_sha": candidate_sha,
+                "qualification_attempt_id": str(attempt_id),
+                "retry_episode": retry_episode,
+                "retry_episode_cap": retry_episode_cap,
+                "detail": _pre_mi_detail,
+                "started_at": started_at,
+            }
+            flag_modified(version, "last_qualification")
+            session.add(version)
+            return {
+                "status": "migration_identity_collision",
+                "blocker": "migration_identity_collision",
+                "detail": _pre_mi_detail,
+                "qualification_attempt_id": str(attempt_id),
+            }
+        if _pre_mi_verdict == "defer":
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s "
+                "migration-identity pre-spawn check deferred — NOT incrementing "
+                "qualification_attempts: %s",
+                version.version_number,
+                candidate_sha[:8],
+                _pre_mi_detail,
+            )
+            return {
+                "status": "migration_identity_deferred",
+                "detail": _pre_mi_detail,
+                "qualification_attempt_id": str(attempt_id),
+            }
     # A child task is needed only when NOT ALL of its produced dimensions are
-    # already resolved.  audit task → {audit, test_erosion}; smoketest task →
-    # {smoketest}; merge_grade task → {merge_grade}.
+    # already resolved. Audit task → {audit, test_erosion}; merge-grade task →
+    # {merge_grade}.
     _audit_needed = not (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
-    # The qualifier-smoketest child is the evidence producer for BOTH the
-    # smoketest score AND the candidate-side env-preflight evidence (Slice 2,
-    # design 245212a4).  Spawn it when EITHER subsystem is enabled so the
-    # env-preflight gate is independently enforceable without smoketest.
-    _smoketest_needed = (smoketest_enabled or env_preflight_enabled) and "smoketest" not in resolved_dims
+    # The walkthrough_e2e child is evidence-only (no scored dimension), so it is
+    # gated purely on the enablement flag.
+    _walkthrough_e2e_needed = walkthrough_e2e_enabled
     _merge_grade_needed = (
         _merge_grade_goal_usable and "merge_grade" not in resolved_dims
     )
@@ -3152,12 +3169,12 @@ async def run_qualification(
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s has %d "
             "already-resolved dimension(s) from a prior finalize — "
-            "audit_needed=%s smoketest_needed=%s merge_grade_needed=%s",
+            "audit_needed=%s merge_grade_needed=%s",
             version.version_number,
             candidate_sha[:8],
             len(resolved_dims),
             _audit_needed,
-            _smoketest_needed,
+
             _merge_grade_needed,
         )
     # The ReleaseVersion row is locked here, so lifetime/new-attempt accounting
@@ -3213,15 +3230,15 @@ async def run_qualification(
                 rubric_fingerprint=rubric_fingerprint,
             )
             merge_grade_task_id = str(merge_grade_task.id)
-        if _smoketest_needed:
-            smoketest_task = await _spawn_qualifier_smoketest_task(
+        if _walkthrough_e2e_needed:
+            walkthrough_e2e_task = await _spawn_qualifier_walkthrough_task(
                 session,
                 project_id,
                 version_id=version.id,
                 candidate_sha=candidate_sha,
                 qualification_attempt_id=attempt_id,
             )
-            smoketest_task_id = str(smoketest_task.id)
+            walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
         logger.warning(
             "[RELEASE_QUALIFIER] failed to spawn qualification children for "
@@ -3253,14 +3270,6 @@ async def run_qualification(
 
     audit_challenge_spawn_pending = _audit_needed
 
-    # When the smoketest dimension is already resolved from a prior finalize
-    # (same candidate SHA) but env-preflight is enabled, carry forward the
-    # prior child's task_id so _finalize_qualification can re-read the
-    # SMOKETEST_RESULT artifact for env-preflight evidence.  Without this
-    # the evidence is lost and the boot_prereq_evidence_missing block fires
-    # spuriously on a same-SHA re-drive.
-    if env_preflight_enabled and "smoketest" in resolved_dims and not smoketest_task_id:
-        smoketest_task_id = prior_qual.get("smoketest_task_id")
 
     # Unconditionally produce candidate-side env-preflight evidence (Slice 2,
     # design 245212a4).  Decoupled from the smoketest child task: this is a
@@ -3322,6 +3331,11 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
+        # Evidence-only walkthrough child (None when the lane is disabled).  Not
+        # a required child for the in-flight / finalize gate — it produces
+        # CriterionEvidence, not a scored qualification dimension.
+        "walkthrough_e2e_enabled": walkthrough_e2e_enabled,
+        "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
         "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
@@ -3366,16 +3380,13 @@ async def run_qualification(
 
     logger.info(
         "[RELEASE_QUALIFIER] qualification started for v%d project=%s "
-        "candidate=%s ci_green=%s smoketest_enabled=%s audit_task=%s "
-        "challenge_pending=%s smoketest_task=%s",
+        "candidate=%s ci_green=%s audit_task=%s challenge_pending=%s",
         version.version_number,
         project_id,
         candidate_sha[:8],
         ci_green,
-        smoketest_enabled,
         audit_task_id,
         audit_challenge_spawn_pending,
-        smoketest_task_id,
     )
     return {
         "status": "spawned",
@@ -3392,6 +3403,8 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
+        "walkthrough_e2e_enabled": walkthrough_e2e_enabled,
+        "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
     }
 
@@ -3438,7 +3451,7 @@ def _advance_qualification_retry_episode(
 _BLOCKER_LABELS: dict[str, str] = {
     "ci_not_green": "CI is not green on the candidate",
     "ci_unresolved": "CI state could not be evaluated (pending, no check-runs, or GitHub I/O degraded)",
-    "smoketest_startup_failed": "the smoketest startup suite failed",
+
     "audit_missing": "the release audit produced no usable report",
     "test_file_deleted": "the diff deleted a test file",
     "migration_identity_collision": (
@@ -4472,7 +4485,7 @@ def _ledger_fact_satisfies_promotion(
 # Gates that must every one have a terminal fact at the SAME candidate_sha before
 # a promotion may compose from the ledger — the informational dimensions
 # (challenge / acceptance_window / debt_pressure) never gate promotion and are
-# excluded.  smoketest is required only when the run had it enabled (audit H3).
+# excluded. Retired smoke rows are archival and never enter this active set.
 # Sourced from the canonical dimension registry (see qualification_dimensions).
 _PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = PROMOTION_REQUIRED_DIMENSIONS
 
@@ -4513,7 +4526,9 @@ async def _load_prior_dimension_results(
             exc,
         )
         return {}
-    return {r.dimension: r for r in rows}
+    # Old smoke rows remain queryable in storage but never compose into a new
+    # attempt, satisfy completeness, or suppress an active child spawn.
+    return {r.dimension: r for r in rows if r.dimension in LEDGER_DIMENSION_KEYS}
 
 async def _load_dimension_result(
     session: AsyncSession,
@@ -4700,6 +4715,26 @@ async def _record_infra_dimension_unavailable(
             prior = existing.detail.get("consecutive_infra_errors")
             if isinstance(prior, int) and not isinstance(prior, bool):
                 prior_streak = prior
+        elif existing is None:
+            # No row for this candidate SHA yet — carry the streak forward from
+            # the most recent unavailable row for this dimension at ANY SHA so
+            # that the cap still fires on a moving automain (new SHA each cycle).
+            prior_row = (
+                await session.execute(
+                    select(QualificationDimensionResult)
+                    .where(
+                        QualificationDimensionResult.release_version_id == version.id,
+                        QualificationDimensionResult.dimension == dimension,
+                        QualificationDimensionResult.status == "unavailable",
+                    )
+                    .order_by(QualificationDimensionResult.computed_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if prior_row is not None and isinstance(prior_row.detail, dict):
+                prior = prior_row.detail.get("consecutive_infra_errors")
+                if isinstance(prior, int) and not isinstance(prior, bool):
+                    prior_streak = prior
     except Exception as exc:  # noqa: BLE001 — best-effort read of the prior streak
         logger.warning(
             "[RELEASE_QUALIFIER] failed to read prior infra streak for dimension "
@@ -4730,8 +4765,6 @@ async def _promotion_dimension_ledger_complete(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     candidate_sha: str | None,
-    *,
-    smoketest_enabled: bool = True,
 ) -> tuple[bool, list[str]]:
     """Is there a full set of durable terminal facts at ONE candidate_sha?
 
@@ -4744,8 +4777,7 @@ async def _promotion_dimension_ledger_complete(
     sha-scoped).  Returns ``(complete, missing_dimensions)``.
     """
     required = list(_PROMOTION_REQUIRED_DIMENSIONS)
-    if smoketest_enabled:
-        required.append("smoketest")
+
     prior = await _load_prior_dimension_results(session, version, candidate_sha)
     missing = [
         dim
@@ -4765,7 +4797,7 @@ async def _dual_write_dimension_results(
     Phase 1 of the per-dimension fact ledger (design doc "From Batch Attempts to
     a Per-Dimension Fact Ledger").  Called from ``_finalize_qualification`` once
     the composite ``base_record`` is fully assembled — i.e. after EVERY gate /
-    dimension has resolved (CI, audit, test-erosion, smoketest, challenge, both
+    dimension has resolved (CI, audit, test-erosion, challenge, both
     migration gates, merge-grade, acceptance-window, debt-pressure,
     capability-proof).  Deriving
     the per-dimension facts from the already-assembled ``base_record`` +
@@ -4803,7 +4835,7 @@ async def _dual_write_dimension_results(
     sub_scores = base_record.get("sub_scores") or {}
     blocker = composite.get("blocker")
     ci_green = bool(base_record.get("ci_green"))
-    smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
+
 
     def _score(key: str) -> float | None:
         v = sub_scores.get(key)
@@ -4830,13 +4862,6 @@ async def _dual_write_dimension_results(
         audit_status = "failed"
     else:
         audit_status = "passed"
-
-    if not smoketest_enabled:
-        smoketest_status = "unavailable"
-    elif blocker == "smoketest_startup_failed":
-        smoketest_status = "blocked"
-    else:
-        smoketest_status = "passed"
 
     mg_status_raw = base_record.get("merge_grade_status")
     if mg_status_raw == "pass":
@@ -4914,14 +4939,6 @@ async def _dual_write_dimension_results(
             "blocker": _own_blocker({"test_file_deleted"}),
             "detail": base_record.get("test_erosion_detail"),
             "producing_task_id": base_record.get("audit_task_id"),
-        },
-        {
-            "dimension": "smoketest",
-            "status": smoketest_status,
-            "sub_score": _score("smoketest") if smoketest_enabled else None,
-            "blocker": _own_blocker({"smoketest_startup_failed"}),
-            "detail": base_record.get("smoketest_detail"),
-            "producing_task_id": base_record.get("smoketest_task_id"),
         },
         {
             "dimension": "challenge",
@@ -5259,26 +5276,22 @@ async def _finalize_qualification(
     *,
     _pre_gates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Finalize qualification once the qualifier children have terminated.
+    """Finalize qualification once the active qualifier children have terminated.
 
-    Invoked by ``_finalize_locked_version`` after the release_audit child — and
-    the qualify-smoketest child, when the smoketest subsystem was enabled for
-    this run (audit H3) — for ``version`` have reached a terminal state.
+    Invoked by ``_finalize_locked_version`` after the active audit, challenge,
+    and merge-grade children for ``version`` have reached a terminal state.
+    Archived qualifier-smoke metadata is retained on old records but is never
+    loaded, scored, or used as a finalization prerequisite.
 
     Re-resolves CI for the candidate commit (``_resolve_ci_at_finalize``)
-    rather than trusting the boolean frozen at spawn, reads the
-    RELEASE_AUDIT_REPORT and (when the smoketest subsystem was
-    enabled) SMOKETEST_RESULT artifacts, computes the composite, then:
+    rather than trusting the boolean frozen at spawn, reads the active child
+    artifacts, computes the composite, then:
       * promote == True  and promotion_enabled ⇒ ``promote()``.
       * promote == True  but promotion_enabled is False ⇒ dry-run: log the
         composite, record it, leave the version open.
       * promote == False ⇒ record the blocker, keep the version open, set
         ``phase = "stabilize"``.
 
-    Audit H3: when the qualifying run recorded ``smoketest_enabled == False``
-    the smoketest dimension is dropped — no SMOKETEST_RESULT is read and
-    ``compute_composite`` renormalizes the audit + test-erosion weights with no
-    smoketest hard blocker.
 
     Runs on whatever ``session`` it is given and does NOT commit it (the
     non-promote paths just mutate ``version.last_qualification``); the promote
@@ -5312,14 +5325,12 @@ async def _finalize_qualification(
     audit_task_id = qual.get("audit_task_id")
     challenge_task_id = qual.get("challenge_task_id")
     audit_challenge_task_id = qual.get("audit_challenge_task_id") or challenge_task_id
+    # Archival compatibility only. Preserve the attempt-time flag and task id on
+    # terminal records, but never load or gate on that old child. New attempts
+    # stamp false/None; legacy attempts retain their original metadata.
     smoketest_task_id = qual.get("smoketest_task_id")
     merge_grade_task_id = qual.get("merge_grade_task_id")
-    # Audit H3: whether the qualifying run had the smoketest subsystem enabled.
-    # Read from the recorded qualification (NOT live runtime_config) — the
-    # config could have flipped between spawn and finalize, and the composite
-    # must match the children that actually ran.  Legacy records that predate
-    # the flag default to True (the old always-spawn behaviour).
-    smoketest_enabled = bool(qual.get("smoketest_enabled", True))
+    smoketest_enabled = bool(qual.get("smoketest_enabled", False))
     # Dimensions already resolved (passed/failed/blocked) for this candidate_sha
     # from a prior finalize, carried forward by run_qualification from the
     # per-dimension ledger.  When a dimension is present here its gate evaluation
@@ -5331,7 +5342,7 @@ async def _finalize_qualification(
     resolved_dims: dict[str, dict[str, Any]] = {
         dim: fact
         for dim, fact in (qual.get("resolved_dimensions") or {}).items()
-        if dim not in MUTABLE_DIMENSION_KEYS
+        if dim in LEDGER_DIMENSION_KEYS and dim not in MUTABLE_DIMENSION_KEYS
     }
 
     # Re-resolve CI for the candidate commit NOW rather than reusing the
@@ -5585,6 +5596,71 @@ async def _finalize_qualification(
                         "status": "audit_infra_respawned",
                         "respawn_count": new_count,
                     }
+                # ADMIN_CANCEL on a CANCELLED audit child (reaper cascade, admin
+                # action, dedup, force-finalize) is a transient external
+                # interruption — candidate quality was never evaluated.  Respawn
+                # the same candidate_sha, parallel to RATE_LIMIT / infra respawn.
+                admin_cancel_respawn_count = qual.get(
+                    "audit_admin_cancel_respawn_count", 0
+                )
+                if (
+                    _audit_task_obj.status == TaskStatus.CANCELLED
+                    and _audit_explicit_cat == ADMIN_CANCEL
+                    and admin_cancel_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    fp = _audit_task_obj.first_payload or {}
+                    _project = await session.get(Project, version.project_id)
+                    _integration_branch = get_project_integration_branch(_project)
+                    new_base_branch = fp.get("base_branch", "") or _integration_branch
+                    new_diff_range = (
+                        fp.get("diff_range", "")
+                        or f"{_integration_branch}...{candidate_sha}"
+                    )
+                    new_audit_task = await _spawn_release_audit_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        base_branch=new_base_branch,
+                        diff_range=new_diff_range,
+                        candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
+                        audit_base_sha=fp.get("audit_base_sha"),
+                        version_goal=_frozen_version_goal,
+                    )
+                    new_count = admin_cancel_respawn_count + 1
+                    updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="audit",
+                        failed_task=_audit_task_obj,
+                        replacement_task_id=str(new_audit_task.id),
+                        label="audit_admin_cancel_respawned",
+                        respawn_count=new_count,
+                    )
+                    updated_qual = {
+                        **updated_qual,
+                        "audit_task_id": str(new_audit_task.id),
+                        "audit_admin_cancel_respawn_count": new_count,
+                    }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
+                    version.last_qualification = updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d audit task %s was admin-cancelled; "
+                        "re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        audit_task_id,
+                        new_audit_task.id,
+                        new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "audit_admin_cancel_respawned",
+                        "respawn_count": new_count,
+                    }
                 infra_label = _enrich_infra_error(
                     f"audit_task_{_audit_task_obj.status.lower()}",
                     _audit_task_obj,
@@ -5601,6 +5677,12 @@ async def _finalize_qualification(
                     and infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
                 ):
                     infra_label = "audit_infra_respawn_cap_exceeded"
+                if (
+                    _audit_task_obj.status == TaskStatus.CANCELLED
+                    and _audit_explicit_cat == ADMIN_CANCEL
+                    and admin_cancel_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    infra_label = "audit_admin_cancel_respawn_cap_exceeded"
                 return await _handle_infra_failure(
                     session,
                     version,
@@ -5612,35 +5694,6 @@ async def _finalize_qualification(
                 "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d "
                 "(skipping infra-failure check)",
                 audit_task_id,
-                version.version_number,
-            )
-
-    _smoke_task_obj: Task | None = None
-    # A FAILED/CANCELLED/BLOCKED child is an infra failure regardless of
-    # which subsystem spawned it (smoketest OR env-preflight).  Check the
-    # terminal status before reading artifacts so the quality-verdict path
-    # only sees COMPLETED children.
-    if (smoketest_enabled or env_preflight_enabled) and smoketest_task_id:
-        try:
-            _smoke_task_obj = await session.get(Task, uuid.UUID(str(smoketest_task_id)))
-            if (
-                _smoke_task_obj is not None
-                and _smoke_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
-            ):
-                return await _handle_infra_failure(
-                    session,
-                    version,
-                    qual,
-                    _enrich_infra_error(
-                        f"smoketest_task_{_smoke_task_obj.status.lower()}",
-                        _smoke_task_obj,
-                    ),
-                )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d "
-                "(skipping infra-failure check)",
-                smoketest_task_id,
                 version.version_number,
             )
 
@@ -5660,14 +5713,119 @@ async def _finalize_qualification(
                 _merge_grade_task_obj is not None
                 and _merge_grade_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
             ):
+                # An ADMIN_CANCEL child is an external operator/reaper supersession,
+                # not a pipeline infrastructure failure.  Return a neutral hold so the
+                # attempt counter and consecutive_infra_errors streak are NOT advanced.
+                if (
+                    (_merge_grade_task_obj.context or {}).get("failure_category")
+                    == ADMIN_CANCEL
+                ):
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d merge-grade task %s was "
+                        "ADMIN_CANCEL'd; returning neutral hold (no infra-failure "
+                        "penalty)",
+                        version.version_number,
+                        merge_grade_task_id,
+                    )
+                    return {"status": "merge_grade_admin_cancel_hold"}
+                _merge_explicit_cat = (_merge_grade_task_obj.context or {}).get(
+                    "failure_category", ""
+                ) or (_merge_grade_task_obj.context or {}).get("failure_class", "")
+                merge_grade_infra_respawn_count = qual.get(
+                    "merge_grade_infra_respawn_count", 0
+                )
+                # --- Merge-grade PROVISION_FAILURE / AGENT_TIMEOUT: bounded respawn ---
+                if (
+                    _merge_grade_task_obj.status == TaskStatus.FAILED
+                    and _merge_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
+                    and merge_grade_infra_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _merge_fp = _merge_grade_task_obj.first_payload or {}
+                    _merge_project = await session.get(
+                        Project, version.project_id
+                    )
+                    _merge_int_branch = get_project_integration_branch(
+                        _merge_project
+                    )
+                    _merge_base = (
+                        _merge_fp.get("base_branch", "") or _merge_int_branch
+                    )
+                    _merge_range = (
+                        _merge_fp.get("diff_range", "")
+                        or f"{_merge_int_branch}...{candidate_sha}"
+                    )
+                    _merge_new_task = await _spawn_release_merge_grade_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        base_branch=_merge_base,
+                        diff_range=_merge_range,
+                        candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
+                        version_goal=(
+                            _merge_fp.get("version_goal")
+                            or _frozen_version_goal
+                        ),
+                        merged_pr_numbers=list(
+                            _merge_fp.get("merged_prs") or []
+                        ),
+                        categories=_merge_fp.get("categories"),
+                        rubric_fingerprint=_merge_fp.get("rubric_fingerprint"),
+                    )
+                    _merge_new_count = merge_grade_infra_respawn_count + 1
+                    _merge_updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="merge_grade",
+                        failed_task=_merge_grade_task_obj,
+                        replacement_task_id=str(_merge_new_task.id),
+                        label="merge_grade_infra_respawned",
+                        respawn_count=_merge_new_count,
+                    )
+                    _merge_updated_qual = {
+                        **_merge_updated_qual,
+                        "merge_grade_task_id": str(_merge_new_task.id),
+                        "merge_grade_infra_respawn_count": _merge_new_count,
+                    }
+                    _merge_updated_qual = _advance_qualification_retry_episode(
+                        version,
+                        _merge_updated_qual,
+                        cap=_MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    version.last_qualification = _merge_updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d merge-grade task %s failed "
+                        "with %s; re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        merge_grade_task_id,
+                        _merge_explicit_cat,
+                        _merge_new_task.id,
+                        _merge_new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "merge_grade_infra_respawned",
+                        "respawn_count": _merge_new_count,
+                    }
+                _merge_infra_label = _enrich_infra_error(
+                    f"merge_grade_task_{_merge_grade_task_obj.status.lower()}",
+                    _merge_grade_task_obj,
+                )
+                if (
+                    _merge_grade_task_obj.status == TaskStatus.FAILED
+                    and _merge_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
+                    and merge_grade_infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _merge_infra_label = (
+                        "merge_grade_infra_respawn_cap_exceeded"
+                    )
                 return await _handle_infra_failure(
                     session,
                     version,
                     qual,
-                    _enrich_infra_error(
-                        f"merge_grade_task_{_merge_grade_task_obj.status.lower()}",
-                        _merge_grade_task_obj,
-                    ),
+                    _merge_infra_label,
                 )
         except (ValueError, TypeError):
             logger.warning(
@@ -5852,93 +6010,11 @@ async def _finalize_qualification(
         origin_attempt_id=attempt_id,
     )
 
-    # --- Read the smoketest result -----------------------------------------
-    # Read the SMOKETEST_RESULT whenever the qualifier-smoketest child was
-    # spawned — whether for smoketest scoring, env-preflight evidence, or both.
-    # Audit H3: when smoketest is disabled the smoketest SCORE is dropped (the
-    # child may still have run for env-preflight evidence).  When the smoketest
-    # dimension is already resolved from a prior finalize at this candidate_sha,
-    # compose the SCORE from the ledger but still re-read the artifact for
-    # env-preflight evidence when enabled.
-    if "smoketest" in resolved_dims:
-        smoketest_result = None
-        _smoke_score = resolved_dims["smoketest"].get("sub_score")
-        # A resolved smoketest fact with status "blocked" carries the
-        # hard-blocker sentinel (sub_score None == startup-suite failure); it
-        # must propagate as None so compute_composite re-raises the block,
-        # never coerce to a clean 1.0 (the same-SHA ledger-reuse fail-open).
-        # A non-blocked reuse with an absent score falls back to neutral 1.0.
-        if (
-            _smoke_score is None
-            and resolved_dims["smoketest"].get("status") == "blocked"
-        ):
-            smoketest_score = None
-        else:
-            smoketest_score = _smoke_score if _smoke_score is not None else 1.0
-        smoketest_detail = resolved_dims["smoketest"].get("detail") or {}
-        # Also read the SMOKETEST_RESULT artifact for env-preflight evidence
-        # when env_preflight is enabled.  The artifact still exists from the
-        # prior finalize that resolved the smoketest dimension; smoketest_task_id
-        # was carried forward by run_qualification for this purpose.
-        if env_preflight_enabled and smoketest_task_id:
-            try:
-                smoketest_result = await _latest_artifact_logs(
-                    session,
-                    uuid.UUID(str(smoketest_task_id)),
-                    ArtifactType.SMOKETEST_RESULT,
-                )
-            except (ValueError, TypeError):
-                pass
-    else:
-        smoketest_result: dict[str, Any] | None = None
-        # Read the SMOKETEST_RESULT when EITHER smoketest or env-preflight
-        # was enabled (both use the same qualifier-smoketest child to
-        # produce the artifact).  When neither was enabled the child was
-        # never spawned and smoketest_task_id is None.
-        if (smoketest_enabled or env_preflight_enabled) and smoketest_task_id:
-            try:
-                smoketest_result = await _latest_artifact_logs(
-                    session,
-                    uuid.UUID(str(smoketest_task_id)),
-                    ArtifactType.SMOKETEST_RESULT,
-                )
-            except (ValueError, TypeError):
-                logger.warning(
-                    "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d",
-                    smoketest_task_id,
-                    version.version_number,
-                )
-        # smoketest_report_missing is gated to smoketest_enabled: when the
-        # child ran ONLY for env-preflight, a missing artifact surfaces as
-        # the deterministic boot_prereq_evidence_missing block, never an
-        # infra-failure retry loop (the v22 migration-gate lesson).
-        if (
-            smoketest_enabled
-            and smoketest_task_id
-            and _smoke_task_obj is not None
-            and _smoke_task_obj.status == TaskStatus.COMPLETED
-            and smoketest_result is None
-        ):
-            return await _handle_infra_failure(
-                session, version, qual, "smoketest_report_missing"
-            )
-        smoketest_score = _score_smoketest(smoketest_result)
-        # Carry the specific smoketest-failure detail (failed suite / named tests)
-        # so the agent can target it when smoketest is the binding constraint.
-        smoketest_detail = _extract_smoketest_detail(smoketest_result)
 
-    # Candidate-side env-preflight evidence (Slice 2, design 245212a4).
-    # ``run_qualification`` now produces this artifact unconditionally via
-    # the GitHub contents API (decoupled from the smoketest child) and stores
-    # it as ``qual["env_preflight_evidence"]``.  Read that first; fall back to
-    # the SMOKETEST_RESULT-carried artifact for backward compatibility with
-    # qualification runs that predate the decoupling.
-    # None when no evidence was produced (smoketest artifact also absent).
+    # Candidate-side env-preflight evidence is produced directly and does not
+    # depend on a smoketest task or artifact.
     _env_preflight_raw = qual.get("env_preflight_evidence")
-    if _env_preflight_raw is None and isinstance(smoketest_result, dict):
-        _env_preflight_raw = smoketest_result.get("env_preflight")
     env_preflight = sanitize_env_preflight_artifact(_env_preflight_raw)
-
     # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
     # default.  The flag was resolved above (before the smoketest result read)
     # so the deployment-time checks in this section (env_preflight_score,
@@ -5983,22 +6059,6 @@ async def _finalize_qualification(
             "missing": [str(n) for n in env_preflight_missing],
         }
 
-    # Persist smoketest to the per-dimension ledger immediately so it
-    # survives a later-gate infra failure before _dual_write_dimension_results.
-    # _upsert_dimension_result handles a None candidate_sha with a silent no-op.
-    if not smoketest_enabled:
-        _smoke_status = "unavailable"
-    elif smoketest_score is None:
-        _smoke_status = "blocked"
-    else:
-        _smoke_status = "passed"
-    await _upsert_dimension_result(
-        session, version, candidate_sha, "smoketest",
-        status=_smoke_status,
-        sub_score=smoketest_score,
-        producing_task_id=smoketest_task_id,
-        origin_attempt_id=attempt_id,
-    )
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
     # If the qualifying run intentionally deferred the challenge spawn, do the
@@ -6100,7 +6160,7 @@ async def _finalize_qualification(
     # challenge artifact, which MUST hold the version.
     if challenge_task_id or not audit_challenge_task_id:
         # Load the challenge task object early so non-completed terminal states
-        # are caught before artifact reads (consistent with audit/smoketest).
+        # are caught before artifact reads (consistent with other active children).
         _challenge_task_obj: Task | None = None
         if challenge_task_id:
             try:
@@ -6111,12 +6171,12 @@ async def _finalize_qualification(
                     _challenge_task_obj is not None
                     and _challenge_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
                 ):
-                    challenge_infra_respawn_count = qual.get(
-                        "challenge_infra_respawn_count", 0
-                    )
                     _chal_explicit_cat = (_challenge_task_obj.context or {}).get(
                         "failure_category", ""
                     ) or (_challenge_task_obj.context or {}).get("failure_class", "")
+                    challenge_infra_respawn_count = qual.get(
+                        "challenge_infra_respawn_count", 0
+                    )
                     if (
                         _challenge_task_obj.status == TaskStatus.FAILED
                         and _chal_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
@@ -6213,6 +6273,107 @@ async def _finalize_qualification(
                                     "status": "challenge_infra_respawned",
                                     "respawn_count": _chal_new_count,
                                 }
+                    # ADMIN_CANCEL on a CANCELLED challenge child — respawn
+                    # the same candidate, parallel to PROVISION_FAILURE/AGENT_TIMEOUT.
+                    challenge_admin_cancel_respawn_count = qual.get(
+                        "challenge_admin_cancel_respawn_count", 0
+                    )
+                    if (
+                        _challenge_task_obj.status == TaskStatus.CANCELLED
+                        and _chal_explicit_cat == ADMIN_CANCEL
+                        and challenge_admin_cancel_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                    ):
+                        _chal_payload = _challenge_task_obj.first_payload or {}
+                        _audit_payload = (
+                            _audit_task_obj.first_payload
+                            if _audit_task_obj is not None
+                            else {}
+                        )
+                        _chal_project2 = await session.get(Project, version.project_id)
+                        _, _chal_promo_target2 = (
+                            _lts_branch_names(_chal_project2)
+                            if _chal_project2 is not None
+                            else ("", "main")
+                        )
+                        _chal_base_branch2 = (
+                            _chal_payload.get("base_branch")
+                            or _audit_payload.get("base_branch")
+                            or _chal_promo_target2
+                        )
+                        _chal_diff_range2 = (
+                            _chal_payload.get("diff_range")
+                            or _audit_payload.get("diff_range")
+                            or f"{_chal_base_branch2}...{candidate_sha}"
+                        )
+                        _chal_primary_findings2 = _primary_findings_for_challenge_retry(
+                            audit_report
+                        )
+                        if _chal_primary_findings2:
+                            from app.payload_schemas import PayloadTooLargeError
+
+                            try:
+                                _new_challenge_task2 = (
+                                    await _spawn_release_audit_challenge_task(
+                                        session,
+                                        version.project_id,
+                                        version_id=version.id,
+                                        base_branch=_chal_base_branch2,
+                                        diff_range=_chal_diff_range2,
+                                        candidate_sha=candidate_sha,
+                                        qualification_attempt_id=attempt_id,
+                                        primary_audit_task_id=audit_task_id,
+                                        primary_findings=_chal_primary_findings2,
+                                        version_goal=_frozen_version_goal,
+                                    )
+                                )
+                            except PayloadTooLargeError as _chal_exc2:
+                                logger.warning(
+                                    "[RELEASE_QUALIFIER] v%d challenge admin-cancel respawn "
+                                    "skipped — primary_findings payload too large "
+                                    "(%s); routing to infra_failure",
+                                    version.version_number,
+                                    _chal_exc2,
+                                )
+                            else:
+                                _chal_ac_new_count = challenge_admin_cancel_respawn_count + 1
+                                _chal_ac_updated_qual = append_infra_failure_child_event(
+                                    qual,
+                                    leg="challenge",
+                                    failed_task=_challenge_task_obj,
+                                    replacement_task_id=str(_new_challenge_task2.id),
+                                    label="challenge_admin_cancel_respawned",
+                                    respawn_count=_chal_ac_new_count,
+                                )
+                                version.last_qualification = {
+                                    **_chal_ac_updated_qual,
+                                    "status": "pending",
+                                    "challenge_task_id": str(_new_challenge_task2.id),
+                                    "audit_challenge_task_id": str(
+                                        _new_challenge_task2.id
+                                    ),
+                                    "challenge_admin_cancel_respawn_count": _chal_ac_new_count,
+                                }
+                                version.last_qualification = _advance_qualification_retry_episode(
+                                    version,
+                                    version.last_qualification,
+                                    cap=_MAX_AUDIT_RL_RESPAWNS,
+                                )
+                                flag_modified(version, "last_qualification")
+                                session.add(version)
+                                await session.flush()
+                                logger.info(
+                                    "[RELEASE_QUALIFIER] v%d challenge task %s was "
+                                    "admin-cancelled; re-spawned as %s (respawn %d/%d)",
+                                    version.version_number,
+                                    challenge_task_id,
+                                    _new_challenge_task2.id,
+                                    _chal_ac_new_count,
+                                    _MAX_AUDIT_RL_RESPAWNS,
+                                )
+                                return {
+                                    "status": "challenge_admin_cancel_respawned",
+                                    "respawn_count": _chal_ac_new_count,
+                                }
                     _challenge_infra_label = _enrich_infra_error(
                         f"audit_challenge_task_{_challenge_task_obj.status.lower()}",
                         _challenge_task_obj,
@@ -6223,6 +6384,12 @@ async def _finalize_qualification(
                         and challenge_infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
                     ):
                         _challenge_infra_label = "challenge_infra_respawn_cap_exceeded"
+                    if (
+                        _challenge_task_obj.status == TaskStatus.CANCELLED
+                        and _chal_explicit_cat == ADMIN_CANCEL
+                        and challenge_admin_cancel_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                    ):
+                        _challenge_infra_label = "challenge_admin_cancel_respawn_cap_exceeded"
                     return await _handle_infra_failure(
                         session,
                         version,
@@ -6893,7 +7060,7 @@ async def _finalize_qualification(
         # to finalize.  A COMPLETED child with an absent artifact, or a present
         # but malformed artifact, is an infrastructure failure (the agent ran but
         # emitted no usable output) — route to a HOLD so the gate cannot be
-        # skipped or waved through, exactly like the audit/smoketest legs.
+        # skipped or waved through, exactly like the other active legs.
         if merge_grade_cert["status"] == "unparseable":
             label = (
                 "merge_grade_report_missing"
@@ -7280,9 +7447,9 @@ async def _finalize_qualification(
         ci_green=ci_green,
         audit_score=audit_score,
         test_erosion=test_erosion_score,
-        smoketest_score=smoketest_score,
+        smoketest_score=None,  # legacy signature; qualifier smoke is inert
         policy=policy,
-        smoketest_enabled=smoketest_enabled,
+        smoketest_enabled=False,
         ci_state=ci_state,
         ci_required=ci_required,
         migration_collision=migration_collision,
@@ -7312,7 +7479,7 @@ async def _finalize_qualification(
     # Reuses the same verified-prs-merged predicate from direction_outcomes so
     # the release qualification surfaces the same proven-vs-delivered signal as
     # the strategic and direction layers. Merged into sub_scores as additive
-    # keys; the existing audit/test_erosion/smoketest weights are unchanged.
+    # keys; the active audit/test-erosion weights are unchanged.
     acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
@@ -7390,12 +7557,12 @@ async def _finalize_qualification(
         # excluded_audit_findings (which tracks the unverified-primary gap).
         "challenger_refuted_audit_findings": challenger_refuted_audit_findings,
         "test_erosion_detail": test_erosion_detail,
-        "smoketest_detail": smoketest_detail,
+
         # Candidate-side env-preflight evidence (Slice 2, design 245212a4):
         # pure-content {required_env, startup_check_names, manifest_source}
         # introspected from the candidate tree. Stored UNCHANGED — no gating,
         # never read by compute_composite or the promotion decision. None when
-        # the smoketest child produced no such artifact.
+        # candidate-side evidence could not be built.
         "env_preflight": env_preflight,
         # Slice 3 (design 245212a4): the deployed-side judge flag + verdict blob.
         # env_preflight_enabled is read back by the state resolver to render the
@@ -7754,7 +7921,7 @@ async def _finalize_qualification(
     # every attempt: otherwise suppressing all first-attempt writes bypasses the
     # same-tree invariant precisely when there is no durable proof at all.
     _ledger_complete, _missing_dims = await _promotion_dimension_ledger_complete(
-        session, version, candidate_sha, smoketest_enabled=smoketest_enabled
+        session, version, candidate_sha
     )
     if not _ledger_complete:
         _prior_any = await _load_prior_dimension_results(
@@ -7805,61 +7972,33 @@ async def _required_children_terminal(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> bool:
-    """Return True iff every required qualifier child of ``version`` is terminal.
+    """Return True iff every active qualifier child of ``version`` is terminal.
 
-    The audit child is always required; the qualifier-smoketest child is
-    required only when the qualifying run had the smoketest subsystem enabled
-    (audit H3) — legacy records that predate the ``smoketest_enabled`` flag
-    default to "required".  Returns False (not ready) when a required child id
-    is missing/unparseable, the row is not yet persisted, or any required child
-    is still non-terminal — i.e. a conservative "not ready to finalize" answer.
-
-    When one or more dimensions are already resolved via the per-dimension
-    ledger (``resolved_dimensions``), their corresponding child task was not
-    spawned — the function skips the terminal check for those dimensions since
-    the ledger carries the durable fact forward from the prior finalize.
+    Qualifier VM smoke is retired. Archival ``smoketest_task_id`` and
+    ``smoketest_enabled`` values are deliberately ignored: they are neither
+    loaded nor attempt-matched and can never delay or fail a current finalize.
+    Dimensions carried forward by the active ledger do not require a child.
     """
     qual = version.last_qualification or {}
-
-    # Dimensions already resolved via the per-dimension ledger, carried forward
-    # from a prior finalize at this candidate_sha.  When present, the
-    # corresponding child task was NOT re-spawned, so skip requiring it.
-    resolved_dims: dict[str, dict[str, Any]] = qual.get("resolved_dimensions") or {}
+    resolved_dims: dict[str, dict[str, Any]] = {
+        dim: fact
+        for dim, fact in (qual.get("resolved_dimensions") or {}).items()
+        if dim in LEDGER_DIMENSION_KEYS
+    }
     audit_resolved = "audit" in resolved_dims and "test_erosion" in resolved_dims
-    smoketest_resolved = "smoketest" in resolved_dims
     merge_grade_resolved = "merge_grade" in resolved_dims
 
-    smoketest_required = bool(
-        qual.get("smoketest_enabled", True)
-        or qual.get("env_preflight_enabled", False)
-    )
     audit_task_id_raw = qual.get("audit_task_id")
-    challenge_task_id_raw = qual.get("challenge_task_id")
-    smoketest_task_id_raw = qual.get("smoketest_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
     challenge_required = bool(challenge_task_id_raw)
     merge_grade_task_id_raw = qual.get("merge_grade_task_id")
     merge_grade_required = bool(merge_grade_task_id_raw)
 
-    # When a dimension is already resolved via the ledger, its child task id
-    # is legitimately None (the spawn coordinator skipped it).  Skip requiring
-    # it rather than returning False for a "missing" task id.
-    if (not audit_task_id_raw and not audit_resolved) or (
-        smoketest_required
-        and not smoketest_task_id_raw
-        and not smoketest_resolved
-    ):
+    if not audit_task_id_raw and not audit_resolved:
         logger.warning(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d has pending "
-            "qualification but missing required child task ids "
-            "(audit=%r smoke=%r smoketest_required=%s audit_resolved=%s "
-            "smoketest_resolved=%s) — not ready",
+            "qualification but no audit child or resolved audit facts",
             version.version_number,
-            audit_task_id_raw,
-            smoketest_task_id_raw,
-            smoketest_required,
-            audit_resolved,
-            smoketest_resolved,
         )
         return False
 
@@ -7867,11 +8006,6 @@ async def _required_children_terminal(
         audit_task_id = (
             uuid.UUID(str(audit_task_id_raw))
             if audit_task_id_raw is not None
-            else None
-        )
-        smoketest_task_id = (
-            uuid.UUID(str(smoketest_task_id_raw))
-            if smoketest_required and smoketest_task_id_raw
             else None
         )
         challenge_task_id = (
@@ -7883,12 +8017,11 @@ async def _required_children_terminal(
     except (ValueError, TypeError, AttributeError):
         logger.warning(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d has unparseable "
-            "child task ids (audit=%r challenge=%r smoke=%r merge_grade=%r) — "
+            "active child task ids (audit=%r challenge=%r merge_grade=%r) — "
             "not ready",
             version.version_number,
             audit_task_id_raw,
             challenge_task_id_raw,
-            smoketest_task_id_raw,
             merge_grade_task_id_raw,
         )
         return False
@@ -7896,11 +8029,6 @@ async def _required_children_terminal(
     audit_task: Task | None = (
         await session.get(Task, audit_task_id)
         if audit_task_id is not None
-        else None
-    )
-    smoketest_task: Task | None = (
-        await session.get(Task, smoketest_task_id)
-        if smoketest_task_id is not None
         else None
     )
     challenge_task: Task | None = (
@@ -7914,17 +8042,14 @@ async def _required_children_terminal(
         else None
     )
 
-    # Strict matching begins once the JSON projection carries identity.  A
-    # partially-backfilled legacy pending row may have only the typed column
-    # while its already-running children have no attempt key; keep that window
-    # readable/finalizable until the projection backfill converges.
+    # Strict attempt matching applies only to active children. Legacy smoke
+    # children may belong to any historical attempt without blocking finalize.
     active_attempt_id = _coerce_qualification_attempt_id(
         qual.get("qualification_attempt_id")
     )
     if active_attempt_id is not None:
         for leg, task in (
             ("audit", audit_task),
-            ("smoketest", smoketest_task),
             ("challenge", challenge_task),
             ("merge_grade", merge_grade_task),
         ):
@@ -7947,24 +8072,25 @@ async def _required_children_terminal(
 
     if (
         (not audit_resolved and audit_task is None)
-        or (smoketest_required and not smoketest_resolved and smoketest_task is None)
         or (challenge_required and challenge_task is None)
-        or (merge_grade_required and not merge_grade_resolved and merge_grade_task is None)
+        or (
+            merge_grade_required
+            and not merge_grade_resolved
+            and merge_grade_task is None
+        )
     ):
         logger.debug(
-            "[RELEASE_QUALIFIER] finalize-gate: version v%d required child "
-            "tasks not yet persisted — not ready",
+            "[RELEASE_QUALIFIER] finalize-gate: version v%d required active "
+            "child tasks not yet persisted — not ready",
             version.version_number,
         )
         return False
 
     if (
-        (not audit_resolved and audit_task is not None and audit_task.status not in _TERMINAL_STATUSES)
-        or (
-            smoketest_required
-            and not smoketest_resolved
-            and smoketest_task is not None
-            and smoketest_task.status not in _TERMINAL_STATUSES
+        (
+            not audit_resolved
+            and audit_task is not None
+            and audit_task.status not in _TERMINAL_STATUSES
         )
         or (
             challenge_required
@@ -7978,24 +8104,22 @@ async def _required_children_terminal(
             and merge_grade_task.status not in _TERMINAL_STATUSES
         )
     ):
-        # A required child is still running — not time to finalize yet.
         return False
 
     logger.info(
-        "[RELEASE_QUALIFIER] finalize-gate: required children terminal for "
-        "version v%d (audit=%s/%s smoke=%s challenge=%s)",
+        "[RELEASE_QUALIFIER] finalize-gate: active children terminal for "
+        "version v%d (audit=%s/%s challenge=%s merge_grade=%s)",
         version.version_number,
         audit_task.id if audit_task is not None else "resolved",
         audit_task.status if audit_task is not None else "N/A",
-        f"{smoketest_task.id}/{smoketest_task.status}"
-        if smoketest_task is not None
-        else "disabled",
         f"{challenge_task.id}/{challenge_task.status}"
         if challenge_task is not None
         else "not_spawned",
+        f"{merge_grade_task.id}/{merge_grade_task.status}"
+        if merge_grade_task is not None
+        else ("resolved" if merge_grade_resolved else "not_spawned"),
     )
     return True
-
 async def _maybe_reconcile_after_promotion_conflict(
     version_id: uuid.UUID,
     result: dict[str, Any] | None,
@@ -8683,7 +8807,7 @@ def _qualification_timeout_age_seconds(
     """Return pending qualification age in seconds, or None if no clock exists.
 
     PAUSE-AWARE when ``deploy_state`` is supplied: pipeline-pause time is not
-    counted toward the 6h timeout. A qualification whose audit/grade/smoketest
+    counted toward the 6h timeout. A qualification whose active audit/grade
     children cannot run *because the pipeline is paused* is not "stuck" — force-
     finalizing it as ``qualification_timeout`` sends the version back to
     stabilize and re-fires the whole triple, which then times out again 6h
@@ -8986,7 +9110,7 @@ async def maybe_finalize_qualification(
 
       2. Takes ``SELECT ... FOR UPDATE SKIP LOCKED`` on the ``ReleaseVersion`` row — the
          serialization point for the non-promote paths.  The ``release_audit``
-         and qualifier ``smoketest`` children can terminate
+         and merge-grade children can terminate
          near-simultaneously, and a reaper sweep can run concurrently; for a
          ``dry_run`` / ``not_promoted`` outcome a peer that cannot acquire the
          lock skips; a later retry bails at the pending guard once the first

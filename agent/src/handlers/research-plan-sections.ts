@@ -595,7 +595,7 @@ If you decide to flip the phase, emit a \`version_phase_decision\` field in your
 If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."
 
 **Requesting qualification (stabilize only):**
-When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the version goal is substantially met — request qualification. The version's acceptance criteria are an authored RUBRIC of aspirational outcomes: use them as judgment aids for whether the goal is met, not as a coverage checklist to burn down. The qualifier grades them at qualify time (the automated release qualifier decides promotion); your job is the readiness call. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
+When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the version goal is substantially met — request qualification. The version's acceptance criteria are an authored RUBRIC of aspirational outcomes: use them as judgment aids for whether the goal is met, not as a coverage checklist to burn down. The qualifier grades them at qualify time (the automated release qualifier decides promotion); your job is the readiness call. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
 \`\`\`json
 {
   "qualify_request": {
@@ -607,9 +607,9 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
 
 **Hold qualification only for legitimate blockers, and keep work flowing while you wait.** Do NOT rush to qualify — readiness is a real judgment, and shipping a half-hardened version to hit a cadence is its own failure. But the trap this phase actually fell into is the opposite: *stalling* — holding qualification on something that is not a real blocker and that nothing is actively working. A legitimate hold is a genuine must-ship concern (a correctness regression, an unmet acceptance criterion, a broken core path) that is being actively driven to resolution. A straggler you are "waiting to land" from a paused or churn-stalled direction is NOT a legitimate hold — nothing is driving it, so the wait is open-ended. In that state the answer is not to rush-qualify; it is to get honest about the gate: if the pending work is genuinely must-ship, re-activate it as an actively-worked fix; if it is only nice-to-have, stop treating it as a blocker. And never let the phase sit idle while you wait — there is always hardening, cleanup, or test-coverage work to keep flowing.
 
-**Do NOT re-request while a qualification is in flight.** If the "Last qualification" line above shows \`status=pending\`, a qualification is already running for this version — the orchestrator has snapshotted a candidate and spawned the audit + smoketest. Do NOT emit \`qualify_request\` again; wait for the in-flight run to finalize (its status will change to \`promoted\`, \`not_promoted\`, \`dry_run\`, or an error). Re-requesting while \`status=pending\` is wasted work and is ignored.
+**Do NOT re-request while a qualification is in flight.** If the "Last qualification" line above shows \`status=pending\`, a qualification is already running for this version — the orchestrator has snapshotted a candidate and spawned the release audit and goal-grade children. Do NOT emit \`qualify_request\` again; wait for the in-flight run to finalize (its status will change to \`promoted\`, \`not_promoted\`, \`dry_run\`, or an error). Re-requesting while \`status=pending\` is wasted work and is ignored.
 
-**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.
+**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns expensive agents to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.
 
 **Three distinct version-authoring concepts — keep them separate:**
 - \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions — never change it here.
@@ -846,65 +846,6 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
       : '';
     lines.push('');
     lines.push(`**Agent timeout rate:** ${overallStr}${dominantStr}`);
-  }
-
-
-  const peff = snap.panel_review_effectiveness && typeof snap.panel_review_effectiveness === 'object'
-    ? snap.panel_review_effectiveness as Record<string, unknown>
-    : null;
-  const peffPd = snap.panel_review_effectiveness_post_deploy && typeof snap.panel_review_effectiveness_post_deploy === 'object'
-    ? snap.panel_review_effectiveness_post_deploy as Record<string, unknown>
-    : null;
-  if (peff || peffPd) {
-    const pdGh = peffPd?.gate_health && typeof peffPd.gate_health === 'object'
-      ? peffPd.gate_health as Record<string, unknown>
-      : null;
-    const pdState = pdGh && typeof pdGh.state === 'string' ? pdGh.state : null;
-    // Use post-deploy as primary when it has sufficient data.
-    // Fall back for NO_DATA (0 gate invocations) and INSUFFICIENT (<min_sample) — both are
-    // low-sample states. Keep DEGRADED as primary: it fires at >=5% even on tiny samples
-    // and is an intentional alarm, not a data-gap.
-    const usePostDeploy = peffPd !== null && pdState !== null
-      && pdState !== 'INSUFFICIENT' && pdState !== 'NO_DATA';
-    // Within this if-block, at least one of peff/peffPd is non-null.
-    // Prefer post-deploy when it has enough data; fall back to rolling otherwise.
-    let primary: Record<string, unknown>;
-    if (usePostDeploy) {
-      primary = peffPd;
-    } else if (peff) {
-      primary = peff;
-    } else {
-      primary = peffPd as Record<string, unknown>;
-    }
-    const primaryGh = primary.gate_health && typeof primary.gate_health === 'object'
-      ? primary.gate_health as Record<string, unknown>
-      : null;
-    const state = primaryGh && typeof primaryGh.state === 'string' ? primaryGh.state : 'NO_DATA';
-    const failOpenRate = typeof primary.fail_open_rate === 'number'
-      ? `${(primary.fail_open_rate * 100).toFixed(2)}%`
-      : 'n/a';
-    const totalChallenged = typeof primary.total_challenged === 'number' ? String(primary.total_challenged) : 'n/a';
-    const coverage = typeof primary.effective_coverage === 'number'
-      ? `${(primary.effective_coverage * 100).toFixed(1)}%`
-      : 'n/a';
-    let label: string;
-    if (usePostDeploy) {
-      label = 'Adversarial gate health (post-deploy)';
-    } else if (peffPd !== null && peff !== null) {
-      // Post-deploy present but low-sample — primary is rolling; annotate accumulation progress.
-      const pdTotal = pdGh && typeof pdGh.total_invocations === 'number' ? pdGh.total_invocations : 0;
-      const pdMinSample = pdGh && typeof pdGh.min_sample === 'number' ? pdGh.min_sample : 30;
-      label = `Adversarial gate health (rolling; post-deploy accumulating ${pdTotal}/${pdMinSample} invocations)`;
-    } else if (peffPd !== null && peff === null) {
-      // No rolling window; post-deploy present but low-sample — label must name the actual source.
-      const pdTotal = pdGh && typeof pdGh.total_invocations === 'number' ? pdGh.total_invocations : 0;
-      const pdMinSample = pdGh && typeof pdGh.min_sample === 'number' ? pdGh.min_sample : 30;
-      label = `Adversarial gate health (post-deploy low-sample: ${pdTotal}/${pdMinSample} invocations)`;
-    } else {
-      label = 'Adversarial gate health';
-    }
-    lines.push('');
-    lines.push(`**${label}:** ${state} — fail_open_rate ${failOpenRate} (n=${totalChallenged}, coverage ${coverage})`);
   }
 
   return lines.join('\n') + '\n';

@@ -1760,8 +1760,17 @@ async def _reconcile_if_managed_check_wait(
             # still snapshotted for the SPAWN MECHANICS (rate limits / suspension)
             # and falls back to defaults when the project never customized it.
             _harvest_selfheal_enabled = promotion_ci_selfheal_enabled(project)
+            from app.project_telemetry import read_telemetry_or_doc
+
             _harvest_ar_config = dict(
-                (project.design_doc or {}).get("_auto_remediation", {}) or {}
+                await read_telemetry_or_doc(
+                    session,
+                    _harvest_project_id,
+                    project.design_doc,
+                    "_auto_remediation",
+                    {},
+                )
+                or {}
             )
 
             # Release the row lock before GitHub I/O (mirrors the other reconcilers).
@@ -2657,6 +2666,24 @@ async def _reconcile_if_pending_qualification_superseded(
             # Only proceed when children are absent OR have reached a terminal
             # state without the normal finalizer running (the stuck-qualification
             # scenario this reconciler exists to resolve).
+            #
+            # EVERY required qualifier child must gate this, not just audit +
+            # smoketest: a still-running blind merge-grade or audit-challenge
+            # child is just as much "in flight" as a running audit.  The prior
+            # older partial-child check diverged from the canonical in-flight
+            # definition (_qualification_in_flight, which also covers merge_grade
+            # and challenge) — so an attempt whose audit had finished but
+            # whose merge-grade/challenge was still running could be falsely
+            # superseded, cancelling a legitimately in-flight attempt and
+            # burning it, exactly when automain advances beneath the pinned
+            # candidate.  Checking all required children keeps the pinned attempt
+            # running to a verdict on its snapshotted candidate_sha.
+            #
+            # Semantics preserved: a child id that is absent/unparseable is NOT
+            # treated as in-flight here (mirrors the out-of-band force-promotion
+            # incident, whose pending record tracks no children) — the reconciler
+            # still supersedes those.  Only a child row that EXISTS and is
+            # non-terminal holds off supersession.
             _TERMINAL = frozenset(
                 {
                     TaskStatus.COMPLETED,
@@ -2665,25 +2692,36 @@ async def _reconcile_if_pending_qualification_superseded(
                     TaskStatus.BLOCKED,
                 }
             )
-            smoketest_required = bool(qual.get("smoketest_enabled", True))
-            audit_task_id_raw = qual.get("audit_task_id")
-            smoketest_task_id_raw = qual.get("smoketest_task_id")
-            if audit_task_id_raw:
+            # Qualifier VM smoke is retired; legacy smoke ids never delay or
+            # protect a pending qualification from reconciliation.
+            in_flight_child_keys = ["audit_task_id"]
+            # The blind merge-grade and audit-challenge children are required
+            # only when the qualifying run recorded them (a non-empty goal /
+            # verified findings); absent ids simply skip.
+            if qual.get("merge_grade_task_id"):
+                in_flight_child_keys.append("merge_grade_task_id")
+            if qual.get("challenge_task_id"):
+                in_flight_child_keys.append("challenge_task_id")
+            for _child_key in in_flight_child_keys:
+                _child_raw = qual.get(_child_key)
+                if not _child_raw:
+                    continue
                 try:
-                    audit_t = await session.get(Task, uuid.UUID(str(audit_task_id_raw)))
-                    if audit_t is not None and audit_t.status not in _TERMINAL:
-                        return False
+                    _child_uuid = uuid.UUID(str(_child_raw))
                 except (ValueError, TypeError):
-                    pass
-            if smoketest_required and smoketest_task_id_raw:
-                try:
-                    smoke_t = await session.get(
-                        Task, uuid.UUID(str(smoketest_task_id_raw))
+                    continue
+                _child_t = await session.get(Task, _child_uuid)
+                if _child_t is not None and _child_t.status not in _TERMINAL:
+                    logger.debug(
+                        "[RELEASE_QUALIFIER] reconcile pending_superseded: v%d "
+                        "%s still non-terminal (%s) — deferring to the normal "
+                        "finalize path so the attempt runs to a verdict on its "
+                        "pinned candidate",
+                        version.version_number,
+                        _child_key,
+                        _child_t.status,
                     )
-                    if smoke_t is not None and smoke_t.status not in _TERMINAL:
-                        return False
-                except (ValueError, TypeError):
-                    pass
+                    return False
 
             # Release the row lock before GitHub I/O (mirrors the other reconcilers).
             try:

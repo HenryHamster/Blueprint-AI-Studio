@@ -9,7 +9,6 @@ let capturedThinkerParams: Record<string, unknown> | undefined;
 
 const {
   INDEX_EXPORT_NAMES,
-  WORKSPACE_PREP_EXPORT_NAMES,
   STRATEGIC_HELPERS_EXPORT_NAMES,
   DESIGN_DOC_PRESENCE_EXPORT_NAMES,
   RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES,
@@ -19,7 +18,6 @@ const {
 } = vi.hoisted(() => {
   // Type-safe export name lists: satisfies ensures each name exists in the actual module exports
   type IndexExportKey = keyof typeof import('../index.js');
-  type WorkspacePrepExportKey = keyof typeof import('../workspacePrep.js');
   type StrategicHelpersExportKey = keyof typeof import('./strategic-helpers.js');
   type DesignDocPresenceExportKey = keyof typeof import('../utils/design-doc-presence.js');
   type ResearchDirectionContextExportKey = keyof typeof import('./research-direction-context.js');
@@ -84,6 +82,7 @@ const {
     'bootstrapPoolMode',
     'buildTargetedPytestRunners',
     'captureTestBaseline',
+    'claimTask',
     'clearLastProviderRunErrorReport',
     'clearLogBuffer',
     'clearToolTrace',
@@ -111,9 +110,9 @@ const {
     'getFormatComplianceTelemetry',
     'getLastProviderRunErrorReport',
     'getOperatorDecisionCaptureTelemetry',
-    'getResidentTurnLatencyTelemetry',
     'getLlmTelemetry',
     'getProviderRunner',
+    'getResidentTurnLatencyTelemetry',
     'git',
     'gitAsync',
     'isBootstrapToken',
@@ -134,7 +133,6 @@ const {
     'parseStaleResultFile',
     'performWarmRetarget',
     'persistAndPostStatus',
-    'persistResidentTurnFailure',
     'pollForNextRole',
     'postTerminalStatusSync',
     'providerSupportsNativeSubagents',
@@ -157,7 +155,6 @@ const {
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
     'replayLogBufferRateLimited',
-    'requireClaimAgentToken',
     'requiredProviderConfigFiles',
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
@@ -182,17 +179,9 @@ const {
     'snapshotToolTrace',
     'staleResultBackoffMs',
     'strVal',
-    'taskRequiresGithubCredentials',
     'testFixLoop',
     'validateBranchName',
   ] satisfies IndexExportKey[],
-    WORKSPACE_PREP_EXPORT_NAMES: [
-    'getLastWorkspacePrepOutcome',
-    'prepareWorkspaceForRole',
-    'listWorkspaceTopDirs',
-    'resetWorkspacePrepOutcome',
-    'resolveReferenceRepo',
-  ] satisfies WorkspacePrepExportKey[],
     STRATEGIC_HELPERS_EXPORT_NAMES: [
     'DESIGN_DOC_FETCH_VERBS',
     'FETCH_VERB_HELP',
@@ -284,7 +273,6 @@ const {
     'buildPayloadStalenessSection',
     'buildPruneCandidatesSection',
     'buildQuestionSection',
-    'buildResidentExamLeadsSection',
     'buildSweepComparisonSection',
     'buildSystemMaturitySection',
     'fmtScalar',
@@ -317,8 +305,8 @@ const {
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
     'resetOperatorDecisionCaptureTelemetry',
-    'restoreOperatorDecisionCaptureTelemetry',
     'resetResidentTurnLatencyTelemetry',
+    'restoreOperatorDecisionCaptureTelemetry',
     'setCurrentPromptFingerprint',
     'setPromptSizeTelemetry',
   ] satisfies TelemetryExportKey[],
@@ -349,10 +337,10 @@ vi.mock('../index.js', () => ({
   sendHeartbeatSync: vi.fn(),
 }));
 
-vi.mock('../workspacePrep.js', () => ({
-  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
@@ -441,13 +429,17 @@ vi.mock('../utils/time.js', async (importOriginal) => {
   return { ...actual };
 });
 
-vi.mock('../utils/design-doc-presence.js', () => ({
-  ...Object.fromEntries(DESIGN_DOC_PRESENCE_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  reconcileDesignDocPresence: (doc: unknown) => doc,
-  // Identity stub: the handler now reconciles the compact index. Return it
-  // unchanged so the overview-rendering assertions see the payload's index.
-  reconcileDesignDocIndex: (index: unknown) => index,
-}));
+vi.mock('../utils/design-doc-presence.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/design-doc-presence.js')>();
+  return {
+    ...actual,
+    ...Object.fromEntries(DESIGN_DOC_PRESENCE_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+    reconcileDesignDocPresence: (doc: unknown) => doc,
+    // Identity stub: the handler now reconciles the compact index. Return it
+    // unchanged so the overview-rendering assertions see the payload's index.
+    reconcileDesignDocIndex: (index: unknown) => index,
+  };
+});
 
 vi.mock('./research-direction-context.js', () => ({
   ...Object.fromEntries(RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES.map((name) => [name, vi.fn()])),
@@ -598,6 +590,7 @@ vi.mock('../telemetry.js', () => ({
 
 import {
   renderStrategicPromptSuffix,
+  resolveStrategicPurpose,
   buildStagedDirectionsSection,
   renderDesignDocIndexOverview,
   handleStrategic,
@@ -763,6 +756,17 @@ describe('renderStrategicPromptSuffix', () => {
 // (Anthropic prefix-cache reads bill at ~10% of base input). It now renders
 // relative to a caller-supplied deterministic reference epoch (the backend-baked
 // payload timestamp), so two builds of an identical payload are byte-identical.
+describe('resolveStrategicPurpose', () => {
+  it('prefers the backend value and retains bounded legacy fallbacks', () => {
+    const problemModel = { intent: { purpose: '...', user_purpose: ' durable operator purpose ' } };
+
+    expect(resolveStrategicPurpose({ effective_purpose: ' canonical purpose ' }, problemModel)).toBe('canonical purpose');
+    expect(resolveStrategicPurpose({}, problemModel)).toBe('durable operator purpose');
+    expect(resolveStrategicPurpose({ vision: { purpose: 'legacy purpose' } }, {})).toBe('legacy purpose');
+    expect(resolveStrategicPurpose({}, { intent: { purpose: '<from analysis>' } })).toBeUndefined();
+  });
+});
+
 describe('formatRelativeDays', () => {
   const iso = '2026-01-01T00:00:00Z';
   const isoMs = Date.parse(iso);

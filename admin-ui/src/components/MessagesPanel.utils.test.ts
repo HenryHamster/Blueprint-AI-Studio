@@ -5,6 +5,7 @@ import {
   type EventPref,
   eventPrefsKey,
   groupRoutineMessages,
+  outcomeBreakdown,
   insertTimeDividers,
   collapseStaleRoutineRows,
   STALE_ROUTINE_COLLAPSE_AGE_MS,
@@ -47,6 +48,7 @@ import {
   countHighSignalMessages,
   countNewSinceLastVisit,
   fetchBackendLastSeen,
+  type RoutineRow,
 } from './MessagesPanel.utils';
 
 vi.mock('../api', async () => {
@@ -407,8 +409,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     const rows = groupRoutineMessages(msgs);
 
     // m1 and m3 should be in the same group (even though m2 is between them)
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // Should have 0 groups (only 2 msgs of same type, below threshold) and 3 singles
     expect(groups.length).toBe(0);
@@ -425,8 +427,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     const rows = groupRoutineMessages(msgs);
 
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // Should have 1 group with all 3 consecutive msgs
     expect(groups.length).toBe(1);
@@ -442,8 +444,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     const rows = groupRoutineMessages(msgs);
 
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // 2 msgs is below the 3-msg threshold, so rendered as singles
     expect(groups.length).toBe(0);
@@ -470,8 +472,8 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     // m2 and m3 are on the same day and within 1 hour, should group
     // m1 is on a different day, should not group with m2/m3
-    const groups = rows.filter(r => r.kind === 'group');
-    const singles = rows.filter(r => r.kind === 'single');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
 
     // m1 rendered as single, m2+m3 as single or group depending on other criteria
     // Since m2+m3 are only 2 msgs, they render as singles too
@@ -495,7 +497,7 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     // Actually, with rolling window: early (10:00), inwindow (10:30 within 1hr of early), outofwindow (11:05 within 1hr of inwindow at 10:30)
     // So yes, all 4 should be in same group since each is within 1hr of the previous
 
-    const groups = rows.filter(r => r.kind === 'group');
+    const groups = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'group' }> => r.kind === 'group');
     expect(groups.length).toBe(1);
     expect(groups[0].msgs.length).toBe(4);
   });
@@ -519,7 +521,11 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     // But output should maintain the message order, so between group and singles...
 
     // Let's verify the IDs are in a reasonable order
-    const ids = rows.map(r => (r.kind === 'group' ? `group(${r.msgs.map((m: TestMessage) => m.id).join(',')})` : r.msg.id));
+    const ids = rows.map(r => {
+      if (r.kind === 'group') return `group(${r.msgs.map((m: TestMessage) => m.id).join(',')})`;
+      if (r.kind === 'single') return r.msg.id;
+      return `digest(${r.day})`;
+    });
     expect(ids[0]).toBe('group(a1,a2,a3)'); // a1 group rendered first
     expect(ids[1]).toBe('b1');
     expect(ids[2]).toBe('c1');
@@ -534,7 +540,7 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
 
     const rows = groupRoutineMessages(msgs);
 
-    const singles = rows.filter(r => r.kind === 'single');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
     expect(singles.length).toBe(3);
     expect(singles.map(s => s.msg.id)).toEqual(['m1', 'm2', 'm3']);
   });
@@ -552,7 +558,7 @@ describe('MessagesPanel.utils - Time-window grouping', () => {
     // m1, m2 are within 1 hour -> group 1 (but <3 so singles)
     // m3, m4 are within 1 hour -> group 2 (but <3 so singles)
     // All rendered as singles due to <3 threshold
-    const singles = rows.filter(r => r.kind === 'single');
+    const singles = rows.filter((r): r is Extract<RoutineRow<TestMessage>, { kind: 'single' }> => r.kind === 'single');
     expect(singles.length).toBe(4);
   });
 });
@@ -712,9 +718,12 @@ describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
     const rows = groupRoutineMessages([makeMsg('m1', 'pr_merged', msgTs)]);
     const collapsed = collapseStaleRoutineRows(rows);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0].kind).toBe('daily_digest');
-    expect(collapsed[0].count).toBe(1);
-    expect(collapsed[0].breakdown['pr_merged']).toBe(1);
+    const digest = collapsed[0];
+    expect(digest.kind).toBe('daily_digest');
+    if (digest.kind === 'daily_digest') {
+      expect(digest.count).toBe(1);
+      expect(digest.breakdown['pr_merged']).toBe(1);
+    }
   });
 
   it('(2) fresh burst of 3 routine messages within 30min stays as a 1h-window group', () => {
@@ -728,8 +737,11 @@ describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
     expect(rows[0].kind).toBe('group'); // sanity: 1h-window grouping fired
     const collapsed = collapseStaleRoutineRows(rows);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0].kind).toBe('group');
-    expect(collapsed[0].msgs).toHaveLength(3);
+    const groupRow = collapsed[0];
+    expect(groupRow.kind).toBe('group');
+    if (groupRow.kind === 'group') {
+      expect(groupRow.msgs).toHaveLength(3);
+    }
   });
 
   it('(3) high-signal event type older than threshold renders as single, not collapsed', () => {
@@ -737,8 +749,11 @@ describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
     const rows = groupRoutineMessages([makeMsg('m1', 'failure_alert', msgTs)]);
     const collapsed = collapseStaleRoutineRows(rows);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0].kind).toBe('single');
-    expect(collapsed[0].msg.id).toBe('m1');
+    const singleRow = collapsed[0];
+    expect(singleRow.kind).toBe('single');
+    if (singleRow.kind === 'single') {
+      expect(singleRow.msg.id).toBe('m1');
+    }
   });
 });
 
@@ -793,7 +808,9 @@ describe('Timezone correctness of day labels (naive backend UTC strings)', () =>
     const rows = groupRoutineMessages(msgs);
     expect(rows).toHaveLength(1);
     expect(rows[0].kind).toBe('group');
-    expect(rows[0].msgs).toHaveLength(3);
+    if (rows[0].kind === 'group') {
+      expect(rows[0].msgs).toHaveLength(3);
+    }
   });
 });
 
@@ -1400,6 +1417,154 @@ describe('countNewSinceLastVisit — pref-aware counting', () => {
   test('zero-arg prefs call is unchanged — existing callers unbroken', () => {
     const msgs = [makeMsg('failure_alert')];
     expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+});
+
+// ── outcomeBreakdown ──────────────────────────────────────────────────────────
+
+describe('outcomeBreakdown', () => {
+  function m(result?: string) { return { context: result ? { result } : {} }; }
+
+  test('returns empty string when no result fields present', () => {
+    expect(outcomeBreakdown([m(), m()])).toBe('');
+  });
+
+  test('shows failed count when only failures present', () => {
+    expect(outcomeBreakdown([m('failed'), m('failed'), m('failed')])).toBe('· 3 failed');
+  });
+
+  test('shows merged count when only merges present', () => {
+    expect(outcomeBreakdown([m('merged'), m('merged')])).toBe('· 2 merged');
+  });
+
+  test('shows mixed breakdown', () => {
+    const msgs = [m('failed'), m('failed'), m('merged'), m('review_needed')];
+    expect(outcomeBreakdown(msgs)).toBe('· 2 failed, 1 merged, 1 review');
+  });
+
+  test('silently degrades when result is absent on all messages', () => {
+    expect(outcomeBreakdown([{ context: { event_type: 'pr_merged' } }])).toBe('');
+  });
+});
+
+// ── groupRoutineMessages — group chip properties ──────────────────────────────
+
+describe('groupRoutineMessages — group chip properties', () => {
+  function makeItem(id: string, event_type: string) {
+    return { id, context: { event_type } };
+  }
+
+  test('group row carries event_type, label, and key from first message', () => {
+    const msgs = Array.from({ length: 5 }, (_, i) => makeItem(`id-${i}`, 'pr_merged'));
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('group');
+    if (rows[0].kind === 'group') {
+      expect(rows[0].event_type).toBe('pr_merged');
+      expect(rows[0].label).toBe('PR merges');
+      expect(rows[0].key).toBe('id-0');
+    }
+  });
+});
+
+// ── classifySignalLevel — explicit message-type coverage ─────────────────────
+
+describe('classifySignalLevel — message-type coverage', () => {
+  const base = { message_type: 'NOTE', from_type: 'system', context: {} };
+
+  test('user messages are always high-signal', () => {
+    expect(classifySignalLevel({ ...base, from_type: 'user' })).toBe('high');
+    expect(classifySignalLevel({ ...base, from_type: 'USER' })).toBe('high');
+  });
+
+  test('FEEDBACK is high-signal regardless of from_type', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'FEEDBACK', from_type: 'agent' })).toBe('high');
+  });
+
+  test('BLOCKER is high-signal', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'BLOCKER' })).toBe('high');
+  });
+
+  test('BUG_REPORT is high-signal', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'BUG_REPORT' })).toBe('high');
+  });
+
+  test('QUESTION is high-signal (awaiting operator reply)', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'QUESTION' })).toBe('high');
+  });
+
+  test('NOTE with failure_alert is high-signal', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'failure_alert' } })).toBe('high');
+  });
+
+  test('NOTE with rollback_recommended is high-signal', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('high');
+  });
+
+  test('NOTE with fix_loop_divergence_regressed is high-signal', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('high');
+  });
+
+  test('NOTE with pr_merged is routine', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'pr_merged' } })).toBe('routine');
+  });
+
+  test('NOTE with feedback_acknowledgment is routine', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('routine');
+  });
+
+  test('NOTE with unknown event_type is routine (fail-safe)', () => {
+    expect(classifySignalLevel({ ...base, context: { event_type: 'some_future_event' } })).toBe('routine');
+  });
+
+  test('NOTE with no event_type is routine', () => {
+    expect(classifySignalLevel({ ...base, context: {} })).toBe('routine');
+  });
+});
+
+// ── getToastSeverity — explicit message-type coverage ────────────────────────
+
+describe('getToastSeverity', () => {
+  const base = { message_type: 'NOTE', from_type: 'system', context: {} };
+
+  test('BLOCKER returns error', () => {
+    expect(getToastSeverity({ ...base, message_type: 'BLOCKER' })).toBe('error');
+  });
+
+  test('BUG_REPORT returns error', () => {
+    expect(getToastSeverity({ ...base, message_type: 'BUG_REPORT' })).toBe('error');
+  });
+
+  test('FEEDBACK returns info', () => {
+    expect(getToastSeverity({ ...base, message_type: 'FEEDBACK' })).toBe('info');
+  });
+
+  test('NOTE with failure_alert returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'failure_alert' } })).toBe('error');
+  });
+
+  test('NOTE with rollback_recommended returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('error');
+  });
+
+  test('NOTE with fix_loop_divergence_regressed returns error', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('error');
+  });
+
+  test('NOTE with account_model_regression_quarantined returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'account_model_regression_quarantined' } })).toBe('info');
+  });
+
+  test('NOTE with feedback_acknowledgment returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('info');
+  });
+
+  test('NOTE with routine event_type returns info', () => {
+    expect(getToastSeverity({ ...base, context: { event_type: 'pr_merged' } })).toBe('info');
+  });
+
+  test('NOTE with no event_type returns info', () => {
+    expect(getToastSeverity({ ...base, context: {} })).toBe('info');
   });
 });
 

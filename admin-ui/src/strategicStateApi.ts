@@ -837,70 +837,6 @@ export interface StrategicConversationQuery {
   search?: string | null;
 }
 
-export interface ResidentEngineTurnHealth {
-  task_id: string;
-  status: string;
-  updated_at: string | null;
-}
-
-export interface ResidentEngineHealth {
-  project_id: string;
-  observed_at: string;
-  resident_initialized: boolean;
-  engine_owner?: 'legacy' | 'strategic_resident' | string;
-  engine_version?: string | null;
-  background_policy?: 'active' | 'paused' | string;
-  authority_generation?: number;
-  health_status?: string | null;
-  last_healthy_at?: string | null;
-  last_error_at?: string | null;
-  checkpoint?: { checkpoint_id: string; version: number; content_hash: string } | null;
-  turns?: {
-    active: ResidentEngineTurnHealth | null;
-    interactive_successor: ResidentEngineTurnHealth | null;
-    background_successor: ResidentEngineTurnHealth | null;
-  };
-  conversation?: {
-    handled_sequence: number;
-    shadow_handled_sequence: number;
-    latest_unhandled_user_sequence: number | null;
-  };
-  operations?: { unsettled_receipt_count: number };
-  shadow?: {
-    state: string | null;
-    last_completed_at: string | null;
-    last_projection_latency_ms: number | null;
-    last_comparison: Record<string, unknown> | null;
-  };
-  soak?: {
-    cutover_completed_at: string | null;
-    observed_seconds: number;
-    required_seconds: number;
-    rollback_rehearsed_at: string | null;
-  };
-  cutover_ready: boolean;
-  rollback_ready: boolean;
-  legacy_retirement_ready: boolean;
-  blockers: string[];
-  retirement_blockers?: string[];
-}
-
-/**
- * Per-kind turn-latency statistics for one turn type (operator or autonomous).
- * Mirrors the shape computed by `getResidentTurnLatencyTelemetry` in the agent.
- */
-export interface TurnLatencyKindSummary {
-  count: number;
-  mean_turn_ms: number | null;
-  max_turn_ms: number;
-  mean_ttft_ms: number | null;
-  interrupted_count: number;
-  total_tool_calls: number;
-  total_tool_call_duration_ms: number;
-  mean_inter_token_ms: number | null;
-  mean_pickup_lag_ms: number | null;
-}
-
 /**
  * Bounded projection of the resident Strategic session state returned by the
  * start/stop endpoints (mirrors `resident_session_snapshot` in
@@ -909,6 +845,10 @@ export interface TurnLatencyKindSummary {
 export interface StrategicResidentSessionSnapshot {
   session_id?: string | null;
   task_id?: string | null;
+  worker_generation?: number | null;
+  worker_state?: 'starting' | 'ready' | 'retry_wait' | 'restart_failed' | string | null;
+  worker_retry_until?: string | null;
+  worker_retry_reason?: string | null;
   runner_id?: string | null;
   status?: string | null;
   stop_requested?: boolean;
@@ -919,42 +859,9 @@ export interface StrategicResidentSessionSnapshot {
   last_operator_interaction_at?: string | null;
   compaction_count?: number | null;
   last_compaction_at?: string | null;
-  /**
-   * Operator-decision capture telemetry for this session (mirrors
-   * `_operator_decision_summary` on the backend session blob, projected by
-   * `resident_session_snapshot`). `capture_rate` is an integer percent (0–100)
-   * of operator turns that ended with a valid OPERATOR-DECISION marker; `null`
-   * when no operator turns have been processed yet. The whole field is optional
-   * and `null` on legacy sessions / before any operator turn.
-   */
-  operator_decision_summary?: {
-    total: number;
-    captured: number;
-    missed: number;
-    capture_rate: number | null;
-  } | null;
-  /**
-   * Per-kind turn-latency summary for this session (mirrors
-   * `_turn_latency_summary` on the backend session blob, projected by
-   * `resident_session_snapshot`). Contains rolling mean/max turn ms for
-   * operator and autonomous turns. `null` when no turns have been recorded yet
-   * or on legacy sessions.
-   */
-  turn_latency_summary?: {
-    operator: TurnLatencyKindSummary;
-    autonomous: TurnLatencyKindSummary;
-  } | null;
 }
 
-/**
- * Legible Workday resident-session availability (mirrors
- * `_resident_session_availability` in `strategic_state_read_model.py`).
- * `state` maps to the operator status chip; `reason` is present whenever the
- * session can't run (`sessions_disabled` / `no_runner` / `runner_offline` /
- * `start_failed: <msg>`). `runner_offline` is the mid-session block-on-offline
- * verdict: the pinned device went offline and the operator must restart to pick
- * another (no auto-migration).
- */
+/** Cheap, operator-legible availability for the persistent Workday session. */
 export interface StrategicResidentSessionAvailability {
   available: boolean;
   state: 'off' | 'ready' | 'starting' | 'active' | 'blocked' | 'error' | string;
@@ -968,9 +875,32 @@ export interface StrategicResidentSessionAvailability {
  * `eligible` = online + agent-ready + can handle strategic work (the full
  * auto-pick gate). The pinned device rides on `resident_session.runner_id`.
  */
+/**
+ * A strategic-memory fact, sourced from the KnowledgeDocument index
+ * (`source_kind='strategic_memory'`). Superseded facts are excluded server-side.
+ * Replaces the former `{note, set_at}` legacy-JSONB shape.
+ */
 export interface StrategicMemoryNote {
-  note: string;
-  set_at: string;
+  id: string;
+  title: string;
+  topic?: string;
+  summary?: string;
+  tags?: string[];
+  created_at?: string;
+}
+
+export interface StrategicAccountSpendStatus {
+  totalAccounts?: number | null;
+  availableAccounts?: number | null;
+  enabledAccounts?: number | null;
+  activeAccountTasks?: number | null;
+  cooldownAccounts?: number | null;
+  cappedAccounts?: number | null;
+  configuredCapAccounts?: number | null;
+  disabledModelCount?: number | null;
+  cumulativeCostUsd?: number | null;
+  trackedSpendUsd?: number | null;
+  dailyCostCeilingUsd?: number | null;
 }
 
 export interface StrategicResidentRunnerOption {
@@ -984,12 +914,13 @@ export interface StrategicResidentRunnerOption {
 
 export interface StrategicSessionStartRequest {
   runner_id?: string | null;
+  expected_interaction_mode?: 'continuous';
 }
 
 export interface StrategicSessionStartResponse {
   project_id: string;
-  enabled: boolean;
   session: StrategicResidentSessionSnapshot | null;
+  ensure_outcome?: 'ensured' | 'mode_changed';
 }
 
 export interface StrategicSessionStopResponse {
@@ -1055,12 +986,6 @@ export interface StrategicStateResponse {
     };
   };
   resident_session?: StrategicResidentSessionSnapshot | null;
-  /**
-   * Whether the resident-session feature flag (`strategic_session_enabled`) is
-   * on. The container gates the Start affordance on this so the button is hidden
-   * when the feature is off (a click would otherwise 403 at the start endpoint).
-   */
-  resident_session_available?: boolean;
   /**
    * Legible Workday resident-session state + the reason it isn't running
    * (mirrors `_resident_session_availability`). Workday is the on-switch:
@@ -1236,19 +1161,13 @@ export interface StrategicStateResponse {
 }
 
 /**
- * Lightweight mode + resident-session liveness probe (mirrors the backend
- * `GET /projects/{id}/strategic-liveness` endpoint). Carries ONLY the cheap
- * fields the chat/workday shell needs to render the mode indicator and the
- * resident-session liveness chip immediately on reload, computed without any of
- * the heavy `strategic-state` Phase-1/Phase-2 assembly. The full read model
- * ({@link fetchStrategicState}) still hydrates the complete state afterward and
- * takes over once it lands.
+ * Lightweight mode and Workday-session liveness probe. Carries only the cheap
+ * fields needed before the full Strategic read model hydrates.
  */
 export interface StrategicLivenessResponse {
   project_id: string;
   interaction_mode: StrategicWorkbenchState['interaction_mode'];
   resident_session?: StrategicResidentSessionSnapshot | null;
-  resident_session_available?: boolean;
   resident_session_availability?: StrategicResidentSessionAvailability | null;
   resident_session_runners?: StrategicResidentRunnerOption[] | null;
 }
@@ -1436,24 +1355,6 @@ export async function fetchStrategicConversation(
     ...(wakeupState !== undefined ? { wakeup_state: wakeupState } : {}),
     ...(responseEtag ? { etag: responseEtag } : {}),
   };
-}
-
-export async function fetchResidentEngineHealth(
-  projectId: string,
-  signal?: AbortSignal,
-): Promise<ResidentEngineHealth | null> {
-  const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/resident-engine/health`,
-    undefined,
-    1,
-    15000,
-    signal,
-  );
-  // The rollout surface is owner-only and may not exist during a staged deploy.
-  // Both cases intentionally degrade to the legacy activity projection.
-  if (res.status === 403 || res.status === 404) return null;
-  if (!res.ok) throw new Error(`Failed to fetch Resident engine health: ${res.status}`);
-  return res.json() as Promise<ResidentEngineHealth>;
 }
 
 export interface StrategicMessageIdentityReceipt {

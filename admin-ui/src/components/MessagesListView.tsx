@@ -1,6 +1,6 @@
 /* eslint-disable react-hooks/refs */
 import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef, useCallback, useImperativeHandle } from 'react';
-import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, Check, MoreVertical } from 'lucide-react';
+import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, MoreVertical } from 'lucide-react';
 import { List, useDynamicRowHeight, useListRef, type RowComponentProps, type ListImperativeAPI } from 'react-window';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
 import { type RoutineRow, routineSummary, formatDailyDigestSummary, outcomeBreakdown, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
@@ -84,7 +84,6 @@ interface TriageRowData {
   setShowResolved: Dispatch<SetStateAction<boolean>>;
   setShowTempMuteMenu: Dispatch<SetStateAction<boolean>>;
   addTemporaryMute: (eventType: string, durationMs: number) => void;
-  handleResolveGroup: (msgs: ProjectMessage[]) => void;
   handleBulkDeleteResolved: () => void;
 }
 
@@ -116,7 +115,6 @@ function TriageRow({
   setShowResolved,
   setShowTempMuteMenu,
   addTemporaryMute,
-  handleResolveGroup,
   handleBulkDeleteResolved,
 }: RowComponentProps<TriageRowData>) {
   const item = items[index];
@@ -359,13 +357,6 @@ function TriageRow({
               </span>
               {bd && <span className="text-xs text-red-400">{bd}</span>}
             </button>
-            <button
-              onClick={() => handleResolveGroup(msgs)}
-              title="Resolve all"
-              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-            >
-              <Check className="w-3 h-3" />
-            </button>
           </div>
           {isExpanded && (
             <div className="space-y-2 p-2 border-t border-red-900/40">
@@ -477,13 +468,6 @@ function TriageRow({
             >
               <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
               <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
-            </button>
-            <button
-              onClick={() => handleResolveGroup(row.msgs)}
-              title="Resolve all"
-              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-            >
-              <Check className="w-3 h-3" />
             </button>
           </div>
           {isExpanded && (
@@ -748,7 +732,7 @@ export function buildTriageItems(p: BuildParams): { items: TriageItem[]; section
 export interface MessagesListViewProps {
   presentation?: 'triage' | 'conversation';
   /**
-   * Live resident-session streaming preview, rendered at the tail of the
+   * Live strategic-session streaming preview, rendered at the tail of the
    * conversation transcript (conversation presentation only). Reconciled away by
    * the caller once the durable strategic ProjectMessage lands, so it never
    * duplicates a persisted message.
@@ -759,6 +743,10 @@ export interface MessagesListViewProps {
   hasOlderConversationMessages?: boolean;
   loadingOlderConversationMessages?: boolean;
   onLoadOlderConversationMessages?: () => void | Promise<void>;
+  /** Triage mode: whether there are older messages beyond the initial page. */
+  hasOlderTriageMessages?: boolean;
+  loadingOlderTriageMessages?: boolean;
+  onLoadOlderTriageMessages?: () => void;
   conversationListRef?: RefObject<ConversationListImperativeApi | null>;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
@@ -808,7 +796,6 @@ export interface MessagesListViewProps {
   setShowTempMuteMenu: Dispatch<SetStateAction<boolean>>;
   addTemporaryMute: (eventType: string, durationMs: number) => void;
   getTop3NoisyEventTypes: () => Array<[string, number]>;
-  handleResolveGroup: (msgs: ProjectMessage[]) => void;
   handleBulkDeleteResolved: () => void;
   scrollToBottom: () => void;
 }
@@ -850,6 +837,7 @@ export function MessagesListView(props: MessagesListViewProps) {
 
 export interface ConversationListImperativeApi {
   scrollToMessage: (messageId: string) => Promise<boolean>;
+  scrollToBottom: () => void;
 }
 
 type ConversationRow =
@@ -984,6 +972,11 @@ function ConversationVirtualList({
         listRef.current?.scrollToRow({ index, align: 'center', behavior: 'instant' });
       });
     },
+    scrollToBottom: () => {
+      const lastIndex = rows.length - 1;
+      if (lastIndex < 0 || !listRef.current) return;
+      listRef.current?.scrollToRow({ index: lastIndex, align: 'end', behavior: 'instant' });
+    },
   }), [conversationListRef, listRef, rows]);
 
   const handleConversationRowsRendered = useCallback((visible: { startIndex: number; stopIndex: number }) => {
@@ -1107,8 +1100,10 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     setShowTempMuteMenu,
     addTemporaryMute,
     getTop3NoisyEventTypes,
-    handleResolveGroup,
     handleBulkDeleteResolved,
+    hasOlderTriageMessages,
+    loadingOlderTriageMessages,
+    onLoadOlderTriageMessages,
   } = props;
   const listRef = useListRef(null);
   const messagesById = useMemo(
@@ -1194,7 +1189,6 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     setShowResolved,
     setShowTempMuteMenu,
     addTemporaryMute,
-    handleResolveGroup,
     handleBulkDeleteResolved,
   }), [
     items, messagesById, dividerTime, totalNewCount,
@@ -1203,7 +1197,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     sectionIndices, bubbleProps, highlightedMessageId,
     visibleRoutineCount, mutedRoutineCount, routineOpen,
     onDismissDivider, onShowOnlyNew, setExpandedGroupKeys, setRoutineExpanded,
-    setShowResolved, setShowTempMuteMenu, addTemporaryMute, handleResolveGroup,
+    setShowResolved, setShowTempMuteMenu, addTemporaryMute,
     handleBulkDeleteResolved,
   ]);
 
@@ -1217,6 +1211,18 @@ function TriageVirtualList(props: TriageVirtualListProps) {
 
   return (
     <div className="relative flex-1 overflow-hidden bg-workbench-surface">
+      {!!hasOlderTriageMessages && (
+        <div className="flex justify-center py-2 border-b border-neutral-800/60">
+          <button
+            type="button"
+            onClick={() => onLoadOlderTriageMessages?.()}
+            disabled={!!loadingOlderTriageMessages}
+            className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+          >
+            {loadingOlderTriageMessages ? 'Loading older messages…' : 'Load older messages'}
+          </button>
+        </div>
+      )}
       <List
         rowCount={items.length}
         rowComponent={TriageRow}

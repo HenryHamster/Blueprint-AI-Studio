@@ -8,7 +8,6 @@ import {
   fetchProjectToolManifest,
   seedProjectTools as seedProjectToolsApi,
   fetchComputeImageStatus,
-  TOOL_PLACEMENTS,
   type ProjectTool,
   type ProjectToolManifestEntry,
   type ProjectSkillManifestEntry,
@@ -34,7 +33,6 @@ interface Props {
 
 interface ConfigDraft {
   title: string;
-  placement: string;
   config: Record<string, string>;
 }
 
@@ -337,7 +335,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     for (const [key, val] of Object.entries(existing)) {
       config[key] = typeof val === 'string' ? val : JSON.stringify(val);
     }
-    setConfigDraft({ title: tool.title, placement: tool.placement, config });
+    setConfigDraft({ title: tool.title, config });
     setConfiguringId(tool.id);
     setConfiguringProjectId(requestedProjectId);
   }
@@ -362,7 +360,6 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
       }
       await updateProjectToolApi(requestedProjectId, tool.id, {
         title,
-        placement: configDraft.placement,
         ...(schemaPropsForKind(tool.kind).length > 0 ? { config } : {}),
       });
       if (!isCurrentProject(requestedProjectId)) return;
@@ -615,7 +612,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     );
   }
 
-  // Owner-only inline rename + placement + schema-driven config editor.
+  // Owner-only inline rename + schema-driven config editor.
   function renderConfigPanel(tool: ProjectTool): ReactNode {
     if (configuringId !== tool.id || configuringProjectId !== projectId || !configDraft) return null;
     const schemaProps = schemaPropsForKind(tool.kind);
@@ -629,18 +626,6 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             onChange={e => setConfigDraft(d => (d ? { ...d, title: e.target.value } : d))}
             className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
           />
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-neutral-400">Placement</label>
-          <select
-            value={configDraft.placement}
-            onChange={e => setConfigDraft(d => (d ? { ...d, placement: e.target.value } : d))}
-            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
-          >
-            {TOOL_PLACEMENTS.map(p => (
-              <option key={p} value={p}>{p}</option>
-            ))}
-          </select>
         </div>
         {schemaProps.map(([key, spec]) => (
           <div key={key}>
@@ -769,14 +754,23 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     const enabledTools = effective.tools.filter(t => t.enabled);
     const disabledTools = effective.tools.filter(t => !t.enabled);
     const registeredTools = enabledTools.filter(t => getToolComponent(t.kind) !== undefined);
+    // Placement-based segmentation: project_section tools render in the main
+    // grid; toolbar/sidebar tools render in a separate "Other surfaces" section
+    // so changing a tool's placement has an observable, durable effect.
+    const projectSectionTools = registeredTools.filter(t => t.placement === 'project_section');
+    const otherPlacementTools = registeredTools.filter(t => t.placement !== 'project_section');
     const allManifestTools = manifestState.status === 'ok' ? manifestState.tools : [];
     const manifestTools = allManifestTools.filter(t => !hiddenManifestSlugs.has(t.slug));
+    const projectSectionManifest = manifestTools.filter(t => t.placement === 'project_section');
+    const otherPlacementManifest = manifestTools.filter(t => t.placement !== 'project_section');
     const hiddenManifestCount = allManifestTools.length - manifestTools.length;
     const manifestSkills = manifestState.status === 'ok' ? manifestState.skills : [];
     const hasAnyTool =
-      registeredTools.length > 0 ||
+      projectSectionTools.length > 0 ||
+      otherPlacementTools.length > 0 ||
       disabledTools.length > 0 ||
-      manifestTools.length > 0 ||
+      projectSectionManifest.length > 0 ||
+      otherPlacementManifest.length > 0 ||
       // Keep the section alive when every manifest tool is hidden so the
       // "Show hidden" restore affordance remains reachable.
       hiddenManifestCount > 0 ||
@@ -809,9 +803,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
 
     return (
       <div className="space-y-4">
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {/* Registered (DB-backed) tools with management controls */}
-          {registeredTools.map(tool => {
+        {/* Registered (DB-backed) tools and project-declared tools in project_section */}
+        {(projectSectionTools.length > 0 || projectSectionManifest.length > 0) && (
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {projectSectionTools.map(tool => {
             const ToolComponent = getToolComponent(tool.kind);
             if (!ToolComponent) return null;
             return (
@@ -901,8 +896,8 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             );
           })}
 
-          {/* Manifest-declared (project-repo) tools — read-only, rendered via iframe */}
-          {manifestTools.map(tool => (
+          {/* Manifest-declared (project-repo) tools in project_section */}
+          {projectSectionManifest.map(tool => (
             <div key={`manifest:${tool.slug}`} className="min-w-0 space-y-1.5">
               <WorkbenchPanel
                 title={tool.title}
@@ -926,32 +921,83 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
               </div>
             </div>
           ))}
+          </div>
+        )}
 
-          {/* Manifest warning (non-fatal validation error) */}
-          {manifestState.status === 'ok' && manifestState.warning && (
-            <div className="col-span-full rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-400">
-              Manifest warning: {manifestState.warning}
+        {/* Non-project_section tools (toolbar / sidebar) in a dedicated section */}
+        {(otherPlacementTools.length > 0 || otherPlacementManifest.length > 0) && (
+          <div className="space-y-3">
+            <h3 className="text-sm font-semibold text-neutral-100">Other surfaces</h3>
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              {otherPlacementTools.map(tool => {
+                const ToolComponent = getToolComponent(tool.kind);
+                if (!ToolComponent) return null;
+                return (
+                  <div key={tool.id} className="min-w-0 space-y-1.5">
+                    <WorkbenchPanel title={tool.title} meta={<span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">{tool.placement}</span>}>
+                      <ToolComponent projectId={projectId} tool={tool} />
+                    </WorkbenchPanel>
+                    {isOwner && (
+                      <div className="flex items-center gap-2 px-1">
+                        <button type="button" data-viewport-allow-small-target onClick={() => handleOpenConfigure(tool)} className="text-xs text-neutral-500 hover:text-neutral-300">Configure</button>
+                        <button type="button" data-viewport-allow-small-target onClick={() => handleToggleEnabled(tool)} disabled={togglingId === tool.id && actionIsCurrent} className="text-xs text-neutral-500 hover:text-neutral-300 disabled:opacity-50">
+                          {togglingId === tool.id && actionIsCurrent ? 'Disabling…' : 'Disable'}
+                        </button>
+                        {pendingDeleteId === tool.id ? (
+                          <>
+                            <span className="text-xs text-neutral-400">Remove &ldquo;{tool.title}&rdquo;? This will permanently delete its content and configuration.</span>
+                            <button type="button" data-viewport-allow-small-target onClick={() => setPendingDeleteId(null)} className="text-xs text-neutral-400 hover:text-neutral-200">Cancel</button>
+                            <button type="button" data-viewport-allow-small-target onClick={() => { setPendingDeleteId(null); void handleDelete(tool.id); }} disabled={deletingId === tool.id && actionIsCurrent} className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50">
+                              {deletingId === tool.id && actionIsCurrent ? 'Removing…' : 'Permanently remove'}
+                            </button>
+                          </>
+                        ) : (
+                          <button type="button" data-viewport-allow-small-target onClick={() => setPendingDeleteId(tool.id)} className="text-xs text-red-400 hover:text-red-300">Remove</button>
+                        )}
+                      </div>
+                    )}
+                    {renderConfigPanel(tool)}
+                  </div>
+                );
+              })}
+              {otherPlacementManifest.map(tool => (
+                <div key={`manifest:${tool.slug}`} className="min-w-0 space-y-1.5">
+                  <WorkbenchPanel title={tool.title} meta={<span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">{tool.placement}</span>}>
+                    <ProjectToolIframe projectId={projectId} tool={tool} />
+                  </WorkbenchPanel>
+                  <div className="flex items-center gap-2 px-1">
+                    <button type="button" data-viewport-allow-small-target onClick={() => hideManifestTool(tool.slug)} className="text-xs text-neutral-500 hover:text-neutral-300">Hide</button>
+                  </div>
+                </div>
+              ))}
             </div>
-          )}
+          </div>
+        )}
 
-          {/* Escape hatch: restore any hidden project-declared tools so Hide is
-              never a permanent dead-end. */}
-          {hiddenManifestCount > 0 && (
-            <div className="col-span-full flex items-center gap-2 text-xs text-neutral-500">
-              <span>
-                {hiddenManifestCount} project-declared tool{hiddenManifestCount === 1 ? '' : 's'} hidden
-              </span>
-              <button
-                type="button"
-                data-viewport-allow-small-target
-                onClick={unhideAllManifestTools}
-                className="text-neutral-400 underline hover:text-neutral-200"
-              >
-                Show hidden
-              </button>
-            </div>
-          )}
-        </div>
+        {/* Manifest warning (non-fatal validation error) — shown once regardless of placement */}
+        {manifestState.status === 'ok' && manifestState.warning && (
+          <div className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-400">
+            Manifest warning: {manifestState.warning}
+          </div>
+        )}
+
+        {/* Escape hatch: restore any hidden project-declared tools so Hide is
+            never a permanent dead-end. */}
+        {hiddenManifestCount > 0 && (
+          <div className="flex items-center gap-2 text-xs text-neutral-500">
+            <span>
+              {hiddenManifestCount} project-declared tool{hiddenManifestCount === 1 ? '' : 's'} hidden
+            </span>
+            <button
+              type="button"
+              data-viewport-allow-small-target
+              onClick={unhideAllManifestTools}
+              className="text-neutral-400 underline hover:text-neutral-200"
+            >
+              Show hidden
+            </button>
+          </div>
+        )}
 
         {restoreBar}
 

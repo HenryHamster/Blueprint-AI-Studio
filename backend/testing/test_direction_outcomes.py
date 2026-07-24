@@ -22,7 +22,6 @@ from app.direction_outcomes import (
     _is_non_genuine_cancelled,
     _longest_chain_length,
     _refresh_pipeline_scope_merge_rates,
-    _update_cochange_index,
     _update_direction_research_outcomes,
     acceptance_metric_invariant_violations,
     acceptance_metrics_consistent,
@@ -2834,6 +2833,23 @@ def _make_project_with_design_doc(design_doc: dict | None = None) -> Project:
     )
 
 
+def _update_cochange_index(project, merged_files_lists):
+    """Local test helper: apply the pure co-change compute onto project.design_doc.
+
+    Mirrors the pre-cutover ``app.direction_outcomes._update_cochange_index``,
+    which was removed as dead production code — the live writer now persists the
+    index SOLELY to the ``cochange_state`` telemetry row. These unit tests still
+    exercise ``_apply_cochange_to_doc``'s accumulation / decay / prune logic via
+    a design_doc carrier dict; the design_doc assignment here is test-only and
+    intentionally not lock-guarded (the app-side guard invariant scans app/ only).
+    """
+    if not merged_files_lists:
+        return
+    doc = dict(project.design_doc or {})
+    _apply_cochange_to_doc(doc, merged_files_lists)
+    project.design_doc = doc
+
+
 def test_cochange_index_basic_pairs():
     """Co-changed files are recorded bidirectionally with score 1."""
     project = _make_project_with_design_doc()
@@ -2906,6 +2922,195 @@ def test_cochange_index_caps_total_files():
     _update_cochange_index(project, [["x.py", "y.py"]])
     idx = project.design_doc["cochange_index"]
     assert len(idx) <= 200
+
+
+@pytest.mark.asyncio
+async def test_cochange_state_dual_written_to_telemetry(db_session: AsyncSession):
+    """The merge path persists the co-change blob SOLELY to project_telemetry.
+
+    God-column cutover: _update_direction_research_outcomes writes the merged
+    {"index", "applied_prs"} blob to the 'cochange_state' KV row and NO LONGER
+    writes the design_doc cochange_index/cochange_applied_prs keys (the write leg
+    is cut). The telemetry-preferring readers return the reconstructed values.
+    """
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+    from app.project_telemetry import read_telemetry
+
+    direction_id = "d-cochange-dual"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
+    await db_session.flush()
+
+    child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "pr_number": 201,
+            "_pr_changed_files": ["alpha.py", "beta.py"],
+        },
+        title="merged with files",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    # design_doc write leg is CUT: neither co-change key is written there.
+    doc = project.design_doc or {}
+    assert "cochange_index" not in doc
+    assert "cochange_applied_prs" not in doc
+
+    # cochange_state telemetry row is the sole authoritative store.
+    state = await read_telemetry(db_session, project.id, "cochange_state")
+    assert state is not None
+    assert "alpha.py" in state["index"]
+    assert "beta.py" in state["index"]["alpha.py"]
+    assert str(child.id) in state["applied_prs"]
+
+    # Telemetry-preferring readers reconstruct index + applied_prs.
+    idx = await read_cochange_index(db_session, project)
+    assert "beta.py" in idx["alpha.py"]
+    applied = await read_cochange_applied_prs(db_session, project)
+    assert str(child.id) in applied
+
+
+@pytest.mark.asyncio
+async def test_cochange_writer_accumulates_from_telemetry_not_design_doc(
+    db_session: AsyncSession,
+):
+    """The cut writer folds new PRs onto the prior cochange_state TABLE row.
+
+    Regression guard for the design_doc write-leg cut: the affinity accumulator
+    must seed from the ``cochange_state`` telemetry row (its new sole source of
+    truth), not from ``design_doc``. A pre-seeded table affinity must survive
+    (decayed) a fresh merge, and design_doc must stay free of the co-change keys.
+    """
+    from app.direction_outcomes import read_cochange_index
+    from app.project_telemetry import read_telemetry, upsert_telemetry
+
+    direction_id = "d-cochange-accum"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
+    await db_session.flush()
+
+    # Pre-seed prior state ONLY in the telemetry table (nothing in design_doc).
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        "cochange_state",
+        {"index": {"old_a.py": {"old_b.py": 5.0}}, "applied_prs": ["seeded-pr"]},
+    )
+    await db_session.flush()
+
+    child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "pr_number": 202,
+            "_pr_changed_files": ["new_x.py", "new_y.py"],
+        },
+        title="second-cycle merge",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    state = await read_telemetry(db_session, project.id, "cochange_state")
+    assert state is not None
+    idx = state["index"]
+    # Prior table affinity survived (decayed 5.0 -> 4.5), proving the accumulator
+    # seeded from the table rather than the empty design_doc.
+    assert "old_a.py" in idx
+    assert idx["old_a.py"]["old_b.py"] == pytest.approx(4.5, abs=0.01)
+    # New merge folded in on top.
+    assert "new_y.py" in idx.get("new_x.py", {})
+    assert str(child.id) in state["applied_prs"]
+    assert "seeded-pr" in state["applied_prs"]
+
+    # design_doc write leg stays cut.
+    doc = project.design_doc or {}
+    assert "cochange_index" not in doc
+    assert "cochange_applied_prs" not in doc
+
+    # Reader returns the table-sourced index.
+    assert "old_a.py" in await read_cochange_index(db_session, project)
+
+
+@pytest.mark.asyncio
+async def test_read_cochange_prefers_telemetry_only_value(db_session: AsyncSession):
+    """A cochange_state present ONLY in telemetry wins over stale design_doc keys."""
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+    from app.project_telemetry import upsert_telemetry
+
+    project = await _create_project(db_session, directions=[])
+    project.design_doc = {
+        "cochange_index": {"stale.py": {"x.py": 1.0}},
+        "cochange_applied_prs": ["old-pr"],
+    }
+    await db_session.flush()
+
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        "cochange_state",
+        {"index": {"fresh.py": {"y.py": 2.0}}, "applied_prs": ["new-pr"]},
+    )
+    await db_session.flush()
+
+    assert await read_cochange_index(db_session, project) == {"fresh.py": {"y.py": 2.0}}
+    assert await read_cochange_applied_prs(db_session, project) == ["new-pr"]
+
+
+@pytest.mark.asyncio
+async def test_read_cochange_falls_back_to_design_doc(db_session: AsyncSession):
+    """With no telemetry row, cochange readers fall back to design_doc (rollback safe)."""
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+
+    project = await _create_project(db_session, directions=[])
+    project.design_doc = {
+        "cochange_index": {"a.py": {"b.py": 1.0}},
+        "cochange_applied_prs": ["pr-1"],
+    }
+    await db_session.flush()
+
+    assert await read_cochange_index(db_session, project) == {"a.py": {"b.py": 1.0}}
+    assert await read_cochange_applied_prs(db_session, project) == ["pr-1"]
 
 
 def test_apply_cochange_idempotent_same_pr_not_double_counted():
@@ -2989,10 +3194,14 @@ async def test_cochange_index_updated_on_merged_pr(db_session: AsyncSession):
     )
 
     await db_session.refresh(project)
-    idx = (project.design_doc or {}).get("cochange_index", {})
+    from app.direction_outcomes import read_cochange_index
+
+    idx = await read_cochange_index(db_session, project)
     assert "app/models.py" in idx
     assert "app/schemas.py" in idx["app/models.py"]
     assert "tests/test_models.py" in idx["app/models.py"]
+    # design_doc write leg is cut — the index lives only in the telemetry row.
+    assert "cochange_index" not in (project.design_doc or {})
 
 
 @pytest.mark.asyncio
@@ -3029,7 +3238,9 @@ async def test_cochange_index_not_updated_when_no_changed_files(
 
     await db_session.refresh(project)
     # cochange_index should not exist or be empty
-    idx = (project.design_doc or {}).get("cochange_index", {})
+    from app.direction_outcomes import read_cochange_index
+
+    idx = await read_cochange_index(db_session, project)
     assert idx == {}
 
 
@@ -3062,6 +3273,11 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.flush()
 
+    from app.direction_outcomes import (
+        read_cochange_applied_prs,
+        read_cochange_index,
+    )
+
     # First refresh: folds child1 in
     await _update_direction_research_outcomes(
         project_id=project.id,
@@ -3071,13 +3287,13 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.refresh(project)
     idx_after_first = dict(
-        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+        (await read_cochange_index(db_session, project)).get("app/models.py", {})
     )
     score_after_first = idx_after_first.get("app/schemas.py", 0.0)
     assert score_after_first == pytest.approx(1.0, abs=0.01), (
         f"Expected score 1.0 after first refresh, got {score_after_first}"
     )
-    applied_after_first = (project.design_doc or {}).get("cochange_applied_prs", [])
+    applied_after_first = await read_cochange_applied_prs(db_session, project)
     assert str(child1.id) in applied_after_first
 
     # Second refresh with identical child set (simulates post-commit replay) —
@@ -3090,7 +3306,7 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.refresh(project)
     idx_after_replay = dict(
-        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+        (await read_cochange_index(db_session, project)).get("app/models.py", {})
     )
     score_after_replay = idx_after_replay.get("app/schemas.py", 0.0)
     assert score_after_replay == pytest.approx(score_after_first, abs=0.01), (
@@ -3119,7 +3335,7 @@ async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSess
     )
     await db_session.refresh(project)
     idx_after_new_pr = dict(
-        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+        (await read_cochange_index(db_session, project)).get("app/models.py", {})
     )
     score_after_new_pr = idx_after_new_pr.get("app/schemas.py", 0.0)
     # New PR increments by 1, previous score decayed once: ~1.0 * 0.9 + 1.0 = 1.9
@@ -5717,16 +5933,16 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
         context={"pr_number": 88},
         title="review-of-open-pr",
     )
-    # (9) COMPLETED 'panel_review' child attached to an open PR via the payload
+    # (9) COMPLETED 'review' child attached to an open PR via the payload
     #     pr_number — excluded too.
     await _create_child_task(
         db_session,
         research_task.id,
         project.id,
         status=TaskStatus.COMPLETED,
-        payloads=[{"type": "panel_review", "pr_number": 91}],
+        payloads=[{"type": "review", "pr_number": 91, "branch": "feat/x"}],
         context={},
-        title="panel-review-of-open-pr",
+        title="review-of-open-pr-2",
     )
     await db_session.flush()
 
@@ -5738,13 +5954,13 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
     )
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    # Only child (1) qualifies: the fix/review/panel_review children attached to
+    # Only child (1) qualifies: the fix/review children attached to
     # open PRs (7-9) are NOT no-CODE no-ops even though _opened_pr is False.
     assert entry["tasks_completed_no_pr"] == 1
     # Sanity: the other completed children are still reflected in their buckets.
     assert entry["prs_merged"] == 1
     assert entry["prs_rejected"] == 1
-    # The open-PR fix/review/panel_review children DID complete, so they are
+    # The open-PR fix/review children DID complete, so they are
     # still part of tasks_completed (1 no-op + merged + rejected + opened-pr + 3).
     assert entry["tasks_completed"] == 7
 

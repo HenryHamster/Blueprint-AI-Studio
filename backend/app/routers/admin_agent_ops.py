@@ -5,6 +5,7 @@ size cap. All HTTP routes, request/response schemas, and authentication rules
 are unchanged.
 """
 
+import hashlib
 import asyncio
 import json
 import logging
@@ -22,6 +23,10 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.alert_dispatch import (
+    _maybe_create_problem_model_live_core_alert,
+    _maybe_create_problem_model_wipe_alert,
+)
 from app.broadcast import broadcast_to_project
 from app.capability_proof import carry_proof_records_for_consolidation
 from app.capability_trial_verdict import (
@@ -51,7 +56,9 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    SourceKind,
     Task,
+    TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
 )
 from app.message_audience import stamp_message_audience
@@ -93,16 +100,16 @@ from app.strategic_completion import (
     _spawn_retirement_memos,
     record_retired_direction_memory,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
-    challenge_approves_retirement,
     find_gap_respawn_match,
     spawn_budget_status,
     spawn_title_is_redundant,
-    strategic_retirement_challenge_gate_mode,
 )
 from app.strategic_resident_session import (
-    RESIDENT_SESSION_KEY as _RESIDENT_SESSION_KEY,
     read_resident_session as _read_resident_session,
     resident_session_is_active as _resident_session_is_active,
+)
+from app.workbench_state import (
+    strategic_local_continuation_status_from_vision,
 )
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
@@ -121,6 +128,7 @@ from app.task_capabilities import (
 from app.auth import require_admin
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
+    DesignDocSizeLimitExceeded,
     _RESERVED_DESIGN_DOC_KEYS,
     lock_project_or_429 as _lock_project_or_429,
     task_lock,
@@ -143,6 +151,7 @@ logger = logging.getLogger(__name__)
 # auth scan as the admin routes.
 ADMIN_AGENT_OPS_MODULE = __name__
 STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
+RESIDENT_REPLY_COVERED_MESSAGE_MAX = 20
 
 # Canonical set of strategic ops the agent script advertises and dispatches.
 # Derived from the same inventory as the agent-side STRATEGIC_OP_INVENTORY
@@ -337,42 +346,81 @@ async def backfill_file_to_system_index(session: AsyncSession) -> int:
     :func:`_get_file_list_from_system_page`) to every existing systems page,
     bringing the index in sync without waiting for each page to be re-set.
 
+    Uses cursor-based pagination (50 projects per batch) to avoid loading all
+    project IDs into memory and to release per-project locks promptly between
+    batches rather than accumulating them in a single long-running transaction.
+
     Returns the number of projects whose index was actually updated.
     """
-    project_ids = (
-        (
-            await session.execute(
-                select(Project.id).where(
-                    Project.design_doc.isnot(None),
-                    Project.design_doc != {},
+    import uuid as _uuid
+
+    updated_count = 0
+    last_cursor: _uuid.UUID = _uuid.UUID("00000000-0000-0000-0000-000000000000")
+    batch_size = 50
+
+    while True:
+        batch_ids = (
+            (
+                await session.execute(
+                    select(Project.id)
+                    .where(
+                        Project.design_doc.isnot(None),
+                        Project.design_doc != {},
+                        Project.id > last_cursor,
+                    )
+                    .order_by(Project.id)
+                    .limit(batch_size)
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    updated_count = 0
-    for project_id in project_ids:
-        _was_updated = False
+        if not batch_ids:
+            break
 
-        def _mutate(doc: dict) -> None:
-            nonlocal _was_updated
-            rebuilt: dict[str, str] = {}
-            for doc_key, doc_val in doc.items():
-                if doc_key.startswith("systems/") and isinstance(doc_val, dict):
-                    sys_id = doc_key[len("systems/") :]
-                    for fpath in _get_file_list_from_system_page(doc_val):
-                        rebuilt[fpath] = sys_id
-            current = doc.get("_file_to_system")
-            if isinstance(current, dict) and current == rebuilt:
-                return  # already correct
-            doc["_file_to_system"] = rebuilt
-            _was_updated = True
+        for project_id in batch_ids:
+            did_update = await _backfill_one_project(session, project_id)
+            await session.commit()
+            if did_update:
+                updated_count += 1
 
-        await _with_design_doc_locked(session, project_id, _mutate)
-        if _was_updated:
-            updated_count += 1
+        last_cursor = batch_ids[-1]
+
     return updated_count
+
+
+async def _backfill_one_project(session: AsyncSession, project_id: uuid.UUID) -> bool:
+    """Recompute ``_file_to_system`` for a single project under a design_doc lock.
+
+    Returns True if the index was updated, False if it was already correct or
+    the project had no systems pages.
+    """
+    updated = False
+
+    def _mutate(doc: dict) -> None:
+        nonlocal updated
+        rebuilt: dict[str, str] = {}
+        for doc_key, doc_val in doc.items():
+            if doc_key.startswith("systems/") and isinstance(doc_val, dict):
+                sys_id = doc_key[len("systems/") :]
+                for fpath in _get_file_list_from_system_page(doc_val):
+                    rebuilt[fpath] = sys_id
+        current = doc.get("_file_to_system")
+        if isinstance(current, dict) and current == rebuilt:
+            return  # already correct
+        doc["_file_to_system"] = rebuilt
+        updated = True
+
+    try:
+        await _with_design_doc_locked(session, project_id, _mutate)
+    except DesignDocSizeLimitExceeded as exc:
+        logger.warning(
+            "[backfill_file_to_system_index] skipped project %s: %s",
+            project_id,
+            exc,
+        )
+        updated = False
+    return updated
 
 
 @router.post("/api/agent/design-doc")
@@ -972,13 +1020,68 @@ async def _maybe_link_task_to_debt(
         return None
 
 
+async def _enforce_resident_mutation_fence(
+    session: AsyncSession,
+    project: Project,
+    task: Task,
+    op: str,
+) -> None:
+    """Require fresh continuation and sole Strategic-lane ownership for mutations."""
+    if op in ("create_message", "resolve_message"):
+        return
+    resident_blob = _read_resident_session(project.vision)
+    operator_user_id = str(
+        (resident_blob or {}).get("operator_user_id") or ""
+    ).strip()
+    continuation = strategic_local_continuation_status_from_vision(
+        project.vision,
+        operator_user_id=operator_user_id or None,
+    )
+    if (
+        not operator_user_id
+        or not continuation.get("enabled")
+        or not continuation.get("fresh")
+        or not continuation.get("owned_by_current_operator")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident continuation expired or ownership changed",
+        )
+
+    active_candidates = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_(
+                    (
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    )
+                ),
+            )
+        )
+    ).scalars()
+    if any(
+        (candidate.first_payload or {}).get("type") in STRATEGIC_TASK_TYPES
+        for candidate in active_candidates
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident no longer owns the Strategic mutation lane",
+        )
+
+
+
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
     # The accepted op vocabulary is the canonical registry mirrored in
     # app/strategic_ops_manifest.json (single source of truth for the ./strategic
-    # CLI, the resident prompt, and this dispatch chain). test_strategic_ops_registry.py
+    # CLI and this dispatch chain). test_strategic_ops_registry.py
     # asserts the dispatch below accepts EXACTLY the manifest's op names.
     op: str
     data: Any = {}
@@ -1031,12 +1134,9 @@ async def strategic_operation(
     # lock (canonical Project→Task order — see task_locking.lock_project_then_task).
     # ``task`` was loaded above WITHOUT a lock and BEFORE the project lock, so its
     # in-memory ``context`` can be stale relative to a concurrent whole-column
-    # writer — specifically the resident-session heartbeat mirror in
-    # ``strategic_resident_session.renew_resident_session_lease``, which stamps
-    # durable restart keys (``_exam_ledger`` / ``message_cursor``). Every
-    # ``task.context = {**ctx, ...}`` read-modify-write in this endpoint would
-    # otherwise overwrite the whole column from that stale read and drop the
-    # heartbeat's keys (lost update), and vice versa. Re-reading FOR UPDATE with
+    # writer. Every ``task.context = {**ctx, ...}`` read-modify-write in this
+    # endpoint would otherwise overwrite the whole column from that stale read and
+    # drop a concurrent writer's keys (lost update), and vice versa. Re-reading FOR UPDATE with
     # populate_existing refreshes the SHARED Task object with the current
     # committed context and holds the row until this request commits, so all
     # downstream context RMWs are serialized and race-free. Since we already hold
@@ -1053,6 +1153,36 @@ async def strategic_operation(
             )
         task = _locked_task
 
+    # A stopped or replaced Resident's still-valid JWT must not be able to
+    # commit one last reply. Validate task/session/generation from the fresh,
+    # locked Project + Task rows before staging any mutation.
+    resident_ctx = task.context or {}
+    if resident_ctx.get("_resident_session") is True:
+        resident_blob = _read_resident_session(project.vision)
+        try:
+            task_generation = int(
+                resident_ctx.get("_resident_worker_generation") or 1
+            )
+            current_generation = int(
+                (resident_blob or {}).get("worker_generation") or 1
+            )
+        except (TypeError, ValueError):
+            task_generation = current_generation = -1
+        if (
+            not _resident_session_is_active(resident_blob)
+            or bool((resident_blob or {}).get("stop_requested"))
+            or str((resident_blob or {}).get("session_id"))
+            != str(resident_ctx.get("strategic_session_id"))
+            or str((resident_blob or {}).get("task_id")) != str(task.id)
+            or current_generation != task_generation
+            or task.status in TASK_OUTCOME_TERMINAL_STATUSES
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident worker generation superseded",
+            )
+
+        await _enforce_resident_mutation_fence(session, project, task, payload.op)
     data = payload.data
     warnings: List[str] = []
 
@@ -1327,7 +1457,7 @@ async def strategic_operation(
         staged_create = bool(data.get("staged"))
         staged_for_version: int | None = None
         if staged_create:
-            from app.release_version import current_open_version  # noqa: PLC0415
+            from app.release_version import current_open_version
 
             open_version = await current_open_version(session, project.id)
             if open_version is None:
@@ -1355,7 +1485,7 @@ async def strategic_operation(
         # consume a slot (mirrors the user PATCH / add_direction staged paths).
         if not staged_create:
             active_count = sum(1 for d in directions if d.get("status") == "active")
-            max_active = _runtime_config.get("max_active_directions", 5)
+            max_active = _runtime_config.get("max_active_directions", 10)
             if active_count >= max_active:
                 ctx = task.context or {}
                 task.context = {**ctx, "_strategic_api_called": True}
@@ -1515,7 +1645,7 @@ async def strategic_operation(
         # gap: add it to active_moves and clear any now-false deferral. Mirrors
         # the retire-side reconciliation but in the staffing direction.
         if new_dir.get("gap_id") and not staged_create:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -1855,7 +1985,7 @@ async def strategic_operation(
         if _updated_dir is not None and (
             _gap_reground is not None or _new_status != _pre_status
         ):
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _new_gap_id = _updated_dir.get("gap_id")
             _prior_gap_id = (
@@ -1964,55 +2094,6 @@ async def strategic_operation(
         )
         now_iso = _utcnow().isoformat()
         ctx = task.context or {}
-        challenge_record = ctx.get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
-        gate_mode = strategic_retirement_challenge_gate_mode()
-        challenge_approved = challenge_approves_retirement(challenge_record, dir_id)
-
-        challenge_status = "missing"
-        challenge_verdict = "missing"
-        challenge_rationale = ""
-        if isinstance(challenge_record, dict):
-            challenge_status = (
-                str(challenge_record.get("status", "invalid") or "invalid")
-                .strip()
-                .lower()
-            )
-            challenge_verdict = "missing_approval"
-            for item in challenge_record.get("retirement_approvals") or []:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("direction_id", "")).strip() != str(dir_id).strip():
-                    continue
-                challenge_verdict = (
-                    str(item.get("verdict", "missing") or "missing").strip().lower()
-                )
-                challenge_rationale = str(item.get("rationale", "")).strip()[
-                    :STRATEGIC_RATIONALE_MAX
-                ]
-                break
-
-        if challenge_approved:
-            gate_reason = "retirement second opinion approved"
-        elif challenge_status != "ok":
-            gate_reason = (
-                f"retirement second opinion unavailable or non-ok "
-                f"(challenge_status={challenge_status})"
-            )
-        else:
-            gate_reason = (
-                f"retirement second opinion did not approve "
-                f"(verdict={challenge_verdict})"
-            )
-        gate_audit = {
-            "direction_id": str(dir_id),
-            "mode": gate_mode,
-            "approved": challenge_approved,
-            "challenge_status": challenge_status,
-            "verdict": challenge_verdict,
-            "rationale": challenge_rationale,
-            "reason": gate_reason[:STRATEGIC_RATIONALE_MAX],
-            "recorded_at": now_iso,
-        }
         directions = list(project.directions or [])
         matched_direction = None
         for d in directions:
@@ -2025,101 +2106,6 @@ async def strategic_operation(
         if _blk is not None:
             return _blk
 
-        if not challenge_approved and gate_mode == "enforce":
-            notes = matched_direction.get("notes", [])
-            notes.append(
-                {
-                    "text": f"Strategic retirement deferred: {gate_reason}",
-                    "added_at": now_iso,
-                }
-            )
-            matched_direction["notes"] = _cap_list(
-                notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
-            )
-            _captured_deferred_dir = dict(matched_direction)
-            _captured_deferred_id = str(dir_id)
-            def _apply_deferred(fresh: list) -> list:
-                return [
-                    _captured_deferred_dir if d.get("id") == _captured_deferred_id else d
-                    for d in fresh
-                ]
-            await _with_directions_locked(session, project.id, _apply_deferred)
-            verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
-            verdicts.append(gate_audit)
-            deferrals = list(ctx.get("_strategic_retirement_deferrals", []))
-            deferrals.append(gate_audit)
-            task.context = {
-                **ctx,
-                "_strategic_api_called": True,
-                "_strategic_retirement_gate_verdicts": _cap_list(
-                    verdicts,
-                    STRATEGIC_NOTES_HISTORY_MAX,
-                    "_strategic_retirement_gate_verdicts",
-                    warnings,
-                ),
-                "_strategic_retirement_deferrals": _cap_list(
-                    deferrals,
-                    STRATEGIC_NOTES_HISTORY_MAX,
-                    "_strategic_retirement_deferrals",
-                    warnings,
-                ),
-            }
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-            # Completion-debt ledger: a deferred retirement is a residual
-            # obligation (the retire is owed once the gate clears). Best-effort,
-            # deduped per (project, direction) so repeated deferrals keep a
-            # single open row and never break the strategic operation.
-            try:
-                from app.completion_debt import (
-                    arecord_completion_debt,
-                    KIND_RETIREMENT_RESIDUAL,
-                )
-
-                await arecord_completion_debt(
-                    session,
-                    dedupe_key=f"retirement_residual:{project.id}:{dir_id}:deferred",
-                    kind=KIND_RETIREMENT_RESIDUAL,
-                    title=f"Retirement deferred for direction {dir_id}: {gate_reason}",
-                    project_id=project.id,
-                    source="admin_agent_ops",
-                    detail={"direction_id": str(dir_id), "kind": "deferred"},
-                )
-                await session.commit()
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "[STRATEGIC API] completion-debt record failed for deferred "
-                    "retirement of direction %s (non-fatal)",
-                    dir_id,
-                )
-            await _emit_updated(
-                STRATEGIC_KIND_DIRECTIONS,
-                changed_direction_ids=[dir_id],
-                changed_count=1,
-            )
-            logger.info(
-                "[STRATEGIC API] Deferred retirement for direction %s: %s",
-                dir_id,
-                gate_reason,
-            )
-            return _resp(
-                {
-                    "status": "deferred",
-                    "op": "retire_direction",
-                    "direction_id": dir_id,
-                    "reason": gate_reason,
-                    "gate_mode": gate_mode,
-                    "challenge_status": challenge_status,
-                    "challenge_verdict": challenge_verdict,
-                }
-            )
-
-        if not challenge_approved and gate_mode == "advisory":
-            warnings.append(
-                f"Retirement challenge did not support direction {dir_id}; "
-                "advisory mode committed the retirement anyway"
-            )
         matched_direction["status"] = "expired"
         notes = matched_direction.get("notes", [])
         note_text = f"Retired by strategic review: {rationale}"
@@ -2169,8 +2155,6 @@ async def strategic_operation(
         # Record retired-direction memory in the SAME committed transaction so a
         # strategist-retired direction blocks a same-gap / text-overlap re-spawn
         # next cycle (mirrors the fallback retire path's deferred vision write).
-        # Only reached on a real commit — the challenge-gate deferral branch
-        # returns above without ever getting here.
         _retire_snapshot = dict(matched_direction)
         _retire_outcome = rationale or None
 
@@ -2183,20 +2167,12 @@ async def strategic_operation(
             )
 
         await _with_vision_locked(session, project.id, _record_retire_memory)
-        verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
-        verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
         retired_ids.append(dir_id)
         task.context = {
             **ctx,
             "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
             "_strategic_retired_ids": retired_ids,
-            "_strategic_retirement_gate_verdicts": _cap_list(
-                verdicts,
-                STRATEGIC_NOTES_HISTORY_MAX,
-                "_strategic_retirement_gate_verdicts",
-                warnings,
-            ),
         }
         flag_modified(task, "context")
         session.add(task)
@@ -2207,11 +2183,6 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
-        # Resolve the gate-DEFERRED retirement residual now that the retire has
-        # committed. Best-effort/non-fatal and idempotent w.r.t. the same
-        # resolution done inside ``_spawn_retirement_memos`` below (the second
-        # call is a no-op on an already-resolved row). Only touches the
-        # ``:deferred`` key — the memo handoff debt is a separate obligation.
         try:
             from app.completion_debt import aresolve_deferred_retirement_debt
 
@@ -2450,7 +2421,7 @@ async def strategic_operation(
             ]
         await _with_directions_locked(session, project.id, _apply_stage)
         if _gap_id:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -2531,7 +2502,7 @@ async def strategic_operation(
         if _blk is not None:
             return _blk
         active_count = sum(1 for d in directions if d.get("status") == "active")
-        max_active = _runtime_config.get("max_active_directions", 5)
+        max_active = _runtime_config.get("max_active_directions", 10)
         if active_count >= max_active:
             ctx = task.context or {}
             task.context = {**ctx, "_strategic_api_called": True}
@@ -2562,7 +2533,7 @@ async def strategic_operation(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
         if target.get("gap_id"):
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             now_iso = _utcnow().isoformat()
             _gap_reconcile = reconcile_gap_staffing_raw_result(
@@ -2600,7 +2571,7 @@ async def strategic_operation(
             "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0)
             + 1,
             "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
-            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))  # noqa: RUF005
             + [dir_id],
             "_strategic_api_called": True,
         }
@@ -2706,7 +2677,7 @@ async def strategic_operation(
             "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0)
             + 1,
             "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
-            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", []))
+            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", []))  # noqa: RUF005
             + [dir_id],
             "_strategic_api_called": True,
         }
@@ -2784,7 +2755,7 @@ async def strategic_operation(
         if _blk is not None:
             return _blk
         active_count = sum(1 for d in directions if d.get("status") == "active")
-        max_active = _runtime_config.get("max_active_directions", 5)
+        max_active = _runtime_config.get("max_active_directions", 10)
         if active_count >= max_active:
             ctx = task.context or {}
             task.context = {**ctx, "_strategic_api_called": True}
@@ -2818,7 +2789,7 @@ async def strategic_operation(
                 notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
             )
         if _gap_id:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -2853,7 +2824,7 @@ async def strategic_operation(
         task.context = {
             **ctx,
             "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
-            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))  # noqa: RUF005
             + [dir_id],
             "_strategic_api_called": True,
         }
@@ -2924,11 +2895,151 @@ async def strategic_operation(
                 detail="idempotency_key exceeds 255 characters",
             )
         idem_key: str | None = raw_idem or None
+        covered_context_key = "_resident_reply_covered_message_ids"
+        turn_state_context_key = "_resident_reply_turn_state_sha256"
+        msg_ctx.pop(covered_context_key, None)
+        msg_ctx.pop(turn_state_context_key, None)
+        raw_covered_ids = data.get("covered_message_ids")
+        covered_message_ids: list[uuid.UUID] | None = None
+        covered_message_id_strings: list[str] | None = None
+        if raw_covered_ids is not None:
+            if not isinstance(raw_covered_ids, list) or not raw_covered_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="covered_message_ids must be a non-empty array",
+                )
+            if len(raw_covered_ids) > RESIDENT_REPLY_COVERED_MESSAGE_MAX:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "covered_message_ids exceeds "
+                        f"{RESIDENT_REPLY_COVERED_MESSAGE_MAX} entries"
+                    ),
+                )
+            if not idem_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail="covered_message_ids requires idempotency_key",
+                )
+            if resident_ctx.get("_resident_session") is not True:
+                raise HTTPException(
+                    status_code=409,
+                    detail="covered_message_ids requires an active Resident session",
+                )
+            parsed_covered: list[uuid.UUID] = []
+            for raw_covered_id in raw_covered_ids:
+                if not isinstance(raw_covered_id, str) or not raw_covered_id.strip():
+                    raise HTTPException(
+                        status_code=400, detail="Invalid covered message id"
+                    )
+                try:
+                    parsed_covered.append(uuid.UUID(raw_covered_id.strip()))
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid covered message id"
+                    ) from None
+            if len(set(parsed_covered)) != len(parsed_covered):
+                raise HTTPException(
+                    status_code=400,
+                    detail="covered_message_ids contains duplicates",
+                )
+            covered_message_ids = parsed_covered
+            covered_message_id_strings = sorted(str(value) for value in parsed_covered)
         from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
 
         event_type = str(msg_ctx.get("event_type") or "").strip() or None
-        msg_ctx = stamp_message_audience(msg_ctx, event_type or "strategic_message")
+        # When replying to a specific message (reply_to present) and no explicit
+        # event_type was supplied, default to "question_answer" (OPERATOR_FYI)
+        # instead of "strategic_message" (STRATEGIST_INTERNAL).  Without this,
+        # the operator never receives a notification that a reply arrived.
+        _default_event_type = (
+            "question_answer"
+            if event_type is None and msg_ctx.get("reply_to") is not None
+            else "strategic_message"
+        )
+        msg_ctx = stamp_message_audience(msg_ctx, event_type or _default_event_type, message_type=msg_type.value)
         is_routine = event_type in ROUTINE_EVENT_TYPES
+        if covered_message_ids is not None and is_routine:
+            raise HTTPException(
+                status_code=409,
+                detail="Resident replies cannot cover messages from the activity surface",
+            )
+        if covered_message_id_strings is not None:
+            msg_ctx[covered_context_key] = covered_message_id_strings
+        raw_turn_state = data.get("resident_turn_state")
+        resident_turn_state: dict[str, Any] | None = None
+        resident_turn_state_sha256: str | None = None
+        if raw_turn_state is not None:
+            if covered_message_ids is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state requires covered_message_ids",
+                )
+            if not isinstance(raw_turn_state, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state must be an object",
+                )
+            unknown_state_keys = set(raw_turn_state) - {
+                "exam_ledger",
+                "decisions_reg",
+                "message_cursor",
+                "operator_decision_summary",
+            }
+            if unknown_state_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state contains unknown fields",
+                )
+            exam_ledger = raw_turn_state.get("exam_ledger")
+            decisions_reg = raw_turn_state.get("decisions_reg")
+            message_cursor = raw_turn_state.get("message_cursor")
+            decision_summary = raw_turn_state.get("operator_decision_summary")
+            if (
+                not isinstance(exam_ledger, str)
+                or not exam_ledger
+                or len(exam_ledger.encode("utf-8")) > 20_000
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.exam_ledger is invalid",
+                )
+            if decisions_reg is not None and (
+                not isinstance(decisions_reg, str)
+                or len(decisions_reg.encode("utf-8")) > 32_000
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.decisions_reg is invalid",
+                )
+            if message_cursor is not None and (
+                not isinstance(message_cursor, str) or len(message_cursor) > 128
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.message_cursor is invalid",
+                )
+            if decision_summary is not None and not isinstance(decision_summary, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state.operator_decision_summary is invalid",
+                )
+            canonical_turn_state = json.dumps(
+                raw_turn_state,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            if len(canonical_turn_state.encode("utf-8")) > 55_000:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resident_turn_state is too large",
+                )
+            resident_turn_state = dict(raw_turn_state)
+            resident_turn_state_sha256 = hashlib.sha256(
+                canonical_turn_state.encode("utf-8")
+            ).hexdigest()
+            msg_ctx[turn_state_context_key] = resident_turn_state_sha256
         reply_to_message_id: uuid.UUID | None = None
         raw_reply_to = msg_ctx.get("reply_to")
         if raw_reply_to is not None:
@@ -2952,6 +3063,94 @@ async def strategic_operation(
             reply_target.handled_by_task_id = task.id
             reply_target.updated_at = _utcnow()
             session.add(reply_target)
+        # Rollback expires ORM instances even when expire_on_commit=False. Keep
+        # identities as plain UUID/string values for replay paths.
+        _task_id = task.id
+        _project_id = project.id
+        current_resident_session_id = str(
+            resident_ctx.get("strategic_session_id") or ""
+        )
+
+        async def _same_message_producer(candidate: ProjectMessage) -> bool:
+            if candidate.from_task_id == _task_id:
+                return True
+            if (
+                resident_ctx.get("_resident_session") is not True
+                or not current_resident_session_id
+                or str(candidate.resident_session_id or "")
+                != current_resident_session_id
+                or candidate.from_task_id is None
+            ):
+                return False
+            prior_task = await session.get(Task, candidate.from_task_id)
+            prior_ctx = prior_task.context if prior_task is not None else {}
+            return bool(
+                prior_ctx
+                and prior_ctx.get("_resident_session") is True
+                and str(prior_ctx.get("strategic_session_id") or "")
+                == current_resident_session_id
+            )
+
+        async def _apply_covered_messages() -> None:
+            if covered_message_ids is None:
+                return
+            rows = (
+                (
+                    await session.execute(
+                        select(ProjectMessage)
+                        .where(
+                            ProjectMessage.project_id == _project_id,
+                            ProjectMessage.id.in_(covered_message_ids),
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            by_id = {row.id: row for row in rows}
+            if len(by_id) != len(covered_message_ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail="covered_message_ids contains an unavailable message",
+                )
+            for covered_id in covered_message_ids:
+                inbound = by_id[covered_id]
+                if inbound.from_type != "user" or (
+                    inbound.resident_session_id is not None
+                    and str(inbound.resident_session_id)
+                    != current_resident_session_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="covered_message_ids is outside this Resident session",
+                    )
+                if inbound.status != "open":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="covered_message_ids contains a non-open message",
+                    )
+                inbound.status = "handled"
+                session.add(inbound)
+
+        def _apply_resident_turn_state() -> None:
+            if resident_turn_state is None:
+                return
+            next_context = dict(task.context or {})
+            next_context["_exam_ledger"] = resident_turn_state["exam_ledger"]
+            decisions_reg = resident_turn_state.get("decisions_reg")
+            if isinstance(decisions_reg, str) and decisions_reg:
+                next_context["_decisions_reg"] = decisions_reg
+            message_cursor = resident_turn_state.get("message_cursor")
+            if isinstance(message_cursor, str) and message_cursor:
+                next_context["message_cursor"] = message_cursor
+            decision_summary = resident_turn_state.get("operator_decision_summary")
+            if isinstance(decision_summary, dict):
+                next_context["_operator_decision_summary"] = decision_summary
+            task.context = next_context
+            flag_modified(task, "context")
+            session.add(task)
+
         if idem_key:
             existing = (
                 await session.execute(
@@ -2964,9 +3163,13 @@ async def strategic_operation(
             if existing is not None:
                 if not (
                     existing.from_type == "strategic"
-                    and existing.from_task_id == task.id
+                    and await _same_message_producer(existing)
                     and existing.message_type == msg_type
                     and existing.content == content
+                    and (existing.context or {}).get(covered_context_key)
+                    == covered_message_id_strings
+                    and (existing.context or {}).get(turn_state_context_key)
+                    == resident_turn_state_sha256
                     and existing.reply_to_message_id == reply_to_message_id
                     and existing.surface
                     == (
@@ -2979,26 +3182,22 @@ async def strategic_operation(
                         status_code=409,
                         detail="idempotency_key already belongs to a different message",
                     )
+                existing_message_id = str(existing.id)
+                # Sequence allocation and reply-target bookkeeping preceded the
+                # replay lookup. Exact replay is read-only.
+                await session.rollback()
                 return _resp(
                     {
                         "status": "ok",
                         "op": "create_message",
-                        "message_id": str(existing.id),
+                        "message_id": existing_message_id,
                     }
                 )
-        # Stamp the resident reply with the live session id (NULL when none is
-        # active) so it is addressed to the same conversation as the operator
-        # messages it answers — matching the session-identity scoping used by the
-        # poll / unattended-cap / pacing queries.
-        from app.strategic_resident_session import (
-            read_resident_session,
-            resident_session_is_active,
-        )
-
-        _resident_blob = read_resident_session(project.vision)
-        _resident_session_id = (
-            _resident_blob.get("session_id")
-            if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)
+        resident_blob = _read_resident_session(project.vision)
+        resident_session_id = (
+            resident_blob.get("session_id")
+            if isinstance(resident_blob, dict)
+            and _resident_session_is_active(resident_blob)
             else None
         )
         next_sequence = preallocated_message_sequence
@@ -3018,23 +3217,26 @@ async def strategic_operation(
                 if is_routine
                 else MessageHandlingState.RESPONDED
             ),
-            handled_by_task_id=task.id if not is_routine else None,
+            handled_by_task_id=_task_id if not is_routine else None,
             reply_to_message_id=reply_to_message_id,
             message_type=msg_type,
             from_type="strategic",
-            from_task_id=task.id,
+            from_task_id=_task_id,
             content=content,
             context=msg_ctx,
             idempotency_key=idem_key,
-            resident_session_id=_resident_session_id,
+            resident_session_id=resident_session_id,
         )
         session.add(new_msg)
+        # Reply, immutable receipt, handled inbound rows, and restart state are
+        # committed together; a crash cannot split acknowledgement from reply.
+        await _apply_covered_messages()
+        _apply_resident_turn_state()
         # Snapshot project.id before commit: the IntegrityError rollback below
         # expires `project` (rollback expires regardless of expire_on_commit), so
         # evaluating ProjectMessage.project_id == project.id in the coalesce
         # re-query would fire a sync lazy-load -> MissingGreenlet, 500-ing the
         # idempotency-coalesce path instead of returning the existing message.
-        _project_id = project.id
         try:
             await session.commit()
         except IntegrityError:
@@ -3051,9 +3253,13 @@ async def strategic_operation(
                 if existing is not None:
                     if not (
                         existing.from_type == "strategic"
-                        and existing.from_task_id == task.id
+                        and await _same_message_producer(existing)
                         and existing.message_type == msg_type
                         and existing.content == content
+                        and (existing.context or {}).get(covered_context_key)
+                        == covered_message_id_strings
+                        and (existing.context or {}).get(turn_state_context_key)
+                        == resident_turn_state_sha256
                         and existing.reply_to_message_id == reply_to_message_id
                         and existing.surface
                         == (
@@ -3062,15 +3268,19 @@ async def strategic_operation(
                             else MessageSurface.CONVERSATION
                         )
                     ):
-                        raise HTTPException(
+                        raise HTTPException(  # noqa: B904
                             status_code=409,
                             detail="idempotency_key already belongs to a different message",
                         )
+                    # The winning transaction already committed the exact
+                    # receipt. Never reapply covered-row writes after rollback.
+                    existing_message_id = str(existing.id)
+                    await session.rollback()
                     return _resp(
                         {
                             "status": "ok",
                             "op": "create_message",
-                            "message_id": str(existing.id),
+                            "message_id": existing_message_id,
                         }
                     )
             raise
@@ -3451,16 +3661,7 @@ async def strategic_operation(
         # the project-wide spawns in the rolling window, then ask the pure policy
         # helper whether one more fits. When exhausted, stamp an observable flag
         # on the review, log, and refuse with 429 — never a silent swallow.
-        #
-        # Resident sessions use one long-lived task_id for their entire lifetime
-        # (hours), so the per-review cap would fire after legitimate operator work.
-        # Skip it for resident sessions; the rolling window cap still applies.
-        _is_resident = bool((task.context or {}).get("_resident_session"))
-        per_review_cap = (
-            0
-            if _is_resident
-            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
-        )
+        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
@@ -3779,16 +3980,7 @@ async def strategic_operation(
         # fix spawns in the rolling window, then ask the same pure policy helper
         # whether one more fits. When exhausted, stamp an observable flag, log,
         # and refuse with 429 — never a silent swallow.
-        #
-        # Resident sessions use one long-lived task_id for their entire lifetime
-        # (hours), so the per-review cap would fire after legitimate operator work.
-        # Skip it for resident sessions; the rolling window cap still applies.
-        _is_resident = bool((task.context or {}).get("_resident_session"))
-        per_review_cap = (
-            0
-            if _is_resident
-            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
-        )
+        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
@@ -4016,14 +4208,34 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model: {ve}"
             ) from None
+        # Reject with HTTP 400 when the live core alone exceeds the byte budget.
+        # Fire the alert and commit it before raising so it persists despite the 400.
+        if pm_diff.get("live_core_exceeds_budget"):
+            await _maybe_create_problem_model_live_core_alert(project.id, session)
+            await session.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"problem_model live core exceeds byte budget — "
+                    f"oversize section: {pm_diff['live_core_exceeds_budget']}. "
+                    "Reduce the size of active gaps, live capabilities, or active friction."
+                ),
+            )
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
         # Surface blocked gap deletions (active direction still references the gap).
         _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
         for _bid in _blocked_dels:
-            warnings.append(
+            warnings.append(  # noqa: PERF401
                 f"gap deletion blocked: {_bid} is still referenced by an active direction"
             )
+        # Fire a deduplicated WARNING alert when the agent attempted a full
+        # collection wipe without an explicit _deletions directive.
+        for _wipe_field in ("gaps", "capabilities"):
+            if pm_diff.get(f"{_wipe_field}_wipe_risk"):
+                await _maybe_create_problem_model_wipe_alert(
+                    project.id, session, field=_wipe_field
+                )
         # Normalize stale active_moves via the shared helper so both write paths
         # (op-endpoint + log-parse fallback) stay converged.
         _active_dir_ids = {
@@ -4036,7 +4248,7 @@ async def strategic_operation(
         )
         if _norm:
             for _c in _norm:
-                warnings.append(f"active_moves normalized: {_c}")
+                warnings.append(f"active_moves normalized: {_c}")  # noqa: PERF401
             project.problem_model = new_pm_raw
         # Carry proof records and adoption verdicts onto survivor keys when a
         # capability consolidation occurred in this write.
@@ -4075,8 +4287,8 @@ async def strategic_operation(
         # Stash keys transiently so _handle_strategic_completion can still read
         # them if something prevents the synchronous apply below from running.
         # They are popped after the synchronous apply so the completion-time
-        # handler is a no-op (prevents double-application for non-resident tasks
-        # that complete normally after this call).
+        # handler is a no-op (prevents double-application for tasks that complete
+        # normally after this call).
         if version_phase_decision is not None:
             new_ctx[VERSION_PHASE_DECISION_CONTEXT_KEY] = version_phase_decision
         if qualify_request is not None:
@@ -4088,9 +4300,8 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
-        # Apply synchronously within this handler so resident sessions (where the
-        # task stays open for the entire conversation) get immediate effect rather
-        # than waiting for task completion. These apply helpers only call
+        # Apply synchronously within this handler so the decision takes immediate
+        # effect rather than waiting for task completion. These apply helpers only call
         # session.add(); the single commit below persists everything atomically.
         # qualify_request is the exception: it does minutes of GitHub I/O
         # (CI-compliance scan + run_qualification) and MUST NOT run under the
@@ -4303,43 +4514,182 @@ async def strategic_operation(
         )
 
     elif payload.op == "set_memory":
-        # Append a durable behavioral-memory note to project.strategic_memory_notes.
-        # The resident strategist uses this to persist lessons and operator
-        # preferences across sessions. No challenge gate — personal memory op.
-        if not isinstance(data, dict) or not isinstance(data.get("note"), str) or not data["note"].strip():
+        # Persist a durable behavioral-memory fact. Each fact becomes ONE
+        # individually-addressable, trigram-searchable KnowledgeDocument row
+        # (source_kind='strategic_memory'), giving strategic memory unbounded
+        # capacity, keyword retrieval (./fetch knowledge --source-kind
+        # strategic_memory), and per-fact lifecycle — replacing the capped
+        # strategic_memory_notes JSONB list. No challenge gate — personal
+        # memory op; the fact is agent-self-attested.
+        #
+        # Backward-compatible op shape: the legacy `note` field is still
+        # accepted (mapped to the document body); richer optional fields
+        # (title/summary/topic/tags/supersedes_id) let the agent categorize and
+        # supersede facts. The KnowledgeDocument row is the SOLE write path; the
+        # legacy strategic_memory_notes JSONB dual-write was cut once every
+        # reader switched to build_strategic_memory_index() (migration 0699
+        # backfilled the pre-existing legacy notes).
+        if not isinstance(data, dict):
             raise HTTPException(
                 status_code=400,
-                detail="set_memory requires data.note as a non-empty string",
+                detail="set_memory requires a data object",
             )
-        note = data["note"].strip()
-        # Per-note length cap (10 KB UTF-8) to keep JSONB columns lean,
-        # consistent with set_session_summary's 10 KB limit.
+        # Body accepts `body` (new) or `note` (legacy); at least one non-empty.
+        raw_body = data.get("body")
+        if not isinstance(raw_body, str) or not raw_body.strip():
+            raw_body = data.get("note")
+        if not isinstance(raw_body, str) or not raw_body.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="set_memory requires data.note (or data.body) as a non-empty string",
+            )
+        # Per-fact body cap (10 KB UTF-8) to keep any single row lean, consistent
+        # with the prior note cap and set_session_summary's 10 KB limit.
         _MAX_MEMORY_NOTE_BYTES = 10_000
-        note_bytes = note.encode("utf-8")
-        if len(note_bytes) > _MAX_MEMORY_NOTE_BYTES:
-            note = note_bytes[:_MAX_MEMORY_NOTE_BYTES].decode("utf-8", errors="replace")
-        entry = {"note": note, "set_at": _utcnow().isoformat()}
-        if project.strategic_memory_notes is None:
-            project.strategic_memory_notes = []
-        project.strategic_memory_notes.append(entry)
-        # Keep last 100 entries for defense-in-depth against JSONB column bloat
-        project.strategic_memory_notes = project.strategic_memory_notes[-100:]
-        flag_modified(project, "strategic_memory_notes")
-        session.add(project)
+        body_bytes = raw_body.strip().encode("utf-8")
+        if len(body_bytes) > _MAX_MEMORY_NOTE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Memory note too large ({len(body_bytes)} bytes, max {_MAX_MEMORY_NOTE_BYTES})",
+            )
+        fact_body = raw_body.strip()
+
+        # Title: agent-supplied short descriptor, else derived from the body's
+        # first line (≤120 chars) so every row is recognizable in the index.
+        raw_title = data.get("title")
+        if isinstance(raw_title, str) and raw_title.strip():
+            fact_title = raw_title.strip()[:120]
+        else:
+            fact_title = " ".join(fact_body.split())[:120]
+
+        # Summary: one-line distillation for the compact spawn index; falls back
+        # to a truncation of the body.
+        raw_summary = data.get("summary")
+        if isinstance(raw_summary, str) and raw_summary.strip():
+            fact_summary = " ".join(raw_summary.split())[:280]
+        else:
+            fact_summary = " ".join(fact_body.split())[:280]
+
+        # Topic: constrained to a stable taxonomy so the index/browse vocabulary
+        # cannot drift. Unknown topics are rejected at write time. Optional.
+        _ALLOWED_MEMORY_TOPICS = {
+            "operator_preference",
+            "technical_constraint",
+            "architecture_pattern",
+            "process_rule",
+            "known_failure_mode",
+            "self_improvement_observation",
+        }
+        raw_topic = data.get("topic")
+        fact_topic: str | None = None
+        if raw_topic is not None:
+            if not isinstance(raw_topic, str) or raw_topic.strip() not in _ALLOWED_MEMORY_TOPICS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "set_memory data.topic must be one of "
+                        f"{sorted(_ALLOWED_MEMORY_TOPICS)}"
+                    ),
+                )
+            fact_topic = raw_topic.strip()
+
+        # Tags: optional free-form list of short string labels.
+        raw_tags = data.get("tags")
+        fact_tags: list[str] = []
+        if isinstance(raw_tags, list):
+            fact_tags = [str(t).strip()[:64] for t in raw_tags if str(t).strip()][:20]
+
+        # supersedes_id: optionally mark an existing strategic_memory fact as
+        # dismissed (superseded) in the same transaction.
+        superseded_id = None
+        raw_supersedes = data.get("supersedes_id")
+        if raw_supersedes:
+            try:
+                superseded_id = uuid.UUID(str(raw_supersedes))
+            except (ValueError, AttributeError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_memory data.supersedes_id must be a valid document UUID",
+                ) from None
+
+        direction_id = None
+        if isinstance(task.context, dict):
+            direction_id = task.context.get("direction_id")
+
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind=SourceKind.STRATEGIC_MEMORY.value,
+            title=fact_title,
+            summary=fact_summary,
+            body=fact_body,
+            topic=fact_topic,
+            direction_id=direction_id if isinstance(direction_id, str) else None,
+            tags=fact_tags,
+            # Provenance survives task cleanup (FK is ON DELETE SET NULL).
+            source_citations=[{"task_id": str(task.id)}],
+            # Agent-self-attested: strategic memory is written directly, not
+            # through a forward-quality grader task. Consumers that filter on
+            # quality can include or exclude on this strategy marker.
+            forward_quality_verdict={"passed": True, "strategy": "agent_self_attested"},
+            # Active fact. Superseding a fact marks the OLD doc dismissed below.
+            lifecycle_status="consumed",
+        )
+        session.add(doc)
+
+        if superseded_id is not None:
+            old = (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.id == superseded_id,
+                        KnowledgeDocument.project_id == project.id,
+                        KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+                    )
+                )
+            ).scalar_one_or_none()
+            if old is not None:
+                old.lifecycle_status = "dismissed"
+                old.dismissed_at = _utcnow()
+                old.dismissed_reason = f"superseded by {doc.id}"
+                session.add(old)
+
+        # The KnowledgeDocument row is now the SOLE write path for strategic
+        # memory. The legacy Project.strategic_memory_notes JSONB list is no
+        # longer written (readers switched to build_strategic_memory_index);
+        # the column is retained for rollback safety but frozen. Migration 0699
+        # backfilled pre-existing notes into KnowledgeDocument rows.
+
         ctx = task.context or {}
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         logger.info(
-            f"[STRATEGIC API] Appended strategic_memory note for project {project.id} "
-            f"(entry count: {len(project.strategic_memory_notes)})"
+            f"[STRATEGIC API] Wrote strategic_memory KnowledgeDocument {doc.id} "
+            f"for project {project.id} (topic={fact_topic})"
         )
+        # entry_count now reflects the active (non-superseded) strategic_memory
+        # KnowledgeDocument rows, the authoritative store, rather than the frozen
+        # legacy JSONB list.
+        entry_count = (
+            await session.execute(
+                select(_func.count())
+                .select_from(KnowledgeDocument)
+                .where(
+                    KnowledgeDocument.project_id == project.id,
+                    KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+                    KnowledgeDocument.lifecycle_status == "consumed",
+                )
+            )
+        ).scalar_one()
         return _resp(
             {
                 "status": "ok",
                 "op": "set_memory",
-                "entry_count": len(project.strategic_memory_notes),
+                "doc_id": str(doc.id),
+                "source_kind": SourceKind.STRATEGIC_MEMORY.value,
+                "superseded_id": str(superseded_id) if superseded_id is not None else None,
+                "entry_count": int(entry_count),
             }
         )
 
@@ -4353,6 +4703,7 @@ async def strategic_operation(
             PENDING_USER_CONFIRMATION_MAX,
             PendingConfirmation,
             parse_problem_model,
+            sanitize_problem_model_raw,
         )
 
         if not isinstance(data, dict):
@@ -4371,7 +4722,14 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail=f"Invalid pending_confirmation: {ve}"
             ) from None
-        current_model = parse_problem_model(project.problem_model)
+        try:
+            current_model = parse_problem_model(
+                sanitize_problem_model_raw(project.problem_model or {})
+            )
+        except _PcValidationError as ve:
+            raise HTTPException(
+                status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+            ) from None
         # Idempotent: same caller-supplied id on a retry is a no-op.
         if any(
             p.id == pending.id
@@ -4408,6 +4766,20 @@ async def strategic_operation(
             "added pending_user_confirmation",
             {"pending_confirmation_added": [pending.id]},
         )
+        from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+        _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+        if _oversize_section:
+            await _maybe_create_problem_model_live_core_alert(project.id, session)
+            await session.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Problem model live core exceeds byte budget after adding "
+                    f"pending_confirmation: {_oversize_section}. Reduce the size "
+                    f"of active state before adding new items."
+                ),
+            )
         project.problem_model = current_model.model_dump()
         flag_modified(project, "problem_model")
         session.add(project)
@@ -4433,7 +4805,9 @@ async def strategic_operation(
         # sibling of the create-only ``pending_confirm`` op — the strategist no
         # longer has to wait for the operator to hand-dismiss a bookkeeping ask.
         # Operator dismiss/accept remains the fallback.
-        from app.problem_model import parse_problem_model
+        from pydantic import ValidationError as _RpcVE
+
+        from app.problem_model import parse_problem_model, sanitize_problem_model_raw
 
         target_id = ""
         if isinstance(data, dict):
@@ -4445,13 +4819,23 @@ async def strategic_operation(
                 status_code=400,
                 detail="resolve_pending_confirm requires an 'id' of the pending confirmation to clear",
             )
-        current_model = parse_problem_model(project.problem_model)
+        try:
+            current_model = parse_problem_model(
+                sanitize_problem_model_raw(project.problem_model or {})
+            )
+        except _RpcVE as ve:
+            raise HTTPException(
+                status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+            ) from None
         before = list(current_model.pending_user_confirmation)
         remaining = [p for p in before if p.id != target_id]
         removed = len(before) - len(remaining)
         if removed:
             current_model.pending_user_confirmation = remaining
-            from app.problem_model import append_revision_log as _append_revision_log
+            from app.problem_model import (
+                append_revision_log as _append_revision_log,
+                enforce_problem_model_size as _enforce_pm_size,
+            )
 
             now_iso = _utcnow().isoformat()
             current_model.revision = (current_model.revision or 0) + 1
@@ -4466,6 +4850,18 @@ async def strategic_operation(
                 "resolved pending_user_confirmation",
                 {"pending_confirmation_resolved": [target_id]},
             )
+            # SHRINK path: always persist the (now-gc-bounded) model.  Alert when
+            # the live core alone exceeds the budget after full eviction — the
+            # operator needs to know even though we do not reject.
+            _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+            if _oversize_section:
+                logger.error(
+                    "[STRATEGIC API] resolve_pending_confirm: project %s "
+                    "problem_model live core still over budget after gc: %s",
+                    project.id,
+                    _oversize_section,
+                )
+                await _maybe_create_problem_model_live_core_alert(project.id, session)
             project.problem_model = current_model.model_dump()
             flag_modified(project, "problem_model")
             session.add(project)
@@ -5174,7 +5570,7 @@ async def strategic_operation(
             for _dk in _mapped_directions:
                 try:
                     await _backfill(session, project.id, _dk)
-                except Exception:
+                except Exception:  # noqa: BLE001, PERF203
                     logger.warning(
                         "[STRATEGIC API] set_acceptance_criteria backfill failed "
                         "for direction %s (non-fatal)",
@@ -5438,7 +5834,10 @@ async def strategic_operation(
         _MAX_SUMMARY_BYTES = 10_000
         summary_bytes = summary.encode("utf-8")
         if len(summary_bytes) > _MAX_SUMMARY_BYTES:
-            summary = summary_bytes[:_MAX_SUMMARY_BYTES].decode("utf-8", errors="replace")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Session summary too large ({len(summary_bytes)} bytes, max {_MAX_SUMMARY_BYTES})",
+            )
 
         # Write to task context so the running agent reads it on bootstrap
         ctx = dict(task.context or {})
@@ -5446,22 +5845,6 @@ async def strategic_operation(
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)
-
-        # Also persist into the resident session blob so it survives a restart
-        # (a new task picks it up via start_resident_session's carry-forward).
-        # Uses with_vision_locked so the invariant test counts it as a locked
-        # write, consistent with the rest of the session-blob code.
-        _existing = _read_resident_session(project.vision)
-        if _existing is not None and _resident_session_is_active(_existing):
-
-            def _update_session_summary(vision: dict) -> None:
-                current = _read_resident_session(vision)
-                if current is not None and _resident_session_is_active(current):
-                    updated = dict(current)
-                    updated["_session_summary"] = summary
-                    vision[_RESIDENT_SESSION_KEY] = updated
-
-            await _with_vision_locked(session, project.id, _update_session_summary)
 
         await session.commit()
         return _resp({"status": "ok", "op": "set_session_summary"})
@@ -5578,7 +5961,7 @@ async def strategic_operation(
         try:
             doc_id = uuid.UUID(raw_id)
         except (ValueError, AttributeError):
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=400,
                 detail=f"consume_knowledge: invalid knowledge_document_id: {raw_id}",
             )
@@ -5624,7 +6007,7 @@ async def strategic_operation(
         try:
             doc_id = uuid.UUID(raw_id)
         except (ValueError, AttributeError):
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=400,
                 detail=f"dismiss_knowledge: invalid knowledge_document_id: {raw_id}",
             )
@@ -5766,7 +6149,7 @@ async def _apply_finding_resolution_write(
             status_code=400,
             detail="finding_key is required and must be at most 64 characters",
         )
-    from app.release_version import current_open_version  # noqa: PLC0415
+    from app.release_version import current_open_version
 
     open_version = await current_open_version(session, project_id)
     if open_version is None:
@@ -5783,7 +6166,7 @@ async def _apply_finding_resolution_write(
             try:
                 bound_id = uuid.UUID(bound_str)
             except (ValueError, AttributeError):
-                raise HTTPException(
+                raise HTTPException(  # noqa: B904
                     status_code=400,
                     detail="Invalid release_version_id in task context",
                 )
@@ -5797,7 +6180,7 @@ async def _apply_finding_resolution_write(
                     ),
                 )
             resolution_version_id = bound_id
-    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
+    from app.release_readiness import apply_finding_resolution
 
     await apply_finding_resolution(
         session,

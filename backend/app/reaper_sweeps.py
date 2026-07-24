@@ -62,18 +62,20 @@ from app.compute_jobs import (
 from app.database import AsyncSessionLocal
 from app.models import (
     ArtifactRefPromotionIntent,
-    ComputeImageBuildStatus,
     ComputeJob,
     ComputeJobFile,
     ComputeJobStatus,
     LocalRunner,
-    ProjectComputeImageBuild,
     ProjectMessageAttachmentUpload,
     Task,
     TaskStatus,
 )
-from app.storage import delete_storage_uri_best_effort
-from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
+from app.storage import (
+    MESSAGE_ATTACHMENT_RETENTION_DAYS,
+    VIEWABLE_ARTIFACT_RETENTION_DAYS,
+    delete_storage_uri_best_effort,
+)
+from app.runner_health_monitors import _get_liveness_seconds
 from app.time_utils import _is_cadence_due, _utcnow
 from app.reaper_fleet_health_sweeps import (
     sweep_merge_gate_verification_degradation,
@@ -397,6 +399,7 @@ async def sweep_queued_age_alerts(
                 f"Likely cause: {_likely_cause}."
             ),
             task_id=_qt.id,
+            event_type="task.blocked",
         )
         session.add(_alert)
 
@@ -454,7 +457,6 @@ async def sweep_stalled_strategic_cycles(
         AlertSeverity,
         Project,
         StrategicCycle,
-        StrategicResident,
     )
     from app.broadcast import broadcast_to_project as _bcast
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
@@ -462,7 +464,7 @@ async def sweep_stalled_strategic_cycles(
     # Pause-aware: a cycle whose completion handler simply could not run while
     # the pipeline was paused must not be force-terminated as "stalled". Passing
     # the deploy state makes find_stalled's 3h deadline exclude pause time.
-    from app.models import DeploymentState  # noqa: PLC0415
+    from app.models import DeploymentState
 
     _deploy_state = await session.get(DeploymentState, 1)
     stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
@@ -472,9 +474,9 @@ async def sweep_stalled_strategic_cycles(
     actually_stalled: list = []
     pending_broadcasts: list[tuple[str, dict]] = []
 
-    # Fence the legacy reaper against ownership cutover without locking the
+    # Lock the owning projects (then cycles, then tasks) without locking the
     # broad discovery scan. These bounded statements follow the canonical
-    # Project -> Resident -> Cycle -> Task order used by cutover/completion.
+    # Project -> Cycle -> Task order used by completion.
     _project_ids = sorted({c.project_id for c in stalled}, key=str)
     _locked_projects = (
         (
@@ -490,30 +492,6 @@ async def sweep_stalled_strategic_cycles(
         .all()
     )
     _locked_project_ids = {project.id for project in _locked_projects}
-    _locked_residents = (
-        (
-            await session.execute(
-                select(StrategicResident)
-                .where(StrategicResident.project_id.in_(_project_ids))
-                .order_by(StrategicResident.project_id.asc())
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    _resident_by_project = {
-        resident.project_id: resident for resident in _locked_residents
-    }
-    _legacy_project_ids = {
-        project_id
-        for project_id in _locked_project_ids
-        if (
-            _resident_by_project.get(project_id) is None
-            or _resident_by_project[project_id].engine_owner == "legacy"
-        )
-    }
     _candidate_cycle_ids = sorted({c.id for c in stalled})
     _locked_cycles = (
         (
@@ -521,7 +499,7 @@ async def sweep_stalled_strategic_cycles(
                 select(StrategicCycle)
                 .where(
                     StrategicCycle.id.in_(_candidate_cycle_ids),
-                    StrategicCycle.project_id.in_(_legacy_project_ids),
+                    StrategicCycle.project_id.in_(_locked_project_ids),
                 )
                 .order_by(StrategicCycle.project_id.asc(), StrategicCycle.id.asc())
                 .with_for_update()
@@ -530,7 +508,7 @@ async def sweep_stalled_strategic_cycles(
         )
         .scalars()
         .all()
-        if _legacy_project_ids
+        if _locked_project_ids
         else []
     )
     _linked_task_ids = sorted(
@@ -653,6 +631,7 @@ async def sweep_stalled_strategic_cycles(
                     f"cycle will spawn a fresh attempt. Phase1 task: {c.phase1_task_id}, "
                     f"phase2 task: {c.phase2_task_id}."
                 ),
+                event_type="research.diagnosis_stalled",
             )
             session.add(alert)
             pending_broadcasts.append(
@@ -717,6 +696,128 @@ async def sweep_metrics_integrity(session, now=None) -> dict | None:
     from app.metrics_integrity_sweep import run_metrics_integrity_sweep
 
     return await run_metrics_integrity_sweep(session, now)
+
+
+async def sweep_mode_knob_graduation(session, now=None) -> list | None:
+    """Always-on shared mode-knob graduation harness — independent of sweep mode.
+
+    Thin delegator to :func:`app.mode_knob_graduation.run_mode_knob_graduation`.
+    Gated ONLY by its own ``mode_knob_graduation_enabled`` flag (default False)
+    inside the callee — deliberately NOT gated on ``metrics_integrity_sweep_mode``
+    so the harness that disposes dormant knobs never itself depends on a dormant
+    knob being enforced. Returns the per-knob decision list, or an empty list when
+    the harness is disabled. The reaper wraps this call in its own
+    try/except+rollback so a raised error can never crash the cycle.
+    """
+    from app.mode_knob_graduation import run_mode_knob_graduation
+
+    return await run_mode_knob_graduation(session, now=now)
+
+
+async def sweep_operator_inbox_liveness(session, now=None) -> list | None:
+    """Always-on operator-inbox liveness signal — independent of sweep mode.
+
+    Thin delegator to
+    :func:`app.operator_inbox_liveness.run_operator_inbox_liveness_check`.
+    Cadence-gated inside the callee; returns the per-project result list, or
+    ``None`` when gated out.  Never mode-gated — fires regardless of
+    ``metrics_integrity_sweep_mode``.  The reaper wraps this call in its own
+    try/except+rollback so a raised error can never crash the cycle.
+    """
+    from app.operator_inbox_liveness import run_operator_inbox_liveness_check
+
+    return await run_operator_inbox_liveness_check(session, now)
+
+
+# Cadence gate for the proactive NULL-audience backfill sweep (Step 16e).
+# Hourly, on an INDEPENDENT timer.  Step 16d (sweep_operator_inbox_liveness)
+# stamps its own cadence global earlier in the same reaper cycle, so a shared
+# timer would report this sweep as "not due" every cycle and gate it out
+# permanently — see the Step 22/22b split note below for the same pattern.
+_BACKFILL_NULL_AUDIENCE_INTERVAL_SECONDS = 3600
+_last_backfill_null_audience_sweep: datetime | None = None
+
+
+async def sweep_backfill_null_audience_messages(
+    session, now=None, *, batch_size: int = 500
+) -> int:
+    """Step 16e: Proactively drain open/linked NULL-audience ProjectMessage rows.
+
+    The operator-inbox audience routing retains legacy rows whose
+    ``context['audience']`` is NULL — ``operator_visible_audience_filter`` fails
+    OPEN on them for backward compatibility — so an un-stamped legacy message
+    reaches the operator inbox until it is stamped.  The hourly
+    ``sweep_operator_inbox_liveness`` (Step 16d) only re-stamps the NARROW
+    'forward-leaked' subset (open/linked non-fyi messages that also fail
+    ``derive_needs_action``); it never drains the full open NULL-audience
+    population, so genuinely-actionable NULL-audience rows (a BLOCKER/QUESTION
+    that DOES satisfy ``derive_needs_action``) are never re-stamped.
+
+    This sweep finds ALL open/linked, non-user ProjectMessage rows whose
+    ``context->>'audience'`` is NULL and re-stamps each with its canonical
+    audience via the shared
+    :func:`app.operator_inbox_liveness._remediate_forward_leaked_messages`
+    helper (which routes through ``stamp_message_audience`` / ``route_event``).
+    A NULL-audience BLOCKER/QUESTION/BUG_REPORT resolves to
+    OPERATOR_ACTION_NEEDED via the ``message_type`` fallback in ``route_event``
+    — so genuinely operator-facing rows stay visible — while
+    unregistered/absent event_types fail closed to STRATEGIST_INTERNAL.  This is
+    purely additive drain-side work: no read-model filter changes, so nothing
+    that is currently operator-visible disappears as a result of the stamp.
+
+    Idempotent: once stamped, a row no longer matches the NULL-audience
+    predicate, so re-running drains the remaining population each tick and
+    converges to zero.  Bounded to *batch_size* rows per tick.  Hourly
+    cadence-gated on an INDEPENDENT timer.  Per-row error isolation lives in the
+    reused helper (a single malformed row never aborts the sweep); the whole
+    sweep is additionally wrapped by the reaper so it can never crash the cycle.
+    Returns the number of rows re-stamped this tick.
+    """
+    global _last_backfill_null_audience_sweep
+    from app.message_convergence import LINKED_STATUS, OPEN_STATUS
+    from app.models import ProjectMessage
+    from app.operator_inbox_liveness import _remediate_forward_leaked_messages
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_backfill_null_audience_sweep,
+        _BACKFILL_NULL_AUDIENCE_INTERVAL_SECONDS,
+        _now,
+    ):
+        return 0
+    _last_backfill_null_audience_sweep = _now
+
+    # NULL-audience predicate: a fully-NULL context column or an empty/keyless
+    # context both yield NULL for ``context->>'audience'`` in Postgres, so
+    # ``.is_(None)`` catches every un-stamped row.  Bounded per tick; the sweep
+    # re-runs each cadence window until the population is drained.
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                    ProjectMessage.from_type != "user",
+                    ProjectMessage.context["audience"].as_string().is_(None),
+                )
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    stamped = _remediate_forward_leaked_messages(session, rows)
+    if stamped:
+        await session.commit()
+        logger.info(
+            "[REAPER] Step 16e: backfilled canonical audience on %d "
+            "NULL-audience message(s)",
+            stamped,
+        )
+    return stamped
 
 
 # Cadence gate for the capability backing-proof sweep. Hourly to bound overall
@@ -1000,6 +1101,25 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
                     model, signals, _now.isoformat()
                 )
                 if cleared:
+                    from app.problem_model import (
+                        enforce_problem_model_size as _enforce_pm_size,
+                    )
+
+                    _gc_summary, _oversize_section = _enforce_pm_size(model)
+                    if _oversize_section:
+                        from app.alert_dispatch import (
+                            _maybe_create_problem_model_live_core_alert,
+                        )
+
+                        logger.error(
+                            "[REAPER] project %s: problem_model live core exceeds "
+                            "byte budget after moot-confirmation gc: %s",
+                            getattr(project, "id", "?"),
+                            _oversize_section,
+                        )
+                        await _maybe_create_problem_model_live_core_alert(
+                            project.id, session
+                        )
                     project.problem_model = model.model_dump()
                     flag_modified(project, "problem_model")
                     session.add(project)
@@ -1024,6 +1144,134 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
             total_cleared,
         )
     return total_cleared
+
+
+# Cadence gate for the stale-decay pending-confirmation sweep (Step 22e-ii).
+# 6-hourly, independent timer (age-based decay; much cheaper than moot sweep
+# which does credential I/O per project, so longer interval is fine).
+_STALE_CONFIRM_DECAY_INTERVAL_SECONDS = 21600
+_last_stale_confirm_decay_sweep: datetime | None = None
+
+
+async def sweep_decay_stale_pending_confirmations(session, now=None) -> int:
+    """Step 22e-ii: Age-decay stale ``pending_user_confirmation`` items.
+
+    Complements :func:`sweep_auto_clear_moot_pending_confirmations` (which is
+    fast-path / signal-based and only touches ``credentials_needed`` /
+    ``access_needed``).  This sweep removes ANY confirmation item whose
+    ``created_at`` is older than
+    :data:`app.problem_model.PENDING_CONFIRMATION_STALE_DECAY_DAYS`, including
+    ``intent_change`` and ``major_decision`` items that the moot sweep can never
+    remove.
+
+    Items with a missing or unparseable ``created_at`` are conservatively kept.
+    Iterates ALL projects via keyset pagination (batches of 100).  6-hourly
+    cadence-gated on an independent timer.  Wrapped so it can never crash the
+    reaper cycle.  Returns the total number of items decayed.
+    """
+    global _last_stale_confirm_decay_sweep
+    from app.models import Project
+    from app.problem_model import (
+        decay_stale_pending_confirmations,
+        parse_problem_model,
+    )
+    from sqlalchemy.orm import load_only
+    from sqlalchemy.orm.attributes import flag_modified
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_stale_confirm_decay_sweep, _STALE_CONFIRM_DECAY_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_stale_confirm_decay_sweep = _now
+
+    now_iso = _now.isoformat()
+    _BATCH = 100
+    last_id = None
+    total_decayed = 0
+
+    while True:
+        query = (
+            select(Project)
+            .options(
+                load_only(
+                    Project.id,
+                    Project.problem_model,
+                    raiseload=True,
+                )
+            )
+            .where(Project.problem_model.is_not(None))
+            .order_by(Project.id)
+            .limit(_BATCH)
+        )
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+
+        last_id = rows[-1].id
+
+        for project in rows:
+            try:
+                pm = getattr(project, "problem_model", None)
+                if not isinstance(pm, dict):
+                    continue
+                pending = pm.get("pending_user_confirmation")
+                if not isinstance(pending, list) or not pending:
+                    continue
+
+                try:
+                    model = parse_problem_model(pm)
+                except Exception:  # noqa: BLE001
+                    continue
+
+                decayed = decay_stale_pending_confirmations(model, now_iso)
+                if decayed:
+                    from app.problem_model import (
+                        enforce_problem_model_size as _enforce_pm_size,
+                    )
+
+                    _gc_summary, _oversize_section = _enforce_pm_size(model)
+                    if _oversize_section:
+                        from app.alert_dispatch import (
+                            _maybe_create_problem_model_live_core_alert,
+                        )
+
+                        logger.error(
+                            "[REAPER] project %s: problem_model live core exceeds "
+                            "byte budget after stale-decay gc: %s",
+                            getattr(project, "id", "?"),
+                            _oversize_section,
+                        )
+                        await _maybe_create_problem_model_live_core_alert(
+                            project.id, session
+                        )
+                    project.problem_model = model.model_dump()
+                    flag_modified(project, "problem_model")
+                    session.add(project)
+                    await session.commit()
+                    total_decayed += len(decayed)
+
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Stale pending-confirmation decay failed for project %s:",
+                    getattr(project, "id", "?"),
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
+
+    if total_decayed:
+        logger.info(
+            "[REAPER] Step 22e-ii: age-decayed %d stale pending confirmation(s)",
+            total_decayed,
+        )
+    return total_decayed
 
 
 async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
@@ -1781,6 +2029,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
                     "starved (zero cycles, not merely stalled mid-cycle). Review the "
                     "strategic loop scheduler and recent orchestrator logs."
                 )[:1000],
+                event_type="research.diagnosis_stalled",
             )
         )
         created += 1
@@ -2206,6 +2455,137 @@ async def sweep_decay_stale_open_messages(
     return resolved
 
 
+async def sweep_auto_resolve_answered_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Auto-resolve OPEN QUESTION / operator-action-needed messages that have a strategic reply.
+
+    A QUESTION or operator-action-needed NOTE/FEEDBACK that has received at
+    least one child reply authored by a non-operator party (from_type in
+    {'strategic', 'agent', 'system'}) is considered answered and resolved with
+    resolution='answered'.  BLOCKER messages are explicitly excluded — they
+    require explicit operator confirmation regardless of replies.
+
+    Uses only DURABLE fields (status, message_type, reply_to_message_id,
+    from_type) — never handling_state, which can be reverted by the
+    migration-0608 compat trigger.
+
+    Idempotent: targets status='open' only; re-runs find nothing.
+    Bounded at batch_size rows per cycle; broadcasts 'message_updated' per
+    resolved row.  Returns number of messages resolved.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+    from app.models import MessageType, ProjectMessage
+    from app.message_convergence import OPEN_STATUS, mark_message_resolved
+    from app.project_message_projection import message_updated_event_payload
+
+    # Fetch candidate parent messages: OPEN, non-BLOCKER, and whose
+    # message_type is QUESTION OR context audience is operator-action-needed.
+    # We load a bounded batch and filter per-row (the audience check is a JSONB
+    # field; doing the IN(...) on message_type first keeps the index hit tight).
+    CANDIDATE_TYPES = [MessageType.QUESTION.value, MessageType.NOTE.value, MessageType.FEEDBACK.value]
+    candidates = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.message_type.in_(CANDIDATE_TYPES),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not candidates:
+        return 0
+
+    if len(candidates) >= batch_size:
+        logger.warning(
+            "[REAPER] answered-message sweep hit cap=%d open candidate "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+
+    # Narrow to messages that qualify: QUESTION type OR operator-action-needed audience.
+    eligible_ids = []
+    for msg in candidates:
+        msg_type = msg.message_type.value if hasattr(msg.message_type, "value") else str(msg.message_type)
+        if msg_type == MessageType.QUESTION.value:
+            eligible_ids.append(msg.id)
+            continue
+        ctx = msg.context or {}
+        if ctx.get("audience") == OPERATOR_ACTION_NEEDED:
+            eligible_ids.append(msg.id)
+
+    if not eligible_ids:
+        return 0
+
+    # For each eligible parent, check whether a strategic/agent/system reply exists.
+    _NON_OPERATOR_FROM_TYPES = ("strategic", "agent", "system")
+    replied_ids: set = set()
+    for chunk_start in range(0, len(eligible_ids), 500):
+        chunk = eligible_ids[chunk_start : chunk_start + 500]
+        reply_rows = (
+            await session.execute(
+                select(ProjectMessage.reply_to_message_id)
+                .where(
+                    ProjectMessage.reply_to_message_id.in_(chunk),
+                    ProjectMessage.from_type.in_(list(_NON_OPERATOR_FROM_TYPES)),
+                )
+                .distinct()
+            )
+        ).scalars().all()
+        replied_ids.update(reply_rows)
+
+    if not replied_ids:
+        return 0
+
+    # Build a fast lookup: id -> msg object
+    id_to_msg = {msg.id: msg for msg in candidates}
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg_id in replied_ids:
+        msg = id_to_msg.get(msg_id)
+        if msg is None or msg.status != OPEN_STATUS:
+            continue
+        mark_message_resolved(msg, now, "answered")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] answered-message sweep: auto-resolved %s message %s (strategic reply present)",
+            msg.message_type.value if hasattr(msg.message_type, "value") else msg.message_type,
+            msg.id,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] answered-message sweep broadcast failed for %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] answered-message sweep: auto-resolved %d message(s)",
+            resolved,
+        )
+    return resolved
+
+
 # ── Re-exports from extracted sub-module ─────────────────────────────────────
 #
 # These symbols were extracted to app.reaper_bug_message_sweeps. They are
@@ -2409,6 +2789,77 @@ _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS = 3600
 _COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS = 30 * 24 * 3600
 _last_compute_image_gc_guard_sweep: datetime | None = None
 
+# Observability state for the operator GC-guard readiness signal.
+# Populated after every actual sweep execution (not cadence-skipped).
+# Reset on process restart — the operator needs a multi-cycle observation
+# window before flipping cleanup_policy_dry_run=false.
+_gc_guard_total_runs: int = 0
+_gc_guard_total_applied: int = 0
+_gc_guard_total_pruned: int = 0
+_gc_guard_total_apply_failed: int = 0
+_gc_guard_consecutive_healthy_cycles: int = 0
+_gc_guard_first_run_at: datetime | None = None
+_gc_guard_last_run_at: datetime | None = None
+# Per-execution snapshot of the last non-cadence-skipped sweep run.
+_gc_guard_last_result: dict[str, int] | None = None
+# Set to True once the DB-persisted state has been loaded into the module
+# globals above (happens on the first sweep execution per process lifetime).
+_gc_guard_state_loaded_from_db: bool = False
+
+async def _load_gc_guard_state_from_db(session) -> None:
+    """Seed module-global GC-guard counters from the DeploymentState row.
+
+    Called once per process lifetime (lazy, on the first sweep execution) to
+    restore cumulative totals that survived a process restart/redeploy.  A
+    missing DeploymentState row or a NULL ``gc_guard_state`` column is silently
+    ignored — the sweep simply starts from zero for this process.
+    """
+    global _gc_guard_state_loaded_from_db
+    global _gc_guard_total_runs, _gc_guard_total_applied, _gc_guard_total_pruned
+    global _gc_guard_total_apply_failed, _gc_guard_consecutive_healthy_cycles
+    global _gc_guard_first_run_at, _gc_guard_last_run_at, _gc_guard_last_result
+    _gc_guard_state_loaded_from_db = True  # mark loaded even if DB has no data
+    try:
+        from app.models import DeploymentState
+
+        row = (
+            (
+                await session.execute(
+                    select(DeploymentState).where(DeploymentState.id == 1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        state = (row.gc_guard_state or {}) if row is not None else {}
+        if not state:
+            return
+        _gc_guard_total_runs = int(state.get("total_runs", 0))
+        _gc_guard_total_applied = int(state.get("total_applied", 0))
+        _gc_guard_total_pruned = int(state.get("total_pruned", 0))
+        _gc_guard_total_apply_failed = int(state.get("total_apply_failed", 0))
+        _gc_guard_consecutive_healthy_cycles = int(
+            state.get("consecutive_healthy_cycles", 0)
+        )
+        raw_first = state.get("first_run_at")
+        if raw_first:
+            _gc_guard_first_run_at = datetime.fromisoformat(raw_first)
+        raw_last = state.get("last_run_at")
+        if raw_last:
+            _gc_guard_last_run_at = datetime.fromisoformat(raw_last)
+        last_result = state.get("last_result")
+        if isinstance(last_result, dict):
+            _gc_guard_last_result = dict(last_result)
+    except Exception:
+        logger.exception("_load_gc_guard_state_from_db: failed to restore GC-guard state")
+
+
+# Result of the last DB-pin reconciliation sweep (None until first run).
+_gc_guard_last_reconciliation: dict[str, Any] | None = None
+# Independent cadence timer for the DB-pin reconciliation sweep. Shares the
+# hourly constant with the protection sweep but runs on its own clock.
+_last_gc_guard_reconcile_sweep: datetime | None = None
+
 # Deduped operator-alert title raised when the GC-protection sweep FAILS to apply
 # an ``inuse-`` tag. The registry helper is fail-open (returns None on a missing
 # gcloud binary / Artifact Registry API error / non-zero exit), so a failed apply
@@ -2478,6 +2929,7 @@ async def _alert_compute_image_protection_failures(
                     "reproducibility. Check gcloud availability and Artifact Registry "
                     "API health on the orchestrator host."
                 )[:1000],
+                event_type="compute.image_protect_fail",
             )
         )
         created += 1
@@ -2598,7 +3050,10 @@ async def sweep_protect_referenced_compute_image_digests(
     (``applied``/``pruned``/``skipped_cadence``). The caller wraps this so it can
     never crash the reaper cycle; the registry helpers fail open individually.
     """
-    global _last_compute_image_gc_guard_sweep
+    global _last_compute_image_gc_guard_sweep, _gc_guard_total_runs, _gc_guard_total_applied
+    global _gc_guard_total_pruned, _gc_guard_total_apply_failed, _gc_guard_consecutive_healthy_cycles
+    global _gc_guard_first_run_at, _gc_guard_last_run_at, _gc_guard_last_result
+    global _gc_guard_state_loaded_from_db
     from app.compute_image_build import (
         apply_registry_protection_tag,
         delete_registry_protection_tag,
@@ -2609,6 +3064,11 @@ async def sweep_protect_referenced_compute_image_digests(
     from app.models import Project, ProjectComputeImage
 
     _now = now or _utcnow()
+
+    # Restore durable counters from the DB on the first sweep call per process.
+    if not _gc_guard_state_loaded_from_db:
+        await _load_gc_guard_state_from_db(session)
+
     if not _is_cadence_due(
         _last_compute_image_gc_guard_sweep,
         _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS,
@@ -2856,7 +3316,7 @@ async def sweep_protect_referenced_compute_image_digests(
             await _alert_compute_image_protection_failures(
                 session, failed_projects, apply_failed=apply_failed, now=_now
             )
-        except Exception:  # noqa: BLE001 — alerting must never crash the sweep
+        except Exception:
             logger.exception(
                 "sweep_protect_referenced_compute_image_digests: failed to raise "
                 "protection-failure alert(s)"
@@ -2864,11 +3324,203 @@ async def sweep_protect_referenced_compute_image_digests(
             with contextlib.suppress(Exception):
                 await session.rollback()
 
+    # --- Update cumulative GC-guard state for operator readiness signal ---
+    _gc_guard_total_runs += 1
+    _gc_guard_total_applied += applied
+    _gc_guard_total_pruned += pruned
+    _gc_guard_total_apply_failed += apply_failed
+    if _gc_guard_first_run_at is None:
+        _gc_guard_first_run_at = _now
+    _gc_guard_last_run_at = _now
+    _gc_guard_last_result = {
+        "applied": applied,
+        "pruned": pruned,
+        "apply_failed": apply_failed,
+        "skipped_cadence": 0,
+    }
+    if apply_failed == 0:
+        _gc_guard_consecutive_healthy_cycles += 1
+    else:
+        _gc_guard_consecutive_healthy_cycles = 0
+
+    # Persist cumulative state to DB so it survives process restarts/redeploys.
+    try:
+        from app.models import DeploymentState
+        from sqlalchemy import update as _sa_update
+
+        await session.execute(
+            _sa_update(DeploymentState)
+            .where(DeploymentState.id == 1)
+            .values(
+                gc_guard_state={
+                    "total_runs": _gc_guard_total_runs,
+                    "total_applied": _gc_guard_total_applied,
+                    "total_pruned": _gc_guard_total_pruned,
+                    "total_apply_failed": _gc_guard_total_apply_failed,
+                    "consecutive_healthy_cycles": _gc_guard_consecutive_healthy_cycles,
+                    "first_run_at": _gc_guard_first_run_at.isoformat()
+                    if _gc_guard_first_run_at
+                    else None,
+                    "last_run_at": _gc_guard_last_run_at.isoformat()
+                    if _gc_guard_last_run_at
+                    else None,
+                    "last_result": dict(_gc_guard_last_result)
+                    if _gc_guard_last_result
+                    else None,
+                }
+            )
+        )
+        await session.commit()
+    except Exception:
+        logger.exception(
+            "sweep_protect_referenced_compute_image_digests: failed to persist GC-guard state"
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+
     return {
         "applied": applied,
         "pruned": pruned,
         "apply_failed": apply_failed,
         "skipped_cadence": 0,
+    }
+
+
+async def sweep_reconcile_gc_guard_db_pins(
+    session,
+    *,
+    now: datetime | None = None,
+    _list_tags=None,
+) -> dict[str, Any]:
+    """Reconcile DB-pinned compute-image digests against inuse- registry tags.
+
+    For each built ``ProjectComputeImage`` row with a digest, verify that its
+    deterministic ``inuse-<shorthash>`` protection tag is present in the
+    Artifact Registry.  Any pinned digest whose tag is absent belongs to the
+    would-delete set and is returned as a blocking risk finding.
+
+    Returns a dict with:
+      - **risk_findings** — list of ``{project_id, repo, digest, missing_tag}``
+        for every DB-pinned digest unprotected in the registry.
+      - **clean** — ``True`` iff the would-delete set is disjoint from
+        DB-pinned digests (no risk findings).
+      - **skipped_cadence** — 1 when the hourly cadence gate fired, 0 otherwise.
+
+    Stores the result in ``_gc_guard_last_reconciliation`` so
+    :func:`get_compute_image_gc_guard_readiness` can surface it.
+    """
+    global _gc_guard_last_reconciliation, _last_gc_guard_reconcile_sweep
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_gc_guard_reconcile_sweep,
+        _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS,
+        _now,
+    ):
+        return {"risk_findings": [], "clean": True, "skipped_cadence": 1}
+    from app.compute_image_build import (
+        list_registry_protection_tags,
+        protection_tag_for_digest,
+    )
+    from app.models import ProjectComputeImage
+
+    list_tags_fn = _list_tags or list_registry_protection_tags
+
+    rows = (
+        await session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.built.is_(True),
+                ProjectComputeImage.digest.is_not(None),
+            )
+        )
+    ).scalars().all()
+
+    by_repo: dict[str, list[tuple[str | None, str, str]]] = {}
+    for img in rows:
+        if not img.digest or not img.registry_repo or not img.image_name:
+            continue
+        repo = f"{img.registry_repo}/{img.image_name}"
+        by_repo.setdefault(repo, []).append(
+            (str(img.project_id) if img.project_id else None, img.digest, protection_tag_for_digest(img.digest))
+        )
+
+    risk_findings: list[dict[str, str | None]] = []
+    for repo, entries in sorted(by_repo.items()):
+        try:
+            existing = set(await asyncio.to_thread(list_tags_fn, repo))
+        except Exception:  # noqa: BLE001 — fail open: skip this repo on error
+            continue
+        for project_id, digest, expected_tag in entries:
+            if expected_tag not in existing:
+                risk_findings.append(
+                    {
+                        "project_id": project_id,
+                        "repo": repo,
+                        "digest": digest,
+                        "missing_tag": expected_tag,
+                    }
+                )
+
+    result: dict[str, Any] = {
+        "risk_findings": risk_findings,
+        "clean": not risk_findings,
+        "skipped_cadence": 0,
+    }
+    _gc_guard_last_reconciliation = result
+    _last_gc_guard_reconcile_sweep = _now
+    return result
+
+
+def get_compute_image_gc_guard_readiness() -> dict[str, Any]:
+    """Return observed GC-guard sweep state for operator readiness assessment.
+
+    The ``cleanup_policy_dry_run=true`` flag on the compute-image Artifact
+    Registry means image storage grows unbounded until an operator confirms
+    the ``inuse-`` protection-tag sweep is working reliably and flips
+    ``dry_run=false``.  This function surfaces the cumulative and per-run
+    observability accumulated since process start so the operator can make
+    that call from a machine-readable signal rather than log inspection.
+
+    Returns a dict with:
+      - **ready** — ``True`` when the sweep has run at least once, has
+        protected at least one digest, and had zero apply failures on the
+        last run.
+      - **total_runs** — number of actual sweep executions since start.
+      - **consecutive_healthy_cycles** — number of consecutive executions
+        with ``apply_failed == 0``.
+      - **first_run_at** / **last_run_at** — ISO-format timestamps.
+      - **last_sweep** — per-run snapshot ``{applied, pruned, apply_failed}``.
+      - **cumulative** — running totals ``{applied, pruned, apply_failed}``.
+      - **reconciliation** — result of the last
+        :func:`sweep_reconcile_gc_guard_db_pins` run, or ``None`` if that
+        sweep has never executed.  ``reconciliation["clean"]`` is ``True``
+        when the would-delete set is disjoint from DB-pinned digests, making
+        it the machine signal the operator should check before flipping
+        ``cleanup_policy_dry_run=false``.
+    """
+    is_healthy = (
+        _gc_guard_last_result is not None
+        and _gc_guard_last_result["applied"] > 0
+        and _gc_guard_consecutive_healthy_cycles >= 1
+    )
+    return {
+        "ready": _gc_guard_total_runs >= 1 and is_healthy,
+        "total_runs": _gc_guard_total_runs,
+        "consecutive_healthy_cycles": _gc_guard_consecutive_healthy_cycles,
+        "first_run_at": _gc_guard_first_run_at.isoformat()
+        if _gc_guard_first_run_at
+        else None,
+        "last_run_at": _gc_guard_last_run_at.isoformat()
+        if _gc_guard_last_run_at
+        else None,
+        "last_sweep": dict(_gc_guard_last_result) if _gc_guard_last_result else None,
+        "cumulative": {
+            "applied": _gc_guard_total_applied,
+            "pruned": _gc_guard_total_pruned,
+            "apply_failed": _gc_guard_total_apply_failed,
+        },
+        "reconciliation": dict(_gc_guard_last_reconciliation)
+        if _gc_guard_last_reconciliation is not None
+        else None,
     }
 
 
@@ -2941,7 +3593,6 @@ async def sweep_refresh_project_compute_images(
         return {
             "projects": 0,
             "rebuilt": 0,
-            "dispatched": 0,
             "unchanged": 0,
             "no_config": 0,
             "deferred": 0,
@@ -2989,7 +3640,6 @@ async def sweep_refresh_project_compute_images(
     summary = {
         "projects": 0,
         "rebuilt": 0,
-        "dispatched": 0,
         "unchanged": 0,
         "no_config": 0,
         "deferred": 0,
@@ -3046,198 +3696,62 @@ async def sweep_refresh_project_compute_images(
                     project_id,
                     exc_info=True,
                 )
-        elif status == "dispatched":
-            # Off-orchestrator async build kicked off; it counts against the
-            # per-cycle build budget. The reaper poll sweep records the pin (and
-            # any drift alert fires once the pinned_ref is known), so nothing to
-            # record here.
-            summary["dispatched"] += 1
-            builds_done += 1
         elif status == "unchanged":
             summary["unchanged"] += 1
         elif status == "no_config":
             summary["no_config"] += 1
         elif status == "deferred":
             summary["deferred"] += 1
+            try:
+                from app.alert_dispatch import (
+                    _maybe_create_compute_image_drift_deferred_alert,
+                )
+
+                await _maybe_create_compute_image_drift_deferred_alert(
+                    session,
+                    project_id,
+                    dep_hash=(result or {}).get("dep_hash"),
+                    reason=(result or {}).get("reason", "unknown"),
+                )
+            except Exception:  # noqa: BLE001 — alert is best-effort
+                logger.warning(
+                    "[REAPER] compute-image drift-deferred alert failed for project %s",
+                    project_id,
+                    exc_info=True,
+                )
         else:  # "error" or an unrecognized status
             summary["errors"] += 1
+            try:
+                from app.alert_dispatch import (
+                    _maybe_create_compute_image_refresh_failure_alert,
+                )
+
+                await _maybe_create_compute_image_refresh_failure_alert(
+                    session,
+                    project_id,
+                    error_reason=(result or {}).get("error", "unknown"),
+                )
+            except Exception:  # noqa: BLE001 — alert is best-effort
+                logger.warning(
+                    "[REAPER] compute-image refresh-failure alert failed for project %s",
+                    project_id,
+                    exc_info=True,
+                )
 
     if (
         summary["rebuilt"]
-        or summary["dispatched"]
         or summary["deferred"]
         or summary["errors"]
     ):
         logger.info(
-            "[REAPER] compute-image auto-refresh: rebuilt=%d dispatched=%d "
+            "[REAPER] compute-image auto-refresh: rebuilt=%d "
             "unchanged=%d deferred=%d no_config=%d errors=%d (of %d project(s))",
             summary["rebuilt"],
-            summary["dispatched"],
             summary["unchanged"],
             summary["deferred"],
             summary["no_config"],
             summary["errors"],
             summary["projects"],
-        )
-    return summary
-
-
-# ── Off-orchestrator image-build poll monitor (DARK — not wired into the loop) ──
-#
-# Sibling of the compute-job monitor: it drives BUILDING ProjectComputeImageBuild
-# rows to a terminal state by polling the throwaway builder VM's serial marker /
-# durable terminal.json, then records the pinned image (through the same
-# digest-preservation guard the inline path uses) and reaps the VM. Past its
-# deadline a build's VM is deleted and the row is marked TIMED_OUT.
-#
-# This sweep is NOT registered in the reaper cycle and NOT called by the trigger
-# endpoint — the whole builder lane ships dark, selectable by config. It exists
-# so the machinery is testable and ready to wire up once proven.
-_IMAGE_BUILD_POLL_MAX_ROWS = 25
-
-
-async def sweep_poll_image_builds(
-    session,
-    now=None,
-    *,
-    _backend=None,
-    _record_fn=None,
-    _preserve_fn=None,
-    _reap_fn=None,
-    max_builds: int = _IMAGE_BUILD_POLL_MAX_ROWS,
-) -> dict[str, int]:
-    """Poll BUILDING off-orchestrator compute-image builds to a terminal state.
-
-    For each ``BUILDING`` :class:`ProjectComputeImageBuild` row (bounded to
-    ``max_builds``):
-
-    * **Past deadline** — delete the builder VM and mark the row ``TIMED_OUT``
-      (a build that ran past its wall-clock ceiling never completes on its own).
-    * **SUCCEEDED** — reconstruct a ``BuildResult`` from the tool's parsed
-      ``RESULT_JSON``, run it through the digest-preservation guard, UPSERT the
-      ``ProjectComputeImage`` pin, persist ``result_json``, mark ``SUCCEEDED``,
-      and reap the VM.
-    * **FAILED** — persist the reason, mark ``FAILED``, and reap the VM.
-    * **still BUILDING** — leave the row untouched for the next pass.
-
-    All VM/serial/registry calls go through the injected ``_backend`` /
-    ``_record_fn`` / ``_preserve_fn`` / ``_reap_fn`` seams so the state machine is
-    testable with no cloud I/O. A per-row failure is isolated — it never aborts
-    the sweep. Returns a summary dict of per-outcome counts. The reaper (once this
-    is wired) wraps it so a raised error can never crash the cycle.
-    """
-    from app import compute_backends as _cb
-
-    _now = now or _utcnow()
-    backend = _backend if _backend is not None else _cb.get_image_builder_backend()
-    record_fn = _record_fn if _record_fn is not None else _cb.record_project_compute_image_build
-    preserve_fn = (
-        _preserve_fn if _preserve_fn is not None else _cb._preserve_existing_digest_pin_cb
-    )
-
-    async def _default_reap(build: ProjectComputeImageBuild) -> bool:
-        return await backend.abort(build, reason="reap_after_terminal")
-
-    reap_fn = _reap_fn if _reap_fn is not None else _default_reap
-
-    rows = (
-        (
-            await session.execute(
-                select(ProjectComputeImageBuild)
-                .where(
-                    ProjectComputeImageBuild.status == ComputeImageBuildStatus.BUILDING
-                )
-                .order_by(ProjectComputeImageBuild.created_at)
-                .limit(max_builds)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    summary = {
-        "polled": 0,
-        "succeeded": 0,
-        "failed": 0,
-        "timed_out": 0,
-        "still_building": 0,
-        "errors": 0,
-    }
-    for build in rows:
-        summary["polled"] += 1
-        try:
-            # Deadline first: a build past its wall-clock ceiling is reaped and
-            # marked TIMED_OUT without trusting a (possibly never-coming) marker.
-            if build.deadline_at is not None and _now >= build.deadline_at:
-                await reap_fn(build)
-                build.status = ComputeImageBuildStatus.TIMED_OUT
-                build.error_reason = "build exceeded its wall-clock deadline"
-                build.updated_at = _now
-                session.add(build)
-                await session.commit()
-                summary["timed_out"] += 1
-                continue
-
-            status = await backend.poll(build)
-            if status.status == ComputeImageBuildStatus.BUILDING:
-                summary["still_building"] += 1
-                continue
-
-            if status.status == ComputeImageBuildStatus.SUCCEEDED:
-                result_payload = status.result or {}
-                build_result = _cb.build_result_from_serial_payload(
-                    result_payload, dep_hash=build.dep_hash
-                )
-                # Never let a digest-less result NULL an already-stored pin.
-                build_result = await preserve_fn(
-                    session, build.project_id, build_result
-                )
-                await record_fn(
-                    session,
-                    build.project_id,
-                    build.registry_repo,
-                    build.image_name,
-                    build_result,
-                )
-                build.status = ComputeImageBuildStatus.SUCCEEDED
-                build.result_json = build_result.to_json()
-                build.error_reason = None
-                build.updated_at = _now
-                session.add(build)
-                await session.commit()
-                await reap_fn(build)
-                summary["succeeded"] += 1
-                continue
-
-            # FAILED (or any non-BUILDING/SUCCEEDED terminal state).
-            build.status = ComputeImageBuildStatus.FAILED
-            build.error_reason = status.reason or "image build failed"
-            build.updated_at = _now
-            session.add(build)
-            await session.commit()
-            await reap_fn(build)
-            summary["failed"] += 1
-        except Exception:  # noqa: BLE001 — isolate a per-row failure
-            logger.warning(
-                "[REAPER] image-build poll raised for build %s",
-                getattr(build, "id", "?"),
-                exc_info=True,
-            )
-            with contextlib.suppress(Exception):
-                await session.rollback()
-            summary["errors"] += 1
-            continue
-
-    if summary["succeeded"] or summary["failed"] or summary["timed_out"] or summary["errors"]:
-        logger.info(
-            "[REAPER] image-build poll: succeeded=%d failed=%d timed_out=%d "
-            "still_building=%d errors=%d (of %d row(s))",
-            summary["succeeded"],
-            summary["failed"],
-            summary["timed_out"],
-            summary["still_building"],
-            summary["errors"],
-            summary["polled"],
         )
     return summary
 
@@ -3305,7 +3819,7 @@ async def sweep_stranded_runner_subprocess_compute_jobs(
     STARTING/RUNNING forever.  ``ran_on_runner_id`` is the authoritative claim
     record; never use the dispatch-only ``runner_target_id`` pin here.
     """
-    liveness_cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    liveness_cutoff = now - timedelta(seconds=_get_liveness_seconds())
     candidates = (
         await session.execute(
             select(ComputeJob.id, ComputeJob.ran_on_runner_id)
@@ -3341,10 +3855,6 @@ async def sweep_stranded_runner_subprocess_compute_jobs(
     return finalized
 
 
-# How old a completed ComputeJob must be before its viewable artifacts are reaped.
-VIEWABLE_ARTIFACT_RETENTION_DAYS = 180
-
-
 async def sweep_retire_viewable_artifacts(
     session,
     *,
@@ -3352,7 +3862,8 @@ async def sweep_retire_viewable_artifacts(
     batch_size: int = 100,
 ) -> int:
     """Step 23: Delete viewable GCS objects and their ComputeJobFile rows for
-    completed jobs older than ``retention_days`` (default 180).
+    completed jobs older than ``retention_days`` (default
+    ``storage.VIEWABLE_ARTIFACT_RETENTION_DAYS`` = 180).
 
     Viewable objects at ``compute-jobs/<uuid>/artifacts/viewable/`` are
     intentionally excluded from the GCS bucket lifecycle rules (which only
@@ -3408,6 +3919,184 @@ async def sweep_retire_viewable_artifacts(
     return removed
 
 
+async def sweep_retire_consumed_message_attachments(
+    session,
+    *,
+    retention_days: int = MESSAGE_ATTACHMENT_RETENTION_DAYS,
+    batch_size: int = 100,
+) -> int:
+    """Step 24: Delete GCS objects and DB rows for consumed message attachments
+    older than ``retention_days`` (default
+    ``storage.MESSAGE_ATTACHMENT_RETENTION_DAYS`` = 180).
+
+    Consumed attachments at ``message-attachments/<project>/<id>/`` are
+    intentionally excluded from the GCS bucket lifecycle rules (see
+    infra/terraform/iam.tf — they are referenced durably by ProjectMessage rows
+    and must not be purged on a fixed calendar schedule).  This sweep is their
+    sole reaper: once the receipt was consumed more than the retention window ago
+    the GCS object is deleted best-effort and the receipt row is removed.
+
+    A receipt is eligible when ``consumed_at IS NOT NULL`` and
+    ``consumed_at < cutoff``.  Unconsumed/orphan receipts are handled by
+    ``sweep_expired_message_attachment_uploads`` instead.
+
+    At most ``batch_size`` receipts are processed per call.  Returns the number
+    of rows deleted.
+    """
+    cutoff = _utcnow() - timedelta(days=max(1, int(retention_days)))
+
+    rows = (
+        await session.execute(
+            select(ProjectMessageAttachmentUpload)
+            .where(
+                ProjectMessageAttachmentUpload.consumed_at.is_not(None),
+                ProjectMessageAttachmentUpload.consumed_at < cutoff,
+            )
+            .order_by(ProjectMessageAttachmentUpload.consumed_at.asc())
+            .limit(max(1, min(int(batch_size), 500)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+
+    if not rows:
+        return 0
+
+    deleted_flags = await asyncio.gather(
+        *(delete_storage_uri_best_effort(row.storage_uri) for row in rows)
+    )
+
+    removed = 0
+    for row, ok in zip(rows, deleted_flags, strict=True):
+        if ok:
+            await session.delete(row)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Retired %d consumed message attachment(s) older than %d days",
+            removed,
+            retention_days,
+        )
+    else:
+        await session.rollback()
+    return removed
+
+
+# Hourly cadence for the merged named-test backfill sweep (Step 21a).
+# Independent timer so it is not suppressed by another sweep's timer stamp
+# earlier in the same reaper cycle.
+_BACKFILL_NAMED_TEST_INTERVAL_SECONDS = 3600
+_last_backfill_named_test_sweep: datetime | None = None
+
+
+async def sweep_backfill_merged_named_test_coverage(session, now=None) -> int:
+    """Step 21a: Auto-backfill acceptance evidence from pre-existing test coverage.
+
+    Finds merged COMPLETED tasks whose declared ``named_test`` acceptance evidence
+    matches test files that shipped in the same PR (the test path is in the task's
+    ``_pr_changed_files`` context), and records
+    :data:`~app.acceptance_criteria.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND`
+    evidence for their active acceptance criteria — upgrading them from 'unproven'
+    to at least 'backfilled' on the coverage ladder.
+
+    This is distinct from the unverified-merge backfill: it processes ALL merged
+    tasks regardless of verification status.  A verified merge whose criteria were
+    added AFTER the merge (so ``record_task_merge_evidence`` never fired) also
+    qualifies.
+
+    Hourly cadence-gated on an independent timer.  Iterates projects with an open
+    release version.  Returns the total number of new ``CriterionEvidence`` rows
+    recorded across all projects.
+
+    When ``acceptance_earn_execution_trials_enabled`` is ON, each per-project pass
+    also enrolls bounded ``criterion_coverage_trial`` execution trials (which,
+    on green, mint the machine-verified ``covered`` tier asynchronously via the
+    completion handler). This sweep threads a SHRINKING global enrollment budget
+    (:data:`~app.acceptance_criteria.MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS`)
+    across projects so the WHOLE pass is bounded — not just each project — and
+    logs the per-project + total counts of trials enrolled for observability. The
+    ``covered``-row MINT counts are logged separately by the completion handler
+    (execution is asynchronous, so a single enrollment pass never knows them).
+    """
+    global _last_backfill_named_test_sweep
+    from app.models import Project
+    from app.release_version import current_open_version as _cur_open_ver
+    from app.acceptance_criteria import (
+        backfill_merged_named_test_coverage as _backfill,
+        MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS,
+    )
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_backfill_named_test_sweep, _BACKFILL_NAMED_TEST_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_backfill_named_test_sweep = _now
+
+    # Find projects that have an open release version — only they have active
+    # criteria that can be backfilled.
+    _BATCH = 50
+    total = 0
+    total_trials = 0
+    # Global execution-trial enrollment budget for THIS sweep pass, shrinking as
+    # projects consume it so test execution can never grow unbounded across
+    # projects × merged tasks.
+    trial_budget = MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS
+    last_id: uuid.UUID | None = None
+    while True:
+        query = select(Project.id).order_by(Project.id).limit(_BATCH)
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+        last_id = rows[-1]
+
+        for pid in rows:
+            try:
+                open_ver = await _cur_open_ver(session, pid)
+                if open_ver is None:
+                    continue
+                result = await _backfill(
+                    session, pid, max_trial_enrollments=max(0, trial_budget)
+                )
+                recorded = int(result)
+                enrolled = getattr(result, "trials_enrolled", 0)
+                if recorded or enrolled:
+                    logger.info(
+                        "[REAPER] Step 21a: backfill_merged_named_test_coverage "
+                        "project=%s recorded=%d trials_enrolled=%d",
+                        pid,
+                        recorded,
+                        enrolled,
+                    )
+                total += recorded
+                total_trials += enrolled
+                trial_budget -= enrolled
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 21a: backfill_merged_named_test_coverage failed "
+                    "for project %s:",
+                    pid,
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
+
+    if total or total_trials:
+        logger.info(
+            "[REAPER] Step 21a: backfill_merged_named_test_coverage total=%d "
+            "trials_enrolled=%d",
+            total,
+            total_trials,
+        )
+    return total
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -3453,15 +4142,22 @@ __all__ = [
     "sweep_resolve_stale_open_bug_messages",
     "sweep_resolve_linked_messages",
     "sweep_decay_stale_open_messages",
+    "sweep_auto_resolve_answered_messages",
+    "sweep_decay_stale_pending_confirmations",
     "STALE_OPEN_DECAY_DAYS",
     "STALE_OPEN_BUG_CLASS_DECAY_DAYS",
     "STALE_QUESTION_DECAY_DAYS",
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
+    "sweep_reconcile_gc_guard_db_pins",
+    "get_compute_image_gc_guard_readiness",
     "sweep_refresh_project_compute_images",
     "sweep_silent_runner_compute_jobs",
     "sweep_stranded_runner_subprocess_compute_jobs",
     "VIEWABLE_ARTIFACT_RETENTION_DAYS",
     "sweep_retire_viewable_artifacts",
+    "MESSAGE_ATTACHMENT_RETENTION_DAYS",
+    "sweep_retire_consumed_message_attachments",
+    "sweep_backfill_merged_named_test_coverage",
 ]

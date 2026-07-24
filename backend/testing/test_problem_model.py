@@ -13,9 +13,10 @@ from pydantic import ValidationError
 from app.acceptance_criteria import criterion_coverage_to_evidence_status
 from app.problem_model import (
     ARCHIVED_GAPS_DURABLE_MAX,
+    sanitize_problem_model_raw,
     CAPABILITIES_DURABLE_MAX,
-    DEFERRAL_STALE_GRACE_DAYS,
     FRICTION_DURABLE_MAX,
+    PACKER_MARKER_KEYS,
     PROBLEM_MODEL_BYTE_BUDGET,
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
@@ -42,12 +43,13 @@ from app.problem_model import (
     apply_user_intent_patch,
     archive_closed_gaps,
     auto_archive_stale_problem_model_items,
-    lifecycle_bound_problem_model,
     check_gap_id_write,
     classify_gap_link,
     compute_model_size_signal,
     capability_evidence_status,
     gap_evidence_status,
+    detect_wipe_risk,
+    enforce_problem_model_size,
     gc_problem_model,
     is_empty,
     normalize_active_moves_writeback,
@@ -711,10 +713,6 @@ def test_gc_problem_model_deduplicates_archived_gaps():
     assert kept_dup.name == "newer copy"
 
 
-# ---------------------------------------------------------------------------
-# lifecycle_bound_problem_model — direct unit
-# ---------------------------------------------------------------------------
-
 _LB_NOW = "2026-07-07T12:00:00"
 
 
@@ -729,187 +727,7 @@ def _deferred_gap(gap_id: str, deferral: GapDeferral, **kw) -> Gap:
     )
 
 
-def test_lifecycle_archives_gap_with_aged_hold_until():
-    """An active, unstaffed gap whose deferral hold_until is in the past is
-    marked abandoned, stamped closed, gets a lifecycle history event, and moves
-    into archived_gaps (reversible — still re-fetchable by id)."""
-    gap = _deferred_gap(
-        "g-aged",
-        GapDeferral(rationale="later", hold_until="2026-01-01T00:00:00"),
-    )
-    model = ProblemModel(gaps=[gap])
-
-    summary = lifecycle_bound_problem_model(model, _LB_NOW)
-
-    assert summary == {"gaps_lifecycle_archived": ["g-aged"]}
-    assert model.gaps == []
-    archived = {g.id: g for g in model.archived_gaps}
-    assert "g-aged" in archived
-    moved = archived["g-aged"]
-    assert moved.status == "abandoned"
-    assert moved.closed == _LB_NOW
-    assert moved.history[-1].event == "lifecycle_auto_archived"
-
-
-def test_lifecycle_preserves_gap_with_future_hold_until():
-    """A fresh/held deferral (hold_until in the future) is never touched."""
-    gap = _deferred_gap(
-        "g-held",
-        GapDeferral(rationale="pinned", hold_until="2027-01-01T00:00:00"),
-    )
-    model = ProblemModel(gaps=[gap])
-    before = model.model_dump()
-
-    summary = lifecycle_bound_problem_model(model, _LB_NOW)
-
-    assert summary == {}
-    assert model.model_dump() == before
-
-
-def test_lifecycle_created_at_grace_boundary():
-    """When hold_until is absent/unparseable, created_at drives staleness against
-    a generous grace window: within the window is preserved, past it is
-    archived."""
-    fresh = _deferred_gap(
-        "g-fresh",
-        GapDeferral(rationale="milestone", hold_until="v22", created_at=_LB_NOW),
-    )
-    aged = _deferred_gap(
-        "g-lapsed",
-        GapDeferral(
-            rationale="milestone",
-            hold_until="v22",  # unparseable → fall back to created_at
-            created_at="2026-01-01T00:00:00",  # far past the grace window
-        ),
-    )
-    model = ProblemModel(gaps=[fresh, aged])
-
-    summary = lifecycle_bound_problem_model(model, _LB_NOW)
-
-    assert summary == {"gaps_lifecycle_archived": ["g-lapsed"]}
-    assert {g.id for g in model.gaps} == {"g-fresh"}
-    assert {g.id for g in model.archived_gaps} == {"g-lapsed"}
-    # Grace window is generous — a full month — so a recently-deferred gap is safe.
-    assert DEFERRAL_STALE_GRACE_DAYS >= 14
-
-
-def test_lifecycle_never_touches_staffed_or_undeferred_gaps():
-    """A gap with active_moves, or one carrying no deferral at all, is never
-    archived even when the deferral (if any) is aged."""
-    staffed = _deferred_gap(
-        "g-staffed",
-        GapDeferral(rationale="x", hold_until="2020-01-01T00:00:00"),
-        active_moves=["d-live"],
-    )
-    undeferred = Gap(
-        id="g-plain", name="plain", status="active", opened="2026-01-01T00:00:00"
-    )
-    model = ProblemModel(gaps=[staffed, undeferred])
-    before = model.model_dump()
-
-    summary = lifecycle_bound_problem_model(model, _LB_NOW)
-
-    assert summary == {}
-    assert model.model_dump() == before
-
-
-def test_lifecycle_ignores_deferral_without_usable_dates():
-    """A deferral with an unparseable hold_until and no created_at yields no
-    usable age signal — the gap is left alone (conservative)."""
-    gap = _deferred_gap(
-        "g-nodate",
-        GapDeferral(rationale="someday", hold_until="when-ready"),
-    )
-    model = ProblemModel(gaps=[gap])
-    before = model.model_dump()
-
-    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
-    assert model.model_dump() == before
-
-
-def test_lifecycle_drops_terminal_friction_toward_healthy_floor():
-    """Terminal (resolved/mitigated) friction is dropped oldest-first, resolved
-    before mitigated, only as far as needed to reach the healthy threshold."""
-    # 2 over the healthy floor, all terminal.
-    friction = [
-        Friction(id=f"f-res-{i}", name=f"r{i}", status="resolved")
-        for i in range(MODEL_SIZE_HEALTHY_FRICTION)
-    ] + [
-        Friction(id="f-mit-0", name="m0", status="mitigated"),
-        Friction(id="f-mit-1", name="m1", status="mitigated"),
-    ]
-    model = ProblemModel(friction=friction)
-
-    summary = lifecycle_bound_problem_model(model, _LB_NOW)
-
-    assert len(model.friction) == MODEL_SIZE_HEALTHY_FRICTION
-    # Resolved are most disposable → the two oldest resolved go first.
-    assert summary["friction_lifecycle_evicted"] == ["f-res-0", "f-res-1"]
-
-
-def test_lifecycle_never_drops_active_friction():
-    """An all-active friction list above the healthy floor is left untouched —
-    live state is never dropped to satisfy a bound."""
-    friction = [
-        Friction(id=f"f-{i}", name=f"a{i}", status="active")
-        for i in range(MODEL_SIZE_HEALTHY_FRICTION + 5)
-    ]
-    model = ProblemModel(friction=friction)
-    before = model.model_dump()
-
-    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
-    assert model.model_dump() == before
-
-
-def test_lifecycle_drops_planned_capabilities_toward_healthy_floor():
-    """Surplus planned (never-built) capabilities are dropped oldest-first;
-    working/partial are never dropped."""
-    caps = [
-        Capability(name=f"working-{i}", status="working")
-        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES)
-    ] + [
-        Capability(name="planned-0", status="planned"),
-        Capability(name="planned-1", status="planned"),
-        Capability(name="partial-live", status="partial"),
-    ]
-    model = ProblemModel(capabilities=caps)
-
-    summary = lifecycle_bound_problem_model(model, _LB_NOW)
-
-    # 3 over the floor, but only 2 are planned (evictable); partial is kept.
-    assert summary["capabilities_lifecycle_evicted"] == ["planned-0", "planned-1"]
-    kept = {c.name for c in model.capabilities}
-    assert "partial-live" in kept
-    assert "planned-0" not in kept and "planned-1" not in kept
-
-
-def test_lifecycle_all_live_capabilities_untouched():
-    """An all-working/partial capability list above the floor is left untouched."""
-    caps = [
-        Capability(name=f"c-{i}", status="working" if i % 2 else "partial")
-        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES + 6)
-    ]
-    model = ProblemModel(capabilities=caps)
-    before = model.model_dump()
-
-    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
-    assert model.model_dump() == before
-
-
-def test_lifecycle_empty_model_is_noop_byte_identical():
-    """The no-op path returns {} and leaves the model byte-identical."""
-    model = ProblemModel(
-        gaps=[Gap(id="g", name="live", status="active")],
-        friction=[Friction(id="f", name="a", status="active")],
-        capabilities=[Capability(name="c", status="working")],
-    )
-    before = model.model_dump()
-
-    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
-    assert model.model_dump() == before
-
-
-# auto_archive_stale_problem_model_items — enhanced lifecycle with live_direction_ids
+# auto_archive_stale_problem_model_items — lifecycle with live_direction_ids
 # ---------------------------------------------------------------------------
 
 
@@ -1056,34 +874,6 @@ def test_auto_archive_gap_undeferred_active_never_archived():
     assert summary == {}
     assert model.model_dump() == before
     assert all(g.status == "active" for g in model.gaps)
-
-
-def test_auto_archive_delegates_from_lifecycle_wrapper():
-    """lifecycle_bound_problem_model delegates to
-    auto_archive_stale_problem_model_items — same behavior with empty
-    live_direction_ids."""
-    gap = _deferred_gap(
-        "g-aged",
-        GapDeferral(rationale="later", hold_until="2020-01-01T00:00:00"),
-    )
-    healthy_gaps = [
-        Gap(
-            id=f"g-h-{i}",
-            name=f"healthy {i}",
-            status="active",
-            opened="2026-06-01T00:00:00",
-            active_moves=[],
-        )
-        for i in range(MODEL_SIZE_HEALTHY_GAPS)
-    ]
-    model1 = ProblemModel(gaps=[gap] + healthy_gaps)
-    model2 = model1.model_copy(deep=True)
-
-    s1 = lifecycle_bound_problem_model(model1, _LB_NOW)
-    s2 = auto_archive_stale_problem_model_items(model2, _LB_NOW)
-
-    assert s1 == s2
-    assert model1.model_dump() == model2.model_dump()
 
 
 def test_apply_agent_update_caps_archived_gaps():
@@ -1461,6 +1251,38 @@ def test_gc_problem_model_byte_aware_runs_when_capfriction_are_bulk():
     assert {g.id for g in model.gaps} == {"g-live"}
 
 
+def test_gc_raises_when_live_core_over_budget():
+    """When a problem_model's live core (active gaps + live capabilities + active
+    friction) alone exceeds PROBLEM_MODEL_BYTE_BUDGET, gc_problem_model evicts
+    all reference-only state then raises ValueError naming the dominant oversize
+    section — the loud failure instead of a silent no-op or silent commit."""
+    big = "x" * 6_000
+
+    gaps = [
+        Gap(
+            id=f"g-{i}", name=f"active gap {i}", status="active",
+            description=big, active_moves=[],
+        )
+        for i in range(6)
+    ]
+    capabilities = [
+        Capability(name=f"cap-{i}", status="working", notes=big)
+        for i in range(6)
+    ]
+    friction = [
+        Friction(id=f"f-{i}", name=f"active {i}", status="active", description=big)
+        for i in range(6)
+    ]
+
+    model = ProblemModel(gaps=gaps, capabilities=capabilities, friction=friction)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "test setup: must exceed budget to trigger the loud-failure path"
+    )
+
+    with pytest.raises(ValueError, match="live core exceeds PROBLEM_MODEL_BYTE_BUDGET"):
+        gc_problem_model(model)
+
+
 def test_gc_problem_model_caps_capabilities_and_friction_count():
     """Count caps evict terminal entries down to the durable max even when the
     model is under the byte budget; live entries are never dropped to satisfy a
@@ -1509,7 +1331,11 @@ def test_gc_problem_model_count_cap_never_evicts_all_live():
     summary = gc_problem_model(model)
 
     # No live entry evicted even though both collections exceed their caps.
-    assert summary == {}
+    # The cap collections alone (with no archived/terminal entries) keep this
+    # model under the byte budget, so no ValueError is raised.  What must NOT
+    # happen regardless is eviction of any live entry.
+    assert "capabilities_evicted" not in summary
+    assert "friction_evicted" not in summary
     assert len(model.capabilities) == CAPABILITIES_DURABLE_MAX + 10
     assert len(model.friction) == FRICTION_DURABLE_MAX + 10
 
@@ -1712,13 +1538,17 @@ def test_apply_agent_update_bootstrap_over_mature_preserves_collections():
 def test_apply_agent_update_explicit_empty_collections_preserve_via_merge():
     """Explicitly submitting empty arrays for all three collections over a
     mature model still preserves them — an empty list is no upserts, not a
-    wipe. Removal is only via the explicit ``_deletions`` directive."""
+    wipe. Removal is only via the explicit ``_deletions`` directive.
+    The diff now also carries wipe-risk signals for gaps and capabilities."""
     current = _mature_current()
     proposed = {"capabilities": [], "gaps": [], "friction": []}
-    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
     assert {c["name"] for c in new_raw["capabilities"]} == {"Billing", "Metering"}
     assert {g["id"] for g in new_raw["gaps"]} == {"g-1"}
     assert {f["id"] for f in new_raw["friction"]} == {"f-1"}
+    # Wipe-risk signals surface in the diff even though the merge preserved entries.
+    assert diff.get("gaps_wipe_risk") is True
+    assert diff.get("capabilities_wipe_risk") is True
 
 
 def test_apply_agent_update_close_by_status_edit_passes():
@@ -4143,8 +3973,12 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     consolidation write — ``_deletions.capabilities`` removing several old names
     plus a working survivor that declares them in ``absorbs`` — makes each old
     name resolve through ``working_capability_names`` +
-    ``registry_satisfies_capability_need``."""
+    ``registry_satisfies_capability_need`` ONLY when the alias relationship is
+    PLATFORM-RECORDED via forwarding markers in ``proof_records``. An agent-declared
+    ``absorbs`` list alone (without corresponding forwarding markers) does NOT
+    cause absorbed names to resolve — closing the alias-forgery bypass."""
     from app.capability_registry import (
+        CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND,
         PLATFORM_WORKING_CAPABILITIES,
         registry_satisfies_capability_need,
         working_capability_names,
@@ -4176,12 +4010,26 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     names = [c["name"] for c in new_raw["capabilities"]]
     assert names == ["ci-pipeline"]
 
-    # working_capability_names folds the absorbed aliases in alongside the
-    # survivor's own name. It also ALWAYS includes the always-working
+    # Simulate the platform forwarding markers that a real consolidation would
+    # leave via carry_proof_records_for_consolidation. Without these markers,
+    # the absorbed names must NOT resolve through working_capability_names.
+    proof_records: dict = {}
+    for _absorbed in ("ci-poll", "ci-resolve", "ci-fix-spawn"):
+        proof_records[_absorbed] = [
+            {
+                "proof_kind": CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND,
+                "survivor": "ci-pipeline",
+                "task_id": f"consolidation:{_absorbed}",
+                "proved_at": "2026-06-10T12:00:00",
+            }
+        ]
+
+    # working_capability_names folds the PLATFORM-RECORDED absorbed aliases in
+    # alongside the survivor's own name. It also ALWAYS includes the always-working
     # PLATFORM_WORKING_CAPABILITIES (foundation capabilities unrelated to this
     # consolidation), so the survivor + its three absorbed aliases are exactly
     # the project-model contribution on top of the platform set.
-    working = working_capability_names(new_raw)
+    working = working_capability_names(new_raw, proof_records=proof_records)
     assert working == {
         "ci-pipeline",
         "ci-poll",
@@ -6089,6 +5937,83 @@ def test_auto_clear_empty_model_is_noop():
     assert model.model_dump() == before
 
 
+def test_alias_forgery_rejected_at_existence_check():
+    """A forged alias in the agent-writable ``absorbs`` list — without a
+    corresponding platform forwarding marker in ``proof_records`` — does NOT
+    resolve through ``working_capability_names`` at ANY of the three consumer
+    seams.
+
+    This pinning test closes the alias-forgery bypass (existence/authority alias
+    divergence): formerly, ``working_capability_names`` read ``absorbs`` from the
+    agent-writable problem_model, so a forged entry like:
+      ``{"name": "bogus", "status": "working", "absorbs": ["real-proven-cap"]}``
+    would include ``"real-proven-cap"`` in the working set, letting a need for
+    that capability satisfy the existence check without any platform-recorded
+    proof relationship. Now only platform-ledger forwarding markers
+    (``absorbed_into``) contribute alias names.
+    """
+    from app.capability_registry import (
+        PLATFORM_WORKING_CAPABILITIES,
+        registry_satisfies_capability_need,
+        working_capability_names,
+    )
+
+    # An agent writes a new capability entry with a forged absorbs that names a
+    # (possibly real) capability — but there is NO platform forwarding marker
+    # for this relationship.
+    forged_model = {
+        "capabilities": [
+            {
+                "name": "my-forged-capability",
+                "status": "working",
+                "absorbs": ["real-proven-capability"],
+            },
+        ],
+    }
+
+    # SCENARIO 1: No proof_records at all → no alias resolution.
+    working = working_capability_names(forged_model)
+    # The forged capability's own name IS in the working set (it's declared working).
+    assert "my-forged-capability" in working
+    # But the forged alias name is NOT included — no platform markers exist.
+    assert "real-proven-capability" not in working
+    # Therefore the existence check for the forged alias fails.
+    assert not registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "real-proven-capability"}, working
+    )
+
+    # SCENARIO 2: proof_records is provided but contains NO forwarding markers
+    # for the forged alias → still not resolved.
+    working_with_ledger = working_capability_names(
+        forged_model,
+        proof_records={
+            # Some unrelated entries exist in the ledger
+            "unrelated-cap": [
+                {"proof_kind": "named_test", "proven": True, "task_id": "t-1"}
+            ],
+        },
+    )
+    assert "my-forged-capability" in working_with_ledger
+    assert "real-proven-capability" not in working_with_ledger
+    assert not registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "real-proven-capability"}, working_with_ledger
+    )
+
+    # SCENARIO 3: Even when some of the working set is PLATFORM capabilities,
+    # the forged alias still does not resolve.
+    assert "real-proven-capability" not in PLATFORM_WORKING_CAPABILITIES
+    working_platform = working_capability_names(forged_model)
+    # Platform capabilities are unaffected.
+    for plat in PLATFORM_WORKING_CAPABILITIES:
+        assert plat in working_platform
+    # Forged alias is still absent.
+    assert "real-proven-capability" not in working_platform
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — packer/view marker sanitization (regression for
+# poisoned stored problem_model containing "truncated": true)
+# ---------------------------------------------------------------------------
 def test_apply_agent_update_poisoned_current_raw_with_truncated_self_heals():
     """A stored problem_model containing 'truncated': true at the top level
     (a stale packer marker that was somehow persisted) must not block every
@@ -6145,3 +6070,623 @@ def test_apply_agent_update_both_current_and_proposed_poisoned_succeeds():
     assert new_raw["revision"] == 11
     assert new_raw["intent"]["purpose"] == "Fresh purpose."
     assert "truncated" not in new_raw
+
+
+# ---------------------------------------------------------------------------
+# sanitize_problem_model_raw
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_problem_model_raw_strips_packer_markers():
+    """All three packer markers are removed by sanitize_problem_model_raw."""
+    raw = {
+        "revision": 5,
+        "intent": {"purpose": "p", "current_focus": ""},
+        "truncated": True,
+        "_agent_view_floor_applied": "gap-abc",
+        "_gap_memory_trimmed": True,
+    }
+    result = sanitize_problem_model_raw(raw)
+    assert "truncated" not in result
+    assert "_agent_view_floor_applied" not in result
+    assert "_gap_memory_trimmed" not in result
+    # Known fields are preserved
+    assert result["revision"] == 5
+    assert result["intent"] == {"purpose": "p", "current_focus": ""}
+
+
+def test_sanitize_problem_model_raw_strips_unknown_keys():
+    """Unknown top-level keys (beyond packer markers) are also removed."""
+    raw = {
+        "revision": 1,
+        "some_unknown_field": "should be gone",
+        "_another_directive": [1, 2, 3],
+    }
+    result = sanitize_problem_model_raw(raw)
+    assert "some_unknown_field" not in result
+    assert "_another_directive" not in result
+    assert result["revision"] == 1
+
+
+def test_sanitize_problem_model_raw_preserves_all_known_keys():
+    """All ProblemModel fields pass through sanitize_problem_model_raw unchanged."""
+    from app.problem_model import ProblemModel
+    known_fields = set(ProblemModel.model_fields)
+    raw = {k: None for k in known_fields}
+    raw["revision"] = 3
+    result = sanitize_problem_model_raw(raw)
+    # Every known field is present in the output
+    for field in known_fields:
+        assert field in result
+    # No unexpected extras
+    assert set(result.keys()) == known_fields
+
+
+def test_sanitize_problem_model_raw_empty_dict():
+    """Empty dict is returned unchanged (no crash, no phantom keys)."""
+    result = sanitize_problem_model_raw({})
+    assert result == {}
+
+
+def test_sanitize_problem_model_raw_output_is_pydantic_parseable():
+    """sanitize_problem_model_raw output round-trips through ProblemModel cleanly."""
+    raw = {
+        "revision": 2,
+        "truncated": True,
+        "_agent_view_floor_applied": "g-1",
+        "intent": {"purpose": "test purpose", "current_focus": "current"},
+        "gaps": [],
+        "capabilities": [],
+    }
+    sanitized = sanitize_problem_model_raw(raw)
+    # Must not raise ValidationError
+    model = parse_problem_model(sanitized)
+    assert model.revision == 2
+    assert model.intent.purpose == "test purpose"
+
+
+# ---------------------------------------------------------------------------
+# PACKER_MARKER_KEYS coverage — every known marker must be stripped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("marker_key", sorted(PACKER_MARKER_KEYS))
+def test_sanitize_problem_model_raw_covers_all_known_markers(marker_key: str):
+    """Every key in PACKER_MARKER_KEYS is stripped by sanitize_problem_model_raw.
+
+    Adding a new packer marker to the constant automatically expands this
+    parameterized test's coverage — a new marker that is NOT stripped by
+    sanitize_problem_model_raw will fail here."""
+    raw = {
+        "revision": 1,
+        "intent": {"purpose": "test", "current_focus": ""},
+        marker_key: "some_value",
+    }
+    result = sanitize_problem_model_raw(raw)
+    assert marker_key not in result, (
+        f"PACKER_MARKER_KEYS includes '{marker_key}' but "
+        f"sanitize_problem_model_raw did not strip it"
+    )
+    # Known fields preserved
+    assert result["revision"] == 1
+    assert result["intent"] == {"purpose": "test", "current_focus": ""}
+
+
+@pytest.mark.parametrize("marker_key", sorted(PACKER_MARKER_KEYS))
+def test_apply_agent_update_strips_all_known_markers_from_both_inputs(marker_key: str):
+    """Every key in PACKER_MARKER_KEYS is stripped from both current_raw and
+    proposed_raw by apply_agent_update."""
+    marker_value: object = True  # All known markers accept a bool or str truthy value
+    current = {
+        "revision": 3,
+        "intent": {"purpose": "Current.", "current_focus": ""},
+        marker_key: marker_value,
+    }
+    proposed = {
+        "intent": {"purpose": "Updated.", "current_focus": ""},
+        marker_key: marker_value,
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-07-22T10:00:00")
+    assert marker_key not in new_raw, (
+        f"PACKER_MARKER_KEYS includes '{marker_key}' but "
+        f"apply_agent_update did not strip it from the output"
+    )
+    # Write succeeded and the update went through
+    assert new_raw["revision"] == 4
+    assert new_raw["intent"]["purpose"] == "Updated."
+
+
+# ---------------------------------------------------------------------------
+# detect_wipe_risk + apply_agent_update wipe-risk diff signals
+# ---------------------------------------------------------------------------
+
+
+def _model_with_gaps_and_caps() -> ProblemModel:
+    return parse_problem_model({
+        "revision": 3,
+        "capabilities": [{"name": "Auth", "status": "working"}],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    })
+
+
+def test_detect_wipe_risk_gaps_no_deletions():
+    """Empty proposed gaps over a non-empty durable model with no _deletions
+    fires gaps_wipe_risk."""
+    current = _model_with_gaps_and_caps()
+    proposed = parse_problem_model({
+        "capabilities": [{"name": "Auth", "status": "working"}],
+        "gaps": [],
+    })
+    result = detect_wipe_risk(current, proposed, deletions=None)
+    assert result.get("gaps_wipe_risk") is True
+    assert "capabilities_wipe_risk" not in result
+
+
+def test_detect_wipe_risk_capabilities_no_deletions():
+    """Empty proposed capabilities over a non-empty durable model with no
+    _deletions fires capabilities_wipe_risk."""
+    current = _model_with_gaps_and_caps()
+    proposed = parse_problem_model({
+        "capabilities": [],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    })
+    result = detect_wipe_risk(current, proposed, deletions=None)
+    assert result.get("capabilities_wipe_risk") is True
+    assert "gaps_wipe_risk" not in result
+
+
+def test_detect_wipe_risk_with_deletions_not_blocked():
+    """When _deletions.gaps explicitly names the gap ids, the wipe is intentional
+    and the risk flag must NOT fire."""
+    current = _model_with_gaps_and_caps()
+    proposed = parse_problem_model({
+        "capabilities": [],
+        "gaps": [],
+    })
+    deletions = {"gaps": ["g-1"], "capabilities": ["Auth"]}
+    result = detect_wipe_risk(current, proposed, deletions=deletions)
+    assert result == {}
+
+
+def test_detect_wipe_risk_empty_current_not_blocked():
+    """First-cycle write: current model is empty, so there is nothing to wipe.
+    No risk flags should fire."""
+    current = parse_problem_model(None)
+    proposed = parse_problem_model({"gaps": [], "capabilities": []})
+    result = detect_wipe_risk(current, proposed, deletions=None)
+    assert result == {}
+
+
+def test_full_collection_wipe_without_deletions_is_rejected():
+    """apply_agent_update must surface gaps_wipe_risk and capabilities_wipe_risk
+    in the diff when the agent proposes empty collections over a non-empty
+    durable model without a _deletions directive, AND must preserve the existing
+    entries via the non-destructive merge."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {"name": "Billing", "status": "working"},
+            {"name": "Metering", "status": "partial"},
+        ],
+        "gaps": [
+            {"id": "g-1", "name": "invoicing", "status": "active"},
+            {"id": "g-2", "name": "reporting", "status": "active"},
+        ],
+    }
+    # Agent proposes completely empty collections with no _deletions directive.
+    proposed = {"capabilities": [], "gaps": []}
+    new_raw, diff = apply_agent_update(current, proposed, "2026-07-22T10:00:00")
+
+    # Wipe risk signals must appear in the diff.
+    assert diff.get("gaps_wipe_risk") is True, (
+        "Expected gaps_wipe_risk in diff when agent proposes empty gaps "
+        "over a non-empty durable model without _deletions"
+    )
+    assert diff.get("capabilities_wipe_risk") is True, (
+        "Expected capabilities_wipe_risk in diff when agent proposes empty "
+        "capabilities over a non-empty durable model without _deletions"
+    )
+
+    # Existing entries must still be preserved (non-destructive merge).
+    assert {c["name"] for c in new_raw["capabilities"]} == {"Billing", "Metering"}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-1", "g-2"}
+
+
+def test_apply_agent_update_wipe_risk_absent_when_deletions_cover_all():
+    """When _deletions explicitly names every gap and capability, the wipe is
+    intentional — no wipe-risk flags appear in the diff."""
+    current = {
+        "revision": 2,
+        "capabilities": [{"name": "Auth", "status": "working"}],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    }
+    proposed = {
+        "capabilities": [],
+        "gaps": [],
+        "_deletions": {"gaps": ["g-1"], "capabilities": ["Auth"]},
+    }
+    _, diff = apply_agent_update(current, proposed, "2026-07-22T10:00:00")
+    assert "gaps_wipe_risk" not in diff
+    assert "capabilities_wipe_risk" not in diff
+
+
+def test_apply_agent_update_no_wipe_risk_on_first_cycle():
+    """A genuine first cycle (empty current) bootstrapping an empty model must
+    not produce wipe-risk signals — there is nothing to preserve."""
+    _, diff = apply_agent_update(
+        None,
+        {"intent": {"purpose": "Bootstrap."}, "gaps": [], "capabilities": []},
+        "2026-07-22T10:00:00",
+    )
+    assert "gaps_wipe_risk" not in diff
+    assert "capabilities_wipe_risk" not in diff
+
+
+# ---------------------------------------------------------------------------
+# Regression: poisoned baseline_raw must not wedge apply_agent_update
+# ---------------------------------------------------------------------------
+
+
+def test_apply_agent_update_poisoned_baseline_sanitized():
+    """apply_agent_update succeeds when stored row AND baseline snapshot both
+    carry packer-injected markers (e.g. 'truncated': True).  Before the fix,
+    parse_problem_model(baseline_raw) threw extra_forbidden; the handler
+    converted that to HTTP 400, wedging every strategist problem-model write
+    for cycles that already had a poisoned snapshot."""
+    poisoned_marker = {"truncated": True, "_agent_view_floor_applied": True}
+
+    current = {
+        "revision": 7,
+        "intent": {"purpose": "Current purpose.", "current_focus": ""},
+        **poisoned_marker,
+    }
+    proposed = {
+        "intent": {"purpose": "Updated purpose.", "current_focus": ""},
+    }
+    baseline_raw = {
+        "revision": 6,
+        "intent": {"purpose": "Baseline purpose.", "current_focus": ""},
+        **poisoned_marker,
+    }
+
+    new_raw, diff = apply_agent_update(
+        current,
+        proposed,
+        "2026-07-22T10:00:00",
+        baseline_raw=baseline_raw,
+    )
+
+    assert new_raw["revision"] == 8
+    assert "truncated" not in new_raw
+    assert "_agent_view_floor_applied" not in new_raw
+    assert new_raw["intent"]["purpose"] == "Updated purpose."
+
+
+# ---------------------------------------------------------------------------
+# Over-budget live-core detection (rev-1367 wipe precondition)
+# ---------------------------------------------------------------------------
+
+
+def _make_oversized_live_core_model() -> ProblemModel:
+    """Build a model whose live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET.
+
+    Uses large-notes working capabilities and active gaps with no terminal
+    (evictable) entries — gc_problem_model cannot bring the model under the cap
+    via history eviction alone.
+    """
+    big = "x" * 5_000
+    # Working capabilities — never evicted.
+    caps = [
+        Capability(name=f"cap-live-{i}", status="working", notes=big)
+        for i in range(12)
+    ]
+    # Active gaps — never evicted.
+    gaps = [
+        Gap(id=f"g-live-{i}", name=f"gap {i}", status="active", description=big)
+        for i in range(8)
+    ]
+    model = ProblemModel(capabilities=caps, gaps=gaps)
+    # Confirm the model actually exceeds the budget before returning.
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "Test helper failed to build an oversized model — increase big or counts."
+    )
+    return model
+
+
+def test_oversized_live_core_signals_loudly():
+    """gc_problem_model raises ValueError naming the oversize section when the
+    live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction.
+
+    This is the acceptance test for the rev-1367 loud-failure guard: the error
+    must name the dominant section (active_gaps, live_capabilities, or
+    active_friction) so the operator knows exactly what to reduce.
+    """
+    model = _make_oversized_live_core_model()
+
+    with pytest.raises(ValueError) as exc_info:
+        gc_problem_model(model)
+
+    msg = str(exc_info.value)
+    assert "live core exceeds PROBLEM_MODEL_BYTE_BUDGET" in msg
+    # The error message must name one of the live sections.
+    assert any(section in msg for section in ("active_gaps", "live_capabilities", "active_friction")), (
+        f"Expected error to name an oversize section; got: {msg}"
+    )
+
+
+def test_gc_live_core_oversize_evicts_first_then_raises():
+    """Regression: when the live core exceeds the byte budget, gc_problem_model
+    still evicts all available reference-only state (archived gaps, terminal
+    caps/friction) before raising — it does NOT silently no-op.
+
+    Construct a model that has BOTH a large live core AND evictable archived
+    gaps.  After gc_problem_model raises, the archived gaps must be gone
+    (eviction ran) and the error must name the oversize section.
+    """
+    big = "x" * 8_000
+    # Live core — cannot be evicted.
+    live_gaps = [
+        Gap(id=f"g-live-{i}", name=f"live gap {i}", status="active", description=big)
+        for i in range(12)
+    ]
+    # Reference-only archived gaps — should be evicted before raising.
+    archived = [
+        Gap(id=f"g-arch-{i}", name=f"archived {i}", status="closed",
+            closed=f"2026-0{(i % 9) + 1}-01T00:00:00")
+        for i in range(5)
+    ]
+    model = ProblemModel(gaps=live_gaps, archived_gaps=archived)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "test setup: model must exceed budget"
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        gc_problem_model(model)
+
+    msg = str(exc_info.value)
+    # Error must name the oversize section.
+    assert "active_gaps" in msg or "live_capabilities" in msg or "active_friction" in msg, (
+        f"Expected error to name an oversize section; got: {msg}"
+    )
+    # Eviction ran before raising — archived gaps must be gone.
+    assert model.archived_gaps == [], (
+        "Expected archived_gaps evicted before raise, but some remain"
+    )
+    # Live gaps must be untouched.
+    assert len(model.gaps) == len(live_gaps)
+
+
+def test_gc_problem_model_evictable_model_does_not_raise():
+    """A model that IS evictable (has terminal caps/archived gaps pushing it
+    over budget) must NOT raise — the byte eviction pass runs and brings it
+    under the cap. No ValueError is raised when eviction succeeds.
+    """
+    big = "w" * 5_000
+    # Terminal / evictable entries that push the model over budget.
+    planned_caps = [
+        Capability(name=f"planned-{i}", status="planned", notes=big)
+        for i in range(25)
+    ]
+    live_cap = Capability(name="cap-working", status="working")
+    model = ProblemModel(capabilities=[*planned_caps, live_cap])
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    # The live working capability survived eviction.
+    assert any(c.name == "cap-working" for c in model.capabilities)
+
+
+def test_apply_agent_update_live_core_exceeds_budget_returns_flag():
+    """apply_agent_update does NOT raise when the live core exceeds
+    PROBLEM_MODEL_BYTE_BUDGET — instead it sets diff["live_core_exceeds_budget"]
+    to the oversize section description and returns normally, so the op endpoint
+    can return HTTP 400 (not an opaque 500) naming the problematic section.
+    """
+    big = "x" * 5_000
+    # Build a current model whose live core is over budget (all working/active).
+    current_raw = {
+        "revision": 3,
+        "capabilities": [
+            {"name": f"cap-live-{i}", "status": "working", "notes": big}
+            for i in range(12)
+        ],
+        "gaps": [
+            {"id": f"g-live-{i}", "name": f"gap {i}", "status": "active", "description": big}
+            for i in range(8)
+        ],
+    }
+    proposed = {"gaps": current_raw["gaps"]}
+
+    # Must NOT raise — the overflow is surfaced as a structured diff flag.
+    result_raw, diff = apply_agent_update(current_raw, proposed, "2026-07-22T12:00:00")
+
+    assert diff.get("live_core_exceeds_budget"), (
+        "Expected diff['live_core_exceeds_budget'] to be set when live core is over budget"
+    )
+    oversize_section = diff["live_core_exceeds_budget"]
+    assert isinstance(oversize_section, str)
+    assert any(
+        s in oversize_section for s in ("active_gaps", "live_capabilities", "active_friction")
+    ), f"Expected section name in live_core_exceeds_budget; got: {oversize_section}"
+    # A model dict is still returned (callers check the flag before deciding to commit).
+    assert isinstance(result_raw, dict)
+
+
+# ---------------------------------------------------------------------------
+# strategic_completion integration: oversized model must NOT be persisted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_oversize_model_not_persisted(db_session, mocker):
+    """When apply_agent_update returns live_core_exceeds_budget in the diff,
+    strategic_completion must NOT write the new model to project.problem_model.
+    The prior model must be preserved unchanged.
+
+    This is the acceptance test for the rev-1367 regression guard: the oversized
+    model that previously poisoned durable state must be silently rejected rather
+    than committed.
+    """
+    import json
+    from unittest.mock import AsyncMock
+
+    from app.models import Project, Task
+    from app.strategic_completion import _handle_strategic_completion
+
+    prior_pm = {"revision": 5, "gaps": [], "capabilities": []}
+
+    project = Project(
+        name="oversize-pm-test",
+        user_id="u1",
+        problem_model=prior_pm,
+        vision={"revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "p", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    oversized_raw = {
+        "revision": 6,
+        "gaps": [{"id": f"g-{i}", "name": f"g {i}", "status": "active"} for i in range(10)],
+        "capabilities": [],
+    }
+    mocker.patch(
+        "app.problem_model.apply_agent_update",
+        return_value=(oversized_raw, {"live_core_exceeds_budget": "active_gaps"}),
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_problem_model_live_core_alert",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    logs = json.dumps({"problem_model": oversized_raw})
+    await _handle_strategic_completion(task, logs, db_session, project=project)
+
+    await db_session.refresh(project)
+    pm = project.problem_model or {}
+    assert pm.get("revision") == 5, (
+        f"Oversized model must NOT be persisted; expected revision=5, got {pm.get('revision')}"
+    )
+    assert len(pm.get("gaps", [])) == 0, (
+        f"Prior model gaps must be preserved; got {len(pm.get('gaps', []))} gap(s)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# enforce_problem_model_size helper
+# ---------------------------------------------------------------------------
+
+
+def test_enforce_problem_model_size_under_budget_returns_none_section():
+    """A model under budget: enforce_problem_model_size returns (summary, None)."""
+    model = ProblemModel(
+        gaps=[Gap(id="g-1", name="small gap", status="active", description="short")]
+    )
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    gc_summary, oversize_section = enforce_problem_model_size(model)
+    assert oversize_section is None, (
+        f"Expected no oversize section for an under-budget model; got: {oversize_section}"
+    )
+    assert isinstance(gc_summary, dict)
+
+
+def test_enforce_problem_model_size_evictable_returns_none_section():
+    """A model that is over budget but has evictable archived gaps:
+    enforce_problem_model_size evicts them and returns (summary, None)."""
+    big = "w" * 5_000
+    archived = [
+        Gap(id=f"g-arch-{i}", name=f"arch {i}", status="closed",
+            closed=f"2025-0{(i % 9) + 1}-01T00:00:00", description=big)
+        for i in range(20)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "test setup: model must exceed budget before eviction"
+    )
+    _gc_summary, oversize_section = enforce_problem_model_size(model)
+    assert oversize_section is None, (
+        f"Expected no oversize section after eviction; got: {oversize_section}"
+    )
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+
+
+def test_operator_mutator_rejects_oversize():
+    """enforce_problem_model_size returns a non-None oversize_section for a model
+    whose live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction.
+
+    This proves GROW mutator paths (context edit, config patch, pending_confirm ADD)
+    will detect the overflow and must reject with HTTP 400 rather than committing
+    an oversized model — the non-None oversize_section is the signal callers
+    check before raising HTTPException 400.
+    """
+    model = _make_oversized_live_core_model()
+    gc_summary, oversize_section = enforce_problem_model_size(model)
+    # GROW paths check: oversize_section non-None → HTTP 400 must fire.
+    assert oversize_section is not None, (
+        "Expected enforce_problem_model_size to detect oversize live core "
+        "and return a non-None oversize_section so GROW paths can reject with 400"
+    )
+    assert any(
+        s in oversize_section
+        for s in ("active_gaps", "live_capabilities", "active_friction")
+    ), f"oversize_section must name the dominant section; got: {oversize_section}"
+    # enforce_problem_model_size must never raise — callers decide what to do.
+    assert isinstance(gc_summary, dict)
+
+
+def test_shrink_path_persists_bounded_result_does_not_reject():
+    """A SHRINK path (dismiss / resolve confirmation) on an already-oversized model:
+    enforce_problem_model_size does NOT raise; it returns (summary, oversize_section)
+    so the caller can still persist the (gc-bounded) result.
+
+    Removing a pending_confirmation from an oversized model reduces total bytes,
+    so the model after gc may or may not still be over budget — the key invariant
+    is that enforce_problem_model_size never raises regardless, and the model is
+    at least as small as it was before gc ran.
+    """
+    big = "x" * 5_000
+    caps = [
+        Capability(name=f"cap-live-{i}", status="working", notes=big)
+        for i in range(20)
+    ]
+    pending = [
+        PendingConfirmation(
+            id=f"p-{i}",
+            type="credentials_needed",
+            proposal="Need credentials",
+            created_at="2026-01-01T00:00:00",
+        )
+        for i in range(3)
+    ]
+    model = ProblemModel(capabilities=caps, pending_user_confirmation=pending)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "test setup: model must exceed budget"
+    )
+    bytes_before = _serialized_bytes(model)
+
+    # Simulate dismiss: remove one pending confirmation (SHRINK).
+    model.pending_user_confirmation = model.pending_user_confirmation[1:]
+
+    # enforce_problem_model_size must not raise, even if still over budget.
+    gc_summary, _oversize_section = enforce_problem_model_size(model)
+    assert isinstance(gc_summary, dict)
+    # The model must be at most as large as before gc ran.
+    assert _serialized_bytes(model) <= bytes_before, (
+        "enforce_problem_model_size must not grow the model"
+    )

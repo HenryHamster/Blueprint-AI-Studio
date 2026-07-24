@@ -42,6 +42,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
+from app.strategic_authority_locks import commit_legacy_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -276,10 +277,6 @@ async def _spawn_residual_fingerprint_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
-
             await commit_legacy_authorized(
                 session, project.id, expected_legacy_generation
             )
@@ -546,10 +543,6 @@ async def _spawn_residual_fingerprint_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
-
             await commit_legacy_authorized(
                 session, project.id, expected_legacy_generation
             )
@@ -681,10 +674,6 @@ async def _spawn_viewport_regression_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
-
             await commit_legacy_authorized(
                 session, project.id, expected_legacy_generation
             )
@@ -821,10 +810,6 @@ async def _spawn_viewport_regression_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
-
             await commit_legacy_authorized(
                 session, project.id, expected_legacy_generation
             )

@@ -62,7 +62,6 @@ function runtimeProps(runtimeSection: RuntimeSection) {
     onDirectionClick: vi.fn(),
     onConfigureTargets: vi.fn(),
     onSpawnOrphanFix: vi.fn(),
-    onPanelReviewPr: vi.fn(),
     onApproveExperiment: vi.fn(async () => {}),
     onDismissExperiment: vi.fn(async () => {}),
     onNavigateToKnowledge: vi.fn(),

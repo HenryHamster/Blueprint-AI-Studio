@@ -24,7 +24,7 @@ rides on those code payloads. This module is the single place that:
     success (:func:`acceptance_blocks_success`).
 
 The contract is deliberately ADDITIVE and fail-safe, mirroring
-:mod:`app.reproduction_scoring`: a task that declared NO acceptance evidence is
+the reproduction-scoring leaf module: a task that declared NO acceptance evidence is
 never blocked or retro-failed (the key is never written, so scoring is
 unchanged); a task that DECLARED evidence which is absent / unsatisfied records
 ``satisfied=False`` and is honestly held back from a verified-success credit.
@@ -117,9 +117,10 @@ def criterion_met(value: Any, op: str, threshold: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 # Additive, non-underscore context key the verdict travels under, so it
-# propagates through the standard context-copy paths exactly like
-# ``target_defect_reproduction``. Absence of the key means "no acceptance
-# verdict was recorded" and preserves prior bare-merge scoring exactly.
+# propagates through the standard context-copy paths (a pattern previously
+# used by the now-removed reproduction-scoring module). Absence of the key
+# means "no acceptance verdict was recorded" and preserves prior bare-merge
+# scoring exactly.
 CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 
 # Context key where the verify-tests handler stores the coverage measurement
@@ -288,6 +289,7 @@ _CROSS_CUTTING_TEST_FILES: frozenset[str] = frozenset({
     "backend/testing/test_c5_approval_gate_invariant.py",
     "backend/testing/test_event_type_invariants.py",
     "backend/testing/test_schema_invariants.py",
+    "backend/testing/test_workday_resident_invariants.py",
     # Validates the CI-compliance fetch/gate + cap-bump remediation flow, which
     # spans ci_compliance, strategic_spawning, strategic_completion,
     # release_version and models — no single ``ci_compliance_gate.py`` module
@@ -883,7 +885,7 @@ def acceptance_blocks_success(recorded: Any) -> bool:
     Absence of the key (``None``) — the case for every task that declared no
     acceptance evidence, plus all legacy rows — returns ``False`` so those tasks
     keep their current bare-merge success. Additive and backward-compatible,
-    mirroring :func:`app.reproduction_scoring.reproduction_blocks_success`.
+    mirroring the now-removed ``reproduction_blocks_success`` predicate.
     """
     if not isinstance(recorded, dict):
         return False

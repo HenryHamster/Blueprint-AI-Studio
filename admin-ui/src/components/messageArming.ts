@@ -13,7 +13,7 @@
  * so these helpers can be exported without tripping react-refresh's
  * only-export-components rule.
  */
-export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | 'duplicate' | 'resident_session';
+export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | 'duplicate';
 
 // Outcome → composer hint copy.
 const ARMING_HINT: Record<ArmingOutcome, string> = {
@@ -22,7 +22,6 @@ const ARMING_HINT: Record<ArmingOutcome, string> = {
   routine_event: 'Routine event — won’t wake the strategist.',
   not_armed: 'Couldn’t wake the strategist — try resending in a moment.',
   duplicate: 'Message already sent — steer already armed.',
-  resident_session: 'Workday is live — the strategist replies here directly.',
 };
 
 // Pre-send hint shown when a strategic cycle is already running: a steering
@@ -43,7 +42,6 @@ const ARMING_TOAST: Record<ArmingOutcome, string> = {
   routine_event: 'Recorded — routine event, won’t wake the strategist',
   not_armed: 'Message saved, but the strategist wasn’t woken — try resending',
   duplicate: 'Message already sent — steer already armed',
-  resident_session: 'Message sent — Workday is replying live',
 };
 
 const WORKBENCH_ARMING_TOAST: Record<Extract<ArmingOutcome, 'steering' | 'not_armed'>, string> = {
@@ -61,22 +59,22 @@ export function armingToastCopy(outcome: ArmingOutcome | null | undefined): stri
   return outcome ? ARMING_TOAST[outcome] : 'Message sent';
 }
 
-export type ResidentWakeupState = 'queued' | 'coalesced' | 'paused' | 'waiting_for_capacity';
+export type ConversationWakeupState = 'queued' | 'coalesced' | 'paused' | 'waiting_for_capacity';
 
 /** Conversation acceptance is authoritative; legacy arming cannot override it. */
-export function residentAcceptanceToastCopy(
-  wakeup: ResidentWakeupState | null | undefined,
+export function conversationAcceptanceToastCopy(
+  wakeup: ConversationWakeupState | null | undefined,
   arming: ArmingOutcome | null | undefined,
 ): { message: string; severity: 'success' | 'info' } {
   switch (wakeup) {
     case 'queued':
-      return { message: 'Message accepted — Resident queued', severity: 'success' };
+      return { message: 'Message accepted — queued', severity: 'success' };
     case 'coalesced':
-      return { message: 'Message accepted — included in the next Resident turn', severity: 'success' };
+      return { message: 'Message accepted — included in the next turn', severity: 'success' };
     case 'paused':
       return { message: 'Message accepted — background autonomy is paused', severity: 'info' };
     case 'waiting_for_capacity':
-      return { message: 'Message accepted — Resident is waiting to start', severity: 'info' };
+      return { message: 'Message accepted — waiting to start', severity: 'info' };
     default:
       return {
         message: armingToastCopy(arming),
@@ -124,8 +122,7 @@ export function parseArmingOutcome(value: unknown): ArmingOutcome | null {
     value === 'passive_note' ||
     value === 'routine_event' ||
     value === 'not_armed' ||
-    value === 'duplicate' ||
-    value === 'resident_session'
+    value === 'duplicate'
     ? value
     : null;
 }

@@ -162,7 +162,11 @@ async def test_admin_playbook_delete(
     doc = project.design_doc or {}
     assert "playbook/remove-me" not in doc
     assert "playbook/remove-me" in (doc.get("playbook_deleted_keys") or [])
-    archive = doc.get("playbook_archive") or []
+    # playbook_archive is a migrated telemetry key — stripped from design_doc
+    # at write time and persisted via project_telemetry.
+    from app.project_telemetry import read_telemetry
+
+    archive = await read_telemetry(db_session, project.id, "playbook_archive") or []
     assert any(
         entry.get("_archived_key") == "playbook/remove-me"
         and entry.get("_retirement_reason") == "operator_deleted"
@@ -416,7 +420,11 @@ async def test_admin_playbook_patch_archive(
 
     await db_session.refresh(project)
     assert "playbook/old-tip" not in (project.design_doc or {})
-    archive = project.design_doc.get("playbook_archive", [])
+    # playbook_archive is a migrated telemetry key — the PATCH archive path
+    # strips it from design_doc and persists it via project_telemetry.
+    from app.project_telemetry import read_telemetry
+
+    archive = await read_telemetry(db_session, project.id, "playbook_archive") or []
     assert any(a.get("_archived_key") == "playbook/old-tip" for a in archive)
 
 

@@ -21,12 +21,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app import release_scoring as rs
 
 # Fixed policy mirroring promotion_policy.yaml; threshold pinned low so the
 # judged-tier penalty (a few %) never crosses the promote boundary by accident.
 _POLICY = {
-    "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+    "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
     "threshold": 0.75,
 }
 
@@ -962,7 +964,7 @@ class TestFailClosedCategoryVerdicts:
         no-criteria path rather than synthesising a spurious block.
         """
         assert self._fn(set()) is None
-        assert self._fn(set([None])) is None  # only None keys → filtered out
+        assert self._fn({None}) is None  # only None keys → filtered out
 
     def test_non_empty_keys_returns_unverified_verdicts(self):
         """Each active criterion key gets an ``unverified`` verdict row, sorted."""
@@ -1063,7 +1065,6 @@ class TestBlockerExecutionSite:
         for code in (
             "ci_not_green",
             "ci_unresolved",
-            "smoketest_startup_failed",
             "audit_missing",
             "test_file_deleted",
             "merge_grade_misses",
@@ -1268,13 +1269,40 @@ class TestScoreEnvPreflight:
 
 
 # ---------------------------------------------------------------------------
-# compute_composite — the boot_prereq_missing hard gate (Slice 3, DARK)
+# compute_composite — the boot_prereq_missing hard gate (Slice 3)
+# runtime_config default: env_preflight_enabled=True (Armed)
 # ---------------------------------------------------------------------------
 
 
 class TestEnvPreflightGate:
-    def test_disabled_by_default_is_byte_for_byte_unchanged(self):
-        # The judge defaults OFF: even with missing names supplied, no block, no
+    def test_production_default_is_armed_in_promotion_policy_yaml(self):
+        # The production default for env_preflight_enabled comes from
+        # promotion_policy.yaml (not the module-level dict, which the conftest
+        # overrides to False for test isolation).  This pin asserts the YAML
+        # carries the Armed (True) value so the gate is active in production.
+        from app.runtime_config_state import _read_promotion_policy_file
+
+        policy = _read_promotion_policy_file()
+        assert policy is not None, "promotion_policy.yaml must be readable"
+        assert policy.get("env_preflight_enabled") is True, (
+            "env_preflight_enabled must be True in promotion_policy.yaml "
+            "(Armed by default); update that file if the gate should be disabled fleet-wide"
+        )
+
+        # With the production default (True) and missing prerequisites, the gate
+        # must block — proving the Armed default has real enforcement effect.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["GITHUB_PAT_ENCRYPTION_KEY"],
+            )
+        )
+        assert result["blocker"] == "boot_prereq_missing"
+        assert result["promote"] is False
+
+    def test_flag_off_is_byte_for_byte_unchanged(self):
+        # When explicitly disabled (env_preflight_enabled=False), no block, no
         # sub_score, and the composite is identical to the no-env-preflight call.
         baseline = rs.compute_composite(**_perfect_kwargs())
         with_flag_off = rs.compute_composite(
@@ -1581,3 +1609,166 @@ class TestEnvPreflightGate:
         # Distinct from operator-env and deployed phrases.
         assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_OPERATOR_ENV]
         assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+
+    def test_manifest_absent_candidate_promotes_while_broken_manifest_blocks(self):
+        """An absent manifest (source=None) must NOT trigger boot_prereq_evidence_missing.
+
+        The env-preflight manifest (backend/app/required_runtime_env.py) is
+        Blueprint-specific.  External and greenfield repos that do not ship it
+        must remain promotable — a missing file means "no prerequisites declared",
+        not "evidence unavailable".  Only a malformed/unparseable manifest (source
+        present but unreadable) should produce a None score and fire the hard block.
+
+        This test drives the full scoring seam from build_env_preflight_from_source
+        through _score_env_preflight into compute_composite to exercise the end-to-end
+        contract, not just the individual helpers.
+        """
+        from app.env_preflight_evidence import build_env_preflight_from_source, sanitize_env_preflight_artifact
+
+        # --- absent manifest → vacuously satisfied (score=1.0) → promotes ---
+        absent_artifact = build_env_preflight_from_source(None)
+        assert absent_artifact is not None, "absent manifest must return a dict, not None"
+        assert absent_artifact["required_env"] == []
+
+        # sanitize (mirrors release_qualifier._finalize_qualification)
+        sanitized_absent = sanitize_env_preflight_artifact(absent_artifact)
+        absent_score, absent_missing, _ = rs._score_env_preflight(
+            sanitized_absent, {"K_REVISION": True}
+        )
+        assert absent_score == 1.0, "absent manifest should score 1.0 (vacuously satisfied)"
+        assert absent_missing == []
+
+        absent_result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=absent_score,
+                env_preflight_missing=absent_missing,
+            )
+        )
+        assert absent_result["blocker"] is None, (
+            f"absent manifest must not block — got blocker={absent_result['blocker']!r}"
+        )
+        assert absent_result["promote"] is True
+
+        # --- broken manifest (unparseable source) → score=None → blocks ---
+        broken_artifact = build_env_preflight_from_source(
+            required_runtime_env_py_source="this is }{{{ not valid python"
+        )
+        # A SyntaxError source yields required_env=[] (graceful degradation in the
+        # parser), so the artifact itself is non-None with an empty list — same
+        # vacuous-satisfaction path as absent.  The true "evidence unavailable" case
+        # is when the score reaches compute_composite as None (e.g. sanitize returns
+        # None for a non-dict raw blob).  Confirm the broken-source path degrades
+        # gracefully (not None) while a raw-None blob remains a hard block.
+        assert broken_artifact is not None
+        assert broken_artifact["required_env"] == [], (
+            "SyntaxError source should degrade to empty required_env (graceful), "
+            "not raise or block"
+        )
+
+        # A raw non-dict blob (e.g. from a corrupted artifact store) sanitizes to
+        # None → score=None → boot_prereq_evidence_missing fires.
+        raw_none_blob = "not-a-dict"
+        sanitized_none = sanitize_env_preflight_artifact(raw_none_blob)
+        assert sanitized_none is None, "non-dict raw blob must sanitize to None"
+
+        none_score, _, _ = rs._score_env_preflight(sanitized_none, {"K_REVISION": True})
+        assert none_score is None
+
+        blocked_result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=none_score,  # None
+                env_preflight_missing=[],
+            )
+        )
+        assert blocked_result["blocker"] == "boot_prereq_evidence_missing", (
+            "corrupted/absent artifact (sanitized to None) must hard-block"
+        )
+        assert blocked_result["promote"] is False
+
+
+# ---------------------------------------------------------------------------
+# env_preflight_enabled armed-by-default: source literal + behavior contract
+# ---------------------------------------------------------------------------
+
+
+class TestEnvPreflightArmedDefault:
+    """Guards the armed-by-default state for env_preflight_enabled.
+
+    The conftest resets env_preflight_enabled to False for test isolation
+    (individual gate tests set it explicitly), so the live runtime_config value
+    during tests is always False.  These tests read the source literal directly
+    via AST to verify the literal default is True — the invariant that survives
+    despite the test-isolation override.
+    """
+
+    def test_env_preflight_literal_default_is_true(self):
+        """runtime_config_state.py dict literal must have env_preflight_enabled=True."""
+        import ast
+        import pathlib
+
+        src = (
+            pathlib.Path(__file__).parent.parent / "app" / "runtime_config_state.py"
+        ).read_text()
+        tree = ast.parse(src)
+        found = None
+        for node in ast.walk(tree):
+            # runtime_config is an annotated assignment (runtime_config: Dict[...] = {...})
+            value = None
+            if isinstance(node, (ast.AnnAssign, ast.Assign)) and isinstance(node.value, ast.Dict):
+                value = node.value
+            if value is None:
+                continue
+            for k, v in zip(value.keys, value.values):
+                if isinstance(k, ast.Constant) and k.value == "env_preflight_enabled":
+                    found = v.value if isinstance(v, ast.Constant) else None
+                    break
+            if found is not None:
+                break
+        assert found is True, (
+            f"runtime_config literal env_preflight_enabled must be True (armed), "
+            f"got {found!r}. The gate was built to prevent the v25 prod boot-crash — "
+            "re-arming it must be explicit."
+        )
+
+    def test_armed_env_preflight_blocks_without_evidence(self):
+        """With env_preflight_enabled=True, missing evidence is a hard block."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] == "boot_prereq_evidence_missing"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+
+
+class TestQualifierSmoketestRetired:
+    """Retired smoke arguments are accepted for legacy callers but inert."""
+
+    def test_legacy_smoke_inputs_do_not_change_score(self):
+        missing = rs.compute_composite(
+            **_perfect_kwargs(smoketest_enabled=True, smoketest_score=None)
+        )
+        passing = rs.compute_composite(
+            **_perfect_kwargs(smoketest_enabled=True, smoketest_score=1.0)
+        )
+        failing = rs.compute_composite(
+            **_perfect_kwargs(smoketest_enabled=True, smoketest_score=0.0)
+        )
+        assert missing == passing == failing
+        assert "smoketest" not in passing["sub_scores"]
+
+    def test_legacy_three_key_and_current_two_key_weights_match(self):
+        from app.release_qualifier import _normalize_active_promotion_weights
+
+        legacy = _normalize_active_promotion_weights(
+            {"audit": 0.4, "test_erosion": 0.3, "smoketest": 0.3}
+        )
+        current = _normalize_active_promotion_weights(
+            {"audit": 4 / 7, "test_erosion": 3 / 7}
+        )
+        assert legacy == pytest.approx(current)

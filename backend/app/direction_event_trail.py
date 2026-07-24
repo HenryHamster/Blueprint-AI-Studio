@@ -192,3 +192,43 @@ async def record_direction_pruned(
             direction_key,
             exc,
         )
+
+
+# Maximum text length when backfilling; matches _RETIRED_OUTCOME_CHAR_CAP in
+# strategic_completion.py so repaired entries stay in the same shape as new ones.
+_RETIRED_TEXT_CHAR_CAP = 200
+
+
+async def repair_retired_direction_memory_texts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    vision: dict,
+) -> bool:
+    """Backfill the ``text`` field in legacy vision memory entries that only have
+    ``text_tokens`` (pre-#16297 shape where ``text`` was absent or empty).
+
+    Reads each missing-text entry's direction key from the ``DirectionEvent``
+    trail via ``latest_direction_snapshot`` and patches ``entry["text"]``
+    in-place on the vision dict.
+
+    Returns True if any entry was patched (caller should call
+    ``flag_modified(project, "vision")`` + ``session.add(project)`` to persist),
+    False when no entries needed repair.
+    """
+    entries = vision.get("_recently_retired_directions") or []
+    patched = False
+    for entry in entries:
+        if entry.get("text") or not entry.get("text_tokens"):
+            # Already has readable text, or nothing useful to fall back from.
+            continue
+        direction_key = entry.get("id")
+        if not direction_key:
+            continue
+        snapshot = await latest_direction_snapshot(session, project_id, direction_key)
+        if not snapshot:
+            continue
+        recovered = (snapshot.get("text") or "").strip()
+        if recovered:
+            entry["text"] = recovered[:_RETIRED_TEXT_CHAR_CAP]
+            patched = True
+    return patched

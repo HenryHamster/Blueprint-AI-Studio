@@ -240,6 +240,61 @@ async def seed():
         await conn.close()
 
 
+LOCAL_TOOLS_ROOT = "/tmp/walkthrough-tools"
+TOOL_SLUG = "walkthrough-iframe-tool"
+
+
+def seed_local_tools_fixture() -> None:
+    """Create the local tool fixture files for the walkthrough subresource-token test.
+
+    The backend reads tools from BLUEPRINT_LOCAL_TOOLS_ROOT when a project has no
+    GitHub connection. This creates the minimal files so the walkthrough harness can:
+      1. Mint a real JWT via POST /api/admin/projects/{id}/tools/{slug}/asset-token
+      2. Assert GET /t/{token}/assets/index.html returns 200 (step 2g)
+
+    Start the backend with BLUEPRINT_LOCAL_TOOLS_ROOT=/tmp/walkthrough-tools for
+    this fixture to take effect.
+    """
+    import json as _json
+
+    tools_dir = os.path.join(LOCAL_TOOLS_ROOT, ".blueprint", "tools", TOOL_SLUG)
+    os.makedirs(tools_dir, exist_ok=True)
+
+    manifest_path = os.path.join(LOCAL_TOOLS_ROOT, ".blueprint", "tools.json")
+    manifest = {
+        "tools": [
+            {
+                "slug": TOOL_SLUG,
+                "title": "Walkthrough iframe tool",
+                "entry": "index.html",
+            }
+        ]
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        _json.dump(manifest, f, indent=2)
+    print(f"✓ Local manifest: {manifest_path}")
+
+    index_path = os.path.join(tools_dir, "index.html")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(
+            "<!DOCTYPE html><html><head><title>Walkthrough Tool</title>"
+            "<script src=\"./app.js\"></script></head>"
+            "<body><p>v26 walkthrough iframe tool fixture</p></body></html>\n"
+        )
+    print(f"✓ Tool asset: {index_path}")
+
+    app_path = os.path.join(tools_dir, "app.js")
+    with open(app_path, "w", encoding="utf-8") as f:
+        f.write("// walkthrough-iframe-tool stub\nconsole.log('walkthrough-iframe-tool loaded');\n")
+    print(f"✓ Tool asset: {app_path}")
+
+    print(
+        f"\n→ Set BLUEPRINT_LOCAL_TOOLS_ROOT={LOCAL_TOOLS_ROOT} in the backend environment "
+        f"for the '{TOOL_SLUG}' tool to be discoverable."
+    )
+
+
 if __name__ == "__main__":
     asyncio.run(seed())
+    seed_local_tools_fixture()
     print("\nSeed complete. Test project ID:", PROJECT_ID)

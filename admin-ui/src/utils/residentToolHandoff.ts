@@ -10,7 +10,6 @@ export interface ResidentToolHandoffDetail {
   artifactRef: ResidentToolArtifactRef;
   intent: 'share' | 'ask';
   prompt: string;
-  laneOwner?: string;
 }
 
 interface StoredResidentToolHandoff {
@@ -189,8 +188,6 @@ export function acknowledgeQueuedResidentToolHandoffs(
 ): void {
   for (const entry of entries) {
     if (!isResidentToolHandoffQueueStorageKey(entry.storageKey, actorUserId, projectId)) continue;
-    // Compare the version token before removing. A second tab may have replaced
-    // this ArtifactRef entry after our snapshot was applied to the draft.
     const current = readStoredEntry(entry.storageKey, actorUserId, projectId);
     if (current?.entryId !== entry.entryId) continue;
     try { localStorage.removeItem(entry.storageKey); } catch { /* retry on next mount */ }
@@ -199,8 +196,7 @@ export function acknowledgeQueuedResidentToolHandoffs(
 
 export function dispatchResidentToolHandoff(detail: ResidentToolHandoffDetail): boolean {
   // Persist before notifying. Project tools and the conversation are separate
-  // routed surfaces, so the MessagesPanel listener is normally unmounted while
-  // Share/Ask is clicked.
+  // routed surfaces, so the conversation listener is normally unmounted here.
   if (!enqueueResidentToolHandoff(detail.artifactRef.author, detail.projectId, detail)) {
     return false;
   }

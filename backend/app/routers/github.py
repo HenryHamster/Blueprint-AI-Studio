@@ -815,9 +815,17 @@ async def github_webhook(
                         f"[WEBHOOK] Rejecting invalid head_branch: {head_branch!r}"
                     )
                     return {"status": "ignored_invalid_branch"}
-                # Read auto-remediation config from project
-                auto_remediation_config = (project.design_doc or {}).get(
-                    "_auto_remediation", {}
+                # Read auto-remediation config (telemetry-first, design_doc
+                # fallback during the rolling God-column cutover).
+                from app.project_telemetry import (
+                    read_telemetry_or_doc,
+                )
+
+                auto_remediation_config = (
+                    await read_telemetry_or_doc(
+                        session, project.id, project.design_doc, "_auto_remediation", {}
+                    )
+                    or {}
                 )
                 enabled = auto_remediation_config.get("enabled", False)
                 branch_whitelist = auto_remediation_config.get(

@@ -334,6 +334,8 @@ def _feedback_scope_override(
     direction: dict,
     project: Any,
     task_type: str | None,
+    *,
+    _dfa: dict | None = None,
 ) -> tuple[str, str | None] | None:
     """Check failure feedback and success patterns for a cold-start scope override.
 
@@ -341,17 +343,20 @@ def _feedback_scope_override(
     Reads direction_first_attempt_feedback for scope_related failures and
     playbook/success-{task_type}-{scope} for confirmed success patterns.
     Only called when historical merge-rate data is insufficient.
+
+    ``_dfa`` is optional telemetry-preferred data for the
+    ``direction_first_attempt_feedback`` key (which is stripped from
+    ``project.design_doc`` by ``strip_migrated_doc_keys`` at write time).
+    When provided, it takes precedence over ``design_doc`` data. Callers
+    with session access should pre-load it via ``get_project_telemetry``.
     """
     doc = getattr(project, "design_doc", None) or {}
     label = direction.get("title", direction.get("id", "?"))
     dir_id = str(direction.get("id") or "")
     # scope_related failure feedback: repeated scope misfits → downscope
     if idx > 0 and dir_id:
-        sc_count = (
-            (doc.get("direction_first_attempt_feedback") or {})
-            .get(dir_id, {})
-            .get("scope_related", 0)
-        )
+        dfa = _dfa or doc.get("direction_first_attempt_feedback") or {}
+        sc_count = dfa.get(dir_id, {}).get("scope_related", 0)
         if isinstance(sc_count, (int, float)) and sc_count >= 3:
             smaller = _SCOPE_ORDER[idx - 1]
             logger.info(
@@ -405,11 +410,18 @@ def _calibrate_scope(
     direction: dict,
     project: Any | None = None,
     task_type: str | None = None,
+    *,
+    _dfa: dict | None = None,
 ) -> tuple[str, str | None]:
     """Downgrade scope if historical merge rate at that scope is below threshold.
 
     Returns (final_scope, calibrated_from) where calibrated_from is the original
     scope if a downgrade occurred, else None.
+
+    ``_dfa`` is optional telemetry-preferred data for the
+    ``direction_first_attempt_feedback`` key. When provided, forwarded to
+    :func:`_feedback_scope_override` so it reads the canonical telemetry
+    value rather than the stripped ``design_doc`` copy.
 
     Uses direction's last-3 research_history (40% threshold) when it has >= 3
     data points. Otherwise falls back to project-wide aggregation across all
@@ -447,7 +459,8 @@ def _calibrate_scope(
         proj_agg = _aggregate_scope_breakdown(proj_entries)
         if sum(v["created"] for v in proj_agg.values()) < 3:
             _ov = _feedback_scope_override(
-                proposed_scope, idx, direction, project, task_type
+                proposed_scope, idx, direction, project, task_type,
+                _dfa=_dfa,
             )
             if _ov is not None:
                 return _ov
@@ -579,8 +592,18 @@ def predict_spawn_success(
     project: Any | None = None,
     related_files: list[str] | None = None,
     complexity_score: float | None = None,
+    *,
+    _module_feedback: dict | None = None,
+    _dfa: dict | None = None,
 ) -> float:
     """Predict P(success) for a spawned task using in-memory data only.
+
+    ``_module_feedback`` and ``_dfa`` are optional telemetry-preferred data
+    for the ``module_feedback`` and ``direction_first_attempt_feedback`` keys
+    (both stripped from ``project.design_doc`` by ``strip_migrated_doc_keys``
+    at write time). When provided, they take precedence over ``design_doc``
+    data. Callers with session access should pre-load them via
+    ``get_project_telemetry``.
 
     Combines four signals with weighted averaging:
     1. Direction's scope-specific merge rate from last 3 history entries
@@ -894,7 +917,7 @@ def predict_spawn_success(
     # _update_module_feedback_profiles). Requires project and related_files.
     if project is not None and related_files:
         design_doc = getattr(project, "design_doc", None) or {}
-        module_feedback = design_doc.get("module_feedback") or {}
+        module_feedback = _module_feedback or design_doc.get("module_feedback") or {}
         if module_feedback:
             aggregate_total = 0
             for f in related_files:
@@ -974,7 +997,7 @@ def predict_spawn_success(
     direction_id = direction.get("id")
     if project is not None and direction_id:
         design_doc = getattr(project, "design_doc", None) or {}
-        dfa = design_doc.get("direction_first_attempt_feedback") or {}
+        dfa = _dfa or design_doc.get("direction_first_attempt_feedback") or {}
         entry = dfa.get(str(direction_id)) or {}
         cat_counts = [
             v

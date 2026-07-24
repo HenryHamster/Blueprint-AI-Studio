@@ -271,7 +271,7 @@ describe('computeResidentActivityState', () => {
     expect(state?.phase).toBe('dead');
   });
 
-  it('DEAD: a heartbeat stale beyond the threshold is presumed dead (no done frame ever arrives)', () => {
+  it('RECOVERABLE: a stale heartbeat asks for a restart instead of claiming the session ended', () => {
     const staleAt = new Date(NOW - RESIDENT_HEARTBEAT_STALE_MS - 5000).toISOString();
     const transcript = [
       delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
@@ -279,8 +279,52 @@ describe('computeResidentActivityState', () => {
     ];
     const state = computeResidentActivityState(transcript, [], session({ updated_at: staleAt }), NOW);
     expect(state?.phase).toBe('dead');
+    expect(state?.label).toBe('Workday needs restart');
+    expect(state?.label).not.toBe('Session ended');
     // Frozen at the last heartbeat — no forever-ticking counter for a dead session.
     expect(state?.endMs).toBe(new Date(staleAt).getTime());
+  });
+
+  it('RECONNECTING: an ensured starting worker stays recoverable with a stale prior heartbeat', () => {
+    const staleAt = new Date(NOW - RESIDENT_HEARTBEAT_STALE_MS - 5000).toISOString();
+    const state = computeResidentActivityState(
+      [], [], session({ updated_at: staleAt, worker_state: 'starting' }), NOW,
+    );
+    expect(state).toMatchObject({ phase: 'idle', label: 'Reconnecting Workday…' });
+    expect(state?.label).not.toBe('Session ended');
+  });
+
+  it('keeps a long provider retry hold idle, then returns to executing after the hold clears', () => {
+    const staleAt = new Date(NOW - RESIDENT_HEARTBEAT_STALE_MS - 10 * 60_000).toISOString();
+    const retryUntil = new Date(NOW + 35 * 60_000).toISOString();
+    const waiting = computeResidentActivityState(
+      [],
+      [],
+      session({
+        updated_at: staleAt,
+        worker_state: 'retry_wait',
+        worker_retry_until: retryUntil,
+        worker_retry_reason: 'Provider rate limit',
+      }),
+      NOW,
+    );
+    expect(waiting).toMatchObject({
+      phase: 'idle',
+      label: 'Provider rate limit — retrying in 35m',
+    });
+    expect(waiting?.label).not.toBe('Session ended');
+
+    const freshAt = new Date(NOW - 1000).toISOString();
+    const resumed = computeResidentActivityState(
+      [
+        delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+        delta({ id: 2, seq: 2, kind: 'command', text: '$ resumed', ts: freshAt }),
+      ],
+      [],
+      session({ updated_at: freshAt, worker_state: 'ready' }),
+      NOW,
+    );
+    expect(resumed).toMatchObject({ phase: 'executing', commandText: '$ resumed' });
   });
 
   it('stays EXECUTING while the heartbeat is fresh and a command is in flight', () => {

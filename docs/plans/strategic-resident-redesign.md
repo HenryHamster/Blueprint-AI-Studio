@@ -1,8 +1,17 @@
 # Strategic Resident Redesign
 
+> **Historical/retired — do not implement.** This document records the abandoned
+> shadow-turn/control-plane Resident replacement (`StrategicResident`,
+> checkpoints, receipts, ownership cutover, and `strategic_resident_turn` Tasks).
+> That subsystem has been removed. It must not be restored from this plan.
+> The supported conversational Chat/Workday `/strategic-session` path is a
+> separate subsystem and must remain intact.
+
 **Target:** `automain`
 
-**Status:** Milestones 1, 2a, 2b, and 3 are merged. M4 remains in progress after
+**Status:** Retired. The milestones and rollout instructions below are retained
+only as historical context and are not current implementation direction.
+Milestones 1, 2a, 2b, and 3 were merged. M4 remained in progress after
 its 2026-07-18 requirement-by-requirement audit. Authority/message hardening and
 the runner/managed-Task/cadence milestone are merged. The terminal managed-Task
 outcome and lock-free `pr.inspect` milestone is also merged. M4 now closes on
@@ -434,7 +443,7 @@ ambient shell access, unrestricted credentials, or broader mutation authority.
 - Additional specialized reads: pipeline, qualification, PR
   reviews/comments/mergeability, branch state, CI runs/streamed logs, and
   deployment inspection.
-- Native managed `panel_review` and repeated CI-repair contracts with exact-head
+- Native managed repeated CI-repair contracts with exact-head
   CAS, correlated evidence, and return-to-Resident completion.
 - Revision-linked deployment outcome wakeups and any direct operational action
   justified by real pilot usage rather than catalog completeness.

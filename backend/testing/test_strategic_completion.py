@@ -8,6 +8,7 @@ Covers:
 """
 
 import json
+import logging
 import uuid
 import pytest
 import pytest_asyncio
@@ -52,7 +53,6 @@ from app.strategic_completion import (
     sanitize_strategic_challenge_record,
     strategic_challenge_summary,
     challenge_approves_evidence_progress,
-    challenge_approves_retirement,
     portfolio_operation_fingerprint,
     challenge_rejects_portfolio_op,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
@@ -72,7 +72,6 @@ from app.strategic_completion import (
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
     _build_past_retirement_critiques,
-    _spawn_strategic_review,
     STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
 )
 from app.strategic_analysis import _build_outcome_evaluation
@@ -1493,6 +1492,19 @@ class TestRecordRetiredDirectionMemory:
         record_retired_direction_memory(vision, d2, reason="strategic_retire")
         assert len(vision["_recently_retired_directions"]) == 2
 
+    def test_stores_readable_text_field(self):
+        """record_retired_direction_memory must persist the original direction text
+        in a ``text`` field so the summary builder can serve human-readable text
+        instead of reconstructing it from the stopword-stripped token bag."""
+        vision: dict = {}
+        readable = "Improve the authentication flow for enterprise users logging in"
+        d = {"id": "d-readable", "text": readable}
+        record_retired_direction_memory(vision, d, reason="saturation")
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["text"] == readable
+        # text_tokens must still be present for dedup/grounding consumers
+        assert "text_tokens" in entry
+        assert isinstance(entry["text_tokens"], list)
 
 
 class TestCheckGapRespawnBlock:
@@ -6509,24 +6521,15 @@ async def test_set_strategic_challenge_non_object_returns_400(client, db_session
 
 
 @pytest.mark.asyncio
-async def test_retirement_gated_on_challenge_second_opinion(client, db_session, mocker):
-    """Agent retirements fail closed on unsupported second opinions in enforce mode."""
+async def test_retirement_always_proceeds_without_challenge_gate(client, db_session, mocker):
+    """Agent retirements always proceed — the observe-only challenge gate has been cut."""
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
-    from app.shared_state import runtime_config
-    from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
-    old_mode = runtime_config.get("strategic_retirement_challenge_gate_mode")
-
-    async def make_task(name, vm, direction_id, challenge_marker=None):
-        context = None
-        if challenge_marker is not None:
-            context = {
-                STRATEGIC_CHALLENGE_CONTEXT_KEY: challenge_marker,
-            }
-        task = await _make_strategic_task(
+    async def make_task(name, vm, direction_id):
+        return await _make_strategic_task(
             db_session,
             name=name,
             vm=vm,
@@ -6540,12 +6543,6 @@ async def test_retirement_gated_on_challenge_second_opinion(client, db_session, 
                 }
             ],
         )
-        if context:
-            task.context = {**(task.context or {}), **context}
-            db_session.add(task)
-            await db_session.commit()
-            await db_session.refresh(task)
-        return task
 
     async def retire(task, vm, direction_id, rationale="pattern is complete"):
         token = create_agent_token(str(task.id), vm, task_type="strategic_review")
@@ -6564,224 +6561,57 @@ async def test_retirement_gated_on_challenge_second_opinion(client, db_session, 
         await db_session.refresh(project)
         return next(d for d in project.directions if d.get("id") == direction_id)
 
-    try:
-        runtime_config["strategic_retirement_challenge_gate_mode"] = "enforce"
-
-        supported_challenge = {
-            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
-            "status": "ok",
-            "portfolio_operations": [
-                {
-                    "op": "retire_direction",
-                    "direction_id": "d-supported",
-                    "verdict": "approved",
-                }
-            ],
-            "retirement_approvals": [
-                {
-                    "direction_id": "d-supported",
-                    "verdict": "approved",
-                    "rationale": "retirement rationale names real evidence",
-                }
-            ],
-        }
-        supported_challenge = sanitize_strategic_challenge_record(supported_challenge)
-        supported = await make_task(
-            "RET-SUPPORTED", "vm-ret-supported", "d-supported", supported_challenge
-        )
-        supported_resp = await retire(
-            supported, "vm-ret-supported", "d-supported", "evidence-rich memo"
-        )
-        assert supported_resp.status_code == 200, supported_resp.text
-        assert supported_resp.json()["status"] == "ok"
-        supported_dir = await project_direction(supported, "d-supported")
-        assert supported_dir["status"] == "expired"
+    # Retirement always proceeds regardless of challenge record presence/verdict.
+    for suffix in ("no-challenge", "with-challenge"):
+        direction_id = f"d-{suffix}"
+        task = await make_task(f"RET-{suffix}", f"vm-{suffix}", direction_id)
+        resp = await retire(task, f"vm-{suffix}", direction_id, "evidence-rich memo")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "ok"
+        direction = await project_direction(task, direction_id)
+        assert direction["status"] == "expired"
         assert any(
             "Retired by strategic review: evidence-rich memo" in note.get("text", "")
-            for note in supported_dir.get("notes", [])
+            for note in direction.get("notes", [])
         )
 
-        rejected_challenge = {
-            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
-            "status": "ok",
-            "portfolio_operations": [
-                {
-                    "op": "retire_direction",
-                    "direction_id": "d-rejected",
-                    "verdict": "approved",
-                }
-            ],
-            "retirement_approvals": [
-                {
-                    "direction_id": "d-rejected",
-                    "verdict": "rejected",
-                    "rationale": "shallow and unsupported",
-                }
-            ],
-            "retirement_critique_quality": {"verdict": "shallow"},
-        }
-        rejected_challenge = sanitize_strategic_challenge_record(rejected_challenge)
-        rejected = await make_task(
-            "RET-REJECTED", "vm-ret-rejected", "d-rejected", rejected_challenge
-        )
-        rejected_resp = await retire(rejected, "vm-ret-rejected", "d-rejected")
-        assert rejected_resp.status_code == 200, rejected_resp.text
-        rejected_body = rejected_resp.json()
-        assert rejected_body["status"] == "deferred"
-        assert rejected_body["op"] == "retire_direction"
-        rejected_dir = await project_direction(rejected, "d-rejected")
-        assert rejected_dir["status"] == "active"
-        assert any(
-            "Strategic retirement deferred" in note.get("text", "")
-            for note in rejected_dir.get("notes", [])
-        )
-        await db_session.refresh(rejected)
-        rejected_ctx = rejected.context or {}
-        assert rejected_ctx["_strategic_retirement_deferrals"][0]["direction_id"] == (
-            "d-rejected"
-        )
-        assert rejected_ctx["_strategic_retirement_deferrals"][0]["approved"] is False
-        assert rejected_ctx["_strategic_api_called"] is True
-        assert "_strategic_retired_ids" not in rejected_ctx
-
-        await _handle_strategic_completion(rejected, "", db_session)
-        cycle = await db_session.get(StrategicCycle, rejected.strategic_cycle_id)
-        meta = cycle.cycle_metadata or {}
-        assert meta["retirement_deferrals"][0]["direction_id"] == "d-rejected"
-        assert meta["retirement_gate_verdicts"][0]["verdict"] == "rejected"
-
-        from app.models import TaskStatus
-
-        rejected.status = TaskStatus.COMPLETED
-        db_session.add(rejected)
-        await db_session.commit()
-        await db_session.refresh(rejected)
-
-        project = await db_session.get(Project, rejected.project_id)
-        assert project is not None
-        spawned = await _spawn_strategic_review(project, db_session)
-        assert spawned is True
-        from sqlmodel import select
-
-        result = await db_session.execute(
-            select(Task).where(Task.project_id == project.id)
-        )
-        spawned_tasks = [t for t in result.scalars().all() if t.id != rejected.id]
-        assert spawned_tasks, "Expected a new strategic_review task after deferral"
-        spawned_payload = spawned_tasks[0].payloads[0]
-        assert spawned_payload["type"] == "strategic_review"
-        assert (
-            spawned_payload["retirement_deferrals"][0]["direction_id"] == "d-rejected"
-        )
-        assert spawned_payload["retirement_deferrals"][0]["verdict"] == "rejected"
-        assert spawned_payload["retirement_deferrals"][0]["challenge_status"] == "ok"
-
-        blocked_challenge = {
-            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
-            "status": "blocked",
-            "retirement_approvals": [
-                {"direction_id": "d-blocked", "verdict": "approved"}
-            ],
-        }
-        invalid_challenge = {
-            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
-            "status": "invalid",
-            "retirement_approvals": [
-                {"direction_id": "d-invalid", "verdict": "approved"}
-            ],
-        }
-        blocked_challenge = sanitize_strategic_challenge_record(blocked_challenge)
-        invalid_challenge = sanitize_strategic_challenge_record(invalid_challenge)
-        for suffix, challenge in (
-            ("missing", None),
-            ("blocked", blocked_challenge),
-            ("invalid", invalid_challenge),
-        ):
-            direction_id = f"d-{suffix}"
-            task = await make_task(
-                f"RET-{suffix}", f"vm-ret-{suffix}", direction_id, challenge
-            )
-            resp = await retire(task, f"vm-ret-{suffix}", direction_id)
-            assert resp.status_code == 200, resp.text
-            expected_status = "deferred" if suffix == "missing" else "blocked"
-            assert resp.json()["status"] == expected_status
-            direction = await project_direction(task, direction_id)
-            assert direction["status"] == "active"
-
-        for mode in ("observe", "advisory"):
-            runtime_config["strategic_retirement_challenge_gate_mode"] = mode
-            direction_id = f"d-{mode}"
-            task = await make_task(
-                f"RET-{mode}",
-                f"vm-ret-{mode}",
-                direction_id,
-                sanitize_strategic_challenge_record(
-                    {
-                        "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
-                        "status": "ok",
-                        "portfolio_operations": [
-                            {
-                                "op": "retire_direction",
-                                "direction_id": direction_id,
-                                "verdict": "warned",
-                            }
-                        ],
-                        "retirement_approvals": [
-                            {"direction_id": direction_id, "verdict": "uncertain"}
-                        ],
-                    }
-                ),
-            )
-            resp = await retire(task, f"vm-ret-{mode}", direction_id)
-            assert resp.status_code == 200, resp.text
-            assert resp.json()["status"] == "ok"
-            if mode == "advisory":
-                assert "warnings" in resp.json()
-            direction = await project_direction(task, direction_id)
-            assert direction["status"] == "expired"
-
-        runtime_config["strategic_retirement_challenge_gate_mode"] = "enforce"
-        operator_project = Project(
-            name="RET-OPERATOR",
+    # Operator-owned retirement path is also unaffected.
+    operator_project = Project(
+        name="RET-OPERATOR",
+        user_id="test-user-123",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-operator",
+                "status": "active",
+                "text": "Operator-owned retirement",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(operator_project)
+    await db_session.commit()
+    await db_session.refresh(operator_project)
+    db_session.add(
+        ProjectMember(
+            project_id=operator_project.id,
             user_id="test-user-123",
-            vision={"purpose": "test", "revision": 1},
-            directions=[
-                {
-                    "id": "d-operator",
-                    "status": "active",
-                    "text": "Operator-owned retirement",
-                    "research_history": [],
-                    "notes": [],
-                }
-            ],
+            role="owner",
         )
-        db_session.add(operator_project)
-        await db_session.commit()
-        await db_session.refresh(operator_project)
-        db_session.add(
-            ProjectMember(
-                project_id=operator_project.id,
-                user_id="test-user-123",
-                role="owner",
-            )
-        )
-        await db_session.commit()
+    )
+    await db_session.commit()
 
-        operator_resp = await client.patch(
-            f"/api/admin/projects/{operator_project.id}/directions/d-operator",
-            json={"status": "expired"},
-        )
-        assert operator_resp.status_code == 200, operator_resp.text
-        await db_session.refresh(operator_project)
-        operator_dir = next(
-            d for d in operator_project.directions if d.get("id") == "d-operator"
-        )
-        assert operator_dir["status"] == "expired"
-    finally:
-        if old_mode is None:
-            runtime_config.pop("strategic_retirement_challenge_gate_mode", None)
-        else:
-            runtime_config["strategic_retirement_challenge_gate_mode"] = old_mode
+    operator_resp = await client.patch(
+        f"/api/admin/projects/{operator_project.id}/directions/d-operator",
+        json={"status": "expired"},
+    )
+    assert operator_resp.status_code == 200, operator_resp.text
+    await db_session.refresh(operator_project)
+    operator_dir = next(
+        d for d in operator_project.directions if d.get("id") == "d-operator"
+    )
+    assert operator_dir["status"] == "expired"
 
 
 async def _set_portfolio_operation_challenge(
@@ -9598,19 +9428,17 @@ async def test_handle_strategic_completion_preserves_collections_on_bootstrap(
 @pytest.mark.asyncio
 async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     """End-to-end: a qualify_request embedded in a set_problem_model call is
-    applied synchronously within the API handler so resident sessions (where the
-    task stays open for the entire conversation) get immediate effect.
+    applied synchronously within the API handler so it takes immediate effect.
 
     The strategic agent embeds qualify_request as a top-level sibling of the
     problem_model; the /api/agent/strategic endpoint lifts it out (ProblemModel
     is extra="forbid"), applies it synchronously by calling _apply_qualify_request
     directly, and pops the context key so _handle_strategic_completion is a
-    no-op — no double-application for non-resident tasks that also complete
-    normally.
+    no-op — no double-application for tasks that also complete normally.
 
-    Regression for fr-resident-qualify-request-application-timing: a qualify_request
+    Regression for fr-qualify-request-application-timing: a qualify_request
     submitted mid-session can no longer sit queued for the entire remaining duration
-    of the resident conversation.
+    of the conversation.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -9697,7 +9525,7 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     )
 
     # Synchronous apply: run_qualification fired during set_problem_model itself —
-    # not deferred to task completion. This is the resident-session fix.
+    # not deferred to task completion.
     run_qualification.assert_awaited_once()
     call_args = run_qualification.await_args.args
     # run_qualification(session, project_id, version) — the handler's own session
@@ -12579,49 +12407,6 @@ class TestChallengeApprovesEvidenceProgress:
         assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
 
 
-class TestChallengeApprovesRetirement:
-    def _rec(self, items, status="ok"):
-        return {"version": 1, "status": status, "retirement_approvals": items}
-
-    def test_approved_exact_match_returns_true(self):
-        rec = self._rec([{"direction_id": "d-1", "verdict": "approved"}])
-        assert challenge_approves_retirement(rec, "d-1") is True
-
-    @pytest.mark.parametrize("verdict", ["rejected", "uncertain"])
-    def test_non_approved_verdict_returns_false(self, verdict):
-        rec = self._rec([{"direction_id": "d-1", "verdict": verdict}])
-        assert challenge_approves_retirement(rec, "d-1") is False
-
-    def test_direction_mismatch_returns_false(self):
-        rec = self._rec([{"direction_id": "d-1", "verdict": "approved"}])
-        assert challenge_approves_retirement(rec, "d-2") is False
-
-    def test_missing_or_malformed_record_returns_false(self):
-        assert challenge_approves_retirement(None, "d-1") is False
-        assert challenge_approves_retirement({}, "d-1") is False
-        assert challenge_approves_retirement("x", "d-1") is False
-        assert challenge_approves_retirement(self._rec([]), "d-1") is False
-
-    def test_blank_direction_returns_false(self):
-        rec = self._rec([{"direction_id": "d-1", "verdict": "approved"}])
-        assert challenge_approves_retirement(rec, "") is False
-
-    @pytest.mark.parametrize("status", ["blocked", "invalid"])
-    def test_non_ok_status_with_approved_entry_returns_false(self, status):
-        rec = self._rec(
-            [{"direction_id": "d-1", "verdict": "approved"}],
-            status=status,
-        )
-        assert challenge_approves_retirement(rec, "d-1") is False
-
-    def test_missing_status_field_returns_false(self):
-        rec = {
-            "version": 1,
-            "retirement_approvals": [{"direction_id": "d-1", "verdict": "approved"}],
-        }
-        assert challenge_approves_retirement(rec, "d-1") is False
-
-
 class TestStrategicChallengeGate:
     """First hard gate: an advancing/met evidence_progress verdict may only
     suppress the deterministic scaffolding flag when the stored challenge record
@@ -13346,14 +13131,15 @@ async def test_spawn_retirement_memo_api_path(db_session, mocker):
     # Memo with rationale is synthesized at spawn time → immediately COMPLETED
     assert memo.status == TaskStatus.COMPLETED
     assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
-    from app.models import Artifact, ArtifactType
+    from app.models import Artifact
 
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+    assert artifacts == []
 
 
 @pytest.mark.asyncio
@@ -13440,14 +13226,15 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
     # Memo with rationale is synthesized at spawn time → immediately COMPLETED
     assert memo.status == TaskStatus.COMPLETED
     assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
-    from app.models import Artifact, ArtifactType
+    from app.models import Artifact
 
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+    assert artifacts == []
 
 
 @pytest.mark.asyncio
@@ -16859,11 +16646,11 @@ async def test_retirement_memo_carries_direction_snapshot(db_session):
 async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
     """A no-rationale retirement with snapshot context produces a COMPLETED memo at spawn.
 
-    Verifies: memo is COMPLETED (not QUEUED), has a MEMO artifact, reasoning includes
-    recent history and metrics, citations include direction:<id> and task:<id>.
-    No QUEUED VM-bearing task is left behind.
+    Verifies: memo is COMPLETED (not QUEUED), records the memo to plan_output
+    (no Artifact row), reasoning includes recent history and metrics, citations
+    include direction:<id> and task:<id>. No QUEUED VM-bearing task is left behind.
     """
-    from app.models import TaskStatus, Artifact, ArtifactType
+    from app.models import TaskStatus, Artifact
     from app.models import Task as TaskModel
     from sqlmodel import select
 
@@ -16953,13 +16740,13 @@ async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
         f"expected COMPLETED (synthesized at spawn), got {memo.status}"
     )
 
-    # Must have a MEMO artifact
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
+    assert artifacts == []
 
     # plan_output must carry the memo
     assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
@@ -17062,21 +16849,21 @@ async def test_spawn_retirement_memo_empty_snapshot_completes_inline_no_vm(db_se
         f"expected COMPLETED (inline synthesis with minimal memo), got {memo.status}"
     )
 
-    # A MEMO artifact must be created at spawn time
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1, (
-        "empty-snapshot memo must have exactly one pre-baked artifact"
+    assert artifacts == [], (
+        "empty-snapshot memo must not create an Artifact row"
     )
-    import json
 
-    artifact_data = json.loads(artifacts[0].logs)
-    assert artifact_data.get("summary"), "memo artifact must have a non-empty summary"
     assert memo.plan_output and memo.plan_output.get("memo"), (
         "plan_output['memo'] must be set for inline-completed memo"
+    )
+    assert memo.plan_output["memo"].get("summary"), (
+        "plan_output memo must have a non-empty summary"
     )
 
 
@@ -18116,6 +17903,46 @@ def test_compute_model_gc_telemetry_shipped_absent_backward_compat():
     assert result["top_budget_consumers"] == []
 
 
+def test_compute_model_gc_telemetry_logs_first_payload_failure(caplog, mocker):
+    """When task.first_payload raises (e.g. detached instance), the function logs a
+    warning and returns all packer-derived counts as empty/zero rather than crashing."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "t", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[{}],
+        context={},
+    )
+    # first_payload is a property; mock it to raise so the except path fires.
+    mocker.patch.object(type(task), "first_payload", new_callable=mocker.PropertyMock, side_effect=RuntimeError("simulated packer read failure"))
+
+    with caplog.at_level(logging.WARNING):
+        result = _compute_model_gc_telemetry(project, task)
+
+    # Function does not crash — falls back to empty packer_meta.
+    assert isinstance(result, dict)
+    assert result["directions_dropped_count"] == 0
+    assert result["open_messages_dropped"] is False
+    assert result["version_phase_dropped"] is False
+    assert result["high_tier_dropped"] == []
+    assert result["problem_model_truncated"] is False
+    assert result["gap_memory_trimmed_count"] == 0
+    assert result["gap_memory_hidden_entries"] == 0
+    assert result["budget_utilization_pct"] is None
+    assert result["top_budget_consumers"] == []
+
+    # A warning was logged about the failure.
+    assert any("Failed to read packer metadata" in record.message for record in caplog.records)
+
+
 # ── QUESTION answer threading tests ──────────────────────────────────────────
 
 
@@ -18611,7 +18438,7 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
 
     Exercises the seam end-to-end using the real HTTP transport (not a mocked
     context write). The context key is popped after synchronous apply so the
-    completion handler is a no-op (idempotency guard for non-resident tasks).
+    completion handler is a no-op (idempotency guard for tasks).
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -19420,10 +19247,6 @@ async def test_unparseable_strategic_failure_counter_is_atomic(db_session, mocke
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="P",
@@ -19476,10 +19299,6 @@ async def test_fallback_activate_direction_applied(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="FallbackActivate",
@@ -19560,10 +19379,6 @@ async def test_fallback_reject_direction_no_mid_loop_write(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="FallbackRejectSingleWrite",
@@ -19647,10 +19462,6 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     concurrent_dir = {
         "id": "d-concurrent",
@@ -19751,10 +19562,6 @@ async def test_retire_direction_note_not_duplicated_on_reprocess(db_session, moc
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="NoteDedup",
@@ -19845,10 +19652,6 @@ async def test_retire_direction_succeeds_when_criterion_is_covered(
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     direction_id = "d-cov-covered"
     direction_dict = {

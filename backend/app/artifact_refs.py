@@ -1,4 +1,4 @@
-"""Revision-safe handoff between human-owned project tools and the Resident."""
+"""Revision-safe handoff for human-owned project tools."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from app.models import (
     ProjectMember,
     ProjectMessageAttachmentUpload,
     ProjectTool,
-    Task,
     _utcnow,
 )
 from app.task_locking import lock_project_or_429
@@ -27,8 +26,7 @@ from app.task_locking import lock_project_or_429
 NOTES_SNAPSHOT_CHAR_CAP = 16_000
 ARTIFACT_REF_KINDS = frozenset({"notes", "whiteboard"})
 SAFE_RENDERED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
-RESIDENT_ARTIFACT_REF_GRANTS_KEY = "_resident_artifact_ref_grants"
-RESIDENT_ARTIFACT_REF_GRANTS_MAX = 256
+ARTIFACT_REF_GRANTS_MAX = 256
 
 
 @dataclass(frozen=True)
@@ -114,25 +112,12 @@ def artifact_ref_projection(ref: ArtifactRef) -> dict[str, Any]:
             "capability": str(
                 retrieval.get("capability") or "project_tool_revision"
             ),
-            "href": f"/api/agent/resident-turn/artifact?artifact_ref_id={ref.id}",
+            "href": f"/api/admin/projects/{ref.project_id}/artifact-refs/{ref.id}",
         },
     }
     if ref.kind == "notes":
         projection["excerpt"] = str(snapshot.get("text") or "")[:2_000]
     return projection
-
-
-def resident_artifact_ref_grants(task: Task) -> frozenset[uuid.UUID]:
-    context = task.context if isinstance(task.context, dict) else {}
-    raw = context.get(RESIDENT_ARTIFACT_REF_GRANTS_KEY)
-    if raw is None:
-        return frozenset()
-    if not isinstance(raw, list) or len(raw) > RESIDENT_ARTIFACT_REF_GRANTS_MAX:
-        raise ValueError("Resident ArtifactRef grants are malformed")
-    try:
-        return frozenset(uuid.UUID(str(value)) for value in raw)
-    except (TypeError, ValueError):
-        raise ValueError("Resident ArtifactRef grants are malformed") from None
 
 
 def artifact_ref_grants_from_message_context(
@@ -150,29 +135,9 @@ def artifact_ref_grants_from_message_context(
             identities.add(uuid.UUID(str(ref["artifact_ref_id"])))
         except (TypeError, ValueError):
             raise ValueError("canonical message contains malformed ArtifactRef") from None
-    if len(identities) > RESIDENT_ARTIFACT_REF_GRANTS_MAX:
-        raise ValueError("Resident ArtifactRef grant limit exceeded")
+    if len(identities) > ARTIFACT_REF_GRANTS_MAX:
+        raise ValueError("ArtifactRef grant limit exceeded")
     return frozenset(identities)
-
-
-def union_resident_artifact_ref_grants(
-    task: Task,
-    artifact_ref_grants: frozenset[uuid.UUID],
-) -> None:
-    """Union canonical grants into a new or still-mutable Resident turn."""
-
-    merged = resident_artifact_ref_grants(task) | artifact_ref_grants
-    if len(merged) > RESIDENT_ARTIFACT_REF_GRANTS_MAX:
-        raise ValueError("Resident ArtifactRef grant limit exceeded")
-    if not merged:
-        return
-    context = dict(task.context or {})
-    context[RESIDENT_ARTIFACT_REF_GRANTS_KEY] = sorted(str(value) for value in merged)
-    task.context = context
-
-
-def merge_resident_artifact_ref_grants(target: Task, source: Task) -> None:
-    union_resident_artifact_ref_grants(target, resident_artifact_ref_grants(source))
 
 
 async def create_tool_artifact_ref(
@@ -367,6 +332,7 @@ async def create_tool_artifact_ref(
             "image_checksum": declared_checksum,
             "mime_type": receipt.content_type or "image/png",
             "size_bytes": receipt.expected_size_bytes,
+            "generation": int(promotion_intent.destination_generation),
             "width": image.get("width") if isinstance(image.get("width"), int) else None,
             "height": image.get("height") if isinstance(image.get("height"), int) else None,
         }
@@ -422,7 +388,4 @@ __all__ = [
     "content_checksum",
     "create_tool_artifact_ref",
     "get_project_artifact_ref",
-    "merge_resident_artifact_ref_grants",
-    "resident_artifact_ref_grants",
-    "union_resident_artifact_ref_grants",
 ]

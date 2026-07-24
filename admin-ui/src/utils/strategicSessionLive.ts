@@ -250,6 +250,23 @@ export interface ResidentActivityState {
  *  arrives. The resident heartbeats on a slow cadence, so the threshold is generous. */
 export const RESIDENT_HEARTBEAT_STALE_MS = 90_000;
 
+function retryWaitLabel(
+  reason: string | null | undefined,
+  retryUntil: string | null | undefined,
+  nowMs: number,
+): string {
+  const cleanReason = reason?.trim() || 'Provider temporarily unavailable';
+  const retryAtMs = retryUntil ? parseTimestamp(retryUntil).getTime() : NaN;
+  if (Number.isNaN(retryAtMs)) return `${cleanReason} — waiting to retry`;
+  const remainingSeconds = Math.max(0, Math.ceil((retryAtMs - nowMs) / 1000));
+  if (remainingSeconds < 60) return `${cleanReason} — retrying in ${remainingSeconds}s`;
+  const remainingMinutes = Math.ceil(remainingSeconds / 60);
+  if (remainingMinutes < 60) return `${cleanReason} — retrying in ${remainingMinutes}m`;
+  const hours = Math.floor(remainingMinutes / 60);
+  const minutes = remainingMinutes % 60;
+  return `${cleanReason} — retrying in ${hours}h${minutes ? ` ${minutes}m` : ''}`;
+}
+
 /** Activity kinds that represent genuine in-progress work. A trailing `tool_result`
  *  (or a read/file completion) means the prior command already returned, so it does
  *  NOT count as still-executing. */
@@ -260,10 +277,10 @@ const EXECUTING_ACTIVITY_KINDS = new Set(['command', 'tool', 'subagent', 'action
  * chat-view widget from ACTUAL feed data — never solely the last WS lifecycle frame
  * (which may never arrive when the session dies).
  *
- * - `dead`  — the resident session is gone: snapshot `status === 'ended'`,
- *   `stop_requested`, `ended_at` set, OR its heartbeat (`last_progress_at` /
- *   `updated_at`) is stale beyond {@link RESIDENT_HEARTBEAT_STALE_MS}. The counter is
- *   frozen at the last known time — it must NEVER keep ticking for a dead session.
+ * - `dead`  — the resident session is explicitly gone, restart failed, or its
+ *   heartbeat is stale enough to require repair. Explicitly ended sessions say
+ *   "Session ended"; recoverable failures say "Workday needs restart". The counter
+ *   is frozen at the last known time — it must NEVER keep ticking for either case.
  * - `executing` — the session is alive AND the live activity feed's last item is an
  *   in-flight running command (not superseded by a `tool_result` / newer activity /
  *   `done`). Only this phase carries a live `startMs` so the timer runs.
@@ -284,18 +301,55 @@ export function computeResidentActivityState(
   const heartbeatMs = heartbeat ? parseTimestamp(heartbeat).getTime() : NaN;
   const endedAtMs = residentSession.ended_at ? parseTimestamp(residentSession.ended_at).getTime() : NaN;
   const stale = !Number.isNaN(heartbeatMs) && nowMs - heartbeatMs > RESIDENT_HEARTBEAT_STALE_MS;
+  const retryWaiting = residentSession.worker_state === 'retry_wait';
 
-  const isDead =
+  const explicitlyEnded =
     (residentSession.status ?? '').toLowerCase() === 'ended'
     || Boolean(residentSession.stop_requested)
-    || Boolean(residentSession.ended_at)
-    || stale;
+    || Boolean(residentSession.ended_at);
 
-  if (isDead) {
+  if (explicitlyEnded) {
     const frozen = !Number.isNaN(endedAtMs)
       ? endedAtMs
       : (!Number.isNaN(heartbeatMs) ? heartbeatMs : undefined);
     return { phase: 'dead', endMs: frozen, label: 'Session ended' };
+  }
+
+  // A provider-enforced retry hold is an intentional dormant state. The worker
+  // cannot heartbeat while it is not claimable, so its old progress timestamp
+  // must never make the still-owned Workday session look dead.
+  if (retryWaiting) {
+    return {
+      phase: 'idle',
+      endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
+      label: retryWaitLabel(
+        residentSession.worker_retry_reason,
+        residentSession.worker_retry_until,
+        nowMs,
+      ),
+    };
+  }
+
+  // A freshly ensured worker can legitimately retain an old session heartbeat
+  // until its first claim. Treat the backend's explicit starting state as a
+  // recoverable transition, never as the contradictory "Active / Session ended".
+  if (residentSession.worker_state === 'starting') {
+    return {
+      phase: 'idle',
+      endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
+      label: 'Reconnecting Workday…',
+    };
+  }
+
+  // A stale ready worker is repaired by the reload ensure path. Until that
+  // authoritative repair completes, make the required action explicit instead
+  // of claiming the operator intentionally ended the conversation.
+  if (residentSession.worker_state === 'restart_failed' || stale) {
+    return {
+      phase: 'dead',
+      endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
+      label: 'Workday needs restart',
+    };
   }
 
   // Session is alive — inspect the live feed for a genuinely-running command.

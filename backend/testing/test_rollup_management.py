@@ -130,6 +130,62 @@ async def _make_merged_child(session, project_id, parent_id):
 
 
 @pytest.mark.asyncio
+async def test_rollup_does_not_credit_childless_plan_without_pr(cleanup_db):
+    """Persisted plan output with zero children is recovery work, not a no-op."""
+    from datetime import timedelta
+    from sqlmodel import select
+
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.time_utils import _utcnow
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="plan",
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "rollup_no_pr_artifact",
+        },
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+    )
+    child.updated_at = _utcnow() - timedelta(minutes=20)
+    cleanup_db.add(child)
+    await cleanup_db.commit()
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    await cleanup_db.refresh(child)
+    # The verifier must override stale credit without writing through this
+    # caller's unlocked/stale ORM instance.
+    assert (child.context or {}).get("pr_merged") is True
+    assert (
+        (child.context or {}).get("_non_merge_unblock_reason")
+        == "rollup_no_pr_artifact"
+    )
+    assert parent.status == TaskStatus.EVALUATING
+    assert "PR not merged" in (parent.latest_status_message or "")
+    child_ids = (
+        await cleanup_db.execute(
+            select(Task.id).where(Task.parent_task_id == parent.id)
+        )
+    ).scalars().all()
+    assert child_ids == [child.id], "no rollup/consolidation child may be spawned"
+
+
+def test_post_commit_locked_preserves_lock_scope():
+    from app.task_lifecycle import PostCommitLocked
+
+    exc = PostCommitLocked("project held", lock_scope="project", resource_id="p1")
+    assert exc.lock_scope == "project"
+
+
+@pytest.mark.asyncio
 async def test_clean_single_head_migration_rollup_auto_merges(cleanup_db, mocker):
     """A rollup touching alembic/versions with a single-head, unique-revision
     combined chain passes the guard and auto-merges (merge_pull_request fires;

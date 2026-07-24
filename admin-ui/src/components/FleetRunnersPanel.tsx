@@ -454,7 +454,7 @@ function readinessClasses(tone: ReadinessTone): string {
 }
 
 /** Compact "ready for Workday / not ready (reason)" statement for a runner row.
- *  Workday (the resident strategic agent) runs on strategic-capable runners; for
+ *  Workday (the strategic agent) runs on strategic-capable runners; for
  *  compute-only runners the identical readiness applies to general task dispatch. */
 function workdayReadinessLine(
   readiness: RunnerReadiness,

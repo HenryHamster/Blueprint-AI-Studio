@@ -94,7 +94,7 @@ describe('SearchFilterBar — viewport regression', () => {
           <SearchFilterBar
             searchQuery="test"
             onSearchChange={() => {}}
-            taskTypeFilter={['create', 'review', 'panel_review']}
+            taskTypeFilter={['create', 'review', 'fix']}
             onTypeFilterChange={() => {}}
             dateRange="24h"
             onDateRangeChange={() => {}}

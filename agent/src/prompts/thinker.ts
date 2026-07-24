@@ -99,7 +99,6 @@ function buildStrategicFingerprintPrompt(
     systemMaturitySection: p.systemMaturitySection ? '<system-maturity>' : '',
     driftSection: p.driftSection ? '<drift>' : '',
     heldDirectionsSection: p.heldDirectionsSection ? '<held-directions>' : '',
-    residentExamLeadsSection: p.residentExamLeadsSection ? '<resident-exam-leads>' : '',
     recentWorkSection: '<recent-work>',
     feedbackSection: '<feedback>',
     questionSection: '<question>',
@@ -209,11 +208,6 @@ export interface ThinkerPromptParams {
    * constructions/tests that omit it still compile; '' renders nothing.
    */
   heldDirectionsSection?: string;
-  /**
-   * Open FOUND leads from the resident session's exam ledger. Optional so
-   * existing constructions/tests that omit it still compile; '' renders nothing.
-   */
-  residentExamLeadsSection?: string;
   recentWorkSection: string;
   feedbackSection: string;
   questionSection: string;
@@ -344,7 +338,7 @@ ${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; reta
 ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
 ${p.directionPortfolioSection}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
 ${p.recentWorkSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 

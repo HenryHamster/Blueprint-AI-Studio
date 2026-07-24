@@ -96,14 +96,14 @@ function DraftStateWrapper(props: Omit<React.ComponentProps<typeof NewTaskModal>
 
 describe('NewTaskModal — Draft contract', () => {
   let computeExperiment: ComputeExperimentForm;
-  let setComputeExperiment: ReturnType<typeof vi.fn>;
+  let setComputeExperiment: ReturnType<typeof vi.fn> & React.Dispatch<React.SetStateAction<ComputeExperimentForm>>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     computeExperiment = makeComputeExperiment();
     setComputeExperiment = vi.fn().mockImplementation((updater: unknown) => {
       if (typeof updater === 'function') {
-        computeExperiment = updater(computeExperiment);
+        computeExperiment = (updater as (prev: ComputeExperimentForm) => ComputeExperimentForm)(computeExperiment);
       } else {
         computeExperiment = updater as ComputeExperimentForm;
       }

@@ -184,9 +184,9 @@ const STATE = {
     cumulative_estimated_cost_usd: 0,
   },
   strategic_memory_notes: [
-    { note: 'Do not assert timelines without supporting evidence — keep projections grounded in measured data.', set_at: '2026-07-08T14:30:00Z' },
-    { note: 'Verify claims from external sources before escalating them to strategic decisions.', set_at: '2026-07-08T15:00:00Z' },
-    { note: 'Prefer concrete action proposals over abstract discussion when blocking on operator input.', set_at: '2026-07-09T09:15:00Z' },
+    { id: 'mem-1', title: 'Do not assert timelines without supporting evidence — keep projections grounded in measured data.', topic: 'process_rule', summary: 'Keep projections grounded in measured data.', tags: [], created_at: '2026-07-08T14:30:00Z' },
+    { id: 'mem-2', title: 'Verify claims from external sources before escalating them to strategic decisions.', topic: 'process_rule', summary: 'Verify external claims before escalating.', tags: [], created_at: '2026-07-08T15:00:00Z' },
+    { id: 'mem-3', title: 'Prefer concrete action proposals over abstract discussion when blocking on operator input.', topic: 'operator_preference', summary: 'Prefer concrete action proposals.', tags: [], created_at: '2026-07-09T09:15:00Z' },
   ],
 } as unknown as StrategicStateResponse;
 
@@ -217,17 +217,8 @@ describe('StrategicContextWorkspace — viewport regression', () => {
         <StrategicContextWorkspace
           open
           state={STATE}
-          accountSpend={{
-            totalAccounts: 4,
-            availableAccounts: 3,
-            enabledAccounts: 4,
-            trackedSpendUsd: 18.42,
-          }}
           onClose={vi.fn()}
           onOpenTarget={vi.fn()}
-          onModeChange={vi.fn()}
-          onCheckIn={vi.fn()}
-          onOpenAccounts={vi.fn()}
           onUpdateSessionRefs={vi.fn()}
         />,
       );

@@ -1,7 +1,8 @@
 import fs from 'fs';
+import path from 'path';
 import { createHash } from 'crypto';
 import type WebSocket from 'ws';
-import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { boundedRegularReadShellFn, excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
 import { extractJsonObject } from '../json-extract.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
@@ -20,6 +21,32 @@ import { cliOps } from './strategic-ops-registry.js';
 // shared manifest carries no bash. The value is the FULL case arm (label + body
 // + `;;`); ops absent here render the uniform default arm.
 const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
+  create_message: `  create-message)
+    # Resident operator turns install one ambient stable key before the model
+    # runs. Use it for this alternate message-send helper too, so a successful
+    # ./strategic create-message and the handler backstop coalesce exactly once.
+    if [ -e "$RESIDENT_REPLY_RECEIPT_PATH" ] || [ -L "$RESIDENT_REPLY_RECEIPT_PATH" ]; then
+      NODE_BIN="\${NODE_BINARY:-node}"
+      RECEIPT=$(_read_regular_bounded "$RESIDENT_REPLY_RECEIPT_PATH" 16384) || {
+        echo "[ERROR] create-message: ambient Resident reply receipt is not a safe regular file" >&2
+        exit 1
+      }
+      DATA=$("$NODE_BIN" -e 'const d=JSON.parse(process.argv[1]); const r=JSON.parse(process.argv[2]); if(!r || typeof r.idempotency_key!=="string" || !r.idempotency_key || !Array.isArray(r.covered_message_ids) || r.covered_message_ids.length===0 || r.covered_message_ids.some(x=>typeof x!=="string" || !x)) process.exit(2); d.idempotency_key=r.idempotency_key; d.covered_message_ids=r.covered_message_ids; process.stdout.write(JSON.stringify(d))' "$DATA" "$RECEIPT") || {
+        echo "[ERROR] create-message: could not merge ambient Resident reply receipt" >&2
+        exit 1
+      }
+      "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const d=JSON.parse(process.argv[2]); const t=p+".tmp."+process.pid; try { fs.writeFileSync(t,JSON.stringify(d),{encoding:"utf8",flag:"wx",mode:0o600}); fs.linkSync(t,p); } finally { try { fs.unlinkSync(t); } catch {} }' "$RESIDENT_STAGED_REPLY_PATH" "$DATA" || {
+        echo "[ERROR] create-message: failed to stage Resident reply" >&2
+        exit 1
+      }
+      printf '{"status":"staged","op":"create_message"}\n'
+      exit 0
+    elif [ -e "$RESIDENT_REPLY_KEY_PATH" ] || [ -L "$RESIDENT_REPLY_KEY_PATH" ]; then
+      echo "[ERROR] create-message: ambient Resident reply key exists without its receipt" >&2
+      exit 1
+    fi
+    _call "create_message"
+    ;;`,
   set_running_update: `  set-running-update)
     # DATA is a path to the markdown file written by the Thinker. Wrap
     # the file contents as {markdown: "..."} before the usual body build.
@@ -47,8 +74,17 @@ function renderStrategicCaseBody(): string {
     .join('\n');
 }
 
-function generateStrategicScript(taskIdRaw: string): string {
+function generateStrategicScript(taskIdRaw: string, helperDir: string): string {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
+  const replyKeyPath = shellEscapeDoubleQuoted(
+    path.resolve(helperDir, '.resident-reply-idempotency-key').replace(/\\/g, '/'),
+  );
+  const replyReceiptPath = shellEscapeDoubleQuoted(
+    path.resolve(helperDir, '.resident-reply-receipt.json').replace(/\\/g, '/'),
+  );
+  const stagedReplyPath = shellEscapeDoubleQuoted(
+    path.resolve(helperDir, '.resident-reply-staged-message.json').replace(/\\/g, '/'),
+  );
   const usageAliases = renderStrategicUsageAliases();
   const caseBody = renderStrategicCaseBody();
   return `#!/bin/bash
@@ -63,13 +99,18 @@ ${agentTokenShellFn()}
 ${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
+RESIDENT_REPLY_KEY_PATH="${replyKeyPath}"
+RESIDENT_REPLY_RECEIPT_PATH="${replyReceiptPath}"
+RESIDENT_STAGED_REPLY_PATH="${stagedReplyPath}"
 DATA="$1"
+NODE_BIN="\${NODE_BINARY:-node}"
+${boundedRegularReadShellFn()}
 
 _call() {
   local attempt=0 saw_auth=0 max=3 delay http_code body dump response
   while [ $attempt -lt $max ]; do
     # Re-read the live token each attempt so a token that rotated between tries
-    # (the agent refreshes at ~45min) is picked up — the resident-session
+    # (the agent refreshes at ~45min) is picked up — the long-lived-session
     # write-token-expiry fix.
     _load_agent_token || return 1
     dump=$(mktemp)
@@ -101,7 +142,13 @@ _call() {
     # Treat it as a transient failure and retry alongside 429/5xx so a network
     # blip (or a token-budget hiccup) is not booked as a permanent failure.
     if [ "$http_code" = "000" ] || [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
-      [ -z "$delay" ] && delay=$((attempt * 2))
+      if [ -z "$delay" ]; then
+        # Exponential backoff: 10s, 20s, 40s (floor=10, ceiling=60)
+        delay=$((10 * (1 << (attempt - 1))))
+        [ "$delay" -gt 60 ] && delay=60
+      elif [ "$delay" -lt 10 ]; then
+        delay=10
+      fi
       echo "[RETRY $attempt/$((max - 1))] $1 failed (HTTP $http_code), retrying in \${delay}s..." >&2
       sleep "$delay"
     elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
@@ -115,7 +162,7 @@ _call() {
     fi
   done
   if [ "$saw_auth" -eq 1 ] && { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; }; then
-    echo "[ERROR] $1 failed: agent token expired and no refreshed token was available after 3 attempts. The resident session must be restarted (agent JWT TTL is 1h and the agent's proactive refresh appears wedged)." >&2
+    echo "[ERROR] $1 failed: agent token expired and no refreshed token was available after 3 attempts. The session must be restarted (agent JWT TTL is 1h and the agent's proactive refresh appears wedged)." >&2
   else
     echo "[ERROR] $1 failed after $max attempts (HTTP $http_code)" >&2
   fi
@@ -292,49 +339,63 @@ if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND
   exit 1
 fi
 
-# Fetch with HTTP status awareness. Capture response body and status code
-# separately so we can surface HTTP errors clearly.
-response=$(curl -sS --max-time 20 --connect-timeout 10 \\
-  -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\
-  -H "X-Agent-Token: $TOKEN" \\
-  -w '\\n%{http_code}')
-http_code=$(printf '%s' "$response" | tail -n1)
-body=$(printf '%s' "$response" | head -n -1)
-
-# On 401/403: the spawn-time token may have rotated (resident session token
-# refresh). Re-read the live token and retry ONCE before surfacing the error.
-if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-  _load_agent_token || exit 1
+# Fetch with HTTP status awareness. Retry on 429/5xx with exponential backoff
+# (10s/20s/40s, ceiling 60s); honor Retry-After header as minimum-10s floor.
+# On 401/403: re-read the rotated token and retry ONCE before surfacing the error.
+_fetch_url="$API/api/agent/projects/$PROJECT/$PATH_SUFFIX"
+_fetch_attempt=0
+_fetch_max=3
+_fetch_auth_retried=0
+while true; do
+  _dump=$(mktemp)
   response=$(curl -sS --max-time 20 --connect-timeout 10 \\
-    -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\
+    -X GET "$_fetch_url" \\
     -H "X-Agent-Token: $TOKEN" \\
+    -D "$_dump" \\
     -w '\\n%{http_code}')
   http_code=$(printf '%s' "$response" | tail -n1)
   body=$(printf '%s' "$response" | head -n -1)
-fi
-
-# On 2xx: pass body through as today (success)
-if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-  printf '%s' "$body"
-  echo ""
-  exit 0
-fi
-
-# On 409: ambiguous ref or constraint violation. Surface the body (which contains
-# candidate refs and minimum hex length) with a clear ambiguity signal so the
-# agent knows to retry with a longer ref.
-if [ "$http_code" -eq 409 ]; then
-  printf '%s' "$body"
-  echo "[AMBIGUOUS] fetch $KIND: multiple candidates found; candidates and minimum ref length in response above" >&2
+  _retry_after=$(grep -i '^retry-after:' "$_dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+  rm -f "$_dump"
+  # On 2xx: success
+  if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+    printf '%s' "$body"
+    echo ""
+    exit 0
+  fi
+  # On 401/403: re-read the rotated token and retry ONCE (not counted against
+  # the transient-error budget — auth retries are a separate concern).
+  if { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; } && [ $_fetch_auth_retried -eq 0 ]; then
+    _fetch_auth_retried=1
+    _load_agent_token || exit 1
+    continue
+  fi
+  # On 409: ambiguous ref or constraint violation.
+  if [ "$http_code" -eq 409 ]; then
+    printf '%s' "$body"
+    echo "[AMBIGUOUS] fetch $KIND: multiple candidates found; candidates and minimum ref length in response above" >&2
+    echo ""
+    exit 1
+  fi
+  # On 429 or 5xx: retry with exponential backoff (floor=10s, ceiling=60s).
+  _fetch_attempt=$((_fetch_attempt + 1))
+  if { [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; } && [ $_fetch_attempt -lt $_fetch_max ]; then
+    if [ -n "$_retry_after" ] && [ "$_retry_after" -ge 10 ] 2>/dev/null; then
+      _delay=$_retry_after
+    else
+      _delay=$((10 * (1 << (_fetch_attempt - 1))))
+      [ "$_delay" -gt 60 ] && _delay=60
+    fi
+    echo "[RETRY $_fetch_attempt/$((_fetch_max - 1))] fetch $KIND failed (HTTP $http_code), retrying in \${_delay}s..." >&2
+    sleep "$_delay"
+    continue
+  fi
+  # Non-retryable or exhausted retries.
+  printf '%s' "$body" >&2
+  echo "[ERROR] fetch $KIND failed (HTTP $http_code)" >&2
   echo ""
   exit 1
-fi
-
-# On any other non-2xx (404, 400, 5xx, etc.): surface the body and report error.
-# The agent can then decide how to handle missing/invalid refs.
-printf '%s' "$body" >&2
-echo "[ERROR] fetch $KIND failed (HTTP $http_code)" >&2
-echo ""
+done
 exit 1
 `;
 }
@@ -856,7 +917,7 @@ export function buildStrategicChallengeExecutorSection(record: StrategicChalleng
 }
 
 export function writeStrategicHelpers(taskId: string, projectId: string, workspace: string): void {
-  const strategicScript = generateStrategicScript(taskId);
+  const strategicScript = generateStrategicScript(taskId, workspace);
   fs.writeFileSync(`${workspace}/strategic`, strategicScript, { mode: 0o755 });
 
   // Strategic agents get the FULL verb set so their ./fetch is byte-identical

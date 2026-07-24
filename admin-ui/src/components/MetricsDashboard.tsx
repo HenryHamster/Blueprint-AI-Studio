@@ -3,7 +3,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type FormatComplianceBySchemaEntry, type ChallengerSampleRateRecommendation, type LlmCostAttributionWindowDelta } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type FormatComplianceBySchemaEntry, type LlmCostAttributionWindowDelta } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import { usePoller } from '../hooks/usePoller';
@@ -522,19 +522,6 @@ function NestedAxisLine({ label, axis, unit, favorableDirection, percent = false
   );
 }
 
-function ChallengerSampleRateRow({ rec }: { rec: ChallengerSampleRateRecommendation }) {
-  const statusColor = rec.status === 'reduce' ? 'text-amber-400' : rec.status === 'gate_earning' ? 'text-emerald-400' : 'text-neutral-500';
-  const rateLabel = rec.recommended_sample_rate != null ? rec.recommended_sample_rate.toFixed(2) : '—';
-  return (
-    <div data-testid="challenger-sample-rate-recommendation" className="mt-1.5 text-ui-sm border-t border-neutral-700/50 pt-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-neutral-400">recommended sample_rate</span>
-        <span className={`font-mono font-semibold ${statusColor}`}>{rateLabel}</span>
-      </div>
-      <p className={`mt-0.5 ${statusColor} leading-tight`}>{rec.rationale}</p>
-    </div>
-  );
-}
 
 function EfficiencyWidget({ projectId }: { projectId: string }) {
   const [data, setData] = useState<EfficiencyAxesLocal | null>(null);
@@ -625,38 +612,6 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
         );
       })}
-      {data.panel_review_effectiveness && (
-        <div data-testid="panel-review-effectiveness-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
-          <div className="flex justify-between items-center gap-4">
-            <span className="text-neutral-400">Panel review effectiveness</span>
-            <div className="space-y-1 min-w-0">
-              <NestedAxisLine
-                label="overturn_rate"
-                axis={{
-                  current: data.panel_review_effectiveness.overturn_rate,
-                  baseline: null,
-                  drift_pct: null,
-                }}
-                unit="%"
-                favorableDirection="higher"
-                percent
-              />
-            </div>
-          </div>
-          <div className="mt-1 text-ui-sm text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
-            <span>challenged confirmed: {data.panel_review_effectiveness.challenged_confirmed ?? '—'}</span>
-            <span>revised: {data.panel_review_effectiveness.challenged_revised ?? '—'}</span>
-            <span>rejected: {data.panel_review_effectiveness.challenged_rejected ?? '—'}</span>
-            <span>total: {data.panel_review_effectiveness.total_challenged ?? '—'}</span>
-            {data.panel_review_effectiveness.cost_per_challenge_usd != null && (
-              <span>cost/challenge: ${data.panel_review_effectiveness.cost_per_challenge_usd.toFixed(4)}</span>
-            )}
-          </div>
-          {data.panel_review_recommended_sample_rate && (
-            <ChallengerSampleRateRow rec={data.panel_review_recommended_sample_rate} />
-          )}
-        </div>
-      )}
       {data.vm_cost_attribution && data.vm_cost_attribution.by_task_type.length > 0 && (
         <div data-testid="vm-cost-attribution-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
           <div className="flex justify-between items-center gap-4 mb-2">

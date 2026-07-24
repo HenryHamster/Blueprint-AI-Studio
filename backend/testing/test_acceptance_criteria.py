@@ -12,7 +12,9 @@ Exercises :mod:`app.acceptance_criteria`:
   * criterion_ids are propagated from direction to spawned task;
   * test_criterion_evidence_recorded_on_task_merge verifies merge evidence flow;
   * GET /version-lifecycle includes criterion_coverage on current_version and history entries;
-  * operator_attestation source_kind satisfies coverage and the attest endpoint records it.
+  * operator_attestation source_kind satisfies coverage and the attest endpoint records it;
+  * test_walkthrough_merge_evidence_flips_criterion_coverage proves v26
+    walkthrough results flip coverage for the three canonical criteria.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from app import acceptance_criteria as ac
 from app.operator_attention import build_operator_attention
 from app.time_utils import _utcnow
 from app.models import (
+    Alert,
     CriterionEvidence,
     Direction,
     Project,
@@ -647,6 +650,164 @@ def test_stale_machine_probe_falls_back_to_partial():
     )
     assert ac._evidence_is_probed(fresh) is True
     assert ac.compute_criterion_coverage([fresh]) == "probed"
+
+
+def test_walkthrough_e2e_evidence_covers_only_when_fresh_and_sha_pinned():
+    """A ``walkthrough_e2e`` row is 'covered' ONLY when fresh AND SHA-pinned.
+
+    This is the whole point of the walkthrough_e2e evidence lane: an autonomous
+    live-stack browser run that actually exercised the criterion against a pinned
+    candidate commit earns genuine machine-verified ``covered`` coverage — but
+    stale or committed walk evidence (e.g. 123 commits old) must stop counting,
+    and a row with no pinned SHA must not forge coverage.
+
+      (a) fresh + SHA-pinned            => 'covered'
+      (b) stale (older than the window) => NOT covered (falls back to 'partial')
+      (c) missing candidate_sha         => NOT covered (falls back to 'partial')
+    """
+    sha = "a" * 40
+
+    # (a) fresh + SHA-pinned → covered. One day of slack keeps the predicate's
+    # slightly-later _utcnow() from tipping the exact-boundary comparison.
+    fresh_pinned = _make_evidence(
+        ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+        detail={"candidate_sha": sha, "evaluated_at": _utcnow().isoformat()},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e_covered(fresh_pinned) is True
+    assert ac._evidence_proves_covered(fresh_pinned) is True
+    assert ac.compute_criterion_coverage([fresh_pinned]) == "covered"
+    # covered maps onto the shared EvidenceStatus axis as full machine-proof.
+    assert ac.criterion_evidence_status([fresh_pinned]) == "proven"
+
+    # (b) stale but SHA-pinned → NOT covered; the only evidence present is
+    # non-covering, so coverage falls back to 'partial'.
+    stale_pinned = _make_evidence(
+        ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+        detail={"candidate_sha": sha},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e_covered(stale_pinned) is False
+    assert ac._evidence_proves_covered(stale_pinned) is False
+    assert ac.compute_criterion_coverage([stale_pinned]) == "partial"
+
+    # (c) fresh but missing candidate_sha → NOT covered → 'partial'. Cover the
+    # blank-string, absent-key, and non-dict-detail variants.
+    for bad_detail in ({"candidate_sha": ""}, {"flow": "runner_enroll"}, None):
+        fresh_unpinned = _make_evidence(
+            ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+            detail=bad_detail,
+            recorded_at=_utcnow() - timedelta(days=1),
+        )
+        assert ac._evidence_is_walkthrough_e2e_covered(fresh_unpinned) is False
+        assert ac.compute_criterion_coverage([fresh_unpinned]) == "partial"
+
+    # A row with no recorded_at at all cannot grant perpetual trust.
+    no_ts = _make_evidence(
+        ac.WALKTHROUGH_E2E_EVIDENCE_KIND,
+        detail={"candidate_sha": sha},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_walkthrough_e2e_covered(no_ts) is False
+    assert ac.compute_criterion_coverage([no_ts]) == "partial"
+
+    # Machine-verified fresh+pinned walkthrough evidence coexisting with a bare
+    # partial signal still resolves to 'covered' (covering wins).
+    partial_only = _make_evidence("operator")
+    assert ac.compute_criterion_coverage([partial_only, fresh_pinned]) == "covered"
+
+
+# ---------------------------------------------------------------------------
+# _evidence_is_walkthrough_e2e + walkthrough_e2e coverage tier
+# ---------------------------------------------------------------------------
+
+
+def test_walkthrough_e2e_fresh_pass_is_covered():
+    """A fresh, SHA-pinned walkthrough_e2e PASS row grants full 'covered' tier."""
+    ev = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "abc123", "verdict": "PASS", "flow": "c-dfdc9d82"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(ev) is True
+    assert ac._evidence_proves_covered(ev) is True
+    assert ac.compute_criterion_coverage([ev]) == "covered"
+
+
+def test_walkthrough_e2e_stale_decays():
+    """A walkthrough_e2e row older than WALKTHROUGH_E2E_WINDOW_DAYS decays to 'partial'."""
+    stale = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "abc123", "verdict": "PASS", "flow": "c-dfdc9d82"},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e(stale) is False
+    assert ac._evidence_proves_covered(stale) is False
+    assert ac.compute_criterion_coverage([stale]) == "partial"
+
+
+def test_walkthrough_e2e_no_recorded_at_not_trusted():
+    """A walkthrough_e2e row with no recorded_at cannot grant perpetual trust."""
+    ev = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "abc123", "verdict": "PASS"},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_walkthrough_e2e(ev) is False
+    assert ac._evidence_proves_covered(ev) is False
+
+
+def test_walkthrough_e2e_missing_candidate_sha_not_trusted():
+    """A walkthrough_e2e row without a candidate_sha is not trusted."""
+    no_sha = _make_evidence(
+        "walkthrough_e2e",
+        detail={"verdict": "PASS", "flow": "c-dfdc9d82"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(no_sha) is False
+    assert ac._evidence_proves_covered(no_sha) is False
+
+    empty_sha = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "", "verdict": "PASS", "flow": "c-dfdc9d82"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(empty_sha) is False
+
+
+def test_walkthrough_e2e_fail_verdict_not_covered():
+    """A walkthrough_e2e row with a FAIL or DEAD_END verdict does not cover."""
+    for verdict in ("FAIL", "DEAD_END", None):
+        ev = _make_evidence(
+            "walkthrough_e2e",
+            detail={"candidate_sha": "abc123", "verdict": verdict, "flow": "c-dfdc9d82"},
+        )
+        assert ac._evidence_is_walkthrough_e2e(ev) is False, f"verdict={verdict!r} should not grant trust"
+        assert ac._evidence_proves_covered(ev) is False
+
+
+def test_walkthrough_e2e_wrong_source_kind_rejected():
+    """_evidence_is_walkthrough_e2e returns False for non-walkthrough_e2e source_kinds."""
+    not_walkthrough = _make_evidence(
+        "operator_attestation",
+        detail={"candidate_sha": "abc123", "verdict": "PASS"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(not_walkthrough) is False
+
+
+def test_walkthrough_e2e_fresh_inside_window():
+    """A row recorded just inside the window boundary is still valid."""
+    fresh = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "deadbeef", "verdict": "PASS", "flow": "c-5214996f"},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e(fresh) is True
+    assert ac.compute_criterion_coverage([fresh]) == "covered"
+
+
+def test_walkthrough_e2e_none_detail_not_trusted():
+    """A walkthrough_e2e row with None detail is not trusted."""
+    ev = _make_evidence("walkthrough_e2e", detail=None)
+    assert ac._evidence_is_walkthrough_e2e(ev) is False
+    assert ac._evidence_proves_covered(ev) is False
 
 
 # ---------------------------------------------------------------------------
@@ -5139,7 +5300,7 @@ async def test_retire_direction_clears_criterion_keys(
 
     # Wire BOTH the Direction ORM row AND the blob entry with criterion_keys
     # so the real propagation path (blob -> sync_directions -> upsert_direction)
-    # is exercised.  Without blob-resident keys the dual-write is a no-op and
+    # is exercised.  Without blob-side keys the dual-write is a no-op and
     # the resurrection regression isn't tested.
     project.directions = [
         {
@@ -10093,3 +10254,2067 @@ async def test_coverage_summary_evidence_carries_tier_and_provenance(db_session)
     reachability_entry = next(e for e in evidence_list if e["source_kind"] == "reachability")
     assert reachability_entry["tier"] == "covered"
     assert reachability_entry["provenance"] is None
+
+
+# ---------------------------------------------------------------------------
+# walkthrough_e2e evidence ingestion (record_walkthrough_e2e_evidence + endpoint)
+# backfill_merged_named_test_coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_writes_covered_when_sha_matches(
+    db_session,
+):
+    """A matching candidate_sha writes covered-tier evidence for passed criteria."""
+    project = await _make_project_with_member(db_session, name="Walk-Match")
+    sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    passed = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    failed = await ac.create_criterion(db_session, project.id, version.id, "Iframe token")
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": passed.criterion_key, "passed": True, "notes": "green"},
+            {"criterion_key": failed.criterion_key, "passed": False, "notes": "red"},
+        ],
+        qualification_attempt_id="attempt-1",
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["skipped_not_passed"] == 1
+    assert summary["unmatched_keys"] == []
+
+    # The passing criterion is now covered by a SHA-pinned walkthrough row.
+    passed_ev = await ac.get_evidence_for_criterion(db_session, passed.id)
+    assert len(passed_ev) == 1
+    assert passed_ev[0].source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND
+    assert passed_ev[0].detail["candidate_sha"] == sha
+    assert passed_ev[0].detail["passed"] is True
+    assert "evaluated_at" in passed_ev[0].detail
+    assert ac.compute_criterion_coverage(passed_ev) == "covered"
+
+    # The failing criterion earned nothing.
+    failed_ev = await ac.get_evidence_for_criterion(db_session, failed.id)
+    assert failed_ev == []
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_rejects_mismatched_sha(db_session):
+    """A candidate_sha that does not match the qualifying SHA writes NOTHING."""
+    project = await _make_project_with_member(db_session, name="Walk-Mismatch")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "c" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha="d" * 40,  # wrong commit
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "candidate_sha_mismatch"
+    assert summary["recorded"] == 0
+    # A run against the wrong commit forged no coverage.
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_rejects_missing_sha(db_session):
+    """An empty candidate_sha is rejected outright (cannot pin coverage)."""
+    project = await _make_project_with_member(db_session, name="Walk-MissingSha")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "e" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha="   ",
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "missing_candidate_sha"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_happy_path(client: AsyncClient, db_session):
+    """POST .../walkthrough-e2e-evidence writes covered evidence and coverage flips."""
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint")
+    sha = "f" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": sha,
+            "qualification_attempt_id": "attempt-9",
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["recorded"] == 1
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[crit.criterion_key]["coverage"] == "covered"
+    assert summary["covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_records_exercised_engine_sha(
+    client: AsyncClient, db_session
+):
+    """The optional ``exercised_engine_sha`` is persisted onto each evidence row.
+
+    This is the additive seam a later guard enforces against ``candidate_sha``:
+    it records the SHA the candidate stack ACTUALLY served, proving the
+    walkthrough exercised the candidate engine (not the deployed one). It must
+    never weaken the existing candidate_sha match — a matching SHA still writes
+    covered evidence, now carrying the exercised SHA in ``detail``.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint-Sha")
+    sha = "a" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": sha,
+            "exercised_engine_sha": sha,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["recorded"] == 1
+
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert evidence[0].detail.get("exercised_engine_sha") == sha
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_rejects_mismatched_sha(
+    client: AsyncClient, db_session
+):
+    """POST with a mismatched candidate_sha returns 409 and writes nothing."""
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint-Bad")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "1" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": "2" * 40,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    # The app reshapes HTTPException into {"error": {"code", "message": detail}}.
+    assert resp.json()["error"]["message"]["reason"] == "candidate_sha_mismatch"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_evidence_rejects_engine_sha_mismatch(db_session):
+    """A mismatched exercised_engine_sha rejects the whole batch — zero rows written.
+
+    This is the named acceptance test for the engine-SHA genuineness guard.
+    When the harness reports exercised_engine_sha != candidate_sha the function
+    must return rejected/exercised_engine_sha_mismatch and write nothing, even
+    though the candidate_sha itself matches the qualifying SHA.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-EngSha-Mismatch")
+    sha = "a" * 40
+    other_sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+        exercised_engine_sha=other_sha,  # harness drove a different engine
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "exercised_engine_sha_mismatch"
+    assert summary["recorded"] == 0
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_evidence_accepts_matching_exercised_engine_sha(db_session):
+    """A matching exercised_engine_sha records evidence and stamps the SHA in detail."""
+    project = await _make_project_with_member(db_session, name="Walk-EngSha-Match")
+    sha = "c" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+        exercised_engine_sha=sha,  # harness confirmed the right engine
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert evidence[0].detail.get("exercised_engine_sha") == sha
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_evidence_accepts_absent_exercised_engine_sha(db_session):
+    """Absent exercised_engine_sha is accepted for backward compatibility."""
+    project = await _make_project_with_member(db_session, name="Walk-EngSha-Absent")
+    sha = "d" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[{"criterion_key": crit.criterion_key, "passed": True}],
+        # exercised_engine_sha intentionally omitted
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) != []
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_endpoint_rejects_mismatched_exercised_engine_sha(
+    client: AsyncClient, db_session
+):
+    """POST with exercised_engine_sha != candidate_sha returns 409 and writes nothing."""
+    project = await _make_project_with_member(db_session, name="Walk-Endpoint-EngSha")
+    sha = "e" * 40
+    other_sha = "f" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Runner enroll")
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/walkthrough-e2e-evidence",
+        json={
+            "candidate_sha": sha,
+            "exercised_engine_sha": other_sha,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["message"]["reason"] == "exercised_engine_sha_mismatch"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_covers_uncovered_criterion(db_session):
+    """Merged task with named_test in changed files SHOULD get backfill evidence.
+
+    When a task's criteria were added AFTER the merge (so record_task_merge_evidence
+    never fired), the backfill must find such tasks, verify the test was in changed
+    files, and record UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND evidence.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestCoverage")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Merged named-test criterion",
+        created_by="strategist",
+    )
+
+    # Simulate a completed merged task that declared named_test in its payload.
+    # Criteria were added after the merge, so record_task_merge_evidence never ran.
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_merged_backfill.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_merged_backfill.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Before backfill: the criterion has no evidence (coverage = uncovered).
+    evidence_before = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence_before == [], "No evidence before backfill"
+    assert ac.compute_criterion_coverage(evidence_before) == "uncovered"
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    assert recorded == 1, (
+        f"Expected 1 evidence row for 1 criterion; got {recorded}"
+    )
+    evidence_after = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_after) == 1
+    assert evidence_after[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    assert evidence_after[0].source_id == str(task.id)
+    assert evidence_after[0].detail is not None
+    assert evidence_after[0].detail.get("proven") is True
+    assert evidence_after[0].detail.get("backfill_reason") == "merged_named_test_matches_changed"
+
+    coverage = ac.compute_criterion_coverage(evidence_after)
+    assert coverage == "backfilled", f"Expected 'backfilled', got '{coverage}'"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_already_covered(db_session):
+    """Criteria already machine-verified as covered get NO new backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestSkipCovered")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Already covered criterion",
+    )
+
+    # Record covering evidence first (task_merge with proven=True).
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_already_covered.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_already_covered.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Record covering evidence (proven task_merge).
+    await ac.record_evidence(
+        db_session,
+        criterion_id=criterion.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id=str(task.id),
+        detail={"proven": True},
+    )
+
+    # Verify criterion is already 'covered'.
+    evidence_before = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert ac.compute_criterion_coverage(evidence_before) == "covered"
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Already-covered criterion must not get backfill evidence"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_test_not_in_changed(db_session):
+    """Declared named_test NOT in changed files gets NO backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestSkipMissing")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Missing test criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_not_shipped.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Test not in changed files must not get backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_no_named_test(db_session):
+    """Task with no named_test declaration gets NO backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestSkipNoNamed")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "No named-test criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_no_named.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "No named_test declaration must not get backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_idempotent(db_session):
+    """Second call to backfill_merged_named_test_coverage records 0 new rows."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestIdempotent")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Idempotent criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_idempotent_backfill.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_idempotent_backfill.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # First call: records evidence.
+    recorded1 = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded1 == 1
+
+    # Second call: should record 0 new rows.
+    recorded2 = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded2 == 0, "Second backfill call must be idempotent"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_no_criterion_ids(db_session):
+    """Task with no criterion_ids gets NO backfill evidence."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestNoCriterionIds")
+    _ = await _make_version(db_session, project)  # open version needed for backfill to proceed
+
+    # Create a task that has a named_test but NO criterion_ids.
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement X",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_no_criterion_ids.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_no_criterion_ids.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Task with no criterion_ids must not get backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_skips_no_seam_files(db_session):
+    """Test-only diff (no production seam) gets NO backfill evidence.
+
+    A named_test that ships NO production seam cannot exercise changed code,
+    so the backfill must skip it.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestNoSeam")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "No-seam criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "test only change",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_only.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_only.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 0, "Test-only diff must not get backfill evidence"
+
+
+# ---------------------------------------------------------------------------
+# _handle_walkthrough_e2e_completion — log format alignment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_walkthrough_e2e_completion_ingests_results(db_session):
+    """_handle_walkthrough_e2e_completion ingests evidence from the agent's
+    actual log format: {git_sha, run_timestamp, results: [{criterion_key, passed, notes}]}.
+
+    Only entries with passed=True create evidence rows; passed=False entries
+    are silently skipped.
+    """
+    import json as _json
+    from app.task_completion import _handle_walkthrough_e2e_completion
+
+    project = await _make_project(db_session, name="Walk-Completion-Ingest")
+    version = await _make_version(db_session, project)
+    sha = "a" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit_pass = await ac.create_criterion(db_session, project.id, version.id, "Passes criterion")
+    crit_fail = await ac.create_criterion(db_session, project.id, version.id, "Fails criterion")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "walkthrough_e2e", "prompt": "run walkthrough"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = _json.dumps({
+        "git_sha": sha,
+        "run_timestamp": "2026-07-22T00:00:00Z",
+        "results": [
+            {"criterion_key": crit_pass.criterion_key, "passed": True, "notes": "all good"},
+            {"criterion_key": crit_fail.criterion_key, "passed": False, "notes": "timeout"},
+        ],
+    })
+
+    await _handle_walkthrough_e2e_completion(task, logs, db_session)
+
+    pass_ev = await ac.get_evidence_for_criterion(db_session, crit_pass.id)
+    assert len(pass_ev) == 1, "passed=True entry must create an evidence row"
+    assert pass_ev[0].source_kind == "walkthrough_e2e"
+    assert pass_ev[0].detail["candidate_sha"] == sha
+    assert pass_ev[0].detail["criterion_key"] == crit_pass.criterion_key
+    assert pass_ev[0].detail["passed"] is True
+    assert pass_ev[0].detail["notes"] == "all good"
+
+    fail_ev = await ac.get_evidence_for_criterion(db_session, crit_fail.id)
+    assert fail_ev == [], "passed=False entry must not create any evidence row"
+
+
+@pytest.mark.asyncio
+async def test_handle_walkthrough_e2e_completion_skips_missing_results_key(db_session):
+    """_handle_walkthrough_e2e_completion skips gracefully when 'results' key
+    is absent (e.g. old 'flows' format or unparseable artifact).
+    """
+    import json as _json
+    from app.task_completion import _handle_walkthrough_e2e_completion
+
+    project = await _make_project(db_session, name="Walk-Completion-OldFormat")
+    version = await _make_version(db_session, project)
+    sha = "b" * 40
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Old-format crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "walkthrough_e2e", "prompt": "run walkthrough"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Old-format artifact: uses "flows" key instead of "results" — must be silently skipped.
+    old_format_logs = _json.dumps({
+        "git_sha": sha,
+        "flows": [{"flow": crit.criterion_key, "verdict": "PASS", "candidate_sha": sha}],
+    })
+
+    await _handle_walkthrough_e2e_completion(task, old_format_logs, db_session)
+
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert evidence == [], "Old 'flows' format must not produce any evidence rows"
+
+
+# ---------------------------------------------------------------------------
+# record_operator_walkthrough_evidence — operator-run walkthrough ingestion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_records_covered(db_session):
+    """record_operator_walkthrough_evidence writes covered-tier evidence when SHA is provided.
+
+    Unlike record_walkthrough_e2e_evidence, this does NOT check that the SHA
+    matches the version's qualifying candidate SHA — the operator asserts the
+    commit is correct by running against it.
+    """
+    project = await _make_project_with_member(db_session, name="OpWalk-Record")
+    sha = "aabbccdd" + "e" * 31
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "z" * 40},  # deliberately different
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    passed_crit = await ac.create_criterion(
+        db_session, project.id, version.id, "Operator runner enroll"
+    )
+    failed_crit = await ac.create_criterion(
+        db_session, project.id, version.id, "Operator iframe token"
+    )
+    unmatched_key = "c-nonexistent"
+
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": passed_crit.criterion_key, "passed": True, "notes": "all green"},
+            {"criterion_key": failed_crit.criterion_key, "passed": False, "notes": "red"},
+            {"criterion_key": unmatched_key, "passed": True, "notes": "ghost"},
+        ],
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["skipped_not_passed"] == 1
+    assert summary["unmatched_keys"] == [unmatched_key]
+
+    # The passing criterion earned covered-tier walkthrough_e2e evidence.
+    passed_ev = await ac.get_evidence_for_criterion(db_session, passed_crit.id)
+    assert len(passed_ev) == 1
+    assert passed_ev[0].source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND
+    assert passed_ev[0].detail["candidate_sha"] == sha
+    assert passed_ev[0].detail["passed"] is True
+    assert "evaluated_at" in passed_ev[0].detail
+    assert ac.compute_criterion_coverage(passed_ev) == "covered"
+
+    # The failing criterion earned nothing.
+    failed_ev = await ac.get_evidence_for_criterion(db_session, failed_crit.id)
+    assert failed_ev == []
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_rejects_empty_sha(db_session):
+    """record_operator_walkthrough_evidence rejects empty candidate_sha."""
+    project = await _make_project_with_member(db_session, name="OpWalk-EmptySha")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+
+    for bad_sha in ("", "   ", None):
+        summary = await ac.record_operator_walkthrough_evidence(
+            db_session,
+            version,
+            candidate_sha=bad_sha,
+            results=[{"criterion_key": crit.criterion_key, "passed": True}],
+        )
+        assert summary["status"] == "rejected"
+        assert summary["rejected_reason"] == "missing_candidate_sha"
+        assert summary["recorded"] == 0
+        assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_operator_walkthrough_endpoint_happy_path(
+    client: AsyncClient, db_session
+):
+    """POST .../operator-walkthrough-evidence writes covered evidence.
+
+    This proves that an operator-run walkthrough against a non-qualifying SHA
+    still produces covered-tier evidence — unlike the qualifier-spawned endpoint
+    which would reject a mismatched SHA with 409.
+    """
+    project = await _make_project_with_member(db_session, name="OpWalk-Endpoint")
+    sha = "operator-pinned-sha-" + "a" * 22
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "z" * 40},  # different from the posted SHA
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(
+        db_session, project.id, version.id, "Endpoint runner enroll"
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/operator-walkthrough-evidence",
+        json={
+            "candidate_sha": sha,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["recorded"] == 1
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[crit.criterion_key]["coverage"] == "covered"
+    assert summary["covered"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_operator_walkthrough_endpoint_rejects_empty_sha(
+    client: AsyncClient, db_session
+):
+    """POST .../operator-walkthrough-evidence returns 409 for empty SHA."""
+    project = await _make_project_with_member(db_session, name="OpWalk-Endpoint-Empty")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/operator-walkthrough-evidence",
+        json={
+            "candidate_sha": "",
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    # The app reshapes HTTPException into {"error": {"code", "message": detail}}.
+    assert resp.json()["error"]["message"]["reason"] == "missing_candidate_sha"
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_script_ingestion_flips_coverage(
+    client: AsyncClient, db_session
+):
+    """Prove that a walkthrough script result POSTed via the operator endpoint
+    flips a criterion from uncovered (or partial) to covered.
+
+    This is the named acceptance evidence test for the walkthrough result
+    ingestion path. A production code change (the new endpoint + function)
+    is exercised by this test — a test-only diff would fail.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Ingestion")
+    sha = "walkthrough-ingestion-test-" + "b" * 14
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create a criterion with NO evidence — starts as "uncovered"
+    crit = await ac.create_criterion(
+        db_session, project.id, version.id, "Ingestion test criterion"
+    )
+
+    # Verify it starts uncovered
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key_before = {c["criterion_key"]: c for c in summary_before["criteria"]}
+    assert by_key_before[crit.criterion_key]["coverage"] == "uncovered"
+
+    # POST walkthrough result (simulating what the walkthrough script does)
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/operator-walkthrough-evidence",
+        json={
+            "candidate_sha": sha,
+            "results": [{"criterion_key": crit.criterion_key, "passed": True}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["recorded"] == 1
+
+    # After ingestion, the criterion flips to "covered"
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key_after = {c["criterion_key"]: c for c in summary_after["criteria"]}
+    assert by_key_after[crit.criterion_key]["coverage"] == "covered"
+    assert summary_after["covered"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_merge_evidence_flips_criterion_coverage(db_session):
+    """Prove that ingesting walkthrough_e2e results for the three canonical v26
+    criterion keys (c-dfdc9d82, c-f52fd975, c-5214996f) flips each criterion from
+    ``"uncovered"`` to ``"covered"`` with the correct ``covered_by`` label.
+
+    This is the named acceptance-evidence test for the walkthrough result
+    ingestion path.  A production code change — the ``covered_by`` field added
+    to the coverage summary — is exercised by assertions below; a test-only diff
+    would fail the gate.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Merge-Flip")
+    sha = "v26-walkthrough-sha-" + "c" * 26
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create the three canonical v26 criteria with specific keys.
+    keys = ["c-dfdc9d82", "c-f52fd975", "c-5214996f"]
+    criteria = {}
+    for key in keys:
+        crit = VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=key,
+            text=f"v26 criterion {key}",
+        )
+        db_session.add(crit)
+        criteria[key] = crit
+    await db_session.commit()
+    for crit in criteria.values():
+        await db_session.refresh(crit)
+
+    # Confirm all three start as "uncovered" with no covered_by.
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key_before = {c["criterion_key"]: c for c in summary_before["criteria"]}
+    for key in keys:
+        assert by_key_before[key]["coverage"] == "uncovered", f"{key} should start uncovered"
+        assert by_key_before[key]["covered_by"] is None, f"{key} covered_by should be None"
+
+    assert summary_before["total"] == 3
+    assert summary_before["covered"] == 0
+    assert summary_before["uncovered"] == 3
+
+    # Ingest walkthrough_e2e evidence for all three canonical keys plus the
+    # FLOW 5 placeholder key (c-workday-session-lifecycle), which is required
+    # by the meta gate and routes to c-5214996f via the alias table.
+    results = [
+        {"criterion_key": key, "passed": True, "notes": f"v26 walkthrough pass for {key}"}
+        for key in keys
+    ]
+    results.append({"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "v26 FLOW 5 pass"})
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=results,
+        qualification_attempt_id="merge-flip-attempt",
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 3
+    assert summary["skipped_not_passed"] == 0
+    assert summary["unmatched_keys"] == []
+
+    # After ingestion, all three flip to "covered" with "walkthrough_e2e" source.
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key_after = {c["criterion_key"]: c for c in summary_after["criteria"]}
+    for key in keys:
+        assert by_key_after[key]["coverage"] == "covered", f"{key} should now be covered"
+        assert by_key_after[key]["covered_by"] == "walkthrough_e2e", (
+            f"{key} covered_by should be 'walkthrough_e2e', "
+            f"got {by_key_after[key]['covered_by']!r}"
+        )
+
+    assert summary_after["covered"] == 3
+    assert summary_after["uncovered"] == 0
+    assert summary_after["total"] == 3
+
+    # Verify one CriterionEvidence row per criterion is in the DB with the
+    # correct source_kind and detail fields — not just the coverage summary.
+    for key, crit in criteria.items():
+        rows = await ac.get_evidence_for_criterion(db_session, crit.id)
+        assert len(rows) == 1, (
+            f"{key}: expected exactly 1 CriterionEvidence row, got {len(rows)}"
+        )
+        row = rows[0]
+        assert row.source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND, (
+            f"{key}: source_kind should be {ac.WALKTHROUGH_E2E_EVIDENCE_KIND!r}, "
+            f"got {row.source_kind!r}"
+        )
+        assert row.detail["candidate_sha"] == sha, f"{key}: detail.candidate_sha mismatch"
+        assert row.detail["criterion_key"] == key, f"{key}: detail.criterion_key mismatch"
+        assert row.detail["passed"] is True, f"{key}: detail.passed should be True"
+        assert "evaluated_at" in row.detail, f"{key}: detail missing evaluated_at"
+
+
+# ---------------------------------------------------------------------------
+# executed_named_test 'covered' tier (execution-trial earn loop)
+# ---------------------------------------------------------------------------
+
+
+def test_executed_named_test_covers_only_when_fresh_and_sha_pinned():
+    """An ``executed_named_test`` row is 'covered' ONLY when fresh AND SHA-pinned.
+
+      (a) fresh + SHA-pinned            => 'covered'
+      (b) stale (older than the window) => NOT covered (falls back to 'partial')
+      (c) missing/blank executed_sha    => NOT covered (falls back to 'partial')
+      (d) no recorded_at                => NOT covered
+    """
+    sha = "a1b2c3d4e5f6"
+
+    fresh_pinned = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": sha, "test_refs": ["testing/test_x.py"]},
+        recorded_at=_utcnow() - timedelta(days=ac.EXECUTED_NAMED_TEST_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_executed_named_test_covered(fresh_pinned) is True
+    assert ac._evidence_proves_covered(fresh_pinned) is True
+    assert ac.compute_criterion_coverage([fresh_pinned]) == "covered"
+    # covered maps onto the shared EvidenceStatus axis as full machine-proof.
+    assert ac.criterion_evidence_status([fresh_pinned]) == "proven"
+
+    stale_pinned = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": sha},
+        recorded_at=_utcnow() - timedelta(days=ac.EXECUTED_NAMED_TEST_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_executed_named_test_covered(stale_pinned) is False
+    assert ac._evidence_proves_covered(stale_pinned) is False
+    assert ac.compute_criterion_coverage([stale_pinned]) == "partial"
+
+    for bad_detail in ({"executed_sha": ""}, {"foo": "bar"}, None):
+        fresh_unpinned = _make_evidence(
+            ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+            detail=bad_detail,
+            recorded_at=_utcnow() - timedelta(days=1),
+        )
+        assert ac._evidence_is_executed_named_test_covered(fresh_unpinned) is False
+        assert ac.compute_criterion_coverage([fresh_unpinned]) == "partial"
+
+    no_ts = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": sha},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_executed_named_test_covered(no_ts) is False
+
+
+def test_executed_named_test_covered_outranks_backfilled_and_is_additive():
+    """A fresh executed row lifts a backfilled criterion to 'covered' (additive)."""
+    backfilled = _make_evidence(
+        ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+        detail={"proven": True, "backfilled": True},
+    )
+    assert ac.compute_criterion_coverage([backfilled]) == "backfilled"
+    executed = _make_evidence(
+        ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+        detail={"executed_sha": "f00dfeed1234"},
+    )
+    # The backfilled fallback is untouched; the executed row wins the tie.
+    assert ac.compute_criterion_coverage([backfilled, executed]) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_record_executed_named_test_evidence_mints_covered_idempotently(db_session):
+    """A green trial mints exactly one SHA-pinned covered row; re-ingest is a no-op."""
+    project = await _make_project(db_session, "ExecMint")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Exec crit")
+
+    n = await ac.record_executed_named_test_evidence(
+        db_session,
+        project_id=project.id,
+        criteria=[crit],
+        executed_sha="a1b2c3d4e5f6a1b2",
+        test_refs=["testing/test_exec.py"],
+        source_task_id="src-task-1",
+    )
+    assert n == 1
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].source_kind == ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND
+    assert ev[0].detail["executed_sha"] == "a1b2c3d4e5f6a1b2"
+    assert ev[0].detail["test_refs"] == ["testing/test_exec.py"]
+    assert ev[0].detail["proven"] is True
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+    # Re-ingesting the SAME green result mints nothing new (idempotent).
+    n2 = await ac.record_executed_named_test_evidence(
+        db_session,
+        project_id=project.id,
+        criteria=[crit],
+        executed_sha="a1b2c3d4e5f6a1b2",
+        test_refs=["testing/test_exec.py"],
+        source_task_id="src-task-1",
+    )
+    assert n2 == 0
+    ev2 = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev2) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_executed_named_test_evidence_blank_sha_records_nothing(db_session):
+    """A blank executed_sha cannot pin coverage — records nothing."""
+    project = await _make_project(db_session, "ExecBlank")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Exec crit")
+    n = await ac.record_executed_named_test_evidence(
+        db_session,
+        project_id=project.id,
+        criteria=[crit],
+        executed_sha="   ",
+        test_refs=["testing/test_exec.py"],
+        source_task_id="src-task-1",
+    )
+    assert n == 0
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+# ---------------------------------------------------------------------------
+# Alert on unmatched walkthrough criterion keys
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_alerts_on_unmatched_key(db_session):
+    """A passing walkthrough result under a key that no active criterion has
+    creates exactly one operator-visible Alert row while still returning the key
+    in summary['unmatched_keys']."""
+    project = await _make_project_with_member(db_session, name="Walk-Unmatched-Alert")
+    sha = "a" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    real_crit = await ac.create_criterion(db_session, project.id, version.id, "Real criterion")
+    phantom_key = "c-deadbeef"  # never registered as a criterion
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": real_crit.criterion_key, "passed": True, "notes": "green"},
+            {"criterion_key": phantom_key, "passed": True, "notes": "phantom"},
+        ],
+        qualification_attempt_id="attempt-alert-1",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == [phantom_key]
+
+    # An operator-visible Alert row must have been created for the dropped key.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 alert, got {len(alerts)}: {alerts}"
+    alert = alerts[0]
+    assert alert.event_type == "release.walkthrough_key_unmatched"
+    assert phantom_key in alert.message
+    assert alert.dedupe_key is not None
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_alerts_on_unmatched_key(db_session):
+    """record_operator_walkthrough_evidence creates an Alert when a passing result's
+    key resolves to no active criterion, while still returning the key in unmatched_keys."""
+    project = await _make_project_with_member(db_session, name="OpWalk-Unmatched-Alert")
+    sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    real_crit = await ac.create_criterion(db_session, project.id, version.id, "Op real criterion")
+    phantom_key = "c-workday-session-lifecycle"  # the canonical phantom key from the bug
+
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": real_crit.criterion_key, "passed": True, "notes": "ok"},
+            {"criterion_key": phantom_key, "passed": True, "notes": "phantom"},
+        ],
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == [phantom_key]
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 alert, got {len(alerts)}: {alerts}"
+    alert = alerts[0]
+    assert alert.event_type == "release.walkthrough_key_unmatched"
+    assert phantom_key in alert.message
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_no_alert_when_all_keys_match(db_session):
+    """When every passing key resolves to an active criterion, no Alert is created."""
+    project = await _make_project_with_member(db_session, name="Walk-AllMatch-NoAlert")
+    sha = "c" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "All-match criterion")
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": crit.criterion_key, "passed": True},
+        ],
+        qualification_attempt_id="attempt-no-alert",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == []
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts, got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_unmatched_alert_is_deduped(db_session):
+    """Calling the function twice with the same unmatched key coalesces into one Alert row."""
+    project = await _make_project_with_member(db_session, name="Walk-Dedup-Alert")
+    sha = "d" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    phantom_key = "c-phantom-dedup"
+    results = [{"criterion_key": phantom_key, "passed": True, "notes": "ghost"}]
+
+    await ac.record_walkthrough_e2e_evidence(
+        db_session, version, candidate_sha=sha, results=results, qualification_attempt_id="attempt-dedup-1"
+    )
+    await ac.record_walkthrough_e2e_evidence(
+        db_session, version, candidate_sha=sha, results=results, qualification_attempt_id="attempt-dedup-2"
+    )
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 deduped alert, got {len(alerts)}"
+    assert alerts[0].occurrence_count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_fail_open_on_alert_error(db_session):
+    """If alert creation fails, the function still returns the normal summary and does not raise."""
+    from unittest.mock import patch, AsyncMock
+
+    project = await _make_project_with_member(db_session, name="Walk-FailOpen")
+    sha = "e" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    phantom_key = "c-fail-open-test"
+    results = [{"criterion_key": phantom_key, "passed": True}]
+
+    with patch(
+        "app.alert_policy.create_project_alert_if_allowed",
+        new=AsyncMock(side_effect=RuntimeError("simulated alert failure")),
+    ):
+        summary = await ac.record_walkthrough_e2e_evidence(
+            db_session, version, candidate_sha=sha, results=results
+        )
+
+    assert summary["status"] == "recorded"
+    assert summary["unmatched_keys"] == [phantom_key]
+    assert summary["recorded"] == 0
+
+
+# ---------------------------------------------------------------------------
+# FLOW 5 Workday session lifecycle — phantom key routing and re-walk evidence
+# ---------------------------------------------------------------------------
+#
+# These tests pin the two defects identified in the FLOW 5 walkthrough fix:
+# (a) c-workday-session-lifecycle is not a registered criterion — posting it
+#     via record_walkthrough_e2e_evidence MUST produce unmatched_keys, not
+#     silently dropping evidence without an observable signal.
+# (b) When FLOW 5's result is correctly routed to a registered criterion (the
+#     re-walk evidence lane, analogous to the c-5214996f criterion), covered-tier
+#     evidence is written and the criterion's coverage flips to "covered".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_canonical_phantom_workday_key_is_unmatched(
+    db_session,
+):
+    """c-workday-session-lifecycle is a phantom key in record_walkthrough_e2e_evidence.
+
+    Posting a PASS result keyed on c-workday-session-lifecycle must land in
+    unmatched_keys (no evidence written, alert fired) — exactly the behaviour
+    produced by the FLOW 5 defect before the routing fix.  Pinned here so a
+    future regression is immediately visible.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Phantom")
+    sha = "aa" * 20  # 40 hex chars
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # No criterion with this key is ever registered — it is the phantom key from
+    # the FLOW 5 bug.
+    phantom_key = "c-workday-session-lifecycle"
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": phantom_key,
+                "passed": True,
+                "notes": ["Workday session started and stopped cleanly"],
+            },
+        ],
+        qualification_attempt_id="attempt-flow5-phantom",
+    )
+
+    # Status is still "recorded" (no SHA rejection), but nothing was written.
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 0
+    assert summary["skipped_not_passed"] == 0
+    assert summary["unmatched_keys"] == [phantom_key], (
+        f"Expected [{phantom_key!r}] in unmatched_keys; got {summary['unmatched_keys']}"
+    )
+
+    # An operator-visible alert must exist — the drop must NOT be silent.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 unmatched-key alert, got {len(alerts)}: {alerts}"
+    assert alerts[0].event_type == "release.walkthrough_key_unmatched"
+    assert phantom_key in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_flow5_rewalk_criterion_writes_evidence(
+    db_session,
+):
+    """When FLOW 5's result is routed to a registered re-walk criterion, coverage flips.
+
+    This is the "natural home" for FLOW 5 evidence after the routing fix: fold
+    the workday-session result into the same criterion that collects re-walk
+    evidence (c-5214996f pattern).  Evidence must be written and the criterion
+    must show 'covered' tier.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Rewalk")
+    sha = "bb" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Register a real criterion (simulating the c-5214996f re-walk criterion that
+    # should receive FLOW 5's evidence after the routing fix).
+    rewalk_crit = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Operator click-to-talk Workday session lifecycle (re-walk)",
+        created_by="strategist",
+    )
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": rewalk_crit.criterion_key,
+                "passed": True,
+                "notes": [
+                    "Workday session started via UI Start button",
+                    "StrategicSessionControl Stop control rendered",
+                    "Session stopped cleanly via strategic-session/stop",
+                ],
+            },
+        ],
+        qualification_attempt_id="attempt-flow5-rewalk",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["skipped_not_passed"] == 0
+    assert summary["unmatched_keys"] == []
+
+    # Coverage must have flipped to covered.
+    evidence = await ac.get_evidence_for_criterion(db_session, rewalk_crit.id)
+    assert len(evidence) == 1
+    ev = evidence[0]
+    assert ev.source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND
+    assert ev.detail["candidate_sha"] == sha
+    assert ev.detail["passed"] is True
+    assert "evaluated_at" in ev.detail
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    # No alert should be created when all keys are matched.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts when key matches; got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_phantom_and_rewalk_key_mixed(
+    db_session,
+):
+    """Phantom key is dropped; real re-walk criterion still gets evidence.
+
+    This is the transition scenario: the walkthrough emits BOTH the phantom key
+    (c-workday-session-lifecycle) and the real registered re-walk criterion key.
+    The real key must receive covered-tier evidence; the phantom must land in
+    unmatched_keys with an alert.  This mirrors the post-fix FLOW 5 where the
+    old key is still present in the output but the new key is also emitted.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Mixed")
+    sha = "cc" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    rewalk_crit = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Workday session re-walk criterion",
+        created_by="strategist",
+    )
+    phantom_key = "c-workday-session-lifecycle"
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": rewalk_crit.criterion_key, "passed": True, "notes": "green"},
+            {"criterion_key": phantom_key, "passed": True, "notes": "phantom"},
+        ],
+        qualification_attempt_id="attempt-flow5-mixed",
+    )
+
+    # One real, one phantom.
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == [phantom_key]
+
+    # Real criterion: covered.
+    evidence = await ac.get_evidence_for_criterion(db_session, rewalk_crit.id)
+    assert len(evidence) == 1
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    # Alert fired for the dropped phantom key.
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert phantom_key in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_workday_slug_routes_to_live_criterion(
+    db_session,
+):
+    """Legacy slug 'c-workday-session-lifecycle' routes to the registered c-5214996f criterion.
+
+    When a VersionAcceptanceCriterion exists with the canonical key 'c-5214996f',
+    a walkthrough result posted under the legacy slug must write covered-tier
+    evidence against that criterion. Because c-5214996f is the meta criterion, the
+    batch must also carry its required sub-criteria (passing) so the meta gate is
+    satisfied — resolving the alias BEFORE the meta-gate check is the behaviour
+    under test (a partial run posting only the alias would be gated out; see the
+    dedicated gate tests). Expect unmatched_keys==[] and covered meta evidence.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-E2E")
+    sha = "dd" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Register the meta criterion under the canonical alias-target key, plus its
+    # required sub-criteria so the meta gate can legitimately pass.
+    canonical_key = "c-5214996f"
+    for ck, txt in (
+        (canonical_key, "Workday click-to-talk session lifecycle (re-walk)"),
+        ("c-dfdc9d82", "Workday session sub-criterion A"),
+        ("c-f52fd975", "Workday session sub-criterion B"),
+    ):
+        db_session.add(VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=ck,
+            text=txt,
+            status="active",
+        ))
+    await db_session.commit()
+    crit = (await db_session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.release_version_id == version.id,
+            VersionAcceptanceCriterion.criterion_key == canonical_key,
+        )
+    )).scalars().one()
+
+    legacy_slug = "c-workday-session-lifecycle"
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": legacy_slug,
+                "passed": True,
+                "notes": ["Workday toggle → Start → liveness reflects session"],
+            },
+            {"criterion_key": "c-dfdc9d82", "passed": True, "notes": ["sub A"]},
+            {"criterion_key": "c-f52fd975", "passed": True, "notes": ["sub B"]},
+        ],
+        qualification_attempt_id="attempt-alias-e2e",
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 3, f"Expected 3 recorded; got {summary}"
+    assert summary["unmatched_keys"] == [], f"Expected no unmatched; got {summary['unmatched_keys']}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts when alias resolves; got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_workday_slug_routes_to_live_criterion(
+    db_session,
+):
+    """Operator lane: legacy slug 'c-workday-session-lifecycle' routes to c-5214996f criterion.
+
+    Mirrors test_record_walkthrough_e2e_evidence_workday_slug_routes_to_live_criterion
+    for the record_operator_walkthrough_evidence path (the one the walkthrough script
+    actually POSTs to via the operator-walkthrough-evidence endpoint). Because
+    c-5214996f is the meta criterion, the alias resolves BEFORE the meta gate, so the
+    batch must also carry the passing sub-criteria for covered meta evidence.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-Op")
+    sha = "ee" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    canonical_key = "c-5214996f"
+    for ck, txt in (
+        (canonical_key, "Workday click-to-talk session lifecycle (re-walk)"),
+        ("c-dfdc9d82", "Workday session sub-criterion A"),
+        ("c-f52fd975", "Workday session sub-criterion B"),
+    ):
+        db_session.add(VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=ck,
+            text=txt,
+            status="active",
+        ))
+    await db_session.commit()
+    crit = (await db_session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.release_version_id == version.id,
+            VersionAcceptanceCriterion.criterion_key == canonical_key,
+        )
+    )).scalars().one()
+
+    legacy_slug = "c-workday-session-lifecycle"
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {
+                "criterion_key": legacy_slug,
+                "passed": True,
+                "notes": ["Workday session started and liveness confirmed"],
+            },
+            {"criterion_key": "c-dfdc9d82", "passed": True, "notes": ["sub A"]},
+            {"criterion_key": "c-f52fd975", "passed": True, "notes": ["sub B"]},
+        ],
+    )
+
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 3, f"Expected 3 recorded; got {summary}"
+    assert summary["unmatched_keys"] == [], f"Expected no unmatched; got {summary['unmatched_keys']}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(evidence) == 1
+    assert ac.compute_criterion_coverage(evidence) == "covered"
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == [], f"Expected no alerts when alias resolves; got {alerts}"
+
+
+@pytest.mark.asyncio
+async def test_record_walkthrough_e2e_evidence_workday_alias_gated_when_subcriteria_absent(
+    db_session,
+):
+    """The legacy alias resolves to the meta criterion BEFORE the meta gate runs.
+
+    A partial run that posts ONLY 'c-workday-session-lifecycle' (which resolves to
+    c-5214996f) without its required sub-criteria (c-dfdc9d82, c-f52fd975) must be
+    gated out: no covered meta evidence is minted from a partial re-walk. Guards the
+    alias-bypass fix at acceptance_criteria.py — the comparison resolves the key.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-Gate-E2E")
+    sha = "cd" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-5214996f",
+        text="Workday click-to-talk session lifecycle (re-walk)",
+        status="active",
+    )
+    db_session.add(crit)
+    await db_session.commit()
+    await db_session.refresh(crit)
+
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": ["partial"]},
+        ],
+        qualification_attempt_id="attempt-alias-gate-e2e",
+    )
+
+    assert summary["recorded"] == 0, f"Alias must not bypass meta gate; got {summary}"
+    assert summary["skipped_not_passed"] == 1
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_workday_alias_gated_when_subcriteria_absent(
+    db_session,
+):
+    """Operator lane: the alias resolves to c-5214996f before the meta gate.
+
+    Mirrors the e2e gate test for record_operator_walkthrough_evidence — a partial run
+    posting only the alias must not mint covered meta evidence.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-Alias-Gate-Op")
+    sha = "ce" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-5214996f",
+        text="Workday click-to-talk session lifecycle (re-walk)",
+        status="active",
+    )
+    db_session.add(crit)
+    await db_session.commit()
+    await db_session.refresh(crit)
+
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": ["partial"]},
+        ],
+    )
+
+    assert summary["recorded"] == 0, f"Alias must not bypass meta gate; got {summary}"
+    assert summary["skipped_not_passed"] == 1
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_operator_walkthrough_evidence_workday_slug_unmatched_when_no_canonical_criterion(
+    db_session,
+):
+    """Fail-closed: when c-5214996f is not registered, the slug still lands in unmatched_keys."""
+    project = await _make_project_with_member(db_session, name="Walk-Flow5-FailClosed")
+    sha = "ff" * 20
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    legacy_slug = "c-workday-session-lifecycle"
+    summary = await ac.record_operator_walkthrough_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": legacy_slug, "passed": True, "notes": "test"},
+        ],
+    )
+
+    assert summary["recorded"] == 0
+    assert summary["unmatched_keys"] == [legacy_slug]
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].event_type == "release.walkthrough_key_unmatched"
+    assert legacy_slug in alerts[0].message
+
+
+# ---------------------------------------------------------------------------
+# enroll_criterion_coverage_trial
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enroll_criterion_coverage_trial_flag_off_is_noop(db_session):
+    """Flag OFF ⇒ no trial task is created (returns None)."""
+    project = await _make_project(db_session, "EnrollOff")
+    rc = {"acceptance_earn_execution_trials_enabled": False}
+    with patch("app.shared_state.runtime_config", new=rc):
+        task = await ac.enroll_criterion_coverage_trial(
+            db_session,
+            project.id,
+            criterion_ids=["c-1"],
+            source_task_id="t-1",
+            test_refs=["testing/test_x.py"],
+        )
+    assert task is None
+
+
+@pytest.mark.asyncio
+async def test_enroll_criterion_coverage_trial_creates_bounded_task_and_dedups(db_session):
+    """Flag ON ⇒ a bounded criterion_coverage_trial is created; refs capped; deduped."""
+    project = await _make_project(db_session, "EnrollOn")
+    rc = {"acceptance_earn_execution_trials_enabled": True}
+    many_refs = [f"testing/test_{i}.py" for i in range(15)]
+    with patch("app.shared_state.runtime_config", new=rc):
+        task = await ac.enroll_criterion_coverage_trial(
+            db_session,
+            project.id,
+            criterion_ids=["c-1", "c-2"],
+            source_task_id="t-1",
+            test_refs=many_refs,
+        )
+    assert task is not None
+    p = task.first_payload
+    assert p["type"] == "criterion_coverage_trial"
+    assert p["source_task_id"] == "t-1"
+    assert p["criterion_ids"] == ["c-1", "c-2"]
+    # Refs are capped to the per-trial bound.
+    assert len(p["test_refs"]) == ac.MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES
+    assert p["max_test_files"] == ac.MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES
+    assert p["wall_clock_seconds"] == ac.CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS
+    assert task.status == TaskStatus.QUEUED
+
+    # A second enroll for the same source task is skipped while the first is in-flight.
+    with patch("app.shared_state.runtime_config", new=rc):
+        dup = await ac.enroll_criterion_coverage_trial(
+            db_session,
+            project.id,
+            criterion_ids=["c-1"],
+            source_task_id="t-1",
+            test_refs=["testing/test_x.py"],
+        )
+    assert dup is None
+
+
+# ---------------------------------------------------------------------------
+# backfill_merged_named_test_coverage — execution-trial enrollment
+# ---------------------------------------------------------------------------
+
+
+async def _make_merged_named_test_task(db_session, project, criterion, test_path):
+    """Build a COMPLETED merged task whose declared named_test shipped in the PR."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {"kind": "named_test", "test_path": test_path},
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [test_path, "backend/app/target_module.py"],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _criterion_coverage_trials(db_session, project_id):
+    rows = (
+        await db_session.execute(select(Task).where(Task.project_id == project_id))
+    ).scalars().all()
+    return [
+        t
+        for t in rows
+        if isinstance(t.first_payload, dict)
+        and t.first_payload.get("type") == "criterion_coverage_trial"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_flag_off_records_backfilled_and_enrolls_no_trial(db_session):
+    """Flag OFF ⇒ byte-for-byte prior behaviour: backfilled row, NO trial enrolled."""
+    project = await _make_project(db_session, "BackfillFlagOff")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Off crit")
+    await _make_merged_named_test_task(
+        db_session, project, crit, "testing/test_off_backfill.py"
+    )
+
+    rc = {"acceptance_earn_execution_trials_enabled": False}
+    with patch("app.shared_state.runtime_config", new=rc):
+        result = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    assert result == 1  # int value = backfilled rows recorded
+    assert result.trials_enrolled == 0
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    assert ac.compute_criterion_coverage(ev) == "backfilled"
+    assert await _criterion_coverage_trials(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_backfill_flag_on_enrolls_execution_trial(db_session):
+    """Flag ON ⇒ backfilled row still recorded AND a bounded execution trial enrolled."""
+    project = await _make_project(db_session, "BackfillFlagOn")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "On crit")
+    src = await _make_merged_named_test_task(
+        db_session, project, crit, "testing/test_on_backfill.py"
+    )
+
+    rc = {"acceptance_earn_execution_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        result = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    # The backfilled fallback is still recorded...
+    assert result == 1
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert ev[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    # ...and exactly one execution trial was enrolled for the source task.
+    assert result.trials_enrolled == 1
+    trials = await _criterion_coverage_trials(db_session, project.id)
+    assert len(trials) == 1
+    p = trials[0].first_payload
+    assert p["source_task_id"] == str(src.id)
+    assert p["criterion_ids"] == [crit.criterion_key]
+    assert p["test_refs"] == ["testing/test_on_backfill.py"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_enrollment_cap_bounds_trials(db_session):
+    """The per-pass enrollment cap bounds how many trials a single pass enrolls."""
+    project = await _make_project(db_session, "BackfillCap")
+    version = await _make_version(db_session, project)
+    for i in range(3):
+        crit = await ac.create_criterion(
+            db_session, project.id, version.id, f"Cap crit {i}"
+        )
+        await _make_merged_named_test_task(
+            db_session, project, crit, f"testing/test_cap_{i}.py"
+        )
+
+    rc = {"acceptance_earn_execution_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        result = await ac.backfill_merged_named_test_coverage(
+            db_session, project.id, max_trial_enrollments=2
+        )
+
+    # All three criteria still get their backfilled fallback...
+    assert result == 3
+    # ...but only two trials are enrolled — the cap bounds test execution.
+    assert result.trials_enrolled == 2
+    assert len(await _criterion_coverage_trials(db_session, project.id)) == 2

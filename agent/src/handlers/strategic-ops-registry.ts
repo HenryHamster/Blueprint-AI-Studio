@@ -1,18 +1,18 @@
 /**
  * SINGLE SOURCE OF TRUTH for the strategist's mutating operation surface.
  *
- * The strategist's mutating ops used to be advertised in three (four, counting
- * the resident stream monitor) hand-maintained lists that drifted out of sync:
+ * The strategist's mutating ops used to be advertised in several
+ * hand-maintained lists that drifted out of sync:
  * the backend dispatch chain (routers/admin_agent_ops.py `strategic_operation`),
  * the generated `./strategic` CLI script (strategic-helpers.ts), and the
- * resident bootstrap prompt (strategic-resident-lib.ts). This ordered registry
+ * strategist bootstrap prompt op list. This ordered registry
  * is the ONE place the op surface is declared; the CLI `case`/usage string and
- * the resident prompt op list are DERIVED from it (no more hand-typed lists),
+ * the bootstrap prompt op list are DERIVED from it (no more hand-typed lists),
  * and a checked-in shared manifest (`backend/app/strategic_ops_manifest.json`)
  * mirrors it so the Python backend and the TypeScript agent stay in lockstep.
  *
  * Drift-guard tests keep every surface honest:
- *  - agent-side (strategic-ops-registry.test.ts): the generated CLI + resident
+ *  - agent-side (strategic-ops-registry.test.ts): the generated CLI + bootstrap
  *    prompt list EXACTLY the registry's cli/prompt-flagged aliases, and the
  *    registry equals the shared JSON manifest.
  *  - backend-side (test_strategic_ops_registry.py): the dispatch chain accepts
@@ -20,7 +20,7 @@
  *    handler, and every accepted op is in the registry (no silent additions).
  *
  * This module is intentionally pure and dependency-free (no `../index.js`, no
- * `fs`/`ws` imports) so both the resident lib and the helper generator can
+ * `fs`/`ws` imports) so any consumer and the helper generator can
  * import it without pulling in the heavy agent surface.
  */
 
@@ -34,7 +34,7 @@ export interface StrategicOpEntry {
   description: string;
   /** True when the op appears in the generated `./strategic` CLI (case + usage). */
   cli: boolean;
-  /** True when the op is advertised in the resident bootstrap prompt op list. */
+  /** True when the op is advertised in the strategist bootstrap prompt op list. */
   prompt: boolean;
   /** For ops with cli=false/prompt=false: WHY they are intentionally excluded
    *  (internal-only / auto-invoked). Null for surfaced ops. Marks exclusion
@@ -44,7 +44,7 @@ export interface StrategicOpEntry {
 
 /**
  * The canonical, ordered strategist mutating-op registry. Order defines the CLI
- * `case`/usage order and the resident prompt op list order, so the first 19
+ * `case`/usage order and the bootstrap prompt op list order, so the first 19
  * surfaced ops are listed in the sequence the CLI historically used; the five
  * internal-only ops follow.
  */
@@ -105,7 +105,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Record a running summary of session context and progress for continuity across restarts.' },
 
   // ── Internal-only / auto-invoked backend ops (deliberately NOT on the CLI or
-  //    resident prompt). They are accepted by the dispatch chain but are invoked
+  //    bootstrap prompt). They are accepted by the dispatch chain but are invoked
   //    programmatically by the one-shot cycle / operator seams, never as a
   //    `./strategic <alias>` command. Excluded EXPLICITLY (flagged), not by
   //    omission, so the drift-guard covers them too.
@@ -137,7 +137,7 @@ export function cliOps(): StrategicOpEntry[] {
   return STRATEGIC_OPS_REGISTRY.filter(e => e.cli);
 }
 
-/** Registry entries advertised in the resident bootstrap prompt, in order. */
+/** Registry entries advertised in the strategist bootstrap prompt, in order. */
 export function promptOps(): StrategicOpEntry[] {
   return STRATEGIC_OPS_REGISTRY.filter(e => e.prompt);
 }

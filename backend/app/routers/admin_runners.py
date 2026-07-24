@@ -55,8 +55,8 @@ from app.workbench_events import (
     emit_workbench_refetch,
 )
 from app.runner_health_monitors import (
-    _RUNNER_DEGRADED_FAILURE_THRESHOLD,
-    _RUNNER_LIVENESS_SECONDS,
+    _get_degraded_failure_threshold,
+    _get_liveness_seconds,
 )
 from app.workbench_state import clear_preferred_runner_references
 
@@ -412,17 +412,18 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         if max_concurrent_compute is not None
         else None
     )
+    liveness_seconds = _get_liveness_seconds()
     is_live = (
         runner.status == "active"
         and seconds_since_last_seen is not None
-        and seconds_since_last_seen < _RUNNER_LIVENESS_SECONDS
+        and seconds_since_last_seen < liveness_seconds
     )
     stale_reason = None
     if runner.status != "active":
         stale_reason = "inactive" if runner.status == "inactive" else runner.status
     elif seconds_since_last_seen is None:
         stale_reason = "never_seen"
-    elif seconds_since_last_seen >= _RUNNER_LIVENESS_SECONDS:
+    elif seconds_since_last_seen >= liveness_seconds:
         stale_reason = "heartbeat_stale"
 
     # Trust telemetry: a live runner can still be failing every job it is handed.
@@ -437,8 +438,9 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         seconds_since_last_success is None
         or seconds_since_last_success >= _SUCCESS_STALE_SECONDS
     )
+    degraded_threshold = _get_degraded_failure_threshold()
     failure_streak_degraded = (
-        consecutive_job_failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD
+        consecutive_job_failures >= degraded_threshold
     )
     success_stale_while_working = (
         active_work_count > 0
@@ -504,7 +506,7 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         # docker} -> bool) so the fleet panel can render a checklist. None when the
         # runner (old build) never reported it.
         "agent_unavailable_legs": (runner.capabilities or {}).get("agent_unavailable_legs"),
-        "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
+        "liveness_window_seconds": _get_liveness_seconds(),
         # Trust telemetry surfaced to the panel.
         "last_successful_job_at": (
             runner.last_successful_job_at.isoformat()
@@ -519,7 +521,7 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "memory_low": memory_low,
         "cpu_load_avg": cpu_load_avg,
         "gpu_utilization_pct": gpu_utilization_pct,
-        "failure_streak_threshold": _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+        "failure_streak_threshold": _get_degraded_failure_threshold(),
     }
 
 
@@ -1611,6 +1613,55 @@ async def fleet_runners_health_summary(
         if view["health"].get("memory_low"):
             fleet["low_memory"] += 1
 
+    # Fleet-wide cloud cost avoided — sum across all physical runners.
+    # Query terminal jobs attributed to any runner in the fleet and price them.
+    fleet_cost_avoided_usd = 0.0
+    if all_runners:
+        runner_ids = [r.id for r in all_runners]
+        terminal_statuses = {
+            ComputeJobStatus.SUCCEEDED,
+            ComputeJobStatus.FAILED,
+            ComputeJobStatus.CANCELLED,
+            ComputeJobStatus.TIMED_OUT,
+        }
+        fleet_cost_rows = (
+            await session.execute(
+                select(
+                    ComputeJob.machine_type,
+                    ComputeJob.accelerator_type,
+                    ComputeJob.accelerator_count,
+                    ComputeJob.started_at,
+                    ComputeJob.completed_at,
+                ).where(
+                    ComputeJob.ran_on_runner_id.in_(runner_ids),
+                    ComputeJob.status.in_(terminal_statuses),
+                    ComputeJob.started_at.is_not(None),
+                    ComputeJob.completed_at.is_not(None),
+                )
+            )
+        ).all()
+
+        fleet_seconds_by_group: Dict[tuple, float] = {}
+        for machine_type, accel_type, accel_count, started_at, completed_at in fleet_cost_rows:
+            runtime_secs = (completed_at - started_at).total_seconds()
+            if runtime_secs <= 0:
+                continue
+            key = (machine_type, accel_type, accel_count)
+            fleet_seconds_by_group[key] = fleet_seconds_by_group.get(key, 0.0) + runtime_secs
+
+        for (machine_type, accel_type, accel_count), total_secs in fleet_seconds_by_group.items():
+            try:
+                rate = get_compute_rate_per_second(
+                    machine_type=machine_type,
+                    accelerator=accel_type,
+                    count=accel_count or 1,
+                    spot=False,
+                )
+            except AcceleratorRejection:
+                continue
+            fleet_cost_avoided_usd += total_secs * rate
+
+    fleet["cloud_cost_avoided_usd"] = round(fleet_cost_avoided_usd, 2)
     fleet["per_project"] = per_project_entries
     fleet["generated_at"] = now.isoformat()
     fleet["project_count"] = len(per_project_entries)

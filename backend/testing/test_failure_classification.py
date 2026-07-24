@@ -1413,20 +1413,6 @@ class TestClassifyFailureAgentTimeout:
         assert result["timeout_count"] == 0
         assert result["by_subtype"]["cascade_cancellation"]["count"] == 0
 
-    def test_resident_session_stop_failure_category_routes_to_admin_cancel(self):
-        """A strategic_review task stopped by the operator should classify as ADMIN_CANCEL.
-
-        stop_resident_session stamps failure_category='ADMIN_CANCEL' on the task
-        context so the classifier's fast-path (agent_category in INFRA_CLASSES)
-        returns ADMIN_CANCEL immediately, without falling through to text-matching
-        on the status message 'Resident strategic session stopped by operator'.
-        """
-        task = _task(
-            "Resident strategic session stopped by operator",
-            ctx={"failure_category": ADMIN_CANCEL},
-        )
-        assert classify_failure(task) == ADMIN_CANCEL
-
 
 class TestAdminSupersedesPersistsAdminCancel:
     def test_admin_superseded_task_persists_admin_cancel_not_agent_timeout(self):
@@ -2610,7 +2596,15 @@ class TestPersistFailureCategoryExternalApiSubtype:
 # Cross-language contract / drift tests
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).parents[2]
+def _resolve_repo_root() -> Path:
+    candidates = (Path(__file__).resolve().parents[2], Path("/repo"))
+    return next(
+        (path for path in candidates if (path / "agent" / "src").is_dir()),
+        candidates[0],
+    )
+
+
+_REPO_ROOT = _resolve_repo_root()
 _VIEWPORT_TS = _REPO_ROOT / "admin-ui" / "src" / "test" / "viewport.ts"
 
 
@@ -3236,167 +3230,6 @@ class TestDeadAuthClassification:
         from app.failure_classification import DEAD_AUTH
 
         assert classify_failure(t) != DEAD_AUTH
-
-    # ── panel_review_lens_failed + dead-auth path (incident 2026-06-13) ────
-
-    def test_panel_review_lens_failed_with_dead_auth_in_logs(self):
-        # panel_review_lens_failed: when the Codex lens dies with a consumed
-        # refresh token, failPanelClosed stores the full error message in
-        # task.latest_status_message (via _sanitize_log_tail(payload.logs, 8000)).
-        # For a startup-death the total output is short (< 4096 chars), so the
-        # dead-auth guard fires and classification returns DEAD_AUTH, not
-        # PROVISION_FAILURE.
-        full_status = (
-            "Panel review fan-out failed: lens 'correctness' agent pass exited 1.\n"
-            "Reading prompt from stdin...\n"
-            "2026-06-13T20:48:11.576087Z ERROR codex_login::auth::manager: "
-            "Failed to refresh token: 401 Unauthorized: "
-            '{"error": {"message": "Your refresh token has already been used '
-            'to generate a new access token."}}\n'
-        )
-        ctx = {
-            "failure_category": "panel_review_lens_failed",
-            "llm_provider": "openai",
-            "llm_auth_mode": "oauth",
-        }
-        t = _task(full_status, ctx)
-        t.api_call_summary = None
-        from app.failure_classification import DEAD_AUTH
-
-        result = classify_failure(t)
-        assert result == DEAD_AUTH
-        assert (
-            t.context.get("dead_auth_matched_pattern")
-            == "refresh token has already been used"
-        )
-
-    def test_panel_review_lens_failed_dead_auth_not_fired_on_long_output(self):
-        # If the lens ran successfully and produced kilobytes of model output
-        # before failing closed (e.g. no usable verdict), latest_status_message
-        # holds the last 8000 chars of that output — which may mention dead-auth
-        # literals if the diff being reviewed touches oauth / test files.
-        # The length guard (>= 4096 chars) must suppress the dead-auth scan
-        # so a healthy account is never falsely disabled.
-        model_output_with_dead_auth_phrase = (
-            # Simulate a lens reviewing a diff that adds the dead-auth pattern
-            # as a test string — the model quotes it in its analysis.
-            "The test file adds 'refresh token has already been used' as a "
-            "fixture string to cover the OAuth error case.  This looks correct "
-            "and necessary for coverage. " * 200  # ~8000 chars of model output
-        )
-        # In production this is _sanitize_log_tail(failLogs, 8000) — the last
-        # 8000 chars of "Panel review fan-out failed: ...\n<model output>".
-        full_status = (
-            "Panel review fan-out failed: lens 'correctness' produced no usable verdict.\n"
-            + model_output_with_dead_auth_phrase
-        )
-        assert len(full_status) >= 4096, "test precondition: status must be long"
-        ctx = {
-            "failure_category": "panel_review_lens_failed",
-            "llm_provider": "openai",
-            "llm_auth_mode": "oauth",
-        }
-        t = _task(full_status, ctx)
-        t.api_call_summary = None
-        from app.failure_classification import DEAD_AUTH
-
-        result = classify_failure(t)
-        assert result != DEAD_AUTH, (
-            "dead-auth must not fire when lens output is long (model output path)"
-        )
-        assert "dead_auth_matched_pattern" not in t.context
-
-    def test_panel_review_lens_failed_rate_limited_classifies_rate_limit(self):
-        # When the lens subprocess is rate-limited (429), the error appears in
-        # latest_status_message.  Classification must return RATE_LIMIT (no-burn
-        # requeue) not PROVISION_FAILURE (which burns attempt_count).
-        # Uses "rate limit reached for" which is in _API_KEY_RATE_LIMIT_PATTERNS.
-        full_status = (
-            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
-            "Error: 429 Too Many Requests\nrate limit reached for model gpt-4o\n"
-        )
-        ctx = {
-            "failure_category": "panel_review_lens_failed",
-            "llm_provider": "openai",
-            "llm_auth_mode": "api_key",
-        }
-        t = _task(full_status, ctx)
-        t.api_call_summary = None
-        from app.failure_classification import (
-            RATE_LIMIT,
-            normalize_agent_failure_category,
-        )
-
-        # Drive via the production write-boundary path: normalize_agent_failure_category
-        # persists failure_class to context (agent_status.py:1085-1096), then
-        # classify_failure short-circuits on that persisted value.
-        normalized = normalize_agent_failure_category("panel_review_lens_failed", t)
-        assert normalized == RATE_LIMIT, (
-            f"normalize should return RATE_LIMIT for rate-limited panel_review_lens_failed, got {normalized}"
-        )
-        # Simulate the agent_status.py write boundary persistence
-        new_ctx = dict(t.context or {})
-        new_ctx["failure_category"] = normalized
-        new_ctx["failure_class"] = normalized
-        t.context = new_ctx
-        # classify_failure must short-circuit to the persisted RATE_LIMIT verdict
-        result = classify_failure(t)
-        assert result == RATE_LIMIT, (
-            f"rate-limited panel_review_lens_failed should be RATE_LIMIT after normalize+persist, got {result}"
-        )
-
-    def test_panel_review_lens_failed_without_dead_auth_stays_provision_failure(self):
-        # panel_review_lens_failed without a dead-auth or rate-limit pattern
-        # should stay PROVISION_FAILURE (lens subprocess crashed for a generic
-        # infra reason — no retry budget should be burned).
-        full_status = (
-            "Panel review fan-out failed: lens 'correctness' agent pass exited 1.\n"
-            "Error: ENOENT: no such file or directory, open '/tmp/foo'\n"
-        )
-        ctx = {
-            "failure_category": "panel_review_lens_failed",
-            "llm_provider": "openai",
-            "llm_auth_mode": "oauth",
-        }
-        t = _task(full_status, ctx)
-        t.api_call_summary = None
-
-        result = classify_failure(t)
-        assert result == PROVISION_FAILURE
-        assert "dead_auth_matched_pattern" not in t.context
-
-    def test_model_no_access_is_config_rejection(self):
-        # Acceptance proof: a 'selected model may not exist / no access' failure
-        # from panel_review_lens_failed must classify as EXTERNAL_API
-        # (provider_model_config subtype), NOT PROVISION_FAILURE.
-        # PROVISION_FAILURE burns the retry budget; EXTERNAL_API does not.
-        full_status = (
-            "Panel review fan-out failed: lens 'security' agent pass exited 1.\n"
-            "Error: 404 The model `o3-mini` does not exist or you do not have "
-            "access to it.\n"
-        )
-        ctx = {
-            "failure_category": "panel_review_lens_failed",
-            "llm_provider": "openai",
-            "llm_auth_mode": "oauth",
-        }
-        t = _task(full_status, ctx)
-        t.api_call_summary = None
-
-        result = classify_failure(t)
-        assert result == EXTERNAL_API, (
-            f"model-no-access panel_review_lens_failed must classify as EXTERNAL_API, got {result!r}"
-        )
-
-        from app.failure_classification import (
-            EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
-            classify_external_api_subtype,
-        )
-
-        subtype = classify_external_api_subtype(t)
-        assert subtype == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG, (
-            f"expected provider_model_config subtype, got {subtype!r}"
-        )
 
     # ── Cross-provider isolation (incident 2026-06-14) ─────────────────────
 
@@ -4181,3 +4014,79 @@ class TestCiInfraFlakeLogSignatures:
             },
         )
         assert classify_failure(t) == BLOCKED_PRECONDITION
+
+
+class TestSmoketestClaudeCodeFailedClassification:
+    """Smoketest tasks that crash with a generic code-error label (e.g.
+    claude_code_failed) are infrastructure failures — the deployed engine
+    is stale or in a deadlock — not code defects in the candidate. They
+    must route to PROVISION_FAILURE so pipeline health dashboards reflect
+    accurate failure patterns, not inflated CODE_ERROR counts."""
+
+    def _smoketest(self, msg: str = "", ctx: dict | None = None) -> Task:
+        t = _task(msg, ctx)
+        t.first_payload = {"type": "smoketest"}
+        return t
+
+    def test_smoketest_claude_code_failed_is_provision_failure(self):
+        """classify_failure must route a smoketest with claude_code_failed
+        to PROVISION_FAILURE (infrastructure failure, not code defect)."""
+        t = self._smoketest(
+            "Claude subprocess exited with code 1",
+            {"failure_category": "claude_code_failed"},
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_normal_task_claude_code_failed_stays_code_error(self):
+        """Regression: a create task with claude_code_failed must still be
+        CODE_ERROR — the distinction is task-type-scoped."""
+        t = _task(
+            "Claude subprocess exited with code 1",
+            {"failure_category": "claude_code_failed"},
+        )
+        t.first_payload = {"type": "create"}
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_smoketest_normalize_agent_category_routes_to_provision_failure(self):
+        """normalize_agent_failure_category must also route the smoketest
+        claude_code_failed to PROVISION_FAILURE."""
+        t = self._smoketest("Claude subprocess exited with code 1")
+        assert (
+            normalize_agent_failure_category("claude_code_failed", t)
+            == PROVISION_FAILURE
+        )
+
+    def test_normal_task_normalize_agent_category_stays_code_error(self):
+        """Regression: normalize_agent_failure_category must not route a
+        create task with claude_code_failed to PROVISION_FAILURE."""
+        t = _task("Claude subprocess exited with code 1")
+        t.first_payload = {"type": "create"}
+        assert (
+            normalize_agent_failure_category("claude_code_failed", t)
+            == CODE_ERROR
+        )
+
+    def test_smoketest_specific_label_not_overridden(self):
+        """A smoketest with a specific agent label (test_failed) is an
+        authoritative verdict about the work — must NOT be overridden."""
+        t = self._smoketest(
+            "pytest failed",
+            {"failure_category": "test_failed"},
+        )
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_smoketest_no_agent_category_falls_through(self):
+        """A smoketest without a failure_category in context still falls
+        through to text classification normally."""
+        t = self._smoketest("AssertionError: expected 1 got 2")
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_smoketest_no_first_payload_does_not_crash(self):
+        """A smoketest-like task without first_payload set must not crash
+        the classifier — degrades gracefully to CODE_ERROR."""
+        t = _task(
+            "Claude subprocess exited with code 1",
+            {"failure_category": "claude_code_failed"},
+        )
+        # first_payload not explicitly set on the mock
+        assert classify_failure(t) == CODE_ERROR

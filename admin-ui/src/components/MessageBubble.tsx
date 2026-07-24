@@ -201,8 +201,6 @@ export interface MessageBubbleProps {
   presentation?: 'triage' | 'chat';
   highlighted?: boolean;
   actionMode?: 'full' | 'reply-only' | 'none';
-  resolvingId: string | null;
-  resolveInput: string;
   deletingIds: Set<string>;
   creatingDirectionIds: Set<string>;
   investigatingId: string | null;
@@ -213,11 +211,7 @@ export interface MessageBubbleProps {
   onToggleSelect: (msgId: string) => void;
   onCreateDirection: (msg: ProjectMessage) => void;
   onCreateInvestigation: (msg: ProjectMessage) => void;
-  onResolve: (msgId: string, resolution: string) => void;
   onDelete: (msgId: string) => void;
-  onStartResolve: (msgId: string) => void;
-  onCancelResolve: () => void;
-  onSetResolveInput: (value: string) => void;
   onStartInvestigate: (msgId: string) => void;
   onCancelInvestigate: () => void;
   onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => void;
@@ -233,8 +227,6 @@ export const MessageBubble = memo(function MessageBubble({
   presentation = 'triage',
   highlighted = false,
   actionMode = 'full',
-  resolvingId,
-  resolveInput,
   deletingIds,
   creatingDirectionIds,
   investigatingId,
@@ -245,11 +237,7 @@ export const MessageBubble = memo(function MessageBubble({
   onToggleSelect,
   onCreateDirection,
   onCreateInvestigation,
-  onResolve,
   onDelete,
-  onStartResolve,
-  onCancelResolve,
-  onSetResolveInput,
   onStartInvestigate,
   onCancelInvestigate,
   onReply,
@@ -266,12 +254,6 @@ export const MessageBubble = memo(function MessageBubble({
   const fromType = (msg.from_type || '').toLowerCase();
   const replyableChatAuthor = fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist';
   const canChatReply = chatMode && replyableChatAuthor && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none';
-  const isResolving = resolvingId === msg.id;
-  // Only genuinely-actionable rows (the derived needs-action set: QUESTION / BLOCKER)
-  // keep a manual resolve affordance. Conversational NOTE/FEEDBACK/BUG_REPORT/reply
-  // rows are transcript and carry no open/resolved obligation, so the manual resolve
-  // control is noise there — the reaper sweeps auto-resolve linked/stale items server-side.
-  const isActionable = msg.message_type === 'QUESTION' || msg.message_type === 'BLOCKER';
   const taskId = msg.from_task_id;
   const strategicContextReceipt = chatMode && userMsg
     ? buildMessageStrategicContextDescriptor(msg.context)
@@ -505,42 +487,6 @@ export const MessageBubble = memo(function MessageBubble({
                 </button>
               </div>
             )}
-            {actionMode === 'full' && isActionable && (!isResolving ? (
-              <button
-                onClick={() => onStartResolve(msg.id)}
-                title="Resolve"
-                className="text-emerald-500/70 hover:text-emerald-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
-              >
-                <Check className="w-3.5 h-3.5" />
-              </button>
-            ) : (
-              <div className="flex items-center gap-1 bg-neutral-900 border border-neutral-700 rounded-lg px-2 py-1 ml-1">
-                <input
-                  type="text"
-                  value={resolveInput}
-                  onChange={e => onSetResolveInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && (msg.message_type !== 'QUESTION' || resolveInput.trim())) onResolve(msg.id, resolveInput); if (e.key === 'Escape') onCancelResolve(); }}
-                  placeholder={msg.message_type === 'QUESTION' ? 'Your answer (required)...' : 'Note (optional)...'}
-                  className="bg-transparent text-neutral-300 text-xs focus:outline-none w-36 md:w-48 placeholder-neutral-600"
-                  autoFocus
-                />
-                <button
-                  onClick={() => onResolve(msg.id, resolveInput)}
-                  disabled={msg.message_type === 'QUESTION' && !resolveInput.trim()}
-                  className="text-emerald-400 hover:text-emerald-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] flex items-center justify-center"
-                  title="Confirm resolve"
-                >
-                  <Check className="w-3 h-3" />
-                </button>
-                <button
-                  onClick={onCancelResolve}
-                  className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
-                  title="Cancel"
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              </div>
-            ))}
             {actionMode === 'full' && (
             <button
               onClick={() => onDelete(msg.id)}

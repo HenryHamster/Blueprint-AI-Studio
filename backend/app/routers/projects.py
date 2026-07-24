@@ -1,12 +1,11 @@
 """Project CRUD, deploy, WebSocket, and status endpoints."""
 
 import asyncio
-import hmac
+import datetime
 import json
 import logging
 import time
 import uuid
-from typing import Optional
 
 from fastapi import (
     APIRouter,
@@ -34,6 +33,7 @@ from app.models import (
     ArtifactType,
     Project,
     ProjectMember,
+    ProjectMessage,
     ProjectStatus,
     Task,
     TaskStatus,
@@ -47,8 +47,9 @@ from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
+from app.project_message_projection import message_event_payload
 from app.strategic_events import emit_strategic_session_delta
-from app.strategic_resident_agent_binding import RESIDENT_CLAIM_NONCE_CONTEXT_KEY
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -69,19 +70,7 @@ def _agent_ws_binding_invalid(task: Task | None, payload: dict) -> bool:
     if task is None or task.status in _AGENT_WS_TERMINAL_STATUSES:
         return True
     token_vm = payload.get("vm_instance_id")
-    if token_vm and task.vm_instance_id and task.vm_instance_id != token_vm:
-        return True
-    if payload.get("task_type") != "strategic_resident_turn":
-        return False
-    persisted_nonce = str(
-        (task.context or {}).get(RESIDENT_CLAIM_NONCE_CONTEXT_KEY) or ""
-    )
-    presented_nonce = str(payload.get("claim_nonce") or "")
-    return (
-        not persisted_nonce
-        or not presented_nonce
-        or not hmac.compare_digest(presented_nonce, persisted_nonce)
-    )
+    return bool(token_vm and task.vm_instance_id and task.vm_instance_id != token_vm)
 
 
 def _truncate_vm_instance_id(vm_instance_id: object) -> str:
@@ -201,7 +190,7 @@ async def deploy_blueprint(
             logger.warning(
                 "Validation error in task payload: %s: %s", type(exc).__name__, exc
             )
-            raise HTTPException(status_code=422, detail="Invalid request")
+            raise HTTPException(status_code=422, detail="Invalid request")  # noqa: B904
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
         vm_name = f"agent-vm-{uuid.uuid4().hex}"
 
@@ -219,11 +208,6 @@ async def deploy_blueprint(
         session.add(task)
         created_tasks.append(task)
 
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-    await initialize_strategic_resident(
-        session, project.id, locked_project=project
-    )
     await session.commit()
 
     # Populate branch columns from GitHub immediately so that the first task
@@ -251,7 +235,7 @@ async def list_projects(
     request: Request,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    status: Optional[ProjectStatus] = None,
+    status: ProjectStatus | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -341,9 +325,9 @@ async def get_project_tasks(
     project_id: uuid.UUID,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    status: Optional[TaskStatus] = None,
-    direction_id: Optional[str] = None,
-    task_type: Optional[str] = None,
+    status: TaskStatus | None = None,
+    direction_id: str | None = None,
+    task_type: str | None = None,
     include_backend_managed: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
@@ -559,7 +543,7 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
     except asyncio.TimeoutError:
         await _safe_ws_close(websocket, code=1008, reason="Authentication timeout")
         return
-    except Exception:
+    except Exception:  # noqa: BLE001
         await _safe_ws_close(websocket, code=1008, reason="Authentication failed")
         return
 
@@ -579,8 +563,41 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             async with AsyncSessionLocal() as ds_session:
                 deploy_payload = await build_deploy_state_payload(ds_session)
             await websocket.send_json({"event": "deploy_state", "data": deploy_payload})
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"[WS] Failed to send initial deploy state on connect: {e}")
+        # Recover undelivered messages: re-broadcast recent messages whose
+        # delivered_at is still NULL. This catches frames that were broadcast
+        # while this client's socket was open but the frame was lost (or the
+        # previous socket was disconnected before the ack arrived).
+        try:
+            async with AsyncSessionLocal() as recovery_session:
+                cutoff = _utcnow() - datetime.timedelta(minutes=10)
+                stmt = (
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == uuid.UUID(project_id),
+                        ProjectMessage.delivered_at.is_(None),
+                        ProjectMessage.created_at >= cutoff,
+                    )
+                    .order_by(ProjectMessage.created_at.asc())
+                )
+                undelivered = (
+                    (await recovery_session.execute(stmt)).scalars().all()
+                )
+            for msg in undelivered:
+                try:
+                    await websocket.send_json(
+                        {
+                            "event": "message_created",
+                            "data": message_event_payload(msg),
+                        }
+                    )
+                except Exception as _delivery_exc:  # noqa: BLE001, PERF203
+                    logger.debug(
+                        f"[WS] Recovery send failed for message {msg.id}: {_delivery_exc}"
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[WS] Recovery query failed: {e}")
         last_message_time = time.time()
         message_count = 0
         while True:
@@ -610,11 +627,34 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
                     # RuntimeError (starlette state errors).
                     try:
                         await websocket.send_json({"event": "pong", "data": {}})
-                    except Exception as _ws_exc:
+                    except Exception as _ws_exc:  # noqa: BLE001
                         logger.debug(
                             f"[WS] pong send failed, client disconnected: {_ws_exc}"
                         )
                         return
+                    continue
+                if isinstance(parsed, dict) and parsed.get("type") == "message_ack":
+                    msg_id_raw = parsed.get("message_id")
+                    if msg_id_raw:
+                        try:
+                            msg_uuid = uuid.UUID(str(msg_id_raw))
+                            async with AsyncSessionLocal() as ack_session:
+                                ack_msg = (
+                                    await ack_session.execute(
+                                        select(ProjectMessage).where(
+                                            ProjectMessage.id == msg_uuid,
+                                            ProjectMessage.project_id == uuid.UUID(project_id),
+                                        )
+                                    )
+                                ).scalars().first()
+                                if ack_msg is not None and ack_msg.delivered_at is None:
+                                    ack_msg.delivered_at = _utcnow()
+                                    ack_session.add(ack_msg)
+                                    await ack_session.commit()
+                        except Exception as _ack_exc:  # noqa: BLE001
+                            logger.debug(
+                                f"[WS] message_ack stamp failed for {msg_id_raw}: {_ack_exc}"
+                            )
                     continue
             except (json.JSONDecodeError, AttributeError):
                 pass
@@ -697,7 +737,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         )
         await _safe_ws_close(websocket, code=1008, reason="Authentication timeout")
         return
-    except Exception:
+    except Exception:  # noqa: BLE001
         _log_agent_auth_reject(
             "ws_initial_auth_failure",
             path=path,
@@ -721,7 +761,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             await _safe_ws_close(websocket, code=1008)
             return
 
-        from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+        from app.routers.agent import _terminated_task_ids
 
         if (
             str(task.id) in _terminated_task_ids
@@ -762,28 +802,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             )
             await _safe_ws_close(websocket, code=1008, reason="VM instance mismatch")
             return
-        if payload.get("task_type") == "strategic_resident_turn":
-            task_context = task.context if isinstance(task.context, dict) else {}
-            persisted_nonce = str(
-                task_context.get(RESIDENT_CLAIM_NONCE_CONTEXT_KEY) or ""
-            )
-            presented_nonce = str(payload.get("claim_nonce") or "")
-            if (
-                not persisted_nonce
-                or not presented_nonce
-                or not hmac.compare_digest(presented_nonce, persisted_nonce)
-            ):
-                _log_agent_auth_reject(
-                    "ws_resident_claim_nonce_stale",
-                    path=path,
-                    task_id=task_id,
-                    token_vm_instance_id=token_vm,
-                    token_project_id=token_project,
-                )
-                await _safe_ws_close(
-                    websocket, code=1008, reason="Resident claim superseded"
-                )
-                return
 
         project_id = str(task.project_id)
 
@@ -798,7 +816,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     _DB_RECHECK_INTERVAL = _RECHECK_INTERVAL
     last_recheck = 0.0  # force first DB recheck on first tick
 
-    receive_task: Optional[asyncio.Task] = None
+    receive_task: asyncio.Task | None = None
     try:
         last_message_time = time.time()
         message_count = 0
@@ -815,7 +833,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             if receive_task in done:
                 # A message arrived — cancel the unused timer.
                 timer_task.cancel()
-                try:
+                try:  # noqa: SIM105
                     await timer_task
                 except asyncio.CancelledError:
                     pass
@@ -824,7 +842,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                     text_data = receive_task.result()
                 except WebSocketDisconnect:
                     return
-                except Exception:
+                except Exception:  # noqa: BLE001
                     return
 
                 # Termination recheck: deny-list fast path + DB fallback
@@ -880,17 +898,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 except json.JSONDecodeError:
                     receive_task = asyncio.create_task(websocket.receive_text())
                     continue
-                if (
-                    payload.get("task_type") == "strategic_resident_turn"
-                    and data.get("type") != "log"
-                ):
-                    await _safe_ws_close(
-                        websocket,
-                        code=1008,
-                        reason="Resident frame type is not authorized",
-                    )
-                    return
-
                 if data.get("type") == "log":
                     sanitized = _sanitize_log(data.get("content", ""))
                     await broadcast_to_project(
@@ -908,7 +915,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                     # Optionally handle status updates via WS too
                     pass
                 elif data.get("type") == "strategic_session":
-                    # Resident strategic-session live transcript delta. The
+                    # Strategic-session live transcript delta. The
                     # 100KB frame-size cap and the 20/sec rate-limit accounting
                     # above already applied to this frame exactly like the log
                     # path. emit_strategic_session_delta secret-sanitizes
@@ -1002,8 +1009,8 @@ async def cancel_project(
 
     Rate limit: 10 requests/minute.
     """
-    from app.vm_lifecycle import _ensure_vm_deleted  # noqa: PLC0415
-    from app.admin import _get_user_project_with_role  # noqa: PLC0415
+    from app.vm_lifecycle import _ensure_vm_deleted
+    from app.admin import _get_user_project_with_role
 
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="owner"
@@ -1043,7 +1050,7 @@ async def cancel_project(
     _CANCEL_BATCH_SIZE = 5000
     active_tasks: list[Task] = []
     vm_ids_to_delete: list[str] = []
-    _last_seen_id: Optional[int] = None
+    _last_seen_id: int | None = None
     while True:
         stmt = tasks_stmt
         if _last_seen_id is not None:

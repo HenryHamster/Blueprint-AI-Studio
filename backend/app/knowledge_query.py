@@ -670,6 +670,59 @@ async def build_knowledge_index(
     return entries
 
 
+# Maximum strategic-memory facts carried in the compact spawn index. Bounded so
+# the section stays a few KB even as the memory store grows without limit — the
+# agent fetches full bodies on demand via ./fetch knowledge --source-kind
+# strategic_memory (list / --topic browse / --q keyword search).
+_STRATEGIC_MEMORY_INDEX_KEEP = 25
+_STRATEGIC_MEMORY_INDEX_SUMMARY_CHARS = 200
+
+
+async def build_strategic_memory_index(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    limit: int = _STRATEGIC_MEMORY_INDEX_KEEP,
+    summary_chars: int = _STRATEGIC_MEMORY_INDEX_SUMMARY_CHARS,
+) -> list[dict]:
+    """Build the compact, bounded spawn index of active strategic-memory facts.
+
+    Returns newest-first, body-omitted entries (id, title, topic, truncated
+    summary, tags, created_at) for ``source_kind='strategic_memory'`` documents
+    that are still active (``lifecycle_status='consumed'``). This replaces
+    shipping the full ``Project.strategic_memory_notes`` JSONB list in the
+    strategist spawn payload: ~100-200 bytes per fact, so 25 facts fit in a few
+    KB regardless of how large the underlying store grows. The agent pulls full
+    bodies on demand via ``./fetch knowledge``.
+    """
+    stmt = (
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.project_id == project_id,
+            KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+            KnowledgeDocument.lifecycle_status == "consumed",
+        )
+        .order_by(KnowledgeDocument.created_at.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    entries: list[dict] = []
+    for doc in rows:
+        summary = doc.summary or ""
+        collapsed = " ".join(summary.split())
+        if len(collapsed) > summary_chars:
+            collapsed = collapsed[: summary_chars - 1].rstrip() + "…"
+        entries.append({
+            "id": str(doc.id),
+            "title": doc.title,
+            "topic": doc.topic,
+            "summary": collapsed,
+            "tags": doc.tags if isinstance(doc.tags, list) else [],
+            "created_at": doc.created_at.isoformat() if doc.created_at else None,
+        })
+    return entries
+
+
 # Maximum pending follow-ups shipped to the strategist payload. Like the knowledge
 # index, this is bounded so it cannot dominate the prompt budget as the store grows.
 _PENDING_LIFECYCLE_ITEMS_KEEP = 20

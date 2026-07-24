@@ -103,6 +103,10 @@ from app.agent_status_spawn import (
     maybe_spawn_debug_create,
 )
 from app.cost_ceiling import check_daily_cost_ceiling as _check_daily_cost_ceiling
+from app.resident_retry_binding import (
+    restore_resident_retry_binding as _restore_resident_retry_binding,
+    sync_resident_retry_wait_after_commit as _sync_resident_retry_wait_after_commit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1603,7 +1607,10 @@ async def update_agent_status(
         # confirms the repo is empty. Best-effort: never raises, and preserves
         # fail-loud for a real clone shortfall (a repo with content leaves the
         # stored signal untouched, so the next task still fails loud).
-        from app.failure_classification import is_clone_delivery_disagreement
+        from app.failure_classification import (
+            is_clone_delivery_disagreement,
+            is_repo_uninitialized,
+        )
 
         _raw_fc = payload.failure_category.strip().lower()
         _disagreement_text = "\n".join(
@@ -1619,6 +1626,22 @@ async def update_agent_status(
             _heal_project = await session.get(Project, task.project_id)
             if _heal_project is not None:
                 await maybe_correct_stale_repo_empty_signal(_heal_project, session)
+        elif _raw_fc == "clone_failed" and is_repo_uninitialized(_disagreement_text):
+            # Second self-heal shape: a genuinely commitless repo whose stored
+            # repo_is_empty=False is stale.  git clone --branch <trunk> dies
+            # before verifyCloneDelivered runs, so the failure text matches the
+            # REPO_UNINITIALIZED patterns (not the clone-delivery-disagreement
+            # string).  Re-verify against GitHub and flip the durable signal when
+            # repo_has_commits() confirms the repo is truly commitless.
+            from app.build_config_detection import (
+                maybe_correct_stale_commitless_repo_signal,
+            )
+
+            _heal_project = await session.get(Project, task.project_id)
+            if _heal_project is not None:
+                await maybe_correct_stale_commitless_repo_signal(
+                    _heal_project, session
+                )
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})
         ctx["scope_gate_triggered"] = payload.scope_gate_triggered
@@ -2467,8 +2490,18 @@ async def update_agent_status(
                         _retry_context = {
                             key: ctx[key] for key in _retry_context_keys if key in ctx
                         }
+                        _prior_resident_ctx = dict(ctx)
                         reset_task_for_fresh_attempt(task)
                         ctx = {**(task.context or {}), **_retry_context}
+                        _resident_retry = await _restore_resident_retry_binding(
+                            task,
+                            session,
+                            _prior_resident_ctx,
+                        )
+                        # Merge retry-critical context back after resident-binding
+                        # may have updated task.context (_retry_context keys are
+                        # disjoint from _resident_* / strategic_session_id).
+                        ctx = {**dict(task.context or {}), **_retry_context}
                         task.context = ctx
                         if external_retry_delay_minutes is not None:
                             set_retry_after(task, external_retry_delay_minutes)
@@ -2494,6 +2527,7 @@ async def update_agent_status(
                             and _runtime_config.get("warm_continuity_enabled", False)
                             and _runtime_config.get("warm_retarget_enabled", False)
                             and old_vm_id_rl
+                            and not _resident_retry
                         )
                         park_blacklisted = list(ctx.get("blacklisted_accounts") or [])
                         if (
@@ -2656,13 +2690,21 @@ async def update_agent_status(
                         ctx.pop("warm_target_vm_id", None)
                         ctx.pop("warm_handoff_deadline", None)
                         ctx.pop("warm_target_pr", None)
+                        await _restore_resident_retry_binding(
+                            task,
+                            session,
+                            _prior_resident_ctx,
+                        )
                         task.context = ctx
                         session.add(task)
                         await session.commit()
+                        await _sync_resident_retry_wait_after_commit(
+                            task, session, _prior_resident_ctx
+                        )
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
-                            {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                            {"task_id": str(task.id), "status": task.status},
                         )
                         logger.info(
                             f"[AGENT STATUS] Task {task.id} {failure_class} — requeued without burning retry"
@@ -2743,6 +2785,7 @@ async def update_agent_status(
                         ctx["blacklisted_accounts"] = blacklisted
 
                     old_vm_id_da = task.vm_instance_id
+                    _prior_resident_ctx = dict(ctx)
                     now_da = _utcnow()
                     bank_task_current_attempt(task, stopped_at=now_da)
                     ctx = with_task_attempt_banking(task, ctx)
@@ -2764,15 +2807,23 @@ async def update_agent_status(
                     task.latest_status_message = (
                         "Dead auth session — requeued onto different account"
                     )
+                    await _restore_resident_retry_binding(
+                        task,
+                        session,
+                        _prior_resident_ctx,
+                    )
                     from app.routers.agent import _terminated_task_ids
 
                     _terminated_task_ids.pop(str(task.id), None)
                     session.add(task)
                     await session.commit()
+                    await _sync_resident_retry_wait_after_commit(
+                        task, session, _prior_resident_ctx
+                    )
                     await broadcast_to_project(
                         str(task.project_id),
                         "task_updated",
-                        {"task_id": str(task.id), "status": TaskStatus.QUEUED},
+                        {"task_id": str(task.id), "status": task.status},
                     )
                     logger.info(
                         "[AGENT STATUS] Task %s DEAD_AUTH — requeued without burning retry",
@@ -3479,6 +3530,12 @@ async def update_agent_status(
                         "[ORCHESTRATOR] Failed to escalate effort for task %s",
                         task.id,
                     )
+            await _restore_resident_retry_binding(
+                task,
+                session,
+                _prior_retry_ctx,
+            )
+            ctx = dict(task.context or {})
             task.context = ctx
             session.add(task)
 
@@ -3497,13 +3554,16 @@ async def update_agent_status(
                 session.add(task)
 
             await session.commit()
+            await _sync_resident_retry_wait_after_commit(
+                task, session, _prior_retry_ctx
+            )
 
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",
                 {
                     "task_id": str(task.id),
-                    "status": TaskStatus.QUEUED,
+                    "status": task.status,
                     "attempt_count": task.attempt_count,
                 },
             )
@@ -3599,6 +3659,7 @@ async def update_agent_status(
                                 f"{type(_alert_err).__name__}: {str(_alert_err)[:200]}"
                             ),
                             task_id=None,  # project-level, not bound to the failed task
+                            event_type="task.failed",
                         )
                         session.add(meta_alert)
                         await broadcast_to_project(
@@ -4281,6 +4342,29 @@ async def update_agent_status(
             logger.debug(
                 f"[PIPELINE] Early session close failed (non-fatal): {_close_exc}"
             )
+        # A resident agent can legitimately reach a terminal state after retries
+        # are exhausted. Reconcile that exact committed generation before the
+        # slower post-commit pipeline: requeues are left alone, continuous
+        # Workday gets a replacement, and a failed replacement is surfaced as
+        # ended/blocked instead of leaving the UI stuck on a false Active state.
+        if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            try:
+                from app.strategic_resident_session import (
+                    reconcile_terminal_resident_worker,
+                )
+
+                await reconcile_terminal_resident_worker(
+                    _task_id_str,
+                    session_factory=_factory,
+                )
+            except Exception:
+                logger.warning(
+                    "[RESIDENT_SESSION] terminal reconciliation failed after commit "
+                    "for task %s; continuing normal post-commit processing",
+                    _task_id_str,
+                    exc_info=True,
+                )
+
         # Cloud Run's default request timeout is 300s. Post-commit makes
         # multiple GitHub calls (review posting, check-run update, PR state
         # check, merge attempts) that each retry with up to 3x120s backoff on

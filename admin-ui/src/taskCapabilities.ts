@@ -22,15 +22,6 @@ export const TASK_CAPABILITIES = [
     synthetic: false,
   },
   {
-    id: 'panel_review',
-    label: 'Panel Review',
-    description: 'Run the fixed multi-lens PR review workflow',
-    userLaunchable: true,
-    providerConfigurable: true,
-    filterVisible: true,
-    synthetic: false,
-  },
-  {
     id: 'fix',
     label: 'Fix',
     description: 'Fix PR feedback',
@@ -209,6 +200,15 @@ export const TASK_CAPABILITIES = [
     providerConfigurable: false,
     filterVisible: true,
     synthetic: true,
+  },
+  {
+    id: 'compute_experiment',
+    label: 'Compute Experiment',
+    description: 'Run a budgeted compute job',
+    userLaunchable: false,
+    providerConfigurable: false,
+    filterVisible: true,
+    synthetic: false,
   },
 ] as const;
 

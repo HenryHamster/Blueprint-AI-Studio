@@ -1622,11 +1622,11 @@ async def test_outcome_scaffolding_memo_completed_at_spawn(db_session, mocker):
 
     The memo task must:
     - be in status COMPLETED (not QUEUED)
-    - have exactly one MEMO Artifact row
+    - write NO MEMO Artifact row (the memo lives only in plan_output)
     - have plan_output['memo']['summary'] containing substantive scaffolding context
     - carry citations with 'direction:<id>' and tags with 'outcome-scaffolding'
     """
-    from app.models import Artifact, ArtifactType
+    from app.models import Artifact
 
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
@@ -1671,15 +1671,14 @@ async def test_outcome_scaffolding_memo_completed_at_spawn(db_session, mocker):
         f"memo task should be COMPLETED at spawn, got {memo.status}"
     )
 
-    # Exactly one MEMO Artifact row must exist
+    # No MEMO Artifact row is written — the memo lives only in plan_output.
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
         .scalars()
         .all()
     )
-    memo_artifacts = [a for a in artifacts if a.artifact_type == ArtifactType.MEMO]
-    assert len(memo_artifacts) == 1, (
-        f"expected 1 MEMO artifact, got {len(memo_artifacts)}"
+    assert artifacts == [], (
+        f"expected no Artifact rows for memo, got {len(artifacts)}"
     )
 
     # plan_output['memo']['summary'] must contain substantive content

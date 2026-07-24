@@ -20,9 +20,8 @@ const mockListFleetRunners = vi.mocked(listFleetRunners);
 
 function catalogEntry(overrides: Partial<TaskTypeCatalogEntry> & { id: string }): TaskTypeCatalogEntry {
   return {
-    id: overrides.id,
-    label: overrides.label ?? overrides.id,
-    description: overrides.description ?? '',
+    label: overrides.id,
+    description: '',
     agent_mode: 'write',
     default_category: null,
     user_launchable: true,
@@ -50,6 +49,7 @@ describe('useTaskModal', () => {
   const originalError = console.error;
 
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     console.error = vi.fn();
     fetchSpy = vi.fn().mockResolvedValue({
       ok: true,
@@ -73,6 +73,7 @@ describe('useTaskModal', () => {
 
   afterEach(() => {
     console.error = originalError;
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -452,23 +453,6 @@ describe('useTaskModal', () => {
     expect(addToast).toHaveBeenCalledWith('PR number must be a positive integer', 'error');
   });
 
-  it('handleCreateTask requires a PR number for panel_review tasks', async () => {
-    const addToast = vi.fn();
-    const { result } = renderHook(() =>
-      useTaskModal('panel_review', addToast, { current: vi.fn() }),
-    );
-    act(() => {
-      result.current.setNewTaskType('panel_review');
-      result.current.setNewTaskPrNumber('');
-    });
-    await act(async () => {
-      await result.current.handleCreateTask({
-        preventDefault: vi.fn(),
-      } as unknown as React.FormEvent);
-    });
-    expect(addToast).toHaveBeenCalledWith('PR number must be a positive integer', 'error');
-  });
-
   it('handleCreateTask rejects review task with missing PR branch', async () => {
     const addToast = vi.fn();
     const { result } = renderHook(() =>
@@ -485,22 +469,6 @@ describe('useTaskModal', () => {
       } as unknown as React.FormEvent);
     });
     expect(addToast).toHaveBeenCalledWith('PR branch is required for review tasks', 'error');
-  });
-
-  it('handleCreateTask rejects panel_review task with missing PR branch', async () => {
-    const addToast = vi.fn();
-    const { result } = renderHook(() =>
-      useTaskModal('panel_review', addToast, { current: vi.fn() }),
-    );
-    act(() => {
-      result.current.setNewTaskType('panel_review');
-      result.current.setNewTaskPrNumber('42');
-      result.current.setNewTaskPrBranch('   ');
-    });
-    await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
-    });
-    expect(addToast).toHaveBeenCalledWith('PR branch is required for panel review tasks', 'error');
   });
 
   it('handleCreateTask rejects fix task with missing PR branch', async () => {
@@ -546,28 +514,6 @@ describe('useTaskModal', () => {
       expect.stringContaining('not operator-launchable'),
       'error',
     );
-  });
-
-  it('handleCreateTask includes PR metadata for panel_review tasks', async () => {
-    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-panel-1' }) });
-    const { result } = renderHook(() =>
-      useTaskModal('panel_review', vi.fn(), { current: vi.fn() }),
-    );
-    act(() => {
-      result.current.setNewTaskRepo('owner/repo');
-      result.current.setNewTaskTitle('Panel review');
-      result.current.setNewTaskPrompt('Run the fixed panel review');
-      result.current.setNewTaskType('panel_review');
-      result.current.setNewTaskPrNumber('77');
-      result.current.setNewTaskPrBranch('feature/panel-review');
-    });
-    await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
-    });
-    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body ?? '{}')) as Record<string, unknown>;
-    expect(body.task_type).toBe('panel_review');
-    expect(body.pr_number).toBe(77);
-    expect(body.branch).toBe('feature/panel-review');
   });
 
   // --- Duplicate-task flow: non-launchable types must not be re-emitted ---
@@ -653,7 +599,7 @@ describe('useTaskModal', () => {
     expect(result.current.newTaskRepo).toBe('owner/repo');
   });
 
-  it('openPrefilledTaskModal sets panel_review type and base branch from baseBranch', async () => {
+  it('openPrefilledTaskModal sets fix type and base branch from baseBranch', async () => {
     const defaultTaskBranchRef = { current: 'automain' };
     const selectedProjectRepoRef = { current: 'owner/repo' };
     const { result } = renderHook(() =>
@@ -661,17 +607,17 @@ describe('useTaskModal', () => {
     );
     await act(async () => {
       result.current.openPrefilledTaskModal({
-        taskType: 'panel_review',
-        title: 'Panel review PR #99',
-        prompt: '',
+        taskType: 'fix',
+        title: 'Fix PR #99',
+        prompt: 'Fix orphaned PR',
         prNumber: 99,
-        prBranch: 'feature/panel',
+        prBranch: 'feature/fix',
         baseBranch: 'release/1.2',
       });
     });
-    expect(result.current.newTaskType).toBe('panel_review');
+    expect(result.current.newTaskType).toBe('fix');
     expect(result.current.newTaskPrNumber).toBe('99');
-    expect(result.current.newTaskPrBranch).toBe('feature/panel');
+    expect(result.current.newTaskPrBranch).toBe('feature/fix');
     // The PR's own base branch wins over the project default.
     expect(result.current.newTaskBranch).toBe('release/1.2');
   });
@@ -684,58 +630,14 @@ describe('useTaskModal', () => {
     );
     await act(async () => {
       result.current.openPrefilledTaskModal({
-        taskType: 'panel_review',
-        title: 'Panel review PR #1',
-        prompt: '',
+        taskType: 'fix',
+        title: 'Fix PR #1',
+        prompt: 'Fix orphaned PR',
         prNumber: 1,
         prBranch: 'feature/x',
       });
     });
     expect(result.current.newTaskBranch).toBe('automain');
-  });
-
-  it('handleCreateTask defaults blank title/prompt for panel_review and POSTs a valid body', async () => {
-    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-pr-1' }) });
-    const { result } = renderHook(() =>
-      useTaskModal('panel_review', vi.fn(), { current: vi.fn() }),
-    );
-    act(() => {
-      result.current.setNewTaskRepo('owner/repo');
-      result.current.setNewTaskType('panel_review');
-      result.current.setNewTaskPrNumber('123');
-      result.current.setNewTaskPrBranch('feature/panel');
-      // Title and prompt intentionally left blank — the fixed workflow needs no
-      // operator-authored prompt.
-    });
-    await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
-    });
-    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body ?? '{}')) as Record<string, unknown>;
-    expect(body.task_type).toBe('panel_review');
-    expect(body.pr_number).toBe(123);
-    expect(body.branch).toBe('feature/panel');
-    // Backend requires non-empty title/prompt — the hook fills sensible defaults.
-    expect(String(body.title).length).toBeGreaterThan(0);
-    expect(String(body.prompt).length).toBeGreaterThan(0);
-    expect(String(body.title)).toContain('123');
-  });
-
-  it('handleCreateTask does NOT default title/prompt for non-panel_review types', async () => {
-    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-c-1' }) });
-    const { result } = renderHook(() =>
-      useTaskModal('create', vi.fn(), { current: vi.fn() }),
-    );
-    act(() => {
-      result.current.setNewTaskRepo('owner/repo');
-      result.current.setNewTaskTitle('Real title');
-      result.current.setNewTaskPrompt('Real prompt');
-    });
-    await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
-    });
-    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body ?? '{}')) as Record<string, unknown>;
-    expect(body.title).toBe('Real title');
-    expect(body.prompt).toBe('Real prompt');
   });
 
   it('openPrefilledTaskModal does NOT autosave the prefilled title/prompt as a draft', async () => {
@@ -751,7 +653,7 @@ describe('useTaskModal', () => {
       });
     });
     // Wait past the 500ms debounce window for draft autosave.
-    await new Promise(r => setTimeout(r, 700));
+    await vi.advanceTimersByTimeAsync(700);
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:title')).toBeNull();
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:prompt')).toBeNull();
   });
@@ -768,7 +670,7 @@ describe('useTaskModal', () => {
     expect(result.current.newTaskType).toBe('web_research');
     expect(result.current.newTaskTitle).toContain('Postgres pooling behavior');
     expect(result.current.newTaskPrompt).toContain('Postgres pooling behavior');
-    await new Promise(r => setTimeout(r, 700));
+    await vi.advanceTimersByTimeAsync(700);
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:title')).toBeNull();
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:prompt')).toBeNull();
   });
@@ -809,7 +711,7 @@ describe('useTaskModal', () => {
   it('openNewTaskModal derives launchable options (incl. newly registered types) from the catalog', async () => {
     mockFetchTaskTypeCatalog.mockResolvedValue([
       catalogEntry({ id: 'create', label: 'Create', description: 'Write code, open PR' }),
-      catalogEntry({ id: 'panel_review', label: 'Panel Review', description: 'Multi-agent review' }),
+      catalogEntry({ id: 'fix', label: 'Fix', description: 'Fix a bug on a PR' }),
       catalogEntry({ id: 'strategic_review', label: 'Strategic Review', user_launchable: false }),
     ]);
     const { result } = renderHook(() =>
@@ -820,11 +722,11 @@ describe('useTaskModal', () => {
     });
     await waitFor(() => {
       const values = result.current.launchableTaskTypeOptions.map(o => o.value);
-      expect(values).toContain('panel_review');
+      expect(values).toContain('fix');
       expect(values).not.toContain('strategic_review');
     });
-    const panel = result.current.launchableTaskTypeOptions.find(o => o.value === 'panel_review');
-    expect(panel).toEqual({ value: 'panel_review', label: 'Panel Review', description: 'Multi-agent review' });
+    const fix = result.current.launchableTaskTypeOptions.find(o => o.value === 'fix');
+    expect(fix).toEqual({ value: 'fix', label: 'Fix', description: 'Fix a bug on a PR' });
   });
 
   it('falls back to the static launchable options when the catalog fetch rejects', async () => {

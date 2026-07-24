@@ -20,6 +20,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    JSON,
     String,
     Integer,
     Float,
@@ -57,24 +58,6 @@ from app.release_models import (  # noqa: F401
     ReleaseVersion,
     ResidualVerdict,
     VersionAcceptanceCriterion,
-)
-from app.strategic_resident_models import (  # noqa: F401
-    StrategicOperationApproval,
-    StrategicOperationReceipt,
-    StrategicResident,
-    StrategicResidentCheckpoint,
-    StrategicWorkerMemoryProposal,
-)
-from app.strategic_resident_sweep_models import (  # noqa: F401
-    StrategicResidentSweepState,
-)
-from app.strategic_resident_ordinary_task_events import (  # noqa: F401
-    StrategicResidentOrdinaryTaskTerminalEvent,
-    register_sqlite_ordinary_task_terminal_listener,
-)
-from app.strategic_resident_task_terminal_events import (  # noqa: F401
-    StrategicResidentTaskTerminalEvent,
-    register_sqlite_terminal_event_listener,
 )
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
@@ -319,6 +302,18 @@ class ArtifactType(str, Enum):
     # agent launched and monitored. Like MERGE_TEST_RESULT, the column is a plain
     # String so no migration is needed.
     COMPUTE_RESULT = "COMPUTE_RESULT"
+    # Result of a walkthrough_e2e task: per-flow verdicts (PASS/FAIL/DEAD_END)
+    # from the live-stack harness. Read by the completion handler to write
+    # CriterionEvidence rows. ArtifactType is a plain String column so no
+    # migration is needed.
+    WALKTHROUGH_E2E_RESULT = "WALKTHROUGH_E2E_RESULT"
+    # Result of the AUTONOMOUS walkthrough_e2e evidence lane: the machine-readable
+    # {git_sha, run_timestamp, results:[{criterion_key, passed, notes}]} report the
+    # live-stack handler captured. Unlike WALKTHROUGH_E2E_RESULT this artifact is
+    # NOT re-ingested by the completion handler — the handler POSTs SHA-pinned
+    # CriterionEvidence directly to the ingestion endpoint. Plain String column so
+    # no migration is needed.
+    WALKTHROUGH_E2E_REPORT = "WALKTHROUGH_E2E_REPORT"
 
 
 class SourceKind(str, Enum):
@@ -339,6 +334,12 @@ class SourceKind(str, Enum):
     RESEARCH_AUDIT = "research_audit"
     REPO_DOMAIN = "repo_domain"
     DIRECTION_RETIREMENT = "direction_retirement"
+    # A single durable behavioral-memory fact written by the ``set_memory``
+    # strategic op. Each fact is one individually-addressable, trigram-searchable
+    # ``KnowledgeDocument`` row (title/body/summary/topic/tags), replacing the
+    # capped ``Project.strategic_memory_notes`` JSONB list — giving strategic
+    # memory unbounded capacity, keyword retrieval, and per-fact lifecycle.
+    STRATEGIC_MEMORY = "strategic_memory"
     UNKNOWN = "unknown"
 
 
@@ -1253,19 +1254,6 @@ class Task(SQLModel, table=True):
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
-    strategic_operation_receipt_id: uuid.UUID | None = Field(
-        default=None,
-        sa_column=Column(
-            GUID(),
-            ForeignKey(
-                "strategicoperationreceipt.id",
-                name="fk_task_strategic_operation_receipt",
-                ondelete="SET NULL",
-                use_alter=True,
-            ),
-            nullable=True,
-        ),
-    )
     requires_approval: bool = Field(default=False)
     spend_approval_cleared_at: datetime | None = Field(default=None, nullable=True)
 
@@ -1626,12 +1614,6 @@ class Task(SQLModel, table=True):
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
         Index("ix_task_project_status_updated", "project_id", "status", "updated_at"),
-        Index(
-            "ix_task_strategic_operation_receipt_id",
-            "strategic_operation_receipt_id",
-            postgresql_where=text("strategic_operation_receipt_id IS NOT NULL"),
-            sqlite_where=text("strategic_operation_receipt_id IS NOT NULL"),
-        ),
         Index(
             "ix_task_project_status_completed", "project_id", "status", "completed_at"
         ),
@@ -2122,7 +2104,7 @@ def get_task_cost_by_provider_model(
                     pass
         provider = attempt.get("provider")
         model = attempt.get("model")
-        if provider and model:
+        if provider and model:  # noqa: SIM108
             bucket = f"{provider}|{model}"
         else:
             bucket = "unknown|unknown"
@@ -2133,7 +2115,7 @@ def get_task_cost_by_provider_model(
     if live_cost > 0:
         provider = task.provider
         model = task.model
-        if provider and model:
+        if provider and model:  # noqa: SIM108
             bucket = f"{provider}|{model}"
         else:
             bucket = "unknown|unknown"
@@ -2352,77 +2334,6 @@ class ProjectComputeImage(SQLModel, table=True):
         UniqueConstraint(
             "project_id", "dep_hash", name="uq_projectcomputeimage_project_dep_hash"
         ),
-    )
-
-
-class ComputeImageBuildStatus(str, Enum):
-    PENDING = "PENDING"
-    BUILDING = "BUILDING"
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-    TIMED_OUT = "TIMED_OUT"
-
-
-class ProjectComputeImageBuild(SQLModel, table=True):
-    """Durable async-tracking row for an off-orchestrator compute-image build.
-
-    Cloud Run's 60-minute request cap forbids the current inline synchronous
-    ``docker build`` path. This row drives the provision -> poll -> terminal ->
-    reap lifecycle for builds dispatched to an isolated builder VM, mirroring
-    the ``ComputeJob`` table's column/typing conventions.
-    """
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
-    dep_hash: str = Field(sa_column=Column(String(255), nullable=False))
-    registry_repo: str = Field(sa_column=Column(String(512), nullable=False))
-    image_name: str = Field(sa_column=Column(String(255), nullable=False))
-    builder_vm_id: str | None = Field(
-        default=None, sa_column=Column(String(255), nullable=True)
-    )
-    zone: str | None = Field(
-        default=None, sa_column=Column(String(128), nullable=True)
-    )
-    status: ComputeImageBuildStatus = Field(
-        default=ComputeImageBuildStatus.PENDING,
-        sa_column=Column(
-            String,
-            nullable=False,
-            server_default=ComputeImageBuildStatus.PENDING.value,
-        ),
-    )
-    started_at: datetime | None = Field(
-        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
-    )
-    deadline_at: datetime | None = Field(
-        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
-    )
-    result_json: str | None = Field(
-        default=None, sa_column=Column(Text, nullable=True)
-    )
-    error_reason: str | None = Field(
-        default=None, sa_column=Column(Text, nullable=True)
-    )
-    created_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
-    )
-    updated_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(
-            NaiveUTCDateTime,
-            nullable=False,
-            server_default=func.now(),
-            onupdate=_utcnow,
-        ),
-    )
-
-    __table_args__ = (
-        Index("ix_projectcomputeimagebuild_project_id_status", "project_id", "status"),
-        Index("ix_projectcomputeimagebuild_project_dep_hash", "project_id", "dep_hash"),
-        Index("ix_projectcomputeimagebuild_status", "status"),
-        Index("ix_projectcomputeimagebuild_deadline_at", "deadline_at"),
-        Index("ix_projectcomputeimagebuild_created_at", "created_at"),
     )
 
 
@@ -2863,10 +2774,6 @@ class TaskHistory(SQLModel, table=True):
     __table_args__ = (
         Index("ix_taskhistory_task_id_timestamp_desc", "task_id", text("timestamp desc")),
     )
-
-
-register_sqlite_terminal_event_listener(Task, StrategicOperationReceipt)
-register_sqlite_ordinary_task_terminal_listener(Task)
 
 
 # Auto-append to status_log whenever latest_status_message is set
@@ -3717,17 +3624,22 @@ class ProjectMessage(SQLModel, table=True):
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
-    # Resident-session identity stamp. Set to the live resident Workday session's
-    # ``session_id`` when the message is created while a session is active, so each
-    # session's poll / unattended-cap / pacing queries can scope to their OWN
-    # conversation instead of every open operator message project-wide. NULL means
-    # the row predates the feature (legacy) or was created outside an active
-    # session (cadence path); NULL is always treated as unscoped/visible so no
-    # pre-migration backlog is silently dropped (see alembic 0396).
+    # Stable identity of the persistent conversational Workday session this
+    # message belongs to. NULL preserves visibility for pre-migration and
+    # out-of-session messages.
     resident_session_id: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
     resolved_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Server-stamped when at least one WS client acknowledges delivery of the
+    # broadcast frame (message_ack). NULL for messages that were never delivered
+    # or whose ack was lost — this IS the durable diagnostic record of a
+    # delivery gap when a message exists with non-NULL created_at but NULL
+    # delivered_at.
+    delivered_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
@@ -3817,6 +3729,7 @@ class ProjectMessage(SQLModel, table=True):
         # the model/migration coverage invariant can track their names.
         Index("ix_projectmessage_context_event_type", "context"),
         Index("ix_projectmessage_context_dedupe_key", "context"),
+        Index("ix_projectmessage_context_audience", "context"),
         # Accelerates high-signal message fetches filtered by (project_id, message_type)
         # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
         Index(
@@ -3825,8 +3738,6 @@ class ProjectMessage(SQLModel, table=True):
             "message_type",
             "created_at",
         ),
-        # Serves the session-scoped poll / unattended-cap / pacing queries
-        # (project_id + resident_session_id + created_at ordering/aggregation).
         Index(
             "ix_projectmessage_project_session_created",
             "project_id",
@@ -4035,6 +3946,12 @@ class DeploymentState(SQLModel, table=True):
     pipeline_events_state: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Persisted GC-guard sweep state — cumulative totals survive process restarts
+    # so the operator readiness signal (get_compute_image_gc_guard_readiness)
+    # reflects durable observed history rather than resetting to zero on deploy.
+    gc_guard_state: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Previous deploy tracking — populated when a new deploy supersedes the
     # current one. Lets RecentChangesContext builders compute the commit range
     # (prior_deploy_sha..current_sha) without a live git checkout.
@@ -4109,17 +4026,26 @@ class MaxPlanAccount(SQLModel, table=True):
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Persisted rate-limit/usage headroom snapshot (latest probe data). Populated
-    # by _refresh_usage_snapshot in max_plan_pool on each successful probe so
-    # the data survives orchestrator restarts, and read back by
+    # by _persist_rate_limit_usage_to_db in max_plan_pool on each successful probe
+    # so the data survives orchestrator restarts, and read back by
     # load_max_plan_pool to re-seed the in-memory usage meter.
-    # Structure: {"five_hour": {"utilization": float, "resets_at": str},
-    #             "seven_day": {"utilization": float, "resets_at": str},
-    #             "updated_at": str, "source": "oauth_usage_probe"}
-    # The OAuth usage probe (anthropic OAuth accounts only) is the SOLE writer.
-    # Messages-API rate-limit headers (direct_llm_client) are NOT persisted
-    # here: inline LLM calls authenticate with the org-level ANTHROPIC_API_KEY
-    # env credential, so their headers describe the org key's limits, not any
-    # pool account's plan — attributing them to an account row would be wrong.
+    #
+    # Two source schemas may appear here (keyed by "source"):
+    #
+    # 1. oauth_usage_probe (Anthropic OAuth accounts):
+    #    {"five_hour": {"utilization": float, "resets_at": str},
+    #     "seven_day":  {"utilization": float, "resets_at": str},
+    #     "updated_at": str, "source": "oauth_usage_probe"}
+    #
+    # 2. messages_api_header (API-key accounts, from per-response rate-limit
+    #    headers returned by the Messages API):
+    #    {"unified_5h": {"utilization": float, "resets_at": str | None},
+    #     "remaining_tokens": int | None, "limit_tokens": int | None,
+    #     "updated_at": str, "source": "messages_api_header"}
+    #    The unified_5h utilization is on a 0..100 scale; _snapshot_from_persisted
+    #    _usage maps it to the five_hour window when rebuilding UsageSnapshot.
+    #
+    # Reader: _snapshot_from_persisted_usage (max_plan_pool) accepts both schemas.
     rate_limit_usage: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
@@ -4492,13 +4418,20 @@ class KnowledgeDocument(SQLModel, table=True):
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
 
     # Provenance: the task whose terminal output produced this document.
-    # ON DELETE CASCADE: removing the source task also removes the derived doc.
-    source_task_id: uuid.UUID = Field(
+    # ON DELETE SET NULL (nullable): most documents are provenance-bound to their
+    # producing task, but ``strategic_memory`` facts must OUTLIVE the task that
+    # wrote them — a set_memory fact is durable behavioral memory, not a task
+    # artifact. Nulling (rather than cascading) on task deletion preserves the
+    # fact; ``source_citations`` retains the immutable provenance. Serialization
+    # and read joins already treat this column as optional (see
+    # knowledge_query.serialize_knowledge_document / the isouter join).
+    source_task_id: uuid.UUID | None = Field(
+        default=None,
         sa_column=Column(
-            ForeignKey("task.id", ondelete="CASCADE"),
-            nullable=False,
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
             index=True,
-        )
+        ),
     )
 
     # Which task kind produced this document (``design`` vs ``web_research``).
@@ -5601,6 +5534,50 @@ class EvergreenFillDecisionLog(SQLModel, table=True):
     )
 
 
+class AuditLaneDecisionLog(SQLModel, table=True):
+    """Durable per-cycle audit-lane decision log for structural_health_audit and
+    metrics_integrity_sweep observe-mode evidence.
+
+    One row per audit cycle (structural_health_audit) or sweep tick
+    (metrics_integrity_sweep), written regardless of mode (observe/enforce) and
+    regardless of whether any findings tripped. This makes the observe-window
+    evidence durable across process restarts and deploys, so the 'observe phase
+    validated it' argument is backed by a queryable cross-deploy record rather
+    than an in-memory ring that resets on every restart.
+
+    Lane discriminator: 'structural_health' | 'metrics_integrity'.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    ts: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True),
+    )
+
+    lane: str = Field(sa_column=Column(String(32), nullable=False))
+    mode: str = Field(sa_column=Column(String(16), nullable=False))
+
+    # True when at least one check/axis tripped (would-have-fired signal).
+    tripped: bool = Field(sa_column=Column(Boolean, nullable=False))
+
+    # Count of checks/findings enrolled in this cycle (0 in observe mode).
+    enrolled: int = Field(default=0, sa_column=Column(Integer, nullable=False))
+
+    # Bounded summary payload (check counts, flag names, etc.) for diagnostics.
+    payload: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_auditlanedecisionlog_lane_ts",
+            "lane",
+            "ts",
+        ),
+    )
+
+
 class LocalRunner(SQLModel, table=True):
     """A pull-based fleet runner registered on operator hardware.
 
@@ -5929,4 +5906,198 @@ class NotificationDeadLetter(SQLModel, table=True):
             "project_id",
             text("created_at desc"),
         ),
+    )
+
+
+class OperatorInboxLivenessObservation(SQLModel, table=True):
+    """Durable record of one operator-inbox liveness tick for a measured project.
+
+    Written once per tick for EVERY measured project (all statuses:
+    ``"flagged"``, ``"ok"``, ``"skipped"``) so non-flagged rows break the
+    consecutive flagged chain and episode boundaries are detected correctly.
+    When a project goes [flagged×3, clean, flagged], the clean-tick row
+    separates the two episodes and escalation only fires after >= 3 NEW
+    consecutive flagged ticks.  Without clean-tick rows the DB sees an
+    unbroken flagged sequence and escalates on the first flagged tick of the
+    new episode.
+
+    Modeled on :class:`NotificationDeadLetter` (durable record of an ephemeral
+    in-memory signal) so the liveness signal survives restart.
+    """
+
+    __tablename__ = "operator_inbox_liveness_observation"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    status: str = Field(
+        sa_column=Column(String(16), nullable=False, server_default=text("'flagged'"))
+    )
+    forward_leaked: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    badge_invisible: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    info_alert_noise: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    detail: str = Field(default="", sa_column=Column(Text, nullable=False))
+    tick_number: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # Composite index for the common query pattern:
+    #   SELECT ... WHERE project_id = ? ORDER BY created_at DESC LIMIT ?
+    # Used by persistence-detection to read the last N ticks for a project.
+    __table_args__ = (
+        Index(
+            "ix_olo_project_id_created_at_desc",
+            "project_id",
+            text("created_at desc"),
+        ),
+    )
+
+
+class ProjectEfficiencySnapshot(SQLModel, table=True):
+    """Time-series efficiency telemetry for a project.
+
+    Migration 0694 repairs the original one-row-per-project table from 0658
+    into the append-only shape used by project_telemetry.py.
+    """
+
+    __tablename__ = "project_efficiency_snapshot"
+
+    id: uuid.UUID = Field(
+        default_factory=uuid.uuid4,
+        sa_column=Column(GUID(), primary_key=True, nullable=False),
+    )
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    captured_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    metric_def_version: str = Field(
+        sa_column=Column(String(64), nullable=False),
+    )
+    blob: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "captured_at", name="uq_proj_efficiency_snap"
+        ),
+        Index("ix_project_efficiency_snapshot_project_id", "project_id"),
+    )
+
+
+class ProjectLaneBaseline(SQLModel, table=True):
+    """Persisted lane-baseline telemetry for a project.
+
+    Replaces design_doc["lane_baselines"] — one row per (project, version_number).
+    Migration 0681 rebuilt this table from the original one-row-per-project
+    schema to this multi-row schema so project_telemetry.py can store and
+    retrieve baselines per release version with retention pruning.
+    """
+
+    __tablename__ = "project_lane_baseline"
+
+    id: uuid.UUID = Field(
+        default_factory=uuid.uuid4,
+        sa_column=Column(GUID(), primary_key=True, nullable=False),
+    )
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    version_number: int = Field(
+        sa_column=Column(Integer(), nullable=False),
+    )
+    captured_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    baseline_def_version: str = Field(
+        sa_column=Column(String(64), nullable=False),
+    )
+    blob: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    __table_args__ = (
+        UniqueConstraint("project_id", "version_number", name="uq_proj_lane_baseline"),
+        Index("ix_project_lane_baseline_project_id", "project_id"),
+    )
+
+
+class ProjectSRAnalytics(SQLModel, table=True):
+    """Persisted self-review analytics telemetry for a project.
+
+    Replaces the sr_catch_rate_trends, fresh_reviewer_trend, edges_trend,
+    sr_reviewer_disagreements, sr_regression_risk_test_signal_trends,
+    sr_false_attestation_trends, sr_blind_spot_signal_last_computed_at,
+    viewport_coverage_snapshot, fix_loop_divergence_* keys in design_doc.
+    One row per project; the data dict holds all SR analytics keys.
+    """
+
+    __tablename__ = "project_sr_analytics"
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class ProjectTelemetry(SQLModel, table=True):
+    """Per-project telemetry blobs moved out of design_doc to reduce row contention.
+
+    Each row holds one reserved key (e.g. ``efficiency_baseline``) for a
+    project.  Writers dual-write to both design_doc and this table during the
+    transition; readers continue to use design_doc until migrated.
+    """
+
+    __tablename__ = "project_telemetry"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    key: str = Field(sa_column=Column(String(100), nullable=False))
+    value: Any = Field(sa_column=Column(JSONB, nullable=True))
+    updated_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False)
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "key", name="uq_project_telemetry_project_key"
+        ),
+        Index("ix_project_telemetry_project_id", "project_id"),
     )

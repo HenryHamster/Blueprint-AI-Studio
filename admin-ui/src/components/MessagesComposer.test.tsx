@@ -1,5 +1,5 @@
 import { afterEach, describe, test, expect, vi } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { createRef } from 'react';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
 
@@ -45,6 +45,59 @@ function renderComposer(props: Partial<React.ComponentProps<typeof MessagesCompo
   );
 }
 
+describe('MessagesComposer — live math preview', () => {
+  test('shows a math preview strip with KaTeX when the draft contains $...$ delimiters', async () => {
+    const { container } = renderComposer({ newContent: 'Energy $E = mc^2$ is famous.' });
+    const preview = screen.getByLabelText('Math preview');
+    expect(preview).toBeTruthy();
+    await waitFor(() => {
+      expect(container.querySelector('.katex')).toBeTruthy();
+    });
+  });
+
+  test('does not render a preview strip for plain text without math delimiters', () => {
+    renderComposer({ newContent: 'Hello, just a plain message.' });
+    expect(screen.queryByLabelText('Math preview')).toBeNull();
+  });
+
+  test('does not render a preview strip when the draft is empty', () => {
+    renderComposer({ newContent: '' });
+    expect(screen.queryByLabelText('Math preview')).toBeNull();
+  });
+});
+
+describe('MessagesComposer — insert equation', () => {
+  test('renders an Insert equation button in minimal chrome', () => {
+    renderComposer({ chrome: 'minimal' });
+    expect(screen.getByLabelText('Insert equation')).toBeTruthy();
+  });
+
+  test('renders an Insert equation button in full chrome', () => {
+    renderComposer({ chrome: 'full' });
+    expect(screen.getByLabelText('Insert equation')).toBeTruthy();
+  });
+
+  test('clicking insert equation calls onChangeContent with $equation$ appended', () => {
+    const onChangeContent = vi.fn();
+    renderComposer({ newContent: 'Energy: ', onChangeContent });
+    fireEvent.click(screen.getByLabelText('Insert equation'));
+    expect(onChangeContent).toHaveBeenCalledWith('Energy: $equation$');
+  });
+
+  test('inserts $equation$ at cursor position when content is empty', () => {
+    const onChangeContent = vi.fn();
+    renderComposer({ newContent: '', onChangeContent });
+    fireEvent.click(screen.getByLabelText('Insert equation'));
+    expect(onChangeContent).toHaveBeenCalledWith('$equation$');
+  });
+
+  test('insert equation button is disabled when composerDisabled', () => {
+    renderComposer({ disabledReason: 'Composer disabled', chrome: 'minimal' });
+    const btn = screen.getByLabelText('Insert equation');
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
 describe('MessagesComposer — clickable pending image preview', () => {
   test('renders an exact-revision source chip and exposes explicit removal', () => {
     const onRemoveArtifactRef = vi.fn();
@@ -55,7 +108,7 @@ describe('MessagesComposer — clickable pending image preview', () => {
       onRemoveArtifactRef,
     });
 
-    expect(screen.getByLabelText('Attached Resident sources')).toBeTruthy();
+    expect(screen.getByLabelText('Attached sources')).toBeTruthy();
     expect(screen.getByText('Notes revision 7')).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Remove Notes revision 7'));
     expect(onRemoveArtifactRef).toHaveBeenCalledWith('tool-ref-7');

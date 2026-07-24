@@ -79,6 +79,26 @@ def test_migration_apply_scratch_url_is_not_a_boot_requirement():
     }
 
 
+def test_qualification_env_and_missing_qualification_env_removed():
+    """QUALIFICATION_ENV and missing_qualification_env are cut dead symbols.
+
+    The scratch-DB-missing signal is produced independently by
+    migration_apply_gate.preflight_migration_apply_scratch() returning
+    status='absent'/code='scratch_database_url_missing'. The unread manifest
+    and its reader are removed; they must not exist in required_runtime_env.
+    """
+    import app.required_runtime_env as mod
+
+    assert not hasattr(mod, "QUALIFICATION_ENV"), (
+        "QUALIFICATION_ENV was cut as a dead unread manifest — it must not be "
+        "exported from required_runtime_env"
+    )
+    assert not hasattr(mod, "missing_qualification_env"), (
+        "missing_qualification_env() was cut as dead code with zero production "
+        "callers — it must not be exported from required_runtime_env"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # active_scopes()
 # --------------------------------------------------------------------------- #

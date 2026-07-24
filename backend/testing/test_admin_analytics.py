@@ -348,7 +348,6 @@ class TestLaneDiag:
             (101, "create", 20, 1800, "code_review"),
             (101, "review", 60, 300, None),
             (101, "fix", 80, 1200, "ci_failure"),
-            (101, "panel_review", 110, 600, None),
             (202, "review", 10, 120, None),
             (202, "create", 15, 240, "merge_conflict"),
             (303, "review", 130, 50, None),
@@ -377,7 +376,7 @@ class TestLaneDiag:
         assert resp.status_code == 200
         body = resp.json()
         assert body["project_id"] == str(project.id)
-        assert body["task_count"] == 8
+        assert body["task_count"] == 7
         assert body["pr_count"] == 3
         assert body["pr_breakdown_truncated"] is True
         assert body["relay_counts_by_lane"] == {
@@ -397,14 +396,14 @@ class TestLaneDiag:
         }
         assert lanes["conflict"]["task_count"] == 1
         assert lanes["ci"]["task_count"] == 1
-        assert lanes["arbitration"]["task_count"] == 1
+        assert lanes["arbitration"]["task_count"] == 0
 
         by_pr = {row["pr_number"]: row for row in body["per_pr_phase_breakdown"]}
         assert list(by_pr.keys()) == ["101", "202"]
-        assert by_pr["101"]["review_seconds"] == 1500.0
+        assert by_pr["101"]["review_seconds"] == 900.0
         assert by_pr["101"]["fix_seconds"] == 3000.0
-        assert by_pr["101"]["gap_seconds"] == 2700.0
-        assert by_pr["101"]["total_seconds"] == 7200.0
+        assert by_pr["101"]["gap_seconds"] == 2100.0
+        assert by_pr["101"]["total_seconds"] == 6000.0
         assert by_pr["101"]["queue_seconds"] == 0.0
         assert by_pr["101"]["provision_seconds"] == 0.0
         assert by_pr["101"]["cold_start_seconds"] == 0.0
@@ -417,41 +416,6 @@ class TestLaneDiag:
         assert by_pr["202"]["provision_seconds"] == 0.0
         assert by_pr["202"]["cold_start_seconds"] == 0.0
         assert by_pr["202"]["execution_seconds"] == 0.0
-
-    @pytest.mark.asyncio
-    async def test_lane_diag_counts_panel_review_runtime_as_active_time(
-        self, client: AsyncClient, db_session
-    ):
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-
-        base = _utcnow() - timedelta(hours=1)
-        self._add_review_loop_task(db_session, project.id, 101, "review", base, 300)
-        self._add_review_loop_task(
-            db_session,
-            project.id,
-            101,
-            "panel_review",
-            base + timedelta(minutes=10),
-            600,
-        )
-        await db_session.commit()
-
-        resp = await client.get(f"/api/admin/lane-diag?project_id={project.id}")
-
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["lane_iteration_distribution"]["arbitration"]["task_count"] == 1
-        [pr_breakdown] = body["per_pr_phase_breakdown"]
-        assert pr_breakdown["review_seconds"] == 900.0
-        assert pr_breakdown["fix_seconds"] == 0.0
-        assert pr_breakdown["gap_seconds"] == 300.0
-        assert pr_breakdown["total_seconds"] == 1200.0
-        assert pr_breakdown["queue_seconds"] == 0.0
-        assert pr_breakdown["provision_seconds"] == 0.0
-        assert pr_breakdown["cold_start_seconds"] == 0.0
-        assert pr_breakdown["execution_seconds"] == 0.0
 
     @pytest.mark.asyncio
     async def test_vm_phase_timing_breakdown_per_pr(
@@ -1064,9 +1028,9 @@ class TestLaneWasteDiag:
             pr_number=502,
             original_task_id=oid_b,
             iteration=3,
-            task_type="panel_review",
+            task_type="review",
             created_at=base + timedelta(minutes=25),
-        )  # review_ambiguity
+        )  # lost_reasoning (LANE_REVIEW_CONVERGENCE, iter>2)
         self._add_original(
             db_session, project.id, oid_b, base - timedelta(minutes=5), merged=True
         )
@@ -1081,8 +1045,8 @@ class TestLaneWasteDiag:
             "infra": 1,
             "merge_conflict": 1,
             "ci_churn": 1,
-            "review_ambiguity": 2,
-            "lost_reasoning": 2,
+            "review_ambiguity": 1,
+            "lost_reasoning": 3,
             "lost_repo_state": 1,
             "unknown": 0,
         }
@@ -1129,7 +1093,7 @@ class TestLaneWasteDiag:
         assert b_cats == {
             1: "lost_repo_state",
             2: "lost_reasoning",
-            3: "review_ambiguity",
+            3: "lost_reasoning",
         }
 
     @pytest.mark.asyncio

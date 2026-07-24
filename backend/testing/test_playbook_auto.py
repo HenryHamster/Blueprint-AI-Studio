@@ -5,9 +5,13 @@ testing/test_playbook_auto.py monolith. Behavior-preserving: test bodies
 are copied verbatim; only file boundaries and shared-helper imports change.
 """
 
+import logging
+from unittest.mock import patch
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.routers.agent_status import _check_recurring_failures
+from app.task_locking import DesignDocSizeLimitExceeded
 
 from testing._playbook_test_helpers import (
     _make_failed_task,
@@ -304,3 +308,61 @@ async def test_auto_playbook_stores_failure_module_and_references_in_content(
     assert "module" in entry["content"].lower()
 
 
+@pytest.mark.asyncio
+async def test_design_doc_size_limit_swallow_logs_warning(
+    db_session: AsyncSession, caplog: pytest.LogCaptureFixture
+):
+    """When with_design_doc_locked raises DesignDocSizeLimitExceeded,
+    _maybe_auto_playbook logs a warning and returns None (preserving the
+    degrade-gracefully behavior)."""
+    from app.playbook_learning import _maybe_auto_playbook, _extract_failure_signature
+
+    error_with_traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/auth.py", line 10, in <module>\n'
+        "ImportError: cannot import name 'oauth_client'\n"
+    )
+
+    project = await _make_project(db_session)
+    sig = _extract_failure_signature("CODE_ERROR", error_with_traceback)
+
+    # Create 2 prior FAILED tasks so the threshold (3) is met
+    t1 = await _make_failed_task(
+        db_session, project.id, status_message=error_with_traceback
+    )
+    t1.context = {"_failure_signature": sig}
+    t2 = await _make_failed_task(
+        db_session, project.id, status_message=error_with_traceback
+    )
+    t2.context = {"_failure_signature": sig}
+    await db_session.flush()
+
+    t3 = await _make_failed_task(
+        db_session, project.id, status_message=error_with_traceback
+    )
+
+    project_id = project.id
+
+    with patch(
+        "app.playbook_auto.with_design_doc_locked",
+        side_effect=DesignDocSizeLimitExceeded(
+            project_id=project_id, old_size=400_000, new_size=500_100, ceiling=500_000
+        ),
+    ):
+        with caplog.at_level(logging.WARNING, logger="app.playbook_auto"):
+            result = await _maybe_auto_playbook(
+                t3, "CODE_ERROR", error_with_traceback, db_session
+            )
+
+    # Return value unchanged (None = no entry created)
+    assert result is None, "Should return None on size cap hit"
+
+    # Warning was emitted with attributable context
+    assert any(
+        "design_doc size limit exceeded" in rec.message
+        and str(project_id) in rec.message
+        for rec in caplog.records
+    ), (
+        "Expected a logger.warning with project_id and 'design_doc size limit exceeded' "
+        f"in caplog records: {[r.message for r in caplog.records]}"
+    )

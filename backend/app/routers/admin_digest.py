@@ -13,6 +13,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import get_session, resolve_dialect_name
+from app.project_telemetry import read_telemetry_or_doc as _read_telemetry_or_doc
 from app.digest_cache import DigestCache, get_digest_cache
 from app.digest_precompute import (
     DIGEST_KIND,
@@ -182,6 +183,7 @@ from app.pipeline_health import (  # noqa: E402
     _evaluate_sr_catch_rate_targets,  # noqa: F401
     _evaluate_lone_checker_alert,  # noqa: F401
     compute_pipeline_health_summary,  # noqa: F401
+    read_project_sr_analytics,
 )
 
 
@@ -1524,17 +1526,16 @@ async def _compute_digest(
         )
         memo_ever_cited = await _strategic_cycle.ever_cited_memo(session, project_id)
         if _proj:
-            _sr_trends = (_proj.design_doc or {}).get("sr_catch_rate_trends") or {}
+            _sr_data = await read_project_sr_analytics(session, _proj)
+            _sr_trends = _sr_data.get("sr_catch_rate_trends") or {}
             if _sr_trends:
                 self_review_prediction_accuracy_trends = (
                     _serialize_sr_catch_rate_trends(_sr_trends)
                 )
-            _sr_rrts = (_proj.design_doc or {}).get(
-                "sr_regression_risk_test_signal_trends"
-            )
+            _sr_rrts = _sr_data.get("sr_regression_risk_test_signal_trends")
             if _sr_rrts:
                 sr_regression_risk_test_signal_trends = _sr_rrts
-            _sft = (_proj.design_doc or {}).get("sr_false_attestation_trends")
+            _sft = _sr_data.get("sr_false_attestation_trends")
             if _sft:
                 sr_false_attestation_trends = _sft
             # Read the newest terminal cycle from the StrategicCycle table.
@@ -1603,7 +1604,12 @@ async def _compute_digest(
             # payload key had no named reader (see retirement note above). The
             # underlying design_doc["fresh_reviewer_trend"] persistence is untouched.
             # Edges-considered cycle-over-cycle trend persisted by compute_edges_trend.
-            _et = (_proj.design_doc or {}).get("edges_trend") or {}
+            _et = (
+                await _read_telemetry_or_doc(
+                    session, _proj.id, _proj.design_doc, "edges_trend"
+                )
+                or {}
+            )
             if _et:
                 edges_trend = {
                     "computed_at": _et.get("computed_at"),
@@ -1794,7 +1800,9 @@ async def _compute_digest(
             # medians computed live, plus deltas.  Only bounded scalars are
             # stored — no per-PR row arrays or per-task chains.
             try:
-                from app.lane_baseline_snapshot import read_version_lane_baseline  # noqa: PLC0415
+                from app.lane_baseline_snapshot import (  # noqa: PLC0415
+                    read_version_lane_baseline_preferring_table,
+                )
                 from app.models import ReleaseVersion as _ReleaseVersion  # noqa: PLC0415
 
                 _latest_rv = (
@@ -1813,8 +1821,8 @@ async def _compute_digest(
                     .first()
                 )
                 if _latest_rv is not None and _digest_project is not None:
-                    _rb = read_version_lane_baseline(
-                        _digest_project, _latest_rv.version_number
+                    _rb = await read_version_lane_baseline_preferring_table(
+                        session, _digest_project, _latest_rv.version_number
                     )
                     if _rb is not None:
                         _relay_m = _rb.get("relay_medians") or {}

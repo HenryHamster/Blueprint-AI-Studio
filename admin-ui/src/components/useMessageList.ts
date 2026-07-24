@@ -80,8 +80,14 @@ export function useMessageList({
   };
 
   const { openMessages, linkedMessages, resolvedMessages, openFeedbackMessages } = useMemo(() => {
-    const open = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
-    const linked = messages.filter(m => m.status === 'linked' && (!criticalOnly || isCriticalSeverity(m)));
+    // Server-flagged needs_operator items are exempt from the criticalOnly gate: the
+    // badge already counts them, so dropping them from the list body breaks badge/list
+    // consistency. isCriticalSeverity uses local heuristics and does not consult the
+    // server attention model.
+    const isAllowed = (m: ProjectMessage) =>
+      !criticalOnly || isCriticalSeverity(m) || (needsOperatorIds?.has(m.id) ?? false);
+    const open = messages.filter(m => m.status === 'open' && isAllowed(m));
+    const linked = messages.filter(m => m.status === 'linked' && isAllowed(m));
     return {
       openMessages: open,
       linkedMessages: linked,
@@ -89,7 +95,7 @@ export function useMessageList({
       openFeedbackMessages: open.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m)),
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, criticalOnly, searchQuery]);
+  }, [messages, criticalOnly, needsOperatorIds, searchQuery]);
 
   // Count new high-signal messages (created after divider time) — for visual divider only
   const newHighSignalCount = useMemo(() => dividerTime

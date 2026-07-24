@@ -54,16 +54,15 @@ from app.shared_state import limiter
 from app.models import (
     ArtifactRef,
     ArtifactRefPromotionIntent,
-    ComputeImageBuildStatus,
     Project,
     ProjectComputeImage,
-    ProjectComputeImageBuild,
     ProjectMessageAttachmentUpload,
     ProjectTool,
     _utcnow,
 )
 from app.auth import (
     get_current_user,
+    require_admin,
     AGENT_JWT_SECRET,
     AGENT_JWT_ALGORITHM,
     TOOL_ASSET_TOKEN_SCOPE,
@@ -72,6 +71,7 @@ from app.admin_helpers import _get_user_project_with_role
 from app.task_locking import lock_project_or_429
 from app import compute_backends as _cb
 from app import compute_image_build as _cib
+from app import reaper_sweeps as _rs
 
 logger = logging.getLogger(__name__)
 
@@ -219,9 +219,6 @@ _MANIFEST_TOOL_REQUIRED = {"slug", "title", "entry"}
 _MANIFEST_TOOL_KNOWN_KEYS = {
     "slug", "title", "description", "placement", "entry",
 }
-
-# Valid placements (must match admin-ui rendering buckets).
-_VALID_PLACEMENTS = {"project_section", "toolbar", "sidebar"}
 
 # ── Skill schema (same manifest, parallel array) ─────────────────────────────
 #
@@ -399,9 +396,6 @@ def _validate_manifest_tool(entry: Dict[str, Any], index: int) -> Optional[str]:
     # Reject paths containing ".." (traversal) or starting with "/" (absolute).
     if ".." in entry_path or entry_path.startswith("/"):
         return f"tools[{index}]: entry path must be relative and must not contain '..'"
-    placement = entry.get("placement", "project_section")
-    if placement not in _VALID_PLACEMENTS:
-        return f"tools[{index}]: placement must be one of {sorted(_VALID_PLACEMENTS)}"
     # Extra unknown keys: silently ignored.
     return None
 
@@ -722,14 +716,12 @@ class _ToolCreate(BaseModel):
     slug: Optional[str] = None
     title: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
-    placement: Optional[str] = None
 
 
 class _ToolUpdate(BaseModel):
     title: Optional[str] = None
     enabled: Optional[bool] = None
     config: Optional[Dict[str, Any]] = None
-    placement: Optional[str] = None
 
 
 class _ToolContentSave(BaseModel):
@@ -914,14 +906,7 @@ async def register_project_tool(
     title = (payload.title or spec["default_title"]).strip()
     if not title:
         title = spec["default_title"]
-    placement = (payload.placement or spec["default_placement"]).strip()
-    if not placement:
-        placement = spec["default_placement"]
-    if placement not in _VALID_PLACEMENTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
-        )
+    placement = spec["default_placement"]
     config = payload.config if isinstance(payload.config, dict) else {}
     _validate_config(kind, config, spec)
 
@@ -978,7 +963,7 @@ async def update_project_tool(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Update a tool's metadata: enable/disable, rename, config/placement (owner)."""
+    """Update a tool's metadata: enable/disable, rename, config (owner)."""
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
@@ -991,16 +976,6 @@ async def update_project_tool(
         tool.title = title
     if payload.enabled is not None:
         tool.enabled = payload.enabled
-    if payload.placement is not None:
-        placement = payload.placement.strip()
-        if not placement:
-            raise HTTPException(status_code=400, detail="placement must not be empty")
-        if placement not in _VALID_PLACEMENTS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
-            )
-        tool.placement = placement
     if payload.config is not None:
         if not isinstance(payload.config, dict):
             raise HTTPException(status_code=400, detail="config must be an object")
@@ -1127,7 +1102,7 @@ async def create_project_tool_artifact_ref(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Freeze an exact Notes/Whiteboard revision for a Resident handoff."""
+    """Freeze an exact Notes/Whiteboard revision for a handoff."""
 
     del request
     await _get_user_project_with_role(
@@ -1969,19 +1944,6 @@ async def trigger_project_compute_image_build(
     ``tag``, ``built``, ``already_present``.  Surfaces build failures (ValueError /
     RuntimeError from the pipeline) as a 422 rather than a 500 traceback.
 
-    **Async build contract (200 vs 202).** When the off-orchestrator builder
-    backend is enabled (``COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED``) and a real
-    build is needed, the build is dispatched to a throwaway builder VM and this
-    returns **202 Accepted** with ``{status, build_id, builder_vm_id, dep_hash,
-    async: true, adopted}`` plus the legacy fields as unresolved placeholders
-    (``pinned_ref``/``digest`` null, ``built`` false). The build is finalized
-    asynchronously by the reaper poll sweep; poll
-    ``GET .../compute-image/status`` (which surfaces in-flight builds under
-    ``active_builds``) to observe completion. An already-present image and a
-    ``dry_run`` request still complete inline and return **200** with the
-    persisted fields. When the backend flag is off the whole build runs inline
-    and always returns 200 (the pre-existing behavior).
-
     **Requires OWNER role.** A build runs docker on the orchestrator host and
     pushes to the shared compute-image registry — a privileged, expensive,
     host-affecting operation, not the member-grade read/save that the rest of
@@ -2105,37 +2067,6 @@ async def trigger_project_compute_image_build(
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # ASYNC CONTRACT: when the off-orchestrator builder backend is enabled and a
-    # real build is needed, the build was handed to a throwaway builder VM and is
-    # NOT finished — the reaper poll sweep finalizes the ProjectComputeImage pin.
-    # Return 202 with the tracking id instead of the synchronous build record.
-    # An already-present image or a ``dry_run`` request still completes inline and
-    # returns 200 with the persisted fields below, so existing callers that expect
-    # a synchronous result keep working for those cases; a caller that triggers a
-    # real async build MUST handle 202 (the ``async`` flag marks it).
-    if isinstance(result, _cb.AsyncImageBuildDispatch):
-        return Response(
-            content=_json.dumps(
-                {
-                    "status": result.status,
-                    "build_id": str(result.build_id),
-                    "builder_vm_id": result.builder_vm_id,
-                    "dep_hash": result.dep_hash,
-                    "async": True,
-                    "adopted": result.adopted,
-                    # Backward-compat fields the admin-ui already reads — present
-                    # but unresolved because the build has not completed yet.
-                    "pinned_ref": None,
-                    "digest": None,
-                    "tag": result.dep_hash,
-                    "built": False,
-                    "already_present": False,
-                }
-            ),
-            media_type="application/json",
-            status_code=202,
-        )
-
     result = await _preserve_existing_digest_pin(session, project.id, result)
 
     row = await _cb.record_project_compute_image_build(
@@ -2168,54 +2099,6 @@ async def trigger_project_compute_image_build(
 # (identical to the build path's hash computation) to detect staleness.
 
 
-async def _list_active_image_builds(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    registry_repo: str,
-    image_name: str,
-) -> list[Dict[str, Any]]:
-    """Serialize in-flight (PENDING/BUILDING) off-orchestrator builds for an image.
-
-    Returns the async-build tracking rows the reaper poll sweep has not yet
-    finalized, newest first, so the status endpoint can surface a dispatched
-    build before its ``ProjectComputeImage`` pin exists. Empty list when the
-    async builder lane is unused (the common case today).
-    """
-    rows = (
-        (
-            await session.execute(
-                select(ProjectComputeImageBuild)
-                .where(
-                    ProjectComputeImageBuild.project_id == project_id,
-                    ProjectComputeImageBuild.registry_repo == registry_repo,
-                    ProjectComputeImageBuild.image_name == image_name,
-                    ProjectComputeImageBuild.status.in_(
-                        [
-                            ComputeImageBuildStatus.PENDING,
-                            ComputeImageBuildStatus.BUILDING,
-                        ]
-                    ),
-                )
-                .order_by(ProjectComputeImageBuild.created_at.desc())
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return [
-        {
-            "build_id": str(b.id),
-            "status": b.status.value if hasattr(b.status, "value") else str(b.status),
-            "dep_hash": b.dep_hash,
-            "builder_vm_id": b.builder_vm_id,
-            "started_at": b.started_at.isoformat() if b.started_at else None,
-            "deadline_at": b.deadline_at.isoformat() if b.deadline_at else None,
-            "created_at": b.created_at.isoformat() if b.created_at else None,
-        }
-        for b in rows
-    ]
-
-
 @router.get("/projects/{project_id}/compute-image/status")
 async def get_project_compute_image_status(
     project_id: uuid.UUID,
@@ -2242,13 +2125,6 @@ async def get_project_compute_image_status(
     when the project does not declare a compute image it reports
     ``no_compute_image_declared`` — both as clean status values, not errors.
 
-    ``active_builds`` (present on ``built`` and ``never_built`` responses) lists
-    any in-flight off-orchestrator builds (PENDING/BUILDING
-    ``ProjectComputeImageBuild`` rows) the reaper poll sweep has not yet
-    finalized — this is how a caller polls an async build dispatched by the
-    trigger endpoint's 202 path. It is an empty list when no async build is in
-    flight (the common case today).
-
     The optional ``?check_drift=true`` param adds a ``drift`` object to the
     response, computed by cloning the project repo and running the same
     dependency-hash computation as the build pipeline (``dry_run=True``).  The
@@ -2268,14 +2144,6 @@ async def get_project_compute_image_status(
     name = compute_image.get("name", "")
     registry_repo, image_name, _ = _cb._split_image_ref(name)
 
-    # In-flight off-orchestrator builds (PENDING/BUILDING) for this exact image,
-    # surfaced alongside the durable ProjectComputeImage record so an operator can
-    # see an async build that has been dispatched but not yet finalized. Additive:
-    # the existing ``status`` values are unchanged.
-    active_builds = await _list_active_image_builds(
-        session, project_id, registry_repo, image_name
-    )
-
     # Query the latest ProjectComputeImage row matching this project/image.
     row = (
         await session.execute(
@@ -2291,7 +2159,11 @@ async def get_project_compute_image_status(
     ).scalar_one_or_none()
 
     if row is None:
-        return {"status": "never_built", "active_builds": active_builds}
+        return {"status": "never_built"}
+
+    build_age_hours: float | None = None
+    if row.updated_at:
+        build_age_hours = (_utcnow() - row.updated_at).total_seconds() / 3600.0
 
     result: Dict[str, Any] = {
         "status": "built",
@@ -2303,7 +2175,7 @@ async def get_project_compute_image_status(
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         "is_digest_pinned": row.digest is not None,
-        "active_builds": active_builds,
+        "build_age_hours": build_age_hours,
     }
 
     if check_drift:
@@ -2408,3 +2280,30 @@ async def _compute_build_drift(
         "current_dep_hash": current_hash,
         "stored_dep_hash": stored_row.dep_hash,
     }
+
+
+@router.get("/compute-image-registry/readiness")
+async def get_compute_image_registry_readiness(
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Return the GC-guard sweep's readiness signal for the compute-image registry.
+
+    The compute-image Artifact Registry has ``cleanup_policy_dry_run=true``,
+    meaning image storage grows unbounded until the operator can confirm the
+    ``inuse-`` protection-tag guard sweep is working reliably.  This endpoint
+    surfaces the machine-readable evidence accumulated since process start so
+    the operator can make the ``dry_run=false`` flip with confidence, without
+    resorting to log inspection.
+
+    Response fields mirror ``reaper_sweeps.get_compute_image_gc_guard_readiness``:
+      - **ready** (bool) — ``True`` when at least one sweep run completed with
+        protected digests and zero apply failures on the last execution.
+      - **total_runs** (int) — number of actual sweep executions since start.
+      - **consecutive_healthy_cycles** (int) — consecutive runs with zero failures.
+      - **first_run_at** / **last_run_at** — ISO-format timestamps (null before
+        first run).
+      - **last_sweep** — per-run snapshot ``{applied, pruned, apply_failed}``
+        from the most recent execution (null before first run).
+      - **cumulative** — running totals ``{applied, pruned, apply_failed}``.
+    """
+    return _rs.get_compute_image_gc_guard_readiness()

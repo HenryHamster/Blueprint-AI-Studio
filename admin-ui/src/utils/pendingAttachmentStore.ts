@@ -15,7 +15,7 @@ interface PendingAttachmentRecord extends StoredPendingAttachment {
   cleanup_requested?: boolean;
 }
 
-const DB_NAME = 'blueprint-resident-composer';
+const DB_NAME = 'blueprint-composer';
 const STORE_NAME = 'pending-attachments';
 const DB_VERSION = 1;
 const memoryFallback = new Map<string, PendingAttachmentRecord>();

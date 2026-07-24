@@ -452,23 +452,6 @@ Verify code is production-ready before release.
 
 ---
 
-## Panel Review Handler
-
-### `handlePanelReview` (panel-review.ts)
-
-**Task type:** `panel_review`
-
-Runs a fixed multi-lens review workflow over a PR. Each lens (correctness, security, performance, maintainability, test coverage) is evaluated independently, and the results are merged into a single structured `PANEL_REVIEW` verdict artifact.
-
-**Workflow:**
-1. Clone repo to the PR head branch
-2. Build the diff context and review checklist
-3. Run Claude Code with a lens-specific system prompt for each activated lens
-4. Merge lens verdicts into the structured output
-5. Persist `PANEL_REVIEW` artifact
-
----
-
 ## Verify Tests Handler
 
 ### `handleVerifyTests` (verify-tests.ts)
@@ -733,7 +716,6 @@ const dispatchResearch: Handler = (taskId, payload, task, ghToken, owner, repo, 
 export const handlers: Record<AgentTaskType, Handler> = {
   create: handleCreate,
   review: handleReview,
-  panel_review: handlePanelReview,
   fix: handleFix,
   verify_tests: handleVerifyTests,
   plan: handlePlan,
@@ -774,7 +756,6 @@ To add a new task type:
 Each handler has a corresponding test file:
 - `standard.test.ts` — Tests for create, refactor, docs, deps, qa
 - `review-fix.test.ts` — Tests for review, fix
-- `panel-review.test.ts` — Tests for panel_review
 - `research-plan.test.ts` — Tests for research, plan
 - `specialized.test.ts` — Tests for security_audit, migrate, etc.
 - `memo.test.ts` — Tests for memo

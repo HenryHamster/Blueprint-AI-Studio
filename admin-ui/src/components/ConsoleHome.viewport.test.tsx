@@ -58,6 +58,7 @@ const TASKS: Task[] = [
   {
     id: 'task-1',
     title: 'feat: add mobile-responsive layout for operator panels across all screen sizes',
+    description: '',
     status: 'IN_PROGRESS',
     created_by: 'agent',
     requires_approval: false,
@@ -67,6 +68,7 @@ const TASKS: Task[] = [
   {
     id: 'task-2',
     title: 'fix: viewport overflow in kanban card when title exceeds two lines',
+    description: '',
     status: 'QUEUED',
     created_by: 'agent',
     requires_approval: false,

@@ -188,7 +188,7 @@ let githubRefreshGeneration = 0;
  *      helper that serves it, keeping the persisted origin URL clean
  *      (https://github.com/owner/repo.git) so the installation token is never
  *      written into .git/config nor exposed in the git process argv.  Reuses
- *      git-credential.ts — the same mechanism the strategic resident installs
+ *      git-credential.ts — the same mechanism the strategic session installs
  *      at role start — rather than embedding the token in the URL.  A stale
  *      credential file causes ``git push`` (and any GitHub git operation
  *      through the credential helper) to fail once the 60-minute installation
@@ -237,7 +237,7 @@ export function scheduleGithubTokenRefresh(
             // (re)configure the credential helper that reads it, leaving the
             // origin URL clean. Git then fetches fresh credentials from the
             // helper on every network call. Reuses the same mechanism the
-            // strategic resident installs (git-credential.ts) instead of
+            // strategic session installs (git-credential.ts) instead of
             // inventing a divergent one. Best-effort: a failure here just
             // leaves the previously-configured auth in place.
             // Always runs — even for read-style tasks — because a stale

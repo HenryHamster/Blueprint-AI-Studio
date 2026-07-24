@@ -1,10 +1,12 @@
 import { memo, useRef, useState, type RefObject } from 'react';
-import { Command, X, Send, Reply, Paperclip, FileText, Image } from 'lucide-react';
+import { Command, X, Send, Reply, Paperclip, FileText, Image, Sigma } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 import { AttachmentPreviewModal } from './AttachmentPreviewModal';
+import { MarkdownContent } from './MarkdownContent';
+import { hasMathDelimiters } from '../utils/mathContent';
 import type { MessageAttachment } from '../types/messages';
 import { MESSAGE_CONTENT_MAX } from '../api';
 
@@ -149,7 +151,7 @@ export const MessagesComposer = memo(function MessagesComposer({
     : sendState === 'needs_retry'
       ? 'Send not confirmed. Retry will first check whether it was accepted.'
       : sendState === 'waiting'
-        ? (wakeupState === 'paused' ? 'Message accepted. Resident is paused.' : 'Message accepted. Resident is waiting for capacity.')
+        ? (wakeupState === 'paused' ? 'Message accepted. Autonomy is paused.' : 'Message accepted. Waiting for capacity.')
         : sendState === 'accepted'
           ? 'Message accepted.'
           : null;
@@ -162,6 +164,9 @@ export const MessagesComposer = memo(function MessagesComposer({
     }),
   ];
   const hasAttachments = (pendingAttachments?.length ?? 0) > 0 || retainedAttachmentCount > 0;
+
+  // Show a live draft preview when the content contains math delimiters.
+  const hasMathInDraft = newContent.length > 0 && hasMathDelimiters(newContent);
 
   // The pending attachment whose full-size preview is open (if any). If it was
   // removed while open, this resolves to undefined and the modal unmounts.
@@ -240,6 +245,20 @@ export const MessagesComposer = memo(function MessagesComposer({
   const attHasPreview = (att: PendingAttachment): string | null =>
     att.previewUrl;
 
+  function insertEquation() {
+    const el = textareaRef.current;
+    if (!el || composerDisabled || editingLocked) return;
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    const placeholder = 'equation';
+    const newText = `${newContent.slice(0, start)}$${placeholder}$${newContent.slice(end)}`;
+    onChangeContent(newText);
+    requestAnimationFrame(() => {
+      if (!textareaRef.current) return;
+      textareaRef.current.focus();
+      textareaRef.current.setSelectionRange(start + 1, start + 1 + placeholder.length);
+    });
+  }
 
   return (
     <div className={minimal
@@ -368,7 +387,7 @@ export const MessagesComposer = memo(function MessagesComposer({
       )}
 
       {displayedSourceRefs.length > 0 && (
-        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`} aria-label="Attached Resident sources" role="list">
+        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`} aria-label="Attached sources" role="list">
           {displayedSourceRefs.map((ref, index) => {
             const identity = String(ref.artifact_ref_id || ref.id || `source-${index}`);
             const fallbackKind = ref.kind ? ref.kind.replace(/_/g, ' ') : 'Source';
@@ -392,6 +411,15 @@ export const MessagesComposer = memo(function MessagesComposer({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {hasMathInDraft && (
+        <div
+          aria-label="Math preview"
+          className={`${minimal ? minimalColumnClass : ''} mb-1.5 max-h-28 overflow-y-auto rounded border border-neutral-800/60 bg-neutral-900/40 px-3 py-2 text-sm`}
+        >
+          <MarkdownContent content={newContent} />
         </div>
       )}
 
@@ -431,6 +459,16 @@ export const MessagesComposer = memo(function MessagesComposer({
             >
               <Paperclip className="h-3.5 w-3.5" />
             </button>
+            <button
+              type="button"
+              onClick={insertEquation}
+              disabled={composerDisabled || Boolean(editingLocked)}
+              title="Insert equation"
+              aria-label="Insert equation"
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40"
+            >
+              <Sigma className="h-3.5 w-3.5" />
+            </button>
           </>
         )}
         {!minimal && (
@@ -443,6 +481,18 @@ export const MessagesComposer = memo(function MessagesComposer({
             className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
           >
             <Paperclip className="w-4 h-4" />
+          </button>
+        )}
+        {!minimal && (
+          <button
+            type="button"
+            onClick={insertEquation}
+            disabled={composerDisabled || Boolean(editingLocked)}
+            title="Insert equation"
+            aria-label="Insert equation"
+            className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
+          >
+            <Sigma className="w-4 h-4" />
           </button>
         )}
         <div className="relative flex-1">

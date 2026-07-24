@@ -537,12 +537,10 @@ class TestSuccessRateSelection:
 class TestBalancedSuccessRateSelection:
     """Covers four scenarios for balanced-mode dispatch with 7d success rate.
 
-    Tests 1, 3, 4 exercise current (stable) behaviour — load balancing and
-    probing semantics — and must pass both before and after the sibling
-    cluster-1/2 change.  Test 2 is marked xfail(strict=False): it checks the
-    new success-rate tiebreak that cluster 1/2 adds to
-    select_max_plan_account_balanced; it will auto-promote to XPASS once that
-    change merges.
+    All four tests exercise stable behaviour: load balancing, probing
+    semantics, and the success-rate soft-bias/tiebreak that is already
+    implemented in select_max_plan_account_balanced.  No xfail marker is
+    needed — the success-rate logic is live in max_plan_pool.py.
     """
 
     @pytest.mark.asyncio
@@ -593,14 +591,11 @@ class TestBalancedSuccessRateSelection:
                 _account_by_id.pop(high_success_id, None)
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        strict=False, reason="Balanced success-rate tiebreak added by cluster 1/2"
-    )
     async def test_equal_load_high_sample_high_success_wins(self):
         """Among healthy candidates with equal active_tasks, the account with a
         materially higher 7d success rate should be selected over one with a low
-        rate.  Ids are assigned so that the low-success account would win the
-        current alphabetic tiebreak — the xfail verifies the new behaviour."""
+        rate.  Ids are assigned so that the low-success account would win a
+        pure alphabetic tiebreak — this verifies the success-rate sort key."""
         user_id = f"u-{uuid.uuid4().hex}"
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         # "aaa-..." sorts before "zzz-..." so current code picks low_success.

@@ -355,14 +355,14 @@ async def _redrive_infra_failure_qualification(
 
     The attempt cap keys on the PERSISTED ``last_qualification["consecutive_infra_errors"]``
     streak that the finalize path (``_handle_infra_failure``) maintains — a
-    per-infra-failure-episode counter that resets to 0 when the candidate SHA
-    changes or a non-infra verdict lands — NOT the lifetime ``qualification_attempts``
-    column (which would silently block re-drives for long-lived versions) and NOT
-    the synchronous ``run_qualification`` return value (which never reports
-    ``infra_failure``: that verdict is only ever written asynchronously at finalize,
-    when the qualifier children terminate).  Because the streak is SHA-scoped, a
-    candidate whose HEAD keeps advancing is never blocked (each new SHA resets the
-    streak to 0); the cap trips only when the SAME candidate fails infra repeatedly.
+    counter that resets to 0 only when a non-infra verdict lands — NOT the
+    lifetime ``qualification_attempts`` column (which would silently block
+    re-drives for long-lived versions) and NOT the synchronous
+    ``run_qualification`` return value (which never reports ``infra_failure``:
+    that verdict is only ever written asynchronously at finalize, when the
+    qualifier children terminate).  The streak accumulates across advancing
+    candidate SHAs so that repeated cancellations on a moving automain still
+    trip the cap and fire an operator Alert.
 
     Commit behavior: COMMIT on every outcome (same as ``_redrive_error_qualification``).
     ``run_qualification`` writes a new ``last_qualification`` on every path it takes,
@@ -400,8 +400,9 @@ async def _redrive_infra_failure_qualification(
         # failing dimension is absent or the ledger read fails (preserving
         # pre-Phase-1b behaviour in those edge cases).
         _failing_dim = qual.get("failing_dimension")
-        _dim_streak: int | None = None
-        if _failing_dim:
+        _legacy_smoke_failure = release_qualifier._legacy_smoke_infra_lineage(qual)
+        _dim_streak: int | None = 0 if _legacy_smoke_failure else None
+        if _failing_dim and not _legacy_smoke_failure:
             try:
                 from app.models import QualificationDimensionResult
 
@@ -428,6 +429,18 @@ async def _redrive_infra_failure_qualification(
             if _dim_streak is not None
             else int(qual.get("consecutive_infra_errors") or 0)
         )
+        # Unconditional deadlock backstop for legacy-smoke lineage.
+        # _legacy_smoke_infra_lineage zeroes effective_streak (via _dim_streak=0
+        # above), so consecutive_infra_errors never accumulates and the cap below
+        # never fires for smoke-lineage failures.  When retry_episode has reached
+        # the declared cap, forcibly override effective_streak so the existing
+        # Alert + halt path fires and the operator is notified.  Guard on
+        # _episode_cap > 0 so versions with no declared cap are not affected.
+        if _legacy_smoke_failure:
+            _episode = int(qual.get("retry_episode") or 0)
+            _episode_cap = int(qual.get("retry_episode_cap") or 0)
+            if _episode_cap > 0 and _episode >= _episode_cap:
+                effective_streak = _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
         if effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
             # Raise an operator Alert (once) so the cap is visible.  Guard
             # against duplicate alerts with a flag on last_qualification.
@@ -455,6 +468,7 @@ async def _redrive_infra_failure_qualification(
                         f"{_last_error}) — autonomous re-qualification halted. "
                         f"Human review required."
                     ),
+                    event_type="release.qualification_crash_loop",
                 )
                 redrive_session.add(alert)
                 version.last_qualification = {
@@ -488,14 +502,15 @@ async def _redrive_infra_failure_qualification(
             if isinstance(row, dict)
         ]
         _same_sig_streak = 0
-        for _entry in reversed(_attempt_history):
-            if (
-                _entry.get("signature") == _cur_sig
-                and _entry.get("engine_sha") == _cur_eng
-            ):
-                _same_sig_streak += 1
-            else:
-                break
+        if not _legacy_smoke_failure:
+            for _entry in reversed(_attempt_history):
+                if (
+                    _entry.get("signature") == _cur_sig
+                    and _entry.get("engine_sha") == _cur_eng
+                ):
+                    _same_sig_streak += 1
+                else:
+                    break
         _required_wait = _infra_backoff_seconds(_same_sig_streak)
         if _required_wait > 0:
             _finalized_at_str = qual.get("finalized_at")
@@ -779,6 +794,7 @@ async def _redrive_promotion_failed_qualification(
                         f"autonomous re-qualification halted. Human review "
                         f"required before next promote attempt."
                     ),
+                    event_type="release.promotion_deploy_failed",
                 )
                 redrive_session.add(alert)
                 version.last_qualification = {
@@ -874,6 +890,7 @@ async def _redrive_promotion_failed_qualification(
                                 + " Harvest remediation spawning."
                             ),
                             dedupe_key=dedupe_key,
+                            event_type="release.ci_unresolved",
                         )
                     )
                     # Snapshot plain scalars before commit to avoid MissingGreenlet
@@ -888,6 +905,20 @@ async def _redrive_promotion_failed_qualification(
                             promotion_ci_selfheal_enabled,
                         )
                         _intbranch, _ = release_qualifier._lts_branch_names(project)
+                        from app.project_telemetry import (
+                            read_telemetry_or_doc,
+                        )
+
+                        _redrive_ar_config = (
+                            await read_telemetry_or_doc(
+                                redrive_session,
+                                _proj_id,
+                                project.design_doc,
+                                "_auto_remediation",
+                                {},
+                            )
+                            or {}
+                        )
                         _harvest_kw = dict(
                             project_id=_proj_id,
                             version_id=_ver_id,
@@ -896,9 +927,7 @@ async def _redrive_promotion_failed_qualification(
                             repo=project.github_repo or "",
                             ci_source_sha=head_sha,
                             integration_branch=_intbranch,
-                            auto_remediation_config=(
-                                (project.design_doc or {}).get("_auto_remediation") or {}
-                            ),
+                            auto_remediation_config=_redrive_ar_config,
                             selfheal_enabled=promotion_ci_selfheal_enabled(project),
                         )
                     await redrive_session.commit()

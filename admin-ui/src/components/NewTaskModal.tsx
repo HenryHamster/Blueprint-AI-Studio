@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes, Cpu } from 'lucide-react';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes, Cpu } from 'lucide-react';
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
@@ -12,7 +12,6 @@ const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   plan: GitFork,
   research: Microscope,
   review: CheckCircle,
-  panel_review: CheckSquare,
   fix: AlertCircle,
   migrate: ArrowUpDown,
   compute_experiment: Cpu,
@@ -304,7 +303,7 @@ export function NewTaskModal({
     setSubmitAttempted(true);
     if (repoError || branchError) return;
     if (!taskBranchDefaultsReady) return;
-    if ((newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
+    if ((newTaskType === 'review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
       setPrNumberError(true);
       prNumberRef.current?.focus();
       return;
@@ -452,7 +451,7 @@ export function NewTaskModal({
               })}
             </div>
           </div>
-          <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
+          <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>
@@ -966,11 +965,11 @@ export function NewTaskModal({
           )}
           <div className="mb-4">
             <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
-              Task Title{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional)</span>}
+              Task Title
             </label>
             <input
               type="text"
-              required={newTaskType !== 'panel_review' && !isComputeExperiment}
+              required={!isComputeExperiment}
               autoFocus
               value={newTaskTitle}
               onChange={e => setNewTaskTitle(e.target.value)}
@@ -980,11 +979,11 @@ export function NewTaskModal({
           </div>
           <div className="mb-6">
             <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
-              Prompt / Instructions{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional — fixed workflow)</span>}
+              Prompt / Instructions
             </label>
             <div className="relative">
               <textarea
-                required={newTaskType !== 'panel_review' && !isComputeExperiment}
+                required={!isComputeExperiment}
                 value={newTaskPrompt}
                 onChange={e => setNewTaskPrompt(e.target.value)}
                 className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"

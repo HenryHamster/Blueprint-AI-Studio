@@ -54,7 +54,7 @@ export interface StrategicCycleCompletion {
   strategic_judgment_challenge?: StrategicChallengeSummary;
 }
 
-/** One resident-session transcript delta, from a `strategic_session` event. */
+/** One strategic-session transcript delta, from a `strategic_session` event. */
 export interface StrategicSessionDelta {
   /** Local monotonic id for stable React keys (the wire has no unique id). */
   id: number;
@@ -72,7 +72,7 @@ export interface StrategicSessionDelta {
 let _trackLogIdCounter = 0;
 let _sessionDeltaIdCounter = 0;
 
-// Cap the live session transcript so a long-running resident session can't grow
+// Cap the live session transcript so a long-running strategic session can't grow
 // it without bound; keep the most recent tail when the cap is hit.
 const SESSION_TRANSCRIPT_CAP = 2000;
 const SESSION_TRANSCRIPT_KEEP = 1500;
@@ -159,7 +159,7 @@ export function useLogViewer({
   const [cycleProgress, setCycleProgress] = useState<StrategicCycleProgress | null>(null);
   // Outcome receipt from the most recently completed cycle (null until first completion).
   const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
-  // Live resident-session transcript buffer, appended from strategic_session events.
+  // Live strategic-session transcript buffer, appended from strategic_session events.
   const [strategicSessionTranscript, setStrategicSessionTranscript] = useState<StrategicSessionDelta[]>([]);
   const gatedTypesRefreshSeqRef = useRef(0);
   const [ceilingDeferredProjectIds, setCeilingDeferredProjectIds] = useState<Set<string>>(new Set());
@@ -236,7 +236,7 @@ export function useLogViewer({
     setCycleProgress(null);
     setLastCycleCompletion(null);
     // The transcript is a per-project live buffer; a fresh project starts empty
-    // and the resident session re-streams its own strategic_session deltas.
+    // and the strategic session re-streams its own strategic_session deltas.
     setStrategicSessionTranscript([]);
     // Per-type gate state is global, but clear on project switch so stale gates
     // from a previous project don't bleed onto the newly-selected project's view.
@@ -517,8 +517,16 @@ export function useLogViewer({
         const canonicalRefetchRequired = msg.data?.canonical_refetch_required === true
           || msg.data?.message?.projection_truncated === true
           || msg.data?.message?.context?.projection_truncated === true;
-        if (canonicalMessage) refreshMessagesRef?.current?.(canonicalMessage, canonicalRefetchRequired);
-        else refreshMessages();
+        if (canonicalMessage) {
+          refreshMessagesRef?.current?.(canonicalMessage, canonicalRefetchRequired);
+          // Acknowledge delivery so the backend stamps delivered_at.
+          // Without this, the recovery-on-reconnect path re-sends every
+          // undelivered message from the last 10 minutes, and the liveness
+          // audit reports permanent false-positive undelivered gaps.
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: 'message_ack', message_id: canonicalMessage.id }));
+          }
+        } else refreshMessages();
       }
       if (projectEventApplies && (
         msg.event === 'alert_created'
@@ -539,7 +547,7 @@ export function useLogViewer({
       if (!projectEventApplies) {
         return;
       }
-      // Resident-session live transcript — mirror the agent_log append: each
+      // Strategic-session live transcript — mirror the agent_log append: each
       // strategic_session event carries one coarsened delta whose text we push
       // onto the transcript buffer the hook exposes. Deltas are already
       // secret-sanitized + length-bounded server-side (strategic_events.py).
@@ -885,7 +893,7 @@ export function useLogViewer({
     strategistActive,
     cycleProgress,
     lastCycleCompletion,
-    // Resident-session live transcript (appended from strategic_session events).
+    // Strategic-session live transcript (appended from strategic_session events).
     strategicSessionTranscript,
     clearStrategicSessionTranscript: () => setStrategicSessionTranscript([]),
     // Tracking

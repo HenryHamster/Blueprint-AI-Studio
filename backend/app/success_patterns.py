@@ -22,6 +22,8 @@ from app.models import (
     _utcnow,
 )
 from app.playbook_storage import maybe_archive_for_capacity
+from app.project_telemetry import get_project_telemetry, set_project_telemetry, strip_migrated_doc_keys
+from app.task_capabilities import ALL_TASK_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,29 @@ logger = logging.getLogger(__name__)
 # Task types where surfacing 'recent successes' patterns at spawn time is useful.
 # Other types (review, plan, qa, audit, etc.) treat this signal as noise.
 RECENT_SUCCESSES_TASK_TYPES: frozenset[str] = frozenset({"create", "fix", "research"})
+
+
+def _purge_retired_success_entries(doc: dict) -> int:
+    """Remove playbook/success-* entries whose task type is no longer in the live registry.
+
+    Entries are keyed as ``playbook/success-{task_type}-{scope_slug}``.  When a
+    task type is retired (removed from ``ALL_TASK_TYPES``), its entries become
+    orphans that would otherwise persist forever.  Returns the count removed.
+    """
+    prefix = "playbook/success-"
+    to_remove = []
+    for key in list(doc):
+        if not key.startswith(prefix):
+            continue
+        rest = key[len(prefix):]
+        # The first "-" separates task_type from scope_slug.
+        hyphen_idx = rest.find("-")
+        task_type_part = rest[:hyphen_idx] if hyphen_idx >= 0 else rest
+        if task_type_part not in ALL_TASK_TYPES:
+            to_remove.append(key)
+    for key in to_remove:
+        del doc[key]
+    return len(to_remove)
 
 
 async def capture_success_pattern(
@@ -51,6 +76,14 @@ async def capture_success_pattern(
     """
     task_type = task.first_payload.get("type", "")
     if not task_type:
+        return None
+
+    if task_type not in ALL_TASK_TYPES:
+        logger.debug(
+            "[SUCCESS_PLAYBOOK] project=%s type=%s: not in live task-type registry — skipping",
+            task.project_id,
+            task_type,
+        )
         return None
 
     scope: str = (task.context or {}).get("scope") or "unspecified"
@@ -114,6 +147,13 @@ async def capture_success_pattern(
 
     doc = dict(project.design_doc or {})
 
+    # Hydrate archive from project_telemetry (with design_doc fallback) so
+    # capacity-eviction appends to the real archive, not an empty in-memory copy.
+    existing_archive = await get_project_telemetry(
+        session, task.project_id, "playbook_archive", design_doc_fallback=doc
+    )
+    doc["playbook_archive"] = list(existing_archive or [])
+
     # One entry per (task_type, scope) pair.
     scope_slug = scope.lower().replace(" ", "-")
     key = f"success-{task_type}-{scope_slug}"
@@ -172,15 +212,26 @@ async def capture_success_pattern(
         doc[playbook_full_key] = new_entry
         action = "created"
 
+    purged = _purge_retired_success_entries(doc)
+    if purged:
+        logger.info(
+            "[SUCCESS_PLAYBOOK] project=%s purged %d orphan entry(ies) for retired task type(s)",
+            task.project_id,
+            purged,
+        )
+
     meta = dict(doc.get("_meta", {"revision": 0}))
     meta["revision"] = meta.get("revision", 0) + 1
     meta["last_updated"] = _utcnow().isoformat()
     meta["updated_by"] = "success-playbook"
     doc["_meta"] = meta
 
+    updated_archive = list(doc.get("playbook_archive") or [])
+    strip_migrated_doc_keys(doc)
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)
+    await set_project_telemetry(session, task.project_id, "playbook_archive", updated_archive)
 
     logger.info(
         "[SUCCESS_PLAYBOOK] project=%s %s entry '%s' for task_type=%s scope=%s",
@@ -288,6 +339,7 @@ def summarize_recent_successes(
 
 __all__ = [
     "RECENT_SUCCESSES_TASK_TYPES",
+    "_purge_retired_success_entries",
     "capture_success_pattern",
     "summarize_recent_successes",
 ]

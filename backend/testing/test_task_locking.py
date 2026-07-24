@@ -20,6 +20,7 @@ from sqlmodel import select
 from app.models import Project, ProjectMember, Task, TaskStatus
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
+    DesignDocSizeLimitExceeded,
     acquire_pr_spawn_lock,
     lock_project_or_429,
     project_lock,
@@ -1022,6 +1023,51 @@ async def test_with_vision_locked_applies_mutation(db_session):
     assert project.vision == {"existing": "kept", "added": "yes"}
 
 
+@pytest.mark.asyncio
+async def test_with_vision_locked_reuses_caller_owned_project_lock(db_session):
+    project = Project(name="vision-reentrant-lock", user_id="user")
+    project.vision = {"existing": "kept"}
+    db_session.add(project)
+    await db_session.commit()
+
+    async with project_lock(
+        db_session, project.id, skip_locked=False
+    ) as locked_project:
+        assert locked_project is not None
+        applied = await with_vision_locked(
+            db_session,
+            project.id,
+            lambda vision: vision.update({"resident": "active"}),
+            _locked_project=locked_project,
+        )
+        assert applied is True
+
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert project.vision == {"existing": "kept", "resident": "active"}
+
+
+@pytest.mark.asyncio
+async def test_with_vision_locked_rejects_mismatched_owned_project(db_session):
+    first = Project(name="vision-reentrant-first", user_id="user")
+    second = Project(name="vision-reentrant-second", user_id="user")
+    db_session.add(first)
+    db_session.add(second)
+    await db_session.commit()
+
+    async with project_lock(
+        db_session, first.id, skip_locked=False
+    ) as locked_project:
+        assert locked_project is not None
+        with pytest.raises(ValueError, match="does not match project_id"):
+            await with_vision_locked(
+                db_session,
+                second.id,
+                lambda vision: vision.update({"wrong": True}),
+                _locked_project=locked_project,
+            )
+
+
 @pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
 @pytest.mark.asyncio
 async def test_concurrent_research_outcomes_preserve_both_directions(db_session):
@@ -1212,8 +1258,8 @@ async def test_with_task_context_locked_preserves_disjoint_keys(db_session):
     """with_task_context_locked must atomically apply the mutate_fn and PRESERVE
     pre-existing keys owned by another writer — the lost-update property.
 
-    Regression for finding 8ff6c48f: the resident-session heartbeat mirror
-    (``renew_resident_session_lease``) writes ``_exam_ledger`` / ``message_cursor``
+    Regression for finding 8ff6c48f: a heartbeat mirror writes
+    ``_exam_ledger`` / ``message_cursor``
     into ``task.context`` while the strategic-API paths in admin_agent_ops.py
     write ``_strategic_api_called`` — each via a whole-column overwrite. Loading
     the context INSIDE the FOR UPDATE lock and merging must keep the other
@@ -1226,7 +1272,7 @@ async def test_with_task_context_locked_preserves_disjoint_keys(db_session):
     # Simulate a strategic-API write already present on the row.
     task = Task(
         project_id=project.id,
-        title="resident session task",
+        title="context lock task",
         status=TaskStatus.IN_PROGRESS,
         context={"_strategic_api_called": True},
     )
@@ -1271,7 +1317,7 @@ async def test_with_task_context_locked_serializes_concurrent_writers(db_session
     """Two concurrent callers writing disjoint keys via with_task_context_locked
     must both survive — the second must see the first's committed write.
 
-    This is the exact race in finding 8ff6c48f: the heartbeat ledger mirror
+    This is the exact race in finding 8ff6c48f: a heartbeat ledger mirror
     (``_exam_ledger``) and a strategic-API write (``_strategic_api_called``)
     targeting the SAME task row. Without the FOR UPDATE re-read inside the
     helper, whichever commits second drops the other's key."""
@@ -1281,7 +1327,7 @@ async def test_with_task_context_locked_serializes_concurrent_writers(db_session
 
     task = Task(
         project_id=project.id,
-        title="contended resident task",
+        title="contended context task",
         status=TaskStatus.IN_PROGRESS,
         context={},
     )
@@ -1418,9 +1464,10 @@ async def test_auto_remediation_recovery_serializes_concurrent_writers(db_sessio
 async def test_background_write_rejects_growth_over_ceiling_but_allows_shrink(
     db_session,
 ):
-    """Core acceptance test: with_design_doc_locked must reject a mutate_fn
-    that would grow design_doc past DESIGN_DOC_MAX_BYTES, but must allow a
-    shrinking write even when the doc is already over the ceiling.
+    """Core acceptance test: with_design_doc_locked with explicit
+    raise_on_size_limit=False must reject a mutate_fn that would grow
+    design_doc past DESIGN_DOC_MAX_BYTES, but must allow a shrinking write
+    even when the doc is already over the ceiling.
 
     Growth over ceiling → returns False, doc unchanged.
     Shrink from over-ceiling → returns True, doc is written (recovery path).
@@ -1436,7 +1483,9 @@ async def test_background_write_rejects_growth_over_ceiling_but_allows_shrink(
     def _grow(doc: dict) -> None:
         doc["new_key"] = "y" * 100  # adds ~100 bytes, crossing the ceiling
 
-    result = await with_design_doc_locked(db_session, project.id, _grow)
+    result = await with_design_doc_locked(
+        db_session, project.id, _grow, raise_on_size_limit=False
+    )
     await db_session.commit()
     await db_session.refresh(project)
 
@@ -1499,7 +1548,8 @@ async def test_with_design_doc_locked_skips_when_doc_already_over_ceiling_and_gr
     db_session,
 ):
     """When the existing doc is already over the ceiling and mutate_fn would
-    grow it further, the write must be skipped (False returned)."""
+    grow it further, the write must be skipped (False returned) when
+    raise_on_size_limit=False is passed explicitly."""
     bloated = "x" * (DESIGN_DOC_MAX_BYTES + 50)
     project = Project(name="ceiling-already-over", user_id="user")
     project.design_doc = {"pad": bloated}
@@ -1512,7 +1562,9 @@ async def test_with_design_doc_locked_skips_when_doc_already_over_ceiling_and_gr
     def _grow_more(doc: dict) -> None:
         doc["extra"] = "y" * 100
 
-    result = await with_design_doc_locked(db_session, project.id, _grow_more)
+    result = await with_design_doc_locked(
+        db_session, project.id, _grow_more, raise_on_size_limit=False
+    )
     await db_session.commit()
     await db_session.refresh(project)
 
@@ -1529,8 +1581,9 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     still succeed as long as the AGENT-OWNED content stays under the ceiling.
 
     Steps:
-    1. Seed design_doc with reserved keys (efficiency_baseline, lane_baselines,
-       etc.) whose SERIALIZED SIZE alone exceeds DESIGN_DOC_MAX_BYTES.
+    1. Seed design_doc with non-migrated reserved keys whose SERIALIZED SIZE
+       alone exceeds DESIGN_DOC_MAX_BYTES, plus generic telemetry keys that
+       have migrated to project_telemetry.
     2. Write a small agent-owned key — must succeed (reserved blobs excluded
        from the size check).
     3. Write an agent-owned key that would push agent-owned content over the
@@ -1538,12 +1591,16 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     """
     import json as _json
 
-    # Build large reserved blobs: a single 600KB string under a reserved key.
+    # Build large blobs under truly non-migrated reserved keys. Generic
+    # telemetry keys are included separately to verify that the dedicated-store
+    # cutover strips their legacy design_doc copies before persistence.
     huge_blob = "z" * 600_000
     project = Project(name="reserved-ceiling-regression", user_id="user")
     project.design_doc = {
-        "efficiency_baseline": huge_blob,
-        "lane_baselines": huge_blob,
+        "repo_overview": huge_blob,
+        "review_effectiveness": huge_blob,
+        "cochange_index": {"legacy": True},
+        "playbook_archive": {"legacy": True},
     }
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
 
@@ -1571,16 +1628,19 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     assert project.design_doc.get("agent_key") == "small_value", (
         "agent-owned write must be persisted"
     )
-    # Reserved blobs must be preserved (mutate_fn only added a new key).
-    assert project.design_doc.get("efficiency_baseline") == huge_blob
-    assert project.design_doc.get("lane_baselines") == huge_blob
+    # Non-migrated reserved blobs remain; migrated generic telemetry is now
+    # authoritative in project_telemetry and must not be persisted here.
+    assert project.design_doc.get("repo_overview") == huge_blob
+    assert project.design_doc.get("review_effectiveness") == huge_blob
+    assert "cochange_index" not in project.design_doc
+    assert "playbook_archive" not in project.design_doc
 
     # Step 3: grow agent-owned content over the ceiling — must be rejected.
     def _grow_agent_over_ceiling(doc: dict) -> None:
         doc["another_agent_key"] = "x" * DESIGN_DOC_MAX_BYTES
 
     result2 = await with_design_doc_locked(
-        db_session, project.id, _grow_agent_over_ceiling
+        db_session, project.id, _grow_agent_over_ceiling, raise_on_size_limit=False
     )
     await db_session.commit()
     await db_session.refresh(project)
@@ -1591,3 +1651,602 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     assert "another_agent_key" not in project.design_doc, (
         "over-ceiling agent write must not be persisted"
     )
+
+
+# ── load_columns projection (perf finding 1) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_lock_project_or_429_load_columns_generates_projected_sql(
+    db_session, mocker
+):
+    """lock_project_or_429 with load_columns issues a SELECT that includes only
+    the specified columns (verified by inspecting the SQL statement)."""
+    from app.task_locking import lock_project_or_429
+
+    project = Project(
+        name="load-columns-test",
+        user_id="user-lc",
+        design_doc={"key": "value"},
+        directions=[{"id": "d1"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    executed_stmts: list[str] = []
+    original_execute = db_session.execute
+
+    async def _capture(stmt, *args, **kwargs):
+        try:
+            compiled = str(stmt.compile(compile_kwargs={"literal_binds": False}))
+        except Exception:
+            compiled = str(stmt)
+        executed_stmts.append(compiled)
+        return await original_execute(stmt, *args, **kwargs)
+
+    mocker.patch.object(db_session, "execute", new=AsyncMock(side_effect=_capture))
+
+    locked = await lock_project_or_429(
+        db_session, project.id, load_columns=[Project.id, Project.design_doc]
+    )
+    assert str(locked.id) == str(project.id)
+
+    locking_stmts = [s for s in executed_stmts if "FOR UPDATE" in s.upper()]
+    assert locking_stmts, "expected at least one FOR UPDATE statement"
+    locking_sql = locking_stmts[0]
+    assert "design_doc" in locking_sql.lower(), (
+        "projected SELECT must include design_doc"
+    )
+    assert "directions" not in locking_sql.lower(), (
+        "projected SELECT must NOT include directions (excluded by load_columns)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_project_or_429_default_loads_all_columns(db_session):
+    """lock_project_or_429 without load_columns loads all columns (backward compat)."""
+    from app.task_locking import lock_project_or_429
+
+    project = Project(
+        name="load-all-test",
+        user_id="user-all",
+        design_doc={"x": 1},
+        directions=[{"id": "d2"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    locked = await lock_project_or_429(db_session, project.id)
+    # All columns must be accessible without error
+    assert str(locked.id) == str(project.id)
+    assert locked.design_doc == {"x": 1}
+    assert locked.directions == [{"id": "d2"}]
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_does_not_load_directions(db_session, mocker):
+    """with_design_doc_locked must issue a projected SELECT that loads only
+    id and design_doc — directions and other bulky columns are excluded.
+
+    This verifies the load_columns=[Project.id, Project.design_doc] projection
+    passes through to project_lock correctly.
+    """
+    executed_stmts: list[str] = []
+    original_execute = db_session.execute
+
+    async def _capture(stmt, *args, **kwargs):
+        try:
+            compiled = str(stmt.compile(compile_kwargs={"literal_binds": False}))
+        except Exception:
+            compiled = str(stmt)
+        executed_stmts.append(compiled)
+        return await original_execute(stmt, *args, **kwargs)
+
+    mocker.patch.object(db_session, "execute", new=AsyncMock(side_effect=_capture))
+
+    project = Project(
+        name="dsl-projection-test",
+        user_id="user-proj",
+        design_doc={"z": 99},
+        directions=[{"id": "d3"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    executed_stmts.clear()
+
+    def _touch(doc: dict) -> None:
+        doc["touched"] = True
+
+    await with_design_doc_locked(db_session, project.id, _touch)
+
+    # The FOR UPDATE SELECT must mention design_doc but NOT directions.
+    locking_stmts = [s for s in executed_stmts if "FOR UPDATE" in s.upper()]
+    assert locking_stmts, "expected at least one FOR UPDATE statement"
+    locking_sql = locking_stmts[0]
+    assert "design_doc" in locking_sql.lower(), (
+        "projected SELECT must include design_doc column"
+    )
+    assert "directions" not in locking_sql.lower(), (
+        "projected SELECT must NOT include directions (load_columns projection)"
+    )
+
+
+# ── backfill_file_to_system_index (perf findings 2 & 3) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_backfill_file_to_system_index_paginates_in_batches(db_session, mocker):
+    """backfill_file_to_system_index must process all projects via cursor
+    pagination (no single unbounded query that loads all IDs at once).
+
+    We seed 3 projects and verify all are processed and the returned count
+    reflects actual updates.
+    """
+    from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+    projects = []
+    for i in range(3):
+        p = Project(
+            name=f"backfill-batch-{i}",
+            user_id="user-bf",
+            design_doc={
+                f"systems/sys-{i}": {
+                    "key_paths": [f"src/file_{i}.py"],
+                }
+            },
+        )
+        db_session.add(p)
+        projects.append(p)
+    await db_session.commit()
+
+    count = await backfill_file_to_system_index(db_session)
+    await db_session.commit()
+
+    assert count == 3, f"expected 3 updates, got {count}"
+
+    for p in projects:
+        await db_session.refresh(p)
+        fts = p.design_doc.get("_file_to_system")
+        assert fts is not None, f"_file_to_system missing on project {p.id}"
+
+
+@pytest.mark.asyncio
+async def test_backfill_file_to_system_index_skips_unchanged(db_session):
+    """Projects whose _file_to_system index is already correct must NOT count
+    as updated — the idempotency guard (current == rebuilt) must fire.
+    """
+    from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+    p = Project(
+        name="backfill-idempotent",
+        user_id="user-bi",
+        design_doc={
+            "systems/comp": {"key_paths": ["a/b.py"]},
+            "_file_to_system": {"a/b.py": "comp"},
+        },
+    )
+    db_session.add(p)
+    await db_session.commit()
+
+    count = await backfill_file_to_system_index(db_session)
+    await db_session.commit()
+
+    assert count == 0, (
+        f"expected 0 updates for already-correct index, got {count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_file_to_system_index_empty_design_doc_skipped(db_session):
+    """Projects with an empty or null design_doc must be skipped entirely."""
+    from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+    p_null = Project(name="backfill-null", user_id="user-bn", design_doc={})
+    db_session.add(p_null)
+    await db_session.commit()
+
+    count = await backfill_file_to_system_index(db_session)
+    await db_session.commit()
+
+    assert count == 0, f"expected 0 for empty design_doc, got {count}"
+
+
+def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
+    """Regression: cochange_index and cochange_applied_prs (written by
+    direction_outcomes.py, ~38KB each) must be reserved so they don't
+    consume the agent-write 500KB budget.  Also covers the full set of
+    code-written analytics keys discovered in the 2026-07 audit.
+    """
+    from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+
+    # Primary fix: cochange keys written by direction_outcomes.py
+    assert "cochange_index" in _RESERVED_DESIGN_DOC_KEYS
+    assert "cochange_applied_prs" in _RESERVED_DESIGN_DOC_KEYS
+
+    # Audit additions: background analytics/sweep keys still written to design_doc
+    # (keys moved to project_efficiency_snapshot, project_lane_baseline, and
+    # project_sr_analytics in migration 0658 are no longer listed here)
+    # Rolling-cutover values remain reserved while their legacy design_doc copy
+    # is retained for fallback and rollback safety.
+    audit_keys = {
+        "repo_overview",
+        "review_effectiveness",
+        "playbook_deleted_keys",
+        "sr_reviewer_disagreements",
+        "sr_catch_rate_trends_alert",
+        "sr_catch_rate_floor_alert",
+        "sr_quadrant_alert",
+        "sr_pass_engagement_alert",
+        "sr_blind_spot_signal_last_computed_at",
+        "fix_loop_divergence_signal_last_computed_at",
+        "fix_loop_divergence_alerted_window",
+        "fix_loop_divergence_regressions",
+        "fix_loop_divergence_detected_at",
+        "viewport_coverage_snapshot",
+    }
+    missing = audit_keys - _RESERVED_DESIGN_DOC_KEYS
+    assert not missing, f"code-written keys not yet reserved: {sorted(missing)}"
+
+
+_ROLLING_CUTOVER_KEYS = (
+    "lane_baselines",
+    "fresh_reviewer_trend",
+    "edges_trend",
+    "sr_false_attestation_trends",
+    "sr_regression_risk_test_signal_trends",
+)
+
+
+def test_rolling_cutover_keys_remain_reserved():
+    """Dedicated-store cutovers retain legacy fallback values in design_doc.
+
+    No migration has stripped these values, so agents must not mutate them and
+    they must not consume the agent-owned size budget.
+    """
+    from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+
+    expected = set(_ROLLING_CUTOVER_KEYS) | {
+        "efficiency_baseline",
+        "sr_catch_rate_trends",
+        "cochange_index",
+        "cochange_applied_prs",
+    }
+    missing = expected - _RESERVED_DESIGN_DOC_KEYS
+    assert not missing, f"rolling-cutover keys must remain reserved: {sorted(missing)}"
+
+
+def test_telemetry_keys_are_subset_of_reserved_design_doc_keys():
+    """Every key in TELEMETRY_KEYS must appear in _RESERVED_DESIGN_DOC_KEYS.
+
+    Dual-written telemetry blobs live in design_doc during the cutover window,
+    so they must be exempted from the agent-owned 500 KB write budget.  This
+    guard runs standalone (no Postgres) so drift is caught in the smoke suite —
+    the same assertion in test_project_telemetry.py is Postgres-gated.
+    """
+    from app.project_telemetry import TELEMETRY_KEYS
+    from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+
+    missing = TELEMETRY_KEYS - _RESERVED_DESIGN_DOC_KEYS
+    assert not missing, (
+        f"TELEMETRY_KEYS keys not in _RESERVED_DESIGN_DOC_KEYS: {sorted(missing)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_lane_baseline_does_not_consume_agent_ceiling(db_session):
+    """A retained system-owned lane fallback cannot block a small agent write."""
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    over_ceiling_blob = "z" * (DESIGN_DOC_MAX_BYTES + 50_000)
+    project = Project(name="lane-fallback-reserved", user_id="user")
+    project.design_doc = {"lane_baselines": over_ceiling_blob}
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    def _add_agent_key(doc: dict) -> None:
+        doc["agent_key"] = "small"
+
+    result = await with_design_doc_locked(
+        db_session, project.id, _add_agent_key, raise_on_size_limit=False
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result is True
+    assert project.design_doc["agent_key"] == "small"
+
+
+# ── raise_on_size_limit: opt-in exception path ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_raises_on_size_limit_when_opted_in(db_session):
+    """When raise_on_size_limit=True, a growth-over-ceiling write must raise
+    DesignDocSizeLimitExceeded instead of silently returning False.
+
+    This lets agent-facing callers surface the failure rather than returning
+    an implicit success that leaves the strategist believing the write persisted.
+    """
+    padding = "x" * (DESIGN_DOC_MAX_BYTES - 30)
+    project = Project(name="raise-on-limit-test", user_id="user")
+    project.design_doc = {"pad": padding}
+    db_session.add(project)
+    await db_session.commit()
+
+    def _grow(doc: dict) -> None:
+        doc["new_key"] = "y" * 100
+
+    with pytest.raises(DesignDocSizeLimitExceeded) as exc_info:
+        await with_design_doc_locked(
+            db_session, project.id, _grow, raise_on_size_limit=True
+        )
+
+    exc = exc_info.value
+    assert exc.project_id == project.id, "exception must carry the project id"
+    assert exc.new_size > exc.old_size, "new_size must be larger than old_size"
+    assert exc.ceiling == DESIGN_DOC_MAX_BYTES, "ceiling must match DESIGN_DOC_MAX_BYTES"
+
+    # Doc must not have been mutated.
+    await db_session.refresh(project)
+    assert "new_key" not in project.design_doc, (
+        "doc must be unchanged after raise_on_size_limit exception"
+    )
+
+
+@pytest.mark.asyncio
+async def test_raise_on_size_limit_default_raises_on_growth(db_session):
+    """Default raise_on_size_limit=True raises DesignDocSizeLimitExceeded
+    when a growth-over-ceiling write would silently drop the mutation.
+
+    Callers that relied on the old silent-False default must either catch
+    the exception or pass raise_on_size_limit=False explicitly.
+    """
+    padding = "x" * (DESIGN_DOC_MAX_BYTES - 30)
+    project = Project(name="silent-limit-test", user_id="user")
+    project.design_doc = {"pad": padding}
+    db_session.add(project)
+    await db_session.commit()
+
+    def _grow(doc: dict) -> None:
+        doc["new_key"] = "y" * 100
+
+    # Default: no raise_on_size_limit kwarg — must raise, not return False.
+    with pytest.raises(DesignDocSizeLimitExceeded) as exc_info:
+        await with_design_doc_locked(db_session, project.id, _grow)
+    exc = exc_info.value
+    assert exc.project_id == project.id, "exception must carry the project id"
+    assert exc.new_size > exc.old_size, "new_size must be larger than old_size"
+    assert exc.ceiling == DESIGN_DOC_MAX_BYTES, "ceiling must match DESIGN_DOC_MAX_BYTES"
+
+    # Explicit False — must still return False (backward-compatible opt-out).
+    result2 = await with_design_doc_locked(
+        db_session, project.id, _grow, raise_on_size_limit=False
+    )
+    assert result2 is False, (
+        "growth over ceiling with raise_on_size_limit=False must return False"
+    )
+
+    await db_session.refresh(project)
+    assert "new_key" not in project.design_doc, "write must not be persisted"
+
+
+@pytest.mark.asyncio
+async def test_raise_on_size_limit_does_not_fire_for_shrinking_write(db_session):
+    """raise_on_size_limit=True must NOT raise when the write shrinks the
+    agent-owned portion — the shrink path is the recovery path and must always
+    succeed even when the doc is already over the ceiling.
+    """
+    bloated = "x" * (DESIGN_DOC_MAX_BYTES + 100)
+    project = Project(name="shrink-no-raise", user_id="user")
+    project.design_doc = {"pad": bloated}
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    def _shrink(doc: dict) -> None:
+        doc["pad"] = "small"
+
+    # Must not raise — shrinking from over-ceiling is the self-healing path.
+    result = await with_design_doc_locked(
+        db_session, project.id, _shrink, raise_on_size_limit=True
+    )
+    await db_session.commit()
+    assert result is True, "shrinking write must succeed even with raise_on_size_limit=True"
+
+    await db_session.refresh(project)
+    assert project.design_doc.get("pad") == "small", "shrink must be persisted"
+
+
+# ---------------------------------------------------------------------------
+# Projection-lock loader-downgrade regression (see _undo_projection_downgrade)
+# ---------------------------------------------------------------------------
+
+
+async def _fully_loaded_project(session, name: str) -> Project:
+    """Create a project and force every column to be materialized on the
+    identity-mapped instance, so a later projection lock has something to
+    downgrade."""
+    project = Project(
+        name=name,
+        user_id="test-user-123",
+        vision={"purpose": "p"},
+        directions=[{"id": "d1", "status": "active"}],
+        design_doc={"proposed_changes": []},
+        problem_model={"gaps": []},
+    )
+    session.add(project)
+    await session.commit()
+    await session.execute(
+        select(Project)
+        .where(Project.id == project.id)
+        .execution_options(populate_existing=True)
+    )
+    return project
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_does_not_downgrade_preloaded_project(
+    db_session, expire_fidelity
+):
+    """A ``load_columns`` lock must not leave a already-loaded project less
+    loaded than it found it.
+
+    Before the fix the lock stored its ``load_only(..., raiseload=True)`` options
+    on the InstanceState permanently. The damage was invisible until something
+    expired the instance: the next ``refresh()`` honored those stored options,
+    reloaded only the projected columns, and left the rest expired — so a sync
+    read of any other column lazy-loaded outside the greenlet and raised
+    MissingGreenlet.
+    """
+    project = await _fully_loaded_project(db_session, "projection-no-downgrade")
+
+    async with project_lock(
+        db_session, project.id, load_columns=[Project.id, Project.vision]
+    ) as locked:
+        assert locked is project, "lock must yield the identity-mapped instance"
+
+    # The expire cycle that used to detonate the stored projection.
+    await db_session.refresh(project)
+
+    # Every one of these is a SYNC attribute read. Under the bug the first
+    # raised MissingGreenlet.
+    assert project.directions == [{"id": "d1", "status": "active"}]
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.problem_model == {"gaps": []}
+    assert project.autonomous_enabled is True
+    assert project.name == "projection-no-downgrade"
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_survives_explicit_expire(db_session, expire_fidelity):
+    """Same invariant, driven by the explicit ``session.expire()`` several
+    completion paths perform — the shape that bit the research spawn flow.
+
+    Note the app runs ``expire_on_commit=False``, so a bare ``commit()`` does
+    NOT expire the instance and would leave the values sitting in ``state.dict``
+    where a sync read finds them regardless of the projection. The expire is
+    what hands control to the stored loaders, so it is what makes this test
+    discriminate between a fixed and an unfixed lock.
+    """
+    project = await _fully_loaded_project(db_session, "projection-commit-expiry")
+
+    async with project_lock(
+        db_session, project.id, load_columns=[Project.id, Project.directions]
+    ) as locked:
+        assert locked is not None
+    await db_session.commit()
+    db_session.expire(project)
+    await db_session.refresh(project)
+
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.vision == {"purpose": "p"}
+
+
+@pytest.mark.asyncio
+async def test_with_vision_locked_leaves_project_readable(
+    db_session, expire_fidelity
+):
+    """``with_vision_locked`` both projects the instance AND leaves ``vision``
+    dirty. The dirty-plus-projected combination is what escalated a lazy-load
+    into a session-poisoning autoflush outside the greenlet."""
+    project = await _fully_loaded_project(db_session, "vision-locked-readable")
+
+    def _mutate(vision: dict) -> None:
+        vision["purpose"] = "changed"
+
+    assert await with_vision_locked(db_session, project.id, _mutate) is True
+    await db_session.commit()
+    # Expire before reading: with expire_on_commit=False the pre-lock values
+    # would otherwise still be in state.dict, and the sync reads below would
+    # pass whether or not the projection had been undone.
+    db_session.expire(project)
+    await db_session.refresh(project)
+
+    assert project.directions == [{"id": "d1", "status": "active"}]
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.vision == {"purpose": "changed"}, "mutation must still persist"
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_still_defers_columns_on_cold_instance(db_session):
+    """The fix must NOT disarm the projection for an instance the lock itself
+    loaded — deferring the 500KB design_doc is the entire point of
+    ``load_columns``, and the raiseload is the intended guard."""
+    project = Project(
+        name="projection-cold-guard",
+        user_id="test-user-123",
+        vision={"purpose": "p"},
+        design_doc={"proposed_changes": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    project_id = project.id
+    db_session.expunge(project)
+
+    async with project_lock(
+        db_session, project_id, load_columns=[Project.id, Project.vision]
+    ) as locked:
+        assert locked is not None
+        assert locked.vision == {"purpose": "p"}, "projected column must load"
+        with pytest.raises(Exception) as exc_info:
+            _ = locked.design_doc
+        assert "raiseload" in str(exc_info.value).lower(), (
+            "non-projected column must still be guarded by raiseload on a cold "
+            f"instance, got: {exc_info.value!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_lock_project_or_429_does_not_downgrade_preloaded_project(db_session):
+    """Same invariant for the handler-path lock, which returns the project
+    directly rather than yielding it."""
+    project = await _fully_loaded_project(db_session, "or429-no-downgrade")
+
+    locked = await lock_project_or_429(
+        db_session, project.id, load_columns=[Project.id, Project.vision]
+    )
+    assert locked is project
+
+    await db_session.refresh(project)
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.directions == [{"id": "d1", "status": "active"}]
+
+
+@pytest.mark.asyncio
+async def test_projection_lock_undoes_downgrade_on_error_path(db_session):
+    """The undo runs in a ``finally``: an exception inside the lock body is
+    normally followed by a rollback, and a rollback is precisely the expire
+    cycle that detonates a leaked projection."""
+    project = await _fully_loaded_project(db_session, "projection-error-path")
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        async with project_lock(
+            db_session, project.id, load_columns=[Project.id, Project.vision]
+        ):
+            raise _Boom()
+
+    await db_session.rollback()
+
+    # A rollback expires EVERY instance in the session, so the values have to be
+    # re-fetched here no matter what — that part is ordinary and no in-memory fix
+    # can avoid it. What the undo controls is WHICH columns come back. With the
+    # projection still leaked onto the state, this awaited refresh honours it and
+    # reloads only id/vision, leaving everything else expired so the sync reads
+    # below lazy-load outside the greenlet and raise MissingGreenlet.
+    await db_session.refresh(project)
+
+    assert project.design_doc == {"proposed_changes": []}
+    assert project.directions == [{"id": "d1", "status": "active"}]
+
+
+def test_with_lane_baseline_locked_removed():
+    """Dead-code guard: with_lane_baseline_locked was removed (stale .data column)."""
+    import app.task_locking as task_locking_module
+
+    assert not hasattr(task_locking_module, "with_lane_baseline_locked")

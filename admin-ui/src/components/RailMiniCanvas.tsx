@@ -12,12 +12,17 @@
 import { useMemo } from 'react';
 import { computeLayout, VIEWBOX_WIDTH } from './StrategicContextMap';
 import type { StrategicContextCanvasNode, StrategicContextCanvasEdge } from '../strategicStateApi';
+import { useStrategistStatus } from '../hooks/useStrategistStatus';
+import type { StrategicCycleProgress, StrategicCycleCompletion } from '../hooks/useLogViewer';
+import { StrategistStatusChip } from './StrategistStatusChip';
 
 export interface RailMiniCanvasProps {
   canvas?: { nodes?: StrategicContextCanvasNode[]; edges?: StrategicContextCanvasEdge[] } | null;
   strategistActive?: boolean;
   activeTaskLabel?: string | null;
   activeDirectionLabel?: string | null;
+  cycleProgress?: StrategicCycleProgress | null;
+  lastCycleCompletion?: StrategicCycleCompletion | null;
 }
 
 /** Resolve a fill color from a node's status string (mirrors StrategicContextMap). */
@@ -29,35 +34,6 @@ function miniFill(s?: string | null): string {
   return '#525252';
 }
 
-/** Stack of small colored dots showing the strategist is actively working. */
-function WorkingIndicator({ activeTaskLabel, activeDirectionLabel }: {
-  activeTaskLabel?: string | null;
-  activeDirectionLabel?: string | null;
-}) {
-  return (
-    <div
-      className="flex items-center gap-3 rounded-md border border-cyan-500/20 bg-cyan-500/5 px-3 py-2"
-      data-testid="rail-mini-canvas-working"
-    >
-      <div className="flex shrink-0 gap-1" aria-hidden="true">
-        <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
-        <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400/60" style={{ animationDelay: '300ms' }} />
-        <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400/30" style={{ animationDelay: '600ms' }} />
-      </div>
-      <div className="min-w-0 text-xs leading-relaxed text-neutral-400">
-        {activeTaskLabel && (
-          <span className="block truncate font-medium text-neutral-200">{activeTaskLabel}</span>
-        )}
-        {activeDirectionLabel && (
-          <span className="block truncate text-cyan-400/70">{activeDirectionLabel}</span>
-        )}
-        {!activeTaskLabel && !activeDirectionLabel && (
-          <span className="text-cyan-400/70">Working…</span>
-        )}
-      </div>
-    </div>
-  );
-}
 
 /** An idle-state placeholder — very quiet, no motion. */
 function IdlePlaceholder() {
@@ -81,7 +57,10 @@ export function RailMiniCanvas({
   strategistActive = false,
   activeTaskLabel,
   activeDirectionLabel,
+  cycleProgress,
+  lastCycleCompletion,
 }: RailMiniCanvasProps) {
+  const status = useStrategistStatus({ strategistActive, cycleProgress, lastCycleCompletion });
   const layout = useMemo(() => {
     const innerNodes = canvas?.nodes ?? [];
     const innerEdges = canvas?.edges ?? [];
@@ -114,13 +93,22 @@ export function RailMiniCanvas({
     );
   }
 
-  // State 2 — no canvas data, strategist active: show a working indicator.
+  // State 2 — no canvas data, strategist active: show the unified status chip.
   if (strategistActive) {
     return (
-      <WorkingIndicator
-        activeTaskLabel={activeTaskLabel}
-        activeDirectionLabel={activeDirectionLabel}
-      />
+      <div className="flex items-center gap-2 rounded-md border border-neutral-800/60 bg-neutral-950/30 px-3 py-2" data-testid="rail-mini-canvas-working">
+        <StrategistStatusChip status={status} />
+        {(activeTaskLabel || activeDirectionLabel) && (
+          <div className="min-w-0 text-xs leading-relaxed text-neutral-400">
+            {activeTaskLabel && (
+              <span className="block truncate font-medium text-neutral-200">{activeTaskLabel}</span>
+            )}
+            {activeDirectionLabel && (
+              <span className="block truncate text-cyan-400/70">{activeDirectionLabel}</span>
+            )}
+          </div>
+        )}
+      </div>
     );
   }
 

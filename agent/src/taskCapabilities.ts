@@ -18,7 +18,6 @@
 export const AGENT_TASK_TYPE_IDS = [
   'create',
   'review',
-  'panel_review',
   'fix',
   'plan',
   'research',
@@ -30,6 +29,7 @@ export const AGENT_TASK_TYPE_IDS = [
   'docs',
   'migrate',
   'smoketest',
+  'walkthrough_e2e',
   'refactor',
   'debug',
   'perf',
@@ -46,7 +46,7 @@ export const AGENT_TASK_TYPE_IDS = [
   'repo_bootstrap',
   'salvage_bundle',
   'capability_proof_trial',
-  'strategic_resident_turn',
+  'criterion_coverage_trial',
 ] as const;
 
 export type AgentTaskType = (typeof AGENT_TASK_TYPE_IDS)[number];

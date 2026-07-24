@@ -3424,7 +3424,7 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
     client: AsyncClient, db_session
 ):
     """Efficiency snapshot includes llm_cost_attribution with by_task_type rows
-    and strategic_cycle_cost_per_event, and panel_review_effectiveness."""
+    and strategic_cycle_cost_per_event."""
     from datetime import datetime, timezone
 
     from app.models import TaskStatus
@@ -3488,28 +3488,8 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
     assert "total_llm_usd" in attr
     assert isinstance(attr["by_task_type"], list)
 
-    # panel_review_effectiveness key present (may be None when no gate invocations)
-    assert "panel_review_effectiveness" in data
-
-    # Rolling-window gate-health verdict present with a valid state. No gate
-    # invocations in this fixture, so the verdict is NO_DATA.
-    assert "gate_health" in data
-    assert data["gate_health"]["state"] in {
-        "NO_DATA",
-        "DEGRADED",
-        "INSUFFICIENT",
-        "PARTIAL",
-        "HEALTHY",
-    }
-    assert data["gate_health"]["state"] == "NO_DATA"
-    assert data["gate_health"]["min_sample"] == 30
-
-    # Deploy-scoped companion keys are present and null when no deploy boundary
-    # is known (no efficiency_baseline snapshot under a serving SHA here).
-    assert "panel_review_effectiveness_post_deploy" in data
-    assert data["panel_review_effectiveness_post_deploy"] is None
-    assert "gate_health_post_deploy" in data
-    assert data["gate_health_post_deploy"] is None
+    # gate_health and gate_health_post_deploy were removed when panel_review was
+    # removed in automain (998c53c). They are no longer present in the response.
 
 
 @pytest.mark.asyncio
@@ -3587,92 +3567,6 @@ async def test_fetch_efficiency_snapshot_includes_llm_cache_hit_rate(
     assert "llm_cache_hit_rate" in data
     # (300 + 100) cache-read / (1000 + 1000) total input = 400/2000 = 0.20
     assert data["llm_cache_hit_rate"] == 0.20
-
-
-@pytest.mark.asyncio
-async def test_fetch_efficiency_snapshot_post_deploy_verdict(
-    client: AsyncClient, db_session, monkeypatch
-):
-    """When a deploy boundary exists, the endpoint returns a deploy-scoped
-    panel_review_effectiveness_post_deploy block AND its own gate_health verdict,
-    restricted to tasks completed after the boundary."""
-    from datetime import timedelta
-
-    from app.models import TaskStatus, _utcnow
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    serving_sha = "deadbeef1234"
-    monkeypatch.setenv("DEPLOY_SHA", serving_sha)
-
-    # captured_at is stored naive-UTC by write_snapshot (_utcnow().isoformat());
-    # mirror that here so the resolved boundary matches the naive task timestamps.
-    now = _utcnow()
-    boundary = now - timedelta(hours=2)
-
-    # Project carries an efficiency_baseline snapshot captured under the current
-    # serving SHA — this is the deploy boundary the endpoint resolves.
-    project = Project(
-        name="Post-Deploy Verdict",
-        user_id="test-user-postdeploy",
-        design_doc={
-            "efficiency_baseline": {
-                "snapshots": [
-                    {
-                        "serving_sha": serving_sha,
-                        "captured_at": boundary.isoformat(),
-                    }
-                ]
-            }
-        },
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    token_task = Task(
-        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-postdeploy"
-    )
-    db_session.add(token_task)
-
-    # Post-boundary challenged reviews: one degraded (fail-open) among several.
-    def _review(state, updated_at):
-        return Task(
-            project_id=project.id,
-            payloads=[{"type": "review"}],
-            status=TaskStatus.COMPLETED,
-            updated_at=updated_at,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state}},
-        )
-
-    post = now - timedelta(minutes=30)
-    db_session.add_all(
-        [
-            _review("challenged_confirmed", post),
-            _review("challenged_confirmed", post),
-            _review("degraded_model_unavailable", post),
-        ]
-    )
-    await db_session.commit()
-    await db_session.refresh(token_task)
-
-    token = create_agent_token(str(token_task.id), "agent-vm-postdeploy")
-    res = await client.get(
-        f"/api/agent/projects/{project.id}/efficiency-snapshot",
-        headers={"x-agent-token": token},
-    )
-    assert res.status_code == 200, res.text
-    data = res.json()["data"]
-
-    # Deploy boundary resolved → post-deploy block is present and non-null.
-    post_deploy = data["panel_review_effectiveness_post_deploy"]
-    assert post_deploy is not None
-    assert post_deploy["total_challenged"] == 2
-    assert post_deploy["challenged_degraded"] == 1
-    # 1 degraded / 3 invocations ≈ 33% fail-open on a tiny sample → DEGRADED.
-    verdict = data["gate_health_post_deploy"]
-    assert verdict is not None
-    assert verdict["state"] == "DEGRADED"
-    assert verdict["total_invocations"] == 3
 
 
 @pytest.mark.asyncio
@@ -6489,3 +6383,22 @@ async def test_agent_fetch_ui_load_timing_rejects_cross_project(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404
+
+
+def test_section_fetch_inventory_covers_tools_and_skills():
+    """SECTION_FETCH_INVENTORY must register both 'skills' and 'project_tools'
+    with their dedicated fetch verbs ('skills' and 'tools' respectively).
+
+    The ./fetch tools and ./fetch skills shell verbs already exist in the agent
+    and hit /api/agent/projects/{id}/tools and /api/agent/projects/{id}/skills,
+    but without inventory entries the completeness tests (and the strategist's
+    recovery path) cannot discover them.
+    """
+    from app.routers.agent_strategic_fetch import SECTION_FETCH_INVENTORY
+
+    assert SECTION_FETCH_INVENTORY.get("skills") == "skills", (
+        "'skills' must be registered in SECTION_FETCH_INVENTORY with verb 'skills'"
+    )
+    assert SECTION_FETCH_INVENTORY.get("project_tools") == "tools", (
+        "'project_tools' must be registered in SECTION_FETCH_INVENTORY with verb 'tools'"
+    )

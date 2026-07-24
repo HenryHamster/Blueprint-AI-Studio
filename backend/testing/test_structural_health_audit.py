@@ -304,6 +304,8 @@ async def test_structural_health_observability_endpoint(client, db_session):
     runtime_config["structural_health_audit_mode"] = "observe"
     runtime_config["structural_health_audit_fat_row_bytes"] = 1000
     await run_structural_health_audit(db_session)
+    # Commit so the AuditLaneDecisionLog row is visible to the HTTP endpoint's session.
+    await db_session.commit()
 
     resp = await client.get("/api/admin/evergreen/structural-health-observability")
     assert resp.status_code == 200, resp.text
@@ -314,3 +316,101 @@ async def test_structural_health_observability_endpoint(client, db_session):
     assert "largest_rows" in body
     assert "recent" in body
     assert body["cycles"] >= 1
+    # Durable DB aggregate is included in the response.
+    assert "observe_window_db" in body
+    db_obs = body["observe_window_db"]
+    assert db_obs["cycles"] >= 1
+    assert "tripped_count" in db_obs
+
+
+# --------------------------------------------------------------------------- #
+# Durable DB writer + reader.
+# --------------------------------------------------------------------------- #
+
+
+async def test_log_audit_cycle_to_db_writes_row(db_session):
+    """log_audit_cycle_to_db writes one AuditLaneDecisionLog row per call."""
+    from app.models import AuditLaneDecisionLog
+    from app.structural_health_audit import log_audit_cycle_to_db
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    await log_audit_cycle_to_db(
+        db_session,
+        ts=now,
+        mode="observe",
+        tripped=True,
+        enrolled=0,
+        payload={"fat_row_offenders": 3},
+    )
+    await db_session.flush()
+
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "structural_health"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    assert rows[0].tripped is True
+    assert rows[0].enrolled == 0
+    assert rows[0].payload["fat_row_offenders"] == 3
+
+
+async def test_get_structural_health_observability_from_db_aggregates(db_session):
+    """get_structural_health_observability_from_db counts tripped vs total cycles."""
+    from app.structural_health_audit import (
+        get_structural_health_observability_from_db,
+        log_audit_cycle_to_db,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    await log_audit_cycle_to_db(
+        db_session, ts=now, mode="observe", tripped=True, enrolled=0, payload={}
+    )
+    await log_audit_cycle_to_db(
+        db_session, ts=now, mode="observe", tripped=False, enrolled=0, payload={}
+    )
+    await log_audit_cycle_to_db(
+        db_session, ts=now, mode="observe", tripped=True, enrolled=0, payload={}
+    )
+    await db_session.flush()
+
+    result = await get_structural_health_observability_from_db(
+        db_session, window_hours=24
+    )
+    assert result["cycles"] == 3
+    assert result["tripped_count"] == 2
+    assert result["enrolled_total"] == 0
+    assert result["source"] == "db"
+
+
+async def test_run_structural_health_audit_writes_db_row(db_session):
+    """run_structural_health_audit writes a durable row even in observe mode."""
+    from app.models import AuditLaneDecisionLog
+
+    runtime_config["structural_health_audit_mode"] = "observe"
+    runtime_config["structural_health_audit_fat_row_bytes"] = 1000
+    await run_structural_health_audit(db_session)
+
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "structural_health"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    assert rows[0].enrolled == 0

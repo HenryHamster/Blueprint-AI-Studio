@@ -248,7 +248,7 @@ const STRATEGIC_MUTATING_VERBS = new Set(
  */
 export function isStrategicMutation(command: string | undefined): boolean {
   if (!command) return false;
-  const m = command.match(/(?:^|[\s;&|(])(?:\.\/)?strategic\s+([a-z][a-z-]*)/);
+  const m = command.match(/(?:^|[\s;&|(])(?:[^\s;&|()]*\/)?strategic\s+([a-z][a-z-]*)/);
   if (!m) return false;
   return STRATEGIC_MUTATING_VERBS.has(m[1]);
 }
@@ -264,8 +264,8 @@ export function isStrategicMutation(command: string | undefined): boolean {
  */
 export function isMessageSend(command: string | undefined): boolean {
   if (!command) return false;
-  if (/(?:^|[\s;&|(])(?:\.\/)?messages\s+send\b/.test(command)) return true;
-  return /(?:^|[\s;&|(])(?:\.\/)?strategic\s+create-message\b/.test(command);
+  if (/(?:^|[\s;&|(])(?:[^\s;&|()]*\/)?messages\s+send\b/.test(command)) return true;
+  return /(?:^|[\s;&|(])(?:[^\s;&|()]*\/)?strategic\s+create-message\b/.test(command);
 }
 
 /**
@@ -328,7 +328,7 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
   if (type === 'result') {
     const result = typeof obj.result === 'string' ? obj.result : '';
     events.push({
-      kind: 'result', text: result, isTurnResult: !nested, nested, sessionId,
+      kind: 'result', text: result, isError: obj.is_error === true, isTurnResult: !nested, nested, sessionId,
       usage: extractResultUsage(obj),
       numTurns: extractResultTurns(obj),
     });

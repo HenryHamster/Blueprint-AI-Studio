@@ -128,6 +128,7 @@ async def _emit_crash_alert(
                     severity=AlertSeverity.ERROR,
                     title=alert_title,
                     message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
+                    event_type="deployment.halted",
                 )
             )
             created += 1
@@ -185,6 +186,7 @@ async def _emit_crash_episode_alert(
                         "not a one-off blip. Auto-restart with backoff is "
                         "still running; investigate the root cause."
                     ),
+                    event_type="deployment.halted",
                 )
             )
             created += 1
@@ -329,6 +331,60 @@ async def _seed_completion_debt_design_doc():
         )
 
 
+async def _heal_poisoned_problem_models() -> None:
+    """One-shot startup heal: strip packer-marker keys from poisoned problem_model rows.
+
+    The ``apply_agent_update`` path already strips packer markers inline when a
+    strategic agent writes a new problem_model, but a row that was poisoned before
+    that guard was added stays poisoned until the next agent write. This sweep finds
+    every project whose stored ``problem_model`` JSONB carries a top-level key that
+    ``ProblemModel (extra='forbid')`` would reject (e.g. ``truncated``) and strips it,
+    so validators no longer fail on read.
+
+    Best-effort and idempotent: a failure on one project must not block startup.
+    """
+    try:
+        from sqlalchemy import text as _text
+        from sqlalchemy.orm.attributes import flag_modified
+        from app.problem_model import sanitize_problem_model_raw
+
+        async with AsyncSessionLocal() as session:
+            # PostgreSQL JSONB `?` operator: true when the key exists at the top level.
+            stmt = select(Project).where(
+                Project.problem_model.is_not(None),
+                _text(
+                    "problem_model ? 'truncated'"
+                    " OR problem_model ? '_agent_view_floor_applied'"
+                    " OR problem_model ? '_gap_memory_trimmed'"
+                ),
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+
+            healed = 0
+            for project in rows:
+                if not project.problem_model:
+                    continue
+                sanitized = sanitize_problem_model_raw(dict(project.problem_model))
+                if sanitized != dict(project.problem_model):
+                    project.problem_model = sanitized
+                    flag_modified(project, "problem_model")
+                    session.add(project)
+                    healed += 1
+
+            if healed:
+                await session.commit()
+                logger.info(
+                    "[STARTUP] Healed %d poisoned problem_model row(s) "
+                    "(stripped packer-marker keys)",
+                    healed,
+                )
+    except Exception:
+        logger.warning(
+            "[STARTUP] problem_model poison heal failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 async def _seed_routing_verdict_from_snapshot():
     """Seed in-memory ``provider_routing_verdict_state`` from the persisted snapshot.
 
@@ -345,24 +401,26 @@ async def _seed_routing_verdict_from_snapshot():
     try:
         from app.shared_state import runtime_config as _rc
         from app.efficiency_snapshot import DESIGN_DOC_KEY
+        from app.models import ProjectTelemetry
 
         async with AsyncSessionLocal() as seed_session:
-            project_rows = (
+            # Primary: read the mutable efficiency container from the keyed
+            # telemetry table. ProjectEfficiencySnapshot is a time-series.
+            eff_rows = (
                 (
                     await seed_session.execute(
-                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True)).limit(5000)
+                        select(ProjectTelemetry)
+                        .where(ProjectTelemetry.key == DESIGN_DOC_KEY)
+                        .limit(5000)
                     )
                 )
                 .scalars()
                 .all()
             )
-            for project in project_rows:
-
-                if not project or not project.design_doc:
+            for eff_row in eff_rows:
+                if not eff_row or not eff_row.value:
                     continue
-                container = project.design_doc.get(DESIGN_DOC_KEY)
-                if not container:
-                    continue
+                container = eff_row.value
                 # Read the verdict from where write_snapshot actually stores it.
                 # Priority (newest-first):
                 #   1. snapshots[-1]["provider_routing_verdict"] — latest snapshot,
@@ -391,6 +449,48 @@ async def _seed_routing_verdict_from_snapshot():
                     _rc["provider_routing_verdict_state"] = state
                     logger.info(
                         "[STARTUP] Seeded provider_routing_verdict_state=%s from project %s",
+                        state,
+                        eff_row.project_id,
+                    )
+                    return  # First project with a verdict is sufficient
+
+            # Fallback: scan design_doc for projects not yet migrated.
+            project_rows = (
+                (
+                    await seed_session.execute(
+                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True)).limit(5000)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for project in project_rows:
+                if not project or not project.design_doc:
+                    continue
+                container = project.design_doc.get(DESIGN_DOC_KEY)
+                if not container:
+                    continue
+                provider_routing_verdict = None
+                snapshots = container.get("snapshots") or []
+                if snapshots:
+                    provider_routing_verdict = snapshots[-1].get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    provider_routing_verdict = (container.get("baseline") or {}).get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    provider_routing_verdict = container.get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    continue
+                state = provider_routing_verdict.get("state")
+                if state:
+                    _rc["provider_routing_verdict_state"] = state
+                    logger.info(
+                        "[STARTUP] Seeded provider_routing_verdict_state=%s from project %s (design_doc fallback)",
                         state,
                         project.id,
                     )
@@ -816,6 +916,11 @@ async def lifespan(app):
     # Seed the completion-debt design-doc section for all projects (idempotent:
     # absent sections are seeded, existing sections only refresh code fields).
     await _seed_completion_debt_design_doc()
+
+    # Strip packer-marker keys (e.g. ``truncated``) that leaked into durable
+    # problem_model rows before the apply_agent_update self-heal guard was added.
+    # Idempotent: only touches rows that carry a marker key.
+    await _heal_poisoned_problem_models()
 
     # Log the resolved deploy-level identity so operators can confirm that
     # deploy-level serving confirmation (backend_revision, agent_image) is
@@ -1784,6 +1889,7 @@ async def lifespan(app):
                                             severity=AlertSeverity.INFO,
                                             title=f"Background service restarted: {name}",
                                             message=f"Service '{name}' was automatically restarted (attempt #{state['attempts']}).",
+                                            event_type="deployment.auto_resume",
                                         )
                                         alert_session.add(alert)
                                     await alert_session.commit()

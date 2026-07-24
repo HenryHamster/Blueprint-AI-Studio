@@ -56,12 +56,18 @@ KNOWN_UNFAITHFUL_ALLOWLIST: frozenset[str] = frozenset({
     # concurrency but the test exercises no ORM session — uses a fake engine, so
     # a Postgres-only skip would be semantically wrong.
     "test_migration_apply_gate.py::test_concurrent_applies_are_serialized",
+    # Both tests verify the FIX (project stays readable after lock), not the
+    # MissingGreenlet fault itself. MissingGreenlet appears only as context
+    # in the docstring describing the historical bug. The test passes on SQLite
+    # and is not made more faithful by a Postgres-only skip.
+    "test_task_locking.py::test_projection_lock_does_not_downgrade_preloaded_project",
+    "test_task_locking.py::test_with_vision_locked_leaves_project_readable",
 })
 
 # Monotonic ceiling for the allowlist: the list can ONLY shrink. Bump this
 # constant when adding an entry (requires deliberate, visible action in the
 # diff alongside the new entry). Burn-down is tracked by lowering the ceiling.
-KNOWN_UNFAITHFUL_ALLOWLIST_CEILING: int = 4
+KNOWN_UNFAITHFUL_ALLOWLIST_CEILING: int = 6
 
 
 def allowlist_within_ceiling() -> bool:
@@ -122,7 +128,7 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     # not ORM-mapped attributes; scanner cannot distinguish list reads from
     # ORM lazy-load reads that would trigger a detached-instance error.
     "metrics_integrity_sweep.py::check_capability_proof_gate_gap",
-    # project.id at the logger.warning() after ShadowResidentOwnershipError rollback
+    # project.id at the logger.warning() after an ownership-conflict rollback
     # is the loaded PK UUID (always in-memory as the object's identity key, not
     # a lazy-load attribute); cycle_id is a local Python UUID, not an ORM column;
     # return False immediately follows so no further ORM access occurs.

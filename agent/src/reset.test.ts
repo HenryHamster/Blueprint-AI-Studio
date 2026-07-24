@@ -191,10 +191,6 @@ describe('resetForNextRole', () => {
     const unlinkPaths = fsPromisesMocks.unlink.mock.calls.map((c) => c[0] as string);
     expect(unlinkPaths).toContain('/tmp/agent_prompt_X.txt');
     expect(unlinkPaths).toContain('/tmp/review_verdict_X.json');
-    expect(unlinkPaths).toContain('/tmp/panel_review_lens_correctness_X.json');
-    expect(unlinkPaths).toContain('/tmp/panel_review_lens_security_X.json');
-    expect(unlinkPaths).toContain('/tmp/panel_review_lens_code_quality_X.json');
-    expect(unlinkPaths).toContain('/tmp/panel_review_lens_test_coverage_X.json');
     expect(unlinkPaths).toContain('/tmp/plan_output_X.json');
     expect(unlinkPaths).toContain('/tmp/research_findings_X.json');
     expect(unlinkPaths).toContain('/tmp/security_findings_X.json');

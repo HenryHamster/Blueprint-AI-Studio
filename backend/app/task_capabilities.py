@@ -14,14 +14,17 @@ from typing import Literal
 
 
 class TaskType(str, Enum):
+    # NOTE: The autonomous resident task type (resident_turn) was permanently
+    # removed in migration 0657. Do NOT re-add it here or in any dispatch /
+    # spawning module — the Workday protection suite scans the full
+    # backend/app tree and agent/src/handlers/ for its literal value and
+    # will fail CI if it reappears.
     create = "create"
     review = "review"
-    panel_review = "panel_review"
     fix = "fix"
     plan = "plan"
     research = "research"
     strategic_review = "strategic_review"
-    strategic_resident_turn = "strategic_resident_turn"
     design_doc_update = "design_doc_update"
     security_audit = "security_audit"
     qa = "qa"
@@ -45,6 +48,8 @@ class TaskType(str, Enum):
     repo_bootstrap = "repo_bootstrap"
     salvage_bundle = "salvage_bundle"
     capability_proof_trial = "capability_proof_trial"
+    criterion_coverage_trial = "criterion_coverage_trial"
+    walkthrough_e2e = "walkthrough_e2e"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -133,8 +138,8 @@ class TaskCapability:
     agent_mode: AgentMode
     # Which runtime owns execution. ``agent`` is the normal provision/claim
     # path; ``backend`` is reserved for bounded control-plane tasks that must
-    # never be handed to an agent process (for example migration-shadow
-    # Resident turns completed by a zero-model backend sweep).
+    # never be handed to an agent process (completed by a zero-model backend
+    # sweep).
     execution_owner: ExecutionOwner = "agent"
     default_category: str | None = None
     user_launchable: bool = False
@@ -273,23 +278,6 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation="none",
     ),
     TaskCapability(
-        TaskType.panel_review,
-        "Panel Review",
-        "read_only",
-        default_category="review",
-        user_launchable=True,
-        description=(
-            "Run a fixed multi-agent review workflow over an existing PR and "
-            "persist a structured verdict artifact."
-        ),
-        run_shape="workflow",
-        output_kind="verdict",
-        evaluation_strategy="review_only",
-        cost_ceiling_usd=6.0,
-        completion_handler="panel_review",
-        evaluation="structured-verdict",
-    ),
-    TaskCapability(
         TaskType.fix,
         "Fix",
         "write",
@@ -351,24 +339,6 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_needs_locked_project=True,
         strategic_phase="phase2",
         evaluation="forward-quality",
-    ),
-    TaskCapability(
-        TaskType.strategic_resident_turn,
-        "Resident Turn",
-        "read_only",
-        execution_owner="agent",
-        default_category="strategic",
-        provider_configurable=True,
-        filter_visible=False,
-        description=(
-            "Run one bounded, checkpoint-derived provider-only Resident turn."
-        ),
-        run_shape="single_agent",
-        output_kind="knowledge",
-        requires_code=False,
-        evaluation_strategy="review_only",
-        cost_ceiling_usd=4.0,
-        evaluation="none",
     ),
     TaskCapability(
         TaskType.design_doc_update,
@@ -775,6 +745,59 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation="none",
         run_shape="single_agent",
     ),
+    TaskCapability(
+        TaskType.criterion_coverage_trial,
+        "Criterion Coverage Trial",
+        "read_only",
+        default_category="ops",
+        # No LLM provider runs — the handler runs a bounded, targeted test suite
+        # (a merged task's declared named_test covering tests) and reports a
+        # pass/fail verdict; it never selects a model/account.
+        user_launchable=False,
+        provider_configurable=False,
+        # Not operator/strategist-spawnable and not a plan child: it is enrolled
+        # programmatically by the acceptance earn loop (via
+        # ``acceptance_criteria.enroll_criterion_coverage_trial`` from the reaper's
+        # step-21a backfill sweep), never authored by an agent or operator.
+        description=(
+            "Acceptance earn-loop execution trial: run ONLY a merged task's "
+            "declared ``named_test`` covering tests as a targeted runner job, "
+            "decoupled from the merge gate. A green run mints machine-verified "
+            "``covered`` criterion evidence (``executed_named_test``); a red run "
+            "records nothing and NEVER demotes existing evidence. Operators can "
+            "pause it with ``acceptance_earn_execution_trials_enabled``."
+        ),
+        # A single targeted agent run produces the verdict; it needs a code
+        # checkout to run the tests, but opens no PR — its durable product is the
+        # ingested covered-tier evidence, so output_kind is ``none`` and there is
+        # no forward merge gate (``evaluation="none"``). The ingestion completion
+        # handler consumes the reported result.
+        output_kind="none",
+        requires_code=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=2.0,
+        completion_handler="criterion_coverage_trial",
+        evaluation="none",
+        run_shape="single_agent",
+    ),
+    TaskCapability(
+        TaskType.walkthrough_e2e,
+        "Walkthrough E2E",
+        "read_only",
+        default_category="ops",
+        user_launchable=False,
+        description=(
+            "Qualifier-spawned live-stack walkthrough that writes SHA-pinned "
+            "CriterionEvidence for operator-tools acceptance criteria."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        requires_compute=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=4.0,
+        completion_handler="walkthrough_e2e",
+        evaluation="none",
+    ),
 )
 
 TASK_CAPABILITY_BY_TYPE: dict[TaskType, TaskCapability] = {
@@ -1002,9 +1025,7 @@ STRATEGIC_TASK_TYPES: frozenset[str] = frozenset(
 )
 # Dispatch compatibility is intentionally distinct from legacy strategic-cycle
 # completion membership and its Project lock/handler semantics.
-STRATEGIC_LOCAL_AGENT_TASK_TYPES: frozenset[str] = frozenset(
-    {*STRATEGIC_TASK_TYPES, TaskType.strategic_resident_turn.value}
-)
+STRATEGIC_LOCAL_AGENT_TASK_TYPES: frozenset[str] = STRATEGIC_TASK_TYPES
 # Default autonomous spawn-budget categories. Runtime config may override these
 # sets, but defaults stay registry-owned so new task types are classified from
 # the same catalog that defines their capabilities.
@@ -1025,7 +1046,6 @@ AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES: frozenset[str] = frozenset(
 AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
     {
         TaskType.review.value,
-        TaskType.panel_review.value,
         TaskType.fix.value,
         TaskType.perf.value,
         TaskType.verify_tests.value,
@@ -1043,7 +1063,8 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
-        TaskType.strategic_resident_turn.value,
+        TaskType.criterion_coverage_trial.value,
+        TaskType.walkthrough_e2e.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering

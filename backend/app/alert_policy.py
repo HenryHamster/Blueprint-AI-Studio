@@ -146,6 +146,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "deployment.halted_recovered": AlertEventPolicy(
         "deployment.halted_recovered", route=ROUTE_TIMELINE, action_required=False
     ),
+    "deployment.wake_delivery_stalled": AlertEventPolicy(
+        "deployment.wake_delivery_stalled"
+    ),
     "branch.unsafe_config": AlertEventPolicy("branch.unsafe_config"),
     "branch.missing_config": AlertEventPolicy("branch.missing_config"),
     "branch.promotion_target_landing": AlertEventPolicy(
@@ -181,6 +184,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     ),
     "release.qualification_crash_loop": AlertEventPolicy(
         "release.qualification_crash_loop", domain=DOMAIN_RELEASE_LIFECYCLE
+    ),
+    "release.walkthrough_key_unmatched": AlertEventPolicy(
+        "release.walkthrough_key_unmatched", domain=CORE_ALERT_DOMAIN
     ),
     "sr.catch_rate_below_target": AlertEventPolicy(
         "sr.catch_rate_below_target", domain=DOMAIN_SR_QUALITY
@@ -232,6 +238,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     ),
     "efficiency.provider_routing_verdict": AlertEventPolicy(
         "efficiency.provider_routing_verdict",
+    ),
+    "notification.dead_letter_lost": AlertEventPolicy(
+        "notification.dead_letter_lost"
     ),
 }
 

@@ -12,14 +12,8 @@ import { type TemporaryMutes } from './temporaryMutes';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { saveServerNoisePrefs } from './serverSync';
 import type { MessageAttachment, ProjectMessage } from '../types/messages';
-import {
-  computeStrategicStreamingTurn,
-  computeStrategicSessionActivity,
-  computeResidentActivityState,
-  countStrategicReplies,
-  type StrategicLiveActivity,
-} from '../utils/strategicSessionLive';
-import { StrategicStreamingBubble, StrategicResidentActivityWidget } from './StrategicLiveTurn';
+import { computeStrategicStreamingTurn } from '../utils/strategicSessionLive';
+import { StrategicStreamingBubble } from './StrategicLiveTurn';
 import { AlertsBanner } from './AlertsBanner';
 import type { Alert } from '../types/alert';
 import { SaveViewDialog } from './SaveViewDialog';
@@ -28,16 +22,16 @@ import { useMessagesPanelFilters } from './useMessagesPanelFilters';
 import { MessagesListView, type ConversationListImperativeApi } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
-import { armingToastCopy, parseArmingOutcome, residentAcceptanceToastCopy, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
+import { armingToastCopy, parseArmingOutcome, conversationAcceptanceToastCopy, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useConversationSend } from '../hooks/useConversationSend';
-import { compareResidentMessages, useResidentConversation } from '../hooks/useResidentConversation';
-import { useResidentEngineHealth } from '../hooks/useResidentEngineHealth';
-import { ResidentEngineHealthChip } from './ResidentEngineHealthChip';
+import { compareConversationMessages, useConversation } from '../hooks/useConversation';
+import { useStrategistStatus } from '../hooks/useStrategistStatus';
+import { StrategistStatusChip } from './StrategistStatusChip';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
@@ -57,7 +51,6 @@ import { ComposerRequestOwnershipGuard } from '../utils/composerRequestOwnership
 import { ConversationAttachmentUploadError, uploadConversationAttachments } from '../utils/conversationAttachmentUpload';
 import {
   acknowledgeQueuedResidentToolHandoffs,
-  enqueueResidentToolHandoff,
   isResidentToolHandoffEvent,
   isResidentToolHandoffQueueStorageKey,
   loadQueuedResidentToolHandoffEntries,
@@ -73,7 +66,7 @@ import {
 } from '../utils/pendingAttachmentStore';
 const DEFAULT_VIEW_ID = '__default__';
 const MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT = 8;
-// Mirrors MAX_IMAGE_DOWNLOAD_BYTES in agent/src/handlers/strategic-resident-lib.ts.
+// Mirrors MAX_IMAGE_DOWNLOAD_BYTES in the agent's strategic image handling.
 // Images above this threshold are uploaded but the agent silently skips them.
 const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
 // Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
@@ -81,7 +74,16 @@ const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
 const OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS = 45_000;
+const TRIAGE_PAGE_SIZE = 30;
 
+function countStrategicReplies(conversationMessages: ProjectMessage[]): number {
+  let n = 0;
+  for (const msg of conversationMessages) {
+    const ft = (msg.from_type || '').toLowerCase();
+    if (ft === 'strategic' || ft === 'strategist') n += 1;
+  }
+  return n;
+}
 function artifactRefIdentity(ref: Record<string, unknown>): string {
   return String(ref.artifact_ref_id || ref.id || '');
 }
@@ -420,18 +422,13 @@ export interface MessagesPanelProps {
   onOpenStrategicContextWorkspace?: () => void;
   /** Open the global command palette from the Strategic composer. */
   onOpenCommandPalette?: () => void;
-  /** Open the project Activity inbox from the calm Resident operation status. */
+  /** Open the project Activity inbox from the calm operation status. */
   onOpenActivityFeed?: () => void;
   /** Backwards-compatible alias for older call sites. */
   onOpenStrategicContextCommands?: () => void;
   /** Legacy refresh callback kept for callers that still wire the old prop name. */
   onStrategicRefresh?: () => void;
-  /**
-   * Live resident-session transcript deltas (from `useLogViewer`, one per
-   * `strategic_session` WS frame). Rendered as a streaming/"typing" bubble in the
-   * conversation transcript while a turn streams; reconciled into the durable
-   * `from_type=strategic` ProjectMessage once it lands via the conversation refresh.
-   */
+  /** Ephemeral Workday transcript deltas for the in-flight Strategic reply. */
   strategicSessionTranscript?: StrategicSessionDelta[];
   /** Active alerts surfaced inline at the top of the panel, replacing the separate AlertsPopover. */
   alerts?: Alert[];
@@ -502,7 +499,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenActivityFeed, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -512,11 +509,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const usesStrategicReadModel = currentStrategicState != null;
   const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
   const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
-  const residentEngineHealth = useResidentEngineHealth({
-    enabled: conversationMode,
-    projectId: selectedProjectId,
-    refreshKey: `${strategicPollEpoch ?? 0}:${realtimeRefreshSignal ?? 0}`,
-  });
   const strategicAttention = currentStrategicState?.attention ?? null;
   const strategicAttentionRef = useRef(strategicAttention);
   // eslint-disable-next-line react-hooks/refs
@@ -564,14 +556,29 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const messagesRef = useRef<ProjectMessage[]>([]);
   messagesRef.current = messages;
   const [loading, setLoading] = useState(true);
+  // Triage pagination: small initial page (~30) with load-older-on-demand
+  const loadingOlderTriageRef = useRef(false);
+  const triageOffsetRef = useRef(0);
+  const [hasOlderTriageMessages, setHasOlderTriageMessages] = useState(false);
+  const [loadingOlderTriageMessages, setLoadingOlderTriageMessages] = useState(false);
   const [expandedConfirmationItemId, setExpandedConfirmationItemId] = useState<string | null>(null);
   const [resolvedConfirmationIds, setResolvedConfirmationIds] = useState<Set<string>>(() => new Set());
+  const visibleAttentionNeedsActionItems = useMemo(
+    () => attentionNeedsActionItems.filter(item => !resolvedConfirmationIds.has(item.id)),
+    [attentionNeedsActionItems, resolvedConfirmationIds],
+  );
   const [chatChromeExpanded, persistChatChrome] = useChatChrome();
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
   const [newType, setNewType] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.type ?? 'FEEDBACK');
   const [newContent, setNewContent] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.content ?? '');
   const [draftSourceRefs, setDraftSourceRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.source_refs ?? []);
   const [draftArtifactRefs, setDraftArtifactRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.artifact_refs ?? []);
+  const [toolHandoffDrainTick, setToolHandoffDrainTick] = useState(0);
+  const activeToolHandoffPromptRef = useRef<{
+    identity: string;
+    prompt: string;
+    insertedIntoEmptyDraft: boolean;
+  } | null>(null);
   const composerDraftWriteIdRef = useRef(loadComposerDraft(currentActorUserId, selectedProjectId)?.write_id ?? null);
   const [submitting, setSubmitting] = useState(false);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
@@ -592,7 +599,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // server idempotency key is the backstop for retries that do reach it).
   const submittingGuardRef = useRef(new ComposerRequestOwnershipGuard());
   const attachmentMutationGuardRef = useRef(new ComposerRequestOwnershipGuard());
+  const attachmentMutationGenerationRef = useRef(0);
   const [attachmentMutating, setAttachmentMutating] = useState(false);
+  const pendingAttachmentRestoreRequestRef = useRef(0);
+  const [restoringPendingAttachments, setRestoringPendingAttachments] = useState(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string; message_type: string; status: string } | null>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.reply_to ?? null);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   // INSTANT ACK — the operator's just-sent message, rendered optimistically at
@@ -711,13 +721,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }, [currentActorUserId, saveComposerDraftSnapshot, selectedProjectId, updateComposerIntent]);
   const applyToolHandoffs = useCallback((entries: ResidentToolHandoffQueueEntry[]) => {
     if (!conversationMode || !currentActorUserId || !selectedProjectId || entries.length === 0) return false;
-    // A composer envelope has one operator intent. Consume one immutable queue
-    // entry at a time so refs from other handoffs cannot be acknowledged under
-    // the wrong prompt, revision, lane owner, or intent.
+    // One composer envelope carries one operator intent. Drain one immutable
+    // handoff at a time so a later revision cannot be acknowledged under the
+    // first handoff's prompt.
     const entry = entries[0];
     const handoff = entry.detail;
     const current = composerIntentRef.current;
     if (current.operator_intent && current.artifact_refs.length > 0) return false;
+    const insertedIntoEmptyDraft = !current.content.trim();
     const artifactRefs = mergeArtifactRefs(
       current.artifact_refs,
       [handoff.artifactRef as unknown as Record<string, unknown>],
@@ -726,67 +737,103 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const operatorIntent: Record<string, unknown> = {
       kind: handoff.intent,
       expected_revision: handoff.artifactRef.revision,
-      ...(handoff.laneOwner ? { lane_owner: handoff.laneOwner } : {}),
+      artifact_ref_id: artifactRefIdentity(handoff.artifactRef as unknown as Record<string, unknown>),
     };
-    const next = updateComposerIntent({
+    const patch: Partial<ConversationComposerIntent> = {
       content,
       artifact_refs: artifactRefs,
       operator_intent: operatorIntent,
-    });
-    setNewContent(content);
-    setDraftArtifactRefs(artifactRefs);
-    const persisted = saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
+    };
+    const next = updateConversationComposerIntent(current, patch);
+    const persisted = saveComposerDraftSnapshot(
+      currentActorUserId,
+      selectedProjectId,
+      next,
+    );
     if (persisted) {
-      acknowledgeQueuedResidentToolHandoffs(currentActorUserId, selectedProjectId, [entry]);
+      activeToolHandoffPromptRef.current = {
+        identity: artifactRefIdentity(handoff.artifactRef as unknown as Record<string, unknown>),
+        prompt: handoff.prompt,
+        insertedIntoEmptyDraft,
+      };
+      updateComposerIntent(patch);
+      setNewContent(content);
+      setDraftArtifactRefs(artifactRefs);
+      acknowledgeQueuedResidentToolHandoffs(
+        currentActorUserId,
+        selectedProjectId,
+        [entry],
+      );
+      focusComposerTextarea();
     }
-    focusComposerTextarea();
     return persisted;
-  }, [conversationMode, currentActorUserId, focusComposerTextarea, saveComposerDraftSnapshot, selectedProjectId, updateComposerIntent]);
+  }, [
+    conversationMode,
+    currentActorUserId,
+    focusComposerTextarea,
+    saveComposerDraftSnapshot,
+    selectedProjectId,
+    updateComposerIntent,
+  ]);
 
   useEffect(() => {
-    const blocked = () => submitting || sendState === 'sending' || sendState === 'needs_retry';
+    const blocked = () => (
+      submitting || sendState === 'sending' || sendState === 'needs_retry'
+    );
     const applyQueued = () => {
       if (!currentActorUserId || !selectedProjectId || blocked()) return false;
       return applyToolHandoffs(
-        loadQueuedResidentToolHandoffEntries(currentActorUserId, selectedProjectId),
+        loadQueuedResidentToolHandoffEntries(
+          currentActorUserId,
+          selectedProjectId,
+        ),
       );
     };
     const onToolHandoff = (event: Event) => {
-      if (!conversationMode) return;
-      if (!isResidentToolHandoffEvent(event) || event.detail.projectId !== selectedProjectId) return;
-      if (!currentActorUserId || event.detail.artifactRef.author !== currentActorUserId) return;
-      // Direct test/integration callers may emit without using the durable
-      // dispatch helper. Replacing the same per-ref entry remains idempotent.
-      const queued = enqueueResidentToolHandoff(currentActorUserId, selectedProjectId, event.detail);
-      if (!queued) {
-        addToastRef.current('Could not queue the tool revision locally. Retry Share with Resident.', 'error');
-        return;
-      }
-      if (composerIntentRef.current.operator_intent && composerIntentRef.current.artifact_refs.length > 0) {
-        addToastRef.current('Exact tool revision queued for your next Resident message', 'info');
-        return;
-      }
-      if (blocked()) {
+      if (
+        !conversationMode
+        || !isResidentToolHandoffEvent(event)
+        || event.detail.projectId !== selectedProjectId
+        || !currentActorUserId
+        || event.detail.artifactRef.author !== currentActorUserId
+      ) return;
+      // dispatchResidentToolHandoff persists before emitting. Never enqueue a
+      // second immutable entry here: the event is only a wake-up signal.
+      if (
+        blocked()
+        || (
+          composerIntentRef.current.operator_intent
+          && composerIntentRef.current.artifact_refs.length > 0
+        )
+      ) {
         addToastRef.current(
-          'Exact tool revision queued for your next Resident message',
+          'Exact tool revision queued for your next conversation message',
           'info',
         );
         return;
       }
       if (applyQueued()) {
-        addToastRef.current('Exact tool revision attached to Resident conversation', 'success');
-      } else {
-        addToastRef.current('Could not preserve the tool revision draft locally. Retry Share with Resident.', 'error');
+        addToastRef.current(
+          'Exact tool revision attached to the conversation',
+          'success',
+        );
       }
     };
     const onStorage = (event: StorageEvent) => {
       if (
         currentActorUserId
         && selectedProjectId
-        && isResidentToolHandoffQueueStorageKey(event.key, currentActorUserId, selectedProjectId)
+        && isResidentToolHandoffQueueStorageKey(
+          event.key,
+          currentActorUserId,
+          selectedProjectId,
+        )
         && applyQueued()
       ) {
-        addToastRef.current('Tool revision from another tab is ready in your next Resident message', 'success');
+        addToastRef.current(
+          'Tool revision from another tab is ready in your next conversation message',
+          'success',
+        );
       }
     };
     window.addEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
@@ -795,7 +842,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       window.removeEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
       window.removeEventListener('storage', onStorage);
     };
-  }, [applyToolHandoffs, conversationMode, currentActorUserId, selectedProjectId, sendState, submitting]);
+  }, [
+    applyToolHandoffs,
+    conversationMode,
+    currentActorUserId,
+    selectedProjectId,
+    sendState,
+    submitting,
+  ]);
 
   useEffect(() => {
     if (
@@ -806,11 +860,25 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       || sendState === 'sending'
       || sendState === 'needs_retry'
     ) return;
-    const queued = loadQueuedResidentToolHandoffEntries(currentActorUserId, selectedProjectId);
+    const queued = loadQueuedResidentToolHandoffEntries(
+      currentActorUserId,
+      selectedProjectId,
+    );
     if (queued.length > 0 && applyToolHandoffs(queued)) {
-      addToastRef.current('Queued tool revision is ready in your next Resident message', 'success');
+      addToastRef.current(
+        'Queued tool revision is ready in your next conversation message',
+        'success',
+      );
     }
-  }, [applyToolHandoffs, conversationMode, currentActorUserId, selectedProjectId, sendState, submitting]);
+  }, [
+    applyToolHandoffs,
+    conversationMode,
+    currentActorUserId,
+    selectedProjectId,
+    sendState,
+    submitting,
+    toolHandoffDrainTick,
+  ]);
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
   // them to one logical message; cleared after a successful send so the next
@@ -827,8 +895,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [pendingConvertMsg, setPendingConvertMsg] = useState<ProjectMessage | null>(null);
   const [convertSubmitting, setConvertSubmitting] = useState(false);
   // Per-message action state
-  const [resolvingId, setResolvingId] = useState<string | null>(null);
-  const [resolveInput, setResolveInput] = useState('');
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [creatingDirectionIds, setCreatingDirectionIds] = useState<Set<string>>(new Set());
   const [investigatingId, setInvestigatingId] = useState<string | null>(null);
@@ -891,6 +957,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
   const optimisticStrategicRefreshRef = useRef<StrategicRefreshMarker | null>(null);
   const completionReceiptTone = lastCycleCompletion ? getCompletionReceiptTone(lastCycleCompletion.status) : null;
+  const strategistStatus = useStrategistStatus({
+    strategistActive,
+    cycleProgress,
+    lastCycleCompletion: undefined, // chip in MessagesPanel only covers active+pending; completion uses its own banner below
+    pendingRefreshAt: strategicRefresh?.requested_at ?? null,
+    lastFiredAt: !strategicRefresh?.requested_at ? (strategicRefresh?.last_fired_at ?? null) : null,
+  });
+  const showStrategistChip = !conversationMode && (strategistActive || Boolean(strategicRefresh));
   // In-flight guard for the "cancel armed steer" affordance on the pending badge.
   const [cancellingRefresh, setCancellingRefresh] = useState(false);
   const openMessageCommandSurface = useCallback(() => {
@@ -999,11 +1073,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }, []);
   const {
-    refresh: refreshResidentConversation,
+    refresh: refreshConversation,
     loadOlder: loadOlderConversation,
     hasMore: conversationHasMore,
     loadingOlder: loadingOlderConversation,
-  } = useResidentConversation({
+  } = useConversation({
     enabled: conversationMode,
     projectId: selectedProjectId,
     actorUserId: currentActorUserId,
@@ -1047,6 +1121,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     setWebhookStats(null);
     optimisticStrategicRefreshRef.current = null;
     if (!usesStrategicReadModelRef.current) setStrategicRefresh(null);
+    // Reset triage pagination when switching projects
+    loadingOlderTriageRef.current = false;
+    triageOffsetRef.current = 0;
+    setHasOlderTriageMessages(false);
+    setLoadingOlderTriageMessages(false);
     const lastSeen = loadLastSeen(currentActorUserId, selectedProjectId);
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
@@ -1105,13 +1184,28 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     setSubmitting(false);
     submittingGuardRef.current.reset();
     attachmentMutationGuardRef.current.reset();
+    attachmentMutationGenerationRef.current += 1;
     setAttachmentMutating(false);
+    pendingAttachmentRestoreRequestRef.current += 1;
+    setRestoringPendingAttachments(false);
     return () => { active = false; };
   }, [currentActorUserId, selectedProjectId, updateComposerIntent]);
   useEffect(() => {
     if (!focusComposerSignal) return;
     focusComposerTextarea();
   }, [focusComposerSignal, focusComposerTextarea]);
+  // Reset triage pagination offset when search query changes so the first page
+  // reflects the newest matching messages.
+  const prevSearchQueryRef = useRef(searchQuery);
+  useEffect(() => {
+    if (prevSearchQueryRef.current !== searchQuery) {
+      prevSearchQueryRef.current = searchQuery;
+      triageOffsetRef.current = 0;
+      loadingOlderTriageRef.current = false;
+      setHasOlderTriageMessages(false);
+      setLoadingOlderTriageMessages(false);
+    }
+  }, [searchQuery]);
   // Memoized message-list derivation: open/resolved split, high-signal vs routine,
   // pinned blockers/questions, auto-promoted failing groups, visible-resolved, and
   // new-message counts — all behind one pure hook so the panel stays focused on
@@ -1153,53 +1247,20 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // narrows to needsOperatorIds, which is only populated from that model.
     needsActionOnly: needsActionOnly && usesStrategicReadModel,
   });
-  // Legacy fallback when the canonical strategic attention read model is unavailable.
-  const highSignalCount = useMemo(
-    () => countHighSignalMessages(messages, eventPrefs, tempMutes),
-    [messages, eventPrefs, tempMutes],
-  );
+  // Derived on-demand in the effect below; no separate memo needed.
   const conversationMessages = useMemo(() => {
     return messages
       .filter(msg => msg.surface != null
         ? msg.surface === 'conversation'
         : isConversationMessage(msg, eventPrefs, tempMutes))
       .slice()
-      .sort(compareResidentMessages);
+      .sort(compareConversationMessages);
   }, [messages, eventPrefs, tempMutes]);
-  // Live streaming turn: the resident strategist's in-flight reply, previewed as a
-  // "typing" bubble at the tail of the chat and reconciled into the durable
-  // ProjectMessage once it lands (see computeStrategicStreamingTurn). Only relevant
-  // in conversation mode; the persisted-message path renders regardless.
   const streamingTurn = useMemo(
-    () => (conversationMode ? computeStrategicStreamingTurn(strategicSessionTranscript, conversationMessages) : null),
+    () => conversationMode
+      ? computeStrategicStreamingTurn(strategicSessionTranscript, conversationMessages)
+      : null,
     [conversationMode, strategicSessionTranscript, conversationMessages],
-  );
-  // Live, ephemeral activity feed (commands / tools) for the in-flight turn.
-  const liveActivity = useMemo(
-    () => (conversationMode
-      ? computeStrategicSessionActivity(strategicSessionTranscript, conversationMessages)
-      : { items: [], latestLifecycle: null } as StrategicLiveActivity),
-    [conversationMode, strategicSessionTranscript, conversationMessages],
-  );
-  // Slow wall-clock tick so the persistent resident-activity widget can transition
-  // to its `dead` state on heartbeat staleness even when NO further WS frame arrives
-  // (a silently-dead session emits nothing). Only runs while a resident session is
-  // present in conversation mode; the InFlightCounter drives the sub-second display.
-  const [residentNowTick, setResidentNowTick] = useState<number>(() => Date.now());
-  const residentSessionSnapshot = currentStrategicState?.resident_session ?? null;
-  useEffect(() => {
-    if (!conversationMode || !residentSessionSnapshot) return;
-    const id = window.setInterval(() => setResidentNowTick(Date.now()), 5000);
-    return () => window.clearInterval(id);
-  }, [conversationMode, residentSessionSnapshot]);
-  // Truthful three-state (executing / idle / dead) resident live-activity, derived
-  // from real feed data + the resident_session snapshot — persistent whenever a
-  // resident session exists, never gated on an in-flight turn.
-  const residentActivity = useMemo(
-    () => (conversationMode
-      ? computeResidentActivityState(strategicSessionTranscript, conversationMessages, residentSessionSnapshot, residentNowTick)
-      : null),
-    [conversationMode, strategicSessionTranscript, conversationMessages, residentSessionSnapshot, residentNowTick],
   );
   // Render the operator's optimistic bubble until the durable copy lands. Client
   // identity, never message content, is the reconciliation key: identical text
@@ -1219,6 +1280,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       status: 'open' as ProjectMessage['status'],
       resolution: null,
       resolved_at: null,
+      delivered_at: null,
       created_at: optimisticSend.created_at,
       reply_to_message_id: optimisticSend.reply_to_message_id ?? null,
       idempotency_key: optimisticSend.key,
@@ -1236,14 +1298,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       conversationSend.clearPending();
     }
   }, [workingSince, conversationMessages, conversationSend]);
-  // A `done` lifecycle frame ends the turn — clear the working state / strip even
-  // before the durable reply is refetched (the streaming bubble keeps the final
-  // reply text until it reconciles).
-  useEffect(() => {
-    if (workingSince == null) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (liveActivity.latestLifecycle === 'done') setWorkingSince(null);
-  }, [workingSince, liveActivity.latestLifecycle]);
   // Safety net: never leave the working state stuck if a turn silently stalls.
   useEffect(() => {
     if (workingSince == null) return;
@@ -1265,14 +1319,44 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const actorUserId = currentActorUserId;
     const projectId = selectedProjectId;
     const sendKey = pendingAttachmentSendKey;
+    const restoreRequest = pendingAttachmentRestoreRequestRef.current + 1;
+    pendingAttachmentRestoreRequestRef.current = restoreRequest;
+    setRestoringPendingAttachments(true);
     let cancelled = false;
-    void listStoredPendingAttachments(actorUserId, projectId, sendKey)
-      .then(stored => {
+    let retryTimer: number | null = null;
+    let retryAttempt = 0;
+    let failureNotified = false;
+    const scopeIsCurrent = () => (
+      !cancelled
+      && pendingAttachmentRestoreRequestRef.current === restoreRequest
+      && selectedProjectIdRef.current === projectId
+      && (conversationSend.identity ?? optimisticSend?.key ?? null) === sendKey
+    );
+    const scheduleRestore = (delayMs: number) => {
+      if (!scopeIsCurrent()) return;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void restoreAttachments();
+      }, delayMs);
+    };
+    const restoreAttachments = async () => {
+      if (!scopeIsCurrent()) return;
+      if (attachmentMutationGuardRef.current.active) {
+        scheduleRestore(50);
+        return;
+      }
+      const mutationGeneration = attachmentMutationGenerationRef.current;
+      try {
+        const stored = await listStoredPendingAttachments(actorUserId, projectId, sendKey);
+        if (!scopeIsCurrent()) return;
         if (
-          cancelled
-          || selectedProjectIdRef.current !== projectId
-          || (conversationSend.identity ?? optimisticSend?.key ?? null) !== sendKey
-        ) return;
+          attachmentMutationGuardRef.current.active
+          || attachmentMutationGenerationRef.current !== mutationGeneration
+        ) {
+          scheduleRestore(50);
+          return;
+        }
         setPendingAttachments(previous => {
           const previousById = new Map(previous.map(attachment => [attachment.id, attachment]));
           const restored = stored.map(attachment => {
@@ -1286,13 +1370,27 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           pendingAttachmentsRef.current = restored;
           return restored;
         });
-      })
-      .catch(() => {
-        if (!cancelled && selectedProjectIdRef.current === projectId) {
-          addToastRef.current('Could not restore pending attachments; retry before sending', 'error');
+        setRestoringPendingAttachments(false);
+      } catch {
+        if (!scopeIsCurrent()) return;
+        if (!failureNotified) {
+          failureNotified = true;
+          addToastRef.current('Could not restore pending attachments; retrying automatically', 'error');
         }
-      });
-    return () => { cancelled = true; };
+        const retryDelayMs = Math.min(250 * (2 ** retryAttempt), 5_000);
+        retryAttempt += 1;
+        scheduleRestore(retryDelayMs);
+      }
+    };
+    void restoreAttachments();
+    return () => {
+      cancelled = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      if (pendingAttachmentRestoreRequestRef.current === restoreRequest) {
+        pendingAttachmentRestoreRequestRef.current += 1;
+        setRestoringPendingAttachments(false);
+      }
+    };
   }, [
     conversationMode,
     conversationSend.identity,
@@ -1480,13 +1578,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     );
     try {
       if (conversationMode) {
-        // When the strategic read model is available, the conversation refresh
-        // piggybacks on the strategic-state poll cadence (via strategicPollEpoch)
-        // instead of running its own independent timer. This eliminates the
-        // duplicate strategic-state assembly the conversation handler would
-        // otherwise trigger on the backend.
+        // When the strategic read model is available, useConversation piggybacks
+        // on that poll cadence. Standalone/minimal callers still need an initial
+        // direct conversation fetch.
         if (!usesStrategicReadModelRef.current) {
-          await refreshResidentConversation(false);
+          await refreshConversation(false);
         }
         const sessionMessages = messagesRef.current;
         sessionMessages.forEach(message => seenMessageIdsRef.current.add(message.id));
@@ -1496,7 +1592,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         }
         return;
       }
-      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: searchQuery.trim() ? '200' : '100' });
+      const loadingOlderTriage = loadingOlderTriageRef.current;
+      const requestOffset = loadingOlderTriage
+        ? triageOffsetRef.current + TRIAGE_PAGE_SIZE
+        : 0;
+      const requestLimit = TRIAGE_PAGE_SIZE;
+      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: String(requestLimit) });
+      if (requestOffset > 0) params.set('offset', String(requestOffset));
       if (searchQuery.trim()) params.set('q', searchQuery.trim());
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1529,18 +1631,57 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // Update tracking of seen message IDs
       msgs.forEach(m => seenMessageIdsRef.current.add(m.id));
       hasInitiallyLoadedRef.current = true;
-      // Only update state if messages actually changed — prevents scroll jumps from polling
-      setMessages(prev => {
-        if (messageListsEqual(prev, msgs)) return prev;
-        return msgs;
-      });
+      // Merge or replace messages depending on load mode
+      if (loadingOlderTriage || triageOffsetRef.current > 0) {
+        // Load-older and subsequent live refreshes merge into the expanded
+        // window so polling the newest page never discards history the operator
+        // explicitly loaded. The admin endpoint caps a single page at 200.
+        if (loadingOlderTriage) triageOffsetRef.current = requestOffset;
+        setMessages(prev => {
+          const merged = new Map(prev.map(m => [m.id, m]));
+          let changed = false;
+          for (const m of msgs) {
+            const existing = merged.get(m.id);
+            if (!existing) {
+              merged.set(m.id, m);
+              changed = true;
+            } else if (!messagesEqual(existing, m)) {
+              merged.set(m.id, m);
+              changed = true;
+            }
+          }
+          if (!changed) return prev;
+          return [...merged.values()];
+        });
+      } else {
+        // Initial load or poller refresh: replace state with fetched messages
+        setMessages(prev => {
+          if (messageListsEqual(prev, msgs)) return prev;
+          return msgs;
+        });
+      }
+      // The endpoint prepends up to 100 guaranteed high-signal rows to the
+      // requested page, so response length is not a pagination signal. Use
+      // the filtered total and actual page window instead. Once an expanded
+      // window reaches its terminal load-older page, normal newest-window
+      // polls must not re-enable the button merely because their single
+      // request is capped at 200 rows.
+      const responseTotal = Number(data.total);
+      const loadedWindow = (loadingOlderTriage ? requestOffset : triageOffsetRef.current) + TRIAGE_PAGE_SIZE;
+      setHasOlderTriageMessages(Number.isFinite(responseTotal) && loadedWindow < responseTotal);
       if (!usesStrategicReadModelRef.current) {
         onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
       }
     } catch {
       if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
     } finally {
-      if (isCurrentRequest()) setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+        if (loadingOlderTriageRef.current) {
+          loadingOlderTriageRef.current = false;
+          setLoadingOlderTriageMessages(false);
+        }
+      }
     }
     // Secondary fetches off the critical path — fire without awaiting so the
     // loading flag clears as soon as the primary messages fetch resolves,
@@ -1586,7 +1727,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           }).catch(() => {});
       }
     }
-  }, [conversationMode, selectedProjectId, onMessageCountChange, refreshResidentConversation, searchQuery, usesStrategicReadModel]);
+  }, [conversationMode, selectedProjectId, onMessageCountChange, refreshConversation, searchQuery, usesStrategicReadModel]);
+  const loadOlderTriageMessages = useCallback(() => {
+    if (conversationMode || loadingOlderTriageRef.current || !hasOlderTriageMessages) return;
+    loadingOlderTriageRef.current = true;
+    setLoadingOlderTriageMessages(true);
+    void fetchMessages();
+  }, [conversationMode, fetchMessages, hasOlderTriageMessages]);
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
   useEffect(() => {
     if (conversationMode || !realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
@@ -1617,8 +1764,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
     const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
     if (isInitialLoad) {
-      // First load — jump to bottom instantly
-      requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
+      // First load — jump to bottom instantly. Use the list's API when available
+      // (react-window scrollHeight is an estimate that lands mid-history).
+      if (conversationMode && conversationListRef.current?.scrollToBottom) {
+        requestAnimationFrame(() => conversationListRef.current?.scrollToBottom());
+      } else {
+        requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
+      }
     } else if (currentCount > prevMessageCountRef.current) {
       // Operator's own just-sent message (optimistic bubble) — always scroll.
       // For incoming messages use a generous threshold (200 px) to absorb mobile
@@ -1632,32 +1784,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
   }, [conversationMode, renderedConversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved, optimisticSend]);
-  // Keep the chat pinned to the live streaming preview as it grows — but only
-  // when the operator is already near the bottom, so a deliberate scroll-up to
-  // read history is never yanked back down mid-turn.
-  // Track total streamed length (reply + reasoning) so the view follows growth
-  // during the thinking phase too, not only once reply text starts landing.
-  const streamingText = streamingTurn?.segments.map(s => s.text).join('') ?? '';
-  useEffect(() => {
-    if (!conversationMode || !streamingText) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
-    if (nearBottom) {
-      requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }));
-    }
-  }, [conversationMode, streamingText]);
   // Update the tab-title badge from the canonical attention read model whenever
   // available, including the full message-list view. This keeps it aligned with
   // the closed-panel count; legacy callers without that model retain the
-  // high-signal fallback.
+  // high-signal fallback computed inline.
   useEffect(() => {
     if (usesStrategicReadModel) {
       onMessageCountChange?.(attentionNeeds);
       return;
     }
-    onMessageCountChange?.(highSignalCount);
-  }, [highSignalCount, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
+    onMessageCountChange?.(countHighSignalMessages(messages, eventPrefs, tempMutes));
+  }, [messages, eventPrefs, tempMutes, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
     const el = scrollRef.current;
@@ -1693,11 +1830,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   function beginAttachmentMutation() {
     if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active || uploading || sendState === 'needs_retry' || !selectedProjectId) return null;
     const scope = { actorUserId: currentActorUserId, projectId: selectedProjectId };
+    attachmentMutationGenerationRef.current += 1;
     const owner = attachmentMutationGuardRef.current.begin(scope.actorUserId, scope.projectId);
     setAttachmentMutating(true);
     return { ...scope, owner };
   }
-  function finishAttachmentMutation(owner: ReturnType<ComposerRequestOwnershipGuard['begin']>) { if (attachmentMutationGuardRef.current.finish(owner)) setAttachmentMutating(false); }
+  function finishAttachmentMutation(owner: ReturnType<ComposerRequestOwnershipGuard['begin']>) {
+    if (attachmentMutationGuardRef.current.finish(owner)) {
+      attachmentMutationGenerationRef.current += 1;
+      setAttachmentMutating(false);
+    }
+  }
   async function handleAddAttachment(file: File) {
     if (file.size > 50 * 1024 * 1024) {
       addToast('File exceeds the 50 MB size limit and was skipped', 'error');
@@ -1864,12 +2007,18 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // Synchronous guard first — reject re-entrant calls before the async
     // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
     // launch two requests.
-    if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active) return;
+    if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active || restoringPendingAttachments) return;
     const submitOwner = submittingGuardRef.current.begin(submitActorUserId, submitProjectId);
+    const releaseSubmittedComposer = () => {
+      if (submittingGuardRef.current.finish(submitOwner)) {
+        setSubmitting(false);
+        setUploading(false);
+      }
+    };
     setSubmitting(true);
     try {
       // The activity inbox retains its legacy operational-resolution endpoint.
-      // Resident conversation replies always use the durable idempotent message
+      // Strategist conversation replies always use the durable idempotent message
       // POST below, whose reply contract resolves open questions atomically.
       if (!conversationMode && submitReplyTo && submitReplyTo.message_type === 'QUESTION' && submitReplyTo.status === 'open') {
         if (attachmentsForSubmit.length > 0) {
@@ -1903,7 +2052,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         ? (isRetry ? optimisticSend.key : conversationSend.ensureIdentity(generateIdempotencyKey))
         : (idempotencyKeyRef.current ?? generateIdempotencyKey());
       if (!conversationMode) idempotencyKeyRef.current = sendIdentity;
-      // The continuous Resident conversation no longer inherits hidden
+      // The continuous strategist conversation no longer inherits hidden
       // Chat/Workday workbench state. Activity-inbox writes retain the legacy
       // workbench snapshot until that surface is retired.
       const workbenchContext = conversationMode
@@ -2143,7 +2292,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setLastArming(arming);
         clearPendingAttachments(sendIdentity);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
-        const receiptToast = residentAcceptanceToastCopy(wakeupState, arming);
+        const receiptToast = conversationAcceptanceToastCopy(wakeupState, arming);
         addToast(receiptToast.message, receiptToast.severity);
         let didRefreshStrategicState = false;
         if (arming === 'steering') {
@@ -2163,6 +2312,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           void refreshStrategicState?.();
           didRefreshStrategicState = true;
         }
+        // The receipt is durable and the old draft has been cleared. Release
+        // composer ownership before the best-effort refresh so the operator can
+        // immediately begin the next turn, including selecting attachments.
+        releaseSubmittedComposer();
         await fetchMessages().catch(() => undefined);
         if (!didRefreshStrategicState) void refreshStrategicState?.();
         recordStrategicInteraction();
@@ -2238,10 +2391,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         if (submitStillCurrent() && !attachmentUploadFailed) addToast('Failed to send message', 'error');
       }
     } finally {
-      if (submittingGuardRef.current.finish(submitOwner)) {
-        setSubmitting(false);
-        setUploading(false);
-      }
+      releaseSubmittedComposer();
     }
   }
 
@@ -2266,22 +2416,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       setCancellingRefresh(false);
     }
   }
-
-  const handleResolve = useCallback(async (msgId: string, resolution: string) => {
-    setResolvingId(null);
-    setResolveInput('');
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msgId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resolution }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await fetchMessages();
-    } catch {
-      addToastRef.current('Failed to resolve message', 'error');
-    }
-  }, [fetchMessages]);
 
   const handleDelete = useCallback(async (msgId: string) => {
     setDeletingIds(prev => new Set(prev).add(msgId));
@@ -2474,30 +2608,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     setSelectMode(false);
     if (count > 0) addToast(`${count} direction${count > 1 ? 's' : ''} created`, 'success');
   }
-
-  async function handleResolveGroup(msgs: ProjectMessage[]) {
-    try {
-      for (const m of msgs) {
-        await apiFetch(`${API_BASE_URL}/api/admin/messages/${m.id}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolution: '' }),
-        });
-      }
-      await fetchMessages();
-    } catch {
-      addToast('Failed to resolve messages', 'error');
-    }
-  }
-
   // Stable per-bubble handlers so `bubbleProps` keeps a stable identity across
   // renders (see React.memo on MessageBubble). Setters/refs are stable, so most
   // carry an empty dependency array; the rest depend only on their (already
   // memoized) target handler.
   const onCreateInvestigation = useCallback((msg: ProjectMessage) => { void handleCreateInvestigation(msg); }, [handleCreateInvestigation]);
   const onDelete = useCallback((msgId: string) => { void handleDelete(msgId); }, [handleDelete]);
-  const onStartResolve = useCallback((msgId: string) => { setResolvingId(msgId); setResolveInput(''); }, []);
-  const onCancelResolve = useCallback(() => setResolvingId(null), []);
   const onStartInvestigate = useCallback((msgId: string) => setInvestigatingId(msgId), []);
   const onCancelInvestigate = useCallback(() => setInvestigatingId(null), []);
   const onReply = useCallback((replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
@@ -2511,8 +2627,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
 
   const bubbleProps = useMemo(() => ({
     actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
-    resolvingId,
-    resolveInput,
     deletingIds,
     creatingDirectionIds,
     investigatingId,
@@ -2523,11 +2637,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     onToggleSelect: toggleSelect,
     onCreateDirection: handleOpenConvertModal,
     onCreateInvestigation,
-    onResolve: handleResolve,
     onDelete,
-    onStartResolve,
-    onCancelResolve,
-    onSetResolveInput: setResolveInput,
     onStartInvestigate,
     onCancelInvestigate,
     onReply,
@@ -2535,8 +2645,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     currentActorUserId: auth.currentUser?.uid ?? null,
   }), [
     conversationMode,
-    resolvingId,
-    resolveInput,
     deletingIds,
     creatingDirectionIds,
     investigatingId,
@@ -2547,10 +2655,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     toggleSelect,
     handleOpenConvertModal,
     onCreateInvestigation,
-    handleResolve,
     onDelete,
-    onStartResolve,
-    onCancelResolve,
     onStartInvestigate,
     onCancelInvestigate,
     onReply,
@@ -2624,16 +2729,40 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const current = composerIntentRef.current;
     const artifactRefs = current.artifact_refs.filter(ref => artifactRefIdentity(ref) !== identity);
     const sourceRefs = current.source_refs.filter(ref => artifactRefIdentity(ref) !== identity);
-    const next = updateComposerIntent({
+    const activePrompt = activeToolHandoffPromptRef.current;
+    const content = activePrompt?.identity === identity
+      && activePrompt.insertedIntoEmptyDraft
+      && current.content === activePrompt.prompt
+      ? ''
+      : current.content;
+    const intentArtifactIdentity = String(current.operator_intent?.artifact_ref_id ?? '');
+    const removingIntentArtifact = activePrompt?.identity === identity
+      || intentArtifactIdentity === identity
+      || (!intentArtifactIdentity
+        && Boolean(current.operator_intent)
+        && current.artifact_refs.length === 1);
+    const next = updateConversationComposerIntent(current, {
+      content,
       artifact_refs: artifactRefs,
       source_refs: sourceRefs,
-      operator_intent: undefined,
+      operator_intent: removingIntentArtifact ? undefined : current.operator_intent,
     });
+    if (
+      currentActorUserId
+      && selectedProjectId
+      && !saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next)
+    ) return;
+    updateComposerIntent({
+      content,
+      artifact_refs: artifactRefs,
+      source_refs: sourceRefs,
+      operator_intent: removingIntentArtifact ? undefined : current.operator_intent,
+    });
+    if (activePrompt?.identity === identity) activeToolHandoffPromptRef.current = null;
+    setNewContent(content);
     setDraftArtifactRefs(artifactRefs);
     setDraftSourceRefs(sourceRefs);
-    if (currentActorUserId && selectedProjectId) {
-      saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
-    }
+    setToolHandoffDrainTick(value => value + 1);
   }, [currentActorUserId, saveComposerDraftSnapshot, selectedProjectId, sendState, updateComposerIntent]);
 
   async function handleAbandonPendingSend() {
@@ -2754,8 +2883,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         <ConversationUtilityBar
           expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
           searchQuery={searchQuery} onSearchChange={setSearchQuery}
-          needsActionCount={usesStrategicReadModel ? attentionNeedsActionItems.length : 0} alertCount={alerts?.length ?? 0}
-          residentHealth={residentEngineHealth ? <ResidentEngineHealthChip health={residentEngineHealth} /> : null}
+          needsActionCount={usesStrategicReadModel ? visibleAttentionNeedsActionItems.length : 0} alertCount={alerts?.length ?? 0}
         />
       )}
 
@@ -2807,35 +2935,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         </div>
       )}
 
-      {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
-          a receipt showing when a prior steer was picked up and acted upon. Hidden
-          once the cycle starts (strategistActive), at which point "Strategist working…"
-          takes over. Displays the queued directive excerpt and coalesce count. */}
-      {strategicRefresh && !strategistActive && !conversationMode && (
-        <div className={`px-4 md:px-6 py-2 border-b ${strategicRefresh.requested_at ? 'border-neutral-800 bg-amber-950/40' : 'border-green-800 bg-emerald-950/40'} flex items-center gap-2 shrink-0`} role="status" aria-live="polite">
-          <span className={`w-2 h-2 rounded-full ${strategicRefresh.requested_at ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} aria-hidden="true" />
-          <span className={`text-xs font-medium ${strategicRefresh.requested_at ? 'text-amber-300' : 'text-emerald-300'}`}>
-            {strategicRefresh.requested_at ? (
-              <>
-                Strategic cycle pending{strategicRefresh.origin ? ` · ${strategicRefresh.origin}` : ''}
-                {strategicRefresh.excerpt && (
-                  <>
-                    {' · '}
-                    <span className="italic">{strategicRefresh.excerpt.slice(0, 120)}{strategicRefresh.excerpt.length > 120 ? '…' : ''}</span>
-                  </>
-                )}
-                {strategicRefresh.operator_count && strategicRefresh.operator_count > 1 && (
-                  <> · +{strategicRefresh.operator_count - 1} {strategicRefresh.operator_count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
-                )}
-                {` · armed ${timeAgo(strategicRefresh.requested_at)}`}
-              </>
-            ) : (
-              <>
-                Steer picked up{strategicRefresh.last_fired_at ? ` · strategic cycle ran ${timeAgo(strategicRefresh.last_fired_at)}` : ''}
-              </>
-            )}
-          </span>
-          {strategicRefresh.requested_at && (
+      {/* Unified strategist status chip: covers active cycle (indigo), pending steer (indigo),
+          and steer-received receipt (emerald). The cycle-completion banner below is kept
+          separate because it carries rich detail (direction counts, etc.). */}
+      {showStrategistChip && (
+        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 flex items-center gap-2 shrink-0">
+          <StrategistStatusChip status={strategistStatus} />
+          {strategicRefresh?.requested_at && (
             <button
               type="button"
               onClick={() => { void handleCancelStrategicRefresh(); }}
@@ -2846,23 +2952,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               {cancellingRefresh ? 'Cancelling…' : 'Cancel'}
             </button>
           )}
-        </div>
-      )}
-
-      {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
-          WS events. Shows phase label and steering excerpt when the enriched event payload
-          is available, otherwise falls back to the minimal "working" text. */}
-      {strategistActive && !conversationMode && (
-        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
-          <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse mt-0.5 shrink-0" aria-hidden="true" />
-          <span className="text-xs text-indigo-300 font-medium min-w-0">
-            {cycleProgress?.phase_label ? `Strategist: ${cycleProgress.phase_label}…` : 'Strategist working…'}
-            {cycleProgress?.steering_excerpt && (
-              <span className="ml-1.5 text-indigo-400/80 italic font-normal truncate block">
-                "{cycleProgress.steering_excerpt.slice(0, 100)}{cycleProgress.steering_excerpt.length > 100 ? '…' : ''}"
-              </span>
-            )}
-          </span>
         </div>
       )}
 
@@ -2917,15 +3006,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       {/* Needs-action strip — derived from the canonical attention model when the
           strategic read model is available. Shows needs_operator items at the top
           with lifecycle.clears_when so the operator sees they will self-clear. */}
-      {(!conversationMode || chatChromeExpanded) && usesStrategicReadModel && attentionNeedsActionItems.length > 0 && (
+      {(!conversationMode || chatChromeExpanded) && usesStrategicReadModel && visibleAttentionNeedsActionItems.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border bg-amber-950/20 px-3 py-2 md:px-4" data-testid="needs-action-strip">
           <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-col gap-1.5">
             <div className="flex items-center gap-2">
               <span className="text-xs font-semibold text-amber-200">Needs your action</span>
-              <span className="shrink-0 rounded-full bg-amber-800/60 px-1.5 text-ui-sm font-semibold text-amber-200">{attentionNeedsActionItems.length}</span>
+              <span className="shrink-0 rounded-full bg-amber-800/60 px-1.5 text-ui-sm font-semibold text-amber-200">{visibleAttentionNeedsActionItems.length}</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {attentionNeedsActionItems.slice(0, 6).filter(item => !resolvedConfirmationIds.has(item.id)).map(item => {
+              {visibleAttentionNeedsActionItems.slice(0, 6).map(item => {
                 const isMessage = item.kind === 'message';
                 const isConfirmation = item.kind === 'confirmation';
                 const messageId = isMessage ? item.ref?.id : null;
@@ -3096,11 +3185,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         hasOlderConversationMessages={conversationMode && conversationHasMore}
         loadingOlderConversationMessages={loadingOlderConversation}
         onLoadOlderConversationMessages={() => loadOlderConversation()}
+        hasOlderTriageMessages={!conversationMode && hasOlderTriageMessages}
+        loadingOlderTriageMessages={loadingOlderTriageMessages}
+        onLoadOlderTriageMessages={loadOlderTriageMessages}
         conversationListRef={conversationListRef}
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
-        operationItem={residentActivity && residentEngineHealth?.engine_owner !== 'strategic_resident' ? (
-          <StrategicResidentActivityWidget state={residentActivity} onOpenActivity={onOpenActivityFeed} />
-        ) : null}
         scrollRef={scrollRef}
         dividerDismissedRef={dividerDismissedRef}
         messages={conversationMode ? renderedConversationMessages : messages}
@@ -3140,7 +3229,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setShowTempMuteMenu={setShowTempMuteMenu}
         addTemporaryMute={addTemporaryMute}
         getTop3NoisyEventTypes={getTop3NoisyEventTypes}
-        handleResolveGroup={handleResolveGroup}
         handleBulkDeleteResolved={handleBulkDeleteResolved}
         scrollToBottom={scrollToBottom}
       />
@@ -3205,8 +3293,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         newType={effectiveNewType}
         newContent={newContent}
         submitting={submitting}
-        sendLocked={attachmentMutating}
-        attachmentLocked={attachmentMutating}
+        sendLocked={attachmentMutating || restoringPendingAttachments}
+        attachmentLocked={attachmentMutating || restoringPendingAttachments}
         sendState={sendState}
         wakeupState={sendWakeupState}
         editingLocked={sendState === 'sending' || sendState === 'needs_retry'}

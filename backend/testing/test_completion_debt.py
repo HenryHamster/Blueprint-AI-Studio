@@ -313,9 +313,6 @@ def test_seed_is_idempotent_and_covers_families(sync_session):
     assert first > 0
     assert second == 0, "re-seeding must never duplicate rows"
     assert _count(sync_session) == total_after_first
-    # Standing inventory families are present.
-    assert _count(sync_session, dedupe_key="seed:no_ci_gate_live_trial") == 1
-    assert _count(sync_session, dedupe_key="seed:capability_trial_rail") == 1
     # Dormant runtime-config knobs are enumerated into the ledger.
     assert _count(sync_session, kind=cd.KIND_DORMANT_KNOB) >= 1
 
@@ -329,7 +326,28 @@ async def test_aseed_matches_sync_seed_and_is_idempotent(db_session):
 
     assert created > 0
     assert again == 0
-    assert await _acount(db_session, dedupe_key="seed:no_ci_gate_live_trial") == 1
+
+
+@pytest.mark.asyncio
+async def test_seed_inventory_rows_are_resolvable(db_session):
+    """Standing seed-inventory rows (no_ci_gate_live_trial, capability_trial_rail,
+    adversarial_observe_watch) are no longer auto-seeded — they had no resolver and
+    permanently consumed open-debt snapshot slots, duplicating dynamic recorders
+    that DO resolve."""
+    # The _standing_inventory_debts function has been removed.
+    assert not hasattr(cd, "_standing_inventory_debts")
+    # The _iter_seed_debts generator no longer yields seed:* keys.
+    from app.completion_debt import _iter_seed_debts
+
+    seed_keys = {d["dedupe_key"] for d in _iter_seed_debts()}
+    assert not any(k.startswith("seed:") for k in seed_keys)
+    # After seeding the full inventory, the former static rows are absent.
+    await cd.aseed_completion_debt_inventory(db_session)
+    assert await _acount(db_session, dedupe_key="seed:no_ci_gate_live_trial") == 0
+    assert await _acount(db_session, dedupe_key="seed:capability_trial_rail") == 0
+    assert await _acount(db_session, dedupe_key="seed:adversarial_observe_watch") == 0
+    # Dormant runtime-config knobs are still seeded.
+    assert await _acount(db_session, kind=cd.KIND_DORMANT_KNOB) >= 1
 
 
 @pytest.mark.asyncio
@@ -386,7 +404,7 @@ async def test_get_open_completion_debt_includes_global_rows(db_session):
     await cd.arecord_completion_debt(
         db_session,
         dedupe_key="global:test_global_item",
-        kind=cd.KIND_SEED_INVENTORY,
+        kind=cd.KIND_DORMANT_KNOB,
         title="Global seed item (no project)",
         project_id=None,
     )
@@ -401,8 +419,8 @@ async def test_get_open_completion_debt_includes_global_rows(db_session):
 
     snapshot = await cd.get_open_completion_debt(db_session, project.id)
     kinds = {e["kind"] for e in snapshot["items"]}
-    assert cd.KIND_SEED_INVENTORY in kinds, (
-        "global seed rows (project_id=None) must surface in per-project snapshots"
+    assert cd.KIND_DORMANT_KNOB in kinds, (
+        "global rows (project_id=None) must surface in per-project snapshots"
     )
     assert cd.KIND_NO_CI_GATE in kinds, "project-scoped rows must also surface"
 
@@ -437,7 +455,7 @@ async def test_open_debt_snapshot_reports_true_totals_and_per_kind_bounds(db_ses
         await cd.arecord_completion_debt(
             db_session,
             dedupe_key=f"global:seed:{i}",
-            kind=cd.KIND_SEED_INVENTORY,
+            kind=cd.KIND_RETIREMENT_RESIDUAL,
             title=f"Global seed {i}",
             project_id=None,
         )
@@ -451,8 +469,8 @@ async def test_open_debt_snapshot_reports_true_totals_and_per_kind_bounds(db_ses
 
     # Project-scoped rows float to the top: all 6 project rows must appear in
     # the snapshot before any global seed rows.
-    project_items = [e for e in snapshot["items"] if e["kind"] != cd.KIND_SEED_INVENTORY]
-    global_items = [e for e in snapshot["items"] if e["kind"] == cd.KIND_SEED_INVENTORY]
+    project_items = [e for e in snapshot["items"] if e["project_id"] is not None]
+    global_items = [e for e in snapshot["items"] if e["project_id"] is None]
     assert len(project_items) == 6, "all 6 project-scoped rows must appear in snapshot"
     assert len(global_items) == 4, "remaining 4 slots filled from global rows"
     # Project rows come before global rows in the snapshot.
@@ -1058,18 +1076,18 @@ async def test_dormant_knob_reconciliation_recovers_env_graduation_and_demotion(
     """Startup-style reconciliation must resolve stale rows and reopen them."""
     from app.completion_debt import areconcile_dormant_knob_debts
 
-    key = "dormant_knob:safeguard_challenge_gate_mode"
+    key = "dormant_knob:direction_gap_respawn_block_mode"
     seeded = await cd.arecord_completion_debt(
         db_session,
         dedupe_key=key,
         kind=cd.KIND_DORMANT_KNOB,
-        title="Safeguard challenge gate is observe-only",
+        title="Direction-gap respawn block is observe-only",
         project_id=None,
     )
     await db_session.commit()
     assert seeded is True
 
-    monkeypatch.setitem(runtime_config, "safeguard_challenge_gate_mode", "enforce")
+    monkeypatch.setitem(runtime_config, "direction_gap_respawn_block_mode", "enforce")
     stats = await areconcile_dormant_knob_debts(db_session)
     await db_session.commit()
     db_session.expire_all()
@@ -1082,7 +1100,7 @@ async def test_dormant_knob_reconciliation_recovers_env_graduation_and_demotion(
     assert resolved_row.status == cd.STATUS_RESOLVED
     assert stats["resolved"] >= 1
 
-    monkeypatch.setitem(runtime_config, "safeguard_challenge_gate_mode", "observe")
+    monkeypatch.setitem(runtime_config, "direction_gap_respawn_block_mode", "observe")
     stats = await areconcile_dormant_knob_debts(db_session)
     await db_session.commit()
     db_session.expire_all()
@@ -1175,30 +1193,62 @@ def test_dormant_knob_registry_covers_all_dormant_defaults():
             ), f"Dormant flag '{knob_key}' (value=False) not in registry"
 
 
-def test_completion_debt_weight_mode_seeds_dormant_debt(monkeypatch):
-    """The new completion_debt_weight_mode knob (default 'observe') is a real
-    runtime_config key, so iter_dormant_knob_debts now emits its dormant-knob row.
+def test_completion_debt_weight_mode_graduated_to_enforce_no_dormant_seed(monkeypatch):
+    """completion_debt_weight_mode graduated to "enforce" (three-state
+    adjudication, decision #7): it is no longer a dormant knob.
 
-    Regression guard for Defect 2: before the knob became a real default key,
-    runtime_config.get(key, "") yielded "" (not in {off, observe}) and the row
-    was silently skipped — so the graduation gate seeded no obligation.
+    The shipped default is now "enforce", the key is removed from
+    ``_DORMANT_MODE_KNOBS``, and ``iter_dormant_knob_debts`` never emits its
+    dormant-knob row again — even if an operator pins it back to "observe" the
+    de-registration means it no longer accrues completion debt.
     """
-    # The shipped default must be a member of the dormant set so the row seeds.
-    assert str(runtime_config.get("completion_debt_weight_mode")).lower() == "observe"
+    # The shipped default is now the armed "enforce" state.
+    assert str(runtime_config.get("completion_debt_weight_mode")).lower() == "enforce"
 
-    debts = iter_dormant_knob_debts()
-    by_key = {d["dedupe_key"]: d for d in debts}
-    assert "dormant_knob:completion_debt_weight_mode" in by_key, (
-        "completion_debt_weight_mode in observe mode must seed its dormant-knob debt"
-    )
-    entry = by_key["dormant_knob:completion_debt_weight_mode"]
-    assert entry["kind"] == "dormant_knob"
-    assert entry["detail"] == {"knob": "completion_debt_weight_mode", "value": "observe"}
+    # De-registered: no longer tracked as dormant debt.
+    assert "completion_debt_weight_mode" not in _DORMANT_MODE_KNOBS
 
-    # When graduated to enforce, the knob leaves the dormant set → no seed row.
-    monkeypatch.setitem(runtime_config, "completion_debt_weight_mode", "enforce")
     enforced_keys = {d["dedupe_key"] for d in iter_dormant_knob_debts()}
-    assert "dormant_knob:completion_debt_weight_mode" not in enforced_keys
+    assert "dormant_knob:completion_debt_weight_mode" not in enforced_keys, (
+        "graduated completion_debt_weight_mode must not seed a dormant-knob debt"
+    )
+
+    # Even an operator rollback to "observe" no longer re-registers dormant debt,
+    # because the knob has left the registry entirely.
+    monkeypatch.setitem(runtime_config, "completion_debt_weight_mode", "observe")
+    rolled_back_keys = {d["dedupe_key"] for d in iter_dormant_knob_debts()}
+    assert "dormant_knob:completion_debt_weight_mode" not in rolled_back_keys
+
+
+def test_completion_debt_weight_default_enforce_blends_weight():
+    """Under the shipped default the enforce blend is armed: the release qualifier
+    lets a configured completion_debt weight reach the composite.
+
+    Ties the promoted runtime_config default to the observable release_qualifier
+    behavior it graduates — a test-only registry edit would not exercise this.
+    """
+    from app.release_qualifier import (
+        _apply_completion_debt_weight_mode,
+        _resolve_completion_debt_weight_mode,
+    )
+    from app.release_scoring import DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+
+    # Shipped default resolves to the armed "enforce" mode.
+    assert _resolve_completion_debt_weight_mode() == "enforce"
+
+    # A configured completion_debt weight survives into the effective blend.
+    configured = {"weights": {"completion_debt": 0.2, "coverage": 0.8}}
+    gated = _apply_completion_debt_weight_mode(configured)
+    assert gated["weights"]["completion_debt"] == 0.2
+
+    # Graduated-but-unset falls back to the nonzero enforce default so promotion
+    # actually changes the composite (never silently zeroed).
+    unset = {"weights": {"coverage": 1.0}}
+    gated_unset = _apply_completion_debt_weight_mode(unset)
+    assert (
+        gated_unset["weights"]["completion_debt"]
+        == DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+    )
 
 
 @pytest.mark.asyncio
@@ -1250,36 +1300,81 @@ async def test_autonomous_spawn_budget_mode_seeds_and_graduates_dormant_debt(db_
     )
 
 
+def test_completion_debt_design_doc_section_includes_all_kinds():
+    """``_build_completion_debt_design_doc_section`` must list every live debt kind.
+
+    Every defined debt-kind constant that has an active writer in the codebase
+    must appear in both the ``debt_kinds`` array and the ``recorders`` map of
+    the design-doc section so the system-surface documentation is complete.
+    Missing a live kind means the seed will silently drop it from the stored
+    section on the next restart, making it invisible through discovery.
+    """
+    section = cd._build_completion_debt_design_doc_section()
+
+    # Every kind with a live writer must appear in the debt_kinds list.
+    assert cd.KIND_DORMANT_KNOB in section["debt_kinds"]
+    assert cd.KIND_CAPABILITY_TRIAL in section["debt_kinds"]
+    assert cd.KIND_NO_CI_GATE in section["debt_kinds"]
+    assert cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL in section["debt_kinds"]
+    assert cd.KIND_RETIREMENT_RESIDUAL in section["debt_kinds"]
+    assert cd.KIND_CAPABILITY_EARN_OBLIGATION in section["debt_kinds"]
+
+    # Every debt kind must have a recorder entry pointing to its writer file.
+    kind_to_recorder_key = {
+        cd.KIND_DORMANT_KNOB: "dormant_knob",
+        cd.KIND_CAPABILITY_TRIAL: "capability_trial",
+        cd.KIND_NO_CI_GATE: "no_ci_gate",
+        cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL: "hotfix_deploy_pending_backfill",
+        cd.KIND_RETIREMENT_RESIDUAL: "retirement_residual",
+        cd.KIND_CAPABILITY_EARN_OBLIGATION: "capability_earn_obligation",
+    }
+    for kind, key in kind_to_recorder_key.items():
+        assert key in section["recorders"], f"recorders missing entry for {kind} (key={key})"
+
+    # Removed/retired kinds must not appear in the code-generated section.
+    # Use getattr so the assertion is robust if the sibling task removing
+    # KIND_SEED_INVENTORY has already landed.
+    if hasattr(cd, "KIND_SEED_INVENTORY"):
+        assert cd.KIND_SEED_INVENTORY not in section["debt_kinds"], (
+            "KIND_SEED_INVENTORY is retired — must not appear in code-generated section"
+        )
+
+
 @pytest.mark.asyncio
 async def test_seed_writes_completion_debt_design_doc_section(db_session):
-    """Verify the design-doc section is seeded when absent and is idempotent.
+    """Verify the ledger section is seeded to project_telemetry, not design_doc.
 
-    Regression test for named_test acceptance requirement: the section must be
-    written to design_doc and re-seeding must not duplicate or churn fields.
+    God-column cutover: the section is stored SOLELY in the dedicated
+    ``project_telemetry`` row (design_doc write leg cut). Re-seeding must be
+    idempotent, must NOT write the design_doc key, and must preserve
+    operator-authored additions carried on the row.
     """
     from app.completion_debt import seed_completion_debt_design_doc_section
+    from app.project_telemetry import read_telemetry, set_project_telemetry
 
     project = Project(name="test-seed-doc", user_id="u")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    # First seed should write the section.
+    section_key = "systems/completion-debt-ledger"
+
+    # First seed should write the section row.
     result_first = await seed_completion_debt_design_doc_section(db_session, project.id)
     await db_session.commit()
 
     assert result_first is True, "first seed should return True (section written)"
 
-    # Refresh project to read the updated design_doc.
+    # The section lives in the telemetry table — NOT in design_doc.
     db_session.expire(project, ["design_doc"])
     await db_session.refresh(project)
-
     doc = project.design_doc or {}
-    section_key = "systems/completion-debt-ledger"
-    assert section_key in doc, f"section '{section_key}' must exist in design_doc"
+    assert section_key not in doc, (
+        f"design_doc write leg is cut: '{section_key}' must NOT be in design_doc"
+    )
 
-    section = doc[section_key]
-    assert isinstance(section, dict), "section must be a dict"
+    section = await read_telemetry(db_session, project.id, section_key)
+    assert isinstance(section, dict), "section must be a dict in project_telemetry"
     assert section.get("summary") is not None, "section must have a summary"
     assert section.get("status") == "active", "section status must be 'active'"
     assert "debt_kinds" in section, "section must list debt_kinds"
@@ -1293,14 +1388,12 @@ async def test_seed_writes_completion_debt_design_doc_section(db_session):
     assert cd.KIND_RETIREMENT_RESIDUAL in section["debt_kinds"], (
         "retirement_residual must be in debt_kinds"
     )
-    assert cd.KIND_SEED_INVENTORY in section["debt_kinds"], (
-        "seed_inventory must be in debt_kinds"
-    )
     assert "recorders" in section, "section must list recorder surfaces"
     assert "reconciliation_surfaces" in section, "section must list reconciliation surfaces"
     assert "strategist_surface" in section, "section must document strategist surface"
     assert "admin_surface" in section, "section must document admin surface"
     assert "module" in section, "section must list the source module"
+    assert section.get("_authored_by") == "code", "seeded section must be code-authored"
 
     # Re-seeding should be idempotent (no churn, no duplication).
     result_second = await seed_completion_debt_design_doc_section(db_session, project.id)
@@ -1308,43 +1401,32 @@ async def test_seed_writes_completion_debt_design_doc_section(db_session):
 
     assert result_second is False, "second seed should return False (no changes)"
 
-    # Refresh again and verify the section is unchanged.
-    db_session.expire(project, ["design_doc"])
-    await db_session.refresh(project)
-    doc_after_reseed = project.design_doc or {}
-    assert doc_after_reseed.get(section_key) == section, (
+    section_after_reseed = await read_telemetry(db_session, project.id, section_key)
+    assert section_after_reseed == section, (
         "re-seeding must not churn or modify the section"
     )
 
-    # Verify that operator-authored additions are not clobbered.
-    # Manually add an operator field via a fresh DB read, then re-seed.
-    # Need to use with_design_doc_locked to properly track changes to JSONB.
-    from app.task_locking import with_design_doc_locked
-
-    def _add_operator_note(doc):
-        doc[section_key]["operator_note"] = "This is an operator-added note"
-
-    await with_design_doc_locked(db_session, project.id, _add_operator_note, skip_locked=False)
+    # Operator-authored additions on the row must survive a re-seed.
+    section_with_note = dict(section)
+    section_with_note["operator_note"] = "This is an operator-added note"
+    await set_project_telemetry(db_session, project.id, section_key, section_with_note)
     await db_session.commit()
 
-    # Re-seed again — the operator_note should remain.
     await seed_completion_debt_design_doc_section(db_session, project.id)
     await db_session.commit()
 
-    db_session.expire(project, ["design_doc"])
-    await db_session.refresh(project)
-    doc_after_op = project.design_doc or {}
-    section_after_op = doc_after_op.get(section_key, {})
+    section_after_op = await read_telemetry(db_session, project.id, section_key)
     assert section_after_op.get("operator_note") == "This is an operator-added note", (
         "re-seeding must preserve operator-authored additions"
     )
     assert section_after_op.get("summary") is not None, (
-        "re-seeding must refresh code-authored fields (summary)"
+        "re-seeding must retain code-authored fields (summary)"
     )
-    # The code fields should have been refreshed (result_third should be False if no code change
-    # between this test run and the previous, but it could be True if code fields changed).
-    # We just verify the section still has the expected structure.
     assert "debt_kinds" in section_after_op, "section must still have debt_kinds after re-seed"
+    # design_doc still untouched by the seeder.
+    db_session.expire(project, ["design_doc"])
+    await db_session.refresh(project)
+    assert section_key not in (project.design_doc or {})
 
 
 @pytest.mark.asyncio

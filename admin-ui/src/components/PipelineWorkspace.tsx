@@ -58,7 +58,7 @@ interface PipelineRailProps {
   attentionTasks: AttentionTaskInput[];
   localFallbackTasks: Task[];
   trackedTaskIds: Set<string>;
-  taskContextSessionProps: Pick<TaskContextRailProps, 'sessionRefs' | 'savingSessionRefs' | 'onUpdateSessionRefs'>;
+  taskContextSessionProps?: Pick<TaskContextRailProps, 'sessionRefs' | 'savingSessionRefs' | 'onUpdateSessionRefs'>;
   onOpenTask: (task: Task) => void;
   onOpenPipeline: () => void;
   onTrackTask: (task: Task) => void;

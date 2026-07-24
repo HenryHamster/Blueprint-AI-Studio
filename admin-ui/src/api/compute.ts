@@ -359,25 +359,6 @@ export interface PoolPayoffVerdict {
   recommended_action: string;
 }
 
-export interface PanelReviewEffectiveness {
-  challenged_confirmed: number;
-  challenged_revised: number;
-  challenged_rejected: number;
-  total_challenged: number;
-  overturn_rate: number | null;
-  cost_per_challenge_usd?: number | null;
-  challenged_escalated?: number;
-  challenged_degraded?: number;
-  sampled_out_count?: number;
-  effective_coverage?: number | null;
-  fail_open_rate?: number | null;
-  gate_health?: {
-    state: 'NO_DATA' | 'DEGRADED' | 'INSUFFICIENT' | 'LOW_COVERAGE' | 'PARTIAL' | 'HEALTHY';
-    fail_open_rate: number | null;
-    total_invocations: number;
-    min_sample: number;
-  };
-}
 
 export interface ChallengerSampleRateRecommendation {
   status: 'no_data' | 'insufficient_data' | 'gate_earning' | 'reduce';
@@ -563,17 +544,6 @@ export interface EfficiencyAxesResponse {
   // Optional nested blocks surfaced by the backend for the operator dashboard.
   format_compliance?: FormatComplianceResponse;
   agent_timeout_rate?: AgentTimeoutRateResponse;
-  // Panel review effectiveness: overturn_rate, challenged outcome counts, and
-  // total gate invocations from the latest snapshot. Null when no gate
-  // invocations exist in the window. Optional for older backends.
-  panel_review_effectiveness?: PanelReviewEffectiveness | null;
-  // Deploy-scoped companion: same metric restricted to tasks after the earliest
-  // snapshot under the current serving SHA. Null on older backends or when the
-  // deploy boundary is unknown (first snapshot under this build).
-  panel_review_effectiveness_post_deploy?: PanelReviewEffectiveness | null;
-  // Data-driven recommended sample_rate for the challenger gate, computed from
-  // the latest snapshot's overturn_rate. Optional for older backends.
-  panel_review_recommended_sample_rate?: ChallengerSampleRateRecommendation | null;
   // VM cost attribution: per-task-type breakdown of infrastructure spend from
   // the latest snapshot, showing which task types (review, create, side-car, etc.)
   // dominate VM spend. Optional for older backends.

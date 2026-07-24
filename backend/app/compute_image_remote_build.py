@@ -59,7 +59,7 @@ def _normalize_builder_sa(sa_email: str, project_id: str) -> str:
 
     Cloud Build's Build.service_account must be
     ``projects/{PROJECT}/serviceAccounts/{EMAIL}``.  The env var is stored as a
-    bare email address (e.g. ``compute-image-builder-sa@proj.iam.gserviceaccount.com``);
+    bare email address (e.g. ``image-builder-sa@proj.iam.gserviceaccount.com``);
     this normalises it so callers never need to know the difference.
     """
     if sa_email.startswith("projects/"):
@@ -363,11 +363,28 @@ def _check_dockerfile_network_directives(content: bytes) -> None:
             )
 
 
+def get_cloud_build_status(build_id: str, *, region: str | None = None, _client=None) -> str:
+    """Return the current Cloud Build status string for *build_id* (single non-blocking check).
+
+    Returns a status name from ``_TERMINAL_BUILD_STATUSES`` or a non-terminal name such as
+    ``"WORKING"``/``"QUEUED"``.  Raises on API error so callers can decide whether to retry.
+    """
+    region = region or _get_build_region()
+    project = _get_gcp_project_id()
+    client = _client or _cloud_build_client(region)
+    build = client.get_build(
+        request={"project_id": project, "id": build_id,
+                 "name": f"projects/{project}/locations/{region}/builds/{build_id}"}
+    )
+    return getattr(build.status, "name", str(build.status))
+
+
 def remote_build_and_push(*, repo_dir: str, registry_repo: str, image_name: str,
                           dockerfile: str, dep_files: Sequence[str], parent: str | None = None,
                           build_args: Dict[str, str] | None = None, dry_run: bool = False,
                           cancel_event=None, _tag_exists_fn=None, _submit_fn=None,
-                          _poll_fn=None, _resolve_digest_fn=None, **_ignored) -> BuildResult:
+                          _poll_fn=None, _resolve_digest_fn=None,
+                          **_ignored) -> BuildResult:
     """Hash, validate, remotely build, scan, publish, and return a digest pin."""
     from app.compute_image_build import CredentialLeakError
     if not _remote_build_configured():
@@ -399,6 +416,7 @@ def remote_build_and_push(*, repo_dir: str, registry_repo: str, image_name: str,
     full_repo = f"{registry_repo}/{image_name}"
     tag_exists = _tag_exists_fn or remote_registry_tag_exists
     resolve_digest = _resolve_digest_fn or _resolve_registry_digest_from_api
+
     if tag_exists(full_repo, dep_hash):
         digest = resolve_digest(full_repo, dep_hash)
         return BuildResult(pinned_ref=f"{full_repo}@{digest}" if digest else f"{full_repo}:{dep_hash}",

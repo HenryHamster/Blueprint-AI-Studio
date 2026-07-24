@@ -444,7 +444,7 @@ async def activate_eligible_staged_directions(
     # eligible direction at once. Overflow stays staged with its marker intact;
     # the periodic Step 13 reaper sweep re-runs and drains it as active slots
     # free, so deferred-but-approved work is never stranded.
-    max_active = _runtime_config.get("max_active_directions", 5)
+    max_active = _runtime_config.get("max_active_directions", 10)
 
     # Scarce-slot tie-break: higher priority wins, then oldest staged_at (FIFO)
     # so the longest-waiting approved work activates first. Unknown priority

@@ -157,15 +157,21 @@ ${checks.join('\n')}
 - A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
 }
 
-// Per-lens checklist text used by buildLensScopedChecklistSection.
-// Each panel_review lens agent receives only its own section so it does not
-// re-read the full four-section list it was explicitly told to ignore.
+// Reviewer criterion for catching unjustified default-off/observe/fail-open hedges.
+// Exported so the self-review test file can assert the reviewer checks the same patterns
+// the agent self-review focus blocks name.
+export const REVIEW_ANTI_HEDGE_CRITERION =
+  '- Does the diff introduce a new flag, gate, or mode that defaults to `observe`, ' +
+  'disabled, or `fail-open` without documented rationale? ' +
+  'New behavior must default ON/committed — flag unjustified hedges as a correctness issue.';
+
 const LENS_CHECKLIST_ITEMS: Record<string, string> = {
   correctness: `**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
-- Do any database queries have N+1 problems or missing indexes?`,
+- Do any database queries have N+1 problems or missing indexes?
+${REVIEW_ANTI_HEDGE_CRITERION}`,
   security: `**Security:**
 - Are user inputs validated and sanitized before use?
 - Are there SQL injection, XSS, path traversal, or command injection risks?
@@ -175,7 +181,8 @@ const LENS_CHECKLIST_ITEMS: Record<string, string> = {
 - Is the code readable and following existing patterns in the codebase?
 - Are there obvious performance issues (unnecessary loops, redundant DB calls)?
 - Does the change break any existing interfaces or contracts?
-- Are type annotations correct (TypeScript/Python)?`,
+- Are type annotations correct (TypeScript/Python)?
+- **Anti-hedging**: Does this diff introduce a new default-off flag, observe mode, or fail-open behavior WITHOUT an explicit written justification (a code comment, PR description note, or inline rationale)? If yes, flag as MAJOR — new features must ship enabled by default; unjustified observe/off/fail-open patterns are forbidden.`,
   test_coverage: `**Test Coverage:**
 - Are there tests for the new/changed behavior? (A genuinely missing test for new behavior is a blockable defect.)
 - Do the changes look likely to break existing tests by reasoning about the diff? (CI runs the full suite as the authoritative gate — do not re-run it yourself or block on a test run you couldn't perform; flag only a specific case the diff clearly breaks.)`,
@@ -195,17 +202,6 @@ ${LENS_CHECKLIST_ITEMS.test_coverage}
 ${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
 }
 
-// Returns a checklist section scoped to a single panel_review lens. The lens
-// agent only receives its own dimension's bullets so it is not prompted to
-// judge dimensions explicitly outside its scope. Falls back to the full
-// checklist for unrecognised lens IDs to avoid silent regressions.
-export function buildLensScopedChecklistSection(lensId: string, buildConfig?: BuildConfig, baseBranch?: string): string {
-  const lensSection = LENS_CHECKLIST_ITEMS[lensId];
-  if (!lensSection) {
-    return buildReviewChecklistSection(buildConfig, baseBranch);
-  }
-  return `Review the changes through your lens using this checklist:\n\n${lensSection}\n\n${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
-}
 
 export function buildReviewSeverityGuideSection(): string {
   return `**Severity Classification Guide:**
@@ -216,10 +212,11 @@ Use these definitions when assigning severity to issues. Severity affects how th
   - Missing auth check on a new endpoint that exposes sensitive data
   - Off-by-one in a loop that silently skips or double-processes records in a DB migration
 
-- **MAJOR** — Logic errors, missing error handling, race conditions, missing tests for new behavior, or violations of the codebase's established patterns. Examples:
+- **MAJOR** — Logic errors, missing error handling, race conditions, missing tests for new behavior, violations of the codebase's established patterns, or hedging that leaves new behavior dark. Examples:
   - Async function whose rejection is silently swallowed (missing try/catch or .catch())
   - New API endpoint with no test coverage at all
   - New code that bypasses an existing invariant (e.g., writing to a field that has a single designated writer elsewhere in the codebase)
+  - New feature hidden behind a default-off flag, fail-open fallback, or observe-mode wrapper when the task called for the feature to be on
 
 - **MINOR** — Style inconsistencies, naming suggestions, documentation gaps, or optional improvements that do not affect correctness. Examples:
   - Variable named \`data\` where \`userRecord\` would be clearer

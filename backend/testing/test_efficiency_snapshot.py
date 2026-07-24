@@ -562,141 +562,6 @@ async def test_read_baseline_surfaces_warm_start_origin_breakdown(db_session):
 
 
 @pytest.mark.asyncio
-async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_vm_cost_attribution(
-    db_session,
-):
-    """read_baseline_with_drift surfaces panel_review_effectiveness (overturn_rate,
-    challenged counts) and vm_cost_attribution (task-type cost breakdown) from the
-    latest snapshot alongside other efficiency-axes data."""
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    now = _utcnow()
-
-    # Create tasks with panel review second opinion and different task types
-    # 2 confirmed, 1 revised, 1 rejected = 4 total challenged
-    db_session.add(
-        make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            context={
-                "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
-                    "state": "challenged_confirmed"
-                },
-            },
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-            api_call_summary={
-                "llm_call_count": 10,
-                "total_input_tokens": 1000,
-                "total_output_tokens": 500,
-            },
-            provider="anthropic",
-            model="claude-sonnet-4-6",
-        )
-    )
-    db_session.add(
-        make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            context={
-                "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
-                    "state": "challenged_confirmed"
-                },
-            },
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-            api_call_summary={
-                "llm_call_count": 5,
-                "total_input_tokens": 500,
-                "total_output_tokens": 250,
-            },
-            provider="anthropic",
-            model="claude-sonnet-4-6",
-        )
-    )
-    db_session.add(
-        make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            context={
-                "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
-                    "state": "challenged_revised"
-                },
-            },
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-            api_call_summary={
-                "llm_call_count": 3,
-                "total_input_tokens": 300,
-                "total_output_tokens": 150,
-            },
-            provider="anthropic",
-            model="claude-sonnet-4-6",
-        )
-    )
-    db_session.add(
-        make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            context={
-                "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
-                    "state": "challenged_rejected"
-                },
-            },
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-            api_call_summary={
-                "llm_call_count": 2,
-                "total_input_tokens": 200,
-                "total_output_tokens": 100,
-            },
-            provider="anthropic",
-            model="claude-sonnet-4-6",
-        )
-    )
-    await db_session.commit()
-
-    await write_snapshot(db_session, project.id)
-    await db_session.commit()
-
-    drift = await read_baseline_with_drift(db_session, project.id)
-
-    # Verify panel_review_effectiveness is present
-    assert "panel_review_effectiveness" in drift
-    eff = drift["panel_review_effectiveness"]
-    assert eff is not None
-    assert eff["challenged_confirmed"] == 2
-    assert eff["challenged_revised"] == 1
-    assert eff["challenged_rejected"] == 1
-    assert eff["total_challenged"] == 4
-    assert eff["overturn_rate"] == 0.25
-
-    # Verify vm_cost_attribution is present
-    assert "vm_cost_attribution" in drift
-    vm_attr = drift["vm_cost_attribution"]
-    assert vm_attr is not None
-    assert isinstance(vm_attr, dict)
-    assert "by_task_type" in vm_attr
-    assert isinstance(vm_attr["by_task_type"], list)
-    assert len(vm_attr["by_task_type"]) > 0
-    assert "total_vm_usd" in vm_attr
-    # Each entry in by_task_type should have task_type and cost info
-    for entry in vm_attr["by_task_type"]:
-        assert "task_type" in entry
-        assert "total_cost_usd" in entry
-        assert "task_count" in entry
-
-
-@pytest.mark.asyncio
 async def test_compute_current_axes_empty_returns_none(db_session):
     project = make_project()
     db_session.add(project)
@@ -979,21 +844,29 @@ async def test_read_baseline_with_drift_returns_drift_pct(db_session):
     await write_snapshot(db_session, project.id)
     await db_session.commit()
 
-    # Mutate the latest snapshot in-place to simulate a regression of +50%.
-    container = dict(project.design_doc[DESIGN_DOC_KEY])
-    snaps = list(container["snapshots"])
-    latest = dict(snaps[-1])
-    base_cpm = container["baseline"][AXIS_COST_PER_MERGED_PR]
-    latest[AXIS_COST_PER_MERGED_PR] = round(base_cpm * 1.5, 6)
-    snaps[-1] = latest
-    container["snapshots"] = snaps
-    new_doc = dict(project.design_doc)
-    new_doc[DESIGN_DOC_KEY] = container
-    project.design_doc = new_doc
+    # read_baseline_with_drift prefers the project_efficiency_snapshot table
+    # (write_snapshot dual-wrote the latest snapshot there). Mutate the latest
+    # TABLE row in-place to simulate a regression of +50%; the immutable baseline
+    # stays in design_doc.
+    from sqlalchemy import select as _select
     from sqlalchemy.orm.attributes import flag_modified
 
-    flag_modified(project, "design_doc")
-    db_session.add(project)
+    from app.models import ProjectEfficiencySnapshot
+
+    base_cpm = project.design_doc[DESIGN_DOC_KEY]["baseline"][AXIS_COST_PER_MERGED_PR]
+    latest_row = (
+        await db_session.execute(
+            _select(ProjectEfficiencySnapshot)
+            .where(ProjectEfficiencySnapshot.project_id == project.id)
+            .order_by(ProjectEfficiencySnapshot.captured_at.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    new_blob = dict(latest_row.blob)
+    new_blob[AXIS_COST_PER_MERGED_PR] = round(base_cpm * 1.5, 6)
+    latest_row.blob = new_blob
+    flag_modified(latest_row, "blob")
+    db_session.add(latest_row)
     await db_session.commit()
 
     result = await read_baseline_with_drift(db_session, project.id)
@@ -1182,24 +1055,33 @@ async def test_snapshot_carries_definition_version_and_change_boundary(db_sessio
     assert snap2.get("metric_def_version") == METRIC_DEF_VERSION
 
     # Simulate a pre-existing snapshot from a prior definition era by back-
-    # patching the first stored snapshot to an older version string.  This models
+    # patching the oldest stored snapshot to drop its version stamp.  This models
     # the real scenario: persisted snapshots 2026-06-06..09 have no version stamp
     # (metric_def_version absent), while future snapshots carry v6.
+    # read_baseline_with_drift prefers the project_efficiency_snapshot table, so
+    # back-patch the oldest TABLE row's blob (write_snapshot dual-wrote both rows).
+    from sqlalchemy import select as _select
     from sqlalchemy.orm.attributes import flag_modified
-    from app.models import Project
 
-    proj = await db_session.get(Project, project.id)
-    assert proj is not None
-    doc = dict(proj.design_doc or {})
-    container = dict(doc.get("efficiency_baseline") or {})
-    snapshots = list(container.get("snapshots") or [])
-    assert len(snapshots) >= 2, "expected at least 2 snapshots to be stored"
-    # Remove version from first snapshot to simulate a pre-v6 era entry.
-    snapshots[0] = {k: v for k, v in snapshots[0].items() if k != "metric_def_version"}
-    container["snapshots"] = snapshots
-    doc["efficiency_baseline"] = container
-    proj.design_doc = doc
-    flag_modified(proj, "design_doc")
+    from app.models import ProjectEfficiencySnapshot
+
+    rows = list(
+        (
+            await db_session.execute(
+                _select(ProjectEfficiencySnapshot)
+                .where(ProjectEfficiencySnapshot.project_id == project.id)
+                .order_by(ProjectEfficiencySnapshot.captured_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) >= 2, "expected at least 2 snapshots to be stored"
+    oldest = rows[0]
+    # Remove version from the oldest snapshot blob to simulate a pre-v6 era entry.
+    oldest.blob = {k: v for k, v in oldest.blob.items() if k != "metric_def_version"}
+    flag_modified(oldest, "blob")
+    db_session.add(oldest)
     await db_session.commit()
 
     # Now read back via the public API and verify def_version is surfaced.
@@ -8910,10 +8792,10 @@ async def test_vm_cost_attribution_by_task_type_in_write_snapshot(db_session):
         vm_stopped_at=now,
         vm_spot=False,
     )
-    # panel_review side-car: 3 min on-demand VM, not merged
-    panel_task = _make_efficient_task(
+    # fix side-car: 3 min on-demand VM, not merged
+    fix_task = _make_efficient_task(
         project.id,
-        payloads=[{"type": "panel_review"}],
+        payloads=[{"type": "fix", "pr_number": 1, "branch": "main"}],
         context={},  # no pr_merged
         vm_provisioned_at=now - timedelta(minutes=3),
         vm_stopped_at=now,
@@ -8921,7 +8803,7 @@ async def test_vm_cost_attribution_by_task_type_in_write_snapshot(db_session):
     )
     db_session.add(review_task)
     db_session.add(create_task)
-    db_session.add(panel_task)
+    db_session.add(fix_task)
     await db_session.commit()
 
     snap = await write_snapshot(db_session, project.id)
@@ -8935,9 +8817,7 @@ async def test_vm_cost_attribution_by_task_type_in_write_snapshot(db_session):
     by_type = {r["task_type"]: r for r in vm_attr["by_task_type"]}
     assert "review" in by_type, "review task type must appear in by_task_type"
     assert "create" in by_type, "create task type must appear in by_task_type"
-    assert "panel_review" in by_type, (
-        "panel_review task type must appear in by_task_type"
-    )
+    assert "fix" in by_type, "fix task type must appear in by_task_type"
 
     # total_vm_usd reconciles: sum of by_task_type costs equals total_vm_usd
     summed = round(sum(r["total_cost_usd"] for r in vm_attr["by_task_type"]), 6)
@@ -8955,9 +8835,9 @@ async def test_vm_cost_attribution_by_task_type_in_write_snapshot(db_session):
         "cost_per_merged_pr must be approximately total_vm_usd / merged_count"
     )
 
-    # panel_review side-car has no merges — cost_per_merge must be None
-    assert by_type["panel_review"]["merged_count"] == 0
-    assert by_type["panel_review"]["cost_per_merge"] is None
+    # fix side-car has no merges — cost_per_merge must be None
+    assert by_type["fix"]["merged_count"] == 0
+    assert by_type["fix"]["cost_per_merge"] is None
 
 
 @pytest.mark.asyncio
@@ -9111,906 +8991,6 @@ async def test_read_baseline_by_schema_passthrough(db_session):
     )
     assert fc["by_schema"]["thinker"]["format_miss"] == 3
     assert fc["by_schema"]["security_audit"]["self_repair_success_rate"] == 1.0
-
-
-# ---------------------------------------------------------------------------
-# Panel review effectiveness tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_panel_review_effectiveness_in_write_snapshot(db_session):
-    """write_snapshot must populate panel_review_effectiveness with correct
-    overturn/confirmed/revision counts from tasks with reconciliation records.
-
-    Three review tasks carry different reconciliation states:
-      - 2 challenged_confirmed  (panel upholds)
-      - 1 challenged_revised    (panel same direction, different issues)
-      - 1 challenged_rejected   (panel overturns — the ROI signal)
-
-    The 'unchallenged' task must be excluded (not a gate invocation).
-    Expected overturn_rate = 1 / 4 = 0.25.
-    """
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    now = _utcnow()
-
-    def _review_task(state):
-        return make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            context={
-                "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state},
-            },
-            vm_provisioned_at=now - timedelta(minutes=10),
-            vm_stopped_at=now,
-        )
-
-    db_session.add(_review_task("challenged_confirmed"))
-    db_session.add(_review_task("challenged_confirmed"))
-    db_session.add(_review_task("challenged_revised"))
-    db_session.add(_review_task("challenged_rejected"))
-    # unchallenged must be ignored (gate not invoked)
-    db_session.add(_review_task("unchallenged"))
-    await db_session.commit()
-
-    snap = await write_snapshot(db_session, project.id)
-    await db_session.commit()
-
-    eff = snap.get("panel_review_effectiveness")
-    assert eff is not None, (
-        "write_snapshot must include panel_review_effectiveness when gate invocations exist"
-    )
-    assert eff["challenged_confirmed"] == 2, (
-        f"expected 2 confirmed, got {eff['challenged_confirmed']}"
-    )
-    assert eff["challenged_revised"] == 1, (
-        f"expected 1 revised, got {eff['challenged_revised']}"
-    )
-    assert eff["challenged_rejected"] == 1, (
-        f"expected 1 rejected, got {eff['challenged_rejected']}"
-    )
-    assert eff["total_challenged"] == 4, (
-        f"expected total_challenged=4, got {eff['total_challenged']}"
-    )
-    assert eff["overturn_rate"] == 0.25, (
-        f"expected overturn_rate=0.25, got {eff['overturn_rate']}"
-    )
-
-
-def test_panel_review_effectiveness_returns_none_when_no_gate_invocations():
-    """compute_panel_review_effectiveness returns None when no tasks have
-    gate invocations (all unchallenged or no review_second_opinion key).
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-
-    # Task with no reconciliation key
-    t1 = make_task(
-        project_id=None,
-        status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
-        vm_provisioned_at=now - timedelta(minutes=5),
-        vm_stopped_at=now,
-    )
-    # Task with unchallenged state (gate not invoked)
-    t2 = make_task(
-        project_id=None,
-        status=TaskStatus.COMPLETED,
-        context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "unchallenged"}},
-        vm_provisioned_at=now - timedelta(minutes=5),
-        vm_stopped_at=now,
-    )
-    result = compute_panel_review_effectiveness([t1, t2])
-    assert result is None, (
-        "must return None when no tasks carry a challenged reconciliation state"
-    )
-
-
-def _peff(*, total_challenged, challenged_degraded):
-    """Minimal panel_review_effectiveness-shaped dict for classifier tests.
-
-    Mirrors compute_panel_review_effectiveness's fail_open_rate accounting:
-    fail_open_rate = degraded / (total + degraded), or None when both are zero.
-    """
-    invocations = total_challenged + challenged_degraded
-    return {
-        "total_challenged": total_challenged,
-        "challenged_degraded": challenged_degraded,
-        "fail_open_rate": (
-            round(challenged_degraded / invocations, 4) if invocations > 0 else None
-        ),
-    }
-
-
-def test_gate_health_verdict_no_data_on_none():
-    """None input → NO_DATA with zero invocations and a null rate."""
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    verdict = compute_gate_health_verdict(None)
-    assert verdict["state"] == "NO_DATA"
-    assert verdict["fail_open_rate"] is None
-    assert verdict["total_invocations"] == 0
-    assert verdict["min_sample"] == 30
-
-
-def test_gate_health_verdict_no_data_on_zero_invocations():
-    """A dict with zero gate invocations → NO_DATA (never HEALTHY)."""
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    verdict = compute_gate_health_verdict(
-        _peff(total_challenged=0, challenged_degraded=0)
-    )
-    assert verdict["state"] == "NO_DATA"
-    assert verdict["total_invocations"] == 0
-
-
-def test_gate_health_verdict_degraded_below_min_sample():
-    """fail_open_rate >= 5% on a sub-min-sample window classifies DEGRADED.
-
-    DEGRADED takes priority over the min-sample gate: a degraded rate on a tiny
-    sample must NOT be reported as INSUFFICIENT or HEALTHY.
-    """
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    # 1 degraded / 10 invocations = 10% fail-open on only 10 invocations (< 30).
-    verdict = compute_gate_health_verdict(
-        _peff(total_challenged=9, challenged_degraded=1)
-    )
-    assert verdict["state"] == "DEGRADED", (
-        f"5%+ fail-open on a small sample must be DEGRADED, got {verdict['state']}"
-    )
-    assert verdict["fail_open_rate"] == 0.1
-    assert verdict["total_invocations"] == 10
-
-
-def test_gate_health_verdict_insufficient_requires_min_sample():
-    """A clean, low-rate window below the min sample is INSUFFICIENT, never HEALTHY."""
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    # Zero fail-open but only 10 invocations — too few to certify HEALTHY.
-    verdict = compute_gate_health_verdict(
-        _peff(total_challenged=10, challenged_degraded=0)
-    )
-    assert verdict["state"] == "INSUFFICIENT", (
-        f"low-rate window below 30 invocations must be INSUFFICIENT, got {verdict['state']}"
-    )
-    assert verdict["total_invocations"] == 10
-
-
-def test_gate_health_verdict_partial_at_min_sample():
-    """>= 30 invocations with 0.01 <= rate < 0.05 → PARTIAL."""
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    # 1 degraded / 50 invocations = 2% fail-open on a sufficient sample.
-    verdict = compute_gate_health_verdict(
-        _peff(total_challenged=49, challenged_degraded=1)
-    )
-    assert verdict["state"] == "PARTIAL", (
-        f"2% fail-open on >=30 invocations must be PARTIAL, got {verdict['state']}"
-    )
-    assert verdict["fail_open_rate"] == 0.02
-    assert verdict["total_invocations"] == 50
-
-
-def test_gate_health_verdict_healthy_requires_min_sample_and_low_rate():
-    """>= 30 invocations with rate < 0.01 → HEALTHY."""
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    # Zero fail-open over 40 invocations — clean and sufficient.
-    verdict = compute_gate_health_verdict(
-        _peff(total_challenged=40, challenged_degraded=0)
-    )
-    assert verdict["state"] == "HEALTHY"
-    assert verdict["fail_open_rate"] == 0.0
-    assert verdict["total_invocations"] == 40
-    assert verdict["min_sample"] == 30
-
-
-def test_gate_health_verdict_low_coverage_after_sufficient_sample():
-    """Sufficient sample, zero fail-open, but effective_coverage < 0.5 → LOW_COVERAGE."""
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    peff = {
-        **_peff(total_challenged=40, challenged_degraded=0),
-        "effective_coverage": 0.3,  # below 0.5 threshold
-    }
-    verdict = compute_gate_health_verdict(peff)
-    assert verdict["state"] == "LOW_COVERAGE", (
-        f"sufficient sample + zero fail-open + low effective_coverage must be LOW_COVERAGE, got {verdict['state']}"
-    )
-    assert verdict["total_invocations"] == 40
-
-    # Boundary: exactly 0.5 coverage should NOT trigger LOW_COVERAGE.
-    peff_boundary = {
-        **_peff(total_challenged=40, challenged_degraded=0),
-        "effective_coverage": 0.5,
-    }
-    verdict_boundary = compute_gate_health_verdict(peff_boundary)
-    assert verdict_boundary["state"] == "HEALTHY", (
-        f"effective_coverage == 0.5 must be HEALTHY, got {verdict_boundary['state']}"
-    )
-
-
-def test_gate_health_verdict_degraded_priority_over_insufficient_at_boundary():
-    """5% exactly on a small sample → DEGRADED; min_sample override respected."""
-    from app.efficiency_snapshot import compute_gate_health_verdict
-
-    # 1 degraded / 20 = 5% exactly, only 20 invocations.
-    verdict = compute_gate_health_verdict(
-        _peff(total_challenged=19, challenged_degraded=1)
-    )
-    assert verdict["state"] == "DEGRADED"
-    # min_sample override flows through to the returned supporting field.
-    custom = compute_gate_health_verdict(
-        _peff(total_challenged=10, challenged_degraded=0), min_sample=5
-    )
-    assert custom["state"] == "HEALTHY"
-    assert custom["min_sample"] == 5
-
-
-def test_gate_health_verdict_on_post_deploy_effectiveness():
-    """Gate health verdict applied to post-deploy panel_review_effectiveness.
-
-    Validates that assess_post_deploy_gate_health correctly classifies verdicts
-    when applied to scoped post-deploy effectiveness windows. Tests the
-    integration of post-deploy boundary filtering with verdict computation.
-
-    Setup: mix of pre-deploy and post-deploy tasks.
-      Pre-deploy (before boundary): 4 total, 1 degraded → 20% fail-open
-      Post-deploy (after boundary): 5 total, 1 degraded → 20% fail-open (DEGRADED)
-
-    Expected: post-deploy verdict should be DEGRADED due to 20% rate >= 5%.
-    """
-    from app.efficiency_snapshot import (
-        assess_post_deploy_gate_health,
-        compute_panel_review_effectiveness,
-    )
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-    deploy_boundary = now - timedelta(days=2)
-    pre_deploy = now - timedelta(days=5)
-
-    def _task(recon, updated_at):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
-            vm_provisioned_at=updated_at - timedelta(minutes=5),
-            vm_stopped_at=updated_at,
-            updated_at=updated_at,
-        )
-
-    # Pre-deploy tasks
-    pre_tasks = [
-        _task({"state": "challenged_confirmed"}, pre_deploy),
-        _task({"state": "challenged_confirmed"}, pre_deploy),
-        _task({"state": "challenged_confirmed"}, pre_deploy),
-        _task({"state": "degraded_model_unavailable"}, pre_deploy),
-    ]
-
-    # Post-deploy tasks (enough for INSUFFICIENT check to pass)
-    post_tasks = [
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=12)),
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=6)),
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=3)),
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=2)),
-        _task({"state": "degraded_model_unavailable"}, now - timedelta(hours=1)),
-    ]
-    all_tasks = pre_tasks + post_tasks
-
-    # Post-deploy only: filter using deploy_boundary
-    post_deploy_effectiveness = compute_panel_review_effectiveness(
-        all_tasks, since_dt=deploy_boundary
-    )
-    assert post_deploy_effectiveness is not None
-    assert post_deploy_effectiveness["total_challenged"] == 4
-    assert post_deploy_effectiveness["challenged_degraded"] == 1
-
-    # Apply assess_post_deploy_gate_health to the post-deploy effectiveness
-    # 1 degraded / (4 + 1) = 0.2 = 20% → exceeds 5% degraded threshold
-    verdict = assess_post_deploy_gate_health(post_deploy_effectiveness)
-    assert verdict["state"] == "DEGRADED", (
-        f"20% fail-open on 5 invocations must be DEGRADED, got {verdict['state']}"
-    )
-    assert verdict["total_invocations"] == 5
-    assert verdict["fail_open_rate"] == 0.2
-
-    # Test a healthy post-deploy scenario: 30+ invocations with 0% fail-open
-    healthy_tasks = [
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=i))
-        for i in range(35)
-    ]
-    healthy_effectiveness = compute_panel_review_effectiveness(
-        healthy_tasks, since_dt=deploy_boundary
-    )
-    healthy_verdict = assess_post_deploy_gate_health(healthy_effectiveness)
-    assert healthy_verdict["state"] == "HEALTHY", (
-        f"zero fail-open on 35 invocations must be HEALTHY, got {healthy_verdict['state']}"
-    )
-    assert healthy_verdict["fail_open_rate"] == 0.0
-    assert healthy_verdict["total_invocations"] == 35
-
-
-def test_panel_review_effectiveness_cost_per_challenge_usd():
-    """compute_panel_review_effectiveness includes cost_per_challenge_usd.
-
-    Two panel_review challenger tasks carry known LLM token usage.
-    Four review tasks carry reconciliation states (total_challenged=4).
-    Expected cost_per_challenge_usd = total_panel_review_llm_cost / 4.
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
-
-    def _challenged_review(state):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state}},
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-        )
-
-    def _panel_review_task(input_tokens, output_tokens):
-        t = make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "panel_review"}],
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-            provider="anthropic",
-            model="claude-sonnet-4-6",
-        )
-        t.api_call_summary = {
-            "llm_call_count": 1,
-            "total_input_tokens": input_tokens,
-            "total_output_tokens": output_tokens,
-        }
-        return t
-
-    tasks = [
-        _challenged_review("challenged_confirmed"),
-        _challenged_review("challenged_confirmed"),
-        _challenged_review("challenged_revised"),
-        _challenged_review("challenged_rejected"),
-        _panel_review_task(1000, 200),
-        _panel_review_task(2000, 400),
-    ]
-
-    result = compute_panel_review_effectiveness(tasks)
-    assert result is not None
-    assert result["total_challenged"] == 4
-    expected_total_cost = (1000 + 2000) * input_rate + (200 + 400) * output_rate
-    expected_per_challenge = round(expected_total_cost / 4, 4)
-    assert result["cost_per_challenge_usd"] == expected_per_challenge, (
-        f"expected cost_per_challenge_usd={expected_per_challenge}, got {result['cost_per_challenge_usd']}"
-    )
-
-
-def test_cost_per_challenge_excludes_out_of_window_and_degraded():
-    """cost_per_challenge_usd must apply since_dt window filter to numerator (LLM cost).
-
-    The bug: panel_review LLM cost was summed with no window filter, but the
-    denominator (challenged counts) was filtered by since_dt. This inflated
-    cost_per_challenge_usd when the task list spanned wider than the reporting window.
-
-    Setup:
-      - 2 in-window challenged_confirmed (total_challenged = 2)
-      - 1 out-of-window challenged_confirmed (must be ignored in cost calc)
-      - 1 degraded_model_unavailable (no cost in calculation; state != challenged_*)
-      - 3 panel_review tasks: 2 in-window, 1 out-of-window
-      - Expected: cost_per_challenge_usd = (cost of 2 in-window panel_review) / 2
-
-    Verify:
-      - cost_per_challenge_usd correctly excludes out-of-window panel_review cost
-      - cost_per_challenge_usd correctly excludes degraded challenges
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-    window_start = now - timedelta(hours=1)
-    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
-
-    def _challenged_review(state, updated_at):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state}},
-            updated_at=updated_at,
-            vm_provisioned_at=updated_at - timedelta(minutes=5),
-            vm_stopped_at=updated_at,
-        )
-
-    def _panel_review_task(input_tokens, output_tokens, updated_at):
-        t = make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "panel_review"}],
-            updated_at=updated_at,
-            vm_provisioned_at=updated_at - timedelta(minutes=5),
-            vm_stopped_at=updated_at,
-            provider="anthropic",
-            model="claude-sonnet-4-6",
-        )
-        t.api_call_summary = {
-            "llm_call_count": 1,
-            "total_input_tokens": input_tokens,
-            "total_output_tokens": output_tokens,
-        }
-        return t
-
-    tasks = [
-        # In-window challenged (should count)
-        _challenged_review("challenged_confirmed", now - timedelta(minutes=10)),
-        _challenged_review("challenged_confirmed", now - timedelta(minutes=5)),
-        # Out-of-window challenged (should NOT count in cost numerator)
-        _challenged_review("challenged_confirmed", window_start - timedelta(minutes=5)),
-        # Degraded challenge (does not count in total_challenged)
-        _challenged_review("degraded_model_unavailable", now - timedelta(minutes=3)),
-        # In-window panel_review tasks (1000+2000 input, 200+400 output)
-        _panel_review_task(1000, 200, now - timedelta(minutes=8)),
-        _panel_review_task(2000, 400, now - timedelta(minutes=3)),
-        # Out-of-window panel_review task (should NOT count in cost)
-        _panel_review_task(3000, 600, window_start - timedelta(minutes=10)),
-    ]
-
-    result = compute_panel_review_effectiveness(tasks, since_dt=window_start)
-    assert result is not None
-    # Only 2 in-window challenged_confirmed counts (excludes out-of-window and degraded)
-    assert result["total_challenged"] == 2, (
-        f"expected total_challenged=2 (in-window only), got {result['total_challenged']}"
-    )
-
-    # Expected cost: only in-window panel_review tasks count
-    expected_cost = (1000 + 2000) * input_rate + (200 + 400) * output_rate
-    expected_per_challenge = round(expected_cost / 2, 4)
-    assert result["cost_per_challenge_usd"] == expected_per_challenge, (
-        f"expected cost_per_challenge_usd={expected_per_challenge} "
-        f"(in-window tasks only), got {result['cost_per_challenge_usd']}"
-    )
-
-
-def test_panel_review_effectiveness_escalated_fail_open():
-    """Escalated records (unchallenged + escalated=True) are counted in
-    challenged_escalated (informational) and excluded from total_challenged and fail_open_rate.
-
-    These records represent a BLOCKED/fail-CLOSED path: the challenger crashed or
-    returned an unparseable verdict, so the merge was blocked and escalated for manual
-    review.  They are NOT auto-merges and must NOT inflate fail_open_rate.
-
-    Setup:
-      - 2 challenged_confirmed (normal gate invocations)
-      - 1 challenged_rejected  (normal gate invocation)
-      - 2 unchallenged + escalated=True (challenger crashed — merge BLOCKED, not fail-open)
-      - 1 unchallenged without escalated (gate not invoked — must be ignored)
-
-    Expected:
-      total_challenged = 3 (only the three successful gate invocations)
-      challenged_escalated = 2 (safe/blocked escalations, informational)
-      fail_open_rate = 0.0 (gate was invoked but no degraded events — confirmed-zero, not no-data)
-      overturn_rate = 1/3
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-
-    def _task(recon):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-        )
-
-    tasks = [
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_rejected"}),
-        _task({"state": "unchallenged", "escalated": True}),
-        _task({"state": "unchallenged", "escalated": True}),
-        _task({"state": "unchallenged"}),  # gate not invoked — must be ignored
-    ]
-
-    result = compute_panel_review_effectiveness(tasks)
-    assert result is not None, "must return a result when escalated records exist"
-    assert result["total_challenged"] == 3, (
-        f"escalated records must be excluded from total_challenged, got {result['total_challenged']}"
-    )
-    assert result["challenged_escalated"] == 2, (
-        f"expected challenged_escalated=2, got {result['challenged_escalated']}"
-    )
-    assert result["overturn_rate"] == round(1 / 3, 4), (
-        f"overturn_rate must be computed from total_challenged only, got {result['overturn_rate']}"
-    )
-    # unchallenged+escalated=True records are safe (merge BLOCKED); fail_open_rate must not count them.
-    # Gate was invoked (total=3), so fail_open_rate is confirmed-zero (0.0), not None (no-data).
-    assert result["fail_open_rate"] == 0.0, (
-        f"fail_open_rate must be 0.0 (confirmed-zero) when gate was invoked but no degraded events exist, got {result['fail_open_rate']}"
-    )
-    assert result.get("challenged_degraded", 0) == 0, (
-        "challenged_degraded must be 0 when no degraded_model_unavailable records exist"
-    )
-
-
-def test_panel_review_effectiveness_fail_open_rate():
-    """fail_open_rate = challenged_degraded / (total_challenged + challenged_degraded).
-
-    degraded_model_unavailable records are the true fail-open path: the challenger's
-    model was inaccessible so the primary verdict was adopted and the PR auto-merged.
-    unchallenged+escalated=True records are safe (merge BLOCKED) and must NOT drive
-    fail_open_rate.
-
-    Setup:
-      - 3 challenged_confirmed (successful gate invocations)
-      - 2 degraded_model_unavailable (silent auto-merges — true fail-opens)
-      - 1 unchallenged + escalated=True (challenger crashed — merge BLOCKED, not counted in fail_open_rate)
-
-    Expected:
-      total_challenged = 3
-      challenged_degraded = 2
-      challenged_escalated = 1 (informational; does NOT affect fail_open_rate)
-      fail_open_rate = 2 / (3 + 2) = 0.4
-      Zero-invocations case (no tasks) returns None for fail_open_rate.
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-
-    def _task(recon):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-        )
-
-    tasks = [
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "degraded_model_unavailable"}),
-        _task({"state": "degraded_model_unavailable"}),
-        _task({"state": "unchallenged", "escalated": True}),  # safe — must not affect fail_open_rate
-    ]
-
-    result = compute_panel_review_effectiveness(tasks)
-    assert result is not None
-    assert result["total_challenged"] == 3
-    assert result["challenged_degraded"] == 2, (
-        f"expected challenged_degraded=2, got {result.get('challenged_degraded')}"
-    )
-    assert result["challenged_escalated"] == 1, (
-        f"expected challenged_escalated=1 (informational), got {result.get('challenged_escalated')}"
-    )
-    expected_rate = round(2 / 5, 4)
-    assert result["fail_open_rate"] == expected_rate, (
-        f"expected fail_open_rate={expected_rate} (degraded only), got {result['fail_open_rate']}"
-    )
-    # Zero-invocations: no tasks with gate records returns None
-    assert compute_panel_review_effectiveness([]) is None
-
-
-def test_panel_review_effectiveness_degraded_fail_open_rate():
-    """degraded_model_unavailable is the true fail-open path; escalated is safe.
-
-    Mixed scenario with all three state classes to verify bucket separation:
-      - 4 challenged_confirmed
-      - 1 challenged_rejected
-      - 3 degraded_model_unavailable (silent auto-merges — true fail-opens)
-      - 2 unchallenged + escalated=True (merge BLOCKED — safe, not fail-open)
-      - 1 unchallenged (gate not invoked — ignored)
-
-    Expected:
-      total_challenged = 5
-      challenged_degraded = 3
-      challenged_escalated = 2
-      fail_open_rate = 3 / (5 + 3) = 0.375
-      overturn_rate = 1 / 5 = 0.2
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-
-    def _task(recon):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-        )
-
-    tasks = [
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_rejected"}),
-        _task({"state": "degraded_model_unavailable"}),
-        _task({"state": "degraded_model_unavailable"}),
-        _task({"state": "degraded_model_unavailable"}),
-        _task({"state": "unchallenged", "escalated": True}),
-        _task({"state": "unchallenged", "escalated": True}),
-        _task({"state": "unchallenged"}),  # ignored
-    ]
-
-    result = compute_panel_review_effectiveness(tasks)
-    assert result is not None
-    assert result["total_challenged"] == 5, f"got {result['total_challenged']}"
-    assert result["challenged_degraded"] == 3, f"got {result.get('challenged_degraded')}"
-    assert result["challenged_escalated"] == 2, f"got {result.get('challenged_escalated')}"
-    assert result["overturn_rate"] == round(1 / 5, 4), f"got {result['overturn_rate']}"
-    expected_rate = round(3 / 8, 4)
-    assert result["fail_open_rate"] == expected_rate, (
-        f"expected fail_open_rate={expected_rate}, got {result['fail_open_rate']}"
-    )
-    # Verify escalated records do NOT bleed into fail_open_rate numerator
-    assert result["fail_open_rate"] != round(5 / 10, 4), (
-        "fail_open_rate must not include challenged_escalated in the numerator"
-    )
-
-
-def test_fail_open_rate_distinguishes_confirmed_zero_from_insufficient_data():
-    """fail_open_rate=0.0 when gate was invoked and no fail-opens occurred (confirmed-zero).
-    fail_open_rate=None only when the window has no gate invocations at all (no-data).
-
-    This distinction is critical for the v18 <=5% audit: a None result means
-    'unknown' (cannot confirm or deny), while 0.0 means 'confirmed healthy'.
-
-    Setup A (confirmed-zero):
-      - 3 challenged_confirmed + 1 challenged_rejected = total=4, degraded=0
-      - Expected: fail_open_rate=0.0 (gate was invoked; zero degraded events measured)
-
-    Setup B (no-data):
-      - 0 gate invocations (only unchallenged tasks)
-      - Expected: fail_open_rate via None return (no gate invocations; rate is unknown)
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-
-    def _task(recon):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-        )
-
-    # Setup A: gate invoked with 0 degraded events → confirmed-zero
-    tasks_a = [
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_confirmed"}),
-        _task({"state": "challenged_rejected"}),
-    ]
-    result_a = compute_panel_review_effectiveness(tasks_a)
-    assert result_a is not None, "must return a result when gate was invoked"
-    assert result_a["total_challenged"] == 4
-    assert result_a["challenged_degraded"] == 0
-    assert result_a["fail_open_rate"] == 0.0, (
-        f"fail_open_rate must be 0.0 (confirmed-zero) when gate invoked and no degraded events, got {result_a['fail_open_rate']}"
-    )
-
-    # Setup B: no gate invocations → no-data (None return)
-    tasks_b = [
-        _task({"state": "unchallenged"}),       # gate not invoked — ignored
-        make_task(project_id=None, status=TaskStatus.COMPLETED),  # no recon key
-    ]
-    result_b = compute_panel_review_effectiveness(tasks_b)
-    assert result_b is None, (
-        f"must return None when no gate invocations exist (fail_open_rate would be meaningless), got {result_b}"
-    )
-
-
-def test_fail_open_rate_scoped_to_post_deploy_window():
-    """compute_panel_review_effectiveness respects since_dt to scope to post-deploy traffic.
-
-    Setup: mix of pre-deploy and post-deploy tasks with gate records.
-      Pre-deploy (before deploy boundary):
-        - 2 challenged_confirmed
-        - 1 degraded_model_unavailable (fail-open)
-      Post-deploy (after deploy boundary):
-        - 3 challenged_confirmed
-        - 1 degraded_model_unavailable (fail-open)
-
-    Without since_dt (7-day window):
-      total_challenged = 5, challenged_degraded = 2
-      fail_open_rate = 2 / (5 + 2) = 2/7
-
-    With since_dt = deploy boundary (post-deploy only):
-      total_challenged = 3, challenged_degraded = 1
-      fail_open_rate = 1 / (3 + 1) = 0.25
-
-    This confirms an operator can isolate the v18-specific rate from the rolling
-    window that mixes pre- and post-deployment traffic.
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-    deploy_boundary = now - timedelta(days=2)
-    pre_deploy = now - timedelta(days=5)
-
-    def _task(recon, updated_at):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
-            vm_provisioned_at=updated_at - timedelta(minutes=5),
-            vm_stopped_at=updated_at,
-            updated_at=updated_at,
-        )
-
-    pre_tasks = [
-        _task({"state": "challenged_confirmed"}, pre_deploy),
-        _task({"state": "challenged_confirmed"}, pre_deploy),
-        _task({"state": "degraded_model_unavailable"}, pre_deploy),
-    ]
-    post_tasks = [
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=12)),
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=6)),
-        _task({"state": "challenged_confirmed"}, now - timedelta(hours=1)),
-        _task({"state": "degraded_model_unavailable"}, now - timedelta(hours=3)),
-    ]
-    all_tasks = pre_tasks + post_tasks
-
-    # Full 7-day window: pre + post traffic mixed
-    full = compute_panel_review_effectiveness(all_tasks)
-    assert full is not None
-    assert full["total_challenged"] == 5
-    assert full["challenged_degraded"] == 2
-    assert full["fail_open_rate"] == round(2 / 7, 4), (
-        f"7-day window: expected fail_open_rate={round(2/7, 4)}, got {full['fail_open_rate']}"
-    )
-
-    # Post-deploy only: tasks before deploy_boundary are excluded
-    post_deploy_only = compute_panel_review_effectiveness(all_tasks, since_dt=deploy_boundary)
-    assert post_deploy_only is not None
-    assert post_deploy_only["total_challenged"] == 3, (
-        f"post-deploy: expected total_challenged=3, got {post_deploy_only['total_challenged']}"
-    )
-    assert post_deploy_only["challenged_degraded"] == 1, (
-        f"post-deploy: expected challenged_degraded=1, got {post_deploy_only.get('challenged_degraded')}"
-    )
-    expected_post_rate = round(1 / 4, 4)
-    assert post_deploy_only["fail_open_rate"] == expected_post_rate, (
-        f"post-deploy: expected fail_open_rate={expected_post_rate}, got {post_deploy_only['fail_open_rate']}"
-    )
-
-    # A deploy boundary after all tasks → no gate invocations → None
-    future = compute_panel_review_effectiveness(all_tasks, since_dt=now + timedelta(days=1))
-    assert future is None, (
-        "since_dt beyond all task timestamps must return None (no gate invocations in window)"
-    )
-
-
-def test_panel_review_effectiveness_fail_open_rate_none_with_only_escalated():
-    """fail_open_rate is None for escalated-only windows (total==0, degraded==0, escalated>0).
-
-    An escalated-only window (all gate invocations crashed/failed and the merge was
-    BLOCKED for manual review) has gate activity, so the function returns a non-None
-    result dict.  But fail_open_rate requires at least one successful gate invocation
-    (total>0) or a real fail-open (degraded>0) to be meaningful — neither holds in an
-    escalated-only window, so fail_open_rate is None rather than 0.0.
-
-    This distinguishes "no-data" (fail_open_rate=None, no successful gate runs) from
-    "confirmed-zero" (fail_open_rate=0.0, gate ran and found zero degraded events).
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-
-    def _escalated_task():
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "unchallenged", "escalated": True}},
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-        )
-
-    tasks = [_escalated_task(), _escalated_task(), _escalated_task()]
-
-    result = compute_panel_review_effectiveness(tasks)
-    assert result is not None, (
-        "escalated-only window must return non-None (escalated>0 bypasses early return)"
-    )
-    assert result["total_challenged"] == 0, f"got {result['total_challenged']}"
-    assert result["challenged_escalated"] == 3, f"got {result['challenged_escalated']}"
-    assert result["challenged_degraded"] == 0, f"got {result.get('challenged_degraded')}"
-    assert result["fail_open_rate"] is None, (
-        f"fail_open_rate must be None (no successful gate invocations or degraded events), "
-        f"got {result['fail_open_rate']}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# compute_recommended_challenger_sample_rate
-# ---------------------------------------------------------------------------
-
-
-def test_recommended_sample_rate_no_data():
-    """Returns no_data status when panel_review_effectiveness is None."""
-    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
-
-    result = compute_recommended_challenger_sample_rate(None)
-    assert result["status"] == "no_data"
-    assert result["recommended_sample_rate"] is None
-    assert "rationale" in result
-
-
-def test_recommended_sample_rate_insufficient_data():
-    """Returns insufficient_data when total_challenged < MIN_SAMPLE_SIZE (30)."""
-    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
-
-    eff = {"total_challenged": 15, "overturn_rate": 0.05}
-    result = compute_recommended_challenger_sample_rate(eff)
-    assert result["status"] == "insufficient_data"
-    assert result["recommended_sample_rate"] is None
-    assert "15" in result["rationale"]
-
-
-def test_recommended_sample_rate_gate_earning():
-    """Returns gate_earning with rate=1.0 when overturn_rate >= 10%."""
-    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
-
-    eff = {"total_challenged": 50, "overturn_rate": 0.15}
-    result = compute_recommended_challenger_sample_rate(eff)
-    assert result["status"] == "gate_earning"
-    assert result["recommended_sample_rate"] == 1.0
-
-
-def test_recommended_sample_rate_reduce():
-    """Returns reduce status with rate < 1.0 when overturn_rate < 10%."""
-    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
-
-    # 4% overturn rate → recommended = max(0.10, 0.04/0.10) = max(0.10, 0.40) = 0.40
-    eff = {"total_challenged": 100, "overturn_rate": 0.04}
-    result = compute_recommended_challenger_sample_rate(eff)
-    assert result["status"] == "reduce"
-    assert result["recommended_sample_rate"] == 0.40
-
-
-def test_recommended_sample_rate_reduce_floor():
-    """Very low overturn_rate is clamped to 0.10 floor."""
-    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
-
-    eff = {"total_challenged": 100, "overturn_rate": 0.005}
-    result = compute_recommended_challenger_sample_rate(eff)
-    assert result["status"] == "reduce"
-    assert result["recommended_sample_rate"] == 0.10
-
-
-def test_recommended_sample_rate_at_threshold_boundary():
-    """Exactly at 10% overturn_rate is gate_earning."""
-    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
-
-    eff = {"total_challenged": 50, "overturn_rate": 0.10}
-    result = compute_recommended_challenger_sample_rate(eff)
-    assert result["status"] == "gate_earning"
-    assert result["recommended_sample_rate"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -11311,72 +10291,6 @@ async def test_llm_cost_attribution_baseline_delta_in_read_baseline(db_session):
     assert ("anthropic", "claude-sonnet-4-6") in model_keys
 
 
-def test_low_coverage_not_healthy():
-    """Effective coverage-aware gate health: low coverage prevents HEALTHY verdict.
-
-    When sample_rate < 1.0, many merges are sampled_out (never challenged).
-    The fail_open_rate computed over only the challenged population can look
-    low (<=5%) even when most merges were never reviewed.
-
-    Scenario: 100 merges total
-      - 80 sampled_out (sample_rate=0.2, 80% skipped)
-      - 19 challenged_confirmed (low fail_open rate)
-      - 1 challenged_degraded (fail-open)
-
-    Metrics:
-      fail_open_rate = 1 / (19 + 1) = 0.05 = 5% (looks HEALTHY)
-      effective_coverage = 20 / 100 = 0.20 (only 20% actually reviewed)
-
-    Gate health verdict must account for low coverage and NOT return HEALTHY
-    when effective_coverage is below threshold. effective_coverage must be
-    exposed in the result so frontends can display it.
-    """
-    from app.efficiency_snapshot import compute_panel_review_effectiveness
-    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
-
-    now = _utcnow()
-
-    def _task(recon):
-        return make_task(
-            project_id=None,
-            status=TaskStatus.COMPLETED,
-            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
-            vm_provisioned_at=now - timedelta(minutes=5),
-            vm_stopped_at=now,
-        )
-
-    tasks = [
-        # 80 sampled_out (not challenged, due to low sample_rate)
-        *[_task({"state": "sampled_out", "sample_rate": 0.2}) for _ in range(80)],
-        # 19 challenged_confirmed (low fail_open)
-        *[_task({"state": "challenged_confirmed"}) for _ in range(19)],
-        # 1 challenged_degraded (fail-open)
-        _task({"state": "degraded_model_unavailable"}),
-    ]
-
-    result = compute_panel_review_effectiveness(tasks)
-    assert result is not None, "must compute metrics with mix of sampled_out and challenged"
-
-    # fail_open_rate looks low: 1 / (19 + 1) = 5%
-    assert result["total_challenged"] == 19
-    assert result["challenged_degraded"] == 1
-    assert result["fail_open_rate"] == round(1 / 20, 4), (
-        f"expected fail_open_rate=0.05, got {result['fail_open_rate']}"
-    )
-
-    # Effective coverage: only 20 out of 100 total invocation opportunities
-    assert "sampled_out_count" in result, "must track sampled_out verdicts"
-    assert result["sampled_out_count"] == 80, (
-        f"expected sampled_out_count=80, got {result.get('sampled_out_count')}"
-    )
-
-    assert "effective_coverage" in result, "must compute and expose effective_coverage"
-    expected_coverage = round(20 / 100, 4)  # (challenged + degraded) / (all invocation opportunities)
-    assert result["effective_coverage"] == expected_coverage, (
-        f"expected effective_coverage={expected_coverage}, got {result.get('effective_coverage')}"
-    )
-
-
 # ---------------------------------------------------------------------------
 # compute_llm_cost_attribution_window_delta — pure unit tests
 # ---------------------------------------------------------------------------
@@ -12043,6 +10957,49 @@ async def test_seed_routing_verdict_from_snapshot_restores_verdict_state(db_sess
 
 
 @pytest.mark.asyncio
+async def test_seed_routing_verdict_prefers_keyed_telemetry(db_session):
+    """Startup restores the authoritative keyed container before design_doc."""
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+    from app.project_telemetry import set_project_telemetry
+    from app.shared_state import runtime_config as _rc
+
+    _rc.pop("provider_routing_verdict_state", None)
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {
+                        "state": PROVIDER_ROUTING_REJECT,
+                    }
+                }
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        DESIGN_DOC_KEY,
+        {
+            "snapshots": [
+                {
+                    "provider_routing_verdict": {
+                        "state": PROVIDER_ROUTING_ADOPT,
+                    }
+                }
+            ]
+        },
+    )
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    assert _rc.get("provider_routing_verdict_state") == PROVIDER_ROUTING_ADOPT
+    _rc.pop("provider_routing_verdict_state", None)
+
+
+@pytest.mark.asyncio
 async def test_seed_routing_verdict_from_snapshot_skips_project_without_verdict(db_session):
     """When no project has a verdict, the runtime_config key remains unset."""
     from app.shared_state import runtime_config as _rc
@@ -12468,4 +11425,274 @@ async def test_load_recent_tasks_is_terminal_time_ordered(db_session):
     dates = [t.updated_at for t in tasks]
     assert dates == sorted(dates, reverse=True), (
         "Tasks must be ordered by updated_at descending"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dual-write to project_efficiency_snapshot (design_doc God-column decomposition)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_write_snapshot_writes_to_efficiency_table(db_session):
+    """write_snapshot appends a row to project_efficiency_snapshot and project_telemetry."""
+    from app.project_telemetry import read_recent_efficiency_snapshots
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    rows = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(rows) == 1
+    # The dedicated table carries the full snapshot blob and the metric-def stamp.
+    assert rows[0].blob["captured_at"] == snap["captured_at"]
+    assert rows[0].metric_def_version == METRIC_DEF_VERSION
+    assert rows[0].blob[AXIS_COST_PER_MERGED_PR] == snap[AXIS_COST_PER_MERGED_PR]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_read_baseline_prefers_table_over_design_doc(db_session):
+    """A snapshot present ONLY in the table (not design_doc) is read back by drift."""
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    # Seed the baseline via a normal write (populates both stores).
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Insert a NEWER snapshot into the table only, with a sentinel cost value
+    # that is absent from any design_doc snapshot.
+    await db_session.refresh(project)
+    container = dict(project.design_doc[DESIGN_DOC_KEY])
+    latest_doc = container["snapshots"][-1]
+    table_only = dict(latest_doc)
+    table_only["captured_at"] = (_utcnow() + timedelta(minutes=1)).isoformat()
+    table_only[AXIS_COST_PER_MERGED_PR] = 4242.0
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=_utcnow() + timedelta(minutes=1),
+        metric_def_version=METRIC_DEF_VERSION,
+        blob=table_only,
+    )
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    # current reflects the LATEST stored snapshot — which is the table-only row.
+    assert drift["axes"][AXIS_COST_PER_MERGED_PR]["current"] == 4242.0
+
+
+@pytest.mark.asyncio
+async def test_read_snapshot_history_falls_back_to_design_doc(db_session):
+    """When the table has no rows, _read_snapshot_history returns the design_doc list."""
+    from app.efficiency_snapshot import _read_snapshot_history
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = {"snapshots": [{"captured_at": "2026-01-01T00:00:00", "x": 1}]}
+    history = await _read_snapshot_history(db_session, project.id, container)
+    assert history == container["snapshots"]
+    # Empty container + empty table -> empty list, not an error.
+    assert await _read_snapshot_history(db_session, project.id, {}) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_efficiency_table_retention_caps_at_seven(db_session):
+    """Repeated write_snapshot calls keep the table pruned to _SNAPSHOT_HISTORY_MAX rows."""
+    from app.efficiency_snapshot import _SNAPSHOT_HISTORY_MAX
+    from app.project_telemetry import read_recent_efficiency_snapshots
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    # Each write_snapshot stamps captured_at = _utcnow(); force distinct
+    # timestamps by inserting directly through the accessor so ON CONFLICT on
+    # (project_id, captured_at) does not collapse same-instant writes.
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    base = _utcnow()
+    for i in range(_SNAPSHOT_HISTORY_MAX + 4):
+        await insert_efficiency_snapshot(
+            db_session,
+            project.id,
+            captured_at=base + timedelta(minutes=i),
+            metric_def_version=METRIC_DEF_VERSION,
+            blob={"captured_at": (base + timedelta(minutes=i)).isoformat(), "i": i},
+        )
+    await db_session.commit()
+
+    rows = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(rows) == _SNAPSHOT_HISTORY_MAX
+    # Newest window retained.
+    assert rows[0].blob["i"] == _SNAPSHOT_HISTORY_MAX + 3
+
+
+# ---------------------------------------------------------------------------
+# Tests: endpoint snapshot-history merges design_doc + table rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_warm_reuse_dropout_trend_merges_table_rows(
+    client: AsyncClient, db_session
+):
+    """warm-reuse-dropout-trend must surface snapshots from the table, not only design_doc."""
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    # Seed a snapshot exclusively in the table (no design_doc entry).
+    cap = _utcnow()
+    table_snap = {
+        "captured_at": cap.isoformat(),
+        "reuse_dropout": {
+            "dropout_total": 7,
+            "dominant_dropout": {"reason": "table_only_reason", "share": 0.75},
+        },
+    }
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=cap,
+        metric_def_version=METRIC_DEF_VERSION,
+        blob=table_snap,
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/warm-reuse-dropout-trend"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "buckets" in data
+    reasons = [b["dominant_reason"] for b in data["buckets"]]
+    assert "table_only_reason" in reasons, (
+        "endpoint must include table-sourced snapshots; got: " + str(data["buckets"])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_pool_dispatch_funnel_trend_merges_table_rows(
+    client: AsyncClient, db_session
+):
+    """pool-dispatch-funnel-trend must surface snapshots from the table, not only design_doc."""
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    cap = _utcnow()
+    table_snap = {
+        "captured_at": cap.isoformat(),
+        "pool_dispatch_funnel": {
+            "pool_lease_hits": 10,
+            "cold_dispatches": 5,
+            "pool_hit_rate": 0.67,
+            "lease_miss_total": 3,
+            "dominant_miss": {"reason": "table_miss_reason", "share": 0.6},
+        },
+    }
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=cap,
+        metric_def_version=METRIC_DEF_VERSION,
+        blob=table_snap,
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-dispatch-funnel-trend"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "buckets" in data
+    reasons = [b["dominant_miss_reason"] for b in data["buckets"]]
+    assert "table_miss_reason" in reasons, (
+        "endpoint must include table-sourced snapshots; got: " + str(data["buckets"])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_batch_read_snapshot_histories_merges_table_rows(db_session):
+    """_batch_read_snapshot_histories includes table-only rows absent from design_doc."""
+    from app.efficiency_snapshot import _batch_read_snapshot_histories
+    from app.project_telemetry import insert_efficiency_snapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cap = _utcnow()
+    await insert_efficiency_snapshot(
+        db_session,
+        project.id,
+        captured_at=cap,
+        metric_def_version=METRIC_DEF_VERSION,
+        blob={"captured_at": cap.isoformat(), "source": "table"},
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    histories = await _batch_read_snapshot_histories(db_session, [project])
+    snaps = histories.get(project.id, [])
+    sources = [s.get("source") for s in snaps]
+    assert "table" in sources, (
+        "_batch_read_snapshot_histories must merge table rows; got: " + str(snaps)
     )

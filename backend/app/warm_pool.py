@@ -21,7 +21,6 @@ credentials frozen into its boot manifest).
 import logging
 import uuid
 from datetime import timedelta
-from typing import Optional
 
 from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm.attributes import flag_modified
@@ -179,11 +178,11 @@ async def register_pool_vm(
     *,
     vm_instance_id: str,
     project_id: uuid.UUID,
-    account_id: Optional[str] = None,
-    provider: Optional[str] = None,
-    auth_mode: Optional[str] = None,
-    model: Optional[str] = None,
-    agent_image_fingerprint: Optional[str] = None,
+    account_id: str | None = None,
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    agent_image_fingerprint: str | None = None,
     state: PoolVmState = PoolVmState.PROVISIONING,
 ) -> PoolVm:
     """Insert a new pool member row and return it.
@@ -219,7 +218,7 @@ async def register_pool_vm(
     return member
 
 
-async def get_pool_vm(session, vm_instance_id: str) -> Optional[PoolVm]:
+async def get_pool_vm(session, vm_instance_id: str) -> PoolVm | None:
     """Return the pool member with this ``vm_instance_id``, or None."""
     return (
         (
@@ -235,8 +234,8 @@ async def get_pool_vm(session, vm_instance_id: str) -> Optional[PoolVm]:
 async def list_pool_vms(
     session,
     *,
-    project_id: Optional[uuid.UUID] = None,
-    state: Optional[PoolVmState] = None,
+    project_id: uuid.UUID | None = None,
+    state: PoolVmState | None = None,
 ) -> list[PoolVm]:
     """List pool members, optionally filtered by project and/or lease state."""
     stmt = select(PoolVm)
@@ -249,7 +248,7 @@ async def list_pool_vms(
 
 
 async def get_live_pool_vm_ids(
-    session, *, project_id: Optional[uuid.UUID] = None
+    session, *, project_id: uuid.UUID | None = None
 ) -> set[str]:
     """Return the vm_instance_ids of all LIVE pool members (state != RETIRING).
 
@@ -267,7 +266,7 @@ async def get_live_pool_vm_ids(
 
 
 async def pool_vm_cleanup_exemptions(
-    session, *, project_id: Optional[uuid.UUID] = None
+    session, *, project_id: uuid.UUID | None = None
 ) -> set[str]:
     """vm_instance_ids the generic GCP/secret cleanup must spare — or an EMPTY
     set when the warm pool is disabled.
@@ -285,7 +284,7 @@ async def pool_vm_cleanup_exemptions(
 
 
 async def count_idle_pool_vms(
-    session, *, project_id: Optional[uuid.UUID] = None
+    session, *, project_id: uuid.UUID | None = None
 ) -> int:
     """Count non-task-bound pool members (PROVISIONING or IDLE) for slot accounting.
 
@@ -304,7 +303,7 @@ async def count_idle_pool_vms(
 
 
 async def count_idle_state_pool_vms(
-    session, *, project_id: Optional[uuid.UUID] = None
+    session, *, project_id: uuid.UUID | None = None
 ) -> int:
     """Count members in the IDLE state only (NOT PROVISIONING), per project or fleet-wide.
 
@@ -325,7 +324,7 @@ async def count_idle_state_pool_vms(
 
 
 async def count_live_pool_vms(
-    session, *, project_id: Optional[uuid.UUID] = None
+    session, *, project_id: uuid.UUID | None = None
 ) -> int:
     """Count live pool members (state != RETIRING), fleet-wide or per project.
 
@@ -343,7 +342,7 @@ async def count_live_pool_vms(
 
 
 async def count_pending_pool_leases(
-    session, *, project_id: Optional[uuid.UUID] = None
+    session, *, project_id: uuid.UUID | None = None
 ) -> int:
     """Count LEASED pool members whose pinned task is still QUEUED.
 
@@ -384,7 +383,7 @@ _ORPHANED_LEASE_TERMINAL_STATUSES = (
 
 
 async def count_orphaned_leased_pool_vms(
-    session, *, project_id: Optional[uuid.UUID] = None
+    session, *, project_id: uuid.UUID | None = None
 ) -> int:
     """Count LEASED pool members whose backing task is terminal or missing.
 
@@ -423,7 +422,7 @@ async def count_orphaned_leased_pool_vms(
 
 
 async def is_pool_cost_guard_engaged(
-    session, project_id: Optional[uuid.UUID] = None
+    session, project_id: uuid.UUID | None = None
 ) -> bool:
     """True iff the cost-aware auto-drain guard is currently engaged.
 
@@ -461,7 +460,7 @@ async def is_pool_cost_guard_engaged(
             )
             return bool(per_guard.get("engaged"))
         return False
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.debug(
             "[WARM-POOL] cost-guard evaluation failed; treating as disengaged",
             exc_info=True,
@@ -484,16 +483,16 @@ async def lease_idle_pool_vm(
     session,
     *,
     project_id: uuid.UUID,
-    account_id: Optional[str] = None,
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
-    excluded_account_ids: Optional[list[str]] = None,
-    leased_task_id: Optional[uuid.UUID] = None,
-    lease_ttl_secs: Optional[int] = None,
+    account_id: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    excluded_account_ids: list[str] | None = None,
+    leased_task_id: uuid.UUID | None = None,
+    lease_ttl_secs: int | None = None,
     allow_account_mismatch: bool = False,
     allow_provider_mismatch: bool = False,
-    lane_id: Optional[str] = None,
-) -> Optional[PoolVm]:
+    lane_id: str | None = None,
+) -> PoolVm | None:
     """Atomically lease an IDLE, compatible, same-tenant pool member, or None.
 
     Selects the oldest-idle IDLE member in ``project_id`` whose pinned identity
@@ -735,8 +734,8 @@ async def release_pool_vm(
     vm_instance_id: str,
     *,
     owning_task_id: uuid.UUID | str,
-    lane_id: Optional[str] = None,
-) -> Optional[PoolVm]:
+    lane_id: str | None = None,
+) -> PoolVm | None:
     """Atomically return a LEASED member to the IDLE pool so it can be re-leased.
 
     Called from the task-completion path when a pool-leased task reaches a
@@ -913,7 +912,7 @@ async def mark_pool_vm_retiring(
         PoolVmState.PROVISIONING,
         PoolVmState.IDLE,
     ),
-) -> Optional[PoolVm]:
+) -> PoolVm | None:
     """Atomically mark a member RETIRING so it is never leased again.
 
     Uses ``SELECT … FOR UPDATE SKIP LOCKED`` restricted to ``source_states`` so a
@@ -1011,10 +1010,7 @@ async def try_pool_dispatch(
     atomic (FOR UPDATE SKIP LOCKED) so two concurrent dispatches — or a concurrent
     agent poll — can never double-lease one member.
     """
-    from app.strategic_resident_runner_policy import is_resident_turn
 
-    if is_resident_turn(task):
-        return None
     if not is_warm_pool_enabled():
         return None
     from app.shared_state import is_warm_pool_suppressed, record_pool_claim_failure
@@ -1078,7 +1074,7 @@ async def try_pool_dispatch(
     # inert when improvement_lanes_enabled is False.
     from app.runtime_config_state import is_improvement_lanes_enabled
 
-    lane_id: Optional[str] = None
+    lane_id: str | None = None
     if is_improvement_lanes_enabled():
         raw_lane = (task.context or {}).get("improvement_lane_id")
         if raw_lane is not None:
@@ -1155,7 +1151,7 @@ async def try_pool_dispatch(
                         "[WARM-POOL] lane %s has no compatible member — degraded to COLD",
                         lane_id,
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.debug(
                     "[WARM-POOL] lane workspace-state correction failed lane=%s",
                     lane_id,
@@ -1239,7 +1235,7 @@ async def try_pool_dispatch(
                     member.vm_instance_id,
                     _prior_vm,
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.debug(
                 "[WARM-POOL] lane workspace-vm correction failed lane=%s",
                 lane_id,

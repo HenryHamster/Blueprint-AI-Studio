@@ -32,6 +32,8 @@ from app.metrics_integrity_sweep import (
     get_metrics_integrity_observability,
 )
 from app.models import (
+    Alert,
+    AlertSeverity,
     Artifact,
     ArtifactType,
     CriterionEvidence,
@@ -1283,16 +1285,15 @@ async def test_completion_debt_completeness_flags_missing_expected_obligations(d
     assert len(global_flags) == 1, f"expected one global flag, got {results}"
     f = global_flags[0]
     assert f.check == "completion_debt_completeness"
-    assert f.delta >= 1  # at least the standing seed inventory is missing
+    assert f.delta >= 1  # at least the dormant knob debts are missing
     assert f.self_reported == 0  # no open rows exist
     assert f.ground_truth == f.delta  # every expected obligation is missing
     assert "under-count" in f.detail
-    # The recomputed expected set covers the standing seed inventory: delta counts
-    # at least the three seed:* rows plus whatever dormant knobs are currently off.
+    # The recomputed expected set covers the currently-dormant knob debts.
     from app.completion_debt import _iter_seed_debts
 
     seed_keys = {d["dedupe_key"] for d in _iter_seed_debts()}
-    assert any(k.startswith("seed:") for k in seed_keys)
+    assert len(seed_keys) >= 1
     assert f.delta >= len(seed_keys)
 
 
@@ -7333,7 +7334,14 @@ async def test_plaintext_in_encrypted_column_is_flagged(db):
 # --- Check: audience_routing_attestation ----------------------------------
 
 
-def _message(db, project, *, event_type: str, audience: str | None = None) -> ProjectMessage:
+def _message(
+    db,
+    project,
+    *,
+    event_type: str,
+    audience: str | None = None,
+    message_type: MessageType = MessageType.NOTE,
+) -> ProjectMessage:
     """Insert a ProjectMessage with the given event_type and audience in context."""
     ctx: dict = {"event_type": event_type}
     if audience is not None:
@@ -7341,10 +7349,42 @@ def _message(db, project, *, event_type: str, audience: str | None = None) -> Pr
     msg = ProjectMessage(
         project_id=project.id,
         context=ctx,
-        message_type=MessageType.NOTE,
+        message_type=message_type,
     )
     db.add(msg)
     return msg
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_ok_for_operator_facing_message_type(db):
+    """A strategist-authored BLOCKER/BUG_REPORT/QUESTION whose event_type resolves
+    to strategist-internal but is stamped operator-action-needed (via the
+    message_type upgrade in route_event) must NOT be flagged: the ground-truth
+    recompute must pass message_type so it mirrors the stamping logic."""
+    project = await _project(db)
+    from app.message_audience import route_event
+
+    # strategic_message alone -> strategist-internal, but the operator-facing
+    # message_type upgrades the audience to operator-action-needed.
+    for mt in (MessageType.BLOCKER, MessageType.BUG_REPORT, MessageType.QUESTION):
+        canonical = route_event("strategic_message", message_type=mt.value)
+        assert canonical == "operator-action-needed"
+        _message(db, project, event_type="strategic_message",
+                 audience=canonical, message_type=mt)
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    pid = str(project.id)
+    project_results = [r for r in results if r.subject == pid]
+    assert len(project_results) == 1, f"expected 1 result, got {results}"
+    r = project_results[0]
+    assert r.status == CheckStatus.OK, f"expected OK, got {r.status}: {r.detail}"
+    assert r.self_reported == 3
+    assert r.ground_truth == 3
+    assert r.delta == 0
 
 
 @pytest.mark.asyncio
@@ -7560,10 +7600,11 @@ async def test_operator_inbox_needs_action_liveness_ok_when_all_actionable(db):
 
 @pytest.mark.asyncio
 async def test_operator_inbox_needs_action_liveness_flags_nonactionable_notice(db):
-    """An open NOTE (non-actionable) in the operator inbox triggers FLAGGED with delta=1."""
+    """An open NULL-audience NOTE (non-actionable, non-fyi) triggers FLAGGED with delta=1."""
     project = await _project(db)
-    # NOTE is non-actionable (not in NEEDS_ACTION_MESSAGE_TYPES, audience != operator-action-needed)
-    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi")
+    # NOTE with no audience (NULL) is operator-visible (legacy fallthrough) but not
+    # needs-action and not operator-fyi — should be flagged as a forward leak.
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience=None)
     await db.commit()
 
     ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
@@ -7629,10 +7670,12 @@ async def test_operator_inbox_needs_action_liveness_ignores_user_messages(db):
 
 @pytest.mark.asyncio
 async def test_operator_inbox_needs_action_liveness_enforce_enrolls_finding(db):
-    """In enforce mode, a non-actionable open message enrolls an EvergreenBacklogItem."""
+    """In enforce mode, a non-actionable NULL-audience open message enrolls an EvergreenBacklogItem."""
     _rc["metrics_integrity_sweep_mode"] = "enforce"
     project = await _project(db)
-    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi")
+    # NULL-audience NOTE: operator-visible (legacy fallthrough) but not needs-action
+    # and not operator-fyi → forward leak → FLAGGED → enrolled in enforce mode.
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience=None)
     await db.commit()
 
     now = _utcnow()
@@ -7659,3 +7702,260 @@ def test_registry_contains_operator_inbox_check():
     """operator_inbox_needs_action_liveness is registered in the check registry."""
     names = {c.name for c in registered_checks()}
     assert "operator_inbox_needs_action_liveness" in names
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_liveness_covers_alerts_and_bidirectional_drift(db):
+    """Verify the check exercises forward drift and the alert channel.
+
+    Forward drift: operator-fyi NOTEs are legitimate informational notices and
+    are NOT counted as leaked chatter. Only non-fyi messages that fail
+    derive_needs_action() are forward leaks.
+
+    Reverse drift: the badge SQL now uses status IN ('open', 'linked') for
+    needs-action queries, so a linked BLOCKER is correctly counted in the badge.
+    badge_invisible is always 0 in the check; delta comes only from the INFO alert.
+
+    Alert coverage: an undismissed INFO-severity, operator-visible Alert is
+    flagged as non-actionable alert noise, demonstrating the check covers the
+    alert channel in addition to the message ledger.
+    """
+    project = await _project(db)
+
+    # Linked BLOCKER: needs-action=True (derive_needs_action), status='linked'.
+    # The badge SQL now includes linked status, so this is NOT badge-invisible.
+    _inbox_message(
+        db, project,
+        message_type=MessageType.BLOCKER,
+        audience="operator-action-needed",
+        status="linked",
+    )
+
+    # operator-fyi NOTE: legitimate informational notice — NOT a forward leak.
+    _inbox_message(
+        db, project,
+        message_type=MessageType.NOTE,
+        audience="operator-fyi",
+    )
+
+    # INFO-severity alert with NULL event_type: operator-visible (fails open on NULL)
+    # but non-actionable → alert channel noise detected by the check.
+    db.add(Alert(
+        project_id=project.id,
+        severity=AlertSeverity.INFO,
+        title="Build completed",
+        message="Image build finished successfully",
+        event_type=None,
+    ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_operator_inbox_needs_action_liveness(ctx)
+
+    pid = str(project.id)
+    project_results = [r for r in results if r.subject == pid]
+    assert len(project_results) == 1
+    r = project_results[0]
+
+    # FLAGGED because of alert channel noise (1 INFO alert).
+    # The operator-fyi NOTE is NOT counted as a forward leak.
+    # badge_invisible is 0 because the badge SQL now includes linked status.
+    assert r.status == CheckStatus.FLAGGED, (
+        f"expected FLAGGED, got {r.status}: {r.detail}"
+    )
+    # delta = 0 forward_leaked + 0 badge_invisible + 1 info_alert = 1
+    assert r.delta == 1, (
+        f"expected delta=1 (only 1 INFO alert), got {r.delta}: {r.detail}"
+    )
+    # Alert channel detail mentions INFO alerts
+    assert "INFO" in r.detail or "alert" in r.detail.lower(), (
+        f"expected alert-channel mention in detail: {r.detail}"
+    )
+
+
+# --- Standalone operator-inbox liveness (always-on, sweep-mode-independent) ---
+
+
+@pytest.fixture(autouse=False)
+def _clean_liveness():
+    """Reset the standalone liveness module's process-local state between tests."""
+    from app.operator_inbox_liveness import _reset_liveness_for_tests
+    _reset_liveness_for_tests()
+    yield
+    _reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_leak_signal_counts_null_audience_noise(db, _clean_liveness):
+    """Standalone liveness check counts NULL-audience non-actionable messages as
+    forward-leak noise and fires even when metrics_integrity_sweep_mode is 'off'.
+
+    This is the acceptance test for the always-on operator-inbox liveness signal:
+    a NULL-audience open NOTE (operator-visible by legacy fail-open, but not
+    needs-action and not operator-fyi) must appear in ``forward_leaked`` regardless
+    of the sweep mode, proving the signal is independent of the cuttable sweep.
+    """
+    from app.operator_inbox_liveness import run_operator_inbox_liveness_check
+
+    # Disable the metrics-integrity sweep entirely — the standalone signal must
+    # still fire and count the noise.
+    _rc["metrics_integrity_sweep_mode"] = "off"
+
+    project = await _project(db)
+    # NULL-audience NOTE: legacy fail-open makes it operator-visible, but it is
+    # not needs-action (not BLOCKER/QUESTION) and not operator-fyi.  It should be
+    # counted as forward-leaked noise by the standalone liveness signal.
+    msg = ProjectMessage(
+        project_id=project.id,
+        context={},  # NULL audience (no "audience" key)
+        message_type=MessageType.NOTE,
+        status="open",
+        from_type="agent",
+    )
+    db.add(msg)
+    await db.commit()
+
+    results = await run_operator_inbox_liveness_check(db, _utcnow(), _force=True)
+
+    assert results is not None, "expected results (not gated out)"
+    pid = str(project.id)
+    project_results = [r for r in results if r.project_id == pid]
+    assert len(project_results) == 1, f"expected one result for project, got {project_results}"
+    r = project_results[0]
+
+    assert r.status == "flagged", (
+        f"expected 'flagged' for NULL-audience NOTE, got '{r.status}': {r.detail}"
+    )
+    assert r.forward_leaked == 1, (
+        f"expected forward_leaked=1, got {r.forward_leaked}: {r.detail}"
+    )
+    assert r.badge_invisible == 0
+    assert r.info_alert_noise == 0
+    assert "forward leak" in r.detail or "not genuinely needs-action" in r.detail, (
+        f"expected forward-leak mention in detail: {r.detail}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Durable DB writer + reader (AuditLaneDecisionLog).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_log_sweep_tick_to_db_writes_row(db):
+    """log_sweep_tick_to_db writes one AuditLaneDecisionLog row per call."""
+    from app.models import AuditLaneDecisionLog
+    from app.metrics_integrity_sweep import log_sweep_tick_to_db
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    now = _utcnow()
+    await log_sweep_tick_to_db(
+        db,
+        ts=now,
+        mode="observe",
+        tripped=True,
+        enrolled=0,
+        payload={"flagged": 2, "results": 5},
+    )
+    await db.flush()
+
+    rows = list(
+        (
+            await db.execute(
+                _select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "metrics_integrity"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    assert rows[0].tripped is True
+    assert rows[0].enrolled == 0
+    assert rows[0].payload["flagged"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_metrics_integrity_observability_from_db_aggregates(db):
+    """get_metrics_integrity_observability_from_db counts tripped vs total ticks."""
+    from app.metrics_integrity_sweep import (
+        get_metrics_integrity_observability_from_db,
+        log_sweep_tick_to_db,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    await log_sweep_tick_to_db(
+        db, ts=now, mode="observe", tripped=True, enrolled=0, payload={}
+    )
+    await log_sweep_tick_to_db(
+        db, ts=now, mode="observe", tripped=False, enrolled=0, payload={}
+    )
+    await log_sweep_tick_to_db(
+        db, ts=now, mode="enforce", tripped=True, enrolled=1, payload={}
+    )
+    await db.flush()
+
+    result = await get_metrics_integrity_observability_from_db(db, window_hours=24)
+    assert result["ticks"] == 3
+    assert result["tripped_count"] == 2
+    assert result["enrolled_total"] == 1
+    assert result["source"] == "db"
+
+
+@pytest.mark.asyncio
+async def test_run_metrics_integrity_sweep_writes_db_row(db):
+    """run_metrics_integrity_sweep writes a durable AuditLaneDecisionLog row."""
+    from app.models import AuditLaneDecisionLog
+    from sqlmodel import select as _select
+
+    _rc["metrics_integrity_sweep_mode"] = "observe"
+    await run_metrics_integrity_sweep(db)
+
+    rows = list(
+        (
+            await db.execute(
+                _select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "metrics_integrity"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    assert rows[0].enrolled == 0
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_tick_is_logged_with_correct_tripped_signal(db):
+    """In observe mode the DB row's tripped field matches whether any flags fired."""
+    from app.models import AuditLaneDecisionLog
+    from sqlmodel import select as _select
+
+    _rc["metrics_integrity_sweep_mode"] = "observe"
+    tick = await run_metrics_integrity_sweep(db)
+
+    rows = list(
+        (
+            await db.execute(
+                _select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "metrics_integrity"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    # tripped must match whether the in-memory tick actually flagged anything.
+    expected_tripped = tick["flagged"] > 0
+    assert rows[0].tripped is expected_tripped

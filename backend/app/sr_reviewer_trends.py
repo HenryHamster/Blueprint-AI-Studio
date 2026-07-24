@@ -10,10 +10,9 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Project, StrategicCycle, TaskStatus, _utcnow
+from app.models import StrategicCycle, TaskStatus, _utcnow
 from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     reviewer_confirmed_categories,
@@ -50,7 +49,9 @@ async def compute_fresh_reviewer_trend(
     ``approval_rate_lift`` — each with ``current``, ``previous``, ``delta``,
     and ``trend`` (stable / improving / regressing).
 
-    **Side effect**: writes result to ``project.design_doc["fresh_reviewer_trend"]``.
+    **Side effect**: writes result to
+    ``ProjectSRAnalytics.data["fresh_reviewer_trend"]``
+    via :func:`~app.task_locking.with_sr_analytics_locked`.
     """
     now = _utcnow()
 
@@ -284,20 +285,16 @@ async def compute_fresh_reviewer_trend(
         "approval_rate_lift": approval_rate_lift,
     }
 
-    _proj_row = await session.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(skip_locked=False, key_share=True)
-    )
-    project = _proj_row.scalar_one_or_none()
-    if not project:
-        return None
+    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
 
-    doc = dict(project.design_doc or {})
-    doc["fresh_reviewer_trend"] = result
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    _result = result
+
+    def _store(data: dict) -> None:
+        data["fresh_reviewer_trend"] = _result
+
+    applied = await with_sr_analytics_locked(session, project_id, _store)
+    if not applied:
+        return None
 
     logger.info(
         "[FRESH_REVIEWER_TREND] project=%s categories=%d bucket_mode=%s",
@@ -327,7 +324,8 @@ async def compute_sr_reviewer_disagreements(
     ``passed: true``.
 
     **Side effect**: writes the result to
-    ``project.design_doc["sr_reviewer_disagreements"]`` so downstream readers
+    ``ProjectSRAnalytics.data["sr_reviewer_disagreements"]``
+    via :func:`~app.task_locking.with_sr_analytics_locked` so downstream readers
     (admin digest, agent project-context) can access pre-computed data without
     re-scanning tasks.
 
@@ -373,18 +371,14 @@ async def compute_sr_reviewer_disagreements(
         "disagreements": entries,
     }
 
-    _proj_row = await session.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(skip_locked=False, key_share=True)
-    )
-    project = _proj_row.scalar_one_or_none()
-    if project:
-        doc = dict(project.design_doc or {})
-        doc["sr_reviewer_disagreements"] = result
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
+    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
+
+    _result = result
+
+    def _store(data: dict) -> None:
+        data["sr_reviewer_disagreements"] = _result
+
+    await with_sr_analytics_locked(session, project_id, _store)
 
     logger.info(
         "[SR_REVIEWER_DISAGREEMENTS] project=%s entries=%d",
@@ -415,10 +409,11 @@ async def compute_edges_trend(
     classified as ``'improving'`` | ``'regressing'`` | ``'stable'`` relative to the
     previous bucket using ``_TREND_DELTA_THRESHOLD``.
 
-    **Side effect**: writes result to ``project.design_doc['edges_trend']`` and
-    maintains a top-level ``rate_history`` list (capped at 5 entries).  Append
-    rule mirrors ``sr_catch_rate_trends``: in cycle mode append on new
-    ``current_cycle_id``; in calendar mode append when ≥14 days since last
+    **Side effect**: writes result to ``ProjectSRAnalytics.data['edges_trend']``
+    via :func:`~app.task_locking.with_sr_analytics_locked` and maintains a
+    top-level ``rate_history`` list (capped at 5 entries).  Append rule mirrors
+    ``sr_catch_rate_trends``: in cycle mode append on new ``current_cycle_id``;
+    in calendar mode append when ≥14 days since last
     ``computed_at``.
     """
     now = _utcnow()
@@ -540,39 +535,38 @@ async def compute_edges_trend(
         "reviewer_caught_trend": reviewer_caught_trend,
     }
 
-    _proj_row = await session.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(skip_locked=False, key_share=True)
-    )
-    project = _proj_row.scalar_one_or_none()
-    if not project:
+    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
+
+    _now = now
+    _use_cycle_mode = use_cycle_mode
+    _current_cycle_id = current_cycle_id
+    _c_rate = c_rate
+    _result = result
+
+    def _store(data: dict) -> None:
+        existing: dict = dict(data.get("edges_trend") or {})
+        existing_computed_at: Optional[str] = existing.get("computed_at")
+
+        is_new_window = True
+        if _use_cycle_mode:
+            is_new_window = existing.get("current_cycle_id") != _current_cycle_id
+        elif existing_computed_at:
+            try:
+                last_dt = datetime.fromisoformat(existing_computed_at)
+                is_new_window = (_now - last_dt).days >= 14
+            except (ValueError, TypeError):
+                pass
+
+        rate_history: list = list(existing.get("rate_history") or [])
+        if is_new_window or not rate_history:
+            rate_history.append(_c_rate)
+            rate_history = rate_history[-5:]
+        _result["rate_history"] = rate_history
+        data["edges_trend"] = _result
+
+    applied = await with_sr_analytics_locked(session, project_id, _store)
+    if not applied:
         return None
-
-    doc = dict(project.design_doc or {})
-    existing: dict = dict(doc.get("edges_trend") or {})
-    existing_computed_at: Optional[str] = existing.get("computed_at")
-
-    is_new_window = True
-    if use_cycle_mode:
-        is_new_window = existing.get("current_cycle_id") != current_cycle_id
-    elif existing_computed_at:
-        try:
-            last_dt = datetime.fromisoformat(existing_computed_at)
-            is_new_window = (now - last_dt).days >= 14
-        except (ValueError, TypeError):
-            pass
-
-    rate_history: list = list(existing.get("rate_history") or [])
-    if is_new_window or not rate_history:
-        rate_history.append(c_rate)
-        rate_history = rate_history[-5:]
-    result["rate_history"] = rate_history
-
-    doc["edges_trend"] = result
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
 
     logger.info(
         "[EDGES_TREND] project=%s trend=%s bucket_mode=%s",

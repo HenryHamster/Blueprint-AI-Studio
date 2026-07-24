@@ -3,8 +3,9 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import type { Components } from 'react-markdown';
+import { hasMathDelimiters, normalizeMathDelimiters } from '../utils/mathContent';
 
-// Lazy KaTeX CSS: only import when content contains math delimiters ($ or $$).
+// Lazy KaTeX CSS: only import when content contains math delimiters.
 // KaTeX CSS is ~30KB; eagerly loading it on every view inflates the initial
 // bundle on routes that never render math.
 let _katexCssLoaded = false;
@@ -38,10 +39,10 @@ const mdComponents: Components = {
 };
 
 export default function MarkdownContentInner({ content }: { content: string }) {
-  // Lazily load KaTeX CSS only when the content contains math delimiters.
-  // Checking for $ / $$ is cheap and avoids the redundant import on non-math views.
-  const hasMath = typeof content === 'string' && /(?<!\$)\${1,2}(?!\$)/.test(content);
+  const hasMath = hasMathDelimiters(content);
   if (hasMath) ensureKaTexCss();
+
+  const normalized = hasMath ? normalizeMathDelimiters(content) : content;
 
   return (
     <ReactMarkdown
@@ -49,7 +50,7 @@ export default function MarkdownContentInner({ content }: { content: string }) {
       rehypePlugins={[rehypeKatex]}
       components={mdComponents}
     >
-      {content}
+      {normalized}
     </ReactMarkdown>
   );
 }

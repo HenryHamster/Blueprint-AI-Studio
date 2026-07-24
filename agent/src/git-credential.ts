@@ -1,7 +1,7 @@
 /**
- * Git read-token file for the strategic resident VM.
+ * Git read-token file for a long-lived agent VM.
  *
- * The resident's provisioned workspace clones the repo with a GitHub App
+ * A provisioned workspace clones the repo with a GitHub App
  * installation token embedded in the remote URL. That token expires after
  * 60 minutes and is never refreshed, so `git fetch origin` fails with an
  * invalid-token auth error after ~1 hour.
@@ -9,9 +9,9 @@
  * Fix: mirror the current read token to a private on-disk file (same .blueprint/
  * directory as agent-token.jwt), configure git to use a credential helper that
  * reads that file on every git operation, and update the remote URL to remove
- * the embedded token so git always asks the helper. The resident's main loop
- * calls /api/agent/git-read-token on a ~8-minute interval to keep the file
- * current before the 60-minute GitHub token TTL.
+ * the embedded token so git always asks the helper. A long-lived session's
+ * main loop calls /api/agent/git-read-token on a ~8-minute interval to keep the
+ * file current before the 60-minute GitHub token TTL.
  *
  * Security: the file lives outside any cloned/committed workspace, in a directory
  * the agent user owns (dir 0700, file 0600), written atomically (temp + rename)
@@ -91,10 +91,10 @@ export function ensureGitCredentialHelperScript(): string {
 
   const helperLines = [
     '#!/bin/bash',
-    '# Git credential helper for the strategic resident VM (read-only GitHub access).',
+    '# Git credential helper for a long-lived agent VM (read-only GitHub access).',
     '# Called by git when credentials are needed for github.com HTTPS operations.',
     '# Reads the GitHub App installation token from GH_READ_TOKEN_FILE, kept fresh',
-    '# by the resident main loop (~8 min interval; tokens expire after 60 min).',
+    '# by the session main loop (~8 min interval; tokens expire after 60 min).',
     '# Falls back to the canonical path when the env var is unset.',
     'if [ "$1" = "get" ]; then',
     `  token_file="\${GH_READ_TOKEN_FILE:-${tokenFile}}"`,
@@ -127,7 +127,7 @@ export function ensureGitCredentialHelperScript(): string {
  * git delegates credential lookup to the helper on every fetch/pull/ls-remote.
  *
  * Also publishes `GH_READ_TOKEN_FILE` into `process.env` so child processes
- * (the resident Claude session and git subprocesses it spawns) inherit the
+ * (the Claude session and git subprocesses it spawns) inherit the
  * token file path.
  *
  * Call this after the workspace is cloned and the initial token is written via

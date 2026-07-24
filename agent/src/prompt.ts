@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { WORKSPACE } from './index.js';
@@ -132,11 +133,11 @@ export function configureAgentPermissions(taskType: string): string[] {
 }
 
 /**
- * Configure the resident seat's explicit read-only posture.
+ * Configure the Workday Resident's explicit read-only posture.
  *
- * The resident uses a live credential helper to keep `git fetch origin`
- * working, so we only install the inner-agent write blockers and commit/push
- * hooks here. The remote URL itself stays untouched.
+ * The session uses a live credential helper to keep `git fetch origin`
+ * working, so only the inner-agent write blockers and commit/push hooks are
+ * installed here. The remote URL itself stays untouched.
  */
 export function configureResidentAgentPermissions(taskType: string): string[] {
   if (!isReadOnlyTaskType(taskType)) {
@@ -197,7 +198,7 @@ export const VIEWPORT_FAILURE_SCREENSHOT_HINT =
  * component+width key rather than emitting a flat list. Returns '' when no
  * screenshots were downloaded, so non-visual PRs are unaffected.
  *
- * Shared by the review, fix, and panel_review prompt builders so a downstream
+ * Shared by the review and fix prompt builders so a downstream
  * agent receives the same screenshot brief regardless of which lane forwarded
  * the PNGs.
  */
@@ -260,7 +261,6 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
 // TASK_TYPE_HINTS or be explicitly opted-out here with justification.
 export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'review',           // Uses review-fix.ts bespoke prompt assembly
-  'panel_review',     // Uses panel-review.ts bespoke fixed-lens review assembly
   'plan',             // Uses research-plan.ts bespoke prompt assembly
   'research',         // Uses research-plan.ts bespoke prompt assembly
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly
@@ -276,7 +276,8 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
   'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
-  'strategic_resident_turn', // Uses strategic-resident-turn.ts bespoke prompt assembly (no-clone resident loop)
+  'criterion_coverage_trial', // Uses criterion-coverage-trial.ts; runs discovered covering tests directly, no Claude prompt
+  'walkthrough_e2e',        // Uses specialized.ts bespoke prompt assembly (live-stack walkthrough harness)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
@@ -553,12 +554,28 @@ Guidelines:
 - Omitting the field entirely is acceptable; it is never required.
 `;
 
+// Anti-hedging instinct: code-writing agents must ship the feature on, not
+// wrapped in a default-off flag, fail-open fallback, or observe-mode shim.
+export const ANTI_HEDGING_GUIDANCE = `
+## Anti-Hedging: Ship It On
+
+When implementing a feature or fix, do NOT introduce:
+- Default-off feature flags, observe-mode wrappers, or "gate_enabled=False" guards
+  that leave the new behavior dark on the first deploy
+- Fail-open fallbacks that silently skip the new logic when an input is missing or unexpected
+- "Log-only" / observe mode that defers enforcement to a follow-up task
+
+These patterns re-introduce the hedging that every clean-up cycle has to remove later.
+If the change is correct, ship it on. If it is unsafe without a flag, the task scope is
+too broad — narrow the scope and ship the safe portion, then file a follow-up.
+`;
+
 // Canonical concatenation of the cross-cutting failure-guidance blocks
 // shared by code-change handlers (standard.ts, review-fix.ts fix path).
 // Centralized so block order, inclusion, and future additions only need
 // to change in one place.
 export function assembleFailureGuidanceBlocks(includeRetryGuidance = true): string {
-  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + (includeRetryGuidance ? PRIOR_ATTEMPT_DIVERGENCE : '') + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE;
+  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + (includeRetryGuidance ? PRIOR_ATTEMPT_DIVERGENCE : '') + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE + ANTI_HEDGING_GUIDANCE;
 }
 
 // Compute a stable 12-hex-char fingerprint of the static prompt guidance for
@@ -699,6 +716,14 @@ _post_with_retry() {
 }`;
 }
 
+/** Bash helper that reads only a stable regular file, never a symlink/FIFO, within a byte cap. */
+export function boundedRegularReadShellFn(): string {
+  return `
+_read_regular_bounded() {
+  "$NODE_BIN" -e 'const fs=require("fs"),p=process.argv[1],max=Number(process.argv[2]); let fd=null,ok=false; try { const before=fs.lstatSync(p); if(!before.isFile()) throw 0; fd=fs.openSync(p,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0)); const opened=fs.fstatSync(fd); if(!opened.isFile()||opened.dev!==before.dev||opened.ino!==before.ino||opened.size>max) throw 0; const b=Buffer.alloc(opened.size+1); let n=0; while(n<b.length){const r=fs.readSync(fd,b,n,b.length-n,null);if(r===0)break;n+=r;} const after=fs.fstatSync(fd); if(n!==opened.size||after.size!==opened.size) throw 0; process.stdout.write(b.subarray(0,n)); ok=true; } catch {} finally { if(fd!==null){try{fs.closeSync(fd)}catch{ok=false}} } if(!ok)process.exit(2);' "$1" "$2"
+}`;
+}
+
 export function writePlaybookHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
@@ -757,6 +782,15 @@ exit $rc
 
 export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
+  const replyKeyPath = shellEscapeDoubleQuoted(
+    path.resolve(workspace, '.resident-reply-idempotency-key').replace(/\\/g, '/'),
+  );
+  const replyReceiptPath = shellEscapeDoubleQuoted(
+    path.resolve(workspace, '.resident-reply-receipt.json').replace(/\\/g, '/'),
+  );
+  const stagedReplyPath = shellEscapeDoubleQuoted(
+    path.resolve(workspace, '.resident-reply-staged-message.json').replace(/\\/g, '/'),
+  );
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
@@ -776,6 +810,11 @@ ${agentTokenShellFn()}
 ${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
+REPLY_KEY_PATH="${replyKeyPath}"
+REPLY_RECEIPT_PATH="${replyReceiptPath}"
+STAGED_REPLY_PATH="${stagedReplyPath}"
+NODE_BIN="\${NODE_BINARY:-node}"
+${boundedRegularReadShellFn()}
 ${retryPostShellFn()}
 if [ "$OP" = "send" ]; then
   if [ "\${2:-}" = "--stdin" ]; then
@@ -786,9 +825,41 @@ if [ "$OP" = "send" ]; then
     MSG_TYPE="\${3:-NOTE}"
   fi
   [ -n "$CONTENT" ] || { echo "Error: send requires message content" >&2; exit 1; }
-  IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
-  PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s}}' \\
-    "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")") || {
+  IDEM_KEY=""
+  COVERED_IDS=""
+  if [ -e "$REPLY_RECEIPT_PATH" ] || [ -L "$REPLY_RECEIPT_PATH" ]; then
+    RECEIPT=$(_read_regular_bounded "$REPLY_RECEIPT_PATH" 16384) || {
+      echo "[ERROR] send: ambient Resident reply receipt is not a safe regular file" >&2; exit 1
+    }
+    RECEIPT_FIELDS=$("$NODE_BIN" -e 'const r=JSON.parse(process.argv[1]); if(!r || typeof r.idempotency_key!=="string" || !r.idempotency_key || !Array.isArray(r.covered_message_ids) || r.covered_message_ids.length===0 || r.covered_message_ids.some(x=>typeof x!=="string" || !x)) process.exit(2); process.stdout.write(r.idempotency_key+"\\n"+JSON.stringify(r.covered_message_ids))' "$RECEIPT") || {
+      echo "[ERROR] send: ambient Resident reply receipt is invalid" >&2; exit 1
+    }
+    IDEM_KEY=$(printf '%s' "$RECEIPT_FIELDS" | head -n1)
+    COVERED_IDS=$(printf '%s' "$RECEIPT_FIELDS" | tail -n +2)
+  elif [ -e "$REPLY_KEY_PATH" ] || [ -L "$REPLY_KEY_PATH" ]; then
+    echo "[ERROR] send: ambient Resident reply key exists without its receipt" >&2
+    exit 1
+  fi
+  if [ -z "$IDEM_KEY" ]; then
+    IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
+  fi
+  if [ -n "$COVERED_IDS" ]; then
+    PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s,"covered_message_ids":%s}}' \\
+      "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")" "$COVERED_IDS")
+    STAGED_DATA=$(printf '{"type":%s,"content":%s,"idempotency_key":%s,"covered_message_ids":%s}' \\
+      "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")" "$COVERED_IDS")
+    [ -n "$STAGED_DATA" ] || { echo "[ERROR] send: failed to serialize staged Resident reply" >&2; exit 1; }
+    "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const d=JSON.parse(process.argv[2]); const t=p+".tmp."+process.pid; try { fs.writeFileSync(t,JSON.stringify(d),{encoding:"utf8",flag:"wx",mode:0o600}); fs.linkSync(t,p); } finally { try { fs.unlinkSync(t); } catch {} }' "$STAGED_REPLY_PATH" "$STAGED_DATA" || {
+      echo "[ERROR] send: failed to stage Resident reply" >&2; exit 1
+    }
+    printf '{"status":"staged","op":"create_message"}'
+    echo ""
+    exit 0
+  else
+    PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s}}' \\
+      "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")")
+  fi
+  [ -n "$PAYLOAD" ] || {
     echo "[ERROR] send: failed to serialize message payload" >&2; exit 1
   }
   printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
@@ -918,18 +989,22 @@ export function writeDesignDocHelper(
   // so 429 (lock contention) and 5xx (transient) are never silently dropped.
   // Non-retryable 4xx responses surface immediately.
   const retryFn = readOnly ? '' : retryPostShellFn();
+  // Payload builders use python3 with sys.argv to pass all values — no printf
+  // format-string substitution, no shell-quoting escape layers. Any character
+  // (double-quote, backslash, newline, %) in KEY or VALUE reaches python3 as a
+  // plain sys.argv element and is serialised correctly by json.dumps / json.loads.
   const writeBranches = readOnly ? `elif [ "$OP" = "set" ] || [ "$OP" = "delete" ]; then
   echo "Error: ./design-doc is read-only in this workspace ($OP not permitted)." >&2; exit 1` : `elif [ "$OP" = "set" ]; then
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE" | \\
+  python3 -c 'import json,sys;t,k,v=sys.argv[1],sys.argv[2],sys.argv[3];sys.stdout.write(json.dumps({"task_id":t,"op":"set","key":k,"value":json.loads(v)}))' "$TASK" "$KEY" "$VALUE" | \\
     _post_with_retry "$API/api/agent/design-doc" "design-doc set"
 elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY" | \\
+  python3 -c 'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"delete","key":k}))' "$TASK" "$KEY" | \\
     _post_with_retry "$API/api/agent/design-doc" "design-doc delete"`;
   const unknownUsage = readOnly ? 'Use get or list.' : 'Use get, set, delete, or list.';
   const helperScript = `#!/bin/bash
@@ -945,6 +1020,7 @@ API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
+command -v python3 >/dev/null 2>&1 || { echo "[ERROR] design-doc requires python3" >&2; exit 1; }
 
 # Fail-fast POST for read operations (list/get): single curl, no retry.
 _post_once() {
@@ -957,12 +1033,12 @@ _post_once() {
 }
 ${retryFn}
 if [ "$OP" = "list" ]; then
-  printf '{"task_id":"%s","op":"list"}' "$TASK" | _post_once
+  python3 -c 'import json,sys;sys.stdout.write(json.dumps({"task_id":sys.argv[1],"op":"list"}))' "$TASK" | _post_once
 elif [ "$OP" = "get" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: get requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | _post_once
+  python3 -c 'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"get","key":k}))' "$TASK" "$KEY" | _post_once
 ${writeBranches}
 else
   echo "Unknown op: $OP. ${unknownUsage}" >&2; exit 1

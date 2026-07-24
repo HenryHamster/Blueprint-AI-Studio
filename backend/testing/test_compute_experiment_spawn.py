@@ -4057,11 +4057,11 @@ async def test_resolve_project_baked_image_strict_no_image_declared(
 async def test_resolve_project_baked_image_strict_manifest_error_is_no_op(
     db_session, mocker
 ):
-    """A manifest-fetch exception (project has no manifest) returns (None, None).
+    """A manifest-fetch exception on a project with NO image history returns (None, None).
 
-    We cannot distinguish 'declares no image' from 'manifest unreadable', so
-    we treat both as 'no image declared' — preserving image-less behavior for
-    projects without a .blueprint/tools.json.
+    Projects with zero ProjectComputeImage rows genuinely have never declared a
+    baked image, so a manifest-fetch error is treated as 'no image declared' —
+    preserving image-less behavior for projects without a .blueprint/tools.json.
     """
     from app.compute_backends import resolve_project_baked_image_strict
 
@@ -4079,6 +4079,55 @@ async def test_resolve_project_baked_image_strict_manifest_error_is_no_op(
     ref, error = await resolve_project_baked_image_strict(db_session, project)
     assert ref is None
     assert error is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_manifest_error_fails_closed_on_image_history(
+    db_session, mocker
+):
+    """A manifest-fetch exception on a project WITH image history returns (None, reason).
+
+    A project that has existing ProjectComputeImage rows has previously declared
+    a baked image. A transient manifest-fetch failure must NOT silently fall back
+    to image-less behavior — the dispatch must be terminal-failed with an honest
+    reason. This is the fail-CLOSED contract for projects with baked-image history.
+    """
+    from app.compute_backends import resolve_project_baked_image_strict
+    from app.models import ProjectComputeImage
+
+    project = Project(name="StrictManifestErrorImageHistory", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Project has an existing built image record.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="history-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-history",
+            tag="latest",
+            pinned_ref="reg.example.com/org/repo/history-proj@sha256:aabbccdd",
+            digest="sha256:aabbccdd",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # Manifest fetch fails transiently.
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("GitHub API rate limit exceeded"),
+    )
+
+    ref, error = await resolve_project_baked_image_strict(db_session, project)
+    assert ref is None
+    assert error is not None
+    assert "image" in (error or "").lower() or "manifest" in (error or "").lower(), (
+        f"error message should reference the image or manifest concept; got: {error!r}"
+    )
 
 
 @pytest.mark.asyncio

@@ -1306,6 +1306,47 @@ def capability_proof_trial_is_green(result: Any) -> bool:
     return capability_proof_trial_suite_verifying(result)
 
 
+def criterion_coverage_trial_is_green(result: Any) -> bool:
+    """Whether a ``criterion_coverage_trial`` result proves the covering tests ran
+    GREEN against the enrolled checkout — the machine evidence that mints a genuine
+    ``covered`` criterion-evidence tier (``executed_named_test``).
+
+    Analogous to :func:`capability_proof_trial_is_green` but keyed on acceptance
+    criteria rather than capabilities (the two earn paths are deliberately NOT
+    entangled). True only when ALL hold:
+
+      * ``could_not_run`` is not set — the targeted run was actually possible,
+      * ``ran`` is True and ``passed`` is True — the tests executed and passed,
+      * the executed checkout is identified: ``head_sha`` is a non-empty string
+        (there must be a concrete SHA to PIN into the ``covered`` evidence), and
+      * the executed SHA MATCHES the enrolled checkout: when the receipt echoes a
+        non-empty ``queued_head_sha`` (the enrolled ``head_sha``), it must equal
+        ``head_sha``. A ``queued_head_sha`` that is absent/blank means the
+        enrollment was revision-unbound, so any executed ``head_sha`` is accepted
+        and pinned (mirroring the capability trial's optional-enrolled-SHA shape).
+
+    Every other combination — an un-targetable run (``could_not_run``), a
+    red/failing run, a missing executed SHA, a SHA mismatch, or a missing/old-shape
+    result — yields False, so no ``covered`` tier is minted on ambiguity and a red
+    or drifted trial never fabricates coverage.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("could_not_run") is True:
+        return False
+    if result.get("ran") is not True:
+        return False
+    if result.get("passed") is not True:
+        return False
+    head_sha = result.get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha.strip():
+        return False
+    queued = result.get("queued_head_sha")
+    if isinstance(queued, str) and queued.strip() and queued.strip() != head_sha.strip():
+        return False
+    return True
+
+
 def pr_self_suppressed_suite(verdict: Any) -> bool:
     """Whether the PR's OWN diff made the suite stop verifying by disabling tests.
 

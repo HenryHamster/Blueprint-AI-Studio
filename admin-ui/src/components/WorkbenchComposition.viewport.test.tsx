@@ -270,7 +270,7 @@ const STATE = {
     },
   },
   design: { has_design_doc: true, revision: 2 },
-} as StrategicStateResponse;
+} as unknown as StrategicStateResponse;
 
 function makeHeaderProps() {
   return {
@@ -293,7 +293,7 @@ function makeHeaderProps() {
     lastFetchTime: 0,
     deployState: null,
     selectedProjectId: 'project-123',
-    projects: [{ id: 'project-123', name: 'Blueprint', github_owner: 'Blueprint', github_repo: 'Blueprint' }],
+    projects: [{ id: 'project-123', name: 'Blueprint', github_owner: 'Blueprint', github_repo: 'Blueprint', status: 'active', autonomous_enabled: false, created_at: '2026-01-01T00:00:00Z' }],
     onSelectProject: noop,
     activeTab: 'chat' as const,
     onTabChange: noop,
@@ -373,32 +373,15 @@ describe('WorkbenchComposition viewport regression', () => {
               title="Strategic"
               showTitle={false}
               actions={(
-                <>
-                  <StrategicSessionControl
-                    mode="continuous"
-                    saving={false}
-                    localRunner={STATE.runtime.local_runner}
-                    runtimeWork={null}
-                    accountSpend={{
-                      totalAccounts: 2,
-                      availableAccounts: 1,
-                      enabledAccounts: 1,
-                      activeAccountTasks: 1,
-                      configuredCapAccounts: 1,
-                      disabledModelCount: 0,
-                      trackedSpendUsd: 12.34,
-                      dailyCostCeilingUsd: 50,
-                    }}
-                    onModeChange={vi.fn()}
-                    onOpenDevices={options.onOpenDevices ?? vi.fn()}
-                    onOpenCompute={options.onOpenCompute ?? vi.fn()}
-                    onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
-                    showMonitoringControls={false}
-                    density="compact"
-                    hideDetailsOnMobile
-                    className="flex"
-                  />
-                </>
+                <StrategicSessionControl
+                  currentMode="chat"
+                  sessionActive={false}
+                  sessionState="ready"
+                  onStartSession={vi.fn()}
+                  onStopSession={vi.fn()}
+                  onModeChange={vi.fn()}
+                  density="compact"
+                />
               )}
               flush
             >

@@ -49,6 +49,7 @@ from app.runtime_config_state import (
     resolve_project_compute_job_concurrency_cap,
     runtime_config as _runtime_config,
 )
+from app.project_telemetry import read_telemetry_or_doc, set_project_telemetry
 from app.schemas import ResourceEnvelope as ResourceEnvelopeSchema
 from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.playbook_storage import archive_playbook_entry
@@ -168,8 +169,10 @@ async def get_auto_remediation_config(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    stored = (project.design_doc or {}).get("_auto_remediation", {})
-    config = {**_build_auto_remediation_defaults(project), **stored}
+    stored = await read_telemetry_or_doc(
+        session, project_id, project.design_doc, "_auto_remediation", {}
+    )
+    config = {**_build_auto_remediation_defaults(project), **(stored or {})}
 
     # Compute activity stats from tasks spawned by auto-remediation
     now = _utcnow()
@@ -323,12 +326,21 @@ async def update_auto_remediation_config(
     # Lock project row before read-modify-write to prevent lost updates.
     project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
-    stored = dict(design_doc.get("_auto_remediation", {}))
+    # Telemetry-first read (design_doc fallback) so an already-migrated value is
+    # not clobbered by a stale design_doc copy during the rolling cutover.
+    stored = dict(
+        await read_telemetry_or_doc(
+            session, project_id, design_doc, "_auto_remediation", {}
+        )
+        or {}
+    )
     stored.update(body)
     design_doc["_auto_remediation"] = stored
     project.design_doc = design_doc
     flag_modified(project, "design_doc")
     session.add(project)
+    # Dual-write to project_telemetry (design_doc copy kept for rollback compat).
+    await set_project_telemetry(session, project_id, "_auto_remediation", stored)
     await session.commit()
 
     config = {**_build_auto_remediation_defaults(project), **stored}
@@ -1517,7 +1529,9 @@ async def get_broadcast_limit_config(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    stored = (project.design_doc or {}).get("_broadcast_limit")
+    stored = await read_telemetry_or_doc(
+        session, project_id, project.design_doc, "_broadcast_limit", None
+    )
     return {
         "project_id": str(project_id),
         "broadcast_limit": stored,
@@ -1557,6 +1571,11 @@ async def update_broadcast_limit_config(
             doc["_broadcast_limit"] = value
 
     await with_design_doc_locked(session, project_id, _apply)
+    # Dual-write to project_telemetry (design_doc copy kept for rollback compat).
+    # A null value stores None; read_telemetry_or_doc treats that as "no row" and
+    # falls back to design_doc, which was also cleared above — both resolve to the
+    # global default.
+    await set_project_telemetry(session, project_id, "_broadcast_limit", value)
     await session.commit()
 
     return {
@@ -1668,6 +1687,16 @@ async def update_playbook_entry(
     # Lock project row before read-modify-write to prevent lost updates.
     project = await lock_project_or_429(session, project_id)
     doc = dict(project.design_doc or {})
+
+    # Hydrate playbook_archive from telemetry — strip_migrated_doc_keys
+    # removes this key from design_doc at write time, so the archive
+    # capture below sees the real data.
+    from app.project_telemetry import get_project_telemetry as _get_pb_archive
+
+    _hydrated_archive = await _get_pb_archive(session, project_id, "playbook_archive")
+    if _hydrated_archive is not None:
+        doc["playbook_archive"] = list(_hydrated_archive)
+
     full_key = f"playbook/{key}"
     if full_key not in doc or not isinstance(doc[full_key], dict):
         raise HTTPException(status_code=404, detail=f"Playbook entry '{key}' not found")
@@ -1691,9 +1720,20 @@ async def update_playbook_entry(
     elif action == "archive":
         archive_playbook_entry(doc, full_key, archived_at=now_iso)
 
+    # Strip migrated telemetry keys before persist — playbook_archive is now
+    # written exclusively via project_telemetry.
+    _pb_archive_value = doc.get("playbook_archive")
+    from app.project_telemetry import (
+        set_project_telemetry as _set_pb_telemetry,
+        strip_migrated_doc_keys as _strip_migrated,
+    )
+
+    _strip_migrated(doc)
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)
+    if action == "archive" and _pb_archive_value is not None:
+        await _set_pb_telemetry(session, project.id, "playbook_archive", _pb_archive_value)
     await session.commit()
 
     if action == "archive":

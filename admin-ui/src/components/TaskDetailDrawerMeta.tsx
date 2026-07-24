@@ -9,7 +9,7 @@ import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel, TeardownForensicsPanel } from './TaskDetailDrawerFailureDetail';
 import { TaskSideboardContextSection } from './TaskDetailDrawerSideboardContext';
-import type { AdversarialGateDiagnostic, PanelReviewVerdict, Task } from '../types/task';
+import type { AdversarialGateDiagnostic, Task } from '../types/task';
 import { CopyableId, SectionHeader, DetailRow, DirectionsSection, DependencyItem } from './TaskDetailDrawerPrimitives';
 import {
   TaskComputeJobsSection,
@@ -18,7 +18,6 @@ import {
   AdversarialGateDiagnosticSection,
   KnowledgeDocumentSection,
   EvaluationSummarySection,
-  PanelReviewVerdictSection,
   AcceptanceEvidenceSection,
   SystemMetricsSection,
   BlockerSection,
@@ -276,15 +275,9 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
 
       {task.evaluation_summary && <EvaluationSummarySection summary={task.evaluation_summary} />}
 
-      {task.task_type === 'panel_review' && task.plan_output ? (() => {
-        const verdict = task.plan_output as unknown as PanelReviewVerdict;
-        if (!verdict?.lenses || !verdict?.overall_verdict || !verdict?.summary) return null;
-        return <PanelReviewVerdictSection verdict={verdict} />;
-      })() : null}
-
       <MemoReasoningSection task={task} onNavigateToTask={onNavigateToTask} />
 
-      {task.plan_output && task.task_type !== 'memo' && task.task_type !== 'panel_review' && !(task.plan_output as Record<string, unknown>).knowledge_document && <>
+      {task.plan_output && task.task_type !== 'memo' && !(task.plan_output as Record<string, unknown>).knowledge_document && <>
         <SectionHeader>Plan Output</SectionHeader>
         <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-purple-950/20 rounded-lg p-3 max-h-64 overflow-y-auto custom-scrollbar border border-purple-900/30 font-mono">{JSON.stringify(task.plan_output, null, 2)}</pre>
       </>}

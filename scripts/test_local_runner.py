@@ -1429,24 +1429,28 @@ class TestLiveRunnerConfig(unittest.TestCase):
 
     def test_rejected_generation_mutates_no_recognized_field(self):
         # A rejected block (mix of known + unrecognized fields) must leave EVERY
-        # recognized field at its prior value — max_concurrent, task_types, and
-        # both GPU-scheduling settings — so the 'rejected' verdict is honest.
+        # recognized field at its prior value — max_concurrent, max_concurrent_compute,
+        # task_types, and both GPU-scheduling settings — so the 'rejected' verdict
+        # is honest and partial state never leaks to the scheduler.
         holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
-        # Establish a known-good baseline generation first.
+        # Establish a known-good baseline generation (all five live-safe fields).
         self.assertTrue(holder.apply({
             "max_concurrent": 5,
+            "max_concurrent_compute": 3,
             "task_types": ["fix"],
             "gpu_indices_allowed": [0, 1],
             "gpus_per_job": 2,
             "config_generation": "base",
         }))
         self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(holder.max_concurrent_compute(), 3)
         self.assertEqual(gpu_state["allowed"], [0, 1])
         self.assertEqual(gpu_state["per_job"], 2)
         # A later block flips every recognized field BUT carries an unrecognized
         # one, so it must be rejected atomically — none of the flips take effect.
         self.assertFalse(holder.apply({
             "max_concurrent": 9,
+            "max_concurrent_compute": 8,
             "task_types": ["create"],
             "gpu_indices_allowed": [2, 3],
             "gpus_per_job": 4,
@@ -1454,6 +1458,7 @@ class TestLiveRunnerConfig(unittest.TestCase):
             "config_generation": "reject",
         }))
         self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(holder.max_concurrent_compute(), 3)
         self.assertEqual(holder.report()["applied_task_types"], ["fix"])
         self.assertEqual(gpu_state["allowed"], [0, 1])
         self.assertEqual(gpu_state["per_job"], 2)
@@ -9483,3 +9488,421 @@ class TestProgressTail(unittest.TestCase):
             self.assertEqual(result["count"], 1)
         finally:
             os.unlink(path)
+
+
+class TestRunnerEnrollmentDocumentation(unittest.TestCase):
+    """Invariant tests: runner-install.md and local_runner error messages
+    must accurately describe the shipped two-button enrollment UI, not a
+    post-click preset chooser that was never shipped."""
+
+    _DOCS_ROOT = Path(__file__).resolve().parents[1] / "docs"
+    _RUNNER_INSTALL_MD = _DOCS_ROOT / "runner-install.md"
+    _SCRIPTS_ROOT = Path(__file__).resolve().parent
+    _LOCAL_RUNNER_PY = _SCRIPTS_ROOT / "local_runner.py"
+
+    def _section1_text(self) -> str:
+        """Return the text of Section 1 (Enroll a runner) from runner-install.md."""
+        content = self._RUNNER_INSTALL_MD.read_text()
+        # Extract between "## 1. Enroll a runner" and the next "---" or "## 2."
+        import re
+        m = re.search(
+            r"## 1\. Enroll a runner(.*?)(?=\n---|\n## 2\.)",
+            content,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(m, "Could not locate '## 1. Enroll a runner' section")
+        return m.group(1)
+
+    # ── docs/runner-install.md: Section 1 ─────────────────────────────────────
+
+    def test_section1_does_not_describe_preset_chooser(self):
+        """Section 1 must not claim a post-click preset chooser dialog exists."""
+        text = self._section1_text()
+        self.assertNotIn(
+            "Choose a preset",
+            text,
+            "runner-install.md Section 1 incorrectly describes a preset chooser "
+            "dialog that does not exist in the shipped UI. The UI ships two "
+            "separate buttons: 'Enroll runner' and 'Strategic runner'.",
+        )
+
+    def test_section1_mentions_enroll_runner_button(self):
+        """Section 1 must mention the 'Enroll runner' button (default preset)."""
+        text = self._section1_text()
+        self.assertIn(
+            "Enroll runner",
+            text,
+            "runner-install.md Section 1 must describe the 'Enroll runner' button "
+            "for the default preset.",
+        )
+
+    def test_section1_mentions_strategic_runner_button(self):
+        """Section 1 must mention the 'Strategic runner' button (strategic_local preset)."""
+        text = self._section1_text()
+        self.assertIn(
+            "Strategic runner",
+            text,
+            "runner-install.md Section 1 must describe the 'Strategic runner' button "
+            "for the strategic_local preset.",
+        )
+
+    def test_section1_references_runtime_tab(self):
+        """Section 1 must reference the Runtime tab, not a Settings or Runners menu."""
+        text = self._section1_text()
+        self.assertIn(
+            "Runtime",
+            text,
+            "runner-install.md Section 1 must reference the 'Runtime' tab where "
+            "the enrollment buttons live.",
+        )
+
+    def test_section1_references_devices_and_runners(self):
+        """Section 1 must reference the 'Devices and runners' section."""
+        text = self._section1_text()
+        self.assertIn(
+            "Devices and runners",
+            text,
+            "runner-install.md Section 1 must name the 'Devices and runners' section "
+            "under the Runtime tab where the enrollment buttons live.",
+        )
+
+    # ── scripts/local_runner.py: re-enroll error message ──────────────────────
+
+    def test_reenroll_message_does_not_cite_settings_runners(self):
+        """The re-enroll error message must not reference the stale 'Settings → Runners' path."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        self.assertNotIn(
+            "Settings → Runners",
+            content,
+            "local_runner.py re-enroll message cites 'Settings → Runners', which is "
+            "stale. The enrollment UI lives under the Runtime tab > Devices and runners.",
+        )
+
+    def test_reenroll_message_references_runtime_tab(self):
+        """The re-enroll error message must reference the Runtime tab."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        # Find the re-enroll print statement and check it references Runtime
+        import re
+        # Extract the block around the Re-enroll print call
+        m = re.search(r"Re-enroll[^\n]*\n", content)
+        self.assertIsNotNone(m, "Could not find Re-enroll message in local_runner.py")
+        reenroll_line = m.group(0)
+        self.assertIn(
+            "Runtime",
+            reenroll_line,
+            f"local_runner.py re-enroll message does not reference the Runtime tab: "
+            f"{reenroll_line!r}",
+        )
+
+    def test_reenroll_message_references_devices_and_runners(self):
+        """The re-enroll error message must reference 'Devices and runners'."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        import re
+        m = re.search(r"Re-enroll[^\n]*\n", content)
+        self.assertIsNotNone(m, "Could not find Re-enroll message in local_runner.py")
+        reenroll_line = m.group(0)
+        self.assertIn(
+            "Devices and runners",
+            reenroll_line,
+            f"local_runner.py re-enroll message does not reference 'Devices and runners': "
+            f"{reenroll_line!r}",
+        )
+
+    # ── docs/runner-install.md: Section 8 consistency ─────────────────────────
+
+    def test_section8_reenroll_matches_two_button_flow(self):
+        """Section 8 re-enrollment must reference the Runtime tab and Devices and runners."""
+        content = self._RUNNER_INSTALL_MD.read_text()
+        import re
+        m = re.search(
+            r"## 8\. Re-enrollment(.*?)$",
+            content,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(m, "Could not locate '## 8. Re-enrollment' section")
+        section8 = m.group(1)
+        self.assertIn(
+            "Runtime",
+            section8,
+            "runner-install.md Section 8 must reference the Runtime tab.",
+        )
+        self.assertIn(
+            "Devices and runners",
+            section8,
+            "runner-install.md Section 8 must reference the 'Devices and runners' section.",
+        )
+        self.assertIn(
+            "Enroll runner",
+            section8,
+            "runner-install.md Section 8 must mention the 'Enroll runner' button.",
+        )
+
+    # ── scripts/local_runner.py: --help / module docstring ────────────────────
+
+    def _help_docstring(self) -> str:
+        """Return the module-level docstring from local_runner.py (shown by --help)."""
+        import ast
+        source = self._LOCAL_RUNNER_PY.read_text()
+        tree = ast.parse(source)
+        docstring = ast.get_docstring(tree)
+        self.assertIsNotNone(docstring, "local_runner.py must have a module docstring")
+        return docstring  # type: ignore[return-value]
+
+    def test_help_token_description_does_not_cite_raw_api_endpoint(self):
+        """The --help BLUEPRINT_RUNNER_TOKEN description must not point at the raw API endpoint."""
+        doc = self._help_docstring()
+        self.assertNotIn(
+            "POST /api/admin/projects",
+            doc,
+            "local_runner.py --help describes BLUEPRINT_RUNNER_TOKEN as coming from "
+            "a raw API endpoint. The token is obtained via the admin UI enrollment "
+            "flow, not by calling the API directly.",
+        )
+
+    def test_help_token_description_references_runtime_tab(self):
+        """The --help BLUEPRINT_RUNNER_TOKEN description must reference the Runtime tab."""
+        doc = self._help_docstring()
+        self.assertIn(
+            "Runtime",
+            doc,
+            "local_runner.py --help must reference the Runtime tab when describing "
+            "where to obtain BLUEPRINT_RUNNER_TOKEN.",
+        )
+
+    def test_help_token_description_references_enroll_runner_button(self):
+        """The --help BLUEPRINT_RUNNER_TOKEN description must reference the 'Enroll runner' button."""
+        doc = self._help_docstring()
+        self.assertIn(
+            "Enroll runner",
+            doc,
+            "local_runner.py --help must name the 'Enroll runner' button when "
+            "describing how to obtain BLUEPRINT_RUNNER_TOKEN.",
+        )
+
+
+class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
+    """Extended doc-invariant tests for runner-install.md sections 2, 3, and 7.
+
+    These tests are part of the machine-readable re-walk for acceptance criterion
+    c-dfdc9d82 (runner enrollment flow), verifying that the full enrollment guide
+    describes the shipped behavior end-to-end, not just Section 1 and Section 8.
+    """
+
+    _DOCS_ROOT = Path(__file__).resolve().parents[1] / "docs"
+    _RUNNER_INSTALL_MD = _DOCS_ROOT / "runner-install.md"
+    _SCRIPTS_ROOT = Path(__file__).resolve().parent
+    _LOCAL_RUNNER_PY = _SCRIPTS_ROOT / "local_runner.py"
+
+    def _section_text(self, section_num: int, section_title_fragment: str) -> str:
+        """Extract the text of a numbered section from runner-install.md."""
+        import re
+        content = self._RUNNER_INSTALL_MD.read_text()
+        m = re.search(
+            rf"## {section_num}\. {re.escape(section_title_fragment)}(.*?)(?=\n## \d+\.|\Z)",
+            content,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            m,
+            f"Could not locate '## {section_num}. {section_title_fragment}' section in runner-install.md",
+        )
+        return m.group(1)
+
+    # ── Section 2: First launch / credential persistence ──────────────────────
+
+    def test_section2_mentions_token_credential_file(self):
+        """Section 2 must document that the runner saves the token to a credential file."""
+        text = self._section_text(2, "First launch")
+        self.assertIn(
+            "runner_token",
+            text,
+            "runner-install.md Section 2 must mention runner_token, the credential "
+            "file where the runner persists the enrollment token for restarts.",
+        )
+
+    def test_section2_mentions_credential_path(self):
+        """Section 2 must document the ~/.blueprint/ credential directory."""
+        text = self._section_text(2, "First launch")
+        self.assertIn(
+            "~/.blueprint",
+            text,
+            "runner-install.md Section 2 must reference ~/.blueprint/ as the credential "
+            "directory so operators know where to look after first launch.",
+        )
+
+    def test_section2_explains_no_reenroll_after_reboot(self):
+        """Section 2 must clarify that re-enrollment is NOT needed after a reboot."""
+        text = self._section_text(2, "First launch")
+        self.assertIn(
+            "reboot",
+            text.lower(),
+            "runner-install.md Section 2 must address the reboot case so operators "
+            "understand that saved credentials survive restarts.",
+        )
+
+    # ── Section 3: Install as a durable service ───────────────────────────────
+
+    def test_section3_mentions_install_command(self):
+        """Section 3 must document the blueprint-runner install command."""
+        text = self._section_text(3, "Install")
+        self.assertIn(
+            "blueprint-runner install",
+            text,
+            "runner-install.md Section 3 must document the 'blueprint-runner install' "
+            "command that sets up a systemd unit.",
+        )
+
+    def test_section3_mentions_token_flag(self):
+        """Section 3 must document the --token flag for the install command."""
+        text = self._section_text(3, "Install")
+        self.assertIn(
+            "--token",
+            text,
+            "runner-install.md Section 3 must document the --token flag so operators "
+            "know how to pass the enrollment token to the installer.",
+        )
+
+    def test_section3_mentions_systemd(self):
+        """Section 3 must reference systemd as the durable service mechanism."""
+        text = self._section_text(3, "Install")
+        self.assertIn(
+            "systemd",
+            text,
+            "runner-install.md Section 3 must reference systemd, the described "
+            "durable service mechanism.",
+        )
+
+    def test_section3_mentions_dry_run(self):
+        """Section 3 must document the --dry-run flag for safe preview."""
+        text = self._section_text(3, "Install")
+        self.assertIn(
+            "--dry-run",
+            text,
+            "runner-install.md Section 3 must document --dry-run so operators can "
+            "preview the install without touching the host.",
+        )
+
+    # ── Section 7: Verify / preflight ────────────────────────────────────────
+
+    def test_section7_mentions_check_flag(self):
+        """Section 7 must document the --check preflight flag."""
+        text = self._section_text(7, "Verify")
+        self.assertIn(
+            "--check",
+            text,
+            "runner-install.md Section 7 must document the --check preflight flag "
+            "that verifies the runner without claiming work.",
+        )
+
+    def test_section7_check_exits_zero_on_success(self):
+        """Section 7 must describe what a successful --check run looks like (exit 0)."""
+        text = self._section_text(7, "Verify")
+        self.assertIn(
+            "0",
+            text,
+            "runner-install.md Section 7 must mention exit code 0 so operators know "
+            "what a successful --check result looks like.",
+        )
+
+    # ── RUNNER_RUNBOOK (--help) must not reference stale UI paths ─────────────
+
+    def test_runner_runbook_does_not_reference_fleet_nav_path(self):
+        """The RUNNER_RUNBOOK (module docstring / --help) must not reference the stale
+        'Fleet' navigation path that was removed from the admin UI."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        # Docstring ends at the last triple-quote before the imports
+        docstring_end = content.find('"""\n\nimport ')
+        self.assertGreater(docstring_end, 0, "Could not locate end of module docstring")
+        docstring = content[:docstring_end]
+        self.assertNotIn(
+            "Fleet ->",
+            docstring,
+            "RUNNER_RUNBOOK (--help text) must not reference the stale 'Fleet ->' "
+            "navigation path; the enrollment UI is under the Runtime tab.",
+        )
+
+    def test_runner_no_token_message_references_runtime_tab(self):
+        """The no-token startup error in local_runner.py must reference the Runtime tab."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        import re
+        m = re.search(r"Re-enroll[^\n]*\n", content)
+        self.assertIsNotNone(m, "Could not find Re-enroll message in local_runner.py")
+        reenroll_line = m.group(0)
+        self.assertIn(
+            "Runtime",
+            reenroll_line,
+            "local_runner.py re-enroll message must reference the 'Runtime' tab — "
+            f"found: {reenroll_line!r}",
+        )
+
+    def test_runner_no_token_message_references_devices_and_runners(self):
+        """The no-token startup error in local_runner.py must reference 'Devices and runners'."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        import re
+        m = re.search(r"Re-enroll[^\n]*\n", content)
+        self.assertIsNotNone(m, "Could not find Re-enroll message in local_runner.py")
+        reenroll_line = m.group(0)
+        self.assertIn(
+            "Devices and runners",
+            reenroll_line,
+            "local_runner.py re-enroll message must reference 'Devices and runners' — "
+            f"found: {reenroll_line!r}",
+        )
+
+
+class TestRunnerEnrollmentUINoPhantomControl(unittest.TestCase):
+    """Verifies that operator enrollment UI controls described in docs match what ships.
+
+    These tests are part of the machine-readable re-walk for c-dfdc9d82 and
+    c-5214996f: a control that claims to do something must do it; a control whose
+    action has no routing semantics must not be exposed.
+    """
+
+    _DOCS_ROOT = Path(__file__).resolve().parents[1] / "docs"
+    _RUNNER_INSTALL_MD = _DOCS_ROOT / "runner-install.md"
+    _ADMIN_UI_ROOT = Path(__file__).resolve().parents[1] / "admin-ui" / "src"
+
+    def test_fleet_runners_panel_renders_enroll_runner_button(self):
+        """The FleetRunnersPanel source must contain an 'Enroll runner' button label.
+
+        This is a static source invariant: if the shipped UI removes or renames the
+        button, this test fails and the documentation (runner-install.md Section 1) must
+        be updated to match."""
+        panel_path = self._ADMIN_UI_ROOT / "components" / "FleetRunnersPanel.tsx"
+        self.assertTrue(panel_path.exists(), f"FleetRunnersPanel.tsx not found at {panel_path}")
+        content = panel_path.read_text()
+        self.assertIn(
+            "Enroll runner",
+            content,
+            "FleetRunnersPanel.tsx must contain 'Enroll runner' button label — "
+            "runner-install.md Section 1 documents this button.",
+        )
+
+    def test_fleet_runners_panel_renders_strategic_runner_button(self):
+        """The FleetRunnersPanel source must contain a 'Strategic runner' button label."""
+        panel_path = self._ADMIN_UI_ROOT / "components" / "FleetRunnersPanel.tsx"
+        self.assertTrue(panel_path.exists(), f"FleetRunnersPanel.tsx not found at {panel_path}")
+        content = panel_path.read_text()
+        self.assertIn(
+            "Strategic runner",
+            content,
+            "FleetRunnersPanel.tsx must contain 'Strategic runner' button label — "
+            "runner-install.md Section 1 documents this button for the strategic_local preset.",
+        )
+
+    def test_fleet_runners_panel_no_preset_chooser_dialog(self):
+        """The FleetRunnersPanel source must NOT describe a post-click 'Choose a preset' dialog.
+
+        The shipped UI is two separate buttons, not a single 'Enroll' button that opens
+        a preset chooser.  If this assertion fails, either the UI was changed back or
+        the test must be updated to reflect the new design."""
+        panel_path = self._ADMIN_UI_ROOT / "components" / "FleetRunnersPanel.tsx"
+        if not panel_path.exists():
+            self.skipTest(f"FleetRunnersPanel.tsx not found at {panel_path}")
+        content = panel_path.read_text()
+        self.assertNotIn(
+            "Choose a preset",
+            content,
+            "FleetRunnersPanel.tsx must not contain 'Choose a preset' — the shipped UI "
+            "uses two separate buttons, not a preset chooser dialog.",
+        )

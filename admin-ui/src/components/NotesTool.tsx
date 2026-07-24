@@ -12,7 +12,7 @@ import {
   ToolResidentHandoffControls,
   type ToolResidentHandoffIntent,
 } from './ToolResidentHandoffControls';
-import MarkdownContentInner from './MarkdownContentInner';
+import { MarkdownContent } from './MarkdownContent';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,7 +32,7 @@ type State =
 
 type Mode = 'edit' | 'preview';
 
-const DEBOUNCE_MS = 1500;
+export const DEBOUNCE_MS = 1500;
 const serialize = (text: string) => JSON.stringify({ text });
 
 // ---------------------------------------------------------------------------
@@ -207,9 +207,8 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
     }
   }, [projectId, tool.id]);
 
-  const handoffToResident = useCallback(async (
+  const handoffToConversation = useCallback(async (
     intent: ToolResidentHandoffIntent,
-    laneOwner?: string,
   ) => {
     if (conflictRef.current) throw new Error('Resolve the Notes conflict before sharing.');
     let saved = await flush();
@@ -230,13 +229,12 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
       projectId,
       artifactRef,
       intent,
-      laneOwner,
       prompt: intent === 'ask'
         ? `Review Notes "${tool.title}" revision ${artifactRef.revision} and answer my question.`
         : `Use Notes "${tool.title}" revision ${artifactRef.revision} as exact project context.`,
     });
     if (!handedOff) {
-      throw new Error('Notes revision was saved, but the Resident handoff could not be stored. Retry Share/Ask.');
+      throw new Error('Notes revision was saved, but the conversation handoff could not be stored. Retry Share/Ask.');
     }
   }, [flush, projectId, tool.id, tool.title]);
 
@@ -352,7 +350,7 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
       <ToolResidentHandoffControls
         toolLabel="Notes"
         disabledReason={conflict ? 'Resolve the edit conflict before sharing this revision.' : saving ? 'Wait for the current save to finish.' : null}
-        onHandoff={handoffToResident}
+        onHandoff={handoffToConversation}
       />
 
       {/* Conflict banner: another viewer saved a newer revision. Local edits
@@ -396,7 +394,7 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
           data-viewport-allow-overflow
         >
           {text ? (
-            <MarkdownContentInner content={text} />
+            <MarkdownContent content={text} />
           ) : (
             <p className="text-sm italic text-neutral-500">Nothing to preview yet.</p>
           )}

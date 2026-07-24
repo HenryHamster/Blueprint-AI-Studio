@@ -1321,7 +1321,7 @@ def _get_spawn_pin_funnel() -> dict:
 
 async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
     try:
-        from app.efficiency_snapshot import DESIGN_DOC_KEY
+        from app.efficiency_snapshot import _batch_read_snapshot_histories
         from app.warm_backlog_reuse import (
             compute_dominant_reuse_dropout,
             get_reuse_funnel_snapshot,
@@ -1340,11 +1340,10 @@ async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
             .scalars()
             .all()
         )
+        histories = await _batch_read_snapshot_histories(session, rows)
         buckets = []
         for project in rows:
-            for entry in ((project.design_doc or {}).get(DESIGN_DOC_KEY) or {}).get(
-                "snapshots"
-            ) or []:
+            for entry in histories.get(project.id, []):
                 block = entry.get("reuse_dropout")
                 if not isinstance(block, dict):
                     continue

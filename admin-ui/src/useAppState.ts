@@ -650,7 +650,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects, projectsLoaded,
     // Log viewer
-    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
+    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer, strategicSessionTranscript,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
@@ -742,7 +742,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     activeTab, setActiveTab,
     // Directions
     showDirections, setShowDirections,
-    fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion, strategicSessionTranscript,
+    fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion,
     // Metrics
     showMetrics, setShowMetrics, metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow,
     // Archive

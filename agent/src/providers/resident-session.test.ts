@@ -46,6 +46,8 @@ vi.mock('./runners.js', () => ({
   __resetClaudeCapabilityCacheForTesting: vi.fn(),
   probeClaudeCapabilities: vi.fn(() => null),
   stripUnsupportedClaudeOptionalArgs: vi.fn((args: readonly string[]) => [...args]),
+  matchesRateLimit: vi.fn((text: string) => /rate limit/i.test(text)),
+  matchesAuthFailure: vi.fn((text: string) => /unauthorized/i.test(text)),
   getProviderRunner: vi.fn(() => ({
     provider: 'anthropic',
     displayName: 'claude',
@@ -81,6 +83,7 @@ type SpawnMock = ReturnType<typeof spawn>;
 function makeControllableChild() {
   let dataCb: ((d: Buffer) => void) | null = null;
   let closeCb: ((code: number | null, signal: NodeJS.Signals | null) => void) | null = null;
+  let stderrCb: ((d: Buffer) => void) | null = null;
   const stdinWrites: string[] = [];
   const proc = {
     pid: 4242,
@@ -94,7 +97,9 @@ function makeControllableChild() {
     stdout: {
       on: vi.fn((event: string, cb: (d: Buffer) => void) => { if (event === 'data') dataCb = cb; }),
     },
-    stderr: { on: vi.fn() },
+    stderr: {
+      on: vi.fn((event: string, cb: (d: Buffer) => void) => { if (event === 'data') stderrCb = cb; }),
+    },
     on: vi.fn((event: string, cb: (...a: unknown[]) => void) => {
       if (event === 'close') closeCb = cb;
     }),
@@ -104,6 +109,7 @@ function makeControllableChild() {
     proc: proc as unknown as SpawnMock,
     stdinWrites,
     pushLine: (obj: unknown) => dataCb?.(Buffer.from(JSON.stringify(obj) + '\n')),
+    pushStderr: (text: string) => stderrCb?.(Buffer.from(text)),
     triggerClose: (code = 0) => { proc.exitCode = code; closeCb?.(code, null); },
   };
 }
@@ -139,7 +145,102 @@ describe('startResidentClaudeSession', () => {
     expect(registerChildPid).toHaveBeenCalledWith(4242);
     session.close();
   });
+  it('classifies provider rate limits from bounded stderr evidence', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
 
+    ctl.pushStderr('Error: rate limit exceeded; retry later');
+
+    expect(session.failureCategory?.()).toBe('rate_limited');
+    session.close();
+  });
+
+  it('propagates a top-level rate-limit error as a failed turn immediately', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    const turn = session.sendTurn('hello');
+    ctl.pushLine({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      result: 'Rate limit exceeded. Retry later.',
+    });
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: true,
+      failureCategory: 'rate_limited',
+      resultText: 'Rate limit exceeded. Retry later.',
+    });
+    expect(session.failureCategory?.()).toBe('rate_limited');
+    session.close();
+  });
+
+  it('clears transient failure evidence after a successful turn', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    ctl.pushStderr('warning: rate limit retry recovered');
+    expect(session.failureCategory?.()).toBe('rate_limited');
+
+    const turn = session.sendTurn('healthy turn');
+    ctl.pushLine({ type: 'result', result: 'done', is_error: false });
+    await expect(turn).resolves.toMatchObject({ providerFailed: false });
+    expect(session.failureCategory?.()).toBeNull();
+
+    ctl.triggerClose(1);
+    expect(session.failureCategory?.()).toBeNull();
+  });
+
+
+
+  it('ignores a nested sub-agent error when the parent turn succeeds', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    const turn = session.sendTurn('parent turn');
+    ctl.pushLine({
+      type: 'result',
+      parent_tool_use_id: 'tool-subagent',
+      is_error: true,
+      result: 'nested rate limit exceeded',
+    });
+    ctl.pushLine({ type: 'result', result: 'parent succeeded', is_error: false });
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: false,
+      failureCategory: null,
+      resultText: 'parent succeeded',
+    });
+    expect(session.failureCategory?.()).toBeNull();
+    session.close();
+  });
+
+  it('ignores a nested type:error event for parent provider classification', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    const turn = session.sendTurn('parent turn');
+    ctl.pushLine({
+      type: 'error',
+      parent_tool_use_id: 'tool-subagent-error',
+      error: { message: 'nested rate limit exceeded' },
+    });
+    ctl.pushLine({ type: 'result', result: 'parent succeeded', is_error: false });
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: false,
+      failureCategory: null,
+      resultText: 'parent succeeded',
+    });
+    expect(session.failureCategory?.()).toBeNull();
+    session.close();
+  });
   it('sendTurn writes a user NDJSON line and resolves on the top-level result', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);

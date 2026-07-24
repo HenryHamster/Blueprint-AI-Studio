@@ -35,7 +35,7 @@ export function ConfirmDialog({ title, message, confirmLabel = 'Confirm', attest
         <button
           onClick={onCancel}
           data-testid="confirm-dialog-cancel"
-          className="px-4 py-2 rounded-lg text-xs font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 transition-colors"
+          className="min-h-11 min-w-11 px-4 py-2 rounded-lg text-xs font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 transition-colors"
         >
           Cancel
         </button>
@@ -43,7 +43,7 @@ export function ConfirmDialog({ title, message, confirmLabel = 'Confirm', attest
           onClick={() => onConfirm(attestationInput ? inputVal.trim() : undefined)}
           data-testid="confirm-dialog-confirm"
           disabled={!canConfirm}
-          className="px-4 py-2 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 border border-amber-500/40 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          className="min-h-11 min-w-11 px-4 py-2 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 border border-amber-500/40 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {confirmLabel}
         </button>

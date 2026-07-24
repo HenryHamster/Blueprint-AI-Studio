@@ -12,7 +12,7 @@ vi.mock('../api', async () => {
 });
 
 vi.mock('./usePersistedState', () => ({
-  usePersistedState: (key: string, init: unknown) => [init, vi.fn()],
+  usePersistedState: (_key: string, init: unknown) => [init, vi.fn()],
 }));
 
 vi.mock('../constants', () => ({

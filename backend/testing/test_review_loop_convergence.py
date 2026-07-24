@@ -813,7 +813,7 @@ async def test_preservability_timeout_raises_unavailable_not_not_preservable(
     mocker.patch("app.review_loop_convergence._PRESERVABILITY_GET_TIMEOUT_S", 0.01)
 
     async def _hang(*_a, **_kw):
-        await asyncio.sleep(5)
+        await asyncio.Event().wait()
 
     mocker.patch("app.github.get_pull_request", new_callable=AsyncMock, side_effect=_hang)
 
@@ -905,7 +905,7 @@ async def test_preservability_timeout_does_not_close_the_pr_or_fail_the_task(
     mocker.patch("app.review_loop_convergence._PRESERVABILITY_GET_TIMEOUT_S", 0.01)
 
     async def _hang(*_a, **_kw):
-        await asyncio.sleep(5)
+        await asyncio.Event().wait()
 
     mocker.patch("app.github.get_pull_request", new_callable=AsyncMock, side_effect=_hang)
 

@@ -19,7 +19,6 @@ import type WebSocket from 'ws';
 import type { AgentTaskType } from '../taskCapabilities.js';
 import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA, handleSalvageBundle } from './standard.js';
 import { handleReview, handleFix } from './review-fix.js';
-import { handlePanelReview } from './panel-review.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { handleStrategicResident } from './strategic-resident.js';
@@ -27,6 +26,7 @@ import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audi
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
 import { handleReleaseMergeGrade } from './merge-grade.js';
 import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate, handleRepoBootstrap } from './specialized.js';
+import { handleWalkthroughE2e } from './walkthrough-e2e.js';
 import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
 import { handleVerifyTests } from './verify-tests.js';
@@ -34,7 +34,7 @@ import { handleComputeExperiment } from './compute-experiment.js';
 import { handleWebResearch } from './web-research.js';
 import { handleDesign } from './design.js';
 import { handleCapabilityProofTrial } from './capability-proof-trial.js';
-import { handleStrategicResidentTurn } from './strategic-resident-turn.js';
+import { handleCriterionCoverageTrial } from './criterion-coverage-trial.js';
 import {
   resolveTaskCapabilityContract,
   resolveGenericRunner,
@@ -54,29 +54,28 @@ export type Handler = (
   model?: string, effort?: string
 ) => Promise<void>;
 
-// A resident strategic session is a strategic_review task pinned to one runner
-// for the session's life. It is marked either on the payload (resident_session)
-// or on the task context (_resident_session), set by the backend start endpoint.
-// When present it routes to the persistent, streaming, chattable resident loop
-// instead of the one-shot thinker→challenge→executor pass.
+// Workday's conversational Resident is deliberately a narrow strategic_review
+// mode, not a task type or autonomous shadow-turn lane. Only an explicitly
+// marked strategic_review claim may enter the persistent session handler.
 export function isResidentSessionTask(
   task: Record<string, unknown>, payload: Record<string, unknown>,
 ): boolean {
+  if (payload.type !== 'strategic_review') return false;
   if (payload.resident_session === true) return true;
   const ctx = task.context;
   return !!ctx && typeof ctx === 'object' && !Array.isArray(ctx)
     && (ctx as Record<string, unknown>)._resident_session === true;
 }
 
-// strategic_review (and research_mode === 'strategic') dispatch: a resident
-// session routes to handleStrategicResident; everything else keeps the one-shot
-// handleStrategic behavior unchanged.
+// strategic_review dispatch preserves one-shot Strategic by default. The
+// explicitly marked Workday conversation is the sole Resident entrypoint.
 const dispatchStrategic: Handler = (taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort) => {
   if (isResidentSessionTask(task, payload)) {
     return handleStrategicResident(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
   }
   return handleStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
 };
+
 
 // research task type forwards to the strategic handler when research_mode is
 // 'strategic'; otherwise it runs the tactical research path. strategic_review
@@ -91,7 +90,6 @@ const dispatchResearch: Handler = (taskId, payload, task, ghToken, owner, repo, 
 export const handlers: Record<AgentTaskType, Handler> = {
   create: handleCreate,
   review: handleReview,
-  panel_review: handlePanelReview,
   fix: handleFix,
   plan: handlePlan,
   research: dispatchResearch,
@@ -119,7 +117,8 @@ export const handlers: Record<AgentTaskType, Handler> = {
   repo_bootstrap: handleRepoBootstrap,
   salvage_bundle: handleSalvageBundle,
   capability_proof_trial: handleCapabilityProofTrial,
-  strategic_resident_turn: handleStrategicResidentTurn,
+  criterion_coverage_trial: handleCriterionCoverageTrial,
+  walkthrough_e2e: handleWalkthroughE2e,
 };
 
 // ── Contract-driven handler resolution ───────────────────────────────────────

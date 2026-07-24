@@ -95,7 +95,7 @@ const strategicRunnerCapabilities = {
   runner_preset: 'strategic_local',
   workload: 'strategic',
   agent_available: true,
-} satisfies NonNullable<NonNullable<StrategicStateResponse['runtime']>['local_runner']>['runners'][number]['capabilities'];
+} satisfies NonNullable<NonNullable<NonNullable<StrategicStateResponse['runtime']>['local_runner']>['runners']>[number]['capabilities'];
 
 const workbenchEventFixture = {
   schema_version: 1,
@@ -384,6 +384,8 @@ const strategicConversationItems = [
     from_task_id: null,
     content: 'Keep it simple.',
     status: 'open',
+    resolution: null,
+    resolved_at: null,
     created_at: '2026-07-01T10:00:00Z',
     context: {},
   },

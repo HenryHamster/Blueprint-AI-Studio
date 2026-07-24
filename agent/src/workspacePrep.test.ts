@@ -434,7 +434,7 @@ describe('prepareWorkspaceForRole', () => {
 
   // ── Warm path: full-clone request unshallows a shallow workspace ────────────
   //
-  // R4-H4: release_audit / qualifier-smoketest pass depth 0 (a FULL-clone
+  // R4-H4: release_audit pass depth 0 (a FULL-clone
   // request) so the merge-base of `main...<candidate_sha>` is reachable. The
   // cold path honors depth 0 by omitting --depth; the warm path's plain
   // `git fetch origin <branch>` did NOT — it kept role 1's shallow boundary.

@@ -6,7 +6,7 @@ import uuid
 import json
 import math
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -42,7 +42,7 @@ from app.admin import (
 )
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
-from app.message_audience import operator_visible_alert_filter, operator_visible_audience_filter
+from app.message_audience import operator_visible_alert_filter, operator_visible_message_audience_filter
 from app.project_message_creation import (
     create_operator_project_message,
     lock_project_and_next_message_sequence,
@@ -51,6 +51,7 @@ from app.project_message_creation import (
     wakeup_state_for_arming,
 )
 from app.project_message_projection import (
+    WAKEUP_STATE_CONTEXT_KEY,
     admin_message_dict,
     admin_message_list_dict,
     message_event_payload,
@@ -88,6 +89,11 @@ from app.playbook_storage import (
     _PLAYBOOK_CAPACITY_BYTES,
     record_playbook_tombstone,
 )
+from app.project_telemetry import (
+    get_project_telemetry,
+    set_project_telemetry,
+    strip_migrated_doc_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,14 +111,14 @@ class _MessageCreate(BaseModel):
     project_id: str
     message_type: str = "NOTE"
     content: str
-    context: Optional[Dict[str, Any]] = None
-    workbench_context: Optional[Dict[str, Any]] = None
-    idempotency_key: Optional[str] = None
+    context: Dict[str, Any] | None = None
+    workbench_context: Dict[str, Any] | None = None
+    idempotency_key: str | None = None
 
 
 class _MessageResolve(BaseModel):
-    resolution: Optional[str] = None
-    workbench_context: Optional[Dict[str, Any]] = None
+    resolution: str | None = None
+    workbench_context: Dict[str, Any] | None = None
 
 
 class _LastSeenUpdate(BaseModel):
@@ -139,7 +145,7 @@ class _TempMutesUpdate(BaseModel):
 
 class _MuteWindowUpdate(BaseModel):
     project_id: str
-    expires_at: Optional[int] = None  # ms epoch; None clears the mute window
+    expires_at: int | None = None  # ms epoch; None clears the mute window
 
 
 class _WorkbenchStateUpdate(BaseModel):
@@ -152,7 +158,7 @@ class _AdminPlaybookSet(BaseModel):
         ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
     )
     value: str = Field(..., description="Playbook value: plain text, max 2048 bytes")
-    applicable_types: Optional[List[str]] = Field(
+    applicable_types: List[str] | None = Field(
         None, description="Task types this entry applies to; None = shown to all types"
     )
 
@@ -164,7 +170,7 @@ _MESSAGES_SAVED_VIEWS_CAP = 10
 _MESSAGES_SAVED_VIEW_PREF_VALUES = {"mute", "routine", "surfaced"}
 
 
-def _sanitize_message_saved_view(raw: Any) -> Optional[Dict[str, Any]]:
+def _sanitize_message_saved_view(raw: Any) -> Dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
 
@@ -184,7 +190,7 @@ def _sanitize_message_saved_view(raw: Any) -> Optional[Dict[str, Any]]:
                 and isinstance(value, str)
                 and value in _MESSAGES_SAVED_VIEW_PREF_VALUES
             ):
-                prefs[key] = value
+                prefs[key] = value  # noqa: PERF403
 
     created_at = raw.get("createdAt")
     if not isinstance(created_at, (int, float)) or isinstance(created_at, bool) or not math.isfinite(created_at):
@@ -272,19 +278,29 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "question_answer",
         "capability_proof_gate_graduated_observe",
         "capability_proof_gate_graduated_enforce",
+        "mode_knob_graduated_observe",
+        "mode_knob_graduated_enforce",
+        "mode_knob_cut_recommended",
     }
 )
 
 
 def _operator_visible_audience():
-    """SQLAlchemy predicate excluding rows tagged with a non-operator audience.
+    """SQLAlchemy predicate for operator-visible ``ProjectMessage`` rows.
 
-    Rows with no ``audience`` key in context (legacy rows written before the
-    registry existed, and all user-authored / BLOCKER / FEEDBACK messages)
-    resolve to NULL and are KEPT — the filter only drops rows that explicitly
-    carry a strategist-internal / pipeline-log audience tag.
+    Fail-closed: uses an explicit IN-allowlist of operator audiences with no
+    NULL pass-through.  NULL-audience rows (legacy un-stamped messages) are
+    treated as non-operator, consistent with the emitter-side fail-closed default.
     """
-    return operator_visible_audience_filter(ProjectMessage.context)
+    return operator_visible_message_audience_filter(ProjectMessage.context)
+
+
+def _operator_visible_audience_or_user_authored():
+    """Admit operator-authored messages while keeping non-user rows fail-closed."""
+    return or_(
+        ProjectMessage.from_type == "user",
+        _operator_visible_audience(),
+    )
 
 
 def _operator_signal_predicate():
@@ -332,7 +348,7 @@ def append_routine_digest(project: Project, event_type: str, summary: str) -> No
     project.append_routine_digest(event_type, summary)
 
 
-from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
+from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402, RUF100
 
 _SEED_ENTRIES: Dict[str, dict] = {
     "build-backend": {
@@ -429,10 +445,10 @@ _SEED_ENTRIES: Dict[str, dict] = {
 
 @router.get("/alerts")
 async def get_alerts(
-    project_id: Optional[str] = None,
-    domain: Optional[str] = None,
-    event_type: Optional[str] = None,
-    source: Optional[str] = None,
+    project_id: str | None = None,
+    domain: str | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
     include_dismissed: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -565,10 +581,10 @@ async def acknowledge_alert(
 
 @router.post("/alerts/dismiss-all")
 async def dismiss_all_alerts(
-    project_id: Optional[str] = None,
-    domain: Optional[str] = None,
-    event_type: Optional[str] = None,
-    source: Optional[str] = None,
+    project_id: str | None = None,
+    domain: str | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -592,7 +608,7 @@ async def dismiss_all_alerts(
         try:
             pid = uuid.UUID(project_id)
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid project_id format")
+            raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
         # Explicit target → say why, don't silently dismiss nothing.
         await _get_user_project_with_role(pid, user_id, session, "member")
 
@@ -644,7 +660,7 @@ async def get_notification_dispatch_stats(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
     return _nd.get_notification_stats(project_id=pid)
 
@@ -666,7 +682,7 @@ async def list_dead_letters(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
     rows, total = await _nd.list_dead_letters(session, project_id=pid, limit=limit, offset=offset)
     # Mask webhook_url for non-admin callers — webhook URLs embed auth tokens
@@ -693,7 +709,7 @@ async def redrive_dead_letters(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
 
     redriven = 0
@@ -717,11 +733,11 @@ async def redrive_dead_letters(
 
 @router.get("/messages")
 async def list_messages(
-    project_id: Optional[str] = Query(None),
-    status: Optional[str] = Query("open"),
+    project_id: str | None = Query(None),
+    status: str | None = Query("open"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    q: Optional[str] = Query(None),
+    q: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -733,13 +749,13 @@ async def list_messages(
             ProjectMessage.surface == MessageSurface.ACTIVITY,
             _operator_signal_predicate(),
         ),
-        _operator_visible_audience(),
+        _operator_visible_audience_or_user_authored(),
     ]
     if project_id:
         try:
             filters.append(ProjectMessage.project_id == uuid.UUID(project_id))
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid project_id format")
+            raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     if status and status != "all":
         if status == "needs_action":
             filters.append(
@@ -787,6 +803,7 @@ async def list_messages(
         ProjectMessage.status,
         ProjectMessage.resolution,
         ProjectMessage.resolved_at,
+        ProjectMessage.delivered_at,
         ProjectMessage.created_at,
         ProjectMessage.updated_at,
         raiseload=True,
@@ -811,7 +828,7 @@ async def list_messages(
             ProjectMessage.project_id.in_(user_pids),
             ProjectMessage.status == "open",
             _operator_signal_predicate(),
-            _operator_visible_audience(),
+            _operator_visible_audience_or_user_authored(),
             *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
         ]
         if q_stripped:
@@ -846,7 +863,7 @@ async def list_messages(
 @router.get("/messages/counts")
 async def get_message_counts(
     project_id: str = Query(...),
-    last_seen_ms: Optional[int] = Query(None),
+    last_seen_ms: int | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -858,7 +875,7 @@ async def get_message_counts(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     from app.messages_last_seen import timestamp_ms_to_naive_utc
@@ -893,7 +910,7 @@ async def create_message(
     try:
         project_id = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     # Verify user has write access (member+; viewers are read-only). The
     # returned instance is used for the access check and for resolving the
     # citation-grounding branch context below; the routine-digest branch
@@ -986,6 +1003,7 @@ async def resolve_message(
             .where(Project.id == message_project_uuid)
             .with_for_update()
         )
+        await session.refresh(project, attribute_names=["vision"])
         reply_sequence = await lock_project_and_next_message_sequence(
             session,
             message_project_uuid,
@@ -1030,6 +1048,14 @@ async def resolve_message(
             resident_session_is_active,
         )
 
+        resident_blob = read_resident_session(project.vision)
+        resident_active = resident_session_is_active(resident_blob)
+        resident_session_id = (
+            str(resident_blob.get("session_id"))
+            if resident_active and resident_blob.get("session_id")
+            else None
+        )
+
         if message_type == MessageType.QUESTION:
             reply = await _post_qa(
                 session,
@@ -1053,8 +1079,8 @@ async def resolve_message(
                 content_override=answer,
                 sequence=reply_sequence,
             )
+        reply.resident_session_id = resident_session_id
         event_type = (reply.context or {}).get("event_type")
-        resident_active = resident_session_is_active(read_resident_session(project.vision))
         locked_vision = await session.scalar(
             select(Project.vision).where(Project.id == message_project_uuid)
         )
@@ -1081,7 +1107,7 @@ async def resolve_message(
         )
         reply.context = {
             **(reply.context or {}),
-            "_resident_wakeup_state": wakeup_state,
+            WAKEUP_STATE_CONTEXT_KEY: wakeup_state,
         }
         session.add(reply)
         return reply, arming, wakeup_state, True
@@ -1179,7 +1205,7 @@ async def delete_message(
 
 @router.get("/messages/last-seen")
 async def get_messages_last_seen(
-    project_id: Optional[str] = Query(None),
+    project_id: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1202,7 +1228,7 @@ async def get_messages_last_seen(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = (
@@ -1229,7 +1255,7 @@ async def put_messages_last_seen(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     new_ts = timestamp_ms_to_naive_utc(payload.timestamp)
@@ -1256,7 +1282,7 @@ async def get_messages_noise_prefs(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = await get_messages_noise_prefs_row(
@@ -1279,7 +1305,7 @@ async def put_messages_noise_prefs(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     if len(json.dumps(payload.prefs)) > 50_000:
@@ -1323,7 +1349,7 @@ async def get_messages_workbench_state(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
     return {
         "workbench": await get_strategic_workbench_state(
@@ -1342,7 +1368,7 @@ async def put_messages_workbench_state(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     # NOT per-user personal UI state, despite living under /messages/* alongside
     # last-seen / noise-prefs / saved-views / temp-mutes / mute-window (which ARE
     # personal — each is keyed by a UniqueConstraint("user_id","project_id") and
@@ -1352,7 +1378,7 @@ async def put_messages_workbench_state(
     # breaker-bypassing, cooldown-bypassing strategic refresh with
     # origin=ORIGIN_OPERATOR, persisting an operator-supplied steering excerpt.
     # Without the member+ floor a viewer can steer the autonomous strategist.
-    await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
+    project = await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
 
     if workbench_state_size_bytes(payload.workbench) > WORKBENCH_STATE_MAX_BYTES:
         raise HTTPException(
@@ -1360,11 +1386,19 @@ async def put_messages_workbench_state(
             detail="Workbench state too large (max 50KB)",
         )
 
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_session_is_active,
+    )
+    resident_active = resident_session_is_active(
+        read_resident_session(project.vision if project else None)
+    )
     result = await persist_strategic_workbench_update(
         session,
         current_user["user_id"],
         pid,
         payload.workbench,
+        resident_session_active=resident_active,
     )
     await emit_workbench_refetch(
         pid,
@@ -1394,7 +1428,7 @@ async def get_messages_saved_views(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = (
@@ -1419,7 +1453,7 @@ async def put_messages_saved_views(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     if len(json.dumps(payload.saved_views)) > 50_000:
@@ -1464,7 +1498,7 @@ async def get_messages_temp_mutes(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = await get_messages_noise_prefs_row(
@@ -1488,7 +1522,7 @@ async def put_messages_temp_mutes(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
@@ -1522,7 +1556,7 @@ async def get_messages_mute_window(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = await get_messages_noise_prefs_row(
@@ -1550,7 +1584,7 @@ async def put_messages_mute_window(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     entry = (
@@ -1609,7 +1643,7 @@ async def put_last_visit_timestamp(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
     new_ts = timestamp_ms_to_naive_utc(payload.timestamp)
     stored_ts = await upsert_messages_last_seen(
@@ -1687,7 +1721,7 @@ async def admin_playbook_list(
                     if _ts.tzinfo is not None:
                         _ts = _ts.replace(tzinfo=None)
                     age_days = (now_utc - _ts).days
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             confirmed = v.get("confirmed_count", 0)
             referenced = v.get("reference_count", 0)
@@ -1814,11 +1848,20 @@ async def admin_playbook_delete(
     if playbook_key not in doc:
         raise HTTPException(status_code=404, detail=f"Playbook key '{key}' not found")
 
+    # Hydrate archive from project_telemetry (with design_doc fallback) so the
+    # tombstone is appended to the real archive, not an empty in-memory copy.
+    existing_archive = await get_project_telemetry(
+        session, project_id, "playbook_archive", design_doc_fallback=doc
+    )
+    doc["playbook_archive"] = list(existing_archive or [])
+
     del doc[playbook_key]
 
     # Record a tombstone so auto-playbook regeneration stays suppressed even
     # after archive trimming.
     record_playbook_tombstone(doc, playbook_key, archived_at=_utcnow().isoformat())
+
+    updated_archive = list(doc.get("playbook_archive") or [])
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1
@@ -1826,9 +1869,11 @@ async def admin_playbook_delete(
     meta["updated_by"] = "admin"
     doc["_meta"] = meta
 
+    strip_migrated_doc_keys(doc)
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)
+    await set_project_telemetry(session, project_id, "playbook_archive", updated_archive)
     await session.commit()
 
     return {"status": "ok", "key": key, "deleted": True}

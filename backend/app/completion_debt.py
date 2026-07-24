@@ -12,9 +12,6 @@ follow-through:
                               merge;
   * ``retirement_residual`` — a strategic retirement/deferral that left a
                               residual handoff behind;
-  * ``seed_inventory``      — a standing backlog item seeded once from the HEAD
-                              dormant-state inventory.
-
 Every entry is IDEMPOTENT on ``dedupe_key`` (globally unique): repeated recorder
 or seed invocations upsert the same logical obligation rather than duplicating a
 row.  Recording is BEST-EFFORT at every write site — the recorders never raise
@@ -53,7 +50,6 @@ KIND_NO_CI_GATE = "no_ci_gate"
 # hotfix contributes to debt-pressure rather than being silently blessed.
 KIND_HOTFIX_DEPLOY_PENDING_BACKFILL = "hotfix_deploy_pending_backfill"
 KIND_RETIREMENT_RESIDUAL = "retirement_residual"
-KIND_SEED_INVENTORY = "seed_inventory"
 # A working capability that already carries a structural path_proven proof
 # (backing_path tier) but has NO discoverable covering test — permanently stuck
 # because the execution-trial earn path requires a convention-named test file.
@@ -474,6 +470,65 @@ async def link_task_to_debt(
     return entry
 
 
+async def astamp_cut_recommendation(
+    session: Any,
+    dedupe_key: str,
+    *,
+    recommendation: dict,
+) -> bool:
+    """Stamp a legible CUT recommendation onto an OPEN debt row's detail (ASYNC).
+
+    The default-off PRINCIPLE demands that a dormant knob be either graduated on
+    measured lift OR cut with measured numbers — but there was no CUT surface on
+    the ledger.  This is that surface: the shared mode-knob graduation harness
+    (:mod:`app.mode_knob_graduation`) calls it when a knob's counterfactual shows
+    the enforce branch would never bind, merging ``recommendation`` (the measured
+    signal — would-have-blocked counts, pressure, window) under
+    ``detail['cut_recommendation']`` so an operator reviewing the completion-debt
+    ledger sees WHY the knob should be removed, not just that it is dormant.
+
+    Idempotent-by-overwrite: re-running replaces the recommendation with the
+    latest measurement.  The row stays OPEN — a CUT recommendation is advisory
+    signal, not a disposition; the operator (or a follow-up removal PR) closes the
+    row.  Best-effort and non-fatal: a missing/non-open row or any error returns
+    ``False`` and never raises, mirroring the other ledger mutators.  Returns
+    ``True`` iff the recommendation was stamped.
+    """
+    if not dedupe_key or session is None or not isinstance(recommendation, dict):
+        return False
+    try:
+        from app.models import CompletionDebtEntry
+
+        async with session.begin_nested():
+            entry = (
+                await session.execute(
+                    select(CompletionDebtEntry)
+                    .where(
+                        CompletionDebtEntry.dedupe_key == dedupe_key,
+                        CompletionDebtEntry.status == STATUS_OPEN,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if entry is None:
+                return False
+            detail = dict(entry.detail) if isinstance(entry.detail, dict) else {}
+            detail["cut_recommendation"] = dict(recommendation)
+            entry.detail = _bound_detail(detail)
+            entry.updated_at = _utcnow()
+            flag_modified(entry, "detail")
+            session.add(entry)
+            await session.flush()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to stamp cut recommendation (key=%s)",
+            dedupe_key,
+            exc_info=True,
+        )
+        return False
+
+
 def debt_to_dict(entry) -> dict[str, Any]:
     return _serialize_debt(entry)
 
@@ -588,6 +643,7 @@ async def get_open_completion_debt(session: Any, project_id: Any) -> dict[str, A
             "kind": entry.kind,
             "title": entry.title,
             "description": description,
+            "project_id": str(entry.project_id) if entry.project_id is not None else None,
             "created_at": created_at.isoformat() if created_at else None,
             "age_days": (
                 max(0, (now - created_at).days) if created_at is not None else None
@@ -908,50 +964,9 @@ async def aresolve_hotfix_deploy_backfill_debts(
 # ── Seed inventory ───────────────────────────────────────────────────────────
 
 
-def _standing_inventory_debts() -> list[dict]:
-    """Static, deployment-global backlog items present on HEAD that are not
-    already enumerable from runtime-config knobs."""
-    return [
-        {
-            "dedupe_key": "seed:no_ci_gate_live_trial",
-            "kind": KIND_NO_CI_GATE,
-            "title": (
-                "No-CI merge gate live-trial: the gate may fall open to "
-                "UNVERIFIED merges until an enforce policy is proven"
-            ),
-            "project_id": None,
-            "source": KIND_SEED_INVENTORY,
-            "detail": {"backlog_item": "no_ci_gate_live_trial"},
-        },
-        {
-            "dedupe_key": "seed:capability_trial_rail",
-            "kind": KIND_CAPABILITY_TRIAL,
-            "title": (
-                "Capability-trial/adoption rail: observe-mode capabilities "
-                "lacking a decided enforce verdict"
-            ),
-            "project_id": None,
-            "source": KIND_SEED_INVENTORY,
-            "detail": {"backlog_item": "capability_trial_adoption"},
-        },
-        {
-            "dedupe_key": "seed:adversarial_observe_watch",
-            "kind": KIND_RETIREMENT_RESIDUAL,
-            "title": (
-                "Adversarial / retirement observe-watch rail: challenges are "
-                "recorded but never enforced pending graduation"
-            ),
-            "project_id": None,
-            "source": KIND_SEED_INVENTORY,
-            "detail": {"backlog_item": "adversarial_observe_watch"},
-        },
-    ]
-
-
 def _iter_seed_debts() -> Iterable[dict]:
-    """All seed rows: the static standing inventory plus the currently-dormant
-    runtime-config knobs enumerated by ``runtime_config_state``."""
-    yield from _standing_inventory_debts()
+    """All seed rows: the currently-dormant runtime-config knobs enumerated by
+    ``runtime_config_state``."""
     try:
         from app.runtime_config_state import iter_dormant_knob_debts
 
@@ -1083,12 +1098,13 @@ async def areconcile_dormant_knob_debts(
 
 
 def _build_completion_debt_design_doc_section() -> dict:
-    """Build the completion-debt-ledger system description for the design doc.
+    """Build the completion-debt-ledger system description section.
 
-    Returns a dict suitable for insertion into ``design_doc["systems/completion-debt-ledger"]``.
+    Returns the section dict stored under the dedicated ``project_telemetry``
+    row (key ``systems/completion-debt-ledger``).
     """
     return {
-        "summary": "Durable ledger that makes merged-but-unfinished work first-class, recording obligations created by dormant knobs, capability trials, no-CI merges, and retirement residuals.",
+        "summary": "Durable ledger that makes merged-but-unfinished work first-class, recording obligations created by dormant knobs, capability trials, no-CI merges, hotfix deploy backfills, retirement residuals, and capability earn obligations.",
         "status": "active",
         "debt_kinds": [
             KIND_DORMANT_KNOB,
@@ -1096,7 +1112,7 @@ def _build_completion_debt_design_doc_section() -> dict:
             KIND_NO_CI_GATE,
             KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
             KIND_RETIREMENT_RESIDUAL,
-            KIND_SEED_INVENTORY,
+            KIND_CAPABILITY_EARN_OBLIGATION,
         ],
         "recorders": {
             "dormant_knob": "backend/app/runtime_config_state.py",
@@ -1104,12 +1120,13 @@ def _build_completion_debt_design_doc_section() -> dict:
             "no_ci_gate": "backend/app/ci_resolution.py",
             "hotfix_deploy_pending_backfill": "backend/app/release_qualifier.py",
             "retirement_residual": "backend/app/strategic_completion.py",
-            "seed_inventory": "backend/app/completion_debt.py",
+            "capability_earn_obligation": "backend/app/metrics_integrity_sweep.py",
         },
         "reconciliation_surfaces": [
             "knob graduation via admin settings endpoint resolves dormant-knob debt",
             "decided capability verdicts resolve capability-trial debt",
             "a passing normal qualification gate resolves hotfix-deploy backfill debt",
+            "adding a discoverable covering test file resolves capability earn obligation debt",
         ],
         "strategist_surface": "open_completion_debt payload section / ./fetch completion-debt verb",
         "admin_surface": "PATCH /api/admin/completion-debt endpoints (list, dismiss, resolve)",
@@ -1118,57 +1135,52 @@ def _build_completion_debt_design_doc_section() -> dict:
 
 
 async def seed_completion_debt_design_doc_section(session: Any, project_id: Any) -> bool:
-    """Seed the design-doc section for completion-debt ledger (idempotent per project).
+    """Seed the completion-debt ledger system section (idempotent per project).
 
-    Writes to ``project.design_doc["systems/completion-debt-ledger"]`` if absent,
-    and refreshes code-owned fields (summary, status, debt_kinds, etc.) without
-    clobbering operator- or strategist-authored additions.
+    God-column cutover: the section is stored SOLELY in the dedicated
+    ``project_telemetry`` row (key ``systems/completion-debt-ledger``) — the
+    design_doc write leg is cut, so this no longer takes the Project row lock.
+    Seeds the row when absent and refreshes code-owned fields (summary, status,
+    debt_kinds, etc.) without clobbering operator- or strategist-authored
+    additions carried on the existing row.
 
-    Returns ``True`` if a new section was written or code fields were refreshed,
-    ``False`` if the section already exists with current code state.
+    Returns ``True`` if the row was newly written or code fields were refreshed,
+    ``False`` if the row already exists with current code state.
     """
     if session is None or project_id is None:
         return False
 
-    from app.task_locking import with_design_doc_locked
+    from app.project_telemetry import read_telemetry, set_project_telemetry
 
     section_key = "systems/completion-debt-ledger"
     new_section = _build_completion_debt_design_doc_section()
-    changed = [False]  # Use list to allow modification in nested function
-
-    def _mutate(doc: dict) -> None:
-        now = _utcnow().isoformat()
-        existing = doc.get(section_key)
-        if existing is None:
-            # No section yet — seed it as code-authored.
-            doc[section_key] = {**new_section, "_authored_by": "code"}
-            changed[0] = True
-        else:
-            # Section exists — start with existing (preserves operator/strategist keys).
-            # Then refresh code-owned fields only (those present in new_section).
-            refreshed = dict(existing)
-            for key, value in new_section.items():
-                if refreshed.get(key) != value:
-                    refreshed[key] = value
-                    changed[0] = True
-            # Mark authorship if missing.
-            if "_authored_by" not in refreshed:
-                refreshed["_authored_by"] = "code"
-            doc[section_key] = refreshed
-
-        # Update _meta if section changed.
-        if changed[0]:
-            meta = dict(doc.get("_meta") or {"revision": 0})
-            meta["revision"] = meta.get("revision", 0) + 1
-            meta["last_updated"] = now
-            doc["_meta"] = meta
 
     try:
-        await with_design_doc_locked(session, project_id, _mutate, skip_locked=True)
-        return changed[0]
+        existing = await read_telemetry(session, project_id, section_key)
+        changed = False
+        if existing is None:
+            # No row yet — seed it as code-authored.
+            section = {**new_section, "_authored_by": "code"}
+            changed = True
+        else:
+            # Row exists — start with existing (preserves operator/strategist
+            # keys). Then refresh code-owned fields only (those in new_section).
+            section = dict(existing)
+            for key, value in new_section.items():
+                if section.get(key) != value:
+                    section[key] = value
+                    changed = True
+            # Mark authorship if missing (does not by itself count as a change,
+            # matching the pre-cutover semantics).
+            if "_authored_by" not in section:
+                section["_authored_by"] = "code"
+
+        if changed:
+            await set_project_telemetry(session, project_id, section_key, section)
+        return changed
     except Exception:  # noqa: BLE001
         logger.warning(
-            "[COMPLETION_DEBT] failed to seed design-doc section for project %s",
+            "[COMPLETION_DEBT] failed to seed completion-debt ledger section for project %s",
             project_id,
             exc_info=True,
         )

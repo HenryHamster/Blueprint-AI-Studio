@@ -1,8 +1,14 @@
-import { afterEach, beforeAll, describe, test, expect, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { registerToolKind } from '../toolRegistry';
 import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+// Preload MarkdownContentInner so the React.lazy import in MarkdownContent
+// (mounted by NotesTool preview mode) resolves immediately from the module
+// cache. Without it the lazy chunk load never settles within the test's wait
+// window and the rendered <strong> never appears. Mirrors the same preload in
+// MessagesPanel.viewport.test.tsx.
+import './MarkdownContentInner';
 
 vi.mock('../api/projectTools', async () => {
   const actual = await vi.importActual<typeof import('../api/projectTools')>('../api/projectTools');
@@ -14,7 +20,7 @@ vi.mock('../api/projectTools', async () => {
 });
 
 import { fetchToolContent, saveToolContent, ConflictError } from '../api/projectTools';
-import NotesTool from './NotesTool';
+import NotesTool, { DEBOUNCE_MS } from './NotesTool';
 
 const SAMPLE_TEXT = '# Research notes\n\nHypothesis: energy is $E = mc^2$.\n\n- point one\n- point two';
 
@@ -36,12 +42,17 @@ describe('NotesTool — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
   afterEach(() => {
     if (root) act(() => { root?.unmount(); });
     root = null;
     host?.remove();
     host = null;
     vi.resetAllMocks();
+    vi.useRealTimers();
   });
 
   // -----------------------------------------------------------------------
@@ -49,6 +60,9 @@ describe('NotesTool — viewport regression', () => {
   // -----------------------------------------------------------------------
 
   test('renders with sample notes without overflow at 375px', async () => {
+    // Viewport helpers settle layout via requestAnimationFrame (and page.viewport),
+    // which the global fake clock freezes — use real timers for helper-driven tests.
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { text: SAMPLE_TEXT },
       content_revision: 2,
@@ -61,7 +75,7 @@ describe('NotesTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('textarea')).toBeTruthy();
@@ -69,6 +83,7 @@ describe('NotesTool — viewport regression', () => {
   });
 
   test('renders with sample notes without overflow at 1280px', async () => {
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { text: SAMPLE_TEXT },
       content_revision: 2,
@@ -82,7 +97,7 @@ describe('NotesTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('textarea')).toBeTruthy();
@@ -124,7 +139,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
     expect(textarea).toBeTruthy();
@@ -136,6 +151,10 @@ describe('NotesTool — viewport regression', () => {
   // -----------------------------------------------------------------------
 
   test('edit mode shows a textarea; preview mode renders markdown', async () => {
+    // Preview mode mounts MarkdownContentInner via React.lazy, whose dynamic
+    // import only resolves on a real macrotask — the global fake clock never
+    // settles it. Use real timers for this test.
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { text: '**bold text**' },
       content_revision: 1,
@@ -147,7 +166,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     if (!host) throw new Error('host not mounted');
 
     // Edit mode by default: textarea present, no rendered markdown <strong>.
@@ -159,7 +178,10 @@ describe('NotesTool — viewport regression', () => {
       b => b.getAttribute('aria-label') === 'Preview mode',
     ) as HTMLButtonElement | null;
     expect(previewBtn).not.toBeNull();
-    await act(async () => { previewBtn!.click(); });
+    await act(async () => {
+      previewBtn!.click();
+      await new Promise(resolve => setTimeout(resolve, 100));
+    });
     expect(host.querySelector('textarea')).toBeNull();
     const strong = host.querySelector('strong');
     expect(strong).toBeTruthy();
@@ -177,7 +199,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Network error');
   });
@@ -204,7 +226,7 @@ describe('NotesTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
 
     if (!host) throw new Error('host not mounted');
     const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
@@ -217,8 +239,8 @@ describe('NotesTool — viewport regression', () => {
       textarea!.dispatchEvent(new Event('input', { bubbles: true }));
     });
 
-    // Wait for auto-save debounce (1500ms) + conflict reload.
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 3000)));
+    // Wait for auto-save debounce + conflict reload.
+    await act(async () => { await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 500); });
 
     // fetchToolContent: 1st call (initial load) + 2nd call (conflict reload).
     expect(fetchToolContent).toHaveBeenCalledTimes(2);

@@ -10,7 +10,6 @@ import statistics
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.failure_stage import _derive_failure_stage
@@ -54,8 +53,9 @@ from app.models import (
     TaskStatus,
     get_task_cost_by_provider_model,
 )
+from app.project_telemetry import read_telemetry, upsert_telemetry
 from app.task_capabilities import PRODUCT_TASK_TYPES, READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES
-from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.task_locking import with_directions_locked
 
 # Task types that never open a PR. Derived directly from the registry so that
 # newly-registered read_only types are automatically excluded from the
@@ -533,10 +533,13 @@ def _apply_cochange_to_doc(
     merged_files_lists: list[list[str]],
     pr_keys: list[str] | None = None,
 ) -> None:
-    """Apply co-change affinity index updates to a design_doc dict in place.
+    """Apply co-change affinity index updates to a ``cochange_index`` /
+    ``cochange_applied_prs`` carrier dict in place.
 
-    Core logic extracted from _update_cochange_index so it can be called
-    inside with_design_doc_locked (which passes the doc dict directly).
+    Pure accumulation logic over a dict holding ``cochange_index`` /
+    ``cochange_applied_prs``. Callers seed the dict from the ``cochange_state``
+    telemetry row (its sole store since the design_doc write leg was cut) and
+    persist the mutated result back to that row.
 
     When pr_keys is provided (a list aligned with merged_files_lists), each
     entry is only folded in once — already-applied keys are skipped.  If all
@@ -626,21 +629,28 @@ def _apply_cochange_to_doc(
         doc["cochange_applied_prs"] = updated_applied
 
 
-def _update_cochange_index(
-    project: Project, merged_files_lists: list[list[str]]
-) -> None:
-    """Update the co-change affinity index in project.design_doc.
+async def read_cochange_index(session: AsyncSession, project: Project) -> dict:
+    """Return the co-change affinity index from the KV table.
 
-    For each merged PR's file list, records which files changed together.
-    Scores decay on each call so stale associations fade over time.
-    Keeps top-5 affinities per file, capped at 200 files total.
+    Reads from the ``project_telemetry`` ``cochange_state`` row (shape
+    ``{"index": {...}, "applied_prs": [...]}``) written by
+    :func:`_update_direction_research_outcomes`.  Returns ``{}`` when the row
+    has not been backfilled yet.
     """
-    if not merged_files_lists:
-        return
-    doc = dict(project.design_doc or {})
-    _apply_cochange_to_doc(doc, merged_files_lists)
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
+    state = await read_telemetry(session, project.id, "cochange_state")
+    if state is not None:
+        return dict(state.get("index") or {})
+    return {}
+
+
+async def read_cochange_applied_prs(
+    session: AsyncSession, project: Project
+) -> list:
+    """Return the co-change applied-PR dedup list from the KV table."""
+    state = await read_telemetry(session, project.id, "cochange_state")
+    if state is not None:
+        return list(state.get("applied_prs") or [])
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -1430,16 +1440,16 @@ async def _update_direction_research_outcomes(
         """True when *ct* opened a PR (via any reliable signal).
 
         PULL_REQUEST artifact is the authoritative signal.  The pr_number
-        fallbacks below are intentionally skipped for 'review', 'fix', and
-        'panel_review' task types: ReviewPayload/PanelReviewPayload.pr_number
-        is the PR under review (not one opened by the task), and fix tasks
+        fallbacks below are intentionally skipped for 'review' and 'fix'
+        task types: ReviewPayload.pr_number is the PR under review (not one
+        opened by the task), and fix tasks
         iterate an existing PR rather than opening a new one (see
         _PR_OPENING_COMPLETION_TYPES in task_lifecycle.py).
         """
         if ct.id in _pr_artifact_task_ids:
             return True
         ct_type = (ct.first_payload or {}).get("type", "")
-        if ct_type in ("review", "fix", "panel_review"):
+        if ct_type in ("review", "fix"):
             return False
         ctx_ = ct.context or {}
         if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
@@ -1450,7 +1460,7 @@ async def _update_direction_research_outcomes(
         """True when *ct* is associated with a real PR — for the no-op gate ONLY.
 
         Unlike ``_opened_pr``, this predicate does NOT skip the pr_number
-        signals for 'review', 'fix', and 'panel_review' types.  For the
+        signals for 'review' and 'fix' types.  For the
         no-CODE-no-op question, ANY association with a real pull request
         disqualifies the child: a fix task that pushed code onto an existing
         open (not-yet-landed) PR carries ``context['review_loop']['pr_number']``
@@ -1459,7 +1469,7 @@ async def _update_direction_research_outcomes(
         code and is NOT a "work already exists" no-op.
 
         Do NOT reuse this for the merge-VOLUME metrics (``merged_prs_any_base``
-        and others): there the fix/review/panel_review pr_number skip in
+        and others): there the fix/review pr_number skip in
         ``_opened_pr`` is correct (a review's pr_number is the PR under review,
         not a merge that task produced).
         """
@@ -1589,7 +1599,7 @@ async def _update_direction_research_outcomes(
     #
     # Excludes merged completions (is_merged_completion) and pr_rejected ones,
     # AND — via ``_associated_with_pr`` rather than ``_opened_pr`` — any
-    # fix/review/panel_review child attached to an open (unmerged) PR.  A fix
+    # fix/review child attached to an open (unmerged) PR.  A fix
     # task that pushed code onto an existing open PR carries a pr_number in
     # context/review_loop but no PULL_REQUEST artifact of its own, so
     # ``_opened_pr`` returns False for it; counting it here would wrongly treat
@@ -2672,18 +2682,35 @@ async def _update_direction_research_outcomes(
     await with_directions_locked(session, project_id, _apply_direction_outcomes)
 
     if merged_files_lists:
-        # Flush the directions mutation before reacquiring the same Project row
-        # for the design_doc/cochange write. Without this, the second
-        # populate_existing refresh can reload a pre-mutation directions blob and
-        # clobber the newly-added research_history metrics in the same session.
+        # Flush the directions mutation before the co-change write so the two
+        # persist under a single commit (preserving the original crash-atomicity:
+        # the directions write cannot land without the co-change write).
         await session.flush()
-        session.expire(project, ["design_doc"])
-        await with_design_doc_locked(
+
+        # God-column cutover: the co-change index is stored SOLELY in the
+        # dedicated ``project_telemetry`` ``cochange_state`` row — the
+        # design_doc write leg is cut. This removes the Project row lock
+        # (``with_design_doc_locked``) from the merge path entirely, which is the
+        # write-serialization relief the decomposition targets. We seed the
+        # accumulator from the table's prior state (not design_doc), fold in the
+        # newly-merged PRs, and upsert only the KV row. Readers
+        # (``read_cochange_index`` / ``read_cochange_applied_prs``) already
+        # prefer this row, with a design_doc fallback retained for pre-backfill /
+        # rollback safety.
+        prev_state = await read_telemetry(session, project_id, "cochange_state")
+        working: dict = {
+            "cochange_index": dict((prev_state or {}).get("index") or {}),
+            "cochange_applied_prs": list((prev_state or {}).get("applied_prs") or []),
+        }
+        _apply_cochange_to_doc(working, merged_files_lists, pr_keys=merged_pr_keys)
+        await upsert_telemetry(
             session,
             project_id,
-            lambda doc: _apply_cochange_to_doc(
-                doc, merged_files_lists, pr_keys=merged_pr_keys
-            ),
+            "cochange_state",
+            {
+                "index": working.get("cochange_index") or {},
+                "applied_prs": working.get("cochange_applied_prs") or [],
+            },
         )
 
     await session.commit()

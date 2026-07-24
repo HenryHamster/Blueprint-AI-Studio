@@ -38,6 +38,7 @@ from app.alert_policy import create_project_alert_if_allowed
 from app.notification import _send_webhook_notification
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
+from app.strategic_authority_locks import commit_legacy_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,7 @@ async def _create_orchestrator_error_alerts(
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
+            event_type="deployment.halted",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -137,6 +139,7 @@ async def _create_halted_alerts(
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
+            event_type="deployment.halted",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -192,6 +195,7 @@ async def _create_rollback_alerts(
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
+            event_type="deployment.rollback_detected",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -246,6 +250,7 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
             severity=AlertSeverity.INFO,
             title=recovery_title,
             message=recovery_title,
+            event_type="deployment.halted_recovered",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -278,6 +283,7 @@ async def _maybe_create_failure_alert(
         title=f"Task failed: {task.title or str(task.id)[:8]}",
         message=f"Task type: {task_type}. {error_snippet or 'See task logs for details.'}",
         task_id=task.id,
+        event_type="task.failed",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -355,6 +361,7 @@ async def _maybe_create_spend_hold_alert(
         title=_SPEND_HOLD_ALERT_TITLE,
         message=message,
         task_id=task.id,
+        event_type="cost.spend_hold",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -421,8 +428,8 @@ _UNVERIFIED_REASON_LABELS = {
 # AlertSeverity mapping cannot drift from the success-scoring classifier. The
 # resulting dict is byte-for-byte identical to the former literal.
 _UNVERIFIED_REASON_SEVERITY = {
-    **{reason: AlertSeverity.ERROR for reason in DEGRADED_UNVERIFIED_REASONS},
-    **{reason: AlertSeverity.WARNING for reason in BENIGN_UNVERIFIED_REASONS},
+    **dict.fromkeys(DEGRADED_UNVERIFIED_REASONS, AlertSeverity.ERROR),
+    **dict.fromkeys(BENIGN_UNVERIFIED_REASONS, AlertSeverity.WARNING),
 }
 
 
@@ -526,6 +533,7 @@ async def _maybe_create_merge_gate_degradation_alerts(
             severity=severity,
             title=title,
             message=msg,
+            event_type="merge.unverified",
         )
         session.add(alert)
         created += 1
@@ -613,7 +621,7 @@ async def _maybe_create_migration_slot_contention_alert(
         f"(task {holder_task_id}) for a stuck author/test loop."
     )[:1000]
 
-    holder_uuid: "uuid.UUID | None" = None
+    holder_uuid: uuid.UUID | None = None
     if holder_task_id:
         try:
             holder_uuid = uuid.UUID(str(holder_task_id))
@@ -626,6 +634,7 @@ async def _maybe_create_migration_slot_contention_alert(
         title=title,
         message=msg,
         task_id=holder_uuid,
+        event_type="migration.slot_contention",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -690,6 +699,7 @@ async def _maybe_create_unverified_merge_alert(
             f"UNVERIFIED. Review the merge if test coverage was expected."
         ),
         task_id=task.id,
+        event_type="merge.unverified",
     )
     session.add(alert)
     await session.commit()
@@ -748,11 +758,10 @@ async def _maybe_create_circuit_breaker_alert(
         severity=AlertSeverity.WARNING,
         title="Circuit breaker opened: autonomous tasks paused",
         message=reason,
+        event_type="capacity.quota_exhausted",
     )
     session.add(alert)
     if expected_legacy_generation is not None:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
-
         await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
@@ -762,60 +771,6 @@ async def _maybe_create_circuit_breaker_alert(
         {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
     )
     await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
-
-
-_ADVERSARIAL_GATE_FAIL_OPEN_TITLE = (
-    "Adversarial gate failed open: second-opinion model unavailable"
-)
-
-
-async def _maybe_create_adversarial_gate_fail_open_alert(
-    review: "Task",
-    challenger: "Task",
-    session: AsyncSession,
-) -> None:
-    """Create a deduplicated WARNING alert when the adversarial review gate degrades.
-
-    When the panel-review challenger model is unavailable (provider model-config
-    rejection), the gate falls back to the primary verdict and auto-merges trunk
-    APPROVEs — a fail-open. Previously this emitted only a logger.warning; this
-    surfaces it in the Alerts banner so operators can investigate.
-
-    Deduplicates on ``(review.id, title)`` so a single fail-open event raises
-    exactly one alert even if the resolution path is re-entered.
-    """
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.task_id == review.id,
-            Alert.dismissed_at.is_(None),
-            Alert.title == _ADVERSARIAL_GATE_FAIL_OPEN_TITLE,
-        )
-    )
-    if existing.scalars().first() is not None:
-        return
-    alert = Alert(
-        project_id=review.project_id,
-        severity=AlertSeverity.WARNING,
-        title=_ADVERSARIAL_GATE_FAIL_OPEN_TITLE,
-        message=(
-            f"The second-opinion panel model (challenger task {str(challenger.id)[:8]}) "
-            f"was unavailable due to a provider model-config rejection. "
-            f"The review gate degraded gracefully: the primary verdict was preserved "
-            f"and the merge proceeded without adversarial verification. "
-            f"Review task: {str(review.id)[:8]}."
-        ),
-        task_id=review.id,
-    )
-    session.add(alert)
-    await broadcast_to_project(
-        str(review.project_id),
-        "alert_created",
-        {
-            "alert_id": str(alert.id),
-            "severity": AlertSeverity.WARNING.value,
-            "title": alert.title,
-        },
-    )
 
 
 _SPEND_CEILING_ALERT_TITLE = "Spend ceiling reached: autonomous spawning paused"
@@ -856,13 +811,12 @@ async def _maybe_create_spend_ceiling_alert(
             f"per-project ceiling ${ceiling_usd:.4f}. New autonomous "
             f"spawning is paused until spend falls below the ceiling."
         ),
+        event_type="cost.ceiling_reached",
     )
     session.add(alert)
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
-
         await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
@@ -917,13 +871,12 @@ async def _maybe_create_approaching_ceiling_alert(
             f"${ceiling_usd:.4f}. Autonomous spawning will pause when spend "
             f"reaches the ceiling."
         ),
+        event_type="cost.ceiling_reached",
     )
     session.add(alert)
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
-
         await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
@@ -989,6 +942,7 @@ async def _maybe_create_escalation_alert(
             f"decision required."
         ),
         task_id=task.id,
+        event_type="review.escalated",
     )
     session.add(alert)
     await session.commit()
@@ -1232,6 +1186,7 @@ async def _maybe_create_unpriced_models_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="cost.unpriced_models",
     )
     session.add(alert)
     await session.commit()
@@ -1305,6 +1260,7 @@ async def _maybe_create_self_repair_burn_share_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="efficiency.self_repair_burn_share",
     )
     session.add(alert)
     await session.commit()
@@ -1316,6 +1272,105 @@ async def _maybe_create_self_repair_burn_share_alert(
             "severity": severity.value,
             "title": alert.title,
         },
+    )
+
+
+async def _maybe_create_problem_model_wipe_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    field: str,
+) -> None:
+    """Create a deduplicated WARNING alert when a problem_model write would have
+    wiped all entries from ``field`` (``'gaps'`` or ``'capabilities'``) without
+    an explicit ``_deletions`` directive.
+
+    The non-destructive merge in ``apply_agent_update`` already prevents the
+    actual wipe; this alert surfaces the signal so operators can investigate
+    whether the agent is acting on a truncated or dropped payload view.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` on a stable
+    title — an agent that repeatedly submits empty payloads raises exactly ONE
+    alert per project per field until the operator dismisses it.
+    """
+    title = f"Problem-model {field} wipe blocked on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    message = (
+        f"An agent write proposed dropping ALL {field} from the problem model "
+        f"without an explicit _deletions directive. The write was merged "
+        f"non-destructively (existing {field} preserved), but this pattern "
+        f"usually means the agent is acting on a truncated payload view. "
+        f"Investigate recent problem_model writes on this project."
+    )
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        event_type="problem_model.wipe_risk",
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+
+
+async def _maybe_create_problem_model_live_core_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+) -> None:
+    """Create a deduplicated ERROR alert when the problem_model live core alone
+    exceeds PROBLEM_MODEL_BYTE_BUDGET, making byte eviction futile.
+
+    This is the exact precondition for the rev-1367 wipe: the oversized model
+    is committed to the durable store, then the next strategic cycle's packer
+    truncates the agent view, the agent echoes back the truncated view, and the
+    non-destructive merge cannot fully protect state.
+
+    Deduplicated by stable title so repeated oversized writes raise exactly ONE
+    alert per project until the operator dismisses it.
+    """
+    title = f"Problem-model live core over byte budget on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    message = (
+        "The problem model's live core (active gaps, live capabilities, active "
+        "friction) alone exceeds the PROBLEM_MODEL_BYTE_BUDGET. Byte eviction "
+        "cannot help — the model was committed oversized. This is the "
+        "precondition for the rev-1367 agent-view truncation / wipe cycle. "
+        "Prune the problem model or increase the byte budget."
+    )
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        event_type="problem_model.live_core_over_budget",
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
     )
 
 
@@ -1370,6 +1425,7 @@ async def _maybe_create_precondition_blocker_alert(
         title=title,
         message=detail[:1000],
         task_id=task.id,
+        event_type="task.blocked",
     )
     session.add(alert)
     await session.commit()
@@ -1463,6 +1519,7 @@ async def _maybe_create_stale_staged_direction_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="research.stale_staged_direction",
     )
     session.add(alert)
     await session.commit()
@@ -1631,6 +1688,7 @@ async def _maybe_create_blocked_escalation_alert(
         title=title,
         message=detail[:1000],
         task_id=task.id,
+        event_type="task.blocked",
     )
     session.add(alert)
     await session.commit()
@@ -1689,6 +1747,7 @@ async def _maybe_create_cascade_cancel_alert(
             f"the root failure is resolved."
         ),
         task_id=prereq_task.id,
+        event_type="task.failed",
     )
     session.add(alert)
     await session.commit()
@@ -1749,6 +1808,7 @@ async def _maybe_create_wake_delivery_stall_alert(
         severity=severity,
         title=title,
         message=msg,
+        event_type="deployment.wake_delivery_stalled",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -1928,6 +1988,7 @@ async def _maybe_create_cost_telemetry_reconciliation_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="cost.telemetry_reconciliation_drift",
     )
     session.add(alert)
     await session.commit()
@@ -2001,6 +2062,7 @@ async def _maybe_create_compute_image_drift_alert(
         severity=AlertSeverity.INFO,
         title=title,
         message=message,
+        event_type="compute.image_drift",
     )
     session.add(alert)
     await session.commit()
@@ -2010,6 +2072,208 @@ async def _maybe_create_compute_image_drift_alert(
         {
             "alert_id": str(alert.id),
             "severity": AlertSeverity.INFO.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
+# Stable title for the per-project compute-image drift-deferred alert. Kept
+# CONSTANT (the dep_hash and reason live in the message) so a build deferred
+# across consecutive hourly sweeps deduplicates to exactly ONE open alert
+# per project. Keep the title stable.
+_COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE = (
+    "Compute image drift detected: dependency manifest changed (rebuild deferred)"
+)
+
+
+async def _maybe_create_compute_image_drift_deferred_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    dep_hash: "str | None",
+    reason: str,
+) -> bool:
+    """Create a deduplicated INFO alert when drift is detected but the rebuild is
+    deferred (builder busy or build budget exhausted).
+
+    The hourly refresh sweep logs the deferral at INFO level only — there is no
+    operator-facing signal that a project's image is stale and waiting for a
+    build slot. This surfaces the event in the same Alerts banner so the operator
+    can see which projects drifted and why the rebuild hasn't started yet.
+
+    Deduplicated on a STABLE title so a project deferred across consecutive
+    sweep ticks raises exactly ONE open alert per project; the dep_hash and
+    reason live in the message so a moving metric never defeats dedup.
+    Commits its own ``Alert`` row and broadcasts ``alert_created``; the caller
+    wraps best-effort so an alert failure can never abort the sweep.
+
+    Returns ``True`` when a NEW alert was created, ``False`` when dedup
+    short-circuited.
+    """
+    title = _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    hash_label = (dep_hash or "(unknown)")[:32]
+    message = (
+        f"The project's baked compute image dependency manifest changed "
+        f"(dep_hash={hash_label}), but the rebuild was deferred: {reason}. "
+        f"The hourly refresh sweep will retry on the next pass."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.INFO,
+        title=title,
+        message=message,
+        event_type="compute.image_drift_deferred",
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.INFO.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
+# ── Live Cloud Build lane failure alert ───────────────────────────────────────
+
+# Stable title for the per-project live-lane refresh failure alert.
+# Keyed to project_id so repeated failures in the same sweep cycle
+# deduplicate to exactly ONE open alert per project.
+_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX = (
+    "Compute image refresh failed: "
+)
+
+
+async def _maybe_create_compute_image_refresh_failure_alert(
+    session: AsyncSession,
+    project_id: "object",
+    *,
+    error_reason: str,
+) -> bool:
+    """Create a deduplicated ERROR alert when the live Cloud Build refresh
+    lane returns a failure status for a project's compute image.
+
+    Deduplicated on a STABLE title keyed to ``project_id`` so a project
+    whose refresh consistently errors raises exactly ONE open alert until
+    an operator dismisses it. Returns ``True`` when a NEW alert was
+    created, ``False`` when dedup short-circuited.
+    """
+    title = f"{_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX}{str(project_id)[:64]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    reason_label = (error_reason or "(unknown)")[:256]
+    message = (
+        f"The compute-image auto-refresh for project {project_id} failed. "
+        f"Reason: {reason_label}. "
+        f"Authoring agents and compute jobs may use a stale or missing image "
+        f"until the build is retried."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        event_type="compute.image_refresh_failure",
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
+# Stable title for the per-project compute-image build failure alert.
+# Kept CONSTANT per (project_id, image_name) so a build that fails and
+# is retried deduplicates to exactly ONE open alert; the dep_hash and
+# failure reason live in the message.
+_COMPUTE_IMAGE_BUILD_FAILURE_ALERT_TITLE_PREFIX = "Compute image build failed: "
+
+
+async def _maybe_create_compute_image_build_failure_alert(
+    session: AsyncSession,
+    build: "object",
+    *,
+    failure_kind: str,
+) -> bool:
+    """Create a deduplicated ERROR alert when an async compute-image build
+    reaches a terminal failure state (``FAILED`` or ``TIMED_OUT``).
+
+    Deduplicated on a STABLE title keyed to ``(project_id, image_name)`` so a
+    project whose build fails on consecutive sweep ticks raises exactly ONE open
+    alert; the dep_hash and failure reason live in the message body.
+
+    Returns ``True`` when a NEW alert was created, ``False`` when dedup
+    short-circuited.  Caller wraps best-effort so an alert failure can never
+    abort the sweep.
+    """
+    image_label = (getattr(build, "image_name", None) or "unknown")[:64]
+    title = f"{_COMPUTE_IMAGE_BUILD_FAILURE_ALERT_TITLE_PREFIX}{image_label}"
+    project_id = getattr(build, "project_id", None)
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    dep_hash_label = (getattr(build, "dep_hash", None) or "(unknown)")[:32]
+    reason_label = (getattr(build, "error_reason", None) or "(unknown)")[:256]
+    kind_label = "timed out" if failure_kind == "timed_out" else "failed"
+    message = (
+        f"The async compute-image build for project {project_id} {kind_label}. "
+        f"dep_hash={dep_hash_label}. "
+        f"Reason: {reason_label}. "
+        f"Authoring agents and compute jobs may use a stale or missing image "
+        f"until the build is retried."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        event_type="compute.image_build_failure",
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
             "title": alert.title,
         },
     )
@@ -2040,13 +2304,12 @@ async def _create_strategic_alert(
         severity=AlertSeverity.WARNING,
         title=title,
         message=message[:1000],
+        event_type="research.strategic_issue",
     )
     session.add(alert)
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
-
         await commit_legacy_authorized(
             session, project_id, expected_legacy_generation
         )
@@ -2114,6 +2377,7 @@ async def _maybe_create_no_progress_watchdog_alert(
         severity=AlertSeverity.WARNING,
         title=_NO_PROGRESS_WATCHDOG_ALERT_TITLE,
         message=message,
+        event_type="task.blocked",
     )
     session.add(alert)
     # Stamp in-memory dedup marker so the caller doesn't re-alert if the
@@ -2131,3 +2395,125 @@ async def _maybe_create_no_progress_watchdog_alert(
             "title": alert.title,
         },
     )
+
+
+_USAGE_METER_DARK_ALERT_TITLE = "Usage meter persistently dark: LLM account(s) unreachable"
+
+
+async def _maybe_create_usage_meter_dark_alert(
+    session: AsyncSession,
+    dark_count: int,
+    persist_failures: int,
+    persist_failing_account_names: list[str] | None = None,
+) -> None:
+    """Fleet-broadcast WARNING when usage meters are persistently dark or persist-failing.
+
+    Deduplicates: skips if an undismissed alert with the stable title already
+    exists for a project.  Called from the orchestrator's 300 s meter cadence.
+    The companion :func:`_resolve_usage_meter_dark_alert` dismisses these alerts
+    when both conditions clear.
+    """
+    msg = (
+        f"{dark_count} LLM account(s) have been unreachable for >30 minutes"
+        if dark_count
+        else ""
+    )
+    if persist_failures:
+        names_part = ""
+        if persist_failing_account_names:
+            _MAX_NAMES = 5
+            shown = persist_failing_account_names[:_MAX_NAMES]
+            extra = len(persist_failing_account_names) - len(shown)
+            names_part = f" ({', '.join(shown)}{f' +{extra} more' if extra else ''})"
+        suffix = (
+            f"{persist_failures} DB persist failure(s) in the usage-meter pipeline{names_part}"
+        )
+        msg = f"{msg}; {suffix}" if msg else suffix
+    msg = (msg or "Usage meter is dark — check logs for details.") + (
+        " Usage headroom gate may be unable to arm."
+    )
+
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
+        logger.warning(
+            "_maybe_create_usage_meter_dark_alert: project_ids capped at %d",
+            global_limit,
+        )
+    existing_rows = (
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _USAGE_METER_DARK_ALERT_TITLE,
+                )
+            )
+        ).all()
+        if project_ids
+        else []
+    )
+    projects_with_alert = {row[0] for row in existing_rows}
+    for pid in project_ids:
+        if pid in projects_with_alert:
+            continue
+        alert = Alert(
+            project_id=pid,
+            severity=AlertSeverity.WARNING,
+            title=_USAGE_METER_DARK_ALERT_TITLE,
+            message=msg,
+            event_type="capacity.usage_meter_dark",
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(pid),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+        )
+
+
+async def _resolve_usage_meter_dark_alert(session: AsyncSession) -> None:
+    """Dismiss all open usage-meter-dark alerts when meters recover.
+
+    Called from the orchestrator's meter cadence when both dark_count and
+    persist_failures are zero.  Paired with
+    :func:`_maybe_create_usage_meter_dark_alert`.
+    """
+    now = _utcnow()
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
+        logger.warning(
+            "_resolve_usage_meter_dark_alert: project_ids capped at %d",
+            global_limit,
+        )
+    open_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _USAGE_METER_DARK_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if project_ids
+        else []
+    )
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)

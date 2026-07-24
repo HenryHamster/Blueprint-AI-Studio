@@ -68,9 +68,6 @@ from app.stall_alert_diagnostics import (
     _format_stall_alert,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES
-from app.strategic_resident_runner_policy import (
-    resident_turn_requires_local_runner,
-)
 from app.time_utils import _utcnow
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -803,8 +800,6 @@ async def _try_runner_dispatch(
 def _task_requires_strategic_local_runner(task: Task) -> bool:
     payload = task.first_payload or {}
     task_type = str(payload.get("type") or "")
-    if resident_turn_requires_local_runner(task):
-        return True
     return (
         task_type in STRATEGIC_TASK_TYPES
         and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY))
@@ -1700,6 +1695,7 @@ async def _maybe_alert_saturated_compute_cap_defer(
             f"Launch precondition: {message[:200]}"
         ),
         task_id=task.id,
+        event_type="capacity.quota_exhausted",
     )
     session.add(alert)
     _alert_project_id = str(task.project_id)
@@ -2671,7 +2667,7 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
                     ),
                 },
             )
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception(
                 "[RUNNERS] Failed to emit stale-runner refetch for project %s",
                 project_id,
@@ -2729,6 +2725,7 @@ async def _create_strategic_local_cloud_fallback_alert(
         title=_STRATEGIC_LOCAL_FALLBACK_ALERT_TITLE,
         message=message,
         task_id=task.id,
+        event_type="runner.degraded",
     )
     session.add(alert)
     try:
@@ -2859,9 +2856,6 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not task.archived
             and task.requires_approval is not True
         )
-        is_resident_hold = bool(strategic_stamp) and resident_turn_requires_local_runner(
-            task
-        )
         is_strategic_hold = (
             bool(strategic_stamp)
             and task_type in STRATEGIC_TASK_TYPES
@@ -2874,13 +2868,7 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not is_container_hold
             and not is_forced_runner_hold
             and not is_strategic_hold
-            and not is_resident_hold
         ):
-            continue
-
-        # Resident local-only authority has no timeout and no cloud fallback.
-        # The main dispatch loop will pin it when compatible capacity appears.
-        if is_resident_hold:
             continue
 
         if is_strategic_hold:
@@ -3133,6 +3121,7 @@ async def _emit_all_accounts_blocked_stall(
                         severity=AlertSeverity.ERROR,
                         title=title,
                         message=msg,
+                        event_type="capacity.all_accounts_blocked",
                     )
                     session.add(alert)
                     await broadcast_to_project(
@@ -3144,7 +3133,7 @@ async def _emit_all_accounts_blocked_stall(
                             "title": title,
                         },
                     )
-                asyncio.ensure_future(
+                asyncio.ensure_future(  # noqa: RUF006
                     dispatch_external_notification(
                         proj_id,
                         "PIPELINE_STALLED",

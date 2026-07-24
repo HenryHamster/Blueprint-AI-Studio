@@ -54,7 +54,7 @@ const healthBarProps = {
       monitoring_since: null,
       recent_outcomes: [],
     },
-    deploy_monitoring: null,
+    deploy_monitoring: undefined,
   },
   detailedHealth: null,
   apiHealthy: true,

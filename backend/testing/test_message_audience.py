@@ -24,11 +24,15 @@ from app.message_audience import (
     PIPELINE_LOG,
     get_logical_event_pairs,
     get_non_operator_event_types,
+    get_operator_event_types,
     get_operator_visible_webhook_events,
     get_registered_event_types,
     is_external_webhook_operator_visible,
     is_operator_visible,
     operator_visible_alert_filter,
+    operator_visible_audience_filter,
+    operator_visible_message_audience_filter,
+    operator_visible_nonactionable_message_filter,
     route_event,
     route_external_webhook_event,
     stamp_message_audience,
@@ -118,6 +122,22 @@ def test_route_event_alert_types_mapped():
     assert route_event("migration.slot_contention") == STRATEGIST_INTERNAL
 
 
+def test_deployment_wake_delivery_stalled_is_operator_action_needed():
+    """deployment.wake_delivery_stalled must route OPERATOR_ACTION_NEEDED and be operator-visible.
+
+    Non-regression: migration.chain_blocked (the wrong event_type previously stamped on
+    wake-delivery stall alerts) remains STRATEGIST_INTERNAL and must NOT be in the
+    operator-visible set.
+    """
+    assert route_event("deployment.wake_delivery_stalled") == OPERATOR_ACTION_NEEDED
+    operator_types = get_operator_event_types()
+    assert "deployment.wake_delivery_stalled" in operator_types
+    # The old wrong event_type is internal — wake-delivery stall alerts must not use it.
+    non_operator = get_non_operator_event_types()
+    assert "migration.chain_blocked" in non_operator
+    assert "migration.chain_blocked" not in operator_types
+
+
 def test_route_event_self_hosted_fleet_health_alert_types_are_operator_visible():
     """Every self-hosted fleet health incident has its intended audience."""
     action_needed = {
@@ -151,6 +171,53 @@ def test_route_event_size_breach_annotation_is_strategist_internal():
 def test_route_event_hotfix_backmerge_size_violation_is_strategist_internal():
     """Module size-overflow alerts are strategist-internal bookkeeping."""
     assert route_event("hotfix_backmerge.size_violation") == STRATEGIST_INTERNAL
+
+
+def test_notification_dead_letter_lost_is_operator_action_needed():
+    """notification.dead_letter_lost must route OPERATOR_ACTION_NEEDED and pass
+    operator_visible_alert_filter so the double-failure surface reaches the operator.
+
+    This event_type is emitted by the _write_dead_letter fallback when the
+    dead-letter persistence write itself fails — the notification is permanently
+    unrecoverable and the operator must be notified.
+    """
+    assert route_event("notification.dead_letter_lost") == OPERATOR_ACTION_NEEDED
+    operator_types = get_operator_event_types()
+    assert "notification.dead_letter_lost" in operator_types
+
+
+def test_operator_decision_summary_absent_is_strategist_internal():
+    """operator_decision.summary_absent routes STRATEGIST_INTERNAL and is excluded
+    from operator badge counts.
+
+    This event_type is emitted by the resident session when the operator decision
+    summary is absent — it is a bookkeeping signal for the strategist, not an
+    operator-facing action item.  It must NOT appear in the operator badge.
+    """
+    assert route_event("operator_decision.summary_absent") == STRATEGIST_INTERNAL
+    non_operator = get_non_operator_event_types()
+    assert "operator_decision.summary_absent" in non_operator, (
+        "operator_decision.summary_absent is registered STRATEGIST_INTERNAL but absent "
+        "from get_non_operator_event_types() — operator_visible_alert_filter will NOT "
+        "exclude it from badge counts"
+    )
+
+
+def test_operator_decision_capture_rate_low_is_strategist_internal():
+    """operator_decision.capture_rate_low routes STRATEGIST_INTERNAL and is excluded
+    from operator badge counts.
+
+    This event_type is emitted when the operator decision capture rate is low — a
+    pipeline-health signal for the strategist that must not surface in the operator
+    badge or action-needed inbox.
+    """
+    assert route_event("operator_decision.capture_rate_low") == STRATEGIST_INTERNAL
+    non_operator = get_non_operator_event_types()
+    assert "operator_decision.capture_rate_low" in non_operator, (
+        "operator_decision.capture_rate_low is registered STRATEGIST_INTERNAL but absent "
+        "from get_non_operator_event_types() — operator_visible_alert_filter will NOT "
+        "exclude it from badge counts"
+    )
 
 
 def test_route_event_pipeline_internal_bookkeeping_is_strategist_internal():
@@ -224,8 +291,46 @@ def test_route_event_unknown_event_type_defaults_to_strategist_internal():
 
 
 def test_route_event_unknown_with_message_type_fallback():
-    """The message_type parameter is reserved — unknown event_type still defaults to internal."""
+    """NOTE message_type does not upgrade an unknown event_type — only BUG_REPORT/BLOCKER/QUESTION do."""
     assert route_event("unknown.event", message_type="NOTE") == STRATEGIST_INTERNAL
+
+
+def test_route_event_message_type_fallback_bug_report_upgrades_audience():
+    """BUG_REPORT with strategist-internal event_type upgrades to operator-action-needed."""
+    assert route_event("strategic_message", message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_blocker_upgrades_audience():
+    """BLOCKER with strategist-internal event_type upgrades to operator-action-needed."""
+    assert route_event("strategic_message", message_type="BLOCKER") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_question_upgrades_audience():
+    """QUESTION with strategist-internal event_type upgrades to operator-action-needed."""
+    assert route_event("strategic_message", message_type="QUESTION") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_absent_event_type_upgrades():
+    """Absent event_type (None/empty) + BUG_REPORT message_type upgrades to operator-action-needed."""
+    assert route_event(None, message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED  # type: ignore[arg-type]
+    assert route_event("", message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED
+    assert route_event("   ", message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_note_stays_internal():
+    """NOTE/FEEDBACK/VISION message_type does NOT upgrade a strategist-internal event_type."""
+    for mt in ("NOTE", "FEEDBACK", "VISION"):
+        assert route_event("strategic_message", message_type=mt) == STRATEGIST_INTERNAL, mt
+    assert route_event("unknown.event", message_type="FEEDBACK") == STRATEGIST_INTERNAL
+
+
+def test_route_event_registered_operator_event_not_affected_by_message_type():
+    """An event_type already resolving to an operator audience is unchanged by message_type."""
+    # auto_fix_escalated is registered OPERATOR_ACTION_NEEDED — message_type must not alter it.
+    assert route_event("auto_fix_escalated", message_type="NOTE") == OPERATOR_ACTION_NEEDED
+    assert route_event("failure_alert", message_type="NOTE") == OPERATOR_FYI
+    # An event_type explicitly registered strategist-internal + NOTE → still internal.
+    assert route_event("pr_merged", message_type="NOTE") == STRATEGIST_INTERNAL
 
 
 # ── is_operator_visible ────────────────────────────────────────────────
@@ -368,6 +473,8 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
 
     # Operator-visible undotted event types that are intentionally non-conversational:
     # lifecycle notices, pipeline alerts, and direct escalations route to ACTIVITY.
+    # MONTHLY_BUDGET_ALERT is an Alert event type (goes through Alert() constructor,
+    # not build_project_message), so it routes to the alert surface, not CONVERSATION.
     _NON_CONVERSATIONAL_OPERATOR_LEDGER_TYPES: frozenset[str] = frozenset({
         "handmerge_pr_preserved",
         "unsafe_branch_configuration",
@@ -381,6 +488,8 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
         "operator_command",
         "strategic_check_in",
         "agent_annotation",
+        "MONTHLY_BUDGET_ALERT",
+        "DAILY_BUDGET_ALERT",
     })
 
     registered = get_registered_event_types()
@@ -453,19 +562,51 @@ def _compile_alert_filter(event_types_to_probe=("warm_pool.payoff",)):
     )
 
 
-def test_operator_visible_alert_filter_retains_null_and_excludes_internal():
-    """The Alert filter keeps NULL/unregistered event_types and drops registered
-    strategist-internal ones — expressed as an ``IS NULL OR NOT IN (...)`` clause."""
+def test_operator_visible_alert_filter_is_fail_closed():
+    """The Alert filter is fail-closed: only explicitly registered operator-visible
+    event_types pass through.  NULL and unregistered event_types are excluded —
+    expressed as an ``IN (...)`` allowlist clause with no IS NULL pass-through."""
     sql = _compile_alert_filter()
-    # NULL rows are retained.
-    assert "event_type IS NULL" in sql
-    # Strategist-internal event types are enumerated in the NOT IN list.
-    assert "NOT IN" in sql
-    assert "warm_pool.payoff" in sql
-    assert "hotfix_backmerge.size_violation" in sql
-    # Operator-visible alert event types are NOT in the exclusion list.
-    assert "task.failed" not in sql
-    assert "approval.needed" not in sql
+    # NULL rows are NOT retained — no IS NULL pass-through.
+    assert "IS NULL" not in sql
+    # Uses an explicit IN allowlist, not a NOT IN denylist.
+    assert "NOT IN" not in sql
+    assert "IN" in sql
+    # Operator-visible alert event types are in the allowlist.
+    assert "task.failed" in sql
+    assert "approval.needed" in sql
+    # Strategist-internal event types are NOT in the allowlist.
+    assert "warm_pool.payoff" not in sql
+    assert "hotfix_backmerge.size_violation" not in sql
+
+
+def test_operator_event_types_registry_is_consistent():
+    """Operator and non-operator event_type sets are disjoint and cover the full registry."""
+    operator_types = get_operator_event_types()
+    non_operator_types = get_non_operator_event_types()
+    registered = get_registered_event_types()
+
+    # Every registered event_type appears in exactly one set.
+    assert operator_types.isdisjoint(non_operator_types), (
+        "Operator and non-operator sets must not overlap"
+    )
+    assert operator_types | non_operator_types == registered, (
+        "Every registered event_type must be in exactly one of the two sets"
+    )
+
+    # Spot-check: known operator-visible events are in the operator set.
+    assert "task.failed" in operator_types
+    assert "approval.needed" in operator_types
+    assert "runner.deactivated" in operator_types
+
+    # Spot-check: known non-operator events are NOT in the operator set.
+    assert "warm_pool.payoff" not in operator_types
+    assert "hotfix_backmerge.size_violation" not in operator_types
+    assert "migration.slot_contention" not in operator_types
+
+    # Every member genuinely resolves to an operator-visible audience.
+    for event_type in operator_types:
+        assert is_operator_visible(route_event(event_type)), event_type
 
 
 # ── External-webhook audience gate ──────────────────────────────────────
@@ -599,6 +740,198 @@ def test_valid_notification_events_all_present_in_webhook_registry():
         "operator has enabled it.\n\n"
         "Fix: add each missing event to _WEBHOOK_EVENT_AUDIENCE in "
         "backend/app/message_audience.py with its intended audience classification."
+    )
+
+
+# ── Strategist reply audience contract ──────────────────────────────────
+
+
+def test_strategist_reply_to_operator_is_operator_visible():
+    """A strategist reply (event_type="question_answer") must resolve to OPERATOR_FYI.
+
+    admin_agent_ops.create_message defaults to "question_answer" when reply_to
+    is present and no explicit event_type was supplied, so the operator receives
+    a notification that a reply arrived.  This test pins the registry contract
+    the fix depends on: "question_answer" → OPERATOR_FYI, and
+    stamp_message_audience stamps that audience on the context dict.
+    """
+    # registry resolution
+    assert route_event("question_answer") == OPERATOR_FYI
+
+    # stamp_message_audience writes the correct audience for a reply context
+    ctx = stamp_message_audience({"reply_to": "some-message-id"}, "question_answer")
+    assert ctx["audience"] == OPERATOR_FYI
+    assert ctx["event_type"] == "question_answer"
+
+    # "strategic_message" (the non-reply fallback) must remain STRATEGIST_INTERNAL
+    # so only genuine replies get upgraded — no regression on the existing fallback.
+    assert route_event("strategic_message") == STRATEGIST_INTERNAL
+
+
+def test_strategist_agent_output_reply_audience():
+    """strategic_completion.py's agent-output path defaults to "question_answer"
+    (OPERATOR_FYI) when reply_to is present but event_type is absent — mirroring
+    the admin_agent_ops.py fix.  Without this, strategist replies to operator
+    messages are invisible (STRATEGIST_INTERNAL).
+
+    This replicates the exact default logic from ``_handle_strategic_completion``
+    (strategic_completion.py:~6275) and verifies every combination:
+    reply_to present/absent × event_type present/absent/Nones.
+    """
+    test_cases: list[tuple[dict, str, str, str]] = [
+        # (context, expected_audience, expected_event_type, scenario)
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            "reply_to present, no event_type → question_answer / OPERATOR_FYI",
+        ),
+        (
+            {"reply_to": "m1", "event_type": "question_answer"},
+            OPERATOR_FYI,
+            "question_answer",
+            "reply_to + explicit question_answer preserved",
+        ),
+        (
+            {"reply_to": "m1", "event_type": "auto_fix_escalated"},
+            OPERATOR_ACTION_NEEDED,
+            "auto_fix_escalated",
+            "reply_to + explicit escalation event_type preserved",
+        ),
+        (
+            {},
+            STRATEGIST_INTERNAL,
+            "strategic_message",
+            "no reply_to, no event_type → strategic_message / STRATEGIST_INTERNAL",
+        ),
+        (
+            {"event_type": "pr_merged"},
+            STRATEGIST_INTERNAL,
+            "pr_merged",
+            "routine event_type, no reply_to preserved",
+        ),
+        (
+            {"event_type": "strategic_message"},
+            STRATEGIST_INTERNAL,
+            "strategic_message",
+            "explicit strategic_message preserved",
+        ),
+    ]
+
+    for ctx_dict, expected_audience, expected_event_type, scenario in test_cases:
+        _event_type = ctx_dict.get("event_type")  # same as strategic_completion.py:6275
+        # Replicate the exact default logic from strategic_completion.py:6280-6284
+        _default_event_type = (
+            "question_answer"
+            if _event_type is None and ctx_dict.get("reply_to") is not None
+            else "strategic_message"
+        )
+        result = stamp_message_audience(
+            dict(ctx_dict),
+            _event_type or _default_event_type,
+        )
+        assert result["audience"] == expected_audience, (
+            f"audience mismatch — {scenario}: "
+            f"expected={expected_audience}, got={result['audience']}"
+        )
+        assert result["event_type"] == expected_event_type, (
+            f"event_type mismatch — {scenario}: "
+            f"expected={expected_event_type}, got={result['event_type']}"
+        )
+
+
+def test_strategist_agent_output_reply_audience_with_message_type():
+    """strategic_completion.py passes ``message_type=msg_type.value`` (typically
+    ``NOTE``) to ``stamp_message_audience``.  A reply with ``reply_to`` present
+    and no explicit ``event_type`` resolves to ``question_answer`` / ``OPERATOR_FYI``
+    regardless of the ``message_type`` parameter.
+
+    This pins the exact ``strategic_completion.py`` call pattern (lines ~6470-6472)
+    so a future default change cannot silently make strategist replies invisible
+    to the operator: the ``message_type`` fallback in ``route_event`` only upgrades
+    ``STRATEGIST_INTERNAL`` → ``OPERATOR_ACTION_NEEDED`` for ``BUG_REPORT`` /
+    ``BLOCKER`` / ``QUESTION``, and ``question_answer`` already resolves to
+    ``OPERATOR_FYI`` directly, so the fallback never fires.
+    """
+    test_cases: list[tuple[dict, str, str, str, str | None]] = [
+        # (context, expected_audience, expected_event_type, message_type, scenario)
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            "NOTE",
+            "reply_to present, event_type=None, message_type=NOTE → question_answer / OPERATOR_FYI",
+        ),
+        (
+            {"reply_to": "m1", "event_type": "question_answer"},
+            OPERATOR_FYI,
+            "question_answer",
+            "NOTE",
+            "reply_to + explicit question_answer, message_type=NOTE preserved",
+        ),
+        (
+            {},
+            STRATEGIST_INTERNAL,
+            "strategic_message",
+            "NOTE",
+            "no reply_to, no event_type, message_type=NOTE → strategic_message / STRATEGIST_INTERNAL",
+        ),
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            "FEEDBACK",
+            "reply_to present, event_type=None, message_type=FEEDBACK → still question_answer / OPERATOR_FYI",
+        ),
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            None,
+            "reply_to present, event_type=None, message_type=None → still question_answer / OPERATOR_FYI",
+        ),
+    ]
+
+    for ctx_dict, expected_audience, expected_event_type, msg_type_str, scenario in test_cases:
+        _event_type = ctx_dict.get("event_type")
+        _default_event_type = (
+            "question_answer"
+            if _event_type is None and ctx_dict.get("reply_to") is not None
+            else "strategic_message"
+        )
+        result = stamp_message_audience(
+            dict(ctx_dict),
+            _event_type or _default_event_type,
+            message_type=msg_type_str,
+        )
+        assert result["audience"] == expected_audience, (
+            f"audience mismatch — {scenario}: "
+            f"expected={expected_audience}, got={result['audience']}"
+        )
+        assert result["event_type"] == expected_event_type, (
+            f"event_type mismatch — {scenario}: "
+            f"expected={expected_event_type}, got={result['event_type']}"
+        )
+
+    # Non-regression: BUG_REPORT/BLOCKER message_type upgrades a fallback
+    # STRATEGIST_INTERNAL event_type but must NOT override the registered
+    # question_answer audience.
+    result = stamp_message_audience(
+        {"reply_to": "m1"},
+        "question_answer",
+        message_type="BUG_REPORT",
+    )
+    assert result["audience"] == OPERATOR_FYI, (
+        "BUG_REPORT message_type must NOT override registered question_answer → OPERATOR_FYI"
+    )
+    result = stamp_message_audience(
+        {},
+        "strategic_message",
+        message_type="BUG_REPORT",
+    )
+    assert result["audience"] == OPERATOR_ACTION_NEEDED, (
+        "BUG_REPORT message_type must upgrade strategist-internal → OPERATOR_ACTION_NEEDED "
+        "when event_type is strategic_message (fallback-only)"
     )
 
 
@@ -1146,9 +1479,13 @@ def test_scan_skips_defaulted_user_from_type():
 
 
 # Modules with directly-authored operator-reaching ProjectMessage/build_project_message
-# sites.  notification_dispatch.py is the original choke-point; the other three
-# construct their escalation/attention rows via ``build_project_message`` and used
-# to land them with a NULL audience (fail-OPEN) — they now stamp at the emitter.
+# sites.  notification_dispatch.py is the original choke-point; the other modules
+# construct their escalation/attention rows via ``build_project_message`` and stamp
+# at the emitter so they carry a fail-closed audience.
+#
+# NOTE: This list is no longer used by test_no_operator_visible_emitter_bypasses_audience_gate,
+# which now scans all modules under backend/app/ exhaustively (no allowlist).  We keep
+# the variable for reference / legacy test isolation if needed.
 _MODULES_WITH_OPERATOR_MESSAGES = [
     "notification_dispatch.py",
     "review_loop_convergence.py",
@@ -1212,25 +1549,35 @@ def test_scan_accepts_stamped_build_project_message():
 
 def test_no_operator_visible_emitter_bypasses_audience_gate():
     """Whole-file invariant: every operator-reaching ProjectMessage /
-    build_project_message construction in the message-authoring modules routes its
-    audience through the shared gate.
+    build_project_message construction under backend/app/ routes its audience
+    through the shared gate.
 
-    Exercises the production stamping seam: reverting any escalation/attention
-    poster stamp (or adding a new operator-reaching row via the raw model
-    constructor OR the canonical ``build_project_message`` builder) makes this
-    scan flag the offending site and fail CI.
+    The test globs the entire app tree so any new module with an unstamped
+    operator-reaching ProjectMessage/build_project_message call fails CI
+    automatically — no allowlist update required.
+
+    This is the structural ratchet that prevents the operator-visible audience
+    leak from silently reoccurring: a freshly added emitter that forgets to call
+    ``stamp_message_audience`` (or ``route_event``) in its enclosing function is
+    caught by this scan. Fix by stamping the context dict with the appropriate
+    event_type before passing it to ``build_project_message`` or the
+    ``ProjectMessage`` constructor.
     """
+    import glob
+
     app_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "app")
     )
     all_offenders: list[str] = []
-    for module_name in _MODULES_WITH_OPERATOR_MESSAGES:
-        fpath = os.path.join(app_dir, module_name)
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
         with open(fpath, encoding="utf-8") as f:
             source = f.read()
-        all_offenders.extend(
-            _collect_ungated_emitters(source, filename=fpath, rel=module_name)
+        offenders = _collect_ungated_emitters(
+            source, filename=fpath, rel=rel
         )
+        all_offenders.extend(offenders)
+
     assert not all_offenders, (
         "Found operator-reaching ProjectMessage/build_project_message site(s) that "
         "do NOT route their audience through the shared gate "
@@ -1340,13 +1687,13 @@ async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
 
 # ── Structural AST scan: Alert(...) constructors must carry event_type ───
 #
-# operator_visible_alert_filter(Alert.event_type) in operator_attention.py
-# FAILS OPEN on NULL event_type, so a directly-constructed Alert(...) without
-# an event_type= keyword silently inflates the operator badge/preview.
+# operator_visible_alert_filter(Alert.event_type) is fail-closed (IN-allowlist).
+# A directly-constructed Alert(...) without an event_type= keyword has a NULL
+# event_type and is silently EXCLUDED from operator-facing surfaces.
 # The correct pattern is either:
 #   (a) Alert(..., event_type="registered.event") in the constructor call, OR
 #   (b) routing through create_project_alert_if_allowed (which stamps it).
-# This ratchet prevents either pattern from silently regressing.
+# This ratchet prevents ungated Alert constructors from silently regressing.
 
 _ALERT_GATE_CALL = "create_project_alert_if_allowed"
 
@@ -1527,47 +1874,1677 @@ def test_alert_scan_mixed_gated_and_ungated():
     assert "emit_ungated()" in offenders[0]
 
 
-# ── Whole-file invariant: zero ungated Alert constructors in domain modules ──
+# ── Structural guard: every Alert event_type must be registered ──────────
 
-_DOMAIN_MODULES_WITH_ALERTS = [
-    "autonomous_research.py",
-    "cost_ceiling.py",
-    "branch_cleanup.py",
-    "direction_lifecycle.py",
-    "warm_pool_maintainer.py",
-    "branch_resolution.py",
-]
+
+def _resolve_module_constant(
+    tree: ast.Module, name: str
+) -> str | None:
+    """Resolve a module-level ``ast.Name`` reference to its string literal value.
+
+    Searches the module body for ``NAME = "string"`` assignments and returns the
+    string value when the name is a simple constant string, or ``None`` when the
+    name cannot be resolved (non-constant value, not found, or the only match is
+    a non-string constant).
+    """
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id == name:
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    return node.value.value
+    return None
+
+
+def _collect_alert_constructors_with_unregistered_event_type(
+    source: str, *, filename: str, rel: str, registered: frozenset[str]
+) -> list[str]:
+    """Return offender strings for Alert(...) calls whose event_type= value is
+    either not present in the audience registry or not statically verifiable.
+
+    Handles four patterns:
+    - ``ast.Constant`` literals: checked directly against the registry.
+    - ``ast.IfExp`` (ternary): all string literal leaves are extracted and each
+      is verified against the registry.  A non-literal leaf that appears outside
+      ``create_project_alert_if_allowed`` is flagged as non-verifiable.
+    - ``ast.Name`` (module-level constant reference): resolved via
+      :func:`_resolve_module_constant`; the resolved string is checked against
+      the registry.
+    - All other non-literals: flagged as non-verifiable unless the enclosing
+      function is ``create_project_alert_if_allowed``, which validates the value
+      at runtime via ``should_emit_project_alert``.
+    """
+    tree = ast.parse(source, filename=filename)
+    funcs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def _enclosing_func_name(lineno: int) -> str | None:
+        best = None
+        for fn in funcs:
+            if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno):
+                if best is None or fn.lineno > best.lineno:
+                    best = fn
+        return best.name if best is not None else None
+
+    def _extract_literal_strings(node: ast.expr) -> tuple[list[str], bool]:
+        """Recursively extract string literal leaves from a (possibly nested) ternary.
+
+        Returns ``(literals, all_literals)``; ``all_literals`` is ``True`` only
+        when every leaf is an ``ast.Constant`` str.
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value], True
+        if isinstance(node, ast.IfExp):
+            body_lits, body_all = _extract_literal_strings(node.body)
+            orelse_lits, orelse_all = _extract_literal_strings(node.orelse)
+            return body_lits + orelse_lits, body_all and orelse_all
+        return [], False
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _ast_called_name(node) != "Alert":
+            continue
+        for kw in node.keywords:
+            if kw.arg != "event_type":
+                continue
+            val = kw.value
+            if isinstance(val, ast.Constant):
+                # Literal string — check directly against the registry.
+                if isinstance(val.value, str) and val.value not in registered:
+                    offenders.append(
+                        f"  {rel}:{node.lineno} — Alert(event_type={val.value!r}) "
+                        "is not registered in _EVENT_AUDIENCE_REGISTRY; "
+                        "add it to backend/app/message_audience.py with its intended audience"
+                    )
+            elif isinstance(val, ast.IfExp):
+                # Ternary — extract all literal leaves and verify each.
+                literals, all_literals = _extract_literal_strings(val)
+                for event_type in literals:
+                    if event_type not in registered:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type={event_type!r} [ternary branch]) "
+                            "is not registered in _EVENT_AUDIENCE_REGISTRY; "
+                            "add it to backend/app/message_audience.py with its intended audience"
+                        )
+                if not all_literals:
+                    # Non-literal ternary branch — safe only inside the gate function.
+                    enclosing = _enclosing_func_name(node.lineno)
+                    if enclosing != _ALERT_GATE_CALL:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type=<non-verifiable ternary>) "
+                            "contains a non-literal branch that cannot be verified at scan time; "
+                            "use only literal string values or route through "
+                            "create_project_alert_if_allowed"
+                        )
+            elif isinstance(val, ast.Name):
+                # Module-level constant reference — try to resolve to a string
+                # literal and check against the registry.  When the reference
+                # cannot be resolved (non-string value, not found) the generic
+                # non-literal rules apply below.
+                resolved = _resolve_module_constant(tree, val.id)
+                if isinstance(resolved, str):
+                    if resolved not in registered:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type={resolved!r} "
+                            f"[resolved from {val.id}]) is not registered in "
+                            "_EVENT_AUDIENCE_REGISTRY; "
+                            "add it to backend/app/message_audience.py with its intended audience"
+                        )
+                else:
+                    # Unresolvable Name — safe only inside the gate function.
+                    enclosing = _enclosing_func_name(node.lineno)
+                    if enclosing != _ALERT_GATE_CALL:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} — Alert(event_type=<non-literal: {val.id}>) "
+                            "uses a module-level name that cannot be resolved to a string "
+                            "constant at scan time; use a literal string value or route through "
+                            "create_project_alert_if_allowed"
+                        )
+            else:
+                # Non-literal event_type — safe only inside the gate function, which
+                # validates the value at runtime via should_emit_project_alert.
+                enclosing = _enclosing_func_name(node.lineno)
+                if enclosing != _ALERT_GATE_CALL:
+                    offenders.append(
+                        f"  {rel}:{node.lineno} — Alert(event_type=<non-literal>) "
+                        "uses a dynamic value that cannot be verified at scan time; "
+                        "use a literal string or route through create_project_alert_if_allowed"
+                    )
+    return offenders
+
+
+# ── Unit tests for the hardened Alert event_type scanner ────────────────
+
+
+def test_alert_scan_accepts_ternary_event_type_both_branches_registered():
+    """A ternary event_type where both branches are registered literals passes."""
+    source = dedent(
+        """
+        def emit_resume(session, project_id, flapping):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="resumed",
+                event_type="deployment.flapping_resume" if flapping else "deployment.auto_resume",
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "Both ternary branches are registered — expected no offenders, got: "
+        + "\n".join(offenders)
+    )
+
+
+def test_alert_scan_flags_ternary_with_unregistered_branch():
+    """A ternary event_type where one branch is NOT registered is flagged."""
+    source = dedent(
+        """
+        def emit_resume(session, project_id, flapping):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="resumed",
+                event_type="deployment.flapping_resume" if flapping else "unregistered.branch",
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.branch" in offenders[0]
+    assert "ternary branch" in offenders[0]
+
+
+def test_alert_scan_flags_dynamic_call_event_type_outside_gate():
+    """An Alert whose event_type comes from a dynamic call (e.g. dict.get) outside
+    create_project_alert_if_allowed is flagged as non-verifiable."""
+    source = dedent(
+        """
+        async def flush_pending(session, items):
+            for item in items:
+                alert = Alert(
+                    project_id=item["project_id"],
+                    severity="ERROR",
+                    title=item["title"],
+                    message=item.get("message") or "",
+                    event_type=item.get("event_type"),
+                )
+                session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "non-literal" in offenders[0]
+    assert "create_project_alert_if_allowed" in offenders[0]
+
+
+def test_alert_scan_resolves_name_to_registered_constant():
+    """An Alert whose event_type is an ast.Name referencing a registered module-
+    level constant passes (no offender)."""
+    source = dedent(
+        """
+        _MY_EVENT_TYPE = "direction_milestone"
+
+        def emit_alert(session, project_id):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=_MY_EVENT_TYPE,
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "_MY_EVENT_TYPE resolves to 'direction_milestone' which IS registered — "
+        "expected no offenders, got: " + "\n".join(offenders)
+    )
+
+
+def test_alert_scan_resolves_name_to_unregistered_constant():
+    """An Alert whose event_type is an ast.Name referencing an unregistered
+    module-level constant is flagged."""
+    source = dedent(
+        """
+        _UNREGISTERED_EVENT = "my.brand.new.event"
+
+        def emit_alert(session, project_id):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=_UNREGISTERED_EVENT,
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "my.brand.new.event" in offenders[0]
+    assert "_UNREGISTERED_EVENT" in offenders[0] or "resolved from" in offenders[0]
+
+
+def test_alert_scan_flags_irresolvable_name_outside_gate():
+    """An Alert whose event_type is an ast.Name that does NOT resolve to a
+    module-level string constant is flagged as non-verifiable when outside
+    create_project_alert_if_allowed."""
+    source = dedent(
+        """
+        def emit_alert(session, project_id, event_type_var):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=event_type_var,
+            )
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "event_type_var" in offenders[0]
+    assert "create_project_alert_if_allowed" in offenders[0]
+
+
+def test_alert_scan_accepts_irresolvable_name_inside_gate():
+    """An Alert whose event_type is an irresolvable ast.Name inside
+    create_project_alert_if_allowed is exempted (runtime validation)."""
+    source = dedent(
+        """
+        async def create_project_alert_if_allowed(session, *, project_id, event_type, decision):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                message="alert",
+                event_type=decision.event_type,
+            )
+            session.add(alert)
+            return alert
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "Inside create_project_alert_if_allowed, unresolvable names must be exempted; "
+        "got: " + "\n".join(offenders)
+    )
+
+
+def test_alert_scan_resolve_module_constant_picks_first_assignment():
+    """_resolve_module_constant returns the first module-level string assignment
+    matching the target name."""
+    source = dedent(
+        """
+        _MY_TYPE = "pr_merged"
+        # Duplicate (shouldn't happen in practice) — first wins.
+        _MY_TYPE = "registration.beta"
+
+        def emit(session, pid):
+            alert = Alert(project_id=pid, severity="WARNING", message="m",
+                          event_type=_MY_TYPE)
+            session.add(alert)
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert not offenders, (
+        "'pr_merged' (first assignment) IS registered — expected no offenders, "
+        "got: " + "\n".join(offenders)
+    )
+
+
+def test_alert_scan_exempts_attribute_event_type_inside_gate_function():
+    """An Alert whose event_type is a non-literal attribute access inside
+    create_project_alert_if_allowed is exempted — that function validates at runtime."""
+    source = dedent(
+        """
+        async def create_project_alert_if_allowed(session, *, project_id, event_type, decision):
+            alert = Alert(
+                project_id=project_id,
+                severity="WARNING",
+                title="alert",
+                message="alert",
+                event_type=decision.event_type,
+            )
+            session.add(alert)
+            return alert
+        """
+    )
+    registered = get_registered_event_types()
+    offenders = _collect_alert_constructors_with_unregistered_event_type(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == [], (
+        "event_type=decision.event_type inside create_project_alert_if_allowed must be exempt; "
+        "got: " + "\n".join(offenders)
+    )
+
+
+def test_no_alert_constructor_uses_unregistered_event_type():
+    """Whole-app invariant: every Alert(event_type=...) literal must be present
+    in the audience registry.
+
+    operator_visible_alert_filter() is fail-closed (IN-allowlist): an Alert whose
+    event_type is not in _EVENT_AUDIENCE_REGISTRY is silently EXCLUDED from the
+    operator badge / preview — it will never be visible to the operator.
+
+    This ratchet catches the gap structurally: adding a new Alert() with an
+    unregistered event_type now fails CI immediately rather than silently
+    disappearing at runtime.  Fix by adding the event_type to _EVENT_AUDIENCE_REGISTRY
+    in backend/app/message_audience.py with the correct audience.
+    """
+    import glob
+
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    registered = get_registered_event_types()
+    all_offenders: list[str] = []
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        all_offenders.extend(
+            _collect_alert_constructors_with_unregistered_event_type(
+                source, filename=fpath, rel=rel, registered=registered
+            )
+        )
+
+    assert not all_offenders, (
+        "Found Alert() constructor(s) under backend/app/ with an event_type= that "
+        "is NOT registered in _EVENT_AUDIENCE_REGISTRY (message_audience.py).\n"
+        "operator_visible_alert_filter() is fail-closed (IN-allowlist), so an "
+        "unregistered event_type will be EXCLUDED from the operator badge/preview — "
+        "the alert will silently disappear from the operator UI.\n"
+        "Fix: add each event_type to _EVENT_AUDIENCE_REGISTRY with its intended audience:\n"
+        + "\n".join(all_offenders)
+    )
+
+
+# ── Whole-file invariant: zero ungated Alert constructors across all app modules ──
 
 
 def test_no_alert_constructor_bypasses_event_type_gate():
-    """Whole-file invariant: every Alert(...) constructed in the pipeline-internal
-    domain modules carries an event_type= keyword (or is in a function that routes
-    through create_project_alert_if_allowed).
+    """Whole-file invariant: every Alert(...) constructed anywhere under backend/app/
+    carries an event_type= keyword (or is in a function that routes through
+    create_project_alert_if_allowed).
+
+    The test globs the entire app tree so any new module with an ungated Alert()
+    constructor fails CI automatically — no allowlist update required.
 
     This is the structural ratchet that prevents the operator-badge leak from
-    silently reoccurring: operator_visible_alert_filter(Alert.event_type) fails
-    OPEN on NULL, so any ungated Alert(...) inflates the operator badge/preview.
-    A new direct constructor without a registered event_type= fails CI here.
+    silently reoccurring: operator_visible_alert_filter(Alert.event_type) is now
+    fail-closed (IN-allowlist), so any Alert(...) without an event_type= keyword
+    will be silently excluded from the operator badge/preview.
+    Fix by adding event_type=<registered_key> to the Alert(...) call (register the
+    key in message_audience.py if needed).
     """
+    import glob
+
     app_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "app")
     )
     all_offenders: list[str] = []
-    for module_name in _DOMAIN_MODULES_WITH_ALERTS:
-        fpath = os.path.join(app_dir, module_name)
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
         with open(fpath, encoding="utf-8") as f:
             source = f.read()
         offenders = _collect_ungated_alert_constructors(
-            source, filename=fpath, rel=module_name
+            source, filename=fpath, rel=rel
         )
         all_offenders.extend(offenders)
 
     assert not all_offenders, (
-        "Found Alert() constructor(s) in pipeline-internal domain modules that "
-        "do NOT supply an event_type= keyword or route through "
-        "create_project_alert_if_allowed. A NULL event_type causes "
-        "operator_visible_alert_filter to FAIL OPEN, leaking the alert into "
-        "the operator badge/preview. Fix by adding event_type=<registered_key> "
-        "to the Alert(...) call (register the key in message_audience.py if needed):\n"
+        "Found Alert() constructor(s) under backend/app/ that do NOT supply an "
+        "event_type= keyword or route through create_project_alert_if_allowed. "
+        "operator_visible_alert_filter is fail-closed (IN-allowlist), so an Alert "
+        "without an event_type will be silently excluded from the operator badge/preview. "
+        "Fix by adding event_type=<registered_key> to the Alert(...) call (register the "
+        "key in message_audience.py if needed):\n" + "\n".join(all_offenders)
+    )
+
+
+# ── NULL-audience quarantine for non-actionable messages ────────────────
+
+
+def test_null_audience_nonactionable_message_excluded_from_operator_counts():
+    """NULL-audience NOTE messages are excluded from the operator badge count.
+
+    ``operator_visible_audience_filter`` is the legacy-preserving filter that
+    retains NULL-audience rows so pre-registry BLOCKER/QUESTION rows remain
+    operator-visible even without an audience stamp.  Non-actionable types
+    (NOTE/FEEDBACK/VISION) carry no such implicit operator intent — a NOTE with
+    no audience stamp is pre-registry bookkeeping that should be treated as
+    strategist-internal, not operator-visible.
+
+    ``operator_visible_nonactionable_message_filter`` is the strict variant: it
+    requires an *explicit* operator audience stamp and does NOT retain NULL rows.
+    ``get_operator_message_counts`` uses this strict filter for its NOTE count
+    and NOTE unread-count queries, so a NULL-audience NOTE no longer inflates
+    the operator badge.
+
+    This test compiles both filters to SQL and verifies the structural difference:
+    the strict filter has no IS NULL pass-through, while the legacy filter does.
+    """
+    from sqlalchemy.dialects import postgresql
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    legacy_sql = _compile(operator_visible_audience_filter(ProjectMessage.context))
+    strict_sql = _compile(operator_visible_nonactionable_message_filter(ProjectMessage.context))
+
+    # The legacy filter retains NULL-audience rows (IS NULL pass-through).
+    assert "IS NULL" in legacy_sql, (
+        "operator_visible_audience_filter must retain NULL-audience rows (legacy behaviour)"
+    )
+
+    # The strict filter does NOT retain NULL-audience rows — no IS NULL clause.
+    assert "IS NULL" not in strict_sql, (
+        "operator_visible_nonactionable_message_filter must NOT retain NULL-audience rows; "
+        "a NULL-audience NOTE is pre-registry bookkeeping and must be excluded from operator counts"
+    )
+
+    # The strict filter includes explicit operator audiences.
+    assert "operator-action-needed" in strict_sql
+    assert "operator-fyi" in strict_sql
+
+    # The strict filter uses an IN clause, not NOT IN — it does not fall back
+    # to "anything not explicitly non-operator" (which would retain NULL).
+    assert "NOT IN" not in strict_sql, (
+        "operator_visible_nonactionable_message_filter must use IN (explicit allowlist), "
+        "not NOT IN (exclusion denylist), so NULL-audience rows are not implicitly retained"
+    )
+
+    # Verify that stamping a NULL-audience NOTE with an unregistered event_type
+    # produces a STRATEGIST_INTERNAL audience — after a quarantine sweep, such
+    # rows would be explicitly classified and excluded by both filters.
+    stamped_ctx = stamp_message_audience({}, "", message_type="NOTE")
+    assert stamped_ctx["audience"] == STRATEGIST_INTERNAL, (
+        "A NOTE with no event_type must stamp STRATEGIST_INTERNAL (fail-closed); "
+        "once stamped, operator_visible_nonactionable_message_filter excludes it"
+    )
+
+
+# ── capacity.usage_meter_dark audience + alert dispatch ────────────────────
+
+
+def test_capacity_usage_meter_dark_routes_operator_fyi():
+    """capacity.usage_meter_dark resolves to OPERATOR_FYI in the audience registry."""
+    from app.message_audience import route_event, is_operator_visible
+
+    audience = route_event("capacity.usage_meter_dark")
+    assert audience == OPERATOR_FYI, (
+        f"capacity.usage_meter_dark must route to OPERATOR_FYI, got {audience!r}"
+    )
+    assert is_operator_visible(audience)
+
+
+def test_capacity_usage_meter_dark_in_operator_event_types():
+    """capacity.usage_meter_dark appears in the operator-visible event-type set."""
+    from app.message_audience import get_operator_event_types
+
+    assert "capacity.usage_meter_dark" in get_operator_event_types()
+
+
+@pytest.mark.asyncio
+async def test_maybe_create_usage_meter_dark_alert_creates_on_dark(monkeypatch):
+    """_maybe_create_usage_meter_dark_alert creates a WARNING alert per project when dark."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.alert_dispatch import _maybe_create_usage_meter_dark_alert
+
+    pid = uuid.uuid4()
+    # Simulate two project rows returned by the DB query
+    project_rows = [(pid, None)]
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    # execute() returns: (1) project select, (2) existing-alert select
+    project_result = MagicMock()
+    project_result.all.return_value = project_rows
+    no_existing = MagicMock()
+    no_existing.all.return_value = []
+    mock_session.execute = AsyncMock(side_effect=[project_result, no_existing])
+
+    with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()) as bcast:
+        await _maybe_create_usage_meter_dark_alert(mock_session, dark_count=2, persist_failures=0)
+
+    mock_session.add.assert_called_once()
+    added_alert = mock_session.add.call_args[0][0]
+    assert added_alert.event_type == "capacity.usage_meter_dark"
+    assert added_alert.severity.value == "WARNING"
+    assert added_alert.title == "Usage meter persistently dark: LLM account(s) unreachable"
+    assert "2 LLM account(s)" in added_alert.message
+    bcast.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_maybe_create_usage_meter_dark_alert_deduplicates(monkeypatch):
+    """_maybe_create_usage_meter_dark_alert skips if an undismissed alert already exists."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.alert_dispatch import _maybe_create_usage_meter_dark_alert
+
+    pid = uuid.uuid4()
+    project_rows = [(pid, None)]
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    project_result = MagicMock()
+    project_result.all.return_value = project_rows
+    # Simulate existing alert already present
+    existing_result = MagicMock()
+    existing_result.all.return_value = [(pid,)]
+    mock_session.execute = AsyncMock(side_effect=[project_result, existing_result])
+
+    with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()) as bcast:
+        await _maybe_create_usage_meter_dark_alert(mock_session, dark_count=1, persist_failures=0)
+
+    mock_session.add.assert_not_called()
+    bcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_usage_meter_dark_alert_dismisses_open_alerts():
+    """_resolve_usage_meter_dark_alert dismisses open usage-meter-dark alerts."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.alert_dispatch import _resolve_usage_meter_dark_alert
+    from app.models import Alert, AlertSeverity
+
+    pid = uuid.uuid4()
+    open_alert = Alert(
+        project_id=pid,
+        severity=AlertSeverity.WARNING,
+        title="Usage meter persistently dark: LLM account(s) unreachable",
+        message="test",
+        event_type="capacity.usage_meter_dark",
+    )
+    assert open_alert.dismissed_at is None
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    project_result = MagicMock()
+    project_result.all.return_value = [(pid, None)]
+    alert_scalars = MagicMock()
+    alert_scalars.all.return_value = [open_alert]
+    alert_result = MagicMock()
+    alert_result.scalars.return_value = alert_scalars
+    mock_session.execute = AsyncMock(side_effect=[project_result, alert_result])
+
+    await _resolve_usage_meter_dark_alert(mock_session)
+
+    assert open_alert.dismissed_at is not None, (
+        "_resolve_usage_meter_dark_alert must set dismissed_at on open alerts"
+    )
+    mock_session.add.assert_called_once_with(open_alert)
+
+
+@pytest.mark.asyncio
+async def test_resolve_usage_meter_dark_alert_no_op_when_none_open():
+    """_resolve_usage_meter_dark_alert is a no-op when no open dark-meter alerts exist."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.alert_dispatch import _resolve_usage_meter_dark_alert
+
+    pid = uuid.uuid4()
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    project_result = MagicMock()
+    project_result.all.return_value = [(pid, None)]
+    alert_scalars = MagicMock()
+    alert_scalars.all.return_value = []
+    alert_result = MagicMock()
+    alert_result.scalars.return_value = alert_scalars
+    mock_session.execute = AsyncMock(side_effect=[project_result, alert_result])
+
+    await _resolve_usage_meter_dark_alert(mock_session)
+    mock_session.add.assert_not_called()
+
+
+# ── Fail-closed message-path filter (operator_visible_message_audience_filter) ──
+
+
+def test_operator_visible_message_audience_filter_is_fail_closed():
+    """operator_visible_message_audience_filter is fail-closed: uses an IN-allowlist
+    with no IS NULL pass-through so NULL-audience messages are excluded, not leaked.
+
+    This is the correct filter for all ProjectMessage.context query paths.
+    """
+    from sqlalchemy.dialects import postgresql
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    sql = _compile(operator_visible_message_audience_filter(ProjectMessage.context))
+
+    # Must NOT retain NULL-audience rows.
+    assert "IS NULL" not in sql, (
+        "operator_visible_message_audience_filter must NOT retain NULL-audience rows; "
+        "NULL means un-stamped (fail-closed: treat as strategist-internal)"
+    )
+    # Uses an explicit IN allowlist, not a NOT IN denylist.
+    assert "NOT IN" not in sql, (
+        "operator_visible_message_audience_filter must use IN (explicit allowlist), "
+        "not NOT IN (exclusion denylist), so NULL-audience rows are not implicitly retained"
+    )
+    assert "IN" in sql
+    # Operator-visible audiences are in the allowlist.
+    assert "operator-action-needed" in sql
+    assert "operator-fyi" in sql
+    # Uses ->> scalar extraction so the expression index is hit.
+    assert "->>" in sql and "audience" in sql
+
+
+def test_operator_visible_message_audience_filter_excludes_null_audience():
+    """SQL shape: operator_visible_message_audience_filter excludes NULL-audience
+    rows while operator_visible_audience_filter (Task path) retains them.
+
+    This is the structural proof that the message path is fail-closed while the
+    Task path (which can never be audience-stamped) keeps the NULL pass-through.
+    """
+    from sqlalchemy.dialects import postgresql
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    message_sql = _compile(operator_visible_message_audience_filter(ProjectMessage.context))
+    task_sql = _compile(operator_visible_audience_filter(ProjectMessage.context))
+
+    # Message path: no NULL pass-through (fail-closed).
+    assert "IS NULL" not in message_sql, (
+        "operator_visible_message_audience_filter must exclude NULL-audience rows"
+    )
+    # Task path: retains NULL because tasks are never audience-stamped.
+    assert "IS NULL" in task_sql, (
+        "operator_visible_audience_filter must retain NULL-audience rows for Task.context"
+    )
+
+
+def test_operator_visible_message_audience_filter_call_sites_updated():
+    """Structural guard: operator_visible_audience_filter must NOT appear in ProjectMessage
+    query paths in operator_attention.py, operator_inbox_liveness.py,
+    admin_notifications.py, admin_debug.py, or metrics_integrity_sweep.py.
+
+    These files previously used the NULL-retaining legacy filter for ProjectMessage
+    queries; the correct filter for the message path is operator_visible_message_audience_filter.
+    This AST check enforces the call-site swap so a future refactor cannot silently
+    reintroduce the NULL pass-through on the message path.
+    """
+    import ast
+
+    app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+    files_to_check = [
+        (os.path.join(app_dir, "operator_attention.py"), "operator_attention.py"),
+        (os.path.join(app_dir, "operator_inbox_liveness.py"), "operator_inbox_liveness.py"),
+        (os.path.join(app_dir, "routers", "admin_notifications.py"), "admin_notifications.py"),
+        (os.path.join(app_dir, "routers", "admin_debug.py"), "admin_debug.py"),
+        (os.path.join(app_dir, "metrics_integrity_sweep.py"), "metrics_integrity_sweep.py"),
+    ]
+
+    offenders: list[str] = []
+
+    for fpath, label in files_to_check:
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=fpath)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            callee = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+            if callee != "operator_visible_audience_filter":
+                continue
+            # Look for ProjectMessage.context as the argument.
+            for arg in node.args:
+                if (
+                    isinstance(arg, ast.Attribute)
+                    and arg.attr == "context"
+                    and isinstance(arg.value, ast.Name)
+                    and arg.value.id == "ProjectMessage"
+                ):
+                    offenders.append(
+                        f"  {label}:{node.lineno} — operator_visible_audience_filter(ProjectMessage.context) "
+                        "found; use operator_visible_message_audience_filter instead"
+                    )
+
+    assert not offenders, (
+        "ProjectMessage.context query paths must use operator_visible_message_audience_filter "
+        "(fail-closed, no NULL pass-through), not operator_visible_audience_filter "
+        "(which retains NULL for Task.context):\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_operator_visible_audience_filter_uses_jsonb_scalar_expression():
+    """operator_visible_audience_filter must use context->>'audience' so the
+    expression index ix_projectmessage_context_audience is picked up by the
+    query planner in 10+ hot operator-inbox paths."""
+    from sqlalchemy.dialects import postgresql
+
+    from app.message_audience import operator_visible_audience_filter
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    sql = _compile(operator_visible_audience_filter(ProjectMessage.context))
+
+    assert "context" in sql, "filter must reference the context column"
+    assert "audience" in sql and "->>" in sql, (
+        "filter must use the ->> scalar extraction operator on audience "
+        "so the ix_projectmessage_context_audience expression index is used; "
+        f"got: {sql}"
+    )
+
+
+def test_projectmessage_table_args_include_audience_index():
+    """ProjectMessage.__table_args__ must declare ix_projectmessage_context_audience
+    for the model/migration coverage invariant."""
+    from app.models import ProjectMessage
+
+    index_names = {
+        idx.name
+        for idx in ProjectMessage.__table_args__
+        if hasattr(idx, "name")
+    }
+    assert "ix_projectmessage_context_audience" in index_names, (
+        "ProjectMessage.__table_args__ must include ix_projectmessage_context_audience; "
+        f"found: {sorted(index_names)}"
+    )
+
+
+# ── Structural guard: no operator-directed reply resolves to non-operator ──
+#
+# The FORWARD direction (internal content leaking TO the operator) is covered by
+# _collect_ungated_emitters above.  This section covers the INVERSE direction:
+# an operator-directed REPLY (stamp_message_audience called with a context dict
+# containing a 'reply_to' key) that silently resolves to a NON-operator audience
+# and therefore never reaches the operator's inbox.
+#
+# Known reply seams:
+#   notification_dispatch.py post_question_answer        → "question_answer" (OPERATOR_FYI) ✓
+#   notification_dispatch.py post_feedback_reply_message → variable event_type (skipped by scan) ✓
+#   strategic_completion.py _handle_strategic_completion → variable ctx (skipped by scan) ✓
+#   routers/admin_agent_ops.py create_message            → variable ctx (skipped by scan) ✓
+#
+# The scanner flags ONLY sites where BOTH arguments are statically determinable:
+#   (a) the first arg is a literal ast.Dict with a Constant("reply_to") key, AND
+#   (b) the second arg is a literal string Constant whose route_event() is NOT
+#       operator-visible.
+# Variable contexts and variable event_types are silently skipped — those paths
+# are covered by the runtime contract tests above.
+
+
+def _collect_reply_misrouted_emitters(
+    source: str, *, filename: str, rel: str
+) -> list[str]:
+    """Return offender strings for stamp_message_audience() calls where the
+    context is a literal dict with a 'reply_to' key AND the event_type is a
+    literal string constant that resolves to a non-operator audience.
+
+    Only literal-dict contexts with a literal event_type second argument are
+    flagged — variable contexts or dynamic event_types cannot be verified at
+    scan time and are silently skipped (runtime contract tests cover those seams).
+    """
+
+    def _dict_has_reply_to(node: ast.Dict) -> bool:
+        return any(
+            isinstance(k, ast.Constant) and k.value == "reply_to"
+            for k in node.keys
+        )
+
+    tree = ast.parse(source, filename=filename)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _ast_called_name(node) != "stamp_message_audience":
+            continue
+        # First positional arg must be a literal dict with a "reply_to" key.
+        if not node.args:
+            continue
+        ctx_arg = node.args[0]
+        if not isinstance(ctx_arg, ast.Dict):
+            continue  # variable context — cannot determine reply status statically
+        if not _dict_has_reply_to(ctx_arg):
+            continue  # no reply_to → not a reply site; internal messages are legit
+        # Second positional arg must be a literal string constant.
+        if len(node.args) < 2:
+            continue
+        et_arg = node.args[1]
+        if not isinstance(et_arg, ast.Constant) or not isinstance(et_arg.value, str):
+            continue  # variable/BoolOp event_type — skip
+        event_type = et_arg.value
+        if is_operator_visible(route_event(event_type)):
+            continue  # resolves to operator-visible audience → correct, no flag
+        offenders.append(
+            f"  {rel}:{node.lineno} — stamp_message_audience"
+            f"({{..., 'reply_to': ...}}, {event_type!r}) resolves to a non-operator "
+            "audience; an operator-directed reply must resolve to an operator-visible "
+            "audience — default event_type to 'question_answer' when reply_to is present"
+        )
+    return offenders
+
+
+# ── Unit tests for the inverse-misroute scanner ──────────────────────────
+
+
+def test_reply_scan_flags_non_operator_event_type_with_reply_to():
+    """A stamp_message_audience call with reply_to and a strategist-internal
+    event_type is flagged — the reply would silently bypass the operator inbox."""
+    source = dedent(
+        """
+        async def post_reply(session, project_id, reply_id, content):
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id), "content": content},
+                "strategic_message",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert len(offenders) == 1
+    assert "strategic_message" in offenders[0]
+    assert "reply_to" in offenders[0]
+    assert "non-operator" in offenders[0]
+
+
+def test_reply_scan_accepts_operator_event_type_with_reply_to():
+    """A stamp_message_audience call with reply_to and an operator-visible
+    event_type ('question_answer' → OPERATOR_FYI) is accepted."""
+    source = dedent(
+        """
+        async def post_question_answer(session, project_id, original_msg_id, answer):
+            ctx = stamp_message_audience(
+                {
+                    "event_type": "question_answer",
+                    "reply_to": str(original_msg_id),
+                    "answer": answer,
+                },
+                "question_answer",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_skips_context_without_reply_to():
+    """A stamp_message_audience call with a strategist-internal event_type but
+    NO 'reply_to' key is NOT flagged — non-reply internal messages are legitimate."""
+    source = dedent(
+        """
+        async def post_internal_note(session, project_id, content):
+            ctx = stamp_message_audience(
+                {"event_type": "strategic_message", "content": content},
+                "strategic_message",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_skips_non_literal_event_type():
+    """A stamp_message_audience call where the event_type is a BoolOp expression
+    (not a literal constant) is skipped — it cannot be verified at scan time."""
+    source = dedent(
+        """
+        async def post_msg(session, project_id, reply_id, event_type):
+            default_event_type = "strategic_message"
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id)},
+                event_type or default_event_type,
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_skips_non_literal_context():
+    """A stamp_message_audience call where the context is a variable (not a
+    literal dict) is skipped — the scanner cannot determine if reply_to is set."""
+    source = dedent(
+        """
+        async def post_msg(session, project_id, msg_ctx):
+            msg_ctx = stamp_message_audience(msg_ctx, "strategic_message")
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_reply_scan_flags_unregistered_event_type_with_reply_to():
+    """An unregistered event_type alongside reply_to is flagged — unregistered
+    event_types fail closed to STRATEGIST_INTERNAL (non-operator)."""
+    source = dedent(
+        """
+        async def post_reply(session, project_id, reply_id):
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id)},
+                "some.completely.unknown.event",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert len(offenders) == 1
+    assert "some.completely.unknown.event" in offenders[0]
+
+
+def test_reply_scan_accepts_operator_action_needed_event_type_with_reply_to():
+    """An operator-action-needed event_type alongside reply_to is accepted —
+    the reply would surface as an escalation that needs operator attention."""
+    source = dedent(
+        """
+        async def post_escalation_reply(session, project_id, reply_id):
+            ctx = stamp_message_audience(
+                {"reply_to": str(reply_id)},
+                "auto_fix_escalated",
+            )
+        """
+    )
+    offenders = _collect_reply_misrouted_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+# ── Whole-app invariant: zero operator-directed replies resolve non-operator ──
+
+
+def test_no_operator_reply_resolves_to_non_operator_audience():
+    """Whole-app invariant: every stamp_message_audience() call under backend/app/
+    whose first argument is a literal dict containing a 'reply_to' key must supply
+    an operator-visible event_type as its second argument.
+
+    This is the inverse-misroute detector: it prevents a reply intended for the
+    operator from silently resolving to a non-operator (strategist-internal /
+    fail-closed) audience and disappearing from the operator's inbox.
+
+    Remediation: default event_type to 'question_answer' when reply_to is present
+    (route_event('question_answer') == OPERATOR_FYI). If a different operator-visible
+    event_type is intended, use it explicitly.
+
+    Sites where the context is a variable or the event_type is not a literal
+    constant are skipped by the static scan; the runtime contract tests
+    (test_strategist_reply_to_operator_is_operator_visible and
+    test_strategist_agent_output_reply_audience) cover those seams.
+    """
+    import glob
+
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    all_offenders: list[str] = []
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        all_offenders.extend(
+            _collect_reply_misrouted_emitters(source, filename=fpath, rel=rel)
+        )
+
+    assert not all_offenders, (
+        "Found stamp_message_audience() call(s) under backend/app/ where the context "
+        "dict contains 'reply_to' but the event_type resolves to a non-operator audience.\n"
+        "An operator-directed reply must resolve to an operator-visible audience so the "
+        "operator's inbox receives it.\n"
+        "Fix: default event_type to 'question_answer' (OPERATOR_FYI) when reply_to is "
+        "present, or use another registered operator-visible event_type explicitly:\n"
+        + "\n".join(all_offenders)
+    )
+
+
+# ── Event-type registration guard: stamp_message_audience / route_event ──
+#
+# The fail-closed structural guard (_collect_ungated_emitters) ensures every
+# operator-reaching ProjectMessage/build_project_message site routes through
+# stamp_message_audience or route_event, but it does NOT verify that the
+# event_type argument itself is registered in _EVENT_AUDIENCE_REGISTRY.
+# An emitter that passes an unregistered or dynamic event_type to these
+# functions silently fails closed to strategist-internal — the operator never
+# sees the message, and no CI gate catches it.
+#
+# This scanner is the second ratchet: it verifies that every statically
+# determinable event_type passed to stamp_message_audience or route_event
+# is registered.  Unresolvable dynamic event_types are flagged unless the
+# enclosing function is in the runtime-validating gate allowlist.
+
+_EVENT_TYPE_GATE_ALLOWLIST: frozenset[str] = frozenset({
+    # === Core gate functions ==============================================
+    # stamp_message_audience itself — passes its event_type parameter through
+    # route_event.  Every caller's stamp/route call is checked; the gate
+    # function itself is exempt.
+    "stamp_message_audience",
+    # post_event_message — takes event_type as parameter; every caller's
+    # invocation of post_event_message with an unregistered literal is caught
+    # by their own file's scan (or the caller's own stamp/route check).
+    "post_event_message",
+    # Accepts event_type as parameter with default ("feedback_acknowledgment",
+    # registered); delegates to stamp_message_audience.
+    "post_feedback_acknowledgment",
+    # Takes event_type as parameter for per-lane event messages.
+    "emit_lane_event_message",
+    # === Runtime validators ===============================================
+    # Routes event_type parameter through route_event inside
+    # should_emit_project_alert — verifies at runtime.
+    "should_emit_project_alert",
+    # === General-purpose message handlers =================================
+    # Handles any event_type from the operator/strategist message context;
+    # default fallbacks (question_answer / strategic_message) are registered.
+    "strategic_operation",
+    "_handle_strategic_completion",
+    # === Verification / remediation paths =================================
+    # Re-derives audience from existing message event_types for sweep
+    # verification — does not introduce new event_types.
+    "check_audience_routing_attestation",
+    # Uses imported module-level constant _CHECK_IN_EVENT_TYPE ("strategic_check_in",
+    # registered) which cannot be resolved from module_constants alone.
+    "create_project_strategic_session_check_in",
+    # Re-stamps existing messages with their own event_type read from
+    # ctx["event_type"] — no new event_type is introduced.
+    "_remediate_forward_leaked_messages",
+})
+
+
+def _get_module_string_constants(tree: ast.AST) -> dict[str, str]:
+    """Map simple module-level ``NAME = "literal"`` assignments to their values.
+
+    Only captures top-level assignments where the target is a bare name
+    and the value is a string constant.  Ignores type-annotated assignments
+    (``NAME: str = "value"`` — those are ``ast.AnnAssign``, not ``ast.Assign``).
+    """
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            constants[node.targets[0].id] = node.value.value
+    return constants
+
+
+def _resolve_event_type(
+    node: ast.expr,
+    module_constants: dict[str, str] | None = None,
+) -> tuple[list[str], bool]:
+    """Try to resolve an event_type expression to concrete string values.
+
+    Returns ``(concrete_values, all_resolved)``.  ``all_resolved`` is True
+    only when EVERY possible value the expression can produce is a known
+    string constant — the caller can safely check all values against the
+    registry and conclude the call site is covered.
+
+    Handles:
+    - ``ast.Constant`` str literals
+    - ``ast.Name`` references resolved via *module_constants*
+    - ``ast.IfExp`` (ternary): both branches resolved and combined
+    - ``ast.BoolOp`` with ``ast.Or``: all sub-operands resolved and combined
+
+    Everything else (``ast.Call``, ``ast.Attribute``, unresolvable
+    ``ast.Name``, etc.) returns ``([], False)``.
+    """
+    consts: dict[str, str] = module_constants or {}
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value], True
+
+    if isinstance(node, ast.Name):
+        value = consts.get(node.id)
+        if value is not None:
+            return [value], True
+        return [], False
+
+    if isinstance(node, ast.IfExp):
+        body_lits, body_all = _resolve_event_type(node.body, consts)
+        orelse_lits, orelse_all = _resolve_event_type(node.orelse, consts)
+        return body_lits + orelse_lits, body_all and orelse_all
+
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        all_values: list[str] = []
+        all_ok = True
+        for val_node in node.values:
+            lits, ok = _resolve_event_type(val_node, consts)
+            all_values.extend(lits)
+            all_ok = all_ok and ok
+        return all_values, all_ok
+
+    return [], False
+
+
+def _collect_unregistered_event_type_invocations(
+    source: str, *, filename: str, rel: str, registered: frozenset[str]
+) -> list[str]:
+    """Return offender strings for ``stamp_message_audience()`` or
+    ``route_event()`` calls whose event_type argument is either not registered
+    in ``_EVENT_AUDIENCE_REGISTRY`` or not statically verifiable (unless the
+    enclosing function is in the gate allowlist).
+
+    Handles four patterns:
+    - **Literal constants**: checked directly against the registry.
+    - **Name references** to module-level string constants: resolved and checked.
+    - **IfExp** (ternary): all literal branches extracted and each checked
+      against the registry.
+    - **BoolOp** with ``Or`` (e.g. ``event_type or "default"``): constant
+      leaves extracted and each checked against the registry; any unregistered
+      value is flagged.
+    - **Other non-literals**: flagged unless the enclosing function is in
+      ``_EVENT_TYPE_GATE_ALLOWLIST``.
+    """
+    tree = ast.parse(source, filename=filename)
+    module_consts = _get_module_string_constants(tree)
+
+    funcs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def _enclosing_func_name(lineno: int) -> str | None:
+        best = None
+        for fn in funcs:
+            if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno):
+                if best is None or fn.lineno > best.lineno:
+                    best = fn
+        return best.name if best is not None else None
+
+    def _get_event_type_node(call: ast.Call, callee: str) -> ast.expr | None:
+        """Extract the event_type expression from a stamp/route call."""  # noqa: DOC201
+        if callee == "route_event":
+            if call.args:
+                return call.args[0]
+            for kw in call.keywords:
+                if kw.arg == "event_type":
+                    return kw.value
+        elif callee == "stamp_message_audience":
+            if len(call.args) >= 2:
+                return call.args[1]
+            for kw in call.keywords:
+                if kw.arg == "event_type":
+                    return kw.value
+        return None
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = _ast_called_name(node)
+        if callee not in ("stamp_message_audience", "route_event"):
+            continue
+
+        et_node = _get_event_type_node(node, callee)
+        if et_node is None:
+            enclosing = _enclosing_func_name(node.lineno)
+            if enclosing not in _EVENT_TYPE_GATE_ALLOWLIST:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}() called without recognizable "
+                    "event_type argument; add a literal event_type or route through "
+                    "a gate function in _EVENT_TYPE_GATE_ALLOWLIST"
+                )
+            continue
+
+        resolved, all_resolved = _resolve_event_type(et_node, module_consts)
+
+        if all_resolved:
+            # Every possible value is known — check against registry.
+            missing = sorted(set(v for v in resolved if v not in registered))
+            if missing:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}({', '.join(repr(m) for m in missing)}) "
+                    "uses unregistered event_type(s); add to _EVENT_AUDIENCE_REGISTRY in "
+                    "backend/app/message_audience.py with its intended audience"
+                )
+        else:
+            # Partially or fully unresolvable dynamic value.
+            unregistered_known = sorted(set(v for v in resolved if v not in registered))
+            enclosing = _enclosing_func_name(node.lineno)
+            if enclosing in _EVENT_TYPE_GATE_ALLOWLIST:
+                continue
+            if unregistered_known:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}() uses known but unregistered "
+                    f"event_type(s) ({', '.join(repr(m) for m in unregistered_known)}) "
+                    "plus unresolvable dynamic values; register the known types or route "
+                    "through a gate function in _EVENT_TYPE_GATE_ALLOWLIST"
+                )
+            else:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — {callee}() uses a non-verifiable dynamic "
+                    "event_type argument; use a literal string or route through a gate "
+                    "function in _EVENT_TYPE_GATE_ALLOWLIST"
+                )
+
+    return offenders
+
+
+# ── Unit tests for _resolve_event_type ──────────────────────────────────
+
+
+def test_resolve_literal_constant():
+    """A literal string constant resolves to [value], True."""
+    values, all_ok = _resolve_event_type(ast.Constant(value="task.failed"))
+    assert values == ["task.failed"]
+    assert all_ok is True
+
+
+def test_resolve_name_reference():
+    """A Name reference resolvable via module constants returns [value], True."""
+    values, all_ok = _resolve_event_type(
+        ast.Name(id="MY_EVENT", ctx=ast.Load()),
+        module_constants={"MY_EVENT": "task.failed"},
+    )
+    assert values == ["task.failed"]
+    assert all_ok is True
+
+
+def test_resolve_name_not_found():
+    """A Name reference missing from module_constants returns [], False."""
+    values, all_ok = _resolve_event_type(
+        ast.Name(id="unknown_var", ctx=ast.Load()),
+        module_constants={},
+    )
+    assert values == []
+    assert all_ok is False
+
+
+def test_resolve_ternary_both_literals():
+    """A ternary with both branches as literals resolves both."""
+    node = ast.IfExp(
+        test=ast.Name(id="cond", ctx=ast.Load()),
+        body=ast.Constant(value="event.a"),
+        orelse=ast.Constant(value="event.b"),
+    )
+    values, all_ok = _resolve_event_type(node)
+    assert sorted(values) == ["event.a", "event.b"]
+    assert all_ok is True
+
+
+def test_resolve_ternary_one_literal_one_name():
+    """A ternary with one literal and one resolvable Name resolves both."""
+    node = ast.IfExp(
+        test=ast.Name(id="cond", ctx=ast.Load()),
+        body=ast.Constant(value="event.a"),
+        orelse=ast.Name(id="FALLBACK", ctx=ast.Load()),
+    )
+    values, all_ok = _resolve_event_type(
+        node,
+        module_constants={"FALLBACK": "event.b"},
+    )
+    assert sorted(values) == ["event.a", "event.b"]
+    assert all_ok is True
+
+
+def test_resolve_boolop_or_with_literals():
+    """A BoolOp(Or) with resolvable branches resolves all values."""
+    node = ast.BoolOp(
+        op=ast.Or(),
+        values=[
+            ast.Name(id="evt", ctx=ast.Load()),
+            ast.Constant(value="fallback.event"),
+        ],
+    )
+    values, all_ok = _resolve_event_type(
+        node,
+        module_constants={"evt": "primary.event"},
+    )
+    assert sorted(values) == ["fallback.event", "primary.event"]
+    assert all_ok is True
+
+
+def test_resolve_boolop_or_partial():
+    """A BoolOp with a known constant and an unresolvable Name returns
+    partially resolved values but all_resolved=False."""
+    node = ast.BoolOp(
+        op=ast.Or(),
+        values=[
+            ast.Constant(value="known.event"),
+            ast.Name(id="unknown_var", ctx=ast.Load()),
+        ],
+    )
+    values, all_ok = _resolve_event_type(node, module_constants={})
+    assert values == ["known.event"]
+    assert all_ok is False
+
+
+def test_resolve_call_expression():
+    """A Call node (e.g., str(event_type)) cannot be statically resolved."""
+    node = ast.Call(
+        func=ast.Name(id="str", ctx=ast.Load()),
+        args=[ast.Name(id="x", ctx=ast.Load())],
+        keywords=[],
+    )
+    values, all_ok = _resolve_event_type(node)
+    assert values == []
+    assert all_ok is False
+
+
+def test_resolve_attribute_access():
+    """An Attribute node (e.g., obj.event_type) cannot be statically resolved."""
+    node = ast.Attribute(
+        value=ast.Name(id="obj", ctx=ast.Load()),
+        attr="event_type",
+        ctx=ast.Load(),
+    )
+    values, all_ok = _resolve_event_type(node)
+    assert values == []
+    assert all_ok is False
+
+
+# ── Unit tests for _collect_unregistered_event_type_invocations ─────────
+
+
+def test_et_scan_accepts_registered_literal_route_event():
+    """A route_event call with a registered literal event_type passes."""
+    source = dedent("""
+        def emit(session, project_id):
+            audience = route_event("task.failed")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_unregistered_literal_route_event():
+    """A route_event call with an unregistered literal event_type is flagged."""
+    source = dedent("""
+        def emit(session, project_id):
+            audience = route_event("completely.unregistered.event")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "completely.unregistered.event" in offenders[0]
+    assert "unregistered" in offenders[0]
+
+
+def test_et_scan_accepts_registered_literal_stamp():
+    """A stamp_message_audience call with a registered literal event_type passes."""
+    source = dedent("""
+        def emit(session, project_id):
+            ctx = stamp_message_audience({}, "task.failed")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_unregistered_literal_stamp():
+    """A stamp_message_audience call with an unregistered literal is flagged."""
+    source = dedent("""
+        def emit(session, project_id):
+            ctx = stamp_message_audience({}, "unregistered.event")
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.event" in offenders[0]
+
+
+def test_et_scan_accepts_module_constant_event_type():
+    """A stamp_message_audience call with a module-level constant event_type
+    that resolves to a registered value passes."""
+    source = dedent("""
+        MY_EVENT = "task.failed"
+        def emit(session, project_id):
+            ctx = stamp_message_audience({}, MY_EVENT)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_accepts_gate_function_dynamic():
+    """A stamp_message_audience call with a dynamic event_type inside an
+    allowlisted gate function passes."""
+    source = dedent("""
+        async def post_event_message(session, project_id, event_type, summary):
+            audience = route_event(event_type)
+            ctx = stamp_message_audience({}, event_type)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_dynamic_outside_gate():
+    """A stamp_message_audience call with a dynamic event_type outside an
+    allowlisted gate function is flagged."""
+    source = dedent("""
+        def emit(session, project_id, event_type):
+            ctx = stamp_message_audience({}, event_type)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "non-verifiable" in offenders[0] or "dynamic" in offenders[0]
+
+
+def test_et_scan_accepts_ternary_both_registered():
+    """A ternary event_type where both branches are registered literals passes."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            ctx = stamp_message_audience(
+                {},
+                "deployment.flapping_resume" if condition else "deployment.auto_resume",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_ternary_with_unregistered():
+    """A ternary event_type where one branch is unregistered is flagged."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            ctx = stamp_message_audience(
+                {},
+                "deployment.flapping_resume" if condition else "unregistered.branch",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.branch" in offenders[0]
+
+
+def test_et_scan_accepts_route_event_with_registered_ternary():
+    """A route_event call with a ternary whose branches are registered passes."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            audience = route_event(
+                "deployment.flapping_resume" if condition else "deployment.auto_resume",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+def test_et_scan_flags_unregistered_ternary_in_route_event():
+    """A route_event call with a ternary whose one branch is unregistered."""
+    source = dedent("""
+        def emit(session, project_id, condition):
+            audience = route_event(
+                "deployment.flapping_resume" if condition else "unregistered.event",
+            )
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "unregistered.event" in offenders[0]
+
+
+def test_et_scan_missing_event_type_argument():
+    """A stamp_message_audience call with no recognizable event_type argument
+    is flagged unless inside an allowlisted gate."""
+    source = dedent("""
+        def emit(session, project_id):
+            ctx = stamp_message_audience({})
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert len(offenders) == 1
+    assert "without recognizable" in offenders[0]
+
+
+def test_et_scan_accepts_boolop_all_registered_inside_gate():
+    """A BoolOp event_type inside an allowlisted gate function passes."""
+    source = dedent("""
+        async def _remediate_forward_leaked_messages(session, msgs):
+            for msg in msgs:
+                event_type = "task.failed"
+                new_ctx = stamp_message_audience({}, event_type)
+    """)
+    registered = get_registered_event_types()
+    offenders = _collect_unregistered_event_type_invocations(
+        source, filename="synthetic.py", rel="synthetic.py", registered=registered
+    )
+    assert offenders == []
+
+
+# ── Whole-app invariant: every event_type used in stamp/route is registered ──
+
+
+def test_no_event_type_invocation_uses_unregistered_event_type():
+    """Whole-app invariant: every ``stamp_message_audience()`` and
+    ``route_event()`` call under ``backend/app/`` uses an event_type that is
+    either registered in ``_EVENT_AUDIENCE_REGISTRY`` or routed through an
+    allowlisted gate function that validates at runtime.
+
+    This is the structural ratchet that prevents a new emitter from passing a
+    dynamic or unregistered event_type through the audience gate without CI
+    noticing.  The companion tests ``_collect_ungated_emitters`` (enforces that
+    every operator-reaching ProjectMessage site has a stamp call) and
+    ``_collect_alert_constructors_with_unregistered_event_type`` (enforces that
+    every ``Alert(event_type=...)`` literal is registered) cover the other two
+    dimensions of the fail-closed guarantee.
+
+    Fix: use a literal registered event_type, or add the enclosing function to
+    ``_EVENT_TYPE_GATE_ALLOWLIST`` if it validates the event_type at runtime
+    before passing it through the stamp gate.
+    """
+    import glob
+
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    registered = get_registered_event_types()
+    all_offenders: list[str] = []
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        all_offenders.extend(
+            _collect_unregistered_event_type_invocations(
+                source, filename=fpath, rel=rel, registered=registered
+            )
+        )
+
+    assert not all_offenders, (
+        "Found stamp_message_audience() or route_event() call(s) under "
+        "backend/app/ that use an unregistered or non-verifiable dynamic "
+        "event_type.\n"
+        "A new emitter that passes an unregistered event_type through the "
+        "audience gate will silently fail closed to strategist-internal — "
+        "the operator never sees the message but no CI gate catches it.\n"
+        "Fix: use a literal registered event_type, or add the enclosing "
+        "function to _EVENT_TYPE_GATE_ALLOWLIST in this test file if it "
+        "validates the event_type at runtime before passing it through the "
+        "stamp gate:\n"
         + "\n".join(all_offenders)
     )

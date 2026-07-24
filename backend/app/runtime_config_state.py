@@ -82,41 +82,6 @@ runtime_config: Dict = {
     # update so the queue and the agent fix path never double-fire. Genuine
     # dirty conflicts outlive the window and use the agent path unchanged.
     "rollup_merge_queue_enabled": True,
-    # Default-on second-opinion gate for high-stakes ordinary review verdicts.
-    # When True, a trunk-targeting APPROVE→merge from an ordinary ``review``
-    # task (PR base = integration branch or promotion target) does not commit
-    # until an independent panel_review challenge has been recorded and
-    # reconciled against the primary verdict. Other verdicts (REQUEST_CHANGES,
-    # non-trunk APPROVEs) proceed synchronously. Disabling it
-    # restores today's synchronous review-finalization behavior WITHOUT removing
-    # the panel_review task type (it stays available as a user-launchable
-    # advisory workflow); reconciliation records then read ``unchallenged``.
-    "review_second_opinion_gate_enabled": True,
-    # Default-on blind multi-reviewer gate for judgment-shaped acceptance
-    # decisions (pillar 2 of independent acceptance verification). When True
-    # (default), eligible high-stakes decisions spawn N independent blind
-    # reviewers (panel_review with is_blind=True and majority voting) instead
-    # of a single second-opinion review. Operator can disable via
-    # PATCH /api/admin/settings.
-    "blind_multi_reviewer_gate_enabled": True,
-    # Fraction of high-stakes trunk-targeting APPROVEs that spawn a panel_review
-    # challenger (0.0 = none, 1.0 = all). Default 1.0 preserves existing behavior.
-    # Uses deterministic task-ID-based sampling so operators can safely dial down
-    # challenger frequency without randomness between restarts.
-    "review_second_opinion_sample_rate": 1.0,
-    # Rollout mode for binding agent-authored direction retirement to the
-    # strategic judgment challenge's per-direction second opinion.
-    #   observe  — compute/record verdict, never block
-    #   advisory — compute/record a prominent warning, never block
-    #   enforce  — unsupported/missing/invalid challenge defers fail-closed
-    # Ships observe by default so operators can inspect challenge quality before
-    # selecting enforce via runtime config.
-    "strategic_retirement_challenge_gate_mode": os.getenv(
-        "STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE", "observe"
-    ).lower()
-    if os.getenv("STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE", "observe").lower()
-    in ("observe", "advisory", "enforce")
-    else "observe",
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "retry_after_reset_alert_threshold": int(
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
@@ -280,14 +245,18 @@ runtime_config: Dict = {
     #   enforce  — the configured completion_debt weight is applied (falling back
     #              to a sensible nonzero default when the operator left it unset),
     #              so open completion debt actually erodes promotion confidence.
-    # Default "observe" is a member of _DORMANT_KNOB_VALUES, so this knob seeds its
-    # own dormant_knob completion-debt row via iter_dormant_knob_debts.
+    # Graduated to "enforce" (three-state adjudication, decision #7): the debt-
+    # pressure counterfactual has been computed for every qualify run under
+    # observe, so the configured completion_debt weight now blends into the
+    # composite by default. No longer a dormant knob — removed from
+    # _DORMANT_MODE_KNOBS below. An operator may still pin "off"/"observe" via
+    # the env var / PATCH settings for a per-deployment rollback.
     "completion_debt_weight_mode": os.getenv(
-        "COMPLETION_DEBT_WEIGHT_MODE", "observe"
+        "COMPLETION_DEBT_WEIGHT_MODE", "enforce"
     ).lower()
-    if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "observe").lower()
+    if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "enforce").lower()
     in ("off", "observe", "enforce")
-    else "observe",
+    else "enforce",
     # Rollout mode for the capability proof gate — controls whether prerequisite
     # resolution gates on machine-verified proof (enforce) or allows self-reported
     # working status (off/observe).
@@ -331,6 +300,120 @@ runtime_config: Dict = {
         os.getenv(
             "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
         )
+    ),
+    # --- Shared mode-knob graduation harness (app.mode_knob_graduation) --------
+    # Generalizes the proven capability_proof_gate auto-graduation pattern into a
+    # reusable driver that disposes dormant mode-knobs with MEASURED evidence:
+    # graduate off→observe→enforce on measured lift, emit a legible CUT
+    # recommendation (with numbers) when the enforce branch would never bind, or
+    # HOLD below threshold. Gated by a single dedicated enabled flag, default OFF
+    # — mirrors capability_proof_gate_auto_graduation_enabled. Runs independently
+    # of any single knob's own mode (it does NOT require the target knob — or the
+    # metrics-integrity sweep — to already be enforcing).
+    "mode_knob_graduation_enabled": os.getenv(
+        "MODE_KNOB_GRADUATION_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Per-knob thresholds for autonomous_spawn_budget_mode. The graduation SIGNAL
+    # is initiative pressure = initiative_count / initiative_cap over the trailing
+    # window. off→observe once pressure clears the observe threshold; observe→
+    # enforce once it clears the enforce threshold (defaults to 1.0 — the cap is
+    # being hit, so enforce would bind). CUT is recommended when pressure sits
+    # below cut_threshold AND nothing would have been blocked over a window with
+    # at least min_sample observed spawns (measured no-lift).
+    "autonomous_spawn_budget_graduation_observe_threshold": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_OBSERVE_THRESHOLD", "0.5")
+    ),
+    "autonomous_spawn_budget_graduation_enforce_threshold": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_ENFORCE_THRESHOLD", "1.0")
+    ),
+    "autonomous_spawn_budget_graduation_cut_threshold": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_CUT_THRESHOLD", "0.1")
+    ),
+    "autonomous_spawn_budget_graduation_min_sample": int(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_MIN_SAMPLE", "20")
+    ),
+    "autonomous_spawn_budget_graduation_window_hours": float(
+        os.getenv("AUTONOMOUS_SPAWN_BUDGET_GRADUATION_WINDOW_HOURS", "24")
+    ),
+    # --- Per-knob graduation thresholds: evergreen_fill_mode --------------------
+    # Signal = would_have_fired_rate = fraction of observe-mode ticks that would
+    # have spawned a probe. off→observe once the rate clears the observe threshold;
+    # observe→enforce once it clears the enforce threshold. CUT when nothing would
+    # have fired over a representative window (zero-lift).
+    "evergreen_fill_graduation_observe_threshold": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_OBSERVE_THRESHOLD", "0.1")
+    ),
+    "evergreen_fill_graduation_enforce_threshold": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_ENFORCE_THRESHOLD", "0.25")
+    ),
+    "evergreen_fill_graduation_cut_threshold": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_CUT_THRESHOLD", "0.05")
+    ),
+    "evergreen_fill_graduation_min_sample": int(
+        os.getenv("EVERGREEN_FILL_GRADUATION_MIN_SAMPLE", "10")
+    ),
+    "evergreen_fill_graduation_window_hours": float(
+        os.getenv("EVERGREEN_FILL_GRADUATION_WINDOW_HOURS", "168")
+    ),
+    # --- Per-knob graduation thresholds: structural_health_audit_mode -----------
+    # Signal = tripped_rate = fraction of audit cycles where at least one offender
+    # was found. CUT when zero cycles tripped over the window (enforce would never
+    # enroll anything).
+    "structural_health_audit_graduation_observe_threshold": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_OBSERVE_THRESHOLD", "0.1")
+    ),
+    "structural_health_audit_graduation_enforce_threshold": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_ENFORCE_THRESHOLD", "0.25")
+    ),
+    "structural_health_audit_graduation_cut_threshold": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_CUT_THRESHOLD", "0.05")
+    ),
+    "structural_health_audit_graduation_min_sample": int(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_MIN_SAMPLE", "3")
+    ),
+    "structural_health_audit_graduation_window_hours": float(
+        os.getenv("STRUCTURAL_HEALTH_AUDIT_GRADUATION_WINDOW_HOURS", "168")
+    ),
+    # --- Per-knob graduation thresholds: metrics_integrity_sweep_mode -----------
+    # Signal = tripped_rate = fraction of sweep ticks where at least one drift
+    # finding was flagged. CUT when zero ticks flagged over the window (enforce
+    # would never enroll anything). The harness does NOT require this knob to be
+    # in enforce to run its own graduation.
+    "metrics_integrity_sweep_graduation_observe_threshold": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_OBSERVE_THRESHOLD", "0.1")
+    ),
+    "metrics_integrity_sweep_graduation_enforce_threshold": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_ENFORCE_THRESHOLD", "0.25")
+    ),
+    "metrics_integrity_sweep_graduation_cut_threshold": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_CUT_THRESHOLD", "0.05")
+    ),
+    "metrics_integrity_sweep_graduation_min_sample": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_MIN_SAMPLE", "3")
+    ),
+    "metrics_integrity_sweep_graduation_window_hours": float(
+        os.getenv("METRICS_INTEGRITY_SWEEP_GRADUATION_WINDOW_HOURS", "168")
+    ),
+    # --- Per-knob graduation thresholds: direction_gap_respawn_block_mode -------
+    # Signal = would_have_blocked_count = raw count of observe-mode would-have-
+    # blocked events in the window. This knob only takes observe/enforce (no off),
+    # so only the enforce threshold applies. CUT when zero would-have-blocked over
+    # a representative window.
+    "direction_gap_respawn_block_graduation_observe_threshold": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_OBSERVE_THRESHOLD", "0.0")
+    ),
+    "direction_gap_respawn_block_graduation_enforce_threshold": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_ENFORCE_THRESHOLD", "3.0")
+    ),
+    "direction_gap_respawn_block_graduation_cut_threshold": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_CUT_THRESHOLD", "0.0")
+    ),
+    "direction_gap_respawn_block_graduation_min_sample": int(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_MIN_SAMPLE", "1")
+    ),
+    "direction_gap_respawn_block_graduation_window_hours": float(
+        os.getenv("DIRECTION_GAP_RESPAWN_BLOCK_GRADUATION_WINDOW_HOURS", "168")
     ),
     # Machine-verified capability-proof earn path: gates the bounded,
     # executed-named_test trial dispatch/enrollment.  Default ON now that the
@@ -378,47 +461,13 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
-    # Independent adversarial verification for compute experiment results.
-    # Checkpoint 1 from the v18 Verified Delivery design.  When enabled, a
-    # compute-experiment task whose criterion is self-declared as met is
-    # independently graded by an adversarial grader BEFORE it completes, to
-    # catch common failure modes (measurable=False reported as SUCCESS, score
-    # inflation, infra-vs-capability confusion).
-    # DARK by default (False) — must be explicitly enabled per project.
-    "compute_verification_enabled": os.getenv(
-        "COMPUTE_VERIFICATION_ENABLED", "false"
-    ).lower()
-    in ("1", "true", "yes"),
-    # Verification mode for compute experiment grading.
-    #   "advisory"  — (default) record the verdict + notifiy, never block.
-    #   "soft_gate" — record + notify, warn prominently on reject.
-    #   "hard_gate" — block SUCCESS when the grader rejects (future use).
-    "compute_verification_mode": os.getenv(
-        "COMPUTE_VERIFICATION_MODE", "advisory"
-    ).lower()
-    if os.getenv("COMPUTE_VERIFICATION_MODE", "advisory").lower()
-    in ("advisory", "soft_gate", "hard_gate")
-    else "advisory",
     # Graduated rollout mode for the safeguard merge-gate challenge.
-    # Mirrors strategic_retirement_challenge_gate_mode.
     #   "off"     — no challenge; gate held unconditionally on any
     #               critical/high finding. Preserves pre-v9 behavior exactly.
     #   "observe" — (default) shadow/observe mode: the challenge is spawned and its verdict
     #               is recorded on the safeguard task as
     #               ``safeguard_observe_verdict``, but the gate is NEVER released
     #               by the verdict. Lets operators measure the false-positive rate
-    #               before flipping to enforce. Any challenge error/timeout records
-    #               ``{"outcome": "unavailable"}`` and never blocks.
-    #   "enforce" — full binding mode: a challenger verdict of "rejected" or
-    #               "downgraded" releases the gate with an auditable record.
-    #               Fail-closed: if the challenge errors or times out the gate
-    #               stays closed.
-    "safeguard_challenge_gate_mode": os.getenv(
-        "SAFEGUARD_CHALLENGE_GATE_MODE", "observe"
-    ).lower()
-    if os.getenv("SAFEGUARD_CHALLENGE_GATE_MODE", "observe").lower()
-    in ("off", "observe", "enforce")
-    else "observe",
     # Per-finding second-opinion challenge for high-stakes research-finding
     # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
     # 'absent' hard-drop or a low-actionability decay) is independently re-examined
@@ -663,16 +712,7 @@ runtime_config: Dict = {
             "low": {"model": "claude-haiku-4-5-20251001", "effort": "low"},
             "medium": {"model": "claude-sonnet-5", "effort": "medium"},
             "high": {"model": "claude-opus-4-8", "effort": "high"},
-            # TEMPORARY: fable-5 has a limited availability window (~2 weeks
-            # from 2026-06-09). fallback_model covers CLI-level rate limits;
-            # the provider's fallback_model() map covers outright model
-            # rejection (incl. retirement). On removal, set model back to
-            # claude-opus-4-8 and drop fallback_model.
-            "max": {
-                "model": "claude-fable-5",
-                "effort": "max",
-                "fallback_model": "claude-opus-4-8",
-            },
+            "max": {"model": "claude-opus-4-8", "effort": "max"},
         },
         "openai": {
             # Verbosity is graded to task-type category, not capability:
@@ -739,6 +779,7 @@ runtime_config: Dict = {
     },
     "autonomous_direction_cooldown_minutes": 240,
     "productive_direction_cooldown_minutes": 45,
+    "directed_research_cooldown_minutes": 120,
     "direction_auto_recovery_hours": 48,
     # Non-merge churn guardrail (Rule 5 in _check_direction_health).
     # window_cycles: how many recent research cycles to evaluate (rolling window).
@@ -1007,11 +1048,6 @@ runtime_config: Dict = {
     # dispatch/prompt context, recovery requeues, and KILL/ADOPT measurement.
     # A KILL verdict flips this back to False so every chain leaves full pilot.
     "review_fix_lane_pilot_enabled": False,
-    # Three-value pilot mode: "off" (inert), "shadow" (arm assignment +
-    # checkpoints, no warm reservation or fix routing), "on" (full pilot).
-    # Takes precedence over the boolean pair when set to "shadow" or "on".
-    # Default "off" preserves the legacy boolean-flag semantics.
-    "review_fix_lane_pilot_mode": "off",
     # Event-driven qualification trigger mode.  Controls whether the sweep-based
     # qualification trigger resolver (qualification_triggers.py) actually fires
     # run_qualification for matched versions:
@@ -1201,10 +1237,38 @@ runtime_config: Dict = {
     # Release qualifier (Phase 3+). promotion_enabled gates whether the
     # qualifier may promote a qualified automain candidate to main — default
     # False ships the qualifier in dry-run (score + log, never promote).
-    # smoketest_enabled gates smoketest task spawns. Operator-tunable via
-    # runtime_config_json; persisted across restarts.
+    # Qualifier promotion remains separately gated and uses promotion PR CI.
     "promotion_enabled": False,
+    # Ordinary post-promotion deployment smoke only; never a qualifier child.
     "smoketest_enabled": False,
+    # walkthrough_e2e_enabled gates the qualifier-spawned ``walkthrough_e2e``
+    # child task (the live-stack Playwright walkthrough evidence lane).
+    # Defaults True: the walkthrough_e2e lane is armed fleet-wide, producing
+    # SHA-pinned CriterionEvidence for the click-to-talk acceptance criterion.
+    # Failure is evidence-only (never cascades a fix).  Operator-tunable via
+    # runtime_config_json; persisted across restarts.
+    "walkthrough_e2e_enabled": True,
+    # Per-project walkthrough_e2e enablement overrides ({project_id: bool}).
+    # An EMPTY map (the default) means every project falls back to the fleet-wide
+    # ``walkthrough_e2e_enabled`` above.  A per-project entry can HOLD the
+    # walkthrough evidence lane for one project without touching the fleet default.
+    # Mirrors ``promotion_enabled_by_project``.
+    "walkthrough_e2e_enabled_by_project": {},
+    # acceptance_earn_execution_trials_enabled gates the acceptance earn-loop's
+    # execution-trial lane: when ON, the reaper step-21a backfill enrolls a bounded
+    # ``criterion_coverage_trial`` that actually RUNS a merged task's declared
+    # named_test covering tests and, on green, mints the machine-verified
+    # ``covered`` evidence tier (instead of only the lower-confidence ``backfilled``
+    # tier). Ships DARK (default False): the lane spawns real targeted test runs,
+    # so it is armed fleet-wide only once proven. When off, the backfill is
+    # byte-for-byte identical to the backfilled-only behaviour. Operator-tunable
+    # via PATCH /api/admin/settings (runtime_config_json); persisted across restarts.
+    "acceptance_earn_execution_trials_enabled": False,
+    # env_preflight_enabled gates the boot-prerequisite hard gate (Slice 3).
+    # Armed True: a new candidate must declare its required boot-time env vars;
+    # missing or absent declarations block promotion.  This gate was built to
+    # prevent the v25 GITHUB_PAT_ENCRYPTION_KEY prod boot-crash.
+    "env_preflight_enabled": True,
     # Per-project live-promotion enablement overrides ({project_id: bool}).
     # An EMPTY map (the default) means every project falls back to the
     # fleet-wide ``promotion_enabled`` above. A per-project entry arms or holds
@@ -1221,7 +1285,7 @@ runtime_config: Dict = {
     # _seed_promotion_policy() below, then made live + admin-tunable via the
     # /api/admin/settings PATCH so calibrating the bar no longer needs a
     # redeploy. release_qualifier._load_policy() reads these at decision time.
-    # The effective default stays the shipped 0.90 / 0.40-0.30-0.30 rubric.
+    # The effective default stays the shipped 0.90 / 4:3 audit-to-erosion rubric.
     "promotion_threshold": None,  # set by _seed_promotion_policy()
     "promotion_weights": None,  # set by _seed_promotion_policy()
     # Broadcast alert safety cap — limits the number of projects receiving
@@ -1241,6 +1305,32 @@ runtime_config: Dict = {
     # Utilization percentage (5h OR 7d) at/above which an account is skipped for
     # long-running task types when the gate is enabled. 0..100.
     "usage_headroom_threshold_pct": 90,
+    # Minimum fraction of meter-eligible accounts that must have a fresh known
+    # snapshot before usage_headroom_gate_enabled is considered safe to arm.
+    # Expressed as an integer percentage (0..100). Default 80 is conservative:
+    # at least 4 out of 5 eligible accounts must report fresh data. An operator
+    # can lower this to 0 to arm regardless of coverage (not recommended).
+    "usage_headroom_min_coverage_pct": 80,
+    # Tri-state control for autonomously arming ``usage_headroom_gate_enabled``
+    # from sustained meter reliability (the ``armable`` verdict computed by
+    # get_meter_reliability_stats). The leader orchestrator runs a reconciler on
+    # the usage-meter cadence:
+    #   "auto"   — the leader ARMS the gate once ``armable`` has held True
+    #              CONTINUOUSLY across usage_headroom_auto_arm_observation_minutes,
+    #              and fail-safe DISARMS it immediately the instant ``armable``
+    #              regresses (no window on the way down).
+    #   "manual" — the reconciler never touches the gate; the operator owns
+    #              usage_headroom_gate_enabled (today's behavior).
+    #   "off"    — force-disarm kill switch: the reconciler drives the gate to
+    #              False and holds it there.
+    # DEFAULT MUST be "auto": defaulting to "manual"/"off" would reproduce the
+    # exact 'a human must flip it' bug this closed loop exists to fix.
+    "usage_headroom_auto_arm_mode": "auto",
+    # Minutes the ``armable`` verdict must hold CONTINUOUSLY before auto mode
+    # arms the gate — sustained above threshold, not a single instantaneous
+    # sample, so a transient healthy blip does not arm. Disarm is always
+    # immediate (fail-safe); this window governs arming only.
+    "usage_headroom_auto_arm_observation_minutes": 60,
     # Task types the claim-time gate applies to (long-running work that burns a
     # large share of an account's budget if it dies mid-run and restarts). The
     # headroom RANKING preference applies to all task types when enabled; only
@@ -1279,85 +1369,6 @@ runtime_config: Dict = {
     # the agent must not arm the post-edit diagnostics hook regardless of arm
     # assignment. Default True (trial active).
     "diagnostics_after_edit_enabled": True,
-    # --- Resident strategic session (dead-man's-switch safety + resident agent) ---
-    # Master feature flag for the resident strategic session runtime. Default
-    # OFF — the legacy one-shot strategic cadence is completely unchanged until an
-    # operator flips this. Safe to land dark.
-    "strategic_session_enabled": os.getenv(
-        "STRATEGIC_SESSION_ENABLED", "false"
-    ).lower()
-    in ("1", "true", "yes"),
-    # Local-Strategic continuation-marker freshness TTL (seconds). REPLACES the
-    # old hardcoded 12h (43200) wall-clock in workbench_state.py. The marker's
-    # freshness now renews ONLY on operator interaction OR an applied strategic op
-    # (progress) — never on bare runner liveness — so an opened-and-abandoned
-    # continuous local session self-heals (cadence resumes / held tasks fall back
-    # to cloud) within this short window instead of pinning the project locally
-    # for 12h. Default 1500s (25 min) — the lease window.
-    "strategic_continuation_ttl_seconds": int(
-        os.getenv("STRATEGIC_CONTINUATION_TTL_SECONDS", "1500")
-    ),
-    # Bounded wait (seconds) a required-local Strategic task is held QUEUED for a
-    # live local runner before it FALLS BACK TO CLOUD (re-dispatched to normal
-    # cloud provisioning, NOT terminally FAILED). REPLACES the old 6h
-    # hold-then-FAIL for Strategic holds (compute_experiment holds keep the 6h
-    # terminal-fail contract). Default 900s (15 min).
-    "strategic_local_hold_timeout_seconds": int(
-        os.getenv("STRATEGIC_LOCAL_HOLD_TIMEOUT_SECONDS", "900")
-    ),
-    # Resident-loop idle poll cadence (seconds): how often the warm resident
-    # session polls the inbound message endpoint when otherwise idle.
-    "strategic_session_idle_tick_seconds": int(
-        os.getenv("STRATEGIC_SESSION_IDLE_TICK_SECONDS", "5")
-    ),
-    # Per-turn wall-clock budget (seconds) for a single bounded resident turn
-    # (interactive reply or one chunked autonomous step).
-    "strategic_session_turn_timeout_seconds": int(
-        os.getenv("STRATEGIC_SESSION_TURN_TIMEOUT_SECONDS", "120")
-    ),
-    # Floor-tick cadence (seconds): the maximum quiet gap between autonomous
-    # resident ticks even when no world-state change is observed, so the session
-    # reviews periodically and never goes fully dark. Read by the agent's
-    # state-gated pacing (residentConfig); absent => agent floor-tick default.
-    "strategic_session_min_tick_seconds": int(
-        os.getenv("STRATEGIC_SESSION_MIN_TICK_SECONDS", "600")
-    ),
-    # Soft cap (count) on how many independent applied strategic ops the
-    # autonomous work-unit prompt should batch into a single turn. Advisory: a
-    # prompt hint only — the hard per-op server-side spawn/retire gates are
-    # unchanged. Absent => agent default.
-    "strategic_session_max_ops_per_turn": int(
-        os.getenv("STRATEGIC_SESSION_MAX_OPS_PER_TURN", "3")
-    ),
-    # Deep-turn stall budget (seconds) for an AUTONOMOUS resident turn, so a long
-    # single read/verify step is not killed mid-thought. Distinct from the
-    # interactive per-turn timeout (kept short for operator responsiveness); the
-    # 15-min absolute hard ceiling is unchanged. Absent => agent default.
-    "strategic_session_autonomous_turn_timeout_seconds": int(
-        os.getenv("STRATEGIC_SESSION_AUTONOMOUS_TURN_TIMEOUT_SECONDS", "300")
-    ),
-    # Hard cap (seconds) on how long a resident strategic session may run
-    # UNATTENDED before it is wound down — the outer bound on autonomous
-    # operation with no operator interaction. Distinct from the continuation
-    # TTL (which is the short freshness lease that self-heals an abandoned
-    # local pin): this caps the total unattended lifetime of a live session.
-    # Default 14400s (4h); admin-clamped to <= 28800 (8h) so it can never
-    # reintroduce a multi-hour (>12h) unattended wall.
-    "strategic_session_max_unattended_seconds": int(
-        os.getenv("STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS", "14400")
-    ),
-    # Reaper carve-out window (seconds) for a resident strategic session task
-    # (context["_resident_session"] == True). Such a task is EXEMPT from the
-    # thinking-heavy progress-staleness budget (it is warm-but-idle between
-    # operator turns) and is reaped only when the runner itself has gone silent
-    # (last_heartbeat / started_at) beyond this window. Read by
-    # reaper_orphan_classify._resident_session_heartbeat_stale_cutoff. Default
-    # 1500s (25 min) — long enough that a briefly-asleep laptop or transient
-    # network gap does not tear down the warm session, short enough that a
-    # genuinely dead runner is still reclaimed.
-    "resident_session_heartbeat_stale_seconds": int(
-        os.getenv("RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS", "1500")
-    ),
     # Gap-scoped recently-retired direction block (direction_gap_respawn_block_mode).
     # When a direction is proposed for a gap that already has a recently-retired
     # direction, this mode controls whether the respawn is blocked:
@@ -1372,6 +1383,20 @@ runtime_config: Dict = {
 }
 
 
+def config_get(key: str):
+    """Get a runtime config value by its registered key.
+
+    The ``runtime_config`` dict IS the registry — every callable key has a
+    registered default baked in at module load.  Use this instead of
+    ``runtime_config.get(key, hardcoded_fallback)`` so the fallback always comes
+    from the registration itself, not a per-call literal that can silently drift.
+
+    Raises ``KeyError`` for unregistered keys so drift is caught at development
+    time rather than silently defaulting to an inconsistent value.
+    """
+    return runtime_config[key]
+
+
 # Completion-debt seed: runtime-config knobs whose current default/observe value
 # means an obligation is standing open (a feature ships dark, or a capability is
 # measured-but-not-enforced). ``iter_dormant_knob_debts`` converts these into
@@ -1383,9 +1408,6 @@ _DORMANT_MODE_KNOBS = {
     "evergreen_fill_mode": (
         "Evergreen auto-fill capability enabled but not enforcing (off/observe)"
     ),
-    "strategic_retirement_challenge_gate_mode": (
-        "Adversarial retirement challenge running in observe-only watch"
-    ),
     "structural_health_audit_mode": (
         "Structural-health audit measuring but not enrolling findings"
     ),
@@ -1395,28 +1417,17 @@ _DORMANT_MODE_KNOBS = {
     "autonomous_spawn_budget_mode": (
         "Autonomous spawn-budget mode observe-only pending dedicated rollout"
     ),
-    "safeguard_challenge_gate_mode": (
-        "Safeguard challenge gate in observe-only shadow mode"
-    ),
     "direction_gap_respawn_block_mode": (
         "Direction-gap respawn block in observe-only mode"
     ),
-    "review_fix_lane_pilot_mode": (
-        "Review-fix lane pilot mode shipping inert (default-off)"
-    ),
-    "completion_debt_weight_mode": (
-        "Completion-debt pressure signal observe-mode: recorded in sub_scores, not blended into confidence"
-    ),
+    # completion_debt_weight_mode graduated to "enforce" (decision #7) — no
+    # longer dormant, so it is intentionally absent from this registry.
     "capability_proof_gate_mode": (
         "Capability proof gate not yet enforcing (off/observe)"
     ),
 }
 # Master feature flags that ship OFF still owe an enablement decision.
-_DORMANT_OFF_FLAGS = {
-    "strategic_session_enabled": (
-        "Resident strategic session runtime shipped disabled (default-off)"
-    ),
-}
+_DORMANT_OFF_FLAGS: dict = {}
 
 
 def iter_dormant_knob_debts() -> list[dict]:
@@ -1460,7 +1471,7 @@ def iter_dormant_knob_debts() -> list[dict]:
 # Promotion-policy key set — the rubric controls that live in runtime_config.
 # Used both by the seed below and by _apply_settings validation.
 PROMOTION_POLICY_KEYS = ("promotion_threshold", "promotion_weights")
-_PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
+_PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion")
 # backend/promotion_policy.yaml lives two parents up from this file
 # (backend/app/runtime_config_state.py).
 _PROMOTION_POLICY_PATH = (
@@ -1474,7 +1485,7 @@ def _read_promotion_policy_file() -> dict | None:
 
     Mirrors release_qualifier._load_policy's parse + validation contract: the
     file must parse to a mapping with a ``weights`` sub-mapping (audit /
-    test_erosion / smoketest, each float-coercible and summing to ~1.0) and a
+    test_erosion, with an optional legacy smoketest key, float-coercible and summing to ~1.0) and a
     float ``threshold``.  ANY failure (missing file, bad YAML, missing/non-numeric
     keys, mis-weighted sum) returns None so the caller falls back to the hardcoded
     _DEFAULT_POLICY rubric rather than honouring a broken file.  Never raises.
@@ -1489,13 +1500,25 @@ def _read_promotion_policy_file() -> dict | None:
         if not isinstance(weights_raw, dict):
             raise ValueError("promotion_policy.yaml missing 'weights' mapping")
         weights = {k: float(weights_raw[k]) for k in _PROMOTION_WEIGHT_KEYS}
+        legacy_smoke = float(weights_raw.get("smoketest", 0.0))
         threshold = float(parsed["threshold"])
-        weight_sum = sum(weights.values())
+        weight_sum = sum(weights.values()) + legacy_smoke
         if abs(weight_sum - 1.0) > 0.01:
             raise ValueError(
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
-        # Optional completion_debt blend factor — SEPARATE from the three-core
+        from decimal import Decimal
+
+        active_decimals = {
+            key: Decimal(str(weights_raw[key])) for key in _PROMOTION_WEIGHT_KEYS
+        }
+        active_sum = sum(active_decimals.values(), Decimal("0"))
+        if active_sum <= 0:
+            raise ValueError("active promotion weights must be positive")
+        weights = {
+            key: float(value / active_sum) for key, value in active_decimals.items()
+        }
+        # Optional completion_debt blend factor — SEPARATE from the active core
         # weights that must sum to ~1.0 (mirrors release_qualifier resolution).
         # Read + preserve it (default 0.0, clamped to [0, 0.5]) so a YAML rubric
         # that documents a completion_debt weight seeds it into runtime_config.
@@ -1506,7 +1529,7 @@ def _read_promotion_policy_file() -> dict | None:
             weights["completion_debt"] = _cd
         result: dict = {"weights": weights, "threshold": threshold}
         if "merge_grade_block_threshold" in parsed:
-            try:
+            try:  # noqa: SIM105
                 result["merge_grade_block_threshold"] = float(
                     parsed["merge_grade_block_threshold"]
                 )
@@ -1580,7 +1603,7 @@ SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
 
 
 def _copy_default_provider_matrix(provider: str) -> dict[str, dict[str, Any]]:
-    raw = runtime_config.get("provider_settings_by_effort", {}).get(provider, {})
+    raw = config_get("provider_settings_by_effort").get(provider, {})
     if not isinstance(raw, dict):
         return {}
     return {
@@ -2108,6 +2131,21 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "compute_experiment_spend_threshold_usd",
                         float(config_json["compute_experiment_spend_threshold_usd"]),
                     )
+                for _int_key in (
+                    "strategic_continuation_ttl_seconds",
+                    "strategic_local_hold_timeout_seconds",
+                    "strategic_session_idle_tick_seconds",
+                    "strategic_session_turn_timeout_seconds",
+                    "strategic_session_min_tick_seconds",
+                    "strategic_session_max_ops_per_turn",
+                    "strategic_session_autonomous_turn_timeout_seconds",
+                    "strategic_session_max_unattended_seconds",
+                ):
+                    if _int_key in config_json:
+                        try:
+                            _set(_int_key, int(config_json[_int_key]))
+                        except (TypeError, ValueError):
+                            pass
                 if "auto_archive_enabled" in config_json:
                     _set(
                         "auto_archive_enabled",
@@ -2133,47 +2171,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "rollup_merge_queue_enabled",
                         bool(config_json["rollup_merge_queue_enabled"]),
                     )
-                if "review_second_opinion_gate_enabled" in config_json:
-                    _set(
-                        "review_second_opinion_gate_enabled",
-                        bool(config_json["review_second_opinion_gate_enabled"]),
-                    )
-                if "blind_multi_reviewer_gate_enabled" in config_json:
-                    _set(
-                        "blind_multi_reviewer_gate_enabled",
-                        bool(config_json["blind_multi_reviewer_gate_enabled"]),
-                    )
-                if "review_second_opinion_sample_rate" in config_json:
-                    try:
-                        _rate = max(
-                            0.0,
-                            min(
-                                1.0,
-                                float(config_json["review_second_opinion_sample_rate"]),
-                            ),
-                        )
-                        _set("review_second_opinion_sample_rate", _rate)
-                    except (TypeError, ValueError):
-                        pass
-                if "strategic_retirement_challenge_gate_mode" in config_json:
-                    raw_mode = (
-                        str(
-                            config_json["strategic_retirement_challenge_gate_mode"]
-                            or ""
-                        )
-                        .strip()
-                        .lower()
-                    )
-                    if raw_mode in ("observe", "advisory", "enforce"):
-                        _set("strategic_retirement_challenge_gate_mode", raw_mode)
-                if "safeguard_challenge_gate_mode" in config_json:
-                    raw_mode = (
-                        str(config_json["safeguard_challenge_gate_mode"] or "")
-                        .strip()
-                        .lower()
-                    )
-                    if raw_mode in ("off", "observe", "enforce"):
-                        _set("safeguard_challenge_gate_mode", raw_mode)
                 if "evergreen_fill_deferred_memo_enrollment" in config_json:
                     _set(
                         "evergreen_fill_deferred_memo_enrollment",
@@ -2203,7 +2200,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "direction_review_recommendation_threshold",
                 ):
                     if _guardrail_int_key in config_json:
-                        try:
+                        try:  # noqa: SIM105
                             _set(
                                 _guardrail_int_key,
                                 int(config_json[_guardrail_int_key]),
@@ -2240,7 +2237,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("completion_debt_weight_mode", raw_mode)
                 if "structural_health_audit_interval_minutes" in config_json:
-                    try:
+                    try:  # noqa: SIM105
                         _set(
                             "structural_health_audit_interval_minutes",
                             int(config_json["structural_health_audit_interval_minutes"]),
@@ -2248,7 +2245,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     except (TypeError, ValueError):
                         pass
                 if "structural_health_audit_fat_row_bytes" in config_json:
-                    try:
+                    try:  # noqa: SIM105
                         _set(
                             "structural_health_audit_fat_row_bytes",
                             int(config_json["structural_health_audit_fat_row_bytes"]),
@@ -2287,6 +2284,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "capability_proof_execution_trials_enabled",
                         bool(config_json["capability_proof_execution_trials_enabled"]),
+                    )
+                if "acceptance_earn_execution_trials_enabled" in config_json:
+                    _set(
+                        "acceptance_earn_execution_trials_enabled",
+                        bool(config_json["acceptance_earn_execution_trials_enabled"]),
                     )
                 for _cap_grad_float_key in (
                     "capability_proof_gate_auto_graduation_observe_threshold",
@@ -2337,36 +2339,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                                 _set(_ms_int_key, _ms_val)
                         except (TypeError, ValueError):
                             pass
-                # Resident strategic session (dead-man's-switch safety + resident
-                # agent). Persisted so an operator enable/tune survives a Cloud Run
-                # restart and reaches the leader across instances; without these the
-                # in-memory values revert to the env defaults on every restart and a
-                # multi-instance PATCH never propagates. Ints are already range-
-                # clamped by the PATCH handler before they reach the DB.
-                if "strategic_session_enabled" in config_json:
-                    _set(
-                        "strategic_session_enabled",
-                        bool(config_json["strategic_session_enabled"]),
-                    )
-                for _strategic_int_key in (
-                    "strategic_continuation_ttl_seconds",
-                    "strategic_local_hold_timeout_seconds",
-                    "strategic_session_idle_tick_seconds",
-                    "strategic_session_turn_timeout_seconds",
-                    "strategic_session_min_tick_seconds",
-                    "strategic_session_max_ops_per_turn",
-                    "strategic_session_autonomous_turn_timeout_seconds",
-                    "strategic_session_max_unattended_seconds",
-                    "resident_session_heartbeat_stale_seconds",
-                ):
-                    if _strategic_int_key in config_json:
-                        try:
-                            _set(
-                                _strategic_int_key,
-                                int(config_json[_strategic_int_key]),
-                            )
-                        except (TypeError, ValueError):
-                            pass
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",
@@ -2414,6 +2386,23 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "usage_headroom_gate_enabled",
                         bool(config_json["usage_headroom_gate_enabled"]),
                     )
+                if "usage_headroom_auto_arm_mode" in config_json:
+                    raw_mode = str(
+                        config_json["usage_headroom_auto_arm_mode"]
+                    ).strip().lower()
+                    if raw_mode in ("auto", "manual", "off"):
+                        _set("usage_headroom_auto_arm_mode", raw_mode)
+                if "usage_headroom_auto_arm_observation_minutes" in config_json:
+                    try:
+                        raw_obs = int(
+                            config_json["usage_headroom_auto_arm_observation_minutes"]
+                        )
+                    except (TypeError, ValueError):
+                        raw_obs = 60
+                    _set(
+                        "usage_headroom_auto_arm_observation_minutes",
+                        max(1, min(1440, raw_obs)),
+                    )
                 if "usage_headroom_long_running_task_types" in config_json:
                     raw_types = config_json["usage_headroom_long_running_task_types"]
                     if isinstance(raw_types, str):
@@ -2435,10 +2424,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "review_fix_lane_pilot_enabled",
                         bool(config_json["review_fix_lane_pilot_enabled"]),
                     )
-                if "review_fix_lane_pilot_mode" in config_json:
-                    raw_mode = str(config_json["review_fix_lane_pilot_mode"]).lower()
-                    if raw_mode in ("off", "shadow", "on"):
-                        _set("review_fix_lane_pilot_mode", raw_mode)
                 if "warm_pool_enabled" in config_json:
                     _set(
                         "warm_pool_enabled",
@@ -2662,6 +2647,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "promotion_enabled",
                         bool(config_json["promotion_enabled"]),
                     )
+                if "env_preflight_enabled" in config_json:
+                    _set(
+                        "env_preflight_enabled",
+                        bool(config_json["env_preflight_enabled"]),
+                    )
                 if "smoketest_enabled" in config_json:
                     _set(
                         "smoketest_enabled",
@@ -2757,7 +2747,7 @@ def resolve_retry_budget(failure_class: str, scope: str | None) -> int:
     per_scope = SCOPE_AWARE_RETRY_BUDGETS.get(failure_class)
     if scope and per_scope and scope in per_scope:
         return per_scope[scope]
-    return runtime_config.get("retry_budgets_by_class", {}).get(
+    return config_get("retry_budgets_by_class").get(
         failure_class, runtime_config["max_retries"]
     )
 
@@ -2798,6 +2788,42 @@ def resolve_project_promotion_enabled(project_id) -> bool:
     if sid in per_project:
         return per_project[sid]
     return bool(runtime_config.get("promotion_enabled"))
+
+
+def walkthrough_e2e_enabled_by_project_map() -> Dict[str, bool]:
+    """Per-project walkthrough_e2e overrides, as ``{project_id: bool}``.
+
+    Read from the durable ``walkthrough_e2e_enabled_by_project`` runtime-config
+    value. Normalizes to trimmed, non-empty string project-id keys mapping to
+    bools, silently dropping malformed entries. An EMPTY map (the default) means
+    every project falls back to the fleet-wide ``walkthrough_e2e_enabled``.
+    Parallel to :func:`promotion_enabled_by_project_map`.
+    """
+    raw = runtime_config.get("walkthrough_e2e_enabled_by_project") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, bool] = {}
+    for key, value in raw.items():
+        sid = str(key).strip()
+        if not sid:
+            continue
+        out[sid] = bool(value)
+    return out
+
+
+def resolve_project_walkthrough_e2e_enabled(project_id) -> bool:
+    """A project's EFFECTIVE walkthrough_e2e gate.
+
+    Returns the project's explicit per-project value from
+    ``walkthrough_e2e_enabled_by_project`` when one is set, otherwise falls back
+    to the fleet-wide ``walkthrough_e2e_enabled`` default (True).  Mirrors
+    :func:`resolve_project_promotion_enabled` for the walkthrough evidence lane.
+    """
+    per_project = walkthrough_e2e_enabled_by_project_map()
+    sid = str(project_id)
+    if sid in per_project:
+        return per_project[sid]
+    return bool(runtime_config.get("walkthrough_e2e_enabled"))
 
 
 def resolve_project_concurrency_cap(project_id) -> int | None:
@@ -2851,7 +2877,7 @@ def is_improvement_lanes_enabled() -> bool:
     Default False (master kill-switch). When False, all lane code is INERT and
     no existing code path changes. Mirrors ``warm_pool_enabled`` gating style.
     """
-    return bool(runtime_config.get("improvement_lanes_enabled", False))
+    return bool(config_get("improvement_lanes_enabled"))
 
 
 def is_review_fix_lane_pilot_enabled() -> bool:
@@ -2865,7 +2891,7 @@ def is_review_fix_lane_pilot_enabled() -> bool:
     """
     if not is_improvement_lanes_enabled():
         return False
-    return bool(runtime_config.get("review_fix_lane_pilot_enabled", False))
+    return bool(config_get("review_fix_lane_pilot_enabled"))
 
 
 def is_review_fix_lane_shadow_enabled() -> bool:
@@ -2876,28 +2902,24 @@ def is_review_fix_lane_shadow_enabled() -> bool:
     and durable KILL checks before creating shadow lanes.
     """
     return is_improvement_lanes_enabled() and not bool(
-        runtime_config.get("review_fix_lane_pilot_enabled", False)
+        config_get("review_fix_lane_pilot_enabled")
     )
 
 
 def get_lane_pilot_mode() -> str:
     """Return the three-value pilot mode: 'off', 'shadow', or 'on'.
 
-    Derives the canonical mode from the explicit ``review_fix_lane_pilot_mode``
-    key when it is set to 'shadow' or 'on', then falls back to the legacy pair
-    (improvement_lanes_enabled + review_fix_lane_pilot_enabled) so existing
-    deployments that only use the boolean flags continue to work.
+    Derives the mode from the boolean flags (improvement_lanes_enabled +
+    review_fix_lane_pilot_enabled) so existing deployments that only use the
+    boolean flags continue to work.  The explicit ``review_fix_lane_pilot_mode``
+    key was deleted per the default-off-is-guilty principle.
     """
-    explicit = str(runtime_config.get("review_fix_lane_pilot_mode", "off"))
-    if explicit in ("shadow", "on"):
-        return explicit
-    # Legacy fallback: derive from the boolean flags.
+    # Derive from the boolean flags.
     if is_review_fix_lane_pilot_enabled():
         return "on"
     if is_review_fix_lane_shadow_enabled():
-        # Classic armless shadow (master on, pilot off) is NOT the new shadow
-        # pilot mode — it is preserved as the "off" baseline for the three-value
-        # scale, accessible via the substrate's original boolean semantics.
+        # Classic armless shadow (master on, pilot off) is "off" for the
+        # three-value scale — accessible via the substrate's boolean semantics.
         return "off"
     return "off"
 
@@ -2919,7 +2941,7 @@ def get_auto_qualification_triggers_mode() -> str:
     Values: "observe" (default, logs decisions without spawning),
     "on" (actively fires run_qualification), "off" (resolver does not run).
     """
-    raw = runtime_config.get("auto_qualification_triggers", "observe")
+    raw = config_get("auto_qualification_triggers")
     if raw in ("on", "observe", "off"):
         return raw
     return "observe"

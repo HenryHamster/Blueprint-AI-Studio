@@ -18,8 +18,6 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
-    StrategicResident,
-    Task,
 )
 from app.notification_dispatch import post_event_message
 from app.project_message_creation import (
@@ -28,14 +26,10 @@ from app.project_message_creation import (
     lock_project_and_next_message_sequence,
     reserve_project_message_sequences,
 )
-from app.strategic_resident_turns import (
-    coalesce_shadow_resident_turn,
-)
-from app.strategic_resident_checkpointing import initialize_strategic_resident
 from testing.conftest import TestingSessionLocal, USE_POSTGRES
 
 
-async def _project_with_resident(session) -> Project:
+async def _project(session) -> Project:
     project = Project(
         name="Message lock window",
         user_id="operator",
@@ -44,9 +38,6 @@ async def _project_with_resident(session) -> Project:
         directions=[],
     )
     session.add(project)
-    await session.commit()
-    await session.refresh(project)
-    await initialize_strategic_resident(session, project.id)
     await session.commit()
     await session.refresh(project)
     return project
@@ -82,39 +73,35 @@ def test_sequence_critical_section_contains_only_atomic_acceptance_work():
     source = inspect.getsource(create_operator_project_message)
     workbench_at = source.index("await persist_strategic_workbench_update")
     workbench_flush_at = source.index("await session.flush()", workbench_at)
-    project_fence_at = source.index("await lock_resident_message_owner_state")
-    arming_at = source.index("arming = await maybe_arm_operator_refresh", project_fence_at)
+    locked_project_at = source.index(
+        "locked_project = await session.scalar(",
+        workbench_flush_at,
+    )
+    arming_at = source.index("arming = await maybe_arm_operator_refresh", locked_project_at)
     identity_lock_at = source.index(
         "await _lock_operator_idempotency_key",
-        project_fence_at,
+        locked_project_at,
     )
     reply_at = source.index("if reply_to_message_id is not None:", identity_lock_at)
     precommit_at = source.index("if precommit_validate is not None:", reply_at)
-    resident_prelock_at = source.index("locked_resident = None", precommit_at)
     sequence_at = source.index(
         "next_sequence = await lock_project_and_next_message_sequence",
-        resident_prelock_at,
+        precommit_at,
     )
     race_close_at = source.index("if idem_key:", sequence_at)
-    shadow_at = source.index(
-        "if locked_resident is not None:",
-        race_close_at,
-    )
-    message_at = source.index("msg = ProjectMessage(", shadow_at)
+    message_at = source.index("msg = ProjectMessage(", race_close_at)
     commit_at = source.index("await session.commit()", message_at)
 
     assert (
         workbench_at
         < workbench_flush_at
-        < project_fence_at
+        < locked_project_at
         < arming_at
         < identity_lock_at
         < reply_at
         < precommit_at
-        < resident_prelock_at
         < sequence_at
         < race_close_at
-        < shadow_at
         < message_at
         < commit_at
     )
@@ -202,7 +189,7 @@ async def test_sequence_allocator_resolves_lazy_session_postgres_bind():
 
 @pytest.mark.asyncio
 async def test_invalid_reply_is_rejected_before_sequence_reservation(db_session):
-    project = await _project_with_resident(db_session)
+    project = await _project(db_session)
 
     with (
         patch(
@@ -231,7 +218,7 @@ async def test_invalid_reply_is_rejected_before_sequence_reservation(db_session)
 
 @pytest.mark.asyncio
 async def test_precommit_failure_is_rejected_before_sequence_reservation(db_session):
-    project = await _project_with_resident(db_session)
+    project = await _project(db_session)
 
     async def reject(_session, _message_id, _context):
         raise HTTPException(status_code=409, detail="source revision changed")
@@ -262,7 +249,7 @@ async def test_precommit_failure_is_rejected_before_sequence_reservation(db_sess
 
 
 @pytest.mark.asyncio
-async def test_precommit_gets_final_message_id_and_activity_skips_resident(db_session):
+async def test_precommit_gets_final_message_id_on_activity_send(db_session):
     project = Project(
         name="Activity message",
         user_id="operator",
@@ -280,34 +267,21 @@ async def test_precommit_gets_final_message_id_and_activity_skips_resident(db_se
         seen_message_id = message_id
         return context
 
-    with patch(
-        "app.strategic_resident_checkpointing.initialize_strategic_resident",
-        new=AsyncMock(side_effect=AssertionError("activity send touched Resident")),
-    ) as initialize:
-        result = await create_operator_project_message(
-            db_session,
-            project=project,
-            user_id="operator",
-            message_type=MessageType.NOTE,
-            content="Routine activity.",
-            context={},
-            workbench_context=None,
-            idempotency_key="activity-no-resident",
-            surface=MessageSurface.ACTIVITY,
-            include_strategic_session_snapshot=False,
-            precommit_validate=capture,
-        )
+    result = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Routine activity.",
+        context={},
+        workbench_context=None,
+        idempotency_key="activity-precommit-id",
+        surface=MessageSurface.ACTIVITY,
+        include_strategic_session_snapshot=False,
+        precommit_validate=capture,
+    )
 
     assert seen_message_id == result.message.id
-    initialize.assert_not_awaited()
-    assert (
-        await db_session.scalar(
-            select(func.count())
-            .select_from(StrategicResident)
-            .where(StrategicResident.project_id == project.id)
-        )
-        == 0
-    )
 
 
 @pytest.mark.skipif(
@@ -316,15 +290,15 @@ async def test_precommit_gets_final_message_id_and_activity_skips_resident(db_se
 )
 @pytest.mark.asyncio
 async def test_slow_precommit_serializes_concurrent_send_without_deadlock(db_session):
-    # The resident owner fence (SELECT ... FOR UPDATE on the project's Resident
-    # row) is acquired up front and held across precommit_validate, because the
+    # The project owner fence (SELECT ... FOR UPDATE on the Project row) is
+    # acquired up front and held across precommit_validate, because the
     # in-lock reference re-check (see _revalidate_message_context) must not race
     # a competing commit. A concurrent same-project send therefore SERIALIZES
     # behind an in-flight slow precommit — it blocks on the exclusive fence until
     # the first send releases, then both complete deadlock-free with monotonic
     # sequences. (It must NOT skip ahead: that only happens on SQLite, where
     # FOR UPDATE is a no-op, which is why this test is PostgreSQL-only.)
-    project = await _project_with_resident(db_session)
+    project = await _project(db_session)
     project_id = project.id
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -382,7 +356,7 @@ async def test_slow_precommit_serializes_concurrent_send_without_deadlock(db_ses
 async def test_concurrent_same_identity_runs_precommit_once_and_adopts_winner(
     db_session,
 ):
-    project = await _project_with_resident(db_session)
+    project = await _project(db_session)
     project_id = project.id
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -430,82 +404,13 @@ async def test_concurrent_same_identity_runs_precommit_once_and_adopts_winner(
 
 @pytest.mark.skipif(
     not USE_POSTGRES,
-    reason="strategic-spawn row-lock concurrency requires PostgreSQL",
-)
-@pytest.mark.asyncio
-async def test_send_and_strategic_spawn_complete_without_deadlock(db_session):
-    project = await _project_with_resident(db_session)
-    project_id = project.id
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    spawn_started = asyncio.Event()
-
-    async def slow_precommit(_session, _message_id, context):
-        entered.set()
-        await release.wait()
-        return context
-
-    async def send():
-        async with TestingSessionLocal() as session:
-            return await _send_conversation(
-                session,
-                project_id,
-                content="Serialize this send with a background wake.",
-                idempotency_key="send-vs-strategic-spawn",
-                precommit_validate=slow_precommit,
-            )
-
-    async def strategic_spawn():
-        async with TestingSessionLocal() as session:
-            spawn_started.set()
-            wake = await coalesce_shadow_resident_turn(
-                session,
-                project_id=project_id,
-                lane="background",
-                trigger_kind="project_change",
-                project_change_cursor={"latency_regression": 1},
-            )
-            await session.commit()
-            return wake
-
-    send_task = asyncio.create_task(send())
-    await asyncio.wait_for(entered.wait(), timeout=2)
-    spawn_task = asyncio.create_task(strategic_spawn())
-    await asyncio.wait_for(spawn_started.wait(), timeout=2)
-    await asyncio.sleep(0.05)
-    release.set()
-    send_result, spawn_result = await asyncio.wait_for(
-        asyncio.gather(send_task, spawn_task),
-        timeout=5,
-    )
-
-    assert send_result.message.sequence == 1
-    assert spawn_result.task_id is not None
-    assert spawn_result.state in {"queued", "coalesced"}
-    async with TestingSessionLocal() as verify:
-        messages = (
-            (
-                await verify.execute(
-                    select(ProjectMessage).where(
-                        ProjectMessage.project_id == project_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-    assert len(messages) == 1
-
-
-@pytest.mark.skipif(
-    not USE_POSTGRES,
     reason="generic-message foreign-key lock concurrency requires PostgreSQL",
 )
 @pytest.mark.asyncio
 async def test_steering_send_and_generic_event_complete_without_deadlock(db_session):
     # Real concurrency, no synthetic parking. An operator steering send and a
     # routine system event target the same project; they SERIALIZE on the
-    # Resident owner fence but must both COMMIT deadlock-free.
+    # project owner fence but must both COMMIT deadlock-free.
     #
     # The earlier version parked the send mid-transaction holding the fence
     # (via a patched allocator + release Event) to force a specific interleave.
@@ -516,7 +421,7 @@ async def test_steering_send_and_generic_event_complete_without_deadlock(db_sess
     # only for the brief message-creation critical section, never across an
     # unbounded await. Driving both operations as genuine concurrent tasks
     # exercises the same fence contention without the un-observable park.
-    project = await _project_with_resident(db_session)
+    project = await _project(db_session)
     project_id = project.id
 
     async def send():
@@ -565,7 +470,7 @@ async def test_steering_send_and_first_bulk_reservation_complete_without_deadloc
     # patched-allocator park is a harness-only deadlock). An operator steering
     # send and a first bulk sequence reservation run concurrently against the
     # same project; both must complete deadlock-free.
-    project = await _project_with_resident(db_session)
+    project = await _project(db_session)
     project_id = project.id
 
     async def send():
@@ -596,96 +501,3 @@ async def test_steering_send_and_first_bulk_reservation_complete_without_deadloc
 
     assert send_result.message.project_id == project_id
     assert len(reserved) == 2
-
-
-async def _assert_resident_contention_precedes_sequence(
-    *,
-    project_id: uuid.UUID,
-    lock_contended_row,
-) -> None:
-    row_locked = asyncio.Event()
-    release_row = asyncio.Event()
-    sequence_called = asyncio.Event()
-    real_allocator = lock_project_and_next_message_sequence
-
-    async def holder():
-        async with TestingSessionLocal() as session:
-            await lock_contended_row(session)
-            row_locked.set()
-            await release_row.wait()
-            await session.commit()
-
-    async def observed_allocator(session, locked_project_id, **kwargs):
-        sequence_called.set()
-        return await real_allocator(session, locked_project_id, **kwargs)
-
-    holder_task = asyncio.create_task(holder())
-    await asyncio.wait_for(row_locked.wait(), timeout=2)
-    with patch(
-        "app.project_message_creation.lock_project_and_next_message_sequence",
-        new=observed_allocator,
-    ):
-        async with TestingSessionLocal() as session:
-            send_task = asyncio.create_task(
-                _send_conversation(
-                    session,
-                    project_id,
-                    content="Do not convoy the message counter on Resident state.",
-                    idempotency_key=f"resident-prelock-{uuid.uuid4()}",
-                )
-            )
-            await asyncio.sleep(0.1)
-            assert not sequence_called.is_set()
-            release_row.set()
-            await asyncio.wait_for(send_task, timeout=5)
-    await asyncio.wait_for(holder_task, timeout=2)
-    assert sequence_called.is_set()
-
-
-@pytest.mark.skipif(
-    not USE_POSTGRES,
-    reason="Resident row-lock latency requires PostgreSQL",
-)
-@pytest.mark.asyncio
-async def test_resident_lock_contention_happens_before_sequence(db_session):
-    project = await _project_with_resident(db_session)
-
-    async def lock_resident(session):
-        await session.execute(
-            select(StrategicResident)
-            .where(StrategicResident.project_id == project.id)
-            .with_for_update()
-        )
-
-    await _assert_resident_contention_precedes_sequence(
-        project_id=project.id,
-        lock_contended_row=lock_resident,
-    )
-
-
-@pytest.mark.skipif(
-    not USE_POSTGRES,
-    reason="Resident Task-pointer lock latency requires PostgreSQL",
-)
-@pytest.mark.asyncio
-async def test_resident_task_pointer_contention_happens_before_sequence(db_session):
-    project = await _project_with_resident(db_session)
-    wake = await coalesce_shadow_resident_turn(
-        db_session,
-        project_id=project.id,
-        lane="background",
-        trigger_kind="project_change",
-        project_change_cursor={"runner_state": 1},
-    )
-    await db_session.commit()
-    assert wake.task_id is not None
-
-    async def lock_pointer_task(session):
-        await session.execute(
-            select(Task).where(Task.id == wake.task_id).with_for_update()
-        )
-
-    await _assert_resident_contention_precedes_sequence(
-        project_id=project.id,
-        lock_contended_row=lock_pointer_task,
-    )

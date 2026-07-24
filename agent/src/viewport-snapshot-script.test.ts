@@ -50,7 +50,8 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
   });
 
   // Requires python3 on PATH (spawns py_compile).
-  it.skipIf(!HAS_PYTHON3)('manifest helper is valid python (py_compile)', () => {
+  it('manifest helper is valid python (py_compile)', () => {
+    if (!HAS_PYTHON3) throw new Error('python3 is required for this test but was not found on PATH. Install python3 (Linux CI always has it).');
     expect(() => execFileSync('python3', ['-m', 'py_compile', MANIFEST_PY])).not.toThrow();
   });
 
@@ -83,7 +84,8 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
   });
 
   // Requires jq on PATH (runs the script's embedded jq filter).
-  it.skipIf(!HAS_JQ)('scales change_pct to a 0-1 magnitude on the "after" row only', () => {
+  it('scales change_pct to a 0-1 magnitude on the "after" row only', () => {
+    if (!HAS_JQ) throw new Error('jq is required for this test but was not found on PATH. Install jq (Linux CI always has it).');
     // Run the REAL jq filter embedded in the script against a sample manifest so a
     // regression in the change_pct/100 scaling (or in which rows carry magnitude)
     // is caught here, not in production. The backend rejects magnitude > 1.0, so
@@ -223,7 +225,8 @@ describe('scripts/viewport-live-capture.js — Playwright capture helper', () =>
   });
 
   // Requires python3 on PATH (runs viewport_manifest.py).
-  it.skipIf(!HAS_PYTHON3)('writes PNGs with the px suffix required by viewport_manifest.py width regex', () => {
+  it('writes PNGs with the px suffix required by viewport_manifest.py width regex', () => {
+    if (!HAS_PYTHON3) throw new Error('python3 is required for this test but was not found on PATH. Install python3 (Linux CI always has it).');
     // viewport_manifest.py uses _WIDTH_RE = re.compile(r"-(\d+)px\.png$").
     // If the capture helper omits "px", the manifest emits width: null and every
     // upload returns 422 from the backend (width: int = Field(ge=1, le=4096)).

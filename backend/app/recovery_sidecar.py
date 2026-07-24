@@ -26,9 +26,7 @@ logger = logging.getLogger(__name__)
 _AWAITING_SIDECAR_KEYS = (
     "awaiting_quality_grader",
     "awaiting_adversarial_grader",
-    "awaiting_safeguard_challenge",
     "awaiting_finding_challenge",
-    "awaiting_review_second_opinion",
 )
 _SIDECAR_VERDICT_APPLICATION_PENDING_KEY = "sidecar_verdict_application_pending"
 _SIDECAR_SWEEP_MAX_PER_CYCLE = 50

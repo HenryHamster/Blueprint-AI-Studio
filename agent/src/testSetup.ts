@@ -49,7 +49,6 @@ afterAll(() => {
 // fixture only — production sources this from the live endpoint.
 const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'review',
-  'panel_review',
   'plan',
   'research',
   'strategic_review',
@@ -69,6 +68,8 @@ const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'web_research',
   'design',
   'capability_proof_trial',
+  'criterion_coverage_trial',
+  'walkthrough_e2e',
 ]);
 
 /** Build a complete, valid capability contract covering every agent task type. */

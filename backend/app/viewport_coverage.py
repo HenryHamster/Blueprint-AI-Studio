@@ -78,18 +78,18 @@ async def update_viewport_coverage_snapshot_from_diff(
     pr_number: int,
     diff_text: str,
 ) -> None:
-    """Write viewport_coverage_snapshot to project.design_doc."""
-    from app.shared_state import with_design_doc_locked
+    """Write viewport_coverage_snapshot to project_sr_analytics."""
+    from app.task_locking import with_sr_analytics_locked
 
     if "admin-ui/" not in diff_text:
         return
 
     snap = compute_viewport_coverage_snapshot(diff_text, pr_number=pr_number)
 
-    def _mutate(doc: dict) -> None:
-        doc["viewport_coverage_snapshot"] = snap
+    def _mutate(data: dict) -> None:
+        data["viewport_coverage_snapshot"] = snap
 
-    await with_design_doc_locked(session, project.id, _mutate)
+    await with_sr_analytics_locked(session, project.id, _mutate)
     logger.info(
         "[REGRESSION_DISPATCHER] viewport_coverage_snapshot updated "
         "project=%s pr=%s before=%d after=%d escape_hatches=%d removed=%d",

@@ -99,13 +99,19 @@ Each shard incurs a fixed startup overhead before any test runs:
 | `python -c 'from app.main import app...'` import check | ~5 s |
 | **Total fixed overhead per shard** | **~80–115 s ≈ 100 s** |
 
-The committed `backend/.test_durations` file was refreshed from the successful
-2026-06-20 `main` CI run
-[`27864265710`](https://github.com/HenryHamster/BlueprintAIStudio/actions/runs/27864265710):
-16,012 backend pytest node timings, ~894 s (~14.9 min) serial. The refresh derived
-per-node durations from Actions timestamps in the eight green backend shard logs,
-without running the full backend suite on an agent VM. GitHub Actions bills each
-job rounded up to the next whole minute.
+The committed `backend/.test_durations` file maps pytest node IDs to per-test
+wall-clock durations and is version-controlled so CI shards can auto-detect it and
+switch from count-based to time-based splitting. It is regenerated via:
+
+```bash
+bash scripts/store-backend-durations.sh
+git add backend/.test_durations && git commit -m "chore: refresh test duration baselines"
+```
+
+A freshness guard in `backend/testing/test_audit_finding_class_guards.py`
+(`TestTestDurationsCommittedAndFresh`) fails CI if the file is missing, malformed,
+too sparse, or its sampled node-ID keys point at deleted test files. GitHub Actions
+bills each job rounded up to the next whole minute.
 
 | Shards | Tests/shard | Total/shard | Billed/shard | **Total billed** | Wall clock |
 |--------|------------|-------------|--------------|-----------------|------------|
@@ -160,11 +166,10 @@ Also update the display name in the `Run tests` step name (line ~451) for clarit
 
 - **Test distribution:** pytest-split auto-detects `backend/.test_durations` and rebalances
   by time. If that file becomes stale or is absent, it falls back to even count-based splits
-  (graceful). No shard isolation problems — each shard runs its own postgres.
+  (graceful). No shard isolation problems — each shard runs its own postgres. Regenerate
+  when the freshness guard fails: `bash scripts/store-backend-durations.sh`.
 - **Wall time:** 6 shards adds ~35 s to the critical path (4.1 min vs. 3.5 min). Unlikely
   to matter for the autonomous pipeline.
-- **The comment in the yml** currently says "~7k tests, ~11.5 min serial"; both numbers are
-  stale (16,012 tests, ~15 min serial per `backend/.test_durations`). Update if you like.
 
 ---
 

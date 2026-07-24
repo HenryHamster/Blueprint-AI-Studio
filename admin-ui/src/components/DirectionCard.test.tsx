@@ -45,6 +45,8 @@ function makeProps(direction: Direction, statusKey = 'active') {
     rejectProposal: vi.fn(),
     reviveProposal: vi.fn(),
     reactivateDirection: vi.fn(),
+    activateStagedDirection: vi.fn(),
+    cancelStagedDirection: vi.fn(),
     unholdDirection: vi.fn(),
     markDirectionComplete: vi.fn(),
     quickToggleStatus: vi.fn(),

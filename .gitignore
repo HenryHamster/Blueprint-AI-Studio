@@ -23,7 +23,6 @@ database.sqlite
 *.tsbuildinfo
 backend/CLAUDE.md
 backend/.testmondata*
-backend/.test_durations
 # Agent runtime tool scripts (auto-generated in workspace, must not be committed)
 # .check-task: per-task generated gate written by writeCheckHelper for Blueprint
 # self-repo. The static ./check delegates to it when present; operators use the

@@ -1246,6 +1246,42 @@ class TestRunnerMemoryTelemetryContract:
         # The per-runner health inside the summary carries the flag the UI renders.
         assert any(r["health"]["memory_low"] for r in entry["runners"])
 
+    @pytest.mark.asyncio
+    async def test_fleet_health_summary_aggregates_cloud_cost_avoided(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="cc" * 32,
+            hostname="cost-runner",
+            status="active",
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        job = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            accelerator_type="T4",
+            accelerator_count=1,
+            started_at=start,
+            completed_at=start + timedelta(hours=1),
+            ran_on_runner_id=runner.id,
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200, resp.text
+        summary = resp.json()
+
+        assert "cloud_cost_avoided_usd" in summary
+        assert summary["cloud_cost_avoided_usd"] > 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # End-to-end runner-enroll walkthrough

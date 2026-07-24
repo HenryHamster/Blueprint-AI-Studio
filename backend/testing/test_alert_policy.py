@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from app.alert_policy import (
+    ALERT_EVENT_POLICIES,
     DOMAIN_RELEASE_LIFECYCLE,
     DOMAIN_WARM_POOL,
     ROUTE_HEALTH,
@@ -324,3 +325,16 @@ async def test_alert_domains_admin_endpoint_rejects_unknown_domain(client, db_se
     )
 
     assert resp.status_code == 422
+
+
+def test_wake_delivery_stalled_is_registered_in_alert_event_policies():
+    """deployment.wake_delivery_stalled must be in ALERT_EVENT_POLICIES so it is
+    unambiguously routed as a core alert rather than relying on the fallback path."""
+    assert "deployment.wake_delivery_stalled" in ALERT_EVENT_POLICIES
+
+
+def test_wake_delivery_stalled_emits_for_core_project():
+    """deployment.wake_delivery_stalled must be emittable for any project (core domain)."""
+    project = make_project(is_self_repo=False)
+    decision = should_emit_project_alert(project, "deployment.wake_delivery_stalled")
+    assert decision.emit is True, f"expected emit=True but got reason={decision.reason}"

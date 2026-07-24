@@ -29,6 +29,9 @@ _redetect_disagreement_cooldown: Dict[str, float] = {}
 # Cooldown for the stale-``repo_is_empty=False`` self-heal (the inverse walk of
 # ``maybe_refresh_empty_build_config``): keyed by str(project.id).
 _redetect_stale_empty_cooldown: Dict[str, float] = {}
+# Cooldown for the commitless-repo stale-``repo_is_empty=False`` self-heal
+# (maybe_correct_stale_commitless_repo_signal): keyed by str(project.id).
+_redetect_stale_commitless_cooldown: Dict[str, float] = {}
 # 6-hour window: a no-test repo walks the tree at most once per window.
 _REDETECT_COOLDOWN_S: float = 6 * 3600.0
 
@@ -261,8 +264,6 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
         _last_attempt = _redetect_empty_cooldown.get(_proj_id_key)
         if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
             return False
-        if _proj_id_key:
-            _redetect_empty_cooldown[_proj_id_key] = _now_mono
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
@@ -300,6 +301,10 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
             project.build_config = detected
         flag_modified(project, "build_config")
         await session.commit()
+        # Stamp cooldown after the API call completes so a transient failure
+        # does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_empty_cooldown[_proj_id_key] = _now_mono
         logger.info(
             "[BUILD_CONFIG] Auto-refreshed empty build_config for project %s "
             "(integration branch %s) after repo gained structure",
@@ -371,10 +376,6 @@ async def maybe_correct_stale_repo_empty_signal(project, session, *, ref=None) -
         _last_attempt = _redetect_stale_empty_cooldown.get(_proj_id_key)
         if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
             return False
-        # Stamp before any API call so concurrent callers in the same window skip
-        # rather than duplicate the expensive walk.
-        if _proj_id_key:
-            _redetect_stale_empty_cooldown[_proj_id_key] = _now_mono
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
@@ -398,6 +399,10 @@ async def maybe_correct_stale_repo_empty_signal(project, session, *, ref=None) -
             project.github_repo,
             ref=integration_branch,
         )
+        # Stamp cooldown after the API call completes so a transient failure
+        # (no token, GitHub 502) does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_stale_empty_cooldown[_proj_id_key] = _now_mono
         if not detected:
             # Transient GitHub failure (detector returned {}). Leave the durable
             # signal untouched — fail-loud is preserved for the clone shortfall.
@@ -437,6 +442,111 @@ async def maybe_correct_stale_repo_empty_signal(project, session, *, ref=None) -
         logger.warning(
             "[BUILD_CONFIG] Self-heal of stale repo_is_empty failed for project "
             "%s; leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
+async def maybe_correct_stale_commitless_repo_signal(
+    project, session, *, ref=None
+) -> bool:
+    """Self-heal a durable ``build_config.repo_is_empty=False`` on a genuinely
+    commitless repo that dies ``clone_failed`` with a REPO_UNINITIALIZED signature.
+
+    Counterpart to :func:`maybe_correct_stale_repo_empty_signal`.  That path
+    handles the *clone-delivery-disagreement* shape (``verifyCloneDelivered``
+    threw because the cloned tree was empty — the agent ran but found nothing).
+    This path handles the *commitless* shape: the repo has NO branches at all, so
+    ``git clone --branch <trunk>`` dies *before* ``verifyCloneDelivered`` runs,
+    emitting the repo-uninitialized signature (``_REPO_UNINITIALIZED_PATTERNS``).
+
+    Oracle: uses :func:`app.github_refs.repo_has_commits` (a single
+    ``GET /repos/{o}/{r}/branches?per_page=1`` roundtrip — no BFS tree walk).
+    When it confirms the repo is commitless, the durable signal is stamped
+    ``repo_is_empty=True`` with the same empty-repo field shape used by
+    ``repo_bootstrap._empty_repo_build_config_fields`` (inlined here to avoid
+    the repo_bootstrap→build_config_detection import cycle) so downstream
+    consumers (spawn gate, ``maybe_refresh_empty_build_config``) see a valid
+    corrected signal.
+
+    Fires ONLY while stored ``repo_is_empty`` is exactly False.  Bounded by the
+    same ``_REDETECT_COOLDOWN_S`` window as the sibling helpers.  Best-effort:
+    never raises into the caller; returns False on any error.
+    """
+    try:
+        existing = project.build_config or {}
+        if existing.get("repo_is_empty") is not False:
+            return False
+        if not getattr(project, "github_owner", None) or not getattr(
+            project, "github_repo", None
+        ):
+            return False
+
+        _proj_id_key = str(getattr(project, "id", None) or "")
+        _now_mono = time.monotonic()
+        _last_attempt = _redetect_stale_commitless_cooldown.get(_proj_id_key)
+        if (
+            _last_attempt is not None
+            and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S
+        ):
+            return False
+
+        from datetime import datetime, timezone
+
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.github import get_repo_installation_token
+        from app.github_refs import repo_has_commits
+
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return False
+
+        has_commits = await repo_has_commits(
+            token, project.github_owner, project.github_repo
+        )
+        # Stamp cooldown after the API call completes so a transient failure
+        # (no token, GitHub 502) does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_stale_commitless_cooldown[_proj_id_key] = _now_mono
+        if has_commits:
+            # Repo is NOT commitless — something else caused the REPO_UNINITIALIZED
+            # signature. Leave the durable signal untouched.
+            return False
+
+        # Confirmed commitless. Stamp the same field shape as
+        # _empty_repo_build_config_fields() in repo_bootstrap.
+        empty_fields = {
+            "language": None,
+            "directories": [],
+            "env_vars": {},
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "repo_is_empty": True,
+            "source_file_count": 0,
+            "has_ci": False,
+        }
+        updated = apply_operator_build_config_overrides(empty_fields, existing)
+        project.build_config = updated
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Self-healed stale repo_is_empty=False for project %s "
+            "(commitless-repo path) — repo_has_commits() confirmed no branches; "
+            "next task proceeds greenfield",
+            getattr(project, "id", None),
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never break the report path
+        logger.warning(
+            "[BUILD_CONFIG] Commitless self-heal of stale repo_is_empty failed for "
+            "project %s; leaving config unchanged",
             getattr(project, "id", None),
             exc_info=True,
         )
@@ -737,10 +847,6 @@ async def maybe_redetect_on_emptiness_disagreement(
             _now_mono - _last_attempt
         ) < _REDETECT_COOLDOWN_S:
             return False
-        # Stamp before any API call so concurrent callers in the same window skip
-        # rather than duplicate the expensive walk.
-        if _proj_id_key:
-            _redetect_disagreement_cooldown[_proj_id_key] = _now_mono
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
@@ -778,6 +884,10 @@ async def maybe_redetect_on_emptiness_disagreement(
             project.build_config = detected
         flag_modified(project, "build_config")
         await session.commit()
+        # Stamp cooldown after the API call completes so a transient failure
+        # does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_disagreement_cooldown[_proj_id_key] = _now_mono
         logger.info(
             "[BUILD_CONFIG] Re-detected repo emptiness for project %s after "
             "agent/backend disagreement (durable repo_is_empty=%s, agent "

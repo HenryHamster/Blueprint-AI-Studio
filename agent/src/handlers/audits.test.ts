@@ -24,9 +24,10 @@ vi.mock('../index.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../workspacePrep.js', () => ({
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
@@ -46,9 +47,10 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../build-config.js', () => ({
-  resolveBuildConfig: vi.fn().mockReturnValue(undefined),
-}));
+vi.mock('../build-config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../build-config.js')>();
+  return { ...actual, resolveBuildConfig: vi.fn().mockReturnValue(undefined) };
+});
 
 vi.mock('../telemetry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../telemetry.js')>();

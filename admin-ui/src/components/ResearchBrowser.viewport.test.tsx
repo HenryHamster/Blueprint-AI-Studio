@@ -197,7 +197,7 @@ describe('ResearchBrowser — viewport regression', () => {
         );
       });
 
-      const buttons = host.querySelectorAll('button, [role="button"]');
+      const buttons = host.querySelectorAll<HTMLElement>('button, [role="button"]');
       const findingButton = Array.from(buttons).find(b => b.textContent?.includes('Connection pool exhaustion under sustained load'));
       if (findingButton) {
         await act(async () => {

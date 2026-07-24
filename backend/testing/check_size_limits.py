@@ -121,7 +121,7 @@ _DEFAULT_JSON_PATH = os.path.join(os.path.dirname(__file__), "module_size_limits
 
 # Section order is significant: matches the JSON's section order so output and
 # --sections=all iteration are deterministic.
-SECTIONS = ("backend", "agent", "frontend")
+SECTIONS = ("backend", "agent", "frontend", "testing")
 
 # Coverage threshold for the complementary guardrail: a source file larger than
 # this with NO cap entry at all is invisible to the per-file caps and can grow
@@ -156,6 +156,7 @@ _SECTION_SCAN = {
     "backend": ((".py",), _no_exclusion),
     "agent": ((".ts",), _is_agent_excluded),
     "frontend": ((".ts", ".tsx"), _is_frontend_excluded),
+    "testing": ((".py",), _no_exclusion),
 }
 
 
@@ -193,6 +194,9 @@ def resolve_section_root(
             if os.path.isdir(candidate):
                 return candidate
         return None
+    if section == "testing":
+        root = os.path.join(repo_root, "backend", "testing")
+        return root if os.path.isdir(root) else None
     raise ValueError(f"Unknown section: {section}")
 
 

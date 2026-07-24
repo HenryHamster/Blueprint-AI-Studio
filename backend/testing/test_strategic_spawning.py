@@ -28,7 +28,6 @@ from app.models import (
     ArtifactType,
     LocalRunner,
     Project,
-    StrategicResident,
     Task,
     TaskStatus,
     MessageType,
@@ -36,7 +35,6 @@ from app.models import (
     RECOMMENDED_MODE_META_KEY,
 )
 from app.strategic_trigger import ORIGIN_OPERATOR, ORIGIN_QUALIFICATION
-from testing._resident_seed import seed_without_authority_enforcement
 from app.workbench_state import (
     SESSION_IDLE_TTL_SECONDS,
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -75,32 +73,6 @@ from app.task_evaluators import (
     CHALLENGE_INDETERMINATE,
 )
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
-from app.strategic_resident_turns import STRATEGIC_RESIDENT_TURN_TASK_TYPE
-
-
-@pytest.fixture(autouse=True)
-def _materialize_migrated_legacy_resident(monkeypatch):
-    """Mirror migration 0611 for legacy tests that construct Project directly."""
-    from app import strategic_resident_transition_locks as transition_locks
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-    real_gate = transition_locks.lock_and_validate_legacy_authority
-
-    async def migrated_gate(session, project_id, *, expected_generation=None):
-        resident = await session.get(StrategicResident, project_id)
-        if resident is None:
-            await initialize_strategic_resident(session, project_id)
-        return await real_gate(
-            session,
-            project_id,
-            expected_generation=expected_generation,
-        )
-
-    monkeypatch.setattr(
-        transition_locks,
-        "lock_and_validate_legacy_authority",
-        migrated_gate,
-    )
 
 
 def _select_agent_tasks(project_id):
@@ -113,7 +85,6 @@ def _select_agent_tasks(project_id):
             task_type.is_(None),
             task_type.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
         ),
-        task_type != STRATEGIC_RESIDENT_TURN_TASK_TYPE,
     )
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
@@ -347,24 +318,6 @@ async def test_architecture_cycle_spawns_design_doc_update(db_session):
     assert tasks[0].payloads[0]["type"] == "design_doc_update", (
         f"Expected design_doc_update on architecture cycle, got {tasks[0].payloads[0]['type']}"
     )
-    all_tasks = (
-        await db_session.execute(select(Task).where(Task.project_id == project.id))
-    ).scalars().all()
-    shadow = [
-        task
-        for task in all_tasks
-        if task.first_payload.get("type") == "strategic_resident_turn"
-    ]
-    assert len(shadow) == 1
-    assert shadow[0].archived is True
-    assert shadow[0].first_payload["lane"] == "background"
-    assert shadow[0].first_payload["project_change_cursor"]["phase1_task_id"] == str(
-        tasks[0].id
-    )
-    assert (
-        shadow[0].first_payload["project_change_cursor"]["strategic_cycle_id"]
-        == tasks[0].strategic_cycle_id
-    )
 
 
 @pytest.mark.asyncio
@@ -394,160 +347,6 @@ async def test_strategy_only_cycle_spawns_strategic_review(db_session):
     assert tasks[0].payloads[0]["type"] == "strategic_review", (
         f"Expected strategic_review on strategy-only cycle, got {tasks[0].payloads[0]['type']}"
     )
-    all_tasks = (
-        await db_session.execute(select(Task).where(Task.project_id == project.id))
-    ).scalars().all()
-    shadow = [
-        task
-        for task in all_tasks
-        if task.first_payload.get("type") == "strategic_resident_turn"
-    ]
-    assert len(shadow) == 1
-    assert shadow[0].archived is True
-    assert shadow[0].first_payload["lane"] == "background"
-    assert shadow[0].first_payload["project_change_cursor"]["phase2_task_id"] == str(
-        tasks[0].id
-    )
-    assert (
-        shadow[0].first_payload["project_change_cursor"]["strategic_cycle_id"]
-        == tasks[0].strategic_cycle_id
-    )
-
-
-@pytest.mark.parametrize("cycle_count", [1, 2])
-@pytest.mark.asyncio
-async def test_paused_resident_keeps_legacy_cycle_but_creates_no_shadow(
-    db_session, cycle_count
-):
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-    project = _make_project(
-        vision={
-            "_strategic_cycle_count": cycle_count,
-            "_research_spawn_count": 5,
-        }
-    )
-    db_session.add(project)
-    await db_session.commit()
-    resident = await initialize_strategic_resident(db_session, project.id)
-    resident.background_policy = "paused"
-    db_session.add(resident)
-    await db_session.commit()
-
-    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
-    _shared_state.runtime_config["architecture_review_frequency"] = 3
-    try:
-        await _spawn_research_task(project, db_session)
-    finally:
-        _shared_state.runtime_config["architecture_review_frequency"] = old
-
-    all_tasks = (
-        await db_session.execute(select(Task).where(Task.project_id == project.id))
-    ).scalars().all()
-    assert len(
-        [task for task in all_tasks if task.first_payload.get("type") != "strategic_resident_turn"]
-    ) == 1
-    assert not [
-        task for task in all_tasks if task.first_payload.get("type") == "strategic_resident_turn"
-    ]
-
-
-@pytest.mark.parametrize("cycle_count", [1, 2])
-@pytest.mark.asyncio
-async def test_owner_flip_rolls_back_whole_legacy_cycle_spawn(
-    db_session, cycle_count
-):
-    from app.models import StrategicCycle
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-    project = _make_project(
-        vision={
-            "_strategic_cycle_count": cycle_count,
-            "_research_spawn_count": 5,
-        }
-    )
-    db_session.add(project)
-    await db_session.commit()
-    resident = await initialize_strategic_resident(db_session, project.id)
-    # initialize_strategic_resident leaves a pending current_checkpoint_id on a
-    # legacy gen-1 resident; flipping owner + generation in the same commit sets
-    # the checkpoint pointer while the generation changes, which the rotation
-    # fence rejects ("checkpoint rotation cannot change authority generation").
-    # This authoritative starting state is seeded with enforcement relaxed
-    # (no-op on SQLite); the _spawn_research_task action below runs with all
-    # fences ACTIVE and must still roll back the whole legacy-cycle spawn.
-    async with seed_without_authority_enforcement(db_session):
-        resident.engine_owner = "strategic_resident"
-        resident.authority_generation += 1
-        db_session.add(resident)
-        await db_session.commit()
-
-    # _spawn_research_task rolls back (owner flipped away from legacy), which
-    # expires `project`; capture the id first so the assertion queries below do
-    # not lazy-load an expired attribute (MissingGreenlet on Postgres/NullPool).
-    project_id = project.id
-    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
-    _shared_state.runtime_config["architecture_review_frequency"] = 3
-    try:
-        await _spawn_research_task(project, db_session)
-    finally:
-        _shared_state.runtime_config["architecture_review_frequency"] = old
-
-    all_tasks = (
-        await db_session.execute(select(Task).where(Task.project_id == project_id))
-    ).scalars().all()
-    assert all_tasks == []
-    cycles = (
-        await db_session.execute(
-            select(StrategicCycle).where(StrategicCycle.project_id == project_id)
-        )
-    ).scalars().all()
-    assert cycles == []
-
-
-@pytest.mark.parametrize("cycle_count", [1, 2])
-@pytest.mark.asyncio
-async def test_mid_spawn_generation_flip_rolls_back_cycle_finalization(
-    db_session, mocker, cycle_count
-):
-    """Both phase families CAS the generation again immediately before INSERT."""
-    from app.models import StrategicCycle
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
-    from app.strategic_resident_transition_locks import LegacyEngineAuthorityExpired
-
-    project = _make_project(
-        vision={"_strategic_cycle_count": cycle_count, "_research_spawn_count": 5}
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await initialize_strategic_resident(db_session, project.id)
-    await db_session.commit()
-    authority = AsyncMock(
-        side_effect=[
-            1,
-            LegacyEngineAuthorityExpired("generation flipped during payload build"),
-        ]
-    )
-    mocker.patch(
-        "app.strategic_resident_transition_locks.lock_and_validate_legacy_authority",
-        new=authority,
-    )
-    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
-    _shared_state.runtime_config["architecture_review_frequency"] = 3
-    try:
-        await _spawn_research_task(project, db_session)
-    finally:
-        _shared_state.runtime_config["architecture_review_frequency"] = old
-
-    assert authority.await_count == 2
-    assert (
-        await db_session.execute(select(Task).where(Task.project_id == project.id))
-    ).scalars().all() == []
-    assert (
-        await db_session.execute(
-            select(StrategicCycle).where(StrategicCycle.project_id == project.id)
-        )
-    ).scalars().all() == []
 
 
 @pytest.mark.asyncio
@@ -806,7 +605,7 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
     assert payload["operator_overrides"][0]["document"] == "running_update"
 
 
-# ── extra_context born-context seeding (resident-session SPAWN-path race fix) ──
+# ── extra_context born-context seeding (SPAWN-path race fix) ──
 
 
 @pytest.mark.asyncio
@@ -814,9 +613,9 @@ async def test_spawn_strategic_review_seeds_extra_context_at_birth(db_session):
     """``extra_context`` is merged into the created task's ``context`` in the SAME
     INSERT that creates it, so the committed task is BORN already carrying those
     keys (it never exists in a committed state without them). This is the atomic
-    seam the resident-session start uses to make its spawned strategic_review
-    claimable ONLY with ``_resident_session`` already set — closing the window in
-    which a warm runner could claim it flag-less and dispatch the one-shot."""
+    seam a caller uses to make its spawned strategic_review claimable ONLY with
+    the pinning flags already set — closing the window in which a warm runner
+    could claim it flag-less and dispatch the one-shot."""
     project = _make_project(vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
@@ -824,10 +623,10 @@ async def test_spawn_strategic_review_seeds_extra_context_at_birth(db_session):
     await _seed_legacy_cycles(db_session, project)
 
     extra = {
-        "_resident_session": True,
+        "_born_marker": True,
         "strategic_session_id": "ss-born-1234",
         STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
-        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "operator_session",
         "preferred_runner_target_id": "runner-abc",
     }
     spawned = await _spawn_strategic_review(project, db_session, extra_context=extra)
@@ -841,10 +640,10 @@ async def test_spawn_strategic_review_seeds_extra_context_at_birth(db_session):
     # The task's FIRST (and only) committed context carries the born flags — proof
     # the seed rode the creating INSERT, not a follow-up transaction.
     ctx = task.context or {}
-    assert ctx.get("_resident_session") is True
+    assert ctx.get("_born_marker") is True
     assert ctx.get("strategic_session_id") == "ss-born-1234"
     assert ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
-    assert ctx.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY) == "resident_session"
+    assert ctx.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY) == "operator_session"
     assert ctx.get("preferred_runner_target_id") == "runner-abc"
     # The function's own derived context (the cycle id) is preserved alongside.
     assert ctx.get("strategic_cycle_id") == task.strategic_cycle_id
@@ -854,8 +653,8 @@ async def test_spawn_strategic_review_seeds_extra_context_at_birth(db_session):
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_default_extra_context_unchanged(db_session):
     """Regression: a normal cadence spawn (``extra_context`` defaulting to None)
-    is unaffected — the created task carries NO resident flags, exactly as before
-    the parameter was added."""
+    is unaffected — the created task carries NO born-context flags, exactly as
+    before the parameter was added."""
     project = _make_project(vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
@@ -872,7 +671,7 @@ async def test_spawn_strategic_review_default_extra_context_unchanged(db_session
     )
     ctx = task.context or {}
     # No born-context leaked into a plain cadence spawn.
-    assert "_resident_session" not in ctx
+    assert "_born_marker" not in ctx
     assert "strategic_session_id" not in ctx
     assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
     # The cadence cycle id is still set as before.
@@ -880,383 +679,11 @@ async def test_spawn_strategic_review_default_extra_context_unchanged(db_session
     assert task.strategic_cycle_id
 
 
-# ── resident_minimal SPAWN path (skips the slow inline GitHub context build) ──
-
-
-@pytest.mark.asyncio
-async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
-    db_session, mocker
-):
-    """The resident-session SPAWN path (``resident_minimal=True``) skips ONLY the
-    slow GitHub-fetching context builders — not the cheap grounding.
-
-    The four network builders (``ground_design_doc``,
-    ``_verify_capability_backing_paths``, ``_build_recent_interventions``,
-    ``resolve_branch_verification_context``) hold the request's DB connection open
-    long enough for asyncpg/Cloud SQL to idle-close it, so a synchronous resident
-    START 500s at ~143s before ``task_id`` lands. They are TRIPWIRES here (raise if
-    reached). The spawn still succeeds with a payload that INCLUDES the cheap
-    in-memory/DB-only grounding (``vision`` / ``problem_model`` /
-    ``running_update`` / ``directions_summary`` / ``direction_counts`` /
-    ``open_messages``) so the resident agent is not context-blind, while the
-    GitHub-derived keys stay absent.
-    """
-    project = _make_project(
-        vision={
-            "purpose": "test purpose",
-            "_strategic_cycle_history": [
-                    {
-                        "cycle_id": "sc-resident-01",
-                        "outcome": "completed",
-                        "phase2_completed_at": "2026-07-02T00:00:00+00:00",
-                        "summary_text": "rev 12, 1 created, 1 retired",
-                        "created_direction_ids": ["d1"],
-                        "retired_direction_ids": ["d-ret"],
-                        "created_rationales": {"d1": "new direction for active work"},
-                        "retired_rationales": {"d-ret": "landed elsewhere"},
-                },
-            ],
-        },
-        problem_model={
-            "capabilities": [
-                {"id": "c1", "status": "working", "backing_paths": ["app/foo.py"]}
-            ]
-        },
-        directions=[
-            {"id": "d1", "text": "ship it", "status": "active"},
-                {
-                    "id": "d-ret",
-                    "text": "retired work",
-                    "status": "retired",
-                    "retired_at": "2026-07-01T00:00:00+00:00",
-                    "retirement_reason": "landed elsewhere",
-                    "retirement_outcome": "merged on automain",
-                    "research_history": [{"timestamp": "2026-07-01T00:00:00+00:00", "prs_merged": 2}],
-                    "history_aggregate": {"total_cycles": 1, "total_prs_merged": 2},
-                },
-        ],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # Seed an OPEN operator message so we can prove the resident payload surfaces
-    # it (an operator message older than the runner's ~2min first-poll cursor is
-    # otherwise missed entirely — the exact context-blindness this key fixes).
-    db_session.add(
-        ProjectMessage(
-            project_id=project.id,
-            from_type="user",
-            message_type=MessageType.QUESTION,
-            content="operator question queued before the session started",
-            status="open",
-        )
-    )
-    await db_session.commit()
-    await _seed_legacy_cycles(db_session, project)
-
-    # ONLY the four slow, network-I/O builders are tripwires. The cheap DB/
-    # in-memory grounding builders are intentionally NOT tripwired — the resident
-    # payload is expected to run them.
-    for _name in (
-        "resolve_branch_verification_context",
-        "_verify_capability_backing_paths",
-        "_build_recent_interventions",
-        "ground_design_doc",
-    ):
-        mocker.patch(
-            f"app.strategic_spawning.{_name}",
-            new=AsyncMock(
-                side_effect=AssertionError(
-                    f"resident_minimal spawn must not call {_name}"
-                )
-            ),
-        )
-
-    extra = {
-        "_resident_session": True,
-        "strategic_session_id": "ss-resident-min",
-        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
-        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
-        "preferred_runner_target_id": "runner-xyz",
-    }
-    spawned = await _spawn_strategic_review(
-        project, db_session, extra_context=extra, resident_minimal=True
-    )
-    assert spawned is True
-
-    task = (
-        (await db_session.execute(_select_agent_tasks(project.id)))
-        .scalars()
-        .all()[0]
-    )
-    payload = task.payloads[0]
-    assert payload["type"] == "strategic_review"
-    assert payload["research_mode"] == "strategic"
-    assert payload.get("project_name") == project.name
-    assert payload.get("base_branch") == "automain"
-
-    # Cheap grounding is PRESENT so the resident agent boots with context.
-    assert "vision" in payload
-    assert "problem_model" in payload
-    assert payload.get("running_update") == ""
-    assert "direction_counts" in payload
-    assert payload["direction_counts"]["active"] == 1
-    assert [d["id"] for d in payload.get("directions_summary") or []] == ["d1"]
-    retired_summary = payload.get("retired_directions_summary")
-    assert retired_summary and retired_summary[0]["id"] == "d-ret"
-    assert retired_summary[0]["retirement_reason"] == "landed elsewhere"
-    assert retired_summary[0]["retirement_outcome"] == "merged on automain"
-    prev_outcomes = payload.get("previous_decision_outcomes")
-    assert prev_outcomes and prev_outcomes["cycle_id"] == "sc-resident-01"
-    assert prev_outcomes["created"][0]["direction_id"] == "d1"
-    assert prev_outcomes["retired"][0]["direction_id"] == "d-ret"
-    # The queued operator message is surfaced (would otherwise be missed).
-    assert any(
-        "operator question queued" in (m.get("content") or "")
-        for m in payload.get("open_messages") or []
-    )
-    # The UNVERIFIED agent-view problem_model carries no backing-path
-    # ``verification`` block — that annotation is exactly the skipped GitHub I/O.
-    _caps = payload["problem_model"].get("capabilities") or []
-    assert all("verification" not in c for c in _caps)
-
-    # The GitHub-derived keys stay ABSENT (their builders were tripwired).
-    for _heavy in ("recent_interventions", "design_doc", "version_phase", "ci_compliance"):
-        assert _heavy not in payload, (
-            f"resident_minimal payload should omit GitHub-derived key {_heavy!r}"
-        )
-
-    # Born-context (resident flags + runner pin) still rode the creating INSERT,
-    # and the strategy-only cycle row was still recorded.
-    ctx = task.context or {}
-    assert ctx.get("_resident_session") is True
-    assert ctx.get("strategic_session_id") == "ss-resident-min"
-    assert ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
-    assert ctx.get("preferred_runner_target_id") == "runner-xyz"
-    assert ctx.get("strategic_cycle_id") == task.strategic_cycle_id
-    assert task.strategic_cycle_id
-
-
-# ── resident_exam_leads surfacing ──
-
-
-@pytest.mark.asyncio
-async def test_payload_includes_resident_exam_leads_section(db_session, mocker):
-    """resident_exam_leads from the exam ledger surfaces in the resident-minimal payload.
-
-    A ledger with one FOUND and one CLEAR record for different surfaces must
-    produce exactly one entry in ``resident_exam_leads`` (the FOUND one only).
-    The CLEAR entry must NOT appear.
-    """
-    from app.strategic_resident_session import RESIDENT_SESSION_KEY
-
-    ledger = json.dumps({
-        "records": [
-            {
-                "surfaceKey": "direction:d-found",
-                "atTick": 3,
-                "at": "2026-07-05T10:00:00Z",
-                "verdict": "found",
-                "note": "missing test coverage",
-            },
-            {
-                "surfaceKey": "direction:d-clear",
-                "atTick": 2,
-                "at": "2026-07-05T09:00:00Z",
-                "verdict": "clear",
-                "note": "",
-            },
-        ],
-        "tick": 3,
-        "corrective": False,
-    })
-    project = _make_project(
-        vision={
-            "purpose": "test purpose",
-            RESIDENT_SESSION_KEY: {
-                "version": 1,
-                "status": "active",
-                "_exam_ledger": ledger,
-            },
-        },
-        directions=[{"id": "d-found", "text": "active direction", "status": "active"}],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-    await _seed_legacy_cycles(db_session, project)
-
-    for _name in (
-        "resolve_branch_verification_context",
-        "_verify_capability_backing_paths",
-        "_build_recent_interventions",
-        "ground_design_doc",
-    ):
-        mocker.patch(
-            f"app.strategic_spawning.{_name}",
-            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
-        )
-
-    extra = {
-        "_resident_session": True,
-        "strategic_session_id": "ss-exam-leads",
-        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
-        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
-        "preferred_runner_target_id": "runner-exam",
-    }
-    spawned = await _spawn_strategic_review(
-        project, db_session, extra_context=extra, resident_minimal=True
-    )
-    assert spawned is True
-
-    task = (
-        (await db_session.execute(_select_agent_tasks(project.id)))
-        .scalars()
-        .all()[0]
-    )
-    payload = task.payloads[0]
-    leads = payload.get("resident_exam_leads")
-    assert leads is not None, "resident_exam_leads should be present when FOUND leads exist"
-    assert len(leads) == 1, f"Expected 1 open FOUND lead, got {len(leads)}: {leads}"
-    assert leads[0]["surfaceKey"] == "direction:d-found"
-    assert leads[0]["note"] == "missing test coverage"
-    assert leads[0]["at"] == "2026-07-05T10:00:00Z"
-
-
-@pytest.mark.asyncio
-async def test_spawn_strategic_review_no_resident_leads_when_ledger_absent(db_session, mocker):
-    """When no _exam_ledger is present in the resident session blob, resident_exam_leads is absent."""
-    from app.strategic_resident_session import RESIDENT_SESSION_KEY
-
-    project = _make_project(
-        vision={
-            "purpose": "test purpose",
-            RESIDENT_SESSION_KEY: {
-                "version": 1,
-                "status": "active",
-                # No _exam_ledger key
-            },
-        },
-        directions=[{"id": "d1", "text": "active direction", "status": "active"}],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-    await _seed_legacy_cycles(db_session, project)
-
-    for _name in (
-        "resolve_branch_verification_context",
-        "_verify_capability_backing_paths",
-        "_build_recent_interventions",
-        "ground_design_doc",
-    ):
-        mocker.patch(
-            f"app.strategic_spawning.{_name}",
-            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
-        )
-
-    extra = {
-        "_resident_session": True,
-        "strategic_session_id": "ss-no-ledger",
-        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
-        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
-    }
-    spawned = await _spawn_strategic_review(
-        project, db_session, extra_context=extra, resident_minimal=True
-    )
-    assert spawned is True
-
-    task = (
-        (await db_session.execute(_select_agent_tasks(project.id)))
-        .scalars()
-        .all()[0]
-    )
-    payload = task.payloads[0]
-    assert "resident_exam_leads" not in payload, (
-        "resident_exam_leads should be absent when no _exam_ledger is present"
-    )
-
-
-@pytest.mark.asyncio
-async def test_spawn_strategic_review_resident_minimal_dedup_keeps_latest_by_tick(db_session, mocker):
-    """Dedup by surfaceKey keeps the record with the highest atTick.
-
-    Two FOUND records for the same surface (atTick=1 and atTick=5); a later
-    CLEAR (atTick=3) for a second surface. Result: first surface stays FOUND
-    (highest tick wins the dedup), second surface is CLEARED (not in output).
-    """
-    from app.strategic_resident_session import RESIDENT_SESSION_KEY
-
-    ledger = json.dumps({
-        "records": [
-            # First surface: FOUND at tick 1, then another FOUND at tick 5 (latest wins)
-            {"surfaceKey": "fetch:ci", "atTick": 1, "at": "2026-07-05T08:00:00Z", "verdict": "found", "note": "old note"},
-            {"surfaceKey": "fetch:ci", "atTick": 5, "at": "2026-07-05T12:00:00Z", "verdict": "found", "note": "newer note"},
-            # Second surface: FOUND at tick 2, then CLEAR at tick 4 (latest wins → cleared)
-            {"surfaceKey": "direction:d2", "atTick": 2, "at": "2026-07-05T09:00:00Z", "verdict": "found", "note": ""},
-            {"surfaceKey": "direction:d2", "atTick": 4, "at": "2026-07-05T11:00:00Z", "verdict": "clear", "note": ""},
-        ],
-        "tick": 5,
-        "corrective": False,
-    })
-    project = _make_project(
-        vision={
-            "purpose": "test purpose",
-            RESIDENT_SESSION_KEY: {
-                "version": 1,
-                "status": "active",
-                "_exam_ledger": ledger,
-            },
-        },
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-    await _seed_legacy_cycles(db_session, project)
-
-    for _name in (
-        "resolve_branch_verification_context",
-        "_verify_capability_backing_paths",
-        "_build_recent_interventions",
-        "ground_design_doc",
-    ):
-        mocker.patch(
-            f"app.strategic_spawning.{_name}",
-            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
-        )
-
-    extra = {
-        "_resident_session": True,
-        "strategic_session_id": "ss-dedup",
-        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
-        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
-    }
-    spawned = await _spawn_strategic_review(
-        project, db_session, extra_context=extra, resident_minimal=True
-    )
-    assert spawned is True
-
-    task = (
-        (await db_session.execute(_select_agent_tasks(project.id)))
-        .scalars()
-        .all()[0]
-    )
-    payload = task.payloads[0]
-    leads = payload.get("resident_exam_leads")
-    assert leads is not None, "resident_exam_leads should be present"
-    assert len(leads) == 1, f"Expected 1 open FOUND lead (fetch:ci only), got {leads}"
-    assert leads[0]["surfaceKey"] == "fetch:ci"
-    assert leads[0]["note"] == "newer note"
-
-
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_cadence_still_runs_context_build(db_session):
-    """Regression guard for the resident_minimal refactor: a plain cadence spawn
-    (``resident_minimal`` defaulting False) STILL runs the full context build —
-    the short-circuit is resident-only. The payload carries the assembled
-    ``recent_interventions`` context (produced solely by the inline build) the
-    strategist consumes."""
+    """Regression guard: a plain cadence spawn STILL runs the full context build.
+    The payload carries the assembled ``recent_interventions`` context (produced
+    solely by the inline build) the strategist consumes."""
     project = _make_project(vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
@@ -1272,7 +699,7 @@ async def test_spawn_strategic_review_cadence_still_runs_context_build(db_sessio
         .all()[0]
     )
     payload = task.payloads[0]
-    # The heavy build ran: context the resident_minimal path omits is present.
+    # The heavy build ran: the full-context keys are present.
     assert "recent_interventions" in payload
     assert payload["type"] == "strategic_review"
 
@@ -5663,7 +5090,7 @@ def test_stamp_direction_in_flight_counts():
 
 
 def test_stamp_direction_in_flight_handles_none_mapping():
-    """A None active_by_direction (e.g. resident/degraded path) stamps 0, never
+    """A None active_by_direction (e.g. a degraded path) stamps 0, never
     raises — graceful degrade."""
     from app.strategic_spawning import _stamp_direction_in_flight
 
@@ -15602,6 +15029,7 @@ async def test_seeded_goal_reaches_strategic_review_payload(db_session):
 
     # Channel 1: intent/purpose
     assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    assert payload["effective_purpose"] == _ONBOARD_GOAL
     # Channel 2: user-message conversation history
     thread_contents = [m["content"] for m in payload["conversation_thread"]]
     assert _ONBOARD_GOAL in thread_contents
@@ -15631,6 +15059,7 @@ async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
     payload = result.scalars().all()[0].payloads[0]
 
     assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    assert payload["effective_purpose"] == _ONBOARD_GOAL
     open_contents = [m["content"] for m in payload["open_messages"]]
     assert _ONBOARD_GOAL in open_contents
 
@@ -18673,108 +18102,6 @@ def test_summarize_efficiency_snapshot_includes_dominant_failure_class():
     }
 
 
-def test_summarize_efficiency_snapshot_forwards_gate_health():
-    """panel_review_effectiveness gate_health verdict is forwarded by _summarize_efficiency_snapshot.
-
-    The gate-health block is the canonical way for the strategic agent to
-    autonomously confirm the adversarial-second-opinion gate's fail-open rate
-    after a version promotion, without an explicit manual fetch.
-    """
-    from app.strategic_spawning import _summarize_efficiency_snapshot
-
-    gate_health = {
-        "state": "HEALTHY",
-        "fail_open_rate": 0.02,
-        "total_invocations": 50,
-        "min_sample": 30,
-    }
-    snapshot = {
-        "axes": {
-            "cost_per_merged_pr": {
-                "current": 1.5,
-                "baseline": 2.0,
-                "drift_pct": -25.0,
-                "history": [],
-            }
-        },
-        "baseline_captured_at": "2026-04-05T00:00:00",
-        "last_snapshot_at": "2026-05-01T00:00:00",
-        "panel_review_effectiveness": {
-            "gate_health": gate_health,
-            "fail_open_rate": 0.02,
-            "total_challenged": 49,
-            "challenged_degraded": 1,
-            "effective_coverage": 0.85,
-            # raw history arrays stripped by summarize
-            "history": [{"captured_at": "2026-04-01", "value": 0.01}],
-        },
-    }
-    result = _summarize_efficiency_snapshot(snapshot)
-    assert "panel_review_effectiveness" in result, (
-        "panel_review_effectiveness missing from summarized snapshot"
-    )
-    peff = result["panel_review_effectiveness"]
-    assert peff["gate_health"] == gate_health, (
-        "gate_health verdict not forwarded faithfully"
-    )
-    assert peff["fail_open_rate"] == 0.02
-    assert peff["total_challenged"] == 49
-    assert peff["challenged_degraded"] == 1
-    assert peff["effective_coverage"] == 0.85
-    assert "history" not in peff, "history array must be stripped from summarized payload"
-
-
-def test_summarize_efficiency_snapshot_forwards_post_deploy_gate_health():
-    """panel_review_effectiveness_post_deploy is forwarded by _summarize_efficiency_snapshot.
-
-    The deploy-scoped gate-health block lets the strategist see post-deploy
-    adversarial coverage that resets every deploy, without having to fetch it
-    separately.
-    """
-    from app.strategic_spawning import _summarize_efficiency_snapshot
-
-    gate_health_pd = {
-        "state": "HEALTHY",
-        "fail_open_rate": 0.01,
-        "total_invocations": 35,
-        "min_sample": 30,
-    }
-    snapshot = {
-        "axes": {
-            "cost_per_merged_pr": {
-                "current": 1.5,
-                "baseline": 2.0,
-                "drift_pct": -25.0,
-                "history": [],
-            }
-        },
-        "baseline_captured_at": "2026-04-05T00:00:00",
-        "last_snapshot_at": "2026-05-01T00:00:00",
-        "panel_review_effectiveness_post_deploy": {
-            "gate_health": gate_health_pd,
-            "fail_open_rate": 0.01,
-            "total_challenged": 34,
-            "challenged_degraded": 0,
-            "effective_coverage": 0.90,
-            # history stripped by summarize
-            "history": [{"captured_at": "2026-05-01", "value": 0.01}],
-        },
-    }
-    result = _summarize_efficiency_snapshot(snapshot)
-    assert "panel_review_effectiveness_post_deploy" in result, (
-        "panel_review_effectiveness_post_deploy missing from summarized snapshot"
-    )
-    peff_pd = result["panel_review_effectiveness_post_deploy"]
-    assert peff_pd["gate_health"] == gate_health_pd, (
-        "gate_health verdict not forwarded faithfully"
-    )
-    assert peff_pd["fail_open_rate"] == 0.01
-    assert peff_pd["total_challenged"] == 34
-    assert peff_pd["challenged_degraded"] == 0
-    assert peff_pd["effective_coverage"] == 0.90
-    assert "history" not in peff_pd, "history array must be stripped from summarized payload"
-
-
 def test_summarize_efficiency_snapshot_forwards_format_miss_attribution():
     """strategist efficiency payload includes per-handler format-miss attribution.
 
@@ -19178,62 +18505,6 @@ async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
     flag = (review.context or {}).get("_strategic_spawn_budget_exhausted")
     assert flag is not None
     assert flag["scope"] == "per_review"
-
-
-@pytest.mark.asyncio
-async def test_spawn_fix_resident_session_exempt_from_per_review_cap(db_session, mocker):
-    """A resident-session task can exceed the per-review cap without being blocked;
-    only the rolling window cap applies. A batch task remains blocked at the cap."""
-    mocker.patch.dict(
-        "app.shared_state.runtime_config",
-        {"strategist_spawn_per_review_cap": 2, "strategist_spawn_window_cap": 50},
-    )
-
-    # --- Resident session task: context["_resident_session"] = True ---
-    project = Project(name="P-resident", user_id="u1")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    resident_review = Task(
-        project_id=project.id,
-        user_id="u1",
-        task_type="strategic_review",
-        status=TaskStatus.IN_PROGRESS,
-        payloads=[{"command": "review"}],
-        context={"_resident_session": True},
-    )
-    db_session.add(resident_review)
-    await db_session.commit()
-    await db_session.refresh(resident_review)
-    resident_id = str(resident_review.id)
-
-    # 3 spawns — exceeds the per-review cap of 2, all should succeed for resident.
-    for n in ("alpha", "beta", "gamma"):
-        body = await _post_spawn_fix(
-            db_session, resident_id, title=f"Fix {n}", prompt=f"do {n}"
-        )
-        assert body["status"] == "ok", f"resident spawn '{n}' was blocked: {body}"
-        assert body["deduplicated"] is False
-
-    # --- Batch task: no _resident_session flag, still blocked at cap ---
-    _project2, batch_id = await _make_strategic_review_task(db_session)
-
-    for n in ("one", "two"):
-        body = await _post_spawn_fix(
-            db_session, batch_id, title=f"Batch fix {n}", prompt=f"do {n}"
-        )
-        assert body["status"] == "ok"
-
-    refused = await _post_spawn_fix(
-        db_session,
-        batch_id,
-        title="Batch fix three",
-        prompt="do three",
-        expect_status=429,
-    )
-    assert refused["status"] == "skipped"
-    assert refused["scope"] == "per_review"
 
 
 # ── CI compliance in strategic review payload ─────────────────────────────────
@@ -20309,80 +19580,8 @@ async def test_cap_bump_task_uncapped_violation_treated_as_routine(db_session, m
 
 
 # ---------------------------------------------------------------------------
-# Session-end message hand-off: _fetch_open_messages exclusion
+# Recent-handled conversation tail: bounds and ordering
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_fetch_open_messages_excludes_session_handoff_resolved_messages(db_session):
-    """Messages resolved via session hand-off must not reappear in later strategic payloads.
-
-    Verifies two things:
-    1. ``handoff_session_messages`` can be imported and called without error.
-    2. ``_fetch_open_messages`` excludes messages with ``status='resolved'`` and
-       ``resolution='session_handoff'``, while unrelated open messages remain visible.
-
-    This covers the full observable contract: a concluded session's conversation
-    messages leave the open-message feed after hand-off, and project-wide standing
-    messages (BUG_REPORTs, questions from other sessions) are unaffected.
-    """
-    from app.session_message_handoff import handoff_session_messages
-    from app.strategic_spawning import _fetch_open_messages
-
-    project = _make_project(vision={"purpose": "test"})
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # Message that belonged to the ending session — will be handed off.
-    msg_session = ProjectMessage(
-        project_id=project.id,
-        from_type="user",
-        message_type=MessageType.NOTE,
-        content="operator chat during session",
-        status="open",
-    )
-    # Unrelated standing message — must survive the hand-off.
-    msg_other = ProjectMessage(
-        project_id=project.id,
-        from_type="user",
-        message_type=MessageType.BUG_REPORT,
-        content="standing bug report unrelated to any session",
-        status="open",
-    )
-    db_session.add_all([msg_session, msg_other])
-    await db_session.commit()
-
-    # Both messages appear before the hand-off.
-    before = await _fetch_open_messages(db_session, project.id)
-    before_ids = {m["id"] for m in before}
-    assert str(msg_session.id) in before_ids
-    assert str(msg_other.id) in before_ids
-
-    # Call the new hand-off function (exercises production code).
-    # When the resident_session_id column is not yet on the model this returns 0
-    # (safe no-op). We then directly mark the session message resolved to test
-    # the _fetch_open_messages exclusion path regardless.
-    _count = await handoff_session_messages(db_session, project.id, "ss-test123456789")
-    assert isinstance(_count, int) and _count >= 0
-
-    # Simulate the resolved state the hand-off produces (or would produce once
-    # the resident_session_id column lands from the sibling PR).
-    msg_session.status = "resolved"
-    msg_session.resolution = "session_handoff"
-    msg_session.resolved_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    db_session.add(msg_session)
-    await db_session.commit()
-
-    # After hand-off: the session message is gone; the standing message remains.
-    after = await _fetch_open_messages(db_session, project.id)
-    after_ids = {m["id"] for m in after}
-    assert str(msg_session.id) not in after_ids, (
-        "session_handoff-resolved message must be excluded from the open-message feed"
-    )
-    assert str(msg_other.id) in after_ids, (
-        "unrelated open message must remain visible after session hand-off"
-    )
 
 
 @pytest.mark.asyncio
@@ -20487,67 +19686,58 @@ async def test_fetch_recent_handled_conversation_bounds_and_order(db_session):
 
 
 @pytest.mark.asyncio
-async def test_handoff_session_messages_write_path(db_session):
-    """handoff_session_messages must resolve messages stamped with the ending
-    session_id: status='resolved', handling_state='responded',
-    resolution='session_handoff', resolved_at set.
+async def test_resident_minimal_spawn_payload_ships_knowledge_index(db_session):
+    """resident_minimal spawn payload ships the KnowledgeDocument index, not raw JSONB notes.
 
-    Tests the core write path by seeding a message WITH resident_session_id
-    matching the session being handed off.
+    Mocks build_strategic_memory_index to return a synthetic KnowledgeDoc entry
+    and verifies:
+    - the mock is called (i.e. the resident_minimal path invokes the index builder)
+    - the stored task payload contains the index entry (id/title keys present)
+    - the raw JSONB note shape ({note, set_at}) is NOT present in the result
     """
-    from app.session_message_handoff import handoff_session_messages
-
-    SESSION_ID = "ss-handoff-writetest"
-
-    project = _make_project(vision={"purpose": "test"})
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
-    # Message stamped for the ending session — must be resolved by handoff.
-    msg_session = ProjectMessage(
-        project_id=project.id,
-        from_type="user",
-        message_type=MessageType.NOTE,
-        content="operator chat during session",
-        status="open",
-        resident_session_id=SESSION_ID,
-    )
-    # Unrelated open message (NULL session) — must NOT be touched.
-    msg_unscoped = ProjectMessage(
-        project_id=project.id,
-        from_type="user",
-        message_type=MessageType.BUG_REPORT,
-        content="standing bug report — no session",
-        status="open",
-        resident_session_id=None,
-    )
-    # Message stamped for a DIFFERENT session — must NOT be touched.
-    msg_other_session = ProjectMessage(
-        project_id=project.id,
-        from_type="user",
-        message_type=MessageType.NOTE,
-        content="message from a different session",
-        status="open",
-        resident_session_id="ss-other-session",
-    )
-    db_session.add_all([msg_session, msg_unscoped, msg_other_session])
-    await db_session.commit()
+    fake_doc_id = str(uuid.uuid4())
+    fake_index = [
+        {
+            "id": fake_doc_id,
+            "title": "Keep scope tight",
+            "topic": "dev-workflow",
+            "summary": "Avoid touching unrelated files.",
+            "tags": [],
+            "created_at": "2024-01-01T00:00:00",
+        }
+    ]
 
-    count = await handoff_session_messages(db_session, project.id, SESSION_ID)
-    assert count == 1, f"expected 1 message resolved, got {count}"
-    await db_session.commit()
+    with patch(
+        "app.strategic_spawning.build_strategic_memory_index",
+        new=AsyncMock(return_value=fake_index),
+    ) as mock_bsmi:
+        spawned = await _spawn_strategic_review(project, db_session, resident_minimal=True)
+        assert spawned is True
+        # The index builder must be called at least once (for the resident_minimal path).
+        assert mock_bsmi.called, "build_strategic_memory_index was not called"
 
-    await db_session.refresh(msg_session)
-    await db_session.refresh(msg_unscoped)
-    await db_session.refresh(msg_other_session)
+    result = await db_session.execute(_select_agent_tasks(project.id))
+    payload = result.scalars().all()[0].payloads[0]
 
-    # The session-stamped message is resolved.
-    assert msg_session.status == "resolved", "stamped message must be resolved"
-    assert msg_session.handling_state == "responded", "stamped message must be RESPONDED canonically"
-    assert msg_session.resolution == "session_handoff"
-    assert msg_session.resolved_at is not None
+    notes = payload.get("strategic_memory_notes", [])
+    assert isinstance(notes, list)
 
-    # Unscoped and other-session messages are untouched.
-    assert msg_unscoped.status == "open", "NULL-session message must remain open"
-    assert msg_other_session.status == "open", "other-session message must remain open"
+    # The synthetic KnowledgeDocument entry must be in the payload.
+    ids = [n.get("id") for n in notes]
+    assert fake_doc_id in ids, f"KnowledgeDoc {fake_doc_id} not found in payload notes: {notes}"
+
+    entry = next(n for n in notes if n.get("id") == fake_doc_id)
+    assert entry.get("title") == "Keep scope tight"
+
+    # Raw JSONB note shape ({note, set_at}) must NOT appear.
+    for n in notes:
+        assert "note" not in n, f"Raw JSONB note shape leaked into spawn payload: {n}"

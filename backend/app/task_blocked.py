@@ -97,6 +97,10 @@ FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
         "warm_target_vm_id",
         "warm_target_pr",
         "warm_handoff_deadline",
+        # Recovery budgets and terminalization evidence belong to the prior
+        # attempt. A manual/automatic fresh requeue must start at attempt zero.
+        "_childless_post_commit_recovery",
+        "_childless_post_commit_abandoned",
     }
 )
 

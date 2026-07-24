@@ -63,6 +63,9 @@ export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
   criterion_superseded: 'Criterion Superseded',
   capability_proof_gate_graduated_observe: 'Proof Gate → Observe',
   capability_proof_gate_graduated_enforce: 'Proof Gate → Enforce',
+  mode_knob_graduated_observe: 'Mode → Observe',
+  mode_knob_graduated_enforce: 'Mode → Enforce',
+  mode_knob_cut_recommended: 'Mode Cut Recommended',
 };
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
@@ -74,6 +77,7 @@ export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'capability_trial_ambiguous_lift_escalation',
   'question_answer', 'criterion_retracted', 'criterion_superseded',
   'capability_proof_gate_graduated_observe', 'capability_proof_gate_graduated_enforce',
+  'mode_knob_graduated_observe', 'mode_knob_graduated_enforce', 'mode_knob_cut_recommended',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
@@ -101,7 +105,21 @@ export const ROUTINE_EVENT_LABELS: Record<string, string> = {
   review_feedback: 'review feedback',
   feedback_acknowledgment: 'feedback acks',
   'operator_decision.capture_rate_low': 'op-decision capture rate',
+  'operator_decision.summary_absent': 'op-decision summary absent',
+  'notification.dead_letter_lost': 'notification failures',
 };
+
+// Event types that the server stamps as audience=strategist-internal. All entries
+// in ROUTINE_EVENT_LABELS are strategist-internal per event_type_snapshot.json,
+// so this set is derived from those keys. Used as a fallback block in
+// classifySignalLevel: if a message arrives without an audience stamp (legacy),
+// we must not let HIGH_SIGNAL_NOTE_EVENTS drift accidentally re-promote an event
+// that the server designates strategist-internal.
+// Invariant: STRATEGIST_INTERNAL_FALLBACK_BLOCK ∩ HIGH_SIGNAL_NOTE_EVENTS = ∅
+// Pinned by: MessagesPanel.invariant.test.ts
+export const STRATEGIST_INTERNAL_FALLBACK_BLOCK: ReadonlySet<string> = new Set(
+  Object.keys(ROUTINE_EVENT_LABELS),
+);
 
 export type EventPref = 'mute' | 'routine' | 'surfaced';
 
@@ -150,10 +168,20 @@ export function classifySignalLevel(msg: {
   from_type: string;
   context: Record<string, unknown>;
 }): 'high' | 'routine' {
+  const audience = msg.context.audience as string | undefined;
+  if (audience) {
+    if (audience === 'operator-action-needed') return 'high';
+    if (audience === 'strategist-internal' || audience === 'pipeline-log') return 'routine';
+    if (audience === 'operator-fyi') return 'routine';
+  }
+  // Legacy fallback for messages without a server-stamped audience
   if ((msg.from_type || '').toLowerCase() === 'user') return 'high';
   if (['FEEDBACK', 'BLOCKER', 'BUG_REPORT', 'QUESTION'].includes(msg.message_type)) return 'high';
   if (msg.message_type === 'NOTE') {
     const et = msg.context.event_type as string | undefined;
+    // Guard: strategist-internal events must never be re-promoted by the
+    // HIGH_SIGNAL_NOTE_EVENTS fallback, even if they drift into that set.
+    if (et && STRATEGIST_INTERNAL_FALLBACK_BLOCK.has(et)) return 'routine';
     if (et && HIGH_SIGNAL_NOTE_EVENTS.has(et)) return 'high';
   }
   return 'routine';
@@ -164,6 +192,12 @@ export function effectiveSignal(
   prefs: Record<string, EventPref>,
   tempMutes?: TemporaryMutes,
 ): 'high' | 'routine' | 'mute' {
+  // Defense in depth: non-operator audiences can never be promoted by local prefs.
+  // The backend already filters these from operator surfaces, but the client must
+  // not re-promote them via event_type heuristics or a 'surfaced' pref.
+  const audience = msg.context.audience as string | undefined;
+  if (audience === 'strategist-internal' || audience === 'pipeline-log') return 'routine';
+
   const et = msg.context.event_type as string | undefined;
   if (tempMutes && isEventTypeTemporarilyMuted(et, tempMutes)) return 'mute';
   const pref = et ? prefs[et] : undefined;
@@ -174,6 +208,14 @@ export function effectiveSignal(
 }
 
 export function getToastSeverity(msg: { message_type: string; from_type: string; context: Record<string, unknown> }): 'error' | 'info' {
+  const audience = msg.context.audience as string | undefined;
+  if (audience === 'operator-action-needed') return 'error';
+  // Non-operator audiences never warrant an error toast
+  if (audience === 'strategist-internal' || audience === 'pipeline-log') return 'info';
+  // operator-fyi is an operator-reaching but informational stamp — the server has
+  // already decided it is not action-needed, so it never warrants an error toast
+  // even when the legacy message_type would (matches classifySignalLevel='routine').
+  if (audience === 'operator-fyi') return 'info';
   const et = msg.context.event_type as string | undefined;
   if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'QUESTION') return 'error';
   if (et && CRITICAL_NOTE_EVENTS.has(et)) return 'error';
@@ -184,6 +226,14 @@ export function isCriticalSeverity(msg: {
   message_type: string;
   context: Record<string, unknown>;
 }): boolean {
+  const audience = msg.context.audience as string | undefined;
+  if (audience === 'operator-action-needed') return true;
+  // Non-operator audiences are never critical from the operator's perspective
+  if (audience === 'strategist-internal' || audience === 'pipeline-log') return false;
+  // operator-fyi reaches the operator but is informational, not action-needed —
+  // the server-stamped audience is authoritative, so it is never critical even
+  // when the legacy message_type would be (matches classifySignalLevel='routine').
+  if (audience === 'operator-fyi') return false;
   if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'QUESTION') return true;
   if (msg.message_type === 'NOTE') {
     const et = msg.context.event_type as string | undefined;

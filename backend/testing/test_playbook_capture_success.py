@@ -587,6 +587,106 @@ def test_summarize_recent_successes_task_type_agnostic():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for retired task-type guard and orphan purge
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_capture_success_skips_retired_task_type(db_session: AsyncSession):
+    """capture_success_pattern returns None and creates no playbook entry for a
+    task type that is no longer in the live task-type registry (ALL_TASK_TYPES)."""
+    from app.success_patterns import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    # Satisfy noise filter: 2 prior completions of the retired type
+    await _make_completed_task(
+        db_session, project.id, task_type="panel_review", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="panel_review", scope="small"
+    )
+    task = await _make_completed_task(
+        db_session, project.id, task_type="panel_review", scope="small"
+    )
+
+    key = await capture_success_pattern(task, db_session)
+    await db_session.flush()
+
+    assert key is None, "Should return None for a retired task type"
+    doc = project.design_doc or {}
+    assert not any(k.startswith("playbook/success-panel_review") for k in doc), (
+        "No playbook entry should be created for a retired task type"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capture_success_purges_orphan_entries_for_retired_types(
+    db_session: AsyncSession,
+):
+    """When a success pattern is captured for a live task type, any pre-existing
+    playbook/success-* entries for retired task types are purged from the design_doc."""
+    from app.success_patterns import capture_success_pattern
+
+    orphan_entry = {
+        "content": "First-attempt success pattern for panel_review tasks (5 observations).",
+        "source": "success-pattern",
+        "success_count": 5,
+        "confirmed_count": 0,
+        "applicable_types": ["panel_review"],
+        "scope": "small",
+        "scope_distribution": {"small": 5},
+        "num_files_changed": 2,
+        "tests_added": False,
+        "first_attempt_success": True,
+        "updated_at": _utcnow().isoformat(),
+    }
+    project = await _make_project(
+        db_session,
+        design_doc={"playbook/success-panel_review-small": orphan_entry},
+    )
+    # 2 prior completions so the live type crosses the noise threshold
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    task = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+
+    key = await capture_success_pattern(task, db_session)
+    await db_session.flush()
+
+    assert key == "success-create-small"
+    doc = project.design_doc or {}
+    assert "playbook/success-panel_review-small" not in doc, (
+        "Orphan entry for retired task type should be purged"
+    )
+    assert "playbook/success-create-small" in doc, (
+        "Live task type entry should still be created"
+    )
+
+
+def test_purge_retired_success_entries_removes_unregistered():
+    """_purge_retired_success_entries removes entries whose task type is absent from
+    ALL_TASK_TYPES and leaves registered-type entries untouched."""
+    from app.success_patterns import _purge_retired_success_entries
+
+    doc = {
+        "playbook/success-panel_review-small": {"content": "orphan"},
+        "playbook/success-create-small": {"content": "keep"},
+        "playbook/other-key": {"content": "untouched"},
+    }
+    removed = _purge_retired_success_entries(doc)
+
+    assert removed == 1
+    assert "playbook/success-panel_review-small" not in doc
+    assert "playbook/success-create-small" in doc
+    assert "playbook/other-key" in doc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for age-based flagging
 # ─────────────────────────────────────────────────────────────────────────────
 

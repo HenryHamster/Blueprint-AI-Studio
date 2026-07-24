@@ -15,7 +15,6 @@ function makeLiveness(projectId = 'proj-1'): StrategicLivenessResponse {
     project_id: projectId,
     interaction_mode: 'chat',
     resident_session: { session_id: `ss-${projectId}`, status: 'active', stop_requested: false },
-    resident_session_available: true,
     resident_session_availability: { available: true, state: 'active', reason: null },
     resident_session_runners: [],
   };

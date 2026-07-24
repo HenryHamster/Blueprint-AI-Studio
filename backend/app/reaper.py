@@ -87,10 +87,6 @@ from app.time_utils import (
 )
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 from app.reaper_post_orphan_sweep import run_post_orphan_sweep
-from app.strategic_resident_failure_recovery import (
-    reap_authoritative_resident_turn,
-)
-from app.strategic_resident_turns import STRATEGIC_RESIDENT_TURN_TASK_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -302,36 +298,32 @@ from app.reaper_sweeps import (
     sweep_resolve_stale_open_bug_messages,
     sweep_resolve_linked_messages,
     sweep_decay_stale_open_messages,
+    sweep_auto_resolve_answered_messages,
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
     sweep_metrics_integrity,
+    sweep_mode_knob_graduation,
+    sweep_operator_inbox_liveness,
+    sweep_backfill_null_audience_messages,
     sweep_capability_backing_proofs,
     sweep_auto_clear_moot_pending_confirmations,
+    sweep_decay_stale_pending_confirmations,
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
+    sweep_reconcile_gc_guard_db_pins,
     sweep_refresh_project_compute_images,
     sweep_stranded_runner_subprocess_compute_jobs,
     sweep_proof_earn_loop,
     sweep_silent_runner_compute_jobs,
     sweep_retire_viewable_artifacts,
+    sweep_retire_consumed_message_attachments,
+    sweep_backfill_merged_named_test_coverage,
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
-from app.strategic_resident_shadow import sweep_shadow_resident_turns
-from app.strategic_resident_cleanup import sweep_resident_transition_cleanup
-from app.strategic_resident_project_change_sweep import (
-    sweep_durable_project_change_wakeups,
-)
-from app.strategic_resident_activation_sweep import (
-    sweep_missing_background_activation_wakeups,
-)
-from app.strategic_resident_wakeups import (
-    sweep_due_authoritative_resident_wakeups,
-    sweep_pending_worker_proposal_wakeups,
-)
 
 
 async def _mark_landed_parent_dependents(parent_id, session) -> None:
@@ -1061,17 +1053,6 @@ async def reaper_service():
                             _orphan_reap_crash_streaks.pop(str(task_id), None)
                             continue
                         task = fresh_task  # Use fresh data for all subsequent reads and writes
-                        resident_payload = (
-                            fresh_task.first_payload
-                            if isinstance(fresh_task.first_payload, dict)
-                            else {}
-                        )
-                        is_resident_reap = bool(
-                            fresh_task.status == TaskStatus.IN_PROGRESS
-                            and resident_payload.get("type")
-                            == STRATEGIC_RESIDENT_TURN_TASK_TYPE
-                            and resident_payload.get("shadow_only") is False
-                        )
 
                         # ── C2: per-orphan idempotency-key pre-query guard ──
                         # The reap below can flip this task to QUEUED (rate-limit /
@@ -1088,7 +1069,7 @@ async def reaper_service():
                         # the work, so reaping (which would requeue a redundant copy)
                         # is moot. Mirrors the proven pre-query guard in
                         # reaper_infra_recovery.py (~263-338).
-                        if task.idempotency_key and not is_resident_reap:
+                        if task.idempotency_key:
                             _dup_active = await session.scalar(
                                 select(Task.id).where(
                                     Task.idempotency_key == task.idempotency_key,
@@ -1255,31 +1236,6 @@ async def reaper_service():
                             fresh_task.vm_machine_type
                         ):
                             _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
-
-                        # Claimed authoritative Resident turns have a separate
-                        # authority and operation-receipt boundary. Route them
-                        # before generic task retry or any external VM/provider I/O.
-                        if is_resident_reap:
-                            resident_project_id = fresh_task.project_id
-                            # The canonical Resident helper reacquires locks in
-                            # Project -> Resident -> Task -> Receipt order.
-                            await session.rollback()
-                            session.expire_all()
-                            mutation = await reap_authoritative_resident_turn(
-                                session,
-                                project_id=resident_project_id,
-                                task_id=task_id,
-                                reap_reason=reap_reason,
-                                reap_reason_code=reap_reason_code,
-                            )
-                            logger.info(
-                                "[REAPER] Fenced Resident turn %s; promoted=%s unsettled=%d",
-                                task_id,
-                                mutation.promoted_task_id,
-                                len(mutation.unsettled_receipt_ids),
-                            )
-                            _orphan_reap_crash_streaks.pop(str(task_id), None)
-                            continue
 
                         # Read-only inputs to the I/O block + branch decisions below.
                         # No mutations happen until AFTER the relock further down.
@@ -2616,6 +2572,7 @@ async def reaper_service():
                                                     f"Last error: {str(_reap_exc)[:300]}"
                                                 ),
                                                 task_id=task_id,
+                                                event_type="task.failed",
                                             )
                                         )
                                         _qsession.add(_qtask)
@@ -2773,84 +2730,6 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Strategic-cycle starvation sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-
-                # Step 7a: project backend-only Resident shadow turns. This is a
-                # deterministic bounded projection with zero model calls.
-                try:
-                    await sweep_shadow_resident_turns(
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident shadow turn sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_resident_transition_cleanup(
-                        session_factory=AsyncSessionLocal,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident rollback cleanup sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_missing_background_activation_wakeups(
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident activation repair sweep error: {e}",
-                        exc_info=True,
-                    )
-                try:
-                    await sweep_due_authoritative_resident_wakeups(
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident due wakeup sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_pending_worker_proposal_wakeups(
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident worker-proposal wakeup sweep error: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-                try:
-                    await sweep_durable_project_change_wakeups(
-                        session_factory=AsyncSessionLocal,
-                        now=now,
-                        batch_size=32,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Resident durable project-change wakeup sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
@@ -3187,6 +3066,58 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 16c2: Shared mode-knob graduation harness — disposes
+                # dormant runtime-config mode-knobs with MEASURED evidence
+                # (graduate off→observe→enforce on measured lift, emit a legible
+                # CUT recommendation on measured no-lift, or HOLD). Runs
+                # INDEPENDENTLY of metrics_integrity_sweep_mode (a harness that
+                # disposes dormant knobs must not itself hinge on a dormant knob
+                # being enforced); gated only by its own mode_knob_graduation_enabled
+                # flag (default off). Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    await sweep_mode_knob_graduation(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Mode-knob graduation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16d: Operator-inbox liveness — always-on signal that
+                # measures forward-leaked non-actionable messages and
+                # badge-invisible linked BLOCKER/QUESTION messages per project.
+                # Runs regardless of metrics_integrity_sweep_mode; survives if
+                # that sweep is cut.  Cadence- and error-isolated.
+                _mark_reaper_progress()
+                try:
+                    await sweep_operator_inbox_liveness(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Operator-inbox liveness sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16e: Proactive NULL-audience backfill — drain the FULL
+                # population of open/linked non-user messages whose audience was
+                # never stamped (legacy pre-registry rows) by re-stamping each
+                # with its canonical audience. Complements Step 16d, which only
+                # re-stamps the narrow forward-leaked subset. Independent hourly
+                # cadence; idempotent (stamped rows stop matching); error-isolated.
+                _mark_reaper_progress()
+                try:
+                    await sweep_backfill_null_audience_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] NULL-audience backfill sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 17: Auto-resolve OPEN owned bug-class messages — resolve an
                 # open system/agent BUG_REPORT/BLOCKER once the outcome that owns
                 # its fix (a direction or a PR, read from creation-time context)
@@ -3263,6 +3194,21 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Stale-open-bug decay sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18f: Answered-question auto-resolve — close OPEN QUESTION and
+                # operator-action-needed messages that have received a genuine
+                # strategic/agent/system reply so they stop inflating the
+                # needs-action badge. BLOCKERs are never auto-resolved here.
+                _mark_reaper_progress()
+                try:
+                    await sweep_auto_resolve_answered_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Answered-message auto-resolve sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
@@ -3345,6 +3291,22 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 21a: Auto-backfill acceptance evidence from pre-existing test
+                # coverage.  Finds merged tasks whose declared named_test matches
+                # test files that shipped in the same PR, and records backfilled
+                # criterion evidence — upgrading from 'unproven' to 'backfilled' on
+                # the coverage ladder.  Hourly cadence-gated; independent timer.
+                _mark_reaper_progress()
+                try:
+                    await sweep_backfill_merged_named_test_coverage(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Backfill-merged-named-test-coverage sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 22: Capability backing-proof sweep — record backing_path
                 # proof for working capabilities whose declared backing_paths all
                 # resolve at HEAD. Hourly cadence-gated. This is a PRODUCER (writes
@@ -3395,6 +3357,21 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 22c-ii: DB-pin reconciliation — verify every DB-pinned
+                # compute-image digest has its ``inuse-`` tag in the registry,
+                # surfacing the case where GC would delete an in-use image.
+                # Hourly cadence-gated on an independent timer. Fail-open.
+                _mark_reaper_progress()
+                try:
+                    await sweep_reconcile_gc_guard_db_pins(session, now=now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] GC-guard DB-pin reconciliation error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 22d: Compute-image auto-refresh — rebuild a project's baked
                 # compute image when its declared dependency manifest changes, so
                 # the image can't silently drift from the code's real deps until an
@@ -3417,7 +3394,10 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 22e: Auto-clear moot pending_user_confirmation items —
+                # Step 22e (was inflight Cloud Build reconciliation — removed;
+                # the ProjectComputeImageBuild table was dead code).
+
+                # Step 22f: Auto-clear moot pending_user_confirmation items —
                 # remove credentials_needed/access_needed asks the runtime can
                 # already prove are resolved (owner LLM-account credential ready,
                 # live cached project repo token) so they drop off the operator's
@@ -3430,6 +3410,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Moot pending-confirmation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22e-ii: Age-decay stale pending_user_confirmation items —
+                # removes ANY item (all types including intent_change/major_decision)
+                # whose created_at is older than PENDING_CONFIRMATION_STALE_DECAY_DAYS.
+                # Complements Step 22e which is signal-based and credential/access-only.
+                # 6-hourly cadence-gated on an independent timer.
+                _mark_reaper_progress()
+                try:
+                    await sweep_decay_stale_pending_confirmations(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale pending-confirmation decay error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
@@ -3471,6 +3467,27 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         "[REAPER] Viewable artifact retirement sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 24: Retire consumed operator-chat message attachments and
+                # their DB rows for receipts consumed more than 180 days ago.
+                # message-attachments/ is exempt from the GCS bucket lifecycle
+                # rules and relies on this sweep for cleanup.
+                _mark_reaper_progress()
+                try:
+                    _attachments_retired = await sweep_retire_consumed_message_attachments(session)
+                    if _attachments_retired:
+                        logger.info(
+                            "[REAPER] Step 24: retired %d consumed message attachment(s)",
+                            _attachments_retired,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Consumed message attachment retirement sweep error: %s",
                         e,
                         exc_info=True,
                     )

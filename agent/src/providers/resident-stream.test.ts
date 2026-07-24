@@ -49,6 +49,8 @@ describe('isStrategicMutation', () => {
     expect(isStrategicMutation('./strategic set-problem-model "$(cat /tmp/x.json)"')).toBe(true);
     expect(isStrategicMutation('./strategic create-direction \'{"text":"x"}\'')).toBe(true);
     expect(isStrategicMutation('strategic retire-direction \'{}\'')).toBe(true);
+    expect(isStrategicMutation('../strategic create-direction \'{}\'')).toBe(true);
+    expect(isStrategicMutation('/workspace/strategic update-direction \'{}\'')).toBe(true);
   });
 
   it('does not count reads (fetch / design-doc get) as mutations', () => {
@@ -78,11 +80,15 @@ describe('isMessageSend', () => {
     expect(isMessageSend("./messages send 'hi there'")).toBe(true);
     expect(isMessageSend('messages send "answer" QUESTION')).toBe(true);
     expect(isMessageSend('cd /x && ./messages send \'done\'')).toBe(true);
+    expect(isMessageSend('../messages send \'from a subdir\'')).toBe(true);
+    expect(isMessageSend('/workspace/messages send \'absolute helper\'')).toBe(true);
   });
 
   it('also detects ./strategic create-message (double-post guard)', () => {
     expect(isMessageSend('./strategic create-message \'{"type":"NOTE","content":"hi"}\'')).toBe(true);
     expect(isMessageSend('cd /ws && strategic create-message \'{}\'')).toBe(true);
+    expect(isMessageSend('../strategic create-message \'{}\'')).toBe(true);
+    expect(isMessageSend('/workspace/strategic create-message \'{}\'')).toBe(true);
   });
 
   it('does not count resolve / unrelated commands', () => {

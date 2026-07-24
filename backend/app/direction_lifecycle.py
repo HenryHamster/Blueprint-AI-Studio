@@ -21,6 +21,7 @@ from app.shared_state import (
 from app.direction_refractory import get_direction_refractory_info, resolve_direction_refractory_minutes
 from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
+from app.strategic_authority_locks import commit_legacy_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -668,7 +669,7 @@ async def _process_direction_lifecycle(
     tick to be skipped rather than queue behind a 30s lock timeout.  The next
     scheduled cycle will pick up any directions that were not processed.
     """
-    from app.task_locking import project_lock  # noqa: PLC0415
+    from app.task_locking import project_lock
 
     async with project_lock(session, project.id, skip_locked=True) as _locked:
         if _locked is None:
@@ -708,7 +709,7 @@ async def _process_direction_lifecycle(
         try:
             locked = await with_vision_locked(session, project.id, _apply_retired_memory)
         except OperationalError:
-            logger.error(
+            logger.error(  # noqa: TRY400
                 "[LIFECYCLE] Vision lock timed out while flushing retired-memory entries; "
                 "entries NOT persisted — direction IDs: %s",
                 dropped_ids,
@@ -718,10 +719,6 @@ async def _process_direction_lifecycle(
             if expected_legacy_generation is None:
                 await session.commit()
             else:
-                from app.strategic_resident_transition_locks import (
-                    commit_legacy_authorized,
-                )
-
                 await commit_legacy_authorized(
                     session, project.id, expected_legacy_generation
                 )
@@ -797,15 +794,16 @@ async def _process_direction_lifecycle_locked(
         )
         if not in_active:
             return
-        from app.problem_model import (  # noqa: PLC0415
+        from app.problem_model import (
             reconcile_gaps_for_retired_directions,
+            sanitize_problem_model_raw,
         )
 
         try:
             _reconciled, _ = reconcile_gaps_for_retired_directions(
-                raw, [retired_id], _utcnow().isoformat()
+                sanitize_problem_model_raw(raw), [retired_id], _utcnow().isoformat()
             )
-        except Exception as _reconcile_exc:  # fail-open — never block the retire
+        except Exception as _reconcile_exc:  # fail-open — never block the retire  # noqa: BLE001
             logger.warning(
                 f"[AUTONOMOUS] Gap reconcile failed for retired direction "
                 f"{retired_id}: {_reconcile_exc}"
@@ -826,7 +824,7 @@ async def _process_direction_lifecycle_locked(
         gap_id = direction.get("gap_id")
         if not did or not gap_id:
             return
-        from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+        from app.problem_model import reconcile_gap_staffing_raw_result
 
         result = reconcile_gap_staffing_raw_result(
             project.problem_model,
@@ -876,7 +874,7 @@ async def _process_direction_lifecycle_locked(
             f"[AUTONOMOUS] Auto-retired lifetime-burn direction {did} after "
             f"{lb_pause_count} burn-pause cycles: {d.get('text', '')[:60]}"
         )
-        from app.models import Alert, AlertSeverity  # noqa: PLC0415
+        from app.models import Alert, AlertSeverity
 
         session.add(
             Alert(
@@ -894,7 +892,7 @@ async def _process_direction_lifecycle_locked(
         try:
             from app.notification_dispatch import (
                 post_direction_milestone_message,
-            )  # noqa: PLC0415
+            )
 
             await post_direction_milestone_message(
                 session,
@@ -904,7 +902,7 @@ async def _process_direction_lifecycle_locked(
                 reason=d["auto_completed_reason"],
                 direction_id=did,
             )
-        except Exception as _notify_exc:
+        except Exception as _notify_exc:  # noqa: BLE001
             logger.warning(
                 f"[NOTIFY] Failed to post lifetime-burn retire milestone for {did}: "
                 f"{_notify_exc}"
@@ -966,7 +964,7 @@ async def _process_direction_lifecycle_locked(
                 f"{_sc_flag_cycles} scaffolding-flagged cycles (designated pass): "
                 f"{_d.get('text', '')[:60]}"
             )
-            from app.models import Alert, AlertSeverity  # noqa: PLC0415
+            from app.models import Alert, AlertSeverity
 
             session.add(
                 Alert(
@@ -982,7 +980,7 @@ async def _process_direction_lifecycle_locked(
                 )
             )
             try:
-                from app.notification_dispatch import (  # noqa: PLC0415
+                from app.notification_dispatch import (
                     post_direction_milestone_message,
                 )
 
@@ -994,7 +992,7 @@ async def _process_direction_lifecycle_locked(
                     reason=_d["auto_completed_reason"],
                     direction_id=_retire_did,
                 )
-            except Exception as _sc_notify_exc:
+            except Exception as _sc_notify_exc:  # noqa: BLE001
                 logger.warning(
                     f"[NOTIFY] Failed to post scaffolding auto-retire milestone: {_sc_notify_exc}"
                 )
@@ -1092,7 +1090,7 @@ async def _process_direction_lifecycle_locked(
                 f"[NOTIFY] Escalation retry succeeded for direction {d.get('id')} "
                 f"after {retries} prior retries"
             )
-        except Exception as _retry_exc:
+        except Exception as _retry_exc:  # noqa: BLE001
             d["escalation_notification_retries"] = retries + 1
             directions_modified = True
             logger.warning(
@@ -1252,7 +1250,7 @@ async def _process_direction_lifecycle_locked(
                         entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
                     ),
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # noqa: PERF203
                 continue
         return (spend / autonomous) if autonomous > 0 else None
 
@@ -1273,7 +1271,7 @@ async def _process_direction_lifecycle_locked(
             for key, val in (entry.get("cost_by_provider_model") or {}).items():
                 try:
                     totals[key] = totals.get(key, 0.0) + max(0.0, float(val))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError):  # noqa: PERF203
                     continue
         return totals, sum(totals.values())
 
@@ -1449,11 +1447,11 @@ async def _process_direction_lifecycle_locked(
                 cumulative_cost += max(
                     0.0, float(entry.get("estimated_cost_usd") or 0.0)
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # noqa: PERF203
                 continue
         # Include evicted cycles folded into history_aggregate so the budget
         # check fires correctly for long-lived directions past the 10-cycle window.
-        try:
+        try:  # noqa: SIM105
             cumulative_cost += max(
                 0.0,
                 float(
@@ -1561,7 +1559,7 @@ async def _process_direction_lifecycle_locked(
                     )
                     if fingerprint:
                         d["error_fingerprint"] = fingerprint
-                except Exception as _fp_exc:
+                except Exception as _fp_exc:  # noqa: BLE001
                     logger.warning(
                         f"[DIAGNOSIS] Failed to compute error fingerprint for {did}: {_fp_exc!r}"
                     )
@@ -1653,7 +1651,7 @@ async def _process_direction_lifecycle_locked(
                         # Clear any pending retry stamps from a prior failed escalation
                         d.pop("escalation_notification_pending", None)
                         d.pop("escalation_notification_retries", None)
-                    except Exception as _esc_exc:
+                    except Exception as _esc_exc:  # noqa: BLE001
                         logger.warning(
                             f"[NOTIFY] Failed to post remediation escalation message: {_esc_exc}"
                         )
@@ -1676,7 +1674,7 @@ async def _process_direction_lifecycle_locked(
                 if pause_reason.startswith("Lifetime burn backstop:"):
                     from app.notification_dispatch import (
                         post_direction_burn_pause_message,
-                    )  # noqa: PLC0415
+                    )
 
                     await post_direction_burn_pause_message(
                         session,
@@ -1689,7 +1687,7 @@ async def _process_direction_lifecycle_locked(
                 elif pause_reason.startswith("Churn guardrail:"):
                     from app.notification_dispatch import (
                         post_direction_churn_pause_message,
-                    )  # noqa: PLC0415
+                    )
 
                     await post_direction_churn_pause_message(
                         session,
@@ -1702,7 +1700,7 @@ async def _process_direction_lifecycle_locked(
                 else:
                     from app.notification_dispatch import (
                         post_direction_milestone_message,
-                    )  # noqa: PLC0415
+                    )
 
                     await post_direction_milestone_message(
                         session,
@@ -1712,7 +1710,7 @@ async def _process_direction_lifecycle_locked(
                         reason=pause_reason,
                         direction_id=did,
                     )
-            except Exception as _notify_exc:
+            except Exception as _notify_exc:  # noqa: BLE001
                 logger.warning(
                     f"[NOTIFY] Failed to post direction pause notification: {_notify_exc}"
                 )
@@ -1786,7 +1784,7 @@ async def _process_direction_lifecycle_locked(
                 try:
                     from app.notification_dispatch import (
                         post_direction_milestone_message,
-                    )  # noqa: PLC0415
+                    )
 
                     await post_direction_milestone_message(
                         session,
@@ -1797,7 +1795,7 @@ async def _process_direction_lifecycle_locked(
                         direction_id=did,
                         evidence=d["churn_retirement_evidence"],
                     )
-                except Exception as _notify_exc:
+                except Exception as _notify_exc:  # noqa: BLE001
                     logger.warning(
                         f"[NOTIFY] Failed to post churn-retirement recommendation for "
                         f"{did}: {_notify_exc}"
@@ -1849,7 +1847,7 @@ async def _process_direction_lifecycle_locked(
                 try:
                     from app.notification_dispatch import (
                         post_direction_milestone_message,
-                    )  # noqa: PLC0415
+                    )
 
                     await post_direction_milestone_message(
                         session,
@@ -1859,7 +1857,7 @@ async def _process_direction_lifecycle_locked(
                         reason=d["auto_completed_reason"],
                         direction_id=did,
                     )
-                except Exception as _notify_exc:
+                except Exception as _notify_exc:  # noqa: BLE001
                     logger.warning(
                         f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                     )
@@ -1926,7 +1924,7 @@ async def _process_direction_lifecycle_locked(
                 try:
                     from app.notification_dispatch import (
                         post_direction_outcome_stalled_message,
-                    )  # noqa: PLC0415
+                    )
 
                     await post_direction_outcome_stalled_message(
                         session,
@@ -1935,7 +1933,7 @@ async def _process_direction_lifecycle_locked(
                         evidence=scaffolding_ev,
                         direction_id=did,
                     )
-                except Exception as _notify_exc:
+                except Exception as _notify_exc:  # noqa: BLE001
                     logger.warning(
                         f"[NOTIFY] Failed to post outcome-stalled message for {did}: "
                         f"{_notify_exc}"
@@ -1943,8 +1941,8 @@ async def _process_direction_lifecycle_locked(
                 # Spawn one memo task to capture this signal as a citable artifact.
                 # The flag already gates first-detection only so no dedup query needed.
                 try:
-                    from app.plan_completion import TASK_PRIORITY_MAP  # noqa: PLC0415
-                    from app.task_completion import _apply_synthesized_memo  # noqa: PLC0415
+                    from app.plan_completion import TASK_PRIORITY_MAP
+                    from app.task_completion import _apply_synthesized_memo
 
                     _scaffolding_topic = (d.get("text") or "")[
                         :120
@@ -1983,10 +1981,10 @@ async def _process_direction_lifecycle_locked(
                         _scaffolding_memo.id,
                         did,
                     )
-                except Exception:
-                    try:
+                except Exception:  # noqa: BLE001
+                    try:  # noqa: SIM105
                         _scaffolding_memo.status = TaskStatus.FAILED
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                     logger.warning(
                         f"[AUTONOMOUS] Failed to spawn scaffolding memo for direction {did}",
@@ -2046,7 +2044,7 @@ async def _process_direction_lifecycle_locked(
                     elif _advanced_flag_cycle and _flag_cycles == _esc_threshold:
                         # Escalation notification at mid-threshold.
                         try:
-                            from app.notification_dispatch import (  # noqa: PLC0415
+                            from app.notification_dispatch import (
                                 post_direction_outcome_scaffolding_escalation_message,
                             )
 
@@ -2058,7 +2056,7 @@ async def _process_direction_lifecycle_locked(
                                 evidence=scaffolding_ev,
                                 direction_id=did,
                             )
-                        except Exception as _esc_notify_exc:
+                        except Exception as _esc_notify_exc:  # noqa: BLE001
                             logger.warning(
                                 f"[NOTIFY] Failed to post scaffolding escalation for {did}: {_esc_notify_exc}"
                             )
@@ -2109,10 +2107,6 @@ async def _process_direction_lifecycle_locked(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
-
             await commit_legacy_authorized(
                 session, project.id, expected_legacy_generation
             )

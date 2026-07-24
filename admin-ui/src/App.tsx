@@ -28,9 +28,9 @@ import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs
 const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
 const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
+const FleetRunnersDashboard = lazy(() => import('./components/FleetRunnersDashboard').then(m => ({ default: m.FleetRunnersDashboard })));
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
-import { useStrategicSession } from './hooks/useStrategicSession';
 import { useSettingsRouterProps } from './hooks/useSettingsRouterProps';
 import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
@@ -43,14 +43,12 @@ const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => 
 const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
 const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
 const StrategicContextRail = lazy(() => import('./components/StrategicContextRail').then(m => ({ default: m.StrategicContextRail })));
-const StrategicSessionControl = lazy(() => import('./components/StrategicSessionControl').then(m => ({ default: m.StrategicSessionControl })));
 const WelcomeScreen = lazy(() => import('./components/WelcomeScreen').then(m => ({ default: m.WelcomeScreen })));
 const ProjectManagementModal = lazy(() => import('./components/ProjectManagementModal').then(m => ({ default: m.ProjectManagementModal })));
 const BulkActionBar = lazy(() => import('./components/BulkActionBar').then(m => ({ default: m.BulkActionBar })));
 const CommandPaletteHost = lazy(() => import('./components/CommandPaletteHost').then(m => ({ default: m.CommandPaletteHost })));
 const KeyboardShortcutsOverlay = lazy(() => import('./components/KeyboardShortcutsOverlay').then(m => ({ default: m.KeyboardShortcutsOverlay })));
 const NullBranchDiagnosticsPanel = lazy(() => import('./components/NullBranchDiagnosticsPanel').then(m => ({ default: m.NullBranchDiagnosticsPanel })));
-import type { StrategicAccountSpendStatus, StrategicInteractionMode } from './components/StrategicSessionControl';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 import type { ProjectMessage } from './types/messages';
@@ -62,18 +60,18 @@ const PipelineWorkspace = lazy(() => import('./components/PipelineWorkspace').th
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useStrategicLiveness } from './hooks/useStrategicLiveness';
+import { useStrategicSession } from './hooks/useStrategicSession';
+import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { useVersionLifecycle, hasVersionLifecycleData } from './hooks/useVersionLifecycle';
-import { type StrategicStateAttentionItem } from './strategicStateApi';
+import { type StrategicAccountSpendStatus, type StrategicStateAttentionItem } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
-import { normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
-import { computeStrategicSessionActivity } from './utils/strategicSessionLive';
 import { STATUS_OPTIONS } from './constants';
 import { reportUiLoadTiming } from './uiLoadTiming';
 
@@ -494,8 +492,22 @@ export default function App() {
   const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
 
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
+  const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
+  const {
+    strategicWorkbenchState, strategicInteractionMode, strategicSessionActive,
+    strategicSessionStatus, strategicSessionState, strategicSessionReason,
+    residentStrategicSessionRunners, strategicSessionSelectedRunnerId,
+    savingStrategicWorkbench, strategicSessionBusy, persistStrategicWorkbench,
+    handleSelectStrategicRunner, handleStartStrategicSession, handleStopStrategicSession,
+  } = useStrategicSession({
+    selectedProjectId, addToast: s.addToast, strategicReadModel,
+    strategicLiveness: strategicLiveness.data,
+  });
+  const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
+    persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
+  }, [persistStrategicWorkbench]);
   // Monotonic epoch that advances each time the strategic-state poll delivers
-  // new data. Threaded into MessagesPanel → useResidentConversation so the
+  // new data. Threaded into MessagesPanel → useConversation so the
   // conversation refresh piggybacks on the strategic-state poll cadence instead
   // of running its own independent timer (eliminating the duplicate assembly).
   const strategicPollEpochRef = useRef(0);
@@ -506,11 +518,6 @@ export default function App() {
       setStrategicPollEpoch(strategicPollEpochRef.current);
     }
   }, [strategicReadModel.data]);
-  // Fast mode + resident-session liveness probe: resolves the mode indicator and
-  // active/dead chip on reload well before the heavy strategic-state fetch lands.
-  // Once strategicReadModel.data hydrates, its values take precedence (fallback
-  // in useStrategicSession), so there is no flicker when the full state arrives.
-  const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
   useEffect(() => {
     refreshStrategicReadModelRef.current = () => {
       void strategicReadModel.refresh();
@@ -519,33 +526,6 @@ export default function App() {
       refreshStrategicReadModelRef.current = () => {};
     };
   }, [strategicReadModel.refresh]);
-  const {
-    strategicWorkbenchState,
-    strategicInteractionMode,
-    strategicSessionActive,
-    strategicSessionStatus,
-    residentStrategicSession,
-    residentStrategicSessionAvailable,
-    strategicSessionState,
-    strategicSessionReason,
-    residentStrategicSessionRunners,
-    strategicSessionSelectedRunnerId,
-    savingStrategicWorkbench,
-    checkingInStrategicSession,
-    strategicSessionBusy,
-    chatComposerContextDescriptor,
-    taskContextSessionProps,
-    persistStrategicWorkbench,
-    updateStrategicSessionRefs,
-    handleSelectStrategicRunner,
-    handleStrategicCheckIn,
-    handleStartStrategicSession,
-    handleStopStrategicSession,
-    strategicWorkbenchOperatorSurfaceTouchedRef,
-    strategicWorkbenchRestoreProjectRef,
-  } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel, strategicLiveness: strategicLiveness.data });
-  const strategicOperatorDecisionSummary = residentStrategicSession?.operator_decision_summary ?? null;
-  const strategicTurnLatencySummary = residentStrategicSession?.turn_latency_summary ?? null;
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -755,16 +735,6 @@ export default function App() {
     return false;
   }, [activeTab, applyPipelineSection, hasVersionLifecycle, pipelineSection, projectSection, runtimeSection]);
   useEffect(() => {
-    if (!selectedProjectId || !strategicWorkbenchState?.active_surface) return;
-    if (strategicWorkbenchOperatorSurfaceTouchedRef.current) return;
-    if (strategicWorkbenchRestoreProjectRef.current === selectedProjectId) return;
-    const tab = tabForWorkbenchSurface(strategicWorkbenchState.active_surface);
-    if (!tab) return;
-    strategicWorkbenchRestoreProjectRef.current = selectedProjectId;
-    if (tab !== 'pipeline') s.setShowArchive(false);
-    if (tab !== activeTab) setPrimaryTab(tab);
-  }, [activeTab, s, selectedProjectId, setPrimaryTab, strategicWorkbenchState?.active_surface]);
-  useEffect(() => {
     if (activeTab !== 'pipeline') return;
     if (s.showArchive) {
       setPipelineSection('archive');
@@ -850,15 +820,11 @@ export default function App() {
 
   // activeTab drives the four operator modes: Strategic, Pipeline, Project, Runtime.
   const handleTabChange = useCallback((tab: PrimaryTab) => {
-    strategicWorkbenchOperatorSurfaceTouchedRef.current = true;
-    strategicWorkbenchRestoreProjectRef.current = s.selectedProjectId;
     if (tab !== 'pipeline') {
       s.setShowArchive(false);
     }
-    const surface = workbenchSurfaceForTab(tab);
-    if (surface) void persistStrategicWorkbench({ active_surface: surface });
     s.setActiveTab(tab);
-  }, [s, persistStrategicWorkbench]);
+  }, [s]);
 
   const openTrackedTaskStreams = useCallback(() => {
     setArchiveVisible(false);
@@ -933,7 +899,6 @@ export default function App() {
   const openNextWorkbenchSubtab = useCallback(() => {
     cycleCurrentWorkbenchSection(1);
   }, [cycleCurrentWorkbenchSection]);
-  const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicInteractionMode);
   const strategicAccountSpend = useMemo<StrategicAccountSpendStatus>(() => {
     const accounts = s.maxPlanAccounts ?? [];
     const cooldownAccounts = accounts.filter(account => Object.keys(account.disabled_models ?? {}).length > 0).length;
@@ -959,20 +924,6 @@ export default function App() {
       dailyCostCeilingUsd: s.dailyCostCeilingUsd,
     };
   }, [s.cumulativeCost, s.dailyCostCeilingUsd, s.maxPlanAccounts]);
-  const railLiveActivity = useMemo(
-    () => computeStrategicSessionActivity(s.strategicSessionTranscript, []),
-    [s.strategicSessionTranscript],
-  );
-  const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
-    void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
-  }, [persistStrategicWorkbench]);
-  const switchStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
-    setStrategicInteractionMode(mode);
-    strategicWorkbenchOperatorSurfaceTouchedRef.current = true;
-    strategicWorkbenchRestoreProjectRef.current = s.selectedProjectId;
-    s.setShowArchive(false);
-    s.setActiveTab('chat');
-  }, [s, setStrategicInteractionMode]);
 
   const workbenchCommands = useWorkbenchCommands({
     selectedProjectId: s.selectedProjectId,
@@ -990,17 +941,11 @@ export default function App() {
     problemModelRevision: strategicReadModel.data?.problem_model.revision,
     hasDesignDoc: strategicReadModel.data?.design.has_design_doc,
     designRevision: strategicReadModel.data?.design.revision,
-    strategicInteractionMode: currentStrategicInteractionMode,
-    strategicState: strategicReadModel.data ?? null, strategicWorkbenchState,
-    savingStrategicWorkbench,
-    checkingInStrategicSession,
-    switchStrategicInteractionMode,
-    markStrategicChecked: handleStrategicCheckIn,
+    strategicState: strategicReadModel.data ?? null,
     focusStrategicComposer,
     openStrategicContextTarget: openStrategicContextWorkspaceTarget,
     openStrategicContextWorkspace,
     openStrategicMessageTarget: openStrategicMessageTargetFromCommandPalette,
-    updateStrategicSessionRefs,
     handleTabChange,
     setCommandPaletteOpen,
     setPipelineSection,
@@ -1270,30 +1215,10 @@ export default function App() {
       <StrategicContextWorkspace
         open={strategicContextWorkspaceOpen}
         state={strategicReadModel.data ?? null}
-        workbenchState={strategicWorkbenchState}
-        savingSession={savingStrategicWorkbench}
-        savingSessionRefs={savingStrategicWorkbench}
-        accountSpend={strategicAccountSpend}
-        sessionActive={strategicSessionActive}
-        sessionStatus={strategicSessionStatus}
-        sessionState={strategicSessionState}
-        sessionReason={strategicSessionReason}
-        sessionBusy={strategicSessionBusy}
-        sessionRunners={residentStrategicSessionRunners}
-        sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
-        operatorDecisionSummary={strategicOperatorDecisionSummary}
-        turnLatencySummary={strategicTurnLatencySummary}
         projectId={selectedProjectId}
-        onSelectRunner={handleSelectStrategicRunner}
-        onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
-        onStopSession={handleStopStrategicSession}
         onClose={closeStrategicContextWorkspace}
         onOpenTarget={openStrategicContextWorkspaceTarget}
         onOpenMessageTarget={strategicMessageTarget.open}
-        onModeChange={setStrategicInteractionMode}
-        onOpenAccounts={openRuntimeAccounts}
-        onOpenSpend={openRuntimeAnalytics}
-        onUpdateSessionRefs={updateStrategicSessionRefs}
       />
       </Suspense>
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
@@ -1354,13 +1279,9 @@ export default function App() {
           showTitle={false}
           actions={(
             <>
-              <Suspense fallback={null}>
               <StrategicSessionControl
-                mode={normalizeStrategicInteractionMode(strategicInteractionMode)}
+                currentMode={strategicInteractionMode === 'continuous' ? 'continuous' : 'chat'}
                 saving={savingStrategicWorkbench}
-                localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
-                runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
-                accountSpend={strategicAccountSpend}
                 sessionActive={strategicSessionActive}
                 sessionStatus={strategicSessionStatus}
                 sessionState={strategicSessionState}
@@ -1368,30 +1289,13 @@ export default function App() {
                 sessionBusy={strategicSessionBusy}
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
-                operatorDecisionSummary={strategicOperatorDecisionSummary}
-                turnLatencySummary={strategicTurnLatencySummary}
                 onSelectRunner={handleSelectStrategicRunner}
-                onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
+                onStartSession={handleStartStrategicSession}
                 onStopSession={handleStopStrategicSession}
                 onModeChange={setStrategicInteractionMode}
-                onOpenDevices={() => {
-                  setRuntimeSection('devices');
-                  handleTabChange('runtime');
-                }}
-                onOpenCompute={() => {
-                  setRuntimeSection('compute');
-                  handleTabChange('runtime');
-                }}
-                onOpenAccounts={openRuntimeAccounts}
-                onOpenSpend={openRuntimeAnalytics}
-                showMonitoringControls={false}
                 density="compact"
-                hideDetailsOnMobile
-                className="flex"
               />
-              </Suspense>
-              {!chatComposerContextDescriptor && (
-                <button
+              <button
                   type="button"
                   onClick={openStrategicContextWorkspace}
                   className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 lg:hidden"
@@ -1401,7 +1305,6 @@ export default function App() {
                   <PanelRightOpen className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
                   <span>Context</span>
                 </button>
-              )}
               <button
                 type="button"
                 onClick={toggleChatRail}
@@ -1440,16 +1343,17 @@ export default function App() {
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
-                strategicSessionTranscript={s.strategicSessionTranscript}
                 focusComposerSignal={strategicComposerFocusSignal}
                 realtimeRefreshSignal={messageRealtimeRefreshSignal}
                 realtimeCanonicalMessage={realtimeCanonicalProjection?.message ?? null}
                 realtimeCanonicalRefetchRequired={realtimeCanonicalProjection?.canonicalRefetchRequired ?? false}
                 strategicPollEpoch={strategicPollEpoch}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
-                strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
+                strategicState={strategicReadModel.data ?? null}
+                strategicWorkbenchState={strategicWorkbenchState}
+                strategicSessionTranscript={s.strategicSessionTranscript}
+                onStrategicInteraction={() => { persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
-                onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onOpenCommandPalette={openCommandPalette}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
                 alerts={combinedAlerts}
@@ -1476,7 +1380,6 @@ export default function App() {
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
-                liveActivity={railLiveActivity}
                 onOpenProjectSection={(section) => openStrategicContextTarget({ surface: 'project', section })}
                 onOpenPipeline={() => openStrategicContextTarget({ surface: 'pipeline', section: 'flow' })}
                 onOpenRuntimeHealth={() => openStrategicContextTarget({ surface: 'runtime', section: 'health' })}
@@ -1488,10 +1391,7 @@ export default function App() {
                 onOpenTask={handleViewTaskById}
                 onOpenMessages={strategicMessageTarget.open}
                 onOpenTarget={openStrategicContextTarget}
-                workbenchState={strategicWorkbenchState}
                 accountSpend={strategicAccountSpend}
-                savingSessionRefs={savingStrategicWorkbench}
-                onUpdateSessionRefs={updateStrategicSessionRefs}
                 onConfirmationResolved={() => { void strategicReadModel.refresh(); }}
                 addToast={s.addToast}
               />
@@ -1565,7 +1465,6 @@ export default function App() {
             onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             onConfigureTargets={handleConfigureTargets}
             onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task - investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })}
-            onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })}
             gatedTaskTypes={s.gatedTaskTypes}
             onApproveExperiment={s.handleApprove}
             onDismissExperiment={s.handleDismiss}
@@ -1579,6 +1478,12 @@ export default function App() {
             versionLifecycleRefreshing={versionLifecycleRefreshing}
             refreshVersionLifecycle={refreshVersionLifecycle}
           />
+          </Suspense>
+        </ErrorBoundary>
+      ) : activeTab === 'fleet' ? (
+        <ErrorBoundary level="panel">
+          <Suspense fallback={<WorkspaceSkeleton />}>
+          <FleetRunnersDashboard />
           </Suspense>
         </ErrorBoundary>
       ) : (
@@ -1633,7 +1538,6 @@ export default function App() {
             attentionTasks: backendAttentionTasks,
             localFallbackTasks: localAttentionTasks,
             trackedTaskIds: s.trackedTaskIds,
-            taskContextSessionProps,
             onOpenTask: handleOpenTaskDetails,
             onOpenPipeline: () => handleTabChange('pipeline'),
             onTrackTask: s.trackTask,
@@ -1882,18 +1786,6 @@ export default function App() {
           onDuplicate={s.openDuplicateTaskModal}
           onResetIterationCap={s.handleResetIterationCap}
           onTriggerRollup={s.handleTriggerRollup}
-          onPanelReview={(task) => {
-            const payload = (task.payloads?.[0] ?? {}) as Record<string, unknown>;
-            const prNumber = payload.pr_number as number | undefined;
-            s.openPrefilledTaskModal({
-              taskType: 'panel_review',
-              title: `Panel review PR #${prNumber ?? ''}`,
-              prompt: '',
-              prNumber,
-              prBranch: payload.branch as string | undefined,
-              baseBranch: payload.base_branch as string | undefined,
-            });
-          }}
           onNavigateToTask={(taskId) => {
             handleViewTaskById(taskId);
           }}

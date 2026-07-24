@@ -17,7 +17,6 @@ import {
 } from './projectTools';
 
 const apiFetchMock = vi.mocked(apiFetch);
-
 const ARTIFACT_REF = {
   id: 'ref-notes-7',
   artifact_ref_id: 'ref-notes-7',
@@ -53,17 +52,13 @@ describe('createResidentToolArtifactRef', () => {
       },
     );
     expect(result).toEqual({ state: 'ready', artifact_ref: ARTIFACT_REF });
-    expect(result.state === 'ready' && result.artifact_ref.artifact_ref_id).toBe(ARTIFACT_REF.id);
   });
 
   test('sends the durable rendered-image receipt for Whiteboard references', async () => {
     apiFetchMock.mockResolvedValue(new Response(JSON.stringify({
       state: 'ready',
       artifact_ref: { ...ARTIFACT_REF, kind: 'whiteboard', tool_id: 'wb-1' },
-    }), {
-      status: 201,
-      headers: { 'Content-Type': 'application/json' },
-    }));
+    }), { status: 201 }));
     const renderedImage = {
       attachment_id: 'upload-1',
       storage_uri: 'gs://resident/upload-1',
@@ -84,16 +79,13 @@ describe('createResidentToolArtifactRef', () => {
     );
   });
 
-  test('returns a typed pending response instead of casting 202 as an ArtifactRef', async () => {
+  test('returns a typed pending response for 202', async () => {
     apiFetchMock.mockResolvedValue(new Response(JSON.stringify({
       state: 'pending',
       promotion_intent_id: 'intent-1',
       receipt_id: 'upload-1',
       retry_after_ms: 5000,
-    }), {
-      status: 202,
-      headers: { 'Content-Type': 'application/json' },
-    }));
+    }), { status: 202 }));
 
     const result = await createResidentToolArtifactRef('project-a', 'wb-1', 11, {
       attachment_id: 'upload-1',
@@ -110,13 +102,10 @@ describe('createResidentToolArtifactRef', () => {
     expect('artifact_ref' in result).toBe(false);
   });
 
-  test('surfaces a 409 as a revision-aware conflict instead of a generic send failure', async () => {
+  test('surfaces a 409 as a revision-aware conflict', async () => {
     apiFetchMock.mockResolvedValue(new Response(JSON.stringify({
       detail: { current_revision: 12, action: 'reload_or_rebase' },
-    }), {
-      status: 409,
-      headers: { 'Content-Type': 'application/json' },
-    }));
+    }), { status: 409 }));
 
     const error = await createResidentToolArtifactRef('project-a', 'notes-1', 11)
       .then(() => null, cause => cause);
@@ -128,10 +117,9 @@ describe('createResidentToolArtifactRef', () => {
     });
   });
 
-  test('treats a transient 401 as retryable so token refresh reuses the same receipt', async () => {
+  test('treats 401 as retryable so replay reuses the same receipt', async () => {
     apiFetchMock.mockResolvedValue(new Response(JSON.stringify({ detail: 'Token expired' }), {
       status: 401,
-      headers: { 'Content-Type': 'application/json' },
     }));
 
     const error = await createResidentToolArtifactRef('project-a', 'wb-1', 11, {

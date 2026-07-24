@@ -100,7 +100,7 @@ export const PrimaryTabNav = memo(function PrimaryTabNav({
       className={navClassName}
       aria-label="Primary workbench sections"
     >
-      {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => {
+      {(['chat', 'pipeline', 'project', 'runtime', 'fleet'] as const).map(tab => {
         const isActive = activeTab === tab;
         const chatBadgeCount = tab === 'chat'
           ? Math.max(openMessageCount, newSinceLastVisitCount)
@@ -268,7 +268,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
             title="Open command palette (Ctrl+K)"
             aria-label="Open command palette (Ctrl+K)"
             data-testid="header-command-search"
-            className="workbench-focus inline-flex h-7 w-full min-w-0 max-w-sm items-center gap-2 rounded-md border border-workbench-border/80 bg-workbench-control px-2 text-xs text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-workbench-layer hover:text-neutral-200"
+            className="workbench-focus inline-flex h-7 w-full min-w-0 items-center gap-2 rounded-md border border-workbench-border/80 bg-workbench-control px-2 text-xs text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-workbench-layer hover:text-neutral-200"
           >
             <Search className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />
             <kbd className="shrink-0 rounded border border-workbench-border/80 bg-workbench-shell px-1.5 py-0.5 font-mono text-ui-sm leading-none text-neutral-500">

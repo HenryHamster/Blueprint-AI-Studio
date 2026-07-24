@@ -2623,6 +2623,61 @@ async def test_markerless_childless_evaluating_recovered(svc_db, mocker):
     synthetic_payload = mock_process.call_args.args[1]
     assert synthetic_payload.status == TaskStatus.COMPLETED
     assert "subtasks" in (synthetic_payload.logs or "")
+    claim_token = mock_process.call_args.kwargs[
+        "_expected_childless_recovery_token"
+    ]
+    assert len(claim_token) == 32
+
+
+@pytest.mark.asyncio
+async def test_markerless_candidate_page_cannot_be_starved(svc_db, mocker):
+    """Older ineligible/malformed rows cannot hide or poison an eligible plan."""
+    project = await _make_project(svc_db)
+    for index in range(50):
+        svc_db.add(
+            Task(
+                id=_uuid.uuid4(),
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": f"ineligible {index}"}],
+                status=TaskStatus.EVALUATING,
+                created_by="ORCHESTRATOR",
+                post_commit_pending=False,
+                updated_at=_naive_utc_ago(minutes=30),
+            )
+        )
+    svc_db.add(
+        Task(
+            id=_uuid.uuid4(),
+            project_id=project.id,
+            payloads=[{"type": "plan", "prompt": "malformed"}],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            post_commit_pending=False,
+            plan_output={"subtasks": {"not": "an array"}},
+            updated_at=_naive_utc_ago(minutes=40),
+        )
+    )
+    eligible = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    svc_db.add(eligible)
+    await svc_db.commit()
+
+    mock_process = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new=AsyncMock(),
+    )
+    await _recover_childless_evaluating_without_marker()
+
+    mock_process.assert_awaited_once()
+    assert mock_process.await_args.args[0] == eligible.id
 
 
 @pytest.mark.asyncio
@@ -2640,6 +2695,12 @@ async def test_markerless_childless_skips_childed_parent(svc_db, mocker):
         payloads=[{"type": "plan", "prompt": "decompose"}],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 1,
+                "claim_token": "prior-success",
+            }
+        },
         post_commit_pending=False,
         plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
         updated_at=_naive_utc_ago(minutes=20),
@@ -2694,6 +2755,226 @@ async def test_markerless_childless_skips_within_grace(svc_db, mocker):
 
     await _recover_childless_evaluating_without_marker()
     mock_process.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_markerless_childless_records_attempt_and_lock_scope(svc_db, mocker):
+    """A failed retry is durably counted and identifies project contention."""
+    import uuid as _uuid
+
+    from app.task_lifecycle import PostCommitLocked
+
+    project = await _make_project(svc_db)
+    task = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_process = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new=AsyncMock(
+            side_effect=PostCommitLocked(
+                "project locked",
+                lock_scope="project",
+                resource_id=project.id,
+            )
+        ),
+    )
+
+    await _recover_childless_evaluating_without_marker()
+    # The claim/failure writes refresh updated_at, but retry metadata must make
+    # the task eligible again on the very next sweep.
+    await _recover_childless_evaluating_without_marker()
+
+    await svc_db.refresh(task)
+    meta = (task.context or {})["_childless_post_commit_recovery"]
+    assert meta["attempts"] == 2
+    assert meta["last_lock_scope"] == "project"
+    assert "PostCommitLocked" in meta["last_error"]
+    assert "claimed_at" not in meta
+    assert mock_process.await_count == 2
+    first_token = mock_process.await_args_list[0].kwargs[
+        "_expected_childless_recovery_token"
+    ]
+    second_token = mock_process.await_args_list[1].kwargs[
+        "_expected_childless_recovery_token"
+    ]
+    assert first_token != second_token
+
+
+@pytest.mark.asyncio
+async def test_markerless_failure_record_cannot_dirty_fresh_requeue(svc_db, mocker):
+    """A requeue that wins during processing must not regain the old budget."""
+    from app import services
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    project = await _make_project(svc_db)
+    task = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    async def _requeue_then_fail(*args, **kwargs):
+        async with services.AsyncSessionLocal() as race_session:
+            raced = await race_session.get(Task, task.id)
+            reset_task_for_fresh_attempt(raced)
+            raced.status = TaskStatus.QUEUED
+            race_session.add(raced)
+            await race_session.commit()
+        raise RuntimeError("old recovery failed after requeue")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new=AsyncMock(side_effect=_requeue_then_fail),
+    )
+
+    await _recover_childless_evaluating_without_marker()
+
+    await svc_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert "_childless_post_commit_recovery" not in (task.context or {})
+    assert "_childless_post_commit_abandoned" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_markerless_late_failure_cannot_clear_newer_claim(svc_db):
+    """A late token-A failure cannot erase the active token-B lease."""
+    from app.recovery_post_commit_pending import (
+        _record_childless_recovery_failure,
+    )
+
+    project = await _make_project(svc_db)
+    task = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 2,
+                "claim_token": "token-b",
+                "claimed_at": _naive_utcnow().isoformat(),
+            }
+        },
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    await _record_childless_recovery_failure(task.id, "token-a", RuntimeError("late"))
+
+    await svc_db.refresh(task)
+    meta = (task.context or {})["_childless_post_commit_recovery"]
+    assert meta["claim_token"] == "token-b"
+    assert "claimed_at" in meta
+    assert "last_error" not in meta
+
+
+@pytest.mark.asyncio
+async def test_markerless_childless_terminalizes_after_bounded_attempts(
+    svc_db, mocker
+):
+    """Exhausted marker-less recovery becomes visible FAILED, not endless churn."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        post_commit_failed=False,
+        context={
+            "_childless_post_commit_recovery": {
+                "attempts": 20,
+                "last_error": "PostCommitLocked: project locked",
+            }
+        },
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_process = AsyncMock()
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _recover_childless_evaluating_without_marker()
+
+    mock_process.assert_not_called()
+    await svc_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.post_commit_failed is True
+    abandoned = (task.context or {})["_childless_post_commit_abandoned"]
+    assert abandoned["after_attempts"] == 20
+
+
+@pytest.mark.asyncio
+async def test_markerless_recovery_budget_resets_for_fresh_attempt(svc_db, mocker):
+    """A manual/automatic requeue gets a new recovery budget, not attempt 21."""
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    project = await _make_project(svc_db)
+    task = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        context={
+            "_childless_post_commit_recovery": {"attempts": 20},
+            "_childless_post_commit_abandoned": {"after_attempts": 20},
+        },
+        plan_output={"subtasks": [{"type": "create", "prompt": "old"}]},
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    reset_task_for_fresh_attempt(task)
+    task.status = TaskStatus.QUEUED
+    await svc_db.commit()
+    assert "_childless_post_commit_recovery" not in (task.context or {})
+    assert "_childless_post_commit_abandoned" not in (task.context or {})
+
+    # Simulate the newly dispatched plan reporting its own completion before a
+    # hard kill at the spawn boundary.
+    task.status = TaskStatus.EVALUATING
+    task.plan_output = {"subtasks": [{"type": "create", "prompt": "new"}]}
+    task.updated_at = _naive_utc_ago(minutes=20)
+    await svc_db.commit()
+
+    mock_process = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new=AsyncMock(side_effect=RuntimeError("retry me")),
+    )
+    await _recover_childless_evaluating_without_marker()
+
+    await svc_db.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert "_childless_post_commit_abandoned" not in (task.context or {})
+    assert (task.context or {})["_childless_post_commit_recovery"]["attempts"] == 1
+    mock_process.assert_awaited_once()
 
 
 @pytest.mark.asyncio

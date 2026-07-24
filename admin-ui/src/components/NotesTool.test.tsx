@@ -174,15 +174,15 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     expect(saveToolContent).toHaveBeenCalledWith('proj-a', 'notes-1', { text: 'save before leaving' }, 2);
   });
 
-  test('Share with Resident flushes the exact dirty revision before creating its reference', async () => {
+  test('Share in conversation flushes the exact dirty revision before creating its reference', async () => {
     vi.mocked(fetchToolContent).mockResolvedValue({ content: { text: 'loaded' }, content_revision: 2 });
     vi.mocked(saveToolContent).mockResolvedValue({ content_revision: 3 });
     vi.mocked(createResidentToolArtifactRef).mockResolvedValue({ state: 'ready', artifact_ref: NOTES_ARTIFACT_REF });
 
     const textarea = await mount();
-    await act(async () => { typeInto(textarea, 'exact resident context'); });
+    await act(async () => { typeInto(textarea, 'exact conversation context'); });
     const share = Array.from(host!.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
+      button => button.textContent === 'Share in conversation',
     ) as HTMLButtonElement;
 
     await act(async () => {
@@ -195,7 +195,7 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     expect(saveToolContent).toHaveBeenCalledWith(
       'proj-a',
       'notes-1',
-      { text: 'exact resident context' },
+      { text: 'exact conversation context' },
       2,
     );
     expect(createResidentToolArtifactRef).toHaveBeenCalledWith('proj-a', 'notes-1', 3);
@@ -209,7 +209,7 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     }));
   });
 
-  test('an unresolved conflict refuses Resident handoff', async () => {
+  test('an unresolved conflict refuses conversation handoff', async () => {
     vi.mocked(fetchToolContent)
       .mockResolvedValueOnce({ content: { text: 'loaded' }, content_revision: 2 })
       .mockResolvedValueOnce({ content: { text: 'server version' }, content_revision: 9 });
@@ -221,7 +221,7 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
 
     const share = Array.from(host!.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
+      button => button.textContent === 'Share in conversation',
     ) as HTMLButtonElement;
     expect(share.disabled).toBe(true);
     await act(async () => { share.click(); await Promise.resolve(); });
@@ -230,14 +230,14 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     expect(dispatchResidentToolHandoff).not.toHaveBeenCalled();
   });
 
-  test('a failed flush never creates a Resident reference', async () => {
+  test('a failed flush never creates a conversation reference', async () => {
     vi.mocked(fetchToolContent).mockResolvedValue({ content: { text: 'loaded' }, content_revision: 2 });
     vi.mocked(saveToolContent).mockRejectedValue(new Error('storage unavailable'));
 
     const textarea = await mount();
     await act(async () => { typeInto(textarea, 'still unsaved'); });
     const share = Array.from(host!.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
+      button => button.textContent === 'Share in conversation',
     ) as HTMLButtonElement;
     await act(async () => {
       share.click();

@@ -9,7 +9,7 @@ import {
   parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks, encodeInterrupt,
   isStrategicMutation, isMessageSend, type ResidentStreamEvent,
 } from './resident-stream.js';
-import { getProviderRunner } from './runners.js';
+import { getProviderRunner, matchesAuthFailure, matchesRateLimit } from './runners.js';
 
 // ── Resident (persistent, streaming, interactive) Claude session ─────────────
 //
@@ -86,6 +86,10 @@ export interface ResidentTurnResult {
    *  The handler uses this to detect context-window pressure and trigger compaction
    *  before the model's context limit is reached. */
   inputTokens: number;
+  /** A top-level provider error result ended this turn. */
+  providerFailed: boolean;
+  /** Canonical provider failure when terminal evidence is recognizable. */
+  failureCategory: 'rate_limited' | 'dead_auth' | null;
 }
 
 export interface ResidentSessionEvent {
@@ -124,6 +128,8 @@ export interface ResidentSession {
   isAlive(): boolean;
   /** The child exit code once it has exited, else null. */
   exitCode(): number | null;
+  /** Classified terminal provider failure from bounded stderr/stream errors. */
+  failureCategory?(): 'rate_limited' | 'dead_auth' | null;
 }
 
 export interface ResidentSessionOptions {
@@ -157,6 +163,8 @@ interface ActiveTurn {
   interrupted: boolean;
   timedOut: boolean;
   hardTimedOut: boolean;
+  providerFailed: boolean;
+  failureCategory: 'rate_limited' | 'dead_auth' | null;
   sawDeltaThisMessage: boolean;
   /** per-active-turn stall budget for THIS turn (may override the session default). */
   stallTimeoutMs: number;
@@ -239,6 +247,21 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   let alive = true;
   let closed = false;
   let exitCodeVal: number | null = null;
+  let terminalFailureCategory: 'rate_limited' | 'dead_auth' | null = null;
+  let failureTextTail = '';
+  const appendFailureText = (text: string): void => {
+    if (!text) return;
+    failureTextTail = (failureTextTail + '\n' + text).slice(-16_000);
+  };
+  const classifyFailure = (text: string): 'rate_limited' | 'dead_auth' | null => {
+    if (matchesRateLimit(text, runner.provider, runner.authMode)) return 'rate_limited';
+    if (matchesAuthFailure(text, runner.provider)) return 'dead_auth';
+    return null;
+  };
+  const clearFailureEvidence = (): void => {
+    failureTextTail = '';
+    terminalFailureCategory = null;
+  };
   let activeTurn: ActiveTurn | null = null;
   let idleTimer: NodeJS.Timeout | null = null;
   // Count of top-level `result` events still owed by turns that were force-settled
@@ -317,6 +340,8 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       totalToolCallDurationMs: t.totalToolCallDurationMs,
       meanInterTokenMs,
       inputTokens: t.inputTokens,
+      providerFailed: t.providerFailed,
+      failureCategory: t.failureCategory,
     });
     resolveIdleWaiters();
   };
@@ -369,6 +394,20 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   };
 
   const handleEvent = (ev: ResidentStreamEvent): void => {
+    if (
+      staleResultsPending === 0
+      && !ev.nested
+      && (ev.kind === 'error'
+        || (ev.kind === 'result' && ev.isError && ev.isTurnResult)) && ev.text
+    ) {
+      appendFailureText(ev.text);
+      const category = classifyFailure(failureTextTail);
+      if (category) terminalFailureCategory = category;
+      if (activeTurn && ev.kind === 'result' && ev.isError && ev.isTurnResult) {
+        activeTurn.providerFailed = true;
+        activeTurn.failureCategory = category;
+      }
+    }
     if (ev.sessionId && !sessionId) sessionId = ev.sessionId;
     // Superseded-turn suppression. When a turn was force-settled (stall path)
     // while the child stayed alive, that abandoned turn still owes exactly one
@@ -506,6 +545,14 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         // Swallow a result owed by an already-force-settled turn so it cannot
         // resolve a newer turn's promise (see staleResultsPending).
         if (staleResultsPending > 0) { staleResultsPending -= 1; break; }
+        // A successful result proves earlier warnings were transient. Scope the
+        // evidence to the current terminal failure so an old warning cannot
+        // poison an unrelated process exit later in the session.
+        if (!ev.isError) clearFailureEvidence();
+        if (ev.isError && activeTurn) {
+          activeTurn.providerFailed = true;
+          activeTurn.failureCategory = classifyFailure(failureTextTail);
+        }
         settleTurn(ev.text ?? '', false);
         break;
       }
@@ -537,12 +584,15 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   });
   child.stderr.on('data', (data: Buffer) => {
     const text = sanitize(data.toString());
+    appendFailureText(text);
     if (text.trim()) log(`[resident stderr] ${text.slice(0, 300)}`);
   });
 
   child.on('error', (err: Error) => {
+    appendFailureText(err.message);
     alive = false;
     emit({ kind: 'error', text: err.message });
+    terminalFailureCategory = classifyFailure(failureTextTail);
     if (activeTurn) settleTurn('', true);
     resolveIdleWaiters();
   });
@@ -552,6 +602,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     // No further results can arrive from a dead child; drop any pending swallows
     // so a subsequent (post-restart) result is never wrongly discarded.
+    if (!closed) {
+      terminalFailureCategory = classifyFailure(failureTextTail);
+      if (activeTurn) activeTurn.failureCategory = terminalFailureCategory;
+    }
     staleResultsPending = 0;
     if (typeof pid === 'number') unregisterChildPid(pid);
     if (activeTurn) settleTurn('', true);
@@ -607,6 +661,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
         processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
         totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
+        providerFailed: false, failureCategory: terminalFailureCategory,
       });
     }
     if (activeTurn) {
@@ -630,6 +685,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         stallTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
         startedAtMs, firstTokenAtMs: null, toolCallCount: 0, totalToolCallDurationMs: 0,
+        providerFailed: false, failureCategory: null,
         toolCallStartTimes: new Map(), lastTokenAtMs: null, interTokenIntervalsMs: [],
         inputTokens: 0,
       };
@@ -649,6 +705,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
           processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
           totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
+          providerFailed: false, failureCategory: terminalFailureCategory,
         });
         return;
       }
@@ -667,5 +724,6 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     sessionId: () => sessionId,
     isAlive: () => alive && !closed,
     exitCode: () => exitCodeVal,
+    failureCategory: () => terminalFailureCategory ?? classifyFailure(failureTextTail),
   };
 }

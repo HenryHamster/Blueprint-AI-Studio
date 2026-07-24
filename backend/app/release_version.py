@@ -932,6 +932,31 @@ def summarize_qualification_state(
     if status == "not_promoted":
         conf = lq.get("confidence")
         thr = lq.get("threshold")
+        sub_scores = lq.get("sub_scores")
+        resolved = lq.get("resolved_dimensions")
+        retired_smoke_participated = bool(
+            lq.get("smoketest_enabled") is True
+            or (isinstance(sub_scores, dict) and "smoketest" in sub_scores)
+            or (isinstance(resolved, dict) and "smoketest" in resolved)
+            or lq.get("blocker") == "smoketest_startup_failed"
+        )
+        if retired_smoke_participated:
+            return {
+                "state": "not_promoted",
+                "summary": (
+                    "This historical not-promoted verdict is STALE because retired "
+                    "qualifier VM smoke participated in it. Do not remediate or wait "
+                    "on the retired smoke gate; re-qualify under the current audit + "
+                    "test-erosion policy."
+                ),
+                "stale": True,
+                "stale_reason": "retired_qualifier_smoketest",
+                # Preserve raw archival evidence for operator diagnosis without
+                # presenting the retired blocker as current guidance.
+                "blocker": lq.get("blocker"),
+                "detail": lq.get("detail"),
+                "sub_scores": sub_scores,
+            }
         return {
             "state": "not_promoted",
             "summary": (
@@ -1061,7 +1086,7 @@ def summarize_qualification_state(
             )
         elif error_sub == "spawn_failed":
             sub_summary = (
-                "Qualification FAILED to start: the audit/smoketest spawn failed. "
+                "Qualification FAILED to start: a qualifier child spawn failed. "
                 "This is an operational problem — re-qualify to retry."
             )
         else:

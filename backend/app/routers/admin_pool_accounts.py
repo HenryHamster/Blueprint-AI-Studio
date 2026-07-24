@@ -1191,6 +1191,7 @@ async def remove_max_plan_account(
                         f"Account {db_account.name} ({account_id[:8]}) was force-removed; "
                         f"these tasks may fail on next token refresh: {short_list}{suffix}"
                     ),
+                    event_type="capacity.all_accounts_blocked",
                 )
             )
 

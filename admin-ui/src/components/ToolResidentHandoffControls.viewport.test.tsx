@@ -1,7 +1,7 @@
 import { afterEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 import { ToolResidentHandoffControls } from './ToolResidentHandoffControls';
 
 describe('ToolResidentHandoffControls — viewport regression', () => {
@@ -16,14 +16,8 @@ describe('ToolResidentHandoffControls — viewport regression', () => {
     vi.resetAllMocks();
   });
 
-  // The lane-ownership input + Share/Ask buttons wrap in a flex row that must
-  // not push past the 375px mobile viewport, and none of the labels/status text
-  // may be silently clipped. The wrapper carries data-viewport-allow-small-target
-  // (intentional compact chip styling), so the touch-target check is opted out;
-  // overflow and text-truncation are the operator-visible risks this surface
-  // must not regress.
-  test('renders handoff controls without overflow or clipped text at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
+  test('renders handoff controls without overflow, clipped text, or small targets at 375px', async () => {
+    const renderControls = async () => {
       host = document.createElement('div');
       document.body.appendChild(host);
       const r = createRoot(host);
@@ -36,13 +30,15 @@ describe('ToolResidentHandoffControls — viewport regression', () => {
           />,
         );
       });
-    });
+    };
+    await expectNoOverflowAt(375, renderControls);
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('button')).toBeTruthy();
     await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
   });
 
-  test('renders the disabled-reason + preparing states without overflow at 375px', async () => {
+  test('renders disabled-reason and preparing states without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       document.body.appendChild(host);

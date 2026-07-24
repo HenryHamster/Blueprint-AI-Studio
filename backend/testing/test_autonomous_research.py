@@ -40,6 +40,7 @@ from app.autonomous_spawn_budget import (
 )
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
+from app.direction_metrics import _compute_direction_quality_score
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 from app.capability_demand import collect_missing_capability_demand
 from app.payload_schemas import validate_internal_payload
@@ -2625,7 +2626,7 @@ async def test_concurrent_spawn_ticks_create_exactly_one_research_task(
     # This eligibility read doubles as the rendezvous point: it is the last shared
     # step BOTH ticks execute before the task INSERT. (M4 relocated
     # check_anomaly_actions to AFTER the spawn/flush and wrapped the post-flush
-    # staging in a Project->Resident authority FOR UPDATE, so it can no longer be
+    # staging in a project-authority FOR UPDATE, so it can no longer be
     # the pre-INSERT barrier: a tick that flushed first holds the idempotency-key
     # index lock while waiting there, and the second tick blocks on the duplicate
     # insert and never arrives — a deadlock.) Rendezvousing here forces both ticks
@@ -3219,8 +3220,8 @@ async def test_autonomous_budget_classifies_downstream_churn_out_of_initiative_c
         ),
         Task(
             project_id=project.id,
-            title="Panel Review: servicing",
-            payloads=[{"type": "panel_review", "pr_number": 101}],
+            title="Review: servicing",
+            payloads=[{"type": "review", "pr_number": 101, "branch": "feat/servicing"}],
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             parent_task_id=parent_research.id,
@@ -3270,9 +3271,8 @@ async def test_autonomous_budget_classifies_downstream_churn_out_of_initiative_c
     assert snapshot.task_type_counts["initiative"] == {"create": 1, "research": 1}
     assert snapshot.task_type_counts["servicing"] == {
         "fix": 1,
-        "panel_review": 1,
         "perf": 1,
-        "review": 1,
+        "review": 2,
     }
     assert snapshot.task_type_counts["other"] == {"new_future_type": 1}
 
@@ -7920,10 +7920,10 @@ async def test_stage_dropout_breakdown(db_session):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# tasks_completed_no_pr type-awareness — review/fix/panel_review children that
-# are ATTACHED to a real (open) PR are NOT genuine no-CODE no-ops.  They carry a
-# pr_number (context/payload) even without a PULL_REQUEST artifact of their own,
-# so they must be EXCLUDED from the no-op bucket.  (This is the no-op gate; the
+# tasks_completed_no_pr type-awareness — review/fix children that are ATTACHED
+# to a real (open) PR are NOT genuine no-CODE no-ops.  They carry a pr_number
+# (context/payload) even without a PULL_REQUEST artifact of their own, so they
+# must be EXCLUDED from the no-op bucket.  (This is the no-op gate; the
 # separate _opened_pr type-skip for the merge-VOLUME metrics is unchanged.)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -8156,80 +8156,6 @@ async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
     )
 
 
-@pytest.mark.asyncio
-async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
-    """A completed panel_review task with pr_number in payload and no PULL_REQUEST
-    artifact is ATTACHED to a real (open) PR, so it must NOT be counted as a
-    no-CODE no-op. PanelReviewPayload.pr_number is the PR under review (input) —
-    a real PR association that disqualifies the child from tasks_completed_no_pr.
-    """
-    direction_id = "d-openedpr004"
-    direction = _active_direction(direction_id, "Panel-review PR classification")
-    project = Project(
-        name="Panel Review PR Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    research_task = await _make_research_task(project, direction, db_session)
-
-    panel_review_task = Task(
-        project_id=project.id,
-        title="Panel review of PR #77",
-        payloads=[{"type": "panel_review", "pr_number": 77, "branch": "feature/z"}],
-        status=TaskStatus.COMPLETED,
-        context={"research_task_id": str(research_task.id)},
-        parent_task_id=research_task.id,
-        created_by="ORCHESTRATOR",
-    )
-    db_session.add(panel_review_task)
-    await db_session.commit()
-    await db_session.refresh(panel_review_task)
-
-    dirs = project.directions or []
-    for d in dirs:
-        if d.get("id") == direction_id:
-            d["research_history"] = [
-                {
-                    "timestamp": "2026-04-07T00:00:00",
-                    "task_id": str(research_task.id),
-                    "tasks_created": 1,
-                    "finding_titles": [],
-                }
-            ]
-            break
-    project.directions = dirs
-    from sqlalchemy.orm.attributes import flag_modified
-
-    flag_modified(project, "directions")
-    db_session.add(project)
-    await db_session.commit()
-
-    await _update_direction_research_outcomes(
-        project_id=project.id,
-        direction_id=direction_id,
-        research_task_id=str(research_task.id),
-        session=db_session,
-    )
-
-    await db_session.refresh(project)
-    dirs = project.directions or []
-    d = next(x for x in dirs if x.get("id") == direction_id)
-    entry = d["research_history"][0]
-
-    # panel_review task attached to an open PR (pr_number in payload) → NOT a
-    # no-CODE no-op, so it is excluded from tasks_completed_no_pr.
-    assert entry.get("tasks_completed_no_pr") == 0, (
-        f"Panel_review task attached to a real PR (pr_number in payload) should NOT count as "
-        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
-        f"entry={entry}"
-    )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # _strategic_failures auto-decay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8261,8 +8187,7 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
     # cycle) or strategic_review (strategy-only cycle).
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    # M4 also spawns a background strategic_resident_turn shadow task alongside the
-    # legacy strategic task; filter to the strategic type under test before asserting.
+    # Filter to the strategic type under test before asserting.
     strategic = [
         t
         for t in tasks
@@ -8312,25 +8237,43 @@ async def test_strategic_failures_auto_decay_persists_cleared_counter(db_session
 
 def test_project_has_purpose_resolves_problem_model_then_vision():
     """problem_model.intent.purpose is canonical; vision.purpose is the legacy fallback."""
-    from app.problem_model import project_has_purpose
+    from app.problem_model import project_has_purpose, resolve_project_purpose
 
     project = Project(name="Purpose Resolution", user_id="test-user-123")
 
     project.problem_model = {"intent": {"purpose": "build a bot"}}
     project.vision = {}
     assert project_has_purpose(project) is True
+    assert resolve_project_purpose(project) == "build a bot"
+
+    project.problem_model = {
+        "intent": {"purpose": "agent rewrite", "user_purpose": "operator purpose"}
+    }
+    assert project_has_purpose(project) is True
+    assert resolve_project_purpose(project) == "operator purpose"
+
+    project.problem_model = {
+        "intent": {
+            "purpose": "<from analysis>",
+            "user_purpose": "operator fallback",
+        }
+    }
+    assert resolve_project_purpose(project) == "operator fallback"
 
     project.problem_model = {}
     project.vision = {"purpose": "legacy purpose"}
     assert project_has_purpose(project) is True
+    assert resolve_project_purpose(project) == "legacy purpose"
 
     project.problem_model = {"intent": {"purpose": "   "}}
     project.vision = {"purpose": ""}
     assert project_has_purpose(project) is False
+    assert resolve_project_purpose(project) == ""
 
     project.problem_model = None
     project.vision = None
     assert project_has_purpose(project) is False
+    assert resolve_project_purpose(project) == ""
 
 
 @pytest.mark.asyncio
@@ -11127,29 +11070,14 @@ def _history_entry(
     }
 
 
-def _load_quality_score():
-    """Sibling cluster (cluster 1/2) adds _compute_direction_quality_score.
-    Skip until it lands so this cluster can merge independently."""
-    pytest.importorskip("app.direction_metrics")
-    import app.direction_metrics as dm
-
-    if not hasattr(dm, "_compute_direction_quality_score"):
-        pytest.skip(
-            "_compute_direction_quality_score not yet available (sibling cluster pending)"
-        )
-    return dm._compute_direction_quality_score
-
-
 def test_quality_score_neutral_for_new_direction():
     """A direction with no history returns the neutral 0.5 sentinel."""
-    compute = _load_quality_score()
-    assert compute({}) == 0.5
-    assert compute({"research_history": []}) == 0.5
+    assert _compute_direction_quality_score({}) == 0.5
+    assert _compute_direction_quality_score({"research_history": []}) == 0.5
 
 
 def test_quality_score_high_for_actionable_taxonomy():
     """Failures dominated by code_defect/scope_related yield a healthy score."""
-    _compute_direction_quality_score = _load_quality_score()
     d = {
         "research_history": [
             _history_entry(tasks_created=3, prs_merged=2, code_defect=3),
@@ -11166,7 +11094,6 @@ def test_quality_score_high_for_actionable_taxonomy():
 
 def test_quality_score_low_for_structural_taxonomy():
     """Failures dominated by infra_related/review_quality yield a poor score."""
-    _compute_direction_quality_score = _load_quality_score()
     d = {
         "research_history": [
             _history_entry(tasks_created=3, prs_merged=0, infra_related=3),
@@ -11183,7 +11110,6 @@ def test_quality_score_low_for_structural_taxonomy():
 
 def test_quality_score_penalizes_wasted_cycles():
     """Cycles where tasks are created but nothing merges reduce the score."""
-    _compute_direction_quality_score = _load_quality_score()
     healthy = {
         "research_history": [
             _history_entry(tasks_created=2, prs_merged=2, code_defect=1),
@@ -11205,7 +11131,6 @@ def test_quality_score_penalizes_wasted_cycles():
 
 def test_quality_score_penalizes_scope_dominated_failures():
     """When scope_related failures dominate (>50%), the score signals mis-sizing."""
-    _compute_direction_quality_score = _load_quality_score()
     balanced = {
         "research_history": [
             _history_entry(
@@ -11228,7 +11153,6 @@ def test_quality_score_penalizes_scope_dominated_failures():
 @pytest.mark.asyncio
 async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
     """With equivalent productivity, the direction with healthier taxonomy wins selection."""
-    _load_quality_score()  # skip unless sibling integration has landed
     from app.shared_state import runtime_config as _runtime_config
 
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)

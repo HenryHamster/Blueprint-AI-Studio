@@ -17,12 +17,12 @@ vi.mock('../strategicStateApi', async () => {
   fetchStrategicWorkbenchState: vi.fn(),
   updateStrategicWorkbenchState: vi.fn(),
   fetchStrategicSession: vi.fn(),
+  startStrategicSession: vi.fn(),
+  stopStrategicSession: vi.fn(),
   fetchStrategicConversation: vi.fn(),
   createStrategicSessionMessage: vi.fn(),
   checkInStrategicSession: vi.fn(),
   executeStrategicWorkSessionCommand: vi.fn(),
-  startStrategicSession: vi.fn(),
-  stopStrategicSession: vi.fn(),
   getMessageAttachmentUploadUrl: vi.fn(),
   deleteMessageAttachmentUpload: vi.fn(),
   getMessageAttachmentDownloadUrl: vi.fn(),
@@ -33,7 +33,6 @@ vi.mock('../strategicStateApi', async () => {
   },
   fetchStrategicState: vi.fn(),
   fetchStrategicLiveness: vi.fn(),
-  fetchResidentEngineHealth: vi.fn(),
   };
 });
 
@@ -75,7 +74,7 @@ function makeState(projectId = 'proj-1'): StrategicStateResponse {
     directions: { total_count: 0, active_count: 0, paused_count: 0, primary: null },
     messages: { counts: { open: 0, linked: 0 }, items: [] },
     tasks: {
-      counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, failed: 0, completed: 0, total: 0 },
+      counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, parked: 0, failed: 0, completed: 0, total: 0 },
       cumulative_estimated_cost_usd: 0,
     },
     design: { has_design_doc: false },

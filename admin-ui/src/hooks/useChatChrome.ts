@@ -1,7 +1,7 @@
 import { useState } from 'react';
 
 /**
- * Collapsed/expanded state for the Resident conversation utility chrome — the
+ * Collapsed/expanded state for the strategist conversation utility chrome — the
  * "Search conversation" bar, the inline alerts banner, and the "Needs your action"
  * strip. Collapsed by default so the conversation stays clean; the operator expands
  * it on demand. Persisted per-browser under `bp.chatChromeExpanded`.

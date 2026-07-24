@@ -23,9 +23,12 @@ Six classes are addressed:
    alembic/versions. ``TestDroppedColumnResidualAbsent`` greps the codebase
    and fails if any such reference is reintroduced.
 
-4. **.test_durations staleness** — ``backend/.test_durations`` was tracked in
-   git and recurred as a low-severity staleness finding. ``TestTestDurationsNotTracked``
-   asserts it is listed in ``.gitignore`` and is not tracked in git.
+4. **.test_durations freshness** — ``backend/.test_durations`` is the committed
+   pytest-split duration cache that enables time-balanced CI shard splitting.
+   ``TestTestDurationsCommittedAndFresh`` asserts it is NOT in ``.gitignore``,
+   IS tracked by git, is valid JSON mapping node IDs to positive floats, contains
+   at least a substantial minimum number of entries, and that sampled test file
+   prefixes still exist on disk (staleness ratchet).
 
 5. **Stale documentation references** — long-lived documentation in /docs/ and
    /docs/plans/ must not reference removed code paths or UI components.
@@ -446,50 +449,63 @@ class TestDroppedColumnResidualAbsent:
 
 
 # ---------------------------------------------------------------------------
-# 4. .test_durations staleness — must be gitignored and untracked
+# 4. .test_durations freshness — must be committed, valid JSON, and not stale
 # ---------------------------------------------------------------------------
 
+# Minimum number of entries the committed durations file must contain.
+# Set safely below the current collection size (~10k nodes) so the threshold
+# does not need to be bumped on every minor test addition, but high enough to
+# catch an accidentally emptied or truncated file.
+_TEST_DURATIONS_MIN_ENTRIES = 5000
 
-class TestTestDurationsNotTracked:
-    """``backend/.test_durations`` is a pytest-split duration cache generated
-    locally by pytest-split. It is large (~1.7 MB) and was previously
-    committed, causing a recurring low-severity staleness finding.
+# When sampling committed node-ID keys for staleness, require at least this
+# fraction of sampled keys to have their test file still present on disk.
+_TEST_DURATIONS_STALE_TOLERANCE = 0.80
+
+
+class TestTestDurationsCommittedAndFresh:
+    """``backend/.test_durations`` is the committed pytest-split duration cache
+    that enables time-balanced CI shard splitting.
 
     Guards:
-    - ``.gitignore`` must list the ``backend/.test_durations`` pattern.
-    - The file must not be tracked in git (``git ls-files`` must not list it).
+    - ``.gitignore`` must NOT list the ``backend/.test_durations`` pattern.
+    - The file must be tracked in git (``git ls-files`` must list it).
+    - The file must be valid JSON mapping strings to positive floats.
+    - The file must contain at least ``_TEST_DURATIONS_MIN_ENTRIES`` entries.
+    - A sample of committed node-ID keys must still have their test files on disk.
+
+    If the staleness check fails, regenerate with:
+        bash scripts/store-backend-durations.sh
+    then commit the updated backend/.test_durations.
 
     Skipped when the repo root is unavailable (CI backend-only Docker context).
     """
 
-    def test_test_durations_in_gitignore(self):
-        """.gitignore must contain ``backend/.test_durations``."""
+    def test_test_durations_committed_valid_and_covers_collection(self):
+        """backend/.test_durations must be tracked, valid JSON, and cover the test collection."""
+        import json
+        import random
+
         gitignore_path = _REPO_ROOT / ".gitignore"
-        if not _repo_root_available() or not gitignore_path.exists():
-            pytest.skip(
-                "repo root / .gitignore not available in this test environment "
-                "(CI docker context is ./backend; run locally or via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
-            )
-        lines = gitignore_path.read_text().splitlines()
-        assert "backend/.test_durations" in lines, (
-            ".gitignore is missing the 'backend/.test_durations' pattern. "
-            "Without it, pytest-split's duration cache file can be accidentally "
-            "staged and committed, causing recurring staleness audit findings. "
-            "Add 'backend/.test_durations' to .gitignore."
-        )
+        durations_path = _BACKEND_ROOT / ".test_durations"
 
-    def test_test_durations_not_git_tracked(self):
-        """backend/.test_durations must not be a tracked git file.
-
-        If this fails, run: git rm --cached backend/.test_durations
-        """
         if not _repo_root_available():
             pytest.skip(
                 "repo root .git not available in this test environment "
                 "(CI docker context is ./backend; run locally or via "
                 "scripts/test-backend.sh from a checkout for enforcement)"
             )
+
+        # (a) .gitignore must NOT contain the pattern
+        if gitignore_path.exists():
+            lines = gitignore_path.read_text().splitlines()
+            assert "backend/.test_durations" not in lines, (
+                ".gitignore still lists 'backend/.test_durations'. "
+                "Remove the line so the committed durations file can be tracked. "
+                "Time-balanced CI shard splitting requires this file to be committed."
+            )
+
+        # (b) File must be tracked by git
         result = subprocess.run(
             ["git", "ls-files", "backend/.test_durations"],
             cwd=str(_REPO_ROOT),
@@ -497,10 +513,69 @@ class TestTestDurationsNotTracked:
             text=True,
         )
         tracked_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        assert not tracked_paths, (
-            "backend/.test_durations is tracked in git. "
-            "Remove it with: git rm --cached backend/.test_durations\n"
-            "Then commit the change to stop the staleness finding from recurring."
+        assert tracked_paths, (
+            "backend/.test_durations is not tracked in git. "
+            "Commit it so CI shards can auto-detect it for time-based splitting. "
+            "Generate with: bash scripts/store-backend-durations.sh"
+        )
+
+        # (c) File must exist on disk and be valid JSON mapping str→positive float
+        assert durations_path.exists(), (
+            "backend/.test_durations does not exist on disk even though git reports it tracked. "
+            "Run: bash scripts/store-backend-durations.sh && git add backend/.test_durations"
+        )
+        try:
+            with durations_path.open() as f:
+                data = json.load(f)
+        except json.JSONDecodeError as exc:
+            pytest.fail(
+                f"backend/.test_durations is not valid JSON: {exc}\n"
+                "Regenerate with: bash scripts/store-backend-durations.sh"
+            )
+        assert isinstance(data, dict), (
+            "backend/.test_durations must be a JSON object mapping node IDs to durations."
+        )
+        bad_values = [
+            (k, v) for k, v in list(data.items())[:20]
+            if not isinstance(v, (int, float)) or v <= 0
+        ]
+        assert not bad_values, (
+            f"backend/.test_durations has entries with non-positive or non-numeric durations: "
+            f"{bad_values[:5]}. All values must be positive floats."
+        )
+
+        # (d) Non-emptiness / coverage floor
+        assert len(data) >= _TEST_DURATIONS_MIN_ENTRIES, (
+            f"backend/.test_durations has only {len(data)} entries "
+            f"(minimum: {_TEST_DURATIONS_MIN_ENTRIES}). "
+            "The file appears truncated or was generated from an incomplete collection. "
+            "Regenerate with: bash scripts/store-backend-durations.sh"
+        )
+
+        # (e) Cheap staleness check: sample committed node-ID keys and verify
+        #     their test file prefixes still exist on disk.
+        keys = list(data.keys())
+        sample_size = min(200, len(keys))
+        sample = random.sample(keys, sample_size)
+
+        missing_files: list[str] = []
+        for key in sample:
+            # Node ID format: testing/test_foo.py::... or testing/test_foo.py::Class::method
+            parts = key.split("::")
+            file_part = parts[0]
+            if not file_part.startswith("testing/"):
+                continue
+            test_file = _BACKEND_ROOT / file_part
+            if not test_file.exists():
+                missing_files.append(file_part)
+
+        missing_ratio = len(missing_files) / max(sample_size, 1)
+        assert missing_ratio <= (1.0 - _TEST_DURATIONS_STALE_TOLERANCE), (
+            f"backend/.test_durations appears stale: {len(missing_files)}/{sample_size} "
+            f"sampled node-ID keys point at test files that no longer exist on disk. "
+            f"Missing (up to 10): {missing_files[:10]}\n"
+            "Regenerate with: bash scripts/store-backend-durations.sh && "
+            "git add backend/.test_durations && git commit"
         )
 
 
@@ -920,7 +995,7 @@ class TestMissingGreenletTestsFaithful:
             "The following tests mention MissingGreenlet in their docstring but "
             "use no recognised fidelity mechanism (see class docstring for the "
             "full list). Either inject the fault (raise MissingGreenlet via a "
-            "proxy — see test_strategic_resident_session.py::_ProjectIdPoisonAfterRollback), "
+            "proxy that poisons an expired attribute after rollback), "
             "use the expire_fidelity or missing_greenlet_proxy fixtures, call "
             "expunge_all() (not expire_all() — it is a no-op on SQLite), use raiseload=True, or mark the "
             "test Postgres-only with @pytest.mark.skipif(not USE_POSTGRES, ...):\n"
@@ -961,7 +1036,7 @@ class TestMissingGreenletTestsFaithful:
 class TestStandaloneRosterIncludesGuardModule:
     """The audit-finding guard module must be included in the standalone test
     roster (--standalone flag in scripts/test-backend.sh) so that guards for
-    dropped columns, .test_durations staleness, and stale documentation
+    dropped columns, .test_durations freshness, and stale documentation
     references always run, even in CI backend-only Docker contexts where
     the repo root is unavailable.
 
@@ -980,7 +1055,7 @@ class TestStandaloneRosterIncludesGuardModule:
             TestModuleSizeGuardsWired,
             TestAuthorizedDivergencesSync,
             TestDroppedColumnResidualAbsent,
-            TestTestDurationsNotTracked,
+            TestTestDurationsCommittedAndFresh,
             TestLongLivedDocsDoNotReferenceRemovedCodePaths,
             TestMissingGreenletTestsFaithful,
             TestStandaloneRosterIncludesGuardModule,
@@ -1005,7 +1080,7 @@ class TestStandaloneRosterIncludesGuardModule:
             "testing/test_audit_finding_class_guards.py must be included in the "
             "STANDALONE_ARGS array in scripts/test-backend.sh. The guards check for "
             "module-size violations, migration divergences, dropped-column residuals, "
-            ".test_durations tracking, and stale documentation references. Three of "
+            ".test_durations freshness, and stale documentation references. Three of "
             "these guards silently skip when the repo root is unavailable; including "
             "this module in --standalone ensures all guards run in CI backend-only "
             "Docker context and catch regressions on every commit."

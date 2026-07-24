@@ -32,8 +32,6 @@ function makeProps(overrides: Partial<MessageBubbleProps> = {}): MessageBubblePr
     faded: false,
     readOnly: false,
     replyTarget: null,
-    resolvingId: null,
-    resolveInput: '',
     deletingIds: new Set(),
     creatingDirectionIds: new Set(),
     investigatingId: null,
@@ -43,11 +41,7 @@ function makeProps(overrides: Partial<MessageBubbleProps> = {}): MessageBubblePr
     onToggleSelect: () => {},
     onCreateDirection: () => {},
     onCreateInvestigation: () => {},
-    onResolve: () => {},
     onDelete: () => {},
-    onStartResolve: () => {},
-    onCancelResolve: () => {},
-    onSetResolveInput: () => {},
     onStartInvestigate: () => {},
     onCancelInvestigate: () => {},
     onReply: () => {},
@@ -246,61 +240,6 @@ describe('MessageBubble — viewport regression', () => {
       });
     });
     if (host) expect(host.textContent).toContain('task-abc');
-  });
-
-  test('actionable BLOCKER row keeps the resolve control at 1280px without overflow', async () => {
-    await expectNoOverflowAt(1280, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await act(async () => {
-        r.render(
-          <MessageBubble
-            {...makeProps({
-              msg: makeMsg({
-                from_type: 'agent',
-                message_type: 'BLOCKER',
-                content: 'Runner enrollment is stuck — needs an operator decision.',
-              }),
-            })}
-          />,
-        );
-      });
-    });
-    // Actionable rows retain the manual resolve fallback.
-    expect(host?.querySelector('[title="Resolve"]')).toBeTruthy();
-    await expectNoTextTruncationAt(1280, async () => {});
-    await expectMinTouchTargetAt(1280, async () => {});
-  });
-
-  test('conversational NOTE row drops the resolve control at 1280px', async () => {
-    await expectNoOverflowAt(1280, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await act(async () => {
-        r.render(
-          <MessageBubble
-            {...makeProps({
-              msg: makeMsg({
-                from_type: 'system',
-                message_type: 'NOTE',
-                content: 'Pipeline heartbeat — no action needed.',
-              }),
-            })}
-          />,
-        );
-      });
-    });
-    // Conversational rows are transcript: no manual resolve affordance, reply stays.
-    expect(host?.querySelector('[title="Resolve"]')).toBeNull();
-    expect(host?.querySelector('[title="Reply"]')).toBeTruthy();
-    await expectNoTextTruncationAt(1280, async () => {});
-    await expectMinTouchTargetAt(1280, async () => {});
   });
 
   test('chat user bubble uses dense developer-tool styling', async () => {

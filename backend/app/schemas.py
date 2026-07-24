@@ -1191,8 +1191,8 @@ class BuildConfig(BaseModel):
     # never persist. Carried across re-detect by apply_operator_build_config_overrides.
     promotion_threshold: float | None = Field(None, ge=0.0, le=1.0)
     promotion_weights: dict[str, float] | None = None
-    # Per-project smoketest opt-in (a project may or may not have a smoke suite).
-    # None means "use the fleet-global smoketest_enabled runtime flag".
+    # Deprecated compatibility field. The qualifier ignores it; ordinary
+    # post-promotion smoke uses the fleet runtime flag.
     smoketest_enabled: bool | None = None
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;

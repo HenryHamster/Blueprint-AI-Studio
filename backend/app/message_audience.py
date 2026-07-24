@@ -63,6 +63,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "direction_outcome_scaffolding_escalation": OPERATOR_ACTION_NEEDED,
     "direction_churn_pause": OPERATOR_ACTION_NEEDED,
     # High-signal → operator-fyi
+    "artifact_handoff_failed": OPERATOR_ACTION_NEEDED,
     "failure_alert": OPERATOR_FYI,
     "rollback_recommended": OPERATOR_FYI,
     "fix_loop_divergence_regressed": OPERATOR_FYI,
@@ -89,9 +90,22 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # BLOCKING task spawning and release promotion, so it needs attention.
     "capability_proof_gate_graduated_observe": OPERATOR_FYI,
     "capability_proof_gate_graduated_enforce": OPERATOR_ACTION_NEEDED,
+    # Shared mode-knob graduation harness (app.mode_knob_graduation). Same split
+    # as the capability-proof gate: off→observe is informational; →enforce turns
+    # on a real blocking branch, so it needs attention. A measured CUT
+    # recommendation (the enforce branch would never bind) is FYI — advisory
+    # signal the operator acts on by removing the knob.
+    "mode_knob_graduated_observe": OPERATOR_FYI,
+    "mode_knob_graduated_enforce": OPERATOR_ACTION_NEEDED,
+    "mode_knob_cut_recommended": OPERATOR_FYI,
     # Criterion mutation removes/replaces a quality gate → operator-action-needed
     "criterion_retracted": OPERATOR_ACTION_NEEDED,
     "criterion_superseded": OPERATOR_ACTION_NEEDED,
+    # alert_dispatch._maybe_create_problem_model_wipe_risk_alert: an agent write
+    # proposed dropping ALL entries of a problem-model field without an explicit
+    # _deletions directive (merged non-destructively). The operator should
+    # investigate recent problem_model writes → operator-action-needed.
+    "problem_model.wipe_risk": OPERATOR_ACTION_NEEDED,
     # Directly-authored operator escalations (previously unregistered → landed
     # with a NULL audience that both read filters fail OPEN on).  Registering
     # them with their intended, operator-facing audience makes the audience gate
@@ -170,6 +184,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "release.managed_check_wait_stalled": OPERATOR_FYI,
     "release.qualification_timeout": OPERATOR_ACTION_NEEDED,
     "release.qualification_crash_loop": OPERATOR_ACTION_NEEDED,
+    "release.walkthrough_key_unmatched": OPERATOR_ACTION_NEEDED,
     # Self-review quality
     "sr.catch_rate_below_target": OPERATOR_FYI,
     "sr.lone_checker": OPERATOR_FYI,
@@ -204,10 +219,98 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "self_improvement.payload_too_large": STRATEGIST_INTERNAL,
     # Cost / efficiency
     "cost.unpriced_models": OPERATOR_FYI,
+    "cost.telemetry_reconciliation_drift": OPERATOR_FYI,
     "efficiency.self_repair_burn_share": STRATEGIST_INTERNAL,
     "efficiency.provider_routing_verdict": STRATEGIST_INTERNAL,
+    # === Compute infrastructure alerts ====================================
+    # compute.image_drift: baked compute image was auto-rebuilt due to
+    # dependency manifest change — informational, operator-visible.
+    "compute.image_drift": OPERATOR_FYI,
+    # compute.image_drift_deferred: dependency manifest changed but the
+    # rebuild was deferred (builder busy or build budget exhausted) —
+    # informational, operator-visible.
+    "compute.image_drift_deferred": OPERATOR_FYI,
+    # compute.image_protect_fail: GC-protection tag sweep failed — the image
+    # digest may be reclaimed by registry retention before being replaced.
+    # Operator should verify gcloud / Artifact Registry availability.
+    "compute.image_protect_fail": OPERATOR_FYI,
+    # compute.image_build_failure: baked compute image build failed — authoring
+    # agents and compute jobs may use a stale or missing image until retried.
+    # Operator-visible so the build failure appears in the alert surface.
+    "compute.image_build_failure": OPERATOR_FYI,
+    # compute.image_refresh_failure: live Cloud Build refresh lane returned a
+    # failure status for a project's compute image — stale images until retried.
+    "compute.image_refresh_failure": OPERATOR_FYI,
+    # === Research / direction drift =======================================
+    # research.direction_drift: direction claim vs. shipped-code drift
+    # detected — operator should review the flagged directions.
+    "research.direction_drift": OPERATOR_FYI,
     # === Back-merge / hotfix alerts (no existing policy entry) ============
     "hotfix_backmerge.size_violation": STRATEGIST_INTERNAL,
+    # === Service/background-process lifecycle alerts ========================
+    # Background service crashed (one-off) or is flapping (repeated crashes).
+    "service.crashed": OPERATOR_ACTION_NEEDED,
+    "service.crash_episode": OPERATOR_ACTION_NEEDED,
+    # Auto-restart of a background service is informational internal bookkeeping.
+    "service.restarted": STRATEGIST_INTERNAL,
+    # === Task-level alerts =================================================
+    # A prerequisite task failed and cascade-cancelled dependent tasks.
+    "task.cascade_cancelled": OPERATOR_FYI,
+    # Post-commit orphan task auto-recovered by spawning a review pipeline.
+    "task.orphan_recovered": STRATEGIST_INTERNAL,
+    # === Deployment-level alerts ===========================================
+    # Orchestrator process hit consecutive exceptions — pipeline may be stalled.
+    "deployment.orchestrator_error_loop": OPERATOR_ACTION_NEEDED,
+    # Wake-delivery sweep is stalled; PARKED tasks with fired wake sources not advancing.
+    "deployment.wake_delivery_stalled": OPERATOR_ACTION_NEEDED,
+    # Baked compute image auto-rebuilt due to manifest drift (pipeline internal).
+    "deployment.compute_image_rebuilt": STRATEGIST_INTERNAL,
+    # Hotfix promotion bypassed the standard qualification gate.
+    "release.hotfix_bypass": OPERATOR_FYI,
+    # === Compute job alerts =================================================
+    # Compute job terminated by the no-progress watchdog.
+    "compute.job_stalled": OPERATOR_FYI,
+    # === Runner-specific alerts =============================================
+    # Runner self-update bookkeeping: INFO (succeeded) and WARNING (failed)
+    # variants both record internal pipeline housekeeping — the operator
+    # does not need to act on a successful update, and a failed update
+    # surfaces via runner.degraded / post_update_silent, which ARE operator-
+    # visible.  Registering here ensures operator_visible_alert_filter drops
+    # these rows when they leak through direct Alert() construction.
+    "runner.self_update": STRATEGIST_INTERNAL,
+    # Task with require_local_runner fell back to cloud after threshold.
+    "runner.local_fallback": OPERATOR_FYI,
+    # Runner repeatedly declined a task (repeated no-bid signals).
+    "runner.task_declined": OPERATOR_FYI,
+    # No self-hosted runner online for a task that requires one (OPERATOR_ACTION_NEEDED
+    # because operator must provision/restart the required runner fleet).
+    "runner.local_runner_unavailable": OPERATOR_ACTION_NEEDED,
+    # No Docker-capable runner online for a task that needs a container image.
+    "runner.container_runner_unavailable": OPERATOR_ACTION_NEEDED,
+    # Task pinned to local runner skipped because LLM credentials cannot be resolved.
+    "runner.credential_skip": OPERATOR_ACTION_NEEDED,
+    # === Billing / budget alerts ============================================
+    # Monthly budget threshold alert — operator should review spend and act.
+    "MONTHLY_BUDGET_ALERT": OPERATOR_ACTION_NEEDED,
+    # Daily spend budget reached — autonomous spawning is paused for the day.
+    "DAILY_BUDGET_ALERT": OPERATOR_ACTION_NEEDED,
+    # === SR quality metrics (strategist-internal, acted on autonomously) ====
+    "sr.precision_recall_degraded": STRATEGIST_INTERNAL,
+    "sr.engagement_thinning": STRATEGIST_INTERNAL,
+    "sr.false_attestation": STRATEGIST_INTERNAL,
+    # === Account management alerts ==========================================
+    # Pool account force-deleted while active tasks still held it.
+    "account.force_deleted_with_active_tasks": OPERATOR_ACTION_NEEDED,
+    # === Capacity management (internal pipeline) ============================
+    # Task deferred because project hit max concurrent compute jobs cap.
+    "capacity.compute_cap_deferred": STRATEGIST_INTERNAL,
+    # Usage meter persistently dark — LLM account(s) unreachable or persist-
+    # failing for >30 min, which can prevent usage_headroom from arming.
+    # Operator-visible so a chronically broken meter does not go unnoticed.
+    "capacity.usage_meter_dark": OPERATOR_FYI,
+    # === Infrastructure alerts =============================================
+    # Compute image GC-protection tag failed to apply; risk of digest loss.
+    "vm.gc_protection_failure": OPERATOR_ACTION_NEEDED,
     # work_session_command_execution: operator command receipts (confirmed/failed).
     # These are resolved NOTEs that record an operator-initiated command result —
     # visible in the conversation panel but not an escalation requiring attention.
@@ -231,12 +334,47 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # already fail-closed to STRATEGIST_INTERNAL via route_event; this entry makes
     # the fallback explicit so it is self-documenting and test-stable.
     "strategic_message": STRATEGIST_INTERNAL,
-    # Resident strategist self-observability. A chronically-low operator-decision
+    # Strategist self-observability. A chronically-low operator-decision
     # capture rate means operator corrections are silently failing to reach the
     # durable decisions register. This is internal strategist bookkeeping — the
     # strategist acts on it (re-emit the marker) but it must NEVER reach the
     # operator chat or the alert channel.
     "operator_decision.capture_rate_low": STRATEGIST_INTERNAL,
+    # operator_decision.summary_absent: the resident agent's heartbeats stopped
+    # carrying operator_decision_summary for longer than the staleness window
+    # despite the session having enough historical data to judge it. Strategist-
+    # internal so the strategist can investigate without creating operator noise.
+    "operator_decision.summary_absent": STRATEGIST_INTERNAL,
+    # operator_inbox_leak_persistent: durable persistent-leak escalation from the
+    # operator-inbox liveness audit.  Strategist-internal so a persistent
+    # forward-leak / alert-noise signal reaches the strategist surface without
+    # creating new operator-facing noise (the very bug this signal detects).
+    "operator_inbox_leak_persistent": STRATEGIST_INTERNAL,
+    # delivery.reply_quarantine_unhealed: an operator-directed reply was stamped
+    # with a non-operator audience (quarantined / never delivered to the operator).
+    # Fires once per episode when the liveness checker detects quarantined replies;
+    # OPERATOR_ACTION_NEEDED so the operator sees that their reply was dropped and
+    # a heal was attempted.  Auto-resolves when the quarantine count reaches zero.
+    "delivery.reply_quarantine_unhealed": OPERATOR_ACTION_NEEDED,
+    # delivery.undelivered_strategist_reply: an operator-directed strategist reply
+    # has an operator-visible audience but was never delivered (delivered_at IS NULL)
+    # past the staleness threshold (~15 min).  Fires once per episode when the
+    # liveness checker detects such replies; OPERATOR_ACTION_NEEDED so the operator
+    # sees that their answer was lost.  Auto-resolves on a clean tick (zero
+    # undelivered replies).  Distinguished from delivery.reply_quarantine_unhealed
+    # because the audience IS operator-visible — the message was routed correctly
+    # but the delivery receipt itself is missing, indicating a transport-level loss.
+    "delivery.undelivered_strategist_reply": OPERATOR_ACTION_NEEDED,
+    # notification.dead_letter_lost: a notification exhausted all retries AND the
+    # subsequent dead-letter persistence write also failed — the notification is
+    # now unrecoverable.  OPERATOR_ACTION_NEEDED so the operator sees that a
+    # webhook notification was permanently lost (double-failure path).
+    "notification.dead_letter_lost": OPERATOR_ACTION_NEEDED,
+    # problem_model.live_core_over_budget: the problem model's live core (active
+    # gaps, capabilities, friction) exceeds the byte budget at write time —
+    # the precondition for the rev-1367 truncation/wipe cycle.  OPERATOR_ACTION_NEEDED
+    # so the operator sees the alert and can prune the model or raise the byte budget.
+    "problem_model.live_core_over_budget": OPERATOR_ACTION_NEEDED,
 }
 
 # Set of audiences that reach the operator through normal channels.
@@ -249,15 +387,32 @@ _NON_OPERATOR_AUDIENCES: frozenset[str] = frozenset(
 )
 
 # Registry event_types that resolve to a non-operator audience.  Precomputed
-# from the single-source-of-truth registry so the Alert read-model filter never
-# duplicates an event-type list.  A row whose ``event_type`` is one of these is
-# strategist-internal / pipeline-log and must never reach an operator badge,
-# count, or preview.  Untagged (NULL) or unregistered ``event_type`` rows are
-# retained by the filter — the conservative, legacy-preserving choice.
+# from the single-source-of-truth registry.  Used by get_non_operator_event_types()
+# (a testing hook); the Alert read-model filter now uses _OPERATOR_EVENT_TYPES
+# (explicit allowlist, fail-closed) rather than this denylist.
 _NON_OPERATOR_EVENT_TYPES: frozenset[str] = frozenset(
     event_type
     for event_type, audience in _EVENT_AUDIENCE_REGISTRY.items()
     if audience in _NON_OPERATOR_AUDIENCES
+)
+
+# Registry event_types that resolve to an operator-visible audience.  Precomputed
+# for use by operator_visible_alert_filter: the Alert read-model uses an explicit
+# IN-allowlist (fail-closed) so NULL and unregistered event_types never reach an
+# operator badge, count, or preview.
+_OPERATOR_EVENT_TYPES: frozenset[str] = frozenset(
+    event_type
+    for event_type, audience in _EVENT_AUDIENCE_REGISTRY.items()
+    if audience in _AUDIENCES_THAT_REACH_OPERATOR
+)
+
+
+# Message types that are inherently operator-facing when no event_type
+# overrides the audience.  A strategist-authored BLOCKER/BUG_REPORT/QUESTION
+# with no registered (or absent) event_type must reach the operator inbox even
+# though the fail-closed default resolves STRATEGIST_INTERNAL.
+_OPERATOR_FACING_MESSAGE_TYPES: frozenset[str] = frozenset(
+    {"BUG_REPORT", "BLOCKER", "QUESTION"}
 )
 
 
@@ -271,13 +426,19 @@ def route_event(event_type: str, *, message_type: str | None = None) -> str:
     is not registered — a new emitter that forgets to declare its audience
     is invisible to the operator.
 
-    The ``message_type`` parameter is reserved for future use (e.g.,
-    distinguishing NOTE from BLOCKER for the same event_type).
+    ``message_type`` fallback: when the event_type resolves to
+    ``STRATEGIST_INTERNAL`` (absent, unregistered, or explicitly internal)
+    *and* ``message_type`` is in ``{BUG_REPORT, BLOCKER, QUESTION}``, the
+    audience is upgraded to ``OPERATOR_ACTION_NEEDED`` — these message classes
+    are inherently operator-facing regardless of the event_type.  An
+    event_type that explicitly resolves to an operator-visible audience always
+    wins; the fallback only fires when the registry alone would bury the message.
     """
     normalized = (event_type or "").strip()
-    if not normalized:
-        return STRATEGIST_INTERNAL
-    return _EVENT_AUDIENCE_REGISTRY.get(normalized, STRATEGIST_INTERNAL)
+    resolved = _EVENT_AUDIENCE_REGISTRY.get(normalized, STRATEGIST_INTERNAL) if normalized else STRATEGIST_INTERNAL
+    if resolved == STRATEGIST_INTERNAL and message_type and message_type.upper() in _OPERATOR_FACING_MESSAGE_TYPES:
+        return OPERATOR_ACTION_NEEDED
+    return resolved
 
 
 def is_operator_visible(audience: str) -> bool:
@@ -286,14 +447,46 @@ def is_operator_visible(audience: str) -> bool:
 
 
 def operator_visible_audience_filter(context: Any) -> Any:
-    """Return the shared SQL filter for legacy and operator-visible rows.
+    """Return the shared SQL filter for Task rows and other legacy/NULL-retaining paths.
 
-    Both message and task projections retain untagged legacy rows, while rows
-    explicitly marked strategist-internal or pipeline-log never contribute to
-    an operator-facing count, preview, or badge.
+    Task rows carry a NULL audience by design (tasks are never audience-stamped),
+    so this filter retains NULL rows alongside explicitly operator-visible rows.
+    Use ONLY for ``Task.context`` call sites — for ``ProjectMessage.context`` use
+    :func:`operator_visible_message_audience_filter` (fail-closed, no NULL pass-through).
     """
     audience = context["audience"].as_string()
     return or_(audience.is_(None), audience.notin_(_NON_OPERATOR_AUDIENCES))
+
+
+def operator_visible_message_audience_filter(context: Any) -> Any:
+    """Return the fail-closed SQL filter for all ``ProjectMessage.context`` query paths.
+
+    Uses an explicit IN-allowlist of operator audiences — no NULL pass-through.
+    NULL-audience messages (legacy un-stamped rows) are treated as non-operator,
+    consistent with the emitter-side fail-closed default via :func:`route_event`.
+
+    All open NULL-audience messages are drained by the proactive backfill sweep
+    (``reaper_sweeps.stamp_all_null_audience_messages``), and every message emitter
+    stamps a canonical audience at construction, so no legitimate operator message
+    is NULL after the drain.
+
+    Use this for every ``ProjectMessage.context`` query path.  For ``Task.context``
+    (tasks are never audience-stamped), use :func:`operator_visible_audience_filter`.
+    """
+    audience = context["audience"].as_string()
+    return audience.in_(list(_AUDIENCES_THAT_REACH_OPERATOR))
+
+
+def operator_visible_nonactionable_message_filter(context: Any) -> Any:
+    """Return the strict SQL filter for non-actionable (NOTE/FEEDBACK) messages.
+
+    Identical semantics to :func:`operator_visible_message_audience_filter` —
+    fail-closed IN-allowlist, no NULL pass-through.  Kept as a named alias for
+    query paths that are already restricted to non-BLOCKER/QUESTION/BUG_REPORT
+    message types (e.g. high-signal NOTE counts in operator_attention.py).
+    """
+    audience = context["audience"].as_string()
+    return audience.in_(list(_AUDIENCES_THAT_REACH_OPERATOR))
 
 
 def operator_visible_alert_filter(event_type_column: Any) -> Any:
@@ -301,22 +494,25 @@ def operator_visible_alert_filter(event_type_column: Any) -> Any:
 
     ``Alert`` carries no ``context``/``audience`` column — its audience is keyed
     on ``event_type`` through the same registry that :func:`route_event`
-    consults at creation.  This is the alert analogue of
-    :func:`operator_visible_audience_filter`: it retains untagged (``NULL``) and
-    unregistered ``event_type`` rows (conservative, legacy-preserving) while
-    dropping rows whose ``event_type`` is explicitly registered
-    strategist-internal or pipeline-log so they never contribute to an
-    operator-facing badge count, severity aggregate, or preview.
+    consults at creation.  This filter is fail-closed: only rows whose
+    ``event_type`` is explicitly registered as operator-visible
+    (``operator-action-needed`` or ``operator-fyi``) pass through.
+    NULL and unregistered ``event_type`` rows are excluded — they must never
+    contribute to an operator-facing badge count, severity aggregate, or preview.
+    Register the event_type in :data:`_EVENT_AUDIENCE_REGISTRY` with the correct
+    operator audience to make an Alert visible.
     """
-    return or_(
-        event_type_column.is_(None),
-        event_type_column.notin_(_NON_OPERATOR_EVENT_TYPES),
-    )
+    return event_type_column.in_(list(_OPERATOR_EVENT_TYPES))
 
 
 def get_non_operator_event_types() -> frozenset[str]:
     """Return every event_type that resolves to a non-operator audience (testing hook)."""
     return _NON_OPERATOR_EVENT_TYPES
+
+
+def get_operator_event_types() -> frozenset[str]:
+    """Return every event_type that resolves to an operator-visible audience (testing hook)."""
+    return _OPERATOR_EVENT_TYPES
 
 
 def stamp_message_audience(
@@ -389,6 +585,7 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     "RUNNER_DEGRADED_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_FLEET_OFFLINE": OPERATOR_ACTION_NEEDED,
     "RUNNER_LOW_DISK": OPERATOR_ACTION_NEEDED,
+    "RUNNER_LOW_MEMORY": OPERATOR_ACTION_NEEDED,
     "RUNNER_OUTAGE_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_LOCAL_HOLD": OPERATOR_ACTION_NEEDED,
     "RUNNER_CONTAINER_HOLD": OPERATOR_ACTION_NEEDED,
@@ -433,6 +630,7 @@ _LOGICAL_EVENT_PAIRS: dict[str, str] = {
     "runner.deactivated": "RUNNER_DEACTIVATED",
     "runner.degraded": "RUNNER_DEGRADED",
     "runner.low_disk": "RUNNER_LOW_DISK",
+    "runner.low_memory": "RUNNER_LOW_MEMORY",
 }
 
 

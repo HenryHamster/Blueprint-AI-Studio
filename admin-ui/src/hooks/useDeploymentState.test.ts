@@ -35,6 +35,7 @@ describe('useDeploymentState', () => {
     // Unmount any hooks from previous tests to prevent state-update leakage
     // that would cause act() to hang waiting for pending React work.
     cleanup();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     console.error = vi.fn();
     fetchSpy = vi.fn().mockResolvedValue({
       ok: true,
@@ -49,6 +50,7 @@ describe('useDeploymentState', () => {
     // Explicitly unmount hooks and clear mocks so previous test state can't
     // bleed into the next test via floating Promises or lingering intervals.
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -69,7 +71,7 @@ describe('useDeploymentState', () => {
   it('does not call authGet when user is null', async () => {
     renderHook(() => useDeploymentState(vi.fn(), null, { current: vi.fn() }));
     // Brief wait to ensure no deferred effects fire
-    await new Promise(r => setTimeout(r, 20));
+    await vi.advanceTimersByTimeAsync(20);
     expect(mockAuthGet).not.toHaveBeenCalled();
   });
 
@@ -78,7 +80,7 @@ describe('useDeploymentState', () => {
       ({ enabled }) => useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }, 'proj-123', enabled),
       { initialProps: { enabled: false } },
     );
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await vi.advanceTimersByTimeAsync(20);
     expect(mockAuthGet).not.toHaveBeenCalled();
 
     rerender({ enabled: true });
@@ -467,9 +469,9 @@ describe('useDeploymentState', () => {
     // The toast auto-dismisses after 4000ms (Toasts.tsx); the affordance must
     // outlive it. The hook holds it as state with no self-clearing timer, so it
     // is still present well past that window.
-    await new Promise((r) => setTimeout(r, 4100));
+    await vi.advanceTimersByTimeAsync(4100);
     expect(result.current.failedRollback?.serving_sha).toBe('sha123bad000000');
-  }, 10_000);
+  });
 
   it('clears failedRollback on a subsequent successful rollback', async () => {
     stubAllEndpoints({ '/api/admin/deploy-state': { status: 'STABLE' } });

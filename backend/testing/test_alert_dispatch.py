@@ -2362,3 +2362,110 @@ async def test_low_disk_vms_check_integration(db_session, mocker):
     await _check_degraded_runners(db_session)
     await db_session.refresh(alerts[0])
     assert alerts[0].dismissed_at is not None, "low-disk VM alert must auto-resolve on recovery"
+
+
+# ── Wake-delivery stall alert ─────────────────────────────────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _maybe_create_wake_delivery_stall_alert,
+    _resolve_wake_delivery_stall_alert,
+)
+
+
+async def _wake_delivery_stall_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == "deployment.wake_delivery_stalled",
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_wake_delivery_stall_alert_stamps_correct_event_type(db_session, mocker):
+    """_maybe_create_wake_delivery_stall_alert must stamp event_type='deployment.wake_delivery_stalled'."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = await _maybe_create_wake_delivery_stall_alert(
+        db_session, project.id, stall_cycles=3
+    )
+    await db_session.commit()
+
+    assert created == 1
+    alerts = await _wake_delivery_stall_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.event_type == "deployment.wake_delivery_stalled"
+    assert alert.severity == AlertSeverity.WARNING
+    assert "3" in alert.message
+
+
+@pytest.mark.asyncio
+async def test_wake_delivery_stall_alert_dedupes_on_stable_title(db_session, mocker):
+    """A sustained stall must raise exactly ONE alert per project across reaper ticks."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await _maybe_create_wake_delivery_stall_alert(
+        db_session, project.id, stall_cycles=1
+    )
+    await db_session.commit()
+    assert first == 1
+
+    second = await _maybe_create_wake_delivery_stall_alert(
+        db_session, project.id, stall_cycles=2
+    )
+    await db_session.commit()
+    assert second == 0, "duplicate stall tick must not create a second alert"
+    assert len(await _wake_delivery_stall_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_wake_delivery_stall_alert_broadcasts_on_create(db_session, mocker):
+    """Alert creation must broadcast alert_created to the project channel."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _maybe_create_wake_delivery_stall_alert(
+        db_session, project.id, stall_cycles=1
+    )
+    await db_session.commit()
+
+    bcast.assert_awaited_once()
+    call_args = bcast.call_args
+    assert call_args.args[1] == "alert_created"
+
+
+@pytest.mark.asyncio
+async def test_wake_delivery_stall_alert_resolves_on_recovery(db_session, mocker):
+    """_resolve_wake_delivery_stall_alert dismisses the open stall alert."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _maybe_create_wake_delivery_stall_alert(
+        db_session, project.id, stall_cycles=1
+    )
+    await db_session.commit()
+
+    resolved = await _resolve_wake_delivery_stall_alert(db_session, project.id)
+    assert resolved == 1
+
+    alerts = await _wake_delivery_stall_alerts(db_session, project.id)
+    assert alerts[0].dismissed_at is not None, "stall alert must be dismissed on recovery"
+    assert bcast.await_count == 2  # alert_created + alert_dismissed

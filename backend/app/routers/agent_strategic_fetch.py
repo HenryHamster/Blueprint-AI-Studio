@@ -28,7 +28,11 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
-from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
+from app.knowledge_query import (
+    build_compute_sweep_groups,
+    build_strategic_memory_index,
+    build_sweep_knowledge_index,
+)
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
 from app.project_message_projection import agent_fetch_message_dict
@@ -306,7 +310,7 @@ async def agent_fetch_open_messages_list(
     message with ``./fetch message <ref>``.
 
     Path is the ``/messages/open`` sub-collection, NOT bare ``/messages`` — the
-    latter is owned by the resident agent's cursor-poll list in
+    latter is owned by the strategic agent's cursor-poll list in
     ``agent_strategic_messages.py`` (``{messages, server_time}``). Keeping this on
     a distinct literal path avoids the route collision where this listing (being
     included first in ``app.main``) silently shadowed that poll. Registered before
@@ -1165,9 +1169,6 @@ async def agent_fetch_efficiency_snapshot(
         _compute_llm_cache_hit_rate,
         _compute_vm_reuse_rate,
         _load_recent_tasks,
-        _resolve_deploy_since,
-        compute_gate_health_verdict,
-        compute_panel_review_effectiveness,
     )
     from app.llm_cost_attribution import (  # noqa: PLC0415
         _compact_llm_cost_attribution,
@@ -1181,29 +1182,6 @@ async def agent_fetch_efficiency_snapshot(
     format_compliance = compute_format_compliance_metrics(tasks)
     llm_cost_attribution = _compact_llm_cost_attribution(tasks)
 
-    # Rolling-window panel-review gate effectiveness plus its calibrated fail-open
-    # health verdict, so the strategist sees the same HEALTHY/PARTIAL/DEGRADED/
-    # INSUFFICIENT/NO_DATA classification the operator dashboard shows.
-    panel_review_effectiveness = compute_panel_review_effectiveness(tasks)
-    gate_health = compute_gate_health_verdict(panel_review_effectiveness)
-
-    # Deploy-scoped companion: restrict the same metric to tasks completed after
-    # the post-deployment boundary (earliest snapshot under the current serving
-    # SHA, derived identically to compute_current_axes). None when no boundary is
-    # known — never fabricated — so the strategist can confirm the per-deployment
-    # ≤5% fail-open target specifically.
-    deploy_since = await _resolve_deploy_since(session, project_id)
-    panel_review_effectiveness_post_deploy = (
-        compute_panel_review_effectiveness(tasks, since_dt=deploy_since)
-        if deploy_since is not None
-        else None
-    )
-    gate_health_post_deploy = (
-        compute_gate_health_verdict(panel_review_effectiveness_post_deploy)
-        if deploy_since is not None
-        else None
-    )
-
     return {
         "status": "success",
         "data": {
@@ -1215,10 +1193,6 @@ async def agent_fetch_efficiency_snapshot(
             AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
             FORMAT_COMPLIANCE_KEY: format_compliance,
             "llm_cost_attribution": llm_cost_attribution,
-            "panel_review_effectiveness": panel_review_effectiveness,
-            "gate_health": gate_health,
-            "panel_review_effectiveness_post_deploy": panel_review_effectiveness_post_deploy,
-            "gate_health_post_deploy": gate_health_post_deploy,
             "window_days": _AXIS_WINDOW_DAYS,
         },
     }
@@ -1308,7 +1282,8 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     # Critical identity/routing — always ships, never dropped
     "type": None, "research_mode": None, "project_name": None, "base_branch": None,
     "is_self_repo": None, "enable_self_improvement": None, "model": None, "effort": None,
-    "vision": None, "direction_counts": None, "max_active_directions": None,
+    "vision": None, "effective_purpose": None, "direction_counts": None,
+    "max_active_directions": None,
     "open_message_count": None,
     # High — dedicated fetch verbs
     "open_messages": "message",
@@ -1344,7 +1319,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "payload_staleness": None, "deployment_state": None,
     "operator_overrides": None, "missing_capability_demand": None,
     "available_capabilities": None, "local_runner_status": None,
-    # Tiny resident/autonomous session cadence scalars — runtime config, no fetch path
+    # Tiny autonomous session cadence scalars — runtime config, no fetch path
     "strategic_session_idle_tick_seconds": None,
     "strategic_session_min_tick_seconds": None,
     "strategic_session_max_ops_per_turn": None,
@@ -1363,9 +1338,11 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "prediction_calibration_factor": None,
     "prediction_calibration_note": None,
     "system_maturity": None,
-    "resident_exam_leads": None,    # exempt (never dropped); session-scoped, no fetch path
     # Low — dedicated fetch verb; tiny persisted trend across recent cycles
     "integrity_conflict_trend": "integrity-conflict-trend",
+    # Medium — dedicated fetch verbs; operator-facing tools/skills readable by strategist
+    "skills": "skills",
+    "project_tools": "tools",
 }
 
 _SECTIONS_NEEDING_CYCLE_HISTORY: frozenset[str] = frozenset({
@@ -1410,12 +1387,22 @@ async def agent_fetch_payload_section(
     if section_name == "self_reflection_log":
         data: Any = project.self_reflection_log or []
     elif section_name == "strategic_memory_notes":
-        data = project.strategic_memory_notes or []
+        # Strategic memory is served from KnowledgeDocument rows (source_kind=
+        # 'strategic_memory'); the compact index omits superseded (dismissed)
+        # facts. Shape: {id, title, topic, summary, tags, created_at}.
+        data = await build_strategic_memory_index(session, project.id)
     elif section_name == "anomaly_summary":
         data = _build_anomaly_summary(project)
     elif section_name == "playbook_summary":
         data = _build_playbook_summary(project)
     elif section_name == "retired_directions_summary":
+        from app.direction_event_trail import repair_retired_direction_memory_texts  # noqa: PLC0415
+        from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+        _vision_for_repair = project.vision or {}
+        if await repair_retired_direction_memory_texts(session, project.id, _vision_for_repair):
+            flag_modified(project, "vision")
+            session.add(project)
+            await session.commit()
         data = _build_retired_directions_summary(project)
     elif section_name == "rejected_proposals":
         cutoff = (_utcnow() - timedelta(days=30)).isoformat()
@@ -1613,7 +1600,7 @@ async def agent_fetch_project_skills(
     means no skills are declared.  Authenticated via agent JWT; cross-project
     access returns 404.
 
-    This endpoint is the backend for the strategic resident's ``./fetch skills``
+    This endpoint is the backend for the strategic agent's ``./fetch skills``
     verb.
     """
     project = await _resolve_agent_project(project_id, token, session)
@@ -1640,9 +1627,9 @@ async def agent_fetch_project_tools(
     An empty array means no enabled tool has renderable content. Authenticated
     via agent JWT; cross-project access returns 404.
 
-    This endpoint is the backend for the strategic resident's ``./fetch tools``
+    This endpoint is the backend for the strategic agent's ``./fetch tools``
     verb — the operator-facing companion to the task-claim ``project_tools``
-    injection, so the resident strategist can read the operator's notes/sketches.
+    injection, so the strategist can read the operator's notes/sketches.
     """
     project = await _resolve_agent_project(project_id, token, session)
     from app.project_tool_context import load_project_tool_context  # noqa: PLC0415

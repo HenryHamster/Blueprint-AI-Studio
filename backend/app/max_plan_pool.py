@@ -27,11 +27,6 @@ from app.providers.openai import (
     codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
 )
 from app.providers.registry import get_provider
-from app.strategic_resident_provider_policy import (
-    ResidentProviderPolicyHold,
-    resolve_resident_provider_routing,
-    validate_resident_model_provider,
-)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -827,6 +822,9 @@ _pending_rl_persists: List[
 _pending_cap_persists: set = (
     set()
 )  # Account IDs with dirty daily_task_count / disabled_reason to flush
+_usage_persist_failing_accounts: set[str] = (
+    set()
+)  # Account IDs whose last usage-snapshot DB persist failed (after retry)
 # Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 # Shared between classify_failure() and any caller that needs to detect a real
 # Claude rate-limit (vs GitHub 429, GCP quota, Anthropic 529 overload, etc).
@@ -854,13 +852,9 @@ _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-7": ("claude-opus-4-8",),
     "claude-opus-4-6": ("claude-opus-4-8",),
     "claude-sonnet-4-6": ("claude-opus-4-8",),
-    # TEMPORARY (fable availability window ~2 weeks from 2026-06-09): tracked
-    # on its own meter — we don't yet know whether a fable 429 implies the
-    # shared opus session bucket is exhausted. If it does, the CLI-level
-    # --fallback-model opus retry 429s immediately and the normal patterns
-    # disable the account, so isolation fails safe. On removal, rewrite to
-    # ("claude-opus-4-8",) like the legacy entries above.
-    "claude-fable-5": ("claude-fable-5",),
+    # fable-5 availability window elapsed (2026-06-09 + ~2 weeks); cascade to
+    # the shared opus meter like other legacy entries.
+    "claude-fable-5": ("claude-opus-4-8",),
 }
 
 _HAIKU_MODEL = "claude-haiku-4-5-20251001"
@@ -1173,16 +1167,19 @@ async def load_max_plan_pool():
             provider = acct.provider or LLMProviderName.ANTHROPIC
             auth_mode = acct.auth_mode or LLMAuthMode.OAUTH
             runtime_secret = decrypt_field(acct.secret_blob_ref) or decrypt_field(acct.oauth_token)
+            secret_fetch_failed = False
             if runtime_secret and runtime_secret.startswith("projects/"):
                 try:
                     from app.secrets_manager import get_user_secret
 
                     runtime_secret = await get_user_secret(runtime_secret)
                 except Exception:
-                    logger.exception(
-                        f"[POOL] Failed to fetch secret from Secret Manager for account {acct.name}"
+                    logger.warning(
+                        f"[POOL] Usage meter: failed to fetch secret for account {acct.name}"
+                        " — meter will be dark"
                     )
                     runtime_secret = None
+                    secret_fetch_failed = True
             token = (
                 runtime_secret
                 if provider == LLMProviderName.ANTHROPIC
@@ -1214,6 +1211,7 @@ async def load_max_plan_pool():
                 "runtime_secret": runtime_secret,
                 "oauth_token": token,
                 "runtime_ready": bool(runtime_secret),
+                "secret_fetch_failed": secret_fetch_failed,
                 "claude_config_json": decrypt_field(acct.claude_config_json),
                 "enabled": acct.enabled,
                 "active_tasks": active_per_account.get(acct_id, 0),
@@ -2806,11 +2804,11 @@ async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> No
 # Everything here is advisory: an unknown snapshot makes selection behave
 # exactly as it did before this feature. The reactive rate-limit cooldowns
 # (disable_account_model / _account_state_for_model) remain the backstop.
-_USAGE_SNAPSHOT_TTL_SECONDS = 60
+_USAGE_SNAPSHOT_TTL_SECONDS = 300
 # Cadence for the display-oriented usage-meter refresh (orchestrator calls
-# refresh_usage_meter_snapshots on this interval). Distinct from the 60s
-# selection TTL above: selection wants near-real-time data when the headroom
-# gate is enabled; the admin meter only needs minutes-fresh data.
+# refresh_usage_meter_snapshots on this interval). Aligned with the selection
+# TTL above: probes run every 300 s, so the selection gate considers a snapshot
+# fresh for the same window to avoid treating the gap as "unknown" on every call.
 _USAGE_METER_REFRESH_INTERVAL_SECONDS = 300
 # A snapshot older than this renders as "stale" on the admin meter — three
 # missed meter refreshes. The 60s selection TTL is intentionally NOT used for
@@ -2985,37 +2983,51 @@ async def _persist_rate_limit_usage_to_db(
 ) -> None:
     """Write the usage snapshot into MaxPlanAccount.rate_limit_usage.
 
-    Pure best-effort advisory: failures are logged but never raised.
+    Best-effort advisory: failures are logged but never raised.
+    On failure, adds the account id to ``_usage_persist_failing_accounts`` and
+    retries once so a transient DB hiccup does not leave the meter dark on
+    non-leader instances (which rely on the persisted ``rate_limit_usage``
+    column).  On success, removes ONLY this account from the failing set so one
+    account's recovery never clears another account's failure attribution.
     """
     if not snapshot.known:
         return
-    usage_dict: dict[str, Any] = {
-        "updated_at": _utcnow().isoformat(),
-        "source": "oauth_usage_probe",
-    }
-    for window in ("five_hour", "seven_day"):
-        util = snapshot.window_utilizations.get(window)
-        if util is not None:
-            entry = {"utilization": float(util)}
-            reset = snapshot.resets_at.get(window)
-            if reset:
-                entry["resets_at"] = reset
-            usage_dict[window] = entry
-    try:
-        from app.models import MaxPlanAccount
+    # When the probe carried a raw messages_api_header blob (API_KEY probe path),
+    # persist it directly so remaining_tokens and limit_tokens survive the round-
+    # trip. The blob's updated_at is overwritten with the actual write time.
+    raw = getattr(snapshot, "raw_rate_limit_blob", None)
+    if isinstance(raw, dict) and raw.get("source") == "messages_api_header":
+        usage_dict = dict(raw)
+    else:
+        usage_dict = snapshot.to_dict()
+    usage_dict["updated_at"] = _utcnow().isoformat()
+    from app.models import MaxPlanAccount
 
-        async with AsyncSessionLocal() as persist_session:
-            row = await persist_session.get(MaxPlanAccount, uuid.UUID(acct_id))
-            if row is not None:
-                row.rate_limit_usage = usage_dict
-                row.updated_at = _utcnow()
-                persist_session.add(row)
-                await persist_session.commit()
-    except Exception:
-        logger.exception(
-            "[POOL] failed to persist rate_limit_usage for account %s; keeping in-memory only",
-            acct_id,
-        )
+    for attempt in range(2):
+        try:
+            async with AsyncSessionLocal() as persist_session:
+                row = await persist_session.get(
+                    MaxPlanAccount, uuid.UUID(acct_id)
+                )
+                if row is not None:
+                    row.rate_limit_usage = usage_dict
+                    row.updated_at = _utcnow()
+                    persist_session.add(row)
+                    await persist_session.commit()
+                _usage_persist_failing_accounts.discard(acct_id)
+                return  # success
+        except Exception:  # noqa: PERF203 - bounded persist-retry, not a hot loop
+            if attempt == 0:
+                _usage_persist_failing_accounts.add(acct_id)
+                logger.warning(
+                    "[POOL] failed to persist rate_limit_usage for account %s; retrying...",
+                    acct_id,
+                )
+            else:
+                logger.warning(
+                    "[POOL] retry also failed for rate_limit_usage for account %s; keeping in-memory only",
+                    acct_id,
+                )
 
 
 def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:
@@ -3061,35 +3073,46 @@ def _snapshot_from_persisted_usage(
 ) -> tuple[UsageSnapshot, datetime] | None:
     """Rebuild (UsageSnapshot, its wall-clock stamp) from a persisted
     ``MaxPlanAccount.rate_limit_usage`` blob written by
-    ``_persist_rate_limit_usage_to_db``. None on any structural mismatch."""
-    if not isinstance(raw, Mapping) or raw.get("source") != "oauth_usage_probe":
+    ``_persist_rate_limit_usage_to_db``. None on any structural mismatch.
+
+    Accepts two source schemas:
+    - ``oauth_usage_probe``: five_hour/seven_day window cells with utilization.
+    - ``messages_api_header``: unified_5h cell with utilization (0..100 scale),
+      mapped to the five_hour window so per-response header data is not silently
+      discarded on non-leader instances that read the DB-persisted blob.
+    """
+    if not isinstance(raw, Mapping):
         return None
+    source = raw.get("source")
     try:
         updated_at = datetime.fromisoformat(raw.get("updated_at"))
     except (TypeError, ValueError):
         return None
-    utils: dict[str, float] = {}
-    resets: dict[str, str | None] = {}
-    for window in ("five_hour", "seven_day"):
-        entry = raw.get(window)
-        if not isinstance(entry, Mapping):
-            continue
-        util = entry.get("utilization")
-        if isinstance(util, bool) or not isinstance(util, (int, float)):
-            continue
-        utils[window] = float(util)
-        reset = entry.get("resets_at")
-        if isinstance(reset, str):
-            resets[window] = reset
-    if not utils:
-        return None
-    snapshot = UsageSnapshot(
-        known=True,
-        window_utilizations=utils,
-        resets_at=resets,
-        probed_at=updated_at.isoformat(),
-    )
-    return snapshot, updated_at
+    # oauth_usage_probe blobs round-trip through UsageSnapshot.to_dict/from_dict.
+    snapshot = UsageSnapshot.from_dict(raw)
+    if snapshot is not None and snapshot.known:
+        return snapshot, updated_at
+    # from_dict only understands the oauth_usage_probe schema. The Messages API
+    # persists a ``messages_api_header`` blob (unified_5h utilization, 0..100
+    # scale) that non-leader instances must still read — map it to the five_hour
+    # window so per-response header data is not silently discarded.
+    if source == "messages_api_header":
+        entry = raw.get("unified_5h")
+        if isinstance(entry, Mapping):
+            util = entry.get("utilization")
+            if not isinstance(util, bool) and isinstance(util, (int, float)):
+                resets: dict[str, str | None] = {}
+                reset = entry.get("resets_at")
+                if isinstance(reset, str):
+                    resets["five_hour"] = reset
+                snapshot = UsageSnapshot(
+                    known=True,
+                    window_utilizations={"five_hour": float(util)},
+                    resets_at=resets,
+                    probed_at=updated_at.isoformat(),
+                )
+                return snapshot, updated_at
+    return None
 
 
 def _restore_usage_state(
@@ -3125,19 +3148,22 @@ def _restore_usage_state(
 def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
     """True iff this account can produce a usage snapshot worth probing.
 
-    Only Anthropic OAuth accounts have a usage source today (every other
-    provider/auth combination resolves to ``UsageSnapshot.unknown()`` — see
-    the ``probe_usage`` implementations), so the meter loop skips the rest
-    rather than burning no-op probes.
+    Anthropic OAuth accounts probe the /api/oauth/usage endpoint.
+    Anthropic API-key accounts probe via a minimal messages.create call to
+    capture rate-limit headers.  Every other provider/auth combination
+    resolves to ``UsageSnapshot.unknown()`` so the meter loop skips them.
     """
     provider = _normalize_provider_name(acct.get("provider"))
     auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
-    return (
-        provider == LLMProviderName.ANTHROPIC.value
-        and auth_mode == LLMAuthMode.OAUTH.value
-        and bool(acct.get("enabled", True))
-        and bool(acct.get("oauth_token") or acct.get("runtime_secret"))
-    )
+    if provider != LLMProviderName.ANTHROPIC.value:
+        return False
+    if not bool(acct.get("enabled", True)):
+        return False
+    if auth_mode == LLMAuthMode.OAUTH.value:
+        return bool(acct.get("oauth_token") or acct.get("runtime_secret"))
+    if auth_mode == LLMAuthMode.API_KEY.value:
+        return bool(acct.get("runtime_secret"))
+    return False
 
 
 async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
@@ -3156,6 +3182,23 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
     async with _max_plan_pool_lock:
         for acct in _account_by_id.values():
             if not _account_meter_eligible(acct):
+                # Warn when an Anthropic OAuth account is dark due to a missing
+                # secret — operators cannot distinguish this from a probe failure
+                # without an explicit log.
+                provider = _normalize_provider_name(acct.get("provider"))
+                auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
+                if (
+                    provider == LLMProviderName.ANTHROPIC.value
+                    and auth_mode == LLMAuthMode.OAUTH.value
+                    and bool(acct.get("enabled", True))
+                    and not bool(acct.get("oauth_token") or acct.get("runtime_secret"))
+                ):
+                    logger.warning(
+                        "[POOL] usage meter dark for account %s: OAuth secret unavailable "
+                        "(Secret Manager fetch failed or secret not set); meter will stay "
+                        "unknown until the secret is restored",
+                        acct.get("id", "<unknown>"),
+                    )
                 continue
             snap = acct.get("usage_snapshot")
             at = acct.get("usage_snapshot_at")
@@ -3181,6 +3224,552 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
     return scheduled
 
 
+def get_usage_persist_failure_count() -> int:
+    """Return the number of accounts currently failing to persist their usage snapshot."""
+    return len(_usage_persist_failing_accounts)
+
+
+def get_usage_persist_failing_accounts() -> list[dict[str, str]]:
+    """Return accounts currently failing to persist usage snapshots.
+
+    Each entry has 'id' and 'name' (name resolved from the in-memory pool where
+    available, otherwise the id string).
+    """
+    result = []
+    for acct_id in _usage_persist_failing_accounts:
+        acct = _account_by_id.get(acct_id)
+        result.append(
+            {"id": acct_id, "name": acct["name"] if acct else acct_id}
+        )
+    return result
+
+
+async def detect_persistently_dark_meters(
+    now: datetime | None = None,
+    threshold_seconds: float = _USAGE_METER_DISPLAY_STALE_SECONDS * 2,
+) -> List[Dict[str, Any]]:
+    """Return meter-eligible accounts whose usage snapshot has been stale/dark
+    for longer than ``threshold_seconds``.
+
+    "Dark" means: known=False (never probed, or probe returned unknown).
+    "Persistently dark" means the darkness has persisted beyond the threshold,
+    suggesting a stuck probe rather than a transient failure.
+
+    Returns a list of dicts with keys: id, name, dark_reason, dark_since.
+    """
+    now = now or _utcnow()
+    stale: List[Dict[str, Any]] = []
+    async with _max_plan_pool_lock:
+        for acct in _account_by_id.values():
+            if not _account_meter_eligible(acct):
+                continue
+            snap = acct.get("usage_snapshot")
+            if isinstance(snap, UsageSnapshot) and snap.known:
+                continue
+            # Account is meter-eligible but has no known snapshot.
+            # Determine how long it has been dark using the oldest relevant stamp.
+            failed_at = acct.get("usage_probe_failed_at")
+            at = acct.get("usage_snapshot_at")
+            dark_since: datetime | None = None
+            if failed_at is not None and at is not None:
+                dark_since = min(failed_at, at)
+            elif failed_at is not None:
+                dark_since = failed_at
+            elif at is not None:
+                dark_since = at
+            # No stamps at all → never probed; use None to indicate unknown onset.
+            if dark_since is not None and (now - dark_since).total_seconds() < threshold_seconds:
+                continue
+            stale.append(
+                {
+                    "id": acct.get("id"),
+                    "name": acct.get("name"),
+                    "dark_reason": _usage_dark_reason(acct),
+                    "dark_since": dark_since,
+                }
+            )
+    return stale
+
+
+async def _load_persisted_usage_blobs() -> Dict[str, Any]:
+    """Fetch every account's persisted ``rate_limit_usage`` blob keyed by id str.
+
+    Best-effort and read-only: on any DB error returns an empty map so the
+    caller degrades to in-memory-only classification rather than raising. The
+    fleet-wide reliability summary must never break the settings load.
+    """
+    from sqlmodel import select as sql_select
+
+    from app.models import MaxPlanAccount
+
+    blobs: Dict[str, Any] = {}
+    try:
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    sql_select(MaxPlanAccount.id, MaxPlanAccount.rate_limit_usage)
+                )
+            ).all()
+        for acct_id, raw in rows:
+            if raw is not None:
+                blobs[str(acct_id)] = raw
+    except Exception:
+        logger.warning(
+            "[POOL] failed to load persisted usage blobs for reliability stats",
+            exc_info=True,
+        )
+    return blobs
+
+
+def _fresher_usage_stamp(
+    acct: Dict[str, Any], persisted_raw: Any
+) -> datetime | None:
+    """Return the wall-clock stamp of the fresher KNOWN usage snapshot across
+    the in-memory probe result and the DB-persisted blob, or None if neither
+    source has a known snapshot. Mirrors ``usage_snapshot_summary_with_fallback``
+    so non-leader instances see the leader's persisted meters.
+    """
+    stamps: list[datetime] = []
+    snap = acct.get("usage_snapshot")
+    at = acct.get("usage_snapshot_at")
+    if isinstance(snap, UsageSnapshot) and snap.known and at is not None:
+        stamps.append(at)
+    parsed = _snapshot_from_persisted_usage(persisted_raw)
+    if parsed is not None:
+        stamps.append(parsed[1])
+    return max(stamps) if stamps else None
+
+
+async def get_meter_reliability_stats(
+    now: datetime | None = None,
+    min_coverage_pct: int = 80,
+) -> Dict[str, Any]:
+    """Return a fleet-wide usage-meter reliability summary.
+
+    Walks the account pool under ``_max_plan_pool_lock`` and classifies every
+    account as ineligible / known-fresh / known-stale / dark.  The returned
+    dict is JSON-safe and side-effect-free.
+
+    Keys returned:
+    - ``meters_eligible``    — accounts that can produce a usage snapshot
+    - ``meters_known``       — eligible accounts with a fresh known snapshot
+    - ``meters_stale``       — eligible accounts with a stale but known snapshot
+    - ``meters_dark``        — eligible accounts with no known snapshot
+    - ``meters_ineligible``  — accounts skipped (non-OAuth / disabled / no secret)
+    - ``dark_by_reason``     — dict mapping dark-reason string → count
+    - ``coverage_ratio``     — meters_known / meters_eligible (None if eligible=0)
+    - ``persist_failure_count`` — module-level DB persist failure counter
+    - ``armable``            — True iff coverage_ratio >= min_coverage_pct/100
+                               and persist_failure_count == 0
+
+    Cross-instance correctness: probes are scheduled only from the leader
+    orchestrator loop, so the in-memory ``usage_snapshot`` is absent on
+    non-leader Cloud Run instances. Classifying purely off memory would report
+    every account dark (coverage_ratio=0, armable=False) on non-leaders even
+    when meters are healthy per the shared DB — the exact blindness
+    ``usage_snapshot_summary_with_fallback`` exists to fix. So we fetch the
+    DB-persisted ``MaxPlanAccount.rate_limit_usage`` blobs and classify each
+    account off the fresher of the in-memory and persisted snapshots.
+    """
+    now = now or _utcnow()
+    meters_known = 0
+    meters_stale = 0
+    meters_dark = 0
+    meters_ineligible = 0
+    dark_by_reason: Dict[str, int] = {}
+
+    persisted_by_id = await _load_persisted_usage_blobs()
+
+    async with _max_plan_pool_lock:
+        for acct in _account_by_id.values():
+            if not _account_meter_eligible(acct):
+                meters_ineligible += 1
+                continue
+            # Prefer the fresher of the in-memory probe result and the
+            # DB-persisted blob (mirrors usage_snapshot_summary_with_fallback),
+            # so non-leader instances read the leader's persisted meters.
+            best_at = _fresher_usage_stamp(
+                acct, persisted_by_id.get(str(acct.get("id")))
+            )
+            if best_at is not None:
+                stale = (now - best_at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
+                if stale:
+                    meters_stale += 1
+                else:
+                    meters_known += 1
+            else:
+                meters_dark += 1
+                reason = _usage_dark_reason(acct) or "unknown"
+                dark_by_reason[reason] = dark_by_reason.get(reason, 0) + 1
+
+    meters_eligible = meters_known + meters_stale + meters_dark
+    persist_failures = get_usage_persist_failure_count()
+    coverage_ratio: float | None = (
+        meters_known / meters_eligible if meters_eligible > 0 else None
+    )
+    armable = (
+        coverage_ratio is not None
+        and coverage_ratio >= min_coverage_pct / 100.0
+        and persist_failures == 0
+    )
+    return {
+        "meters_eligible": meters_eligible,
+        "meters_known": meters_known,
+        "meters_stale": meters_stale,
+        "meters_dark": meters_dark,
+        "meters_ineligible": meters_ineligible,
+        "dark_by_reason": dark_by_reason,
+        "coverage_ratio": coverage_ratio,
+        "persist_failure_count": persist_failures,
+        "armable": armable,
+    }
+
+
+# Leader-memory marker: the timestamp at which ``armable`` first became — and has
+# since continuously stayed — True. Reset to None the instant ``armable`` regresses
+# (or the mode leaves "auto"), so the sustained-observation clock restarts. A leader
+# restart also resets it via module reload, which is fail-closed / conservative: the
+# window is simply re-observed before the gate is (re-)armed.
+_usage_headroom_armable_since: datetime | None = None
+
+
+def get_usage_headroom_armable_since() -> datetime | None:
+    """Return the leader-memory 'armable-since' marker (None if not currently
+    holding, or if this instance is not the leader that runs the reconciler)."""
+    return _usage_headroom_armable_since
+
+
+async def _persist_usage_headroom_armable_since(dt: datetime | None) -> bool:
+    """Persist the armable-since timestamp into DeploymentState.runtime_config_json.
+
+    Modeled after ``_persist_usage_headroom_gate_enabled`` — the same JSONB config
+    row, different key. None values are persisted as JSON null so the restore
+    path can distinguish ``never-set`` from ``explicitly-reset``.
+    """
+    from app.models import DeploymentState
+
+    value = dt.isoformat() if dt is not None else None
+    try:
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            if state is None:
+                logger.warning(
+                    "[POOL] usage_headroom persist armable-since: "
+                    "DeploymentState id=1 missing; skipped"
+                )
+                return False
+            config_json = dict(getattr(state, "runtime_config_json", None) or {})
+            config_json["usage_headroom_armable_since"] = value
+            state.runtime_config_json = config_json
+            session.add(state)
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "[POOL] usage_headroom persist armable-since: failed to persist %s",
+            value,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+async def _restore_usage_headroom_armable_since() -> bool:
+    """Restore armable-since from DB on leader start.
+
+    Called from ``reconcile_usage_headroom_arming`` when the module variable is
+    None (process restart / module reload). Reads the previously-persisted ISO
+    string from DeploymentState.runtime_config_json and sets the module variable
+    so the sustained-observation window is **not** reset by a restart.
+
+    Returns True if a value was restored.
+    """
+    global _usage_headroom_armable_since
+
+    try:
+        from app.models import DeploymentState
+
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            if state is None:
+                return False
+            config_json = getattr(state, "runtime_config_json", None) or {}
+            raw = config_json.get("usage_headroom_armable_since")
+            if raw is not None and isinstance(raw, str):
+                _usage_headroom_armable_since = datetime.fromisoformat(raw)
+                return True
+    except Exception:
+        logger.warning(
+            "[POOL] usage_headroom restore armable-since: failed; "
+            "window will start fresh",
+            exc_info=True,
+        )
+    return False
+
+
+async def _persist_usage_headroom_gate_enabled(value: bool) -> bool:
+    """Persist ``usage_headroom_gate_enabled`` into DeploymentState.runtime_config_json
+    (id=1) BEFORE mutating in-memory ``runtime_config``.
+
+    A process must never run a gate state that was not durably committed, so the
+    DB write happens first; only on a successful commit do we mirror the value
+    into process-local config (non-leader instances pick it up via
+    ``sync_runtime_config_from_state``). A persist failure leaves in-memory state
+    unchanged and returns False — it never raises.
+    """
+    from app.models import DeploymentState
+
+    try:
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            if state is None:
+                logger.warning(
+                    "[POOL] usage_headroom auto-arm: DeploymentState id=1 missing; "
+                    "gate left unchanged (wanted=%s)",
+                    value,
+                )
+                return False
+            config_json = dict(getattr(state, "runtime_config_json", None) or {})
+            config_json["usage_headroom_gate_enabled"] = value
+            state.runtime_config_json = config_json
+            session.add(state)
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "[POOL] usage_headroom auto-arm: failed to persist gate=%s to "
+            "DeploymentState; in-memory state unchanged",
+            value,
+            exc_info=True,
+        )
+        return False
+
+    # Durably committed — now mirror into process-local runtime_config.
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        if isinstance(_rc, dict):
+            _rc["usage_headroom_gate_enabled"] = value
+    except Exception:  # pragma: no cover - config mirror is best-effort
+        logger.warning(
+            "[POOL] usage_headroom auto-arm: persisted gate=%s but failed to "
+            "update in-memory runtime_config",
+            value,
+            exc_info=True,
+        )
+    return True
+
+
+async def reconcile_usage_headroom_arming(
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Autonomously arm/disarm the usage_headroom selection gate from sustained
+    meter reliability. Leader-only (probes and the observation-window marker are
+    leader-memory). Returns a JSON-safe decision dict for logging/observability.
+
+    Governed by ``usage_headroom_auto_arm_mode`` (default "auto"):
+
+    - ``"auto"``: ARM (set ``usage_headroom_gate_enabled`` True) only once the
+      ``armable`` verdict has held True CONTINUOUSLY for
+      ``usage_headroom_auto_arm_observation_minutes`` (default 60). DISARM
+      immediately (fail-safe, no window) the instant ``armable`` goes False.
+    - ``"manual"``: the reconciler never touches the gate — operator owns it.
+    - ``"off"``: force-disarm kill switch — drive the gate to False and hold it.
+
+    Flips are persisted to DeploymentState BEFORE the in-memory mutation and are
+    idempotent (only written when the value actually changes). A persist failure
+    leaves state unchanged and never crashes the caller.
+
+    Persistence: the armable-since marker is written to
+    ``DeploymentState.runtime_config_json`` on every transition (non-None to None
+    on reset, or None to a timestamp on first observation).  On process restart
+    the marker is restored on the first reconciler tick so the observation window
+    is **not** reset by a restart — only a genuine meter-health regression
+    (armable=False) discards it.
+    """
+    global _usage_headroom_armable_since
+    now = now or _utcnow()
+
+    # After a process restart the module variable is None (module reload). Restore
+    # any previously-persisted marker so the observation window survives restarts.
+    # Only a genuine metering-health regression (armable=False below) discards it.
+    if _usage_headroom_armable_since is None:
+        await _restore_usage_headroom_armable_since()
+
+    cfg = _runtime_config_snapshot()
+    mode = str(cfg.get("usage_headroom_auto_arm_mode", "auto") or "auto").strip().lower()
+    if mode not in ("auto", "manual", "off"):
+        mode = "auto"
+    current_enabled = bool(cfg.get("usage_headroom_gate_enabled", False))
+
+    # manual: reconciler is a no-op; the operator owns the gate. Reset the window
+    # so a later switch to auto starts a fresh observation rather than arming on a
+    # marker that accrued while manual. Persist the reset so the next leader also
+    # starts fresh.
+    if mode == "manual":
+        had_marker = _usage_headroom_armable_since is not None
+        _usage_headroom_armable_since = None
+        if had_marker:
+            await _persist_usage_headroom_armable_since(None)
+        return {
+            "mode": "manual",
+            "action": "noop",
+            "gate_enabled": current_enabled,
+            "armable": None,
+            "armable_since": None,
+        }
+
+    # off: force-disarm kill switch. Hold the gate False. Persist the marker
+    # reset so a subsequent "auto" mode restart doesn't inherit the stale window.
+    if mode == "off":
+        had_marker = _usage_headroom_armable_since is not None
+        _usage_headroom_armable_since = None
+        if had_marker:
+            await _persist_usage_headroom_armable_since(None)
+        if not current_enabled:
+            return {
+                "mode": "off",
+                "action": "noop",
+                "gate_enabled": False,
+                "armable": None,
+                "armable_since": None,
+            }
+        ok = await _persist_usage_headroom_gate_enabled(False)
+        if ok:
+            logger.info(
+                "[POOL] usage_headroom auto-arm: mode=off — force-disarmed gate"
+            )
+            return {
+                "mode": "off",
+                "action": "disarmed",
+                "gate_enabled": False,
+                "armable": None,
+                "armable_since": None,
+            }
+        return {
+            "mode": "off",
+            "action": "persist_failed",
+            "gate_enabled": current_enabled,
+            "armable": None,
+            "armable_since": None,
+        }
+
+    # auto mode.
+    min_coverage_pct = 80
+    try:
+        min_coverage_pct = int(cfg.get("usage_headroom_min_coverage_pct", 80))
+    except (TypeError, ValueError):
+        min_coverage_pct = 80
+    stats = await get_meter_reliability_stats(
+        now=now, min_coverage_pct=min_coverage_pct
+    )
+    armable = bool(stats.get("armable"))
+
+    observation_minutes = 60
+    try:
+        observation_minutes = int(
+            cfg.get("usage_headroom_auto_arm_observation_minutes", 60)
+        )
+    except (TypeError, ValueError):
+        observation_minutes = 60
+    if observation_minutes < 1:
+        observation_minutes = 1
+
+    # Fail-safe: the instant armable regresses, reset the window and disarm now
+    # (no observation window on the way down). Persist the reset so a subsequent
+    # restart doesn't inherit the stale window.
+    if not armable:
+        had_marker = _usage_headroom_armable_since is not None
+        _usage_headroom_armable_since = None
+        if had_marker:
+            await _persist_usage_headroom_armable_since(None)
+        if not current_enabled:
+            return {
+                "mode": "auto",
+                "action": "noop",
+                "gate_enabled": False,
+                "armable": False,
+                "armable_since": None,
+            }
+        ok = await _persist_usage_headroom_gate_enabled(False)
+        if ok:
+            logger.info(
+                "[POOL] usage_headroom auto-arm: armable regressed — fail-safe "
+                "disarmed gate (coverage_ratio=%s, persist_failures=%s)",
+                stats.get("coverage_ratio"),
+                stats.get("persist_failure_count"),
+            )
+            return {
+                "mode": "auto",
+                "action": "disarmed",
+                "gate_enabled": False,
+                "armable": False,
+                "armable_since": None,
+            }
+        return {
+            "mode": "auto",
+            "action": "persist_failed",
+            "gate_enabled": current_enabled,
+            "armable": False,
+            "armable_since": None,
+        }
+
+    # armable is True — track the sustained-observation window.
+    # If this is a fresh observation (never held or restored), mark the start
+    # and persist it so the window survives a restart.
+    if _usage_headroom_armable_since is None:
+        _usage_headroom_armable_since = now
+        await _persist_usage_headroom_armable_since(now)
+    since = _usage_headroom_armable_since
+    elapsed_seconds = (now - since).total_seconds()
+    window_seconds = observation_minutes * 60
+
+    # Already armed — idempotent no-op (do NOT re-persist each cycle).
+    if current_enabled:
+        return {
+            "mode": "auto",
+            "action": "noop",
+            "gate_enabled": True,
+            "armable": True,
+            "armable_since": since.isoformat(),
+        }
+
+    # Not yet armed and the window has not elapsed — keep waiting.
+    if elapsed_seconds < window_seconds:
+        return {
+            "mode": "auto",
+            "action": "waiting",
+            "gate_enabled": False,
+            "armable": True,
+            "armable_since": since.isoformat(),
+            "elapsed_seconds": elapsed_seconds,
+            "window_seconds": window_seconds,
+        }
+
+    # Sustained across the window — arm the gate.
+    ok = await _persist_usage_headroom_gate_enabled(True)
+    if ok:
+        logger.info(
+            "[POOL] usage_headroom auto-arm: armable sustained %.0fs "
+            "(window=%.0fs) — armed gate (coverage_ratio=%s)",
+            elapsed_seconds,
+            window_seconds,
+            stats.get("coverage_ratio"),
+        )
+        return {
+            "mode": "auto",
+            "action": "armed",
+            "gate_enabled": True,
+            "armable": True,
+            "armable_since": since.isoformat(),
+        }
+    return {
+        "mode": "auto",
+        "action": "persist_failed",
+        "gate_enabled": current_enabled,
+        "armable": True,
+        "armable_since": since.isoformat(),
+    }
+
+
 def _apply_usage_gate(
     candidates: List[Any],
     *,
@@ -3204,6 +3793,52 @@ def _apply_usage_gate(
     return not_exhausted if not_exhausted else candidates
 
 
+def _usage_dark_reason(acct: Dict[str, Any]) -> str | None:
+    """Classify WHY an account's usage meter is dark (known=False).
+
+    Returns one of:
+    - ``"not_oauth"``: account uses API-key or other non-OAuth auth — the
+      provider's probe_usage returns unknown() for all non-OAuth modes.
+    - ``"no_secret"``: OAuth account but both oauth_token and runtime_secret
+      are absent and Secret Manager was not attempted — probe cannot
+      authenticate.
+    - ``"secret_fetch_failed"``: OAuth account whose Secret Manager fetch
+      failed — credential is unreachable, meter cannot authenticate.
+    - ``"never_probed"``: meter-eligible account that has never been probed
+      (no snapshot and no probe-failure stamp).
+    - ``"endpoint_error"``: probe was attempted but the endpoint returned
+      unknown (HTTP error, schema drift, or transient failure).
+    - ``None``: meter is known (should not be called on known snapshots).
+    """
+    auth_mode = _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
+    provider = _normalize_provider_name(acct.get("provider"))
+    # Anthropic API-key accounts with a runtime_secret are now meter-eligible
+    # (they probe via messages.create headers).  All other non-OAuth modes are
+    # ineligible and classified as not_oauth.
+    if auth_mode != LLMAuthMode.OAUTH.value:
+        if (
+            auth_mode == LLMAuthMode.API_KEY.value
+            and provider == LLMProviderName.ANTHROPIC.value
+            and bool(acct.get("runtime_secret"))
+        ):
+            pass  # fall through to the eligible path below
+        else:
+            return "not_oauth"
+    secret = acct.get("oauth_token") or acct.get("runtime_secret")
+    if not secret:
+        if acct.get("secret_fetch_failed"):
+            return "secret_fetch_failed"
+        return "no_secret"
+    # Meter-eligible: OAuth + secret present.
+    snap = acct.get("usage_snapshot")
+    failed_at = acct.get("usage_probe_failed_at")
+    at = acct.get("usage_snapshot_at")
+    if snap is None and failed_at is None and at is None:
+        return "never_probed"
+    # Probe was attempted (has a snapshot timestamp or failure stamp).
+    return "endpoint_error"
+
+
 def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """JSON-safe per-account usage snapshot for the admin health endpoint.
 
@@ -3213,6 +3848,9 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
     the 60s selection TTL, which would flag nearly every render under the
     300s meter cadence. Selection freshness is handled separately by
     ``_cached_usage_snapshot``.
+
+    ``dark_reason`` (str | None) is populated on the ``known=False`` branch so
+    operators can distinguish ineligible accounts from probe failures.
     """
     snap = acct.get("usage_snapshot")
     at = acct.get("usage_snapshot_at")
@@ -3224,6 +3862,7 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
         probed_at = snap.probed_at if isinstance(snap, UsageSnapshot) else None
         return {
             "known": False,
+            "dark_reason": _usage_dark_reason(acct),
             "five_hour_utilization": None,
             "seven_day_utilization": None,
             "resets_at": {},
@@ -3232,6 +3871,7 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
         }
     return {
         "known": True,
+        "dark_reason": None,
         "five_hour_utilization": snap.window_utilizations.get("five_hour"),
         "seven_day_utilization": snap.window_utilizations.get("seven_day"),
         "resets_at": dict(snap.resets_at),
@@ -3247,6 +3887,7 @@ def _usage_summary_from_snapshot(
     stale = (now - at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
     return {
         "known": True,
+        "dark_reason": None,
         "five_hour_utilization": snap.window_utilizations.get("five_hour"),
         "seven_day_utilization": snap.window_utilizations.get("seven_day"),
         "resets_at": dict(snap.resets_at),
@@ -3295,6 +3936,7 @@ def usage_snapshot_summary_with_fallback(
             return _usage_snapshot_summary(acct, now)
         return {
             "known": False,
+            "dark_reason": None,
             "five_hour_utilization": None,
             "seven_day_utilization": None,
             "resets_at": {},
@@ -3695,7 +4337,6 @@ async def select_llm_runtime_for_task(
     project_id: str | None = None,
     runner_available_clis: dict[str, dict] | None = None,
     failure_reasons: List[str] | None = None,
-    raise_resident_policy_hold: bool = False,
 ) -> LLMSelectionResult | None:
     """Resolve the (provider, model, account) runtime for a task.
 
@@ -3765,19 +4406,6 @@ async def select_llm_runtime_for_task(
         explicit_model, runtime_config
     )
     routing_task_type = _task_type(task)
-    try:
-        resident_routing = resolve_resident_provider_routing(
-            task,
-            project_provider_preference=provider_preference,
-            allow_cross_provider_fallback=allow_fallback,
-        )
-        validate_resident_model_provider(resident_routing, lambda model: infer_provider_for_model(model, runtime_config))
-    except ResidentProviderPolicyHold as exc:
-        if failure_reasons is not None:
-            failure_reasons.append(str(exc))
-        if raise_resident_policy_hold:
-            raise
-        return None
     # Resolve project_id: explicit parameter takes precedence, then task attribute.
     _resolved_project_id = (
         project_id
@@ -3787,18 +4415,6 @@ async def select_llm_runtime_for_task(
     )
     _log_project_id = _resolved_project_id or "unknown"
     logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", _log_project_id, user_id, routing_task_type)
-
-    if resident_routing is not None:
-        provider_preference = list(resident_routing.provider_preference)
-        explicit_provider = resident_routing.primary_provider or None
-        explicit_model = (
-            resident_routing.primary_model if explicit_provider else None
-        )
-        # Resident failover is ordered, never load-balanced. Generic model
-        # preference order cannot put a compatible provider ahead of primary.
-        mode = "preferred"
-        allow_fallback = resident_routing.allow_fallback
-        model_preferences = []
 
     # If the inferred explicit_provider isn't allowed by the resolved
     # routing, drop the pin so category_routing wins. Catches:
@@ -4046,9 +4662,7 @@ async def select_llm_runtime_for_task(
         # admin UI / logs surface the downgrade explicitly — silently
         # running a different tier than the user asked for is a trust-losing
         # failure mode.
-        fallback = (
-            None if resident_routing is not None else provider.fallback_model(model)
-        )
+        fallback = provider.fallback_model(model)
         if fallback and fallback != model:
             sub_reasons = _sub_reasons()
             account = await select_max_plan_account(

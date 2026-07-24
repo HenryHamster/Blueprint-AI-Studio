@@ -95,16 +95,17 @@ def _locate_agent_binary() -> list[str] | None:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_TASK_TYPES = frozenset({
-    "review", "panel_review", "plan", "research", "strategic_review",
+    "review", "plan", "research", "strategic_review",
     "design_doc_update", "security_audit", "investigate", "self_audit",
     "release_audit", "release_audit_challenge", "release_merge_grade",
     "memo", "verify_tests", "compute_experiment", "web_research",
     "design", "repo_bootstrap", "perf",
+    "capability_proof_trial", "criterion_coverage_trial", "walkthrough_e2e",
 })
 
 _ALL_TASK_TYPES = _READ_ONLY_TASK_TYPES | {
     "create", "fix", "refactor", "qa", "deps", "docs", "migrate",
-    "smoketest", "debug",
+    "smoketest", "debug", "salvage_bundle",
 }
 
 
@@ -154,11 +155,26 @@ def _build_claim_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 # Pricing in USD per 1M tokens (as of mid-2026).
 # These are approximate and used only for golden-task cost comparisons.
+# Cache: read = 0.10x input, write = 1.25x input (standard 5-min TTL).
+# Prefix order matters — more-specific prefixes must appear before
+# catch-all entries (e.g. gpt-4o-mini before gpt-4o before gpt-4).
 _PRICING: dict[str, dict[str, float]] = {
     # model_prefix -> {input_per_1M, output_per_1M, cache_read_per_1M, cache_write_per_1M}
+    # Claude
+    "claude-fable": {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50},
+    "claude-opus": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-opus": {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
-    "claude-haiku": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_write": 1.00},
+    "claude-haiku": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
+    # OpenAI (approximate)
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache_read": 0.075, "cache_write": 0.075},
+    "gpt-4o": {"input": 2.50, "output": 10.00, "cache_read": 1.25, "cache_write": 1.25},
+    "gpt-4": {"input": 2.50, "output": 10.00, "cache_read": 1.25, "cache_write": 1.25},
+    "o3": {"input": 10.00, "output": 40.00, "cache_read": 5.00, "cache_write": 5.00},
+    "o4": {"input": 10.00, "output": 40.00, "cache_read": 5.00, "cache_write": 5.00},
+    # Google Gemini (approximate)
+    "gemini": {"input": 1.25, "output": 5.00, "cache_read": 0.31, "cache_write": 1.25},
+    # DeepSeek (approximate)
+    "deepseek": {"input": 0.50, "output": 2.00, "cache_read": 0.125, "cache_write": 0.50},
 }
 
 

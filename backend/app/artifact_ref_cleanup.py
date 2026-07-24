@@ -216,9 +216,10 @@ async def _await_tracked_promotion_drain() -> bool:
         task = asyncio.create_task(drain_artifact_ref_promotion_intents(limit=8))
         _lifecycle_promotion_drain_task = task
     try:
-        async with asyncio.timeout(_LIFECYCLE_RECONCILE_WAIT_SECONDS):
-            await asyncio.shield(task)
-    except TimeoutError:
+        await asyncio.wait_for(
+            asyncio.shield(task), timeout=_LIFECYCLE_RECONCILE_WAIT_SECONDS
+        )
+    except (TimeoutError, asyncio.TimeoutError):
         return False
     except BaseException:
         if _lifecycle_promotion_drain_task is task and task.done():
@@ -241,11 +242,12 @@ async def artifact_ref_lifecycle_service() -> None:
                     "ArtifactRef promotion reconciliation remains in progress"
                 )
                 continue
-            async with asyncio.timeout(45):
-                await drain_artifact_ref_cleanup_intents(limit=8)
+            await asyncio.wait_for(
+                drain_artifact_ref_cleanup_intents(limit=8), timeout=45
+            )
         except asyncio.CancelledError:
             raise
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             logger.warning("ArtifactRef lifecycle cycle exceeded its 45s budget")
         except Exception:
             logger.exception("ArtifactRef lifecycle cycle failed")

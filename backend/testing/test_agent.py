@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from datetime import datetime, timedelta
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from app.database import get_session
 from app.main import app
 from testing.conftest import USE_POSTGRES
@@ -145,555 +145,8 @@ async def _seed_deploy_state(
     return state
 
 
-@pytest.mark.smoketest
-@pytest.mark.asyncio
-async def test_agent_claim_success(client: AsyncClient, db_session):
-    """
-    Tests an agent successfully claiming a QUEUED task.
-    """
-    project = Project(name="Agent Claim Test", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
 
-    task = Task(
-        project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="agent-vm-999"
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
 
-    # Generate a valid JWT for this task/VM
-    token = create_agent_token(str(task.id), "agent-vm-999")
-    headers = {"x-agent-token": token}
-    resp = await client.post("/api/agent/claim", headers=headers)
-
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["task_id"] is not None
-    assert data["title"] is not None
-    assert "payloads" in data
-    assert "task_capability" not in data
-
-    await db_session.refresh(task)
-    assert task.status == TaskStatus.IN_PROGRESS
-
-
-@pytest.mark.smoketest
-@pytest.mark.asyncio
-async def test_agent_claim_unauthorized(client: AsyncClient):
-    """
-    Tests that missing or invalid token returns 401.
-    """
-    resp = await client.post(
-        "/api/agent/claim", headers={"x-agent-token": "wrong-token"}
-    )
-    assert resp.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_missing_task_row_returns_401(client: AsyncClient):
-    """Claim auth fails closed when the JWT points at a missing task row."""
-    token = create_agent_token(
-        "00000000-0000-0000-0000-000000000000", "non-existent-vm"
-    )
-    headers = {"x-agent-token": token}
-    resp = await client.post("/api/agent/claim", headers=headers)
-    assert resp.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_scoped_to_jwt_task(client: AsyncClient, db_session):
-    """With multiple tasks pinned to one shared vm_instance_id (persistent
-    runner pattern), a claim returns exactly the JWT's task — never an
-    arbitrary sibling. Regression: the unscoped claim let the agent spawned
-    for task B grab older task A, then every follow-up call 403'd
-    "Task ID mismatch" and the agent crash-looped (2026-07-11 pile-up)."""
-    project = Project(name="Claim Scoping Test", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    runner_vm = "runner:dd59526e-78f1-44ad-913e-85c72cd41151"
-    task_a = Task(
-        project_id=project.id, payloads=[{"cmd": "a"}], vm_instance_id=runner_vm
-    )
-    db_session.add(task_a)
-    await db_session.commit()
-    task_b = Task(
-        project_id=project.id, payloads=[{"cmd": "b"}], vm_instance_id=runner_vm
-    )
-    db_session.add(task_b)
-    await db_session.commit()
-    await db_session.refresh(task_a)
-    await db_session.refresh(task_b)
-
-    token_b = create_agent_token(str(task_b.id), runner_vm)
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token_b})
-
-    assert resp.status_code == 200
-    assert resp.json()["task_id"] == str(task_b.id)
-
-    await db_session.refresh(task_a)
-    await db_session.refresh(task_b)
-    assert task_b.status == TaskStatus.IN_PROGRESS
-    assert task_a.status == TaskStatus.QUEUED
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_rejects_taskless_vm_scoped_token(
-    client: AsyncClient, db_session
-):
-    """A VM-scoped (taskless) token cannot claim: /claim requires a task sub."""
-    project = Project(name="Claim VM-Scoped Test", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    vm_id = "agent-vm-pool-taskless"
-    task = Task(
-        project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id=vm_id
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_vm_scoped_token(vm_id, str(project.id))
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-
-    assert resp.status_code == 403
-    await db_session.refresh(task)
-    assert task.status == TaskStatus.QUEUED
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_includes_task_capability_slice(
-    client: AsyncClient, db_session
-):
-    project = Project(name="Agent Claim Capability Test", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "cmd": "ls"}],
-        vm_instance_id="agent-vm-capability",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-capability")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-
-    assert resp.status_code == 200
-    data = resp.json()
-    expected = {entry["id"]: entry for entry in task_type_catalog()}["create"]
-    assert data["task_capability"] == expected
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_surfaces_reserved_migration_revision(
-    client: AsyncClient, db_session
-):
-    """A migration task with an ACTIVE reservation surfaces it on the claim.
-
-    Proves the reserved identifiers reach the agent end to end: the orchestrator
-    locks a provisional revision, and the claim response carries it verbatim so
-    the agent consumes it instead of deriving max+1 locally.
-    """
-    from app.models import MigrationReservation, MigrationReservationStatus
-
-    project = Project(name="Agent Claim Reservation Test", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "migrate", "cmd": "ls"}],
-        vm_instance_id="agent-vm-reservation",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    reservation = MigrationReservation(
-        project_id=project.id,
-        task_id=task.id,
-        provisional_revision="0153",
-        provisional_down_revision="0151",
-        status=MigrationReservationStatus.ACTIVE,
-    )
-    db_session.add(reservation)
-    await db_session.commit()
-
-    token = create_agent_token(str(task.id), "agent-vm-reservation")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["migration_reservation"] == {
-        "provisional_revision": "0153",
-        "provisional_down_revision": "0151",
-    }
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
-    client: AsyncClient, db_session
-):
-    """A fix task inherits the create task's reservation in the real spawn topology.
-
-    Regression for the sibling-topology bug: review/fix tasks are spawned with
-    ``parent_task_id`` set to the create task's plan/research parent (so they are
-    SIBLINGS of the create task, not its children). The parent-walk therefore
-    never reaches the create task that holds the MigrationReservation; inheritance
-    must come from ``payload.original_task_id``. This exercises the full claim
-    handler end to end so a regression in the seeding logic is caught.
-    """
-    from app.models import MigrationReservation, MigrationReservationStatus
-
-    project = Project(name="Agent Claim Fix Inherit", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # Plan/research parent that both the create and fix task hang off of.
-    plan_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "plan"}],
-    )
-    db_session.add(plan_task)
-    await db_session.commit()
-    await db_session.refresh(plan_task)
-
-    # The original create task: child of the plan, holds the reservation.
-    create_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create"}],
-        parent_task_id=plan_task.id,
-    )
-    db_session.add(create_task)
-    await db_session.commit()
-    await db_session.refresh(create_task)
-
-    reservation = MigrationReservation(
-        project_id=project.id,
-        task_id=create_task.id,
-        provisional_revision="0207",
-        provisional_down_revision="0205",
-        status=MigrationReservationStatus.ACTIVE,
-    )
-    db_session.add(reservation)
-    await db_session.commit()
-
-    # The fix task: SIBLING of the create task (parent is the plan, NOT the
-    # create task), carrying original_task_id pointing at the create task.
-    fix_task = Task(
-        project_id=project.id,
-        payloads=[
-            {
-                "type": "fix",
-                "pr_number": 42,
-                "original_task_id": str(create_task.id),
-            }
-        ],
-        parent_task_id=plan_task.id,
-        vm_instance_id="agent-vm-fix-inherit",
-    )
-    db_session.add(fix_task)
-    await db_session.commit()
-    await db_session.refresh(fix_task)
-
-    # Sanity: the parent walk alone never reaches the reservation holder, and the
-    # fix task has no reservation of its own.
-    assert fix_task.parent_task_id == plan_task.id
-    assert fix_task.parent_task_id != create_task.id
-
-    token = create_agent_token(str(fix_task.id), "agent-vm-fix-inherit")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-
-    assert resp.status_code == 200
-    assert resp.json()["migration_reservation"] == {
-        "provisional_revision": "0207",
-        "provisional_down_revision": "0205",
-    }
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_review_task_inherits_reservation_via_review_loop_context(
-    client: AsyncClient, db_session
-):
-    """A review task inherits the reservation via context.review_loop.original_task_id.
-
-    Complements the fix-task test: the original_task_id is carried in
-    ``context['review_loop']`` (as review_pipeline propagates it) rather than the
-    payload, and the review task is again a sibling of the create task.
-    """
-    from app.models import MigrationReservation, MigrationReservationStatus
-
-    project = Project(name="Agent Claim Review Inherit", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    plan_task = Task(project_id=project.id, payloads=[{"type": "plan"}])
-    db_session.add(plan_task)
-    await db_session.commit()
-    await db_session.refresh(plan_task)
-
-    create_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create"}],
-        parent_task_id=plan_task.id,
-    )
-    db_session.add(create_task)
-    await db_session.commit()
-    await db_session.refresh(create_task)
-
-    reservation = MigrationReservation(
-        project_id=project.id,
-        task_id=create_task.id,
-        provisional_revision="0211",
-        provisional_down_revision="0209",
-        status=MigrationReservationStatus.ACTIVE,
-    )
-    db_session.add(reservation)
-    await db_session.commit()
-
-    review_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "review", "pr_number": 7}],
-        context={"review_loop": {"original_task_id": str(create_task.id)}},
-        parent_task_id=plan_task.id,
-        vm_instance_id="agent-vm-review-inherit",
-    )
-    db_session.add(review_task)
-    await db_session.commit()
-    await db_session.refresh(review_task)
-
-    token = create_agent_token(str(review_task.id), "agent-vm-review-inherit")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-
-    assert resp.status_code == 200
-    assert resp.json()["migration_reservation"] == {
-        "provisional_revision": "0211",
-        "provisional_down_revision": "0209",
-    }
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_session):
-    """A task with no reservation omits the key (backward-compatible claim)."""
-    project = Project(name="Agent Claim No Reservation", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "migrate", "cmd": "ls"}],
-        vm_instance_id="agent-vm-no-reservation",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-no-reservation")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-
-    assert resp.status_code == 200
-    assert "migration_reservation" not in resp.json()
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_scoped_to_token_sub_prevents_cross_claim(
-    client: AsyncClient, db_session,
-):
-    """
-    When multiple QUEUED/PROVISIONING tasks share the same vm_instance_id
-    (e.g. local-runner concurrent tasks all pinned to "runner:<id>"), claim_task
-    must scope the primary SELECT by the token's ``sub`` (task id) so an agent
-    whose token authorizes Task A does not accidentally claim Task B. Without
-    this scoping, the vm_instance_id-only SELECT returns whichever row FOR UPDATE
-    SKIP LOCKED picks first, causing every subsequent task-scoped call to 403
-    with "Task ID mismatch" and the agent self-terminates.
-    """
-    project = Project(name="Cross-Claim Guard", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    shared_vm = "runner:test-123"
-
-    task_a = Task(
-        project_id=project.id,
-        payloads=[{"cmd": "task_a"}],
-        vm_instance_id=shared_vm,
-        status=TaskStatus.PROVISIONING,
-    )
-    db_session.add(task_a)
-    await db_session.commit()
-    await db_session.refresh(task_a)
-
-    task_b = Task(
-        project_id=project.id,
-        payloads=[{"cmd": "task_b"}],
-        vm_instance_id=shared_vm,
-        status=TaskStatus.PROVISIONING,
-    )
-    db_session.add(task_b)
-    await db_session.commit()
-    await db_session.refresh(task_b)
-
-    # Token scoped to task_b — claim must return task_b, not task_a
-    token = create_agent_token(str(task_b.id), shared_vm)
-    headers = {"x-agent-token": token}
-    resp = await client.post("/api/agent/claim", headers=headers)
-
-    assert resp.status_code == 200
-    claimed_id = resp.json()["task_id"]
-    assert claimed_id == str(task_b.id), (
-        f"Claim returned task {claimed_id} instead of the token's task {task_b.id}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_returns_409_when_jwt_task_is_terminal(
-    client: AsyncClient, db_session
-):
-    """When the JWT's task exists but is terminal (cancelled/reaped/doomed),
-    claim must return 409 — not 404 and not a different task.
-
-    Regression: before the scoping fix, claim returned a DIFFERENT task (the
-    oldest pinned sibling). After the scoping fix, it now correctly checks only
-    the JWT's task; when that task is no longer claimable the response should be
-    409 so the agent knows to stop retrying rather than treating it as a routing
-    error.
-    """
-    project = Project(name="Claim Terminal 409", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    shared_vm = "runner:term-409-test"
-
-    # Older task pinned to the same runner — still claimable.
-    task_old = Task(
-        project_id=project.id,
-        payloads=[{"cmd": "old"}],
-        vm_instance_id=shared_vm,
-        status=TaskStatus.PROVISIONING,
-    )
-    db_session.add(task_old)
-    await db_session.commit()
-    await db_session.refresh(task_old)
-
-    # Newer task pinned to the same runner — starts PROVISIONING, then goes terminal.
-    task_new = Task(
-        project_id=project.id,
-        payloads=[{"cmd": "new"}],
-        vm_instance_id=shared_vm,
-        status=TaskStatus.PROVISIONING,
-    )
-    db_session.add(task_new)
-    await db_session.commit()
-    await db_session.refresh(task_new)
-
-    # JWT is scoped to the newer task.
-    token = create_agent_token(str(task_new.id), shared_vm)
-    headers = {"x-agent-token": token}
-
-    # Sanity: before the task moves off PROVISIONING, claim succeeds and returns the newer task.
-    resp = await client.post("/api/agent/claim", headers=headers)
-    assert resp.status_code == 200
-    assert resp.json()["task_id"] == str(task_new.id)
-
-    # Now move the newer task to EVALUATING (non-terminal, so verify_agent_token
-    # passes, but no longer QUEUED/PROVISIONING and outside the IN_PROGRESS
-    # idempotency window — simulates a task that was claimed and then handed to
-    # evaluation, after which the agent's retry must not grab the older sibling).
-    task_new.status = TaskStatus.EVALUATING
-    # Clear the heartbeat so the IN_PROGRESS idempotency replay window doesn't fire.
-    task_new.last_heartbeat = _utcnow() - timedelta(minutes=10)
-    db_session.add(task_new)
-    await db_session.commit()
-
-    # The JWT still has the newer task's sub. Claim must return 409, not 404
-    # (task exists but not claimable) and not 200 (must not return the older task).
-    resp2 = await client.post("/api/agent/claim", headers=headers)
-    assert resp2.status_code == 409, (
-        f"Expected 409 for non-claimable task but got {resp2.status_code}: {resp2.text}"
-    )
-    # The older pinned task must remain untouched.
-    await db_session.refresh(task_old)
-    assert task_old.status == TaskStatus.PROVISIONING
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_ancestor_chain_fetched_in_single_query(
-    client: AsyncClient, db_session
-):
-    """Ancestor walk uses a recursive CTE — all levels are found in one round-trip.
-
-    Builds a grandparent -> parent -> task chain; the grandparent holds the
-    reservation. The claim must surface the reservation even though it is two
-    hops away, exercising that the CTE walks the full chain.
-    """
-    from app.models import MigrationReservation, MigrationReservationStatus
-
-    project = Project(name="Agent Claim Ancestor Chain", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    grandparent_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "research"}],
-    )
-    db_session.add(grandparent_task)
-    await db_session.commit()
-    await db_session.refresh(grandparent_task)
-
-    reservation = MigrationReservation(
-        project_id=project.id,
-        task_id=grandparent_task.id,
-        provisional_revision="0301",
-        provisional_down_revision="0299",
-        status=MigrationReservationStatus.ACTIVE,
-    )
-    db_session.add(reservation)
-    await db_session.commit()
-
-    parent_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "plan"}],
-        parent_task_id=grandparent_task.id,
-    )
-    db_session.add(parent_task)
-    await db_session.commit()
-    await db_session.refresh(parent_task)
-
-    leaf_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create"}],
-        parent_task_id=parent_task.id,
-        vm_instance_id="agent-vm-ancestor-chain",
-    )
-    db_session.add(leaf_task)
-    await db_session.commit()
-    await db_session.refresh(leaf_task)
-
-    token = create_agent_token(str(leaf_task.id), "agent-vm-ancestor-chain")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-
-    assert resp.status_code == 200
-    assert resp.json()["migration_reservation"] == {
-        "provisional_revision": "0301",
-        "provisional_down_revision": "0299",
-    }
 
 
 @pytest.mark.asyncio
@@ -1618,25 +1071,76 @@ async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_resident_claim_survives_aborted_retry_projection_session(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    project = Project(name="Resident claim projection failure", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    session_id = f"ss-{uuid.uuid4()}"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-resident-projection-failure",
+        status=TaskStatus.PROVISIONING,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": 1,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    async def abort_projection_transaction(projection_session, **_kwargs):
+        # This is a real PostgreSQL transaction abort, not merely a mocked
+        # exception. If claim used its main session here, later response-building
+        # reads would raise PendingRollbackError and turn a durable claim into 500.
+        await projection_session.execute(
+            text("SELECT * FROM deliberately_missing_retry_projection_table")
+        )
+
+    monkeypatch.setattr(
+        "app.strategic_resident_session.clear_resident_worker_retry_wait",
+        abort_projection_transaction,
+    )
+    token = create_agent_token(
+        str(task.id), "agent-vm-resident-projection-failure"
+    )
+    response = await client.post(
+        "/api/agent/claim",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task_id"] == str(task.id)
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_session):
     """
     Idempotent replay only fires within 5 min of the original claim. Beyond
-    that window a stray claim from the same VM is a real anomaly. The task
-    exists (IN_PROGRESS) but is no longer claimable — this returns 409 (task
-    exists but not claimable), not 404 (task not found / not pinned here).
+    that window a stray claim from the same VM is a real anomaly even when the
+    legitimate worker has heartbeated recently. Mutable heartbeat liveness must
+    never extend the immutable replay window.
     """
     project = Project(name="Claim Replay Expiry", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    stale_heartbeat = _utcnow() - timedelta(minutes=10)
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "run"}],
         vm_instance_id="agent-vm-stale-replay",
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=stale_heartbeat,
+        status=TaskStatus.PROVISIONING,
     )
     db_session.add(task)
     await db_session.commit()
@@ -1644,8 +1148,54 @@ async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_ses
 
     token = create_agent_token(str(task.id), "agent-vm-stale-replay")
     headers = {"x-agent-token": token}
-    resp = await client.post("/api/agent/claim", headers=headers)
-    assert resp.status_code == 409
+    first = await client.post("/api/agent/claim", headers=headers)
+    assert first.status_code == 200
+
+    await db_session.refresh(task)
+    context = dict(task.context or {})
+    replay_record = dict(context["_agent_claim_replay"])
+    replay_record["claimed_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    context["_agent_claim_replay"] = replay_record
+    task.context = context
+    task.last_heartbeat = _utcnow()
+    db_session.add(task)
+    await db_session.commit()
+
+    replay = await client.post("/api/agent/claim", headers=headers)
+    assert replay.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_replay_rejects_different_token(
+    client: AsyncClient, db_session
+):
+    """A newly minted token cannot join a task inside another token's window."""
+    project = Project(name="Claim Replay Token Binding", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-token-bound-replay",
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    original_token = create_agent_token(str(task.id), task.vm_instance_id)
+    first = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": original_token}
+    )
+    assert first.status_code == 200
+
+    different_token = create_agent_token(str(task.id), task.vm_instance_id)
+    replay = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": different_token}
+    )
+    assert replay.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -1936,7 +1486,7 @@ async def test_heartbeat_writes_task_scoped_contact_on_multiplexed_runner(
     is what let a working sibling mask a hung agent's stall forever.
 
     The heartbeat must therefore ALSO write a TASK-scoped taskcontact row, so the
-    two co-resident tasks end up with INDEPENDENT progress stamps: the working
+    two co-located tasks end up with INDEPENDENT progress stamps: the working
     sibling's tool calls advance the shared row and its OWN row, while the hung
     task's row keeps a NULL/stale last_tool_use_at — which is exactly the signal
     the reaper needs to reap it."""
@@ -9189,13 +8739,30 @@ async def test_claim_injects_direction_successful_analysis(
     assert len(_json.dumps(dsa)) <= 1500
 
 
+async def _seed_cochange_index(db_session, project_id, index: dict) -> None:
+    """Seed the co-change affinity index where the claim endpoint actually reads it.
+
+    ``read_cochange_index()`` resolves the ``project_telemetry`` ``cochange_state``
+    row only. These tests used to seed ``project.design_doc["cochange_index"]``,
+    which that reader has never consulted since migration 0698 made the KV row the
+    sole store — so the index came back empty and no co-change context was injected.
+    """
+    from app.project_telemetry import upsert_telemetry
+
+    await upsert_telemetry(
+        db_session,
+        project_id,
+        "cochange_state",
+        {"index": index, "applied_prs": []},
+    )
+    await db_session.commit()
+
+
 @pytest.mark.asyncio
 async def test_claim_injects_cochange_files_for_create_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint injects cochange_files in project_context for create tasks when related_files match index."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {
             "backend/app/schemas.py": 3.0,
@@ -9206,12 +8773,16 @@ async def test_claim_injects_cochange_files_for_create_task(
     project = Project(
         name="Cochange Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # read_cochange_index() reads the project_telemetry "cochange_state" row and
+    # has NO design_doc fallback (migration 0698 made the KV row the sole store).
+    # Seeding design_doc instead leaves the index empty, so the injection never
+    # runs and the assertions below pass or fail for the wrong reason.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -9244,20 +8815,20 @@ async def test_claim_does_not_inject_cochange_files_for_review_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint does NOT inject cochange_files for review tasks."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {"backend/app/schemas.py": 3.0},
     }
     project = Project(
         name="Cochange Review Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Seeded on purpose: the exclusion below must be earned by the task-type
+    # gate, not granted for free by an index the reader never finds.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -9285,8 +8856,6 @@ async def test_claim_injects_cochange_hints_for_plan_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint injects cochange_hints in direction_context for plan tasks restricted to related_files."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {
             "backend/app/schemas.py": 3.0,
@@ -9304,12 +8873,12 @@ async def test_claim_injects_cochange_hints_for_plan_task(
     project = Project(
         name="Cochange Plan Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -9351,8 +8920,6 @@ async def test_claim_omits_cochange_hints_when_below_threshold(
     client: AsyncClient, db_session
 ):
     """Claim endpoint omits cochange_hints when no within-set pairs meet the >= 1.0 threshold."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/a.py": {"backend/app/b.py": 0.7},  # below threshold
         "backend/app/b.py": {"backend/app/a.py": 0.7},
@@ -9360,12 +8927,14 @@ async def test_claim_omits_cochange_hints_when_below_threshold(
     project = Project(
         name="Cochange Plan Threshold Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Seeded on purpose: the omission below must be earned by the >= 1.0
+    # threshold, not by an index the reader never finds.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -9391,8 +8960,6 @@ async def test_claim_does_not_inject_cochange_hints_for_create_task(
     client: AsyncClient, db_session
 ):
     """Claim endpoint does NOT inject cochange_hints (a plan-only signal) into direction_context for create tasks."""
-    from sqlalchemy.orm.attributes import flag_modified
-
     cochange_index = {
         "backend/app/models.py": {"backend/app/schemas.py": 3.0},
         "backend/app/schemas.py": {"backend/app/models.py": 3.0},
@@ -9400,12 +8967,16 @@ async def test_claim_does_not_inject_cochange_hints_for_create_task(
     project = Project(
         name="Cochange Hint Skip Test",
         user_id="test-user-123",
-        design_doc={"cochange_index": cochange_index},
     )
-    flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Seeded on purpose: cochange_hints must be absent because the task is a
+    # create, not because the index was unreadable. This test is the guard that
+    # the create path still gets cochange_files while skipping the plan-only
+    # hints, so the index has to be genuinely present.
+    await _seed_cochange_index(db_session, project.id, cochange_index)
 
     task = Task(
         project_id=project.id,
@@ -9807,7 +9378,8 @@ async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-sr-fp-calib")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     project_ctx = resp.json().get("project_context", {})
     sr = project_ctx.get("self_review_catch_rate")
@@ -9955,7 +9527,8 @@ async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-sr-failure-mode")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     project_ctx = resp.json().get("project_context", {})
     sr = project_ctx.get("self_review_catch_rate")
@@ -10578,7 +10151,7 @@ async def test_agent_ws_receive_loop_closes_on_periodic_recheck_terminal(
 @pytest.mark.asyncio
 async def test_agent_ws_strategic_session_frame_forwards_to_emit(mocker):
     """A ``strategic_session`` WS frame forwards its payload to
-    ``emit_strategic_session_delta`` (the resident-session live transcript path).
+    ``emit_strategic_session_delta`` (the strategic-session live transcript path).
     """
     import json as _json
     import app.routers.projects as projects_module
@@ -19501,9 +19074,11 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
     real_ensure = vm_lifecycle_mod._ensure_vm_deleted
 
     async def _slow_delete(*args, **kwargs):
-        # Simulate GCP delete latency. If fire_and_forget were
-        # accidentally awaited, the caller would block for 2 seconds.
-        await asyncio.sleep(2.0)
+        # Simulate GCP delete latency by blocking until cancelled. If
+        # fire_and_forget were accidentally awaited, the caller would block
+        # here instead of returning synchronously (modeled event-driven so CI
+        # never incurs a real multi-second sleep).
+        await asyncio.Event().wait()
         return True
 
     vm_lifecycle_mod._ensure_vm_deleted = _slow_delete  # type: ignore[assignment]
@@ -19763,7 +19338,8 @@ async def test_claim_injects_self_review_catch_rate_for_direction_when_above_thr
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-srdir-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -19824,7 +19400,8 @@ async def test_claim_omits_self_review_catch_rate_for_direction_when_no_directio
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-srdir-2")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -19869,7 +19446,8 @@ async def test_claim_omits_self_review_catch_rate_for_direction_when_below_thres
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-srdir-3")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -19940,7 +19518,8 @@ async def test_claim_injects_sr_recent_miss_examples_for_create_task(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-miss-ex-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -20100,7 +19679,8 @@ async def test_claim_sr_recent_miss_examples_matches_typescript_consumer_contrac
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-contract-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     project_ctx = resp.json().get("project_context", {})
@@ -20226,7 +19806,8 @@ async def test_claim_sr_recent_miss_examples_global_unchanged_without_direction_
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-no-dir-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
@@ -20303,7 +19884,8 @@ async def test_claim_sr_recent_miss_examples_prefers_direction_examples(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-dir-pref-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
@@ -20368,7 +19950,8 @@ async def test_claim_sr_recent_miss_examples_falls_back_to_global_when_direction
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-dir-fallback-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
 
     miss_ex = resp.json().get("project_context", {}).get("sr_recent_miss_examples", {})
@@ -21274,16 +20857,15 @@ async def test_failed_release_audit_last_child_triggers_finalization(
 
 
 @pytest.mark.asyncio
-async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
+async def test_legacy_qualifier_smoke_failure_is_ignored_by_finalization(
     db_session, mocker
 ):
-    """CRITICAL: a qualifier-smoketest that FAILS without posting a
-    SMOKETEST_RESULT artifact (harness ERROR_LOG, VM crash, reaper kill) must
-    still finalize the qualification when it is the last child.
+    """A terminal legacy qualifier-smoke task may wake finalization, but its
+    failure and missing artifact are archival facts, never a qualification gate.
 
-    The old agent_status.py hook was gated on
-    `artifact_type == SMOKETEST_RESULT`, so an artifact-less smoketest failure
-    never reached it. The relocated hook keys on context, not artifact_type.
+    The active audit remains authoritative. Because this fixture deliberately
+    gives that COMPLETED audit no report, finalization must report the audit
+    infrastructure failure rather than resurrecting a smoke failure.
     """
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
@@ -21304,8 +20886,9 @@ async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
     )
 
     project, version = await _make_qualifier_project_and_version(db_session)
-    # Audit sibling already terminal; the qualifier-smoketest is the last child
-    # and fails terminally with NO artifact attached to the payload.
+    # The legacy smoke child fails terminally with no artifact. Its historical
+    # marker still routes through the cheap finalization wake-up, but the
+    # retired child must not influence the result.
     _audit, smoke_task = await _seed_qualifier_children(
         db_session,
         project,
@@ -21323,14 +20906,11 @@ async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
         refetched = await fresh.get(ReleaseVersion, version.id)
         qual = refetched.last_qualification or {}
 
-    assert qual.get("status") != "pending", (
-        f"artifact-less FAILED qualifier-smoketest left version wedged: {qual}"
-    )
-    # A FAILED required smoketest child is an infrastructure failure (VM crash /
-    # harness ERROR_LOG), NOT a quality verdict — it routes to infra_failure
-    # rather than recording a smoketest_startup_failed quality blocker.
+    assert qual.get("status") != "pending", f"version left wedged: {qual}"
     assert qual.get("status") == "infra_failure"
-    assert qual.get("error") == "smoketest_task_failed"
+    assert qual.get("error") == "audit_report_missing"
+    assert qual.get("error") != "smoketest_task_failed"
+    assert "smoketest" not in (qual.get("sub_scores") or {})
 
 
 @pytest.mark.asyncio
@@ -21424,11 +21004,15 @@ async def test_blocked_release_audit_last_child_triggers_finalization(
 
 
 @pytest.mark.asyncio
-async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
+async def test_running_legacy_qualifier_smoke_cannot_delay_audit_failure(
     db_session, mocker
 ):
-    """A FAILED qualifier child must NOT finalize while its sibling is still
-    running — finalization waits for BOTH children to be terminal."""
+    """An archival qualifier-smoke child cannot delay an active qualification.
+
+    Even when the old smoke task is still IN_PROGRESS, the terminal required
+    audit drives finalization. This protects upgraded databases containing
+    legacy ``smoketest_task_id`` values from remaining pending forever.
+    """
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
     from app.models import ReleaseVersion
@@ -21448,7 +21032,7 @@ async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
     )
 
     project, version = await _make_qualifier_project_and_version(db_session)
-    # Smoketest sibling still IN_PROGRESS — finalization must defer.
+    # Legacy smoketest sibling remains IN_PROGRESS. It is not a required child.
     audit_task, _smoke = await _seed_qualifier_children(
         db_session,
         project,
@@ -21465,28 +21049,21 @@ async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
         refetched = await fresh.get(ReleaseVersion, version.id)
         qual = refetched.last_qualification or {}
 
-    # Sibling still running — qualification stays pending (not yet finalized).
-    assert qual.get("status") == "pending"
+    assert qual.get("status") == "infra_failure"
+    assert qual.get("error") == "audit_task_failed"
+    assert qual.get("error") != "smoketest_task_failed"
+    assert "smoketest" not in (qual.get("sub_scores") or {})
 
 
 @pytest.mark.asyncio
-async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
+async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
     client: AsyncClient, db_session, mocker
 ):
-    """CRITICAL (unflushed-artifact regression): when a qualifier-smoketest is
-    the SECOND child to finish, finalization must see the SMOKETEST_RESULT
-    artifact posted in the SAME /api/agent/status request.
+    """A legacy SMOKETEST_RESULT posted at terminal status is stored but inert.
 
-    The status handler disables autoflush and only session.add(...)s the
-    artifact. The old in-handler finalize ran before the early commit, so its
-    SELECT could not see the pending artifact → _score_smoketest(None) → hard
-    blocker → a PASSING candidate wrongly recorded not_promoted. Finalization
-    now runs in _process_post_commit AFTER the early commit, so the artifact
-    and the task's terminal status are committed and visible.
-
-    Here the smoketest PASSES every test; with promotion shipping dark the
-    correct outcome is a dry-run with a non-zero smoketest sub-score — proving
-    the artifact was read, not seen as None.
+    The historical qualifier marker still suppresses ordinary task-repair
+    handling and may wake finalization, while the artifact itself must never be
+    loaded into the active score or reintroduce the retired smoke gate.
     """
     import json as _json
     from app import release_version as _rv
@@ -21539,9 +21116,7 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     await db_session.commit()
     await db_session.refresh(version)
 
-    # The release_audit sibling already COMPLETED with a clean audit report
-    # (high audit score, no test erosion) so the only remaining input is the
-    # smoketest about to be posted.
+    # The active release audit already completed with a clean report.
     audit_task = Task(
         project_id=project.id,
         title="Release audit child",
@@ -21572,7 +21147,8 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     )
     await db_session.commit()
 
-    # The qualifier-smoketest is IN_PROGRESS and about to post its result.
+    # A legacy qualifier-smoketest is IN_PROGRESS and about to post its archival
+    # result through the ordinary agent endpoint.
     smoke_task = Task(
         project_id=project.id,
         title="Qualifier smoketest child",
@@ -21633,15 +21209,20 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     async with _process_post_commit_factory(db_session)() as fresh:
         refetched = await fresh.get(ReleaseVersion, version.id)
         qual = refetched.last_qualification or {}
+        archival_artifact = await fresh.scalar(
+            select(Artifact).where(
+                Artifact.task_id == smoke_task.id,
+                Artifact.artifact_type == ArtifactType.SMOKETEST_RESULT,
+            )
+        )
 
-    # Finalization ran and the smoketest artifact was visible: a passing
-    # smoketest yields a non-zero smoketest sub-score (not the 0.0 / hard
-    # blocker the unflushed-artifact bug produced).
+    assert archival_artifact is not None
+    # Finalization ran, but the archival artifact is absent from active scoring.
     assert qual.get("status") != "pending", f"version left wedged: {qual}"
     assert qual.get("blocker") is None, (
-        f"passing candidate wrongly hard-blocked — artifact not visible: {qual}"
+        f"archival smoketest wrongly hard-blocked the candidate: {qual}"
     )
-    assert qual.get("sub_scores", {}).get("smoketest", 0.0) > 0.0
+    assert "smoketest" not in qual.get("sub_scores", {})
     # Promotion ships dark (promotion_enabled False) → dry-run, not promoted.
     assert qual.get("status") == "dry_run"
 
@@ -21876,13 +21457,6 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
-    # Keep this test focused on the back-merge commit contract; the new
-    # default-on second-opinion gate would otherwise park the review before the
-    # merge path under test runs.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
 
     # open_backmerge_pr mocked to REPLICATE its real conflict path: session.add
     # an ERROR Alert + a high-priority conflict-resolution Task, then flush() —
@@ -27241,10 +26815,7 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
             "playbook/lint-rules": "hidden",
             "playbook_archive": [],
             "proposed_changes": {},
-            "lane_baselines": {},
             "module_feedback": {},
-            "sr_catch_rate_trends": {},
-            "efficiency_baseline": {},
             "retired_diagnoses_archive": [],
         },
     )
@@ -27277,13 +26848,15 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
     keys = resp.json()["keys"]
     assert "normal-key" in keys
     assert "playbook/lint-rules" not in keys
+    # Dedicated-store values remain hidden while their retained design_doc
+    # fallback is available for rolling deploys and rollback.
     for reserved in (
-        "playbook_archive",
-        "proposed_changes",
         "lane_baselines",
-        "module_feedback",
         "sr_catch_rate_trends",
         "efficiency_baseline",
+        "playbook_archive",
+        "proposed_changes",
+        "module_feedback",
         "retired_diagnoses_archive",
     ):
         assert reserved not in keys, f"Reserved key '{reserved}' must not appear in list"
@@ -27317,12 +26890,12 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
 
     # set/delete on each exact reserved key must return 400
     for reserved in (
-        "playbook_archive",
-        "proposed_changes",
         "lane_baselines",
-        "module_feedback",
         "sr_catch_rate_trends",
         "efficiency_baseline",
+        "playbook_archive",
+        "proposed_changes",
+        "module_feedback",
         "retired_diagnoses_archive",
     ):
         r_set = await client.post(

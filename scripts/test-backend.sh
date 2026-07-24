@@ -349,7 +349,7 @@ if [ "$USE_POSTGRES" = "1" ] && [ "$SANDBOX_POSTGRES" = "1" ]; then
   PG_BIN="$(pg_config --bindir)"
   PG_DATA=$(mktemp -d /tmp/blueprint-test-pg.XXXXXX)
   PG_SOCKET=$(mktemp -d /tmp/blueprint-test-pg-sock.XXXXXX)
-  "$PG_BIN/initdb" -D "$PG_DATA" -A trust --no-locale -U test >/dev/null
+  "$PG_BIN/initdb" -D "$PG_DATA" -A trust --no-locale --encoding=UTF-8 -U test >/dev/null
   "$PG_BIN/pg_ctl" -D "$PG_DATA" \
     -o "-F -c listen_addresses='' -k '$PG_SOCKET'" -w start >/dev/null
   "$PG_BIN/createdb" -h "$PG_SOCKET" -U test test_blueprint
@@ -500,7 +500,6 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_impacted_tests.py
     testing/test_audit_finding_class_guards.py
     testing/test_admin_auth_invariant.py
-    testing/test_panel_review_metric_manifest.py
     testing/test_release_promotion_metric_manifest.py
     testing/test_dependency_deprecations.py
     testing/test_websocket_emitter_inventory.py
@@ -508,6 +507,10 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_monthly_budget_alerts.py
     testing/test_migration_chain.py
     testing/test_salvage_bundle_standalone.py
+    testing/test_test_durations_freshness.py
+    testing/test_shard_balance.py
+    testing/test_conversational_workday_protection.py
+    testing/test_vitest_durations_freshness.py
   )
   # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
   [ -f /repo/scripts/test_blueprint_cli.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_cli.py)
@@ -572,7 +575,7 @@ if [ $# -gt 0 ]; then
 fi
 
 echo "=== Standalone tests ==="
-_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_panel_review_metric_manifest.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py -v --noconftest
+_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py testing/test_test_durations_freshness.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
 
 echo "=== Full test suite ==="
 if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then

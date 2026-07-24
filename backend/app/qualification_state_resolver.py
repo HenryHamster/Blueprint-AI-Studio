@@ -150,7 +150,6 @@ def qualification_read_provenance(
     child_tasks: dict[str, dict[str, Any]] = {}
     for child, field in (
         ("audit", "audit_task_id"),
-        ("smoketest", "smoketest_task_id"),
         ("challenge", "challenge_task_id"),
         ("merge_grade", "merge_grade_task_id"),
     ):

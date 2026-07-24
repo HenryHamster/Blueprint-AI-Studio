@@ -38,25 +38,4 @@ describe('qualification_state_vocab fixture contract (agent)', () => {
     expect(vocabStates).toEqual(fixtureStates);
   });
 
-  it('all fixture states are present in QUALIFICATION_STATE_VOCAB', () => {
-    for (const state of fixture.states) {
-      expect(
-        QUALIFICATION_STATE_VOCAB.has(state),
-        `fixture state '${state}' is missing from agent QUALIFICATION_STATE_VOCAB`,
-      ).toBe(true);
-    }
-  });
-
-  it('AUDIT_IN_PROGRESS_STATES qualification subset is within QUALIFICATION_STATE_VOCAB', () => {
-    // 'pending' is the raw backend stamp (not a derived state), so it is NOT
-    // in QUALIFICATION_STATE_VOCAB. Only 'qualifying' is the derived state that
-    // must be in the vocab.
-    const qualificationSubset = ['qualifying'];
-    for (const state of qualificationSubset) {
-      expect(
-        QUALIFICATION_STATE_VOCAB.has(state),
-        `AUDIT_IN_PROGRESS_STATES derived state '${state}' is not in QUALIFICATION_STATE_VOCAB`,
-      ).toBe(true);
-    }
-  });
 });

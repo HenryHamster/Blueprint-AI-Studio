@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, test, expect, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { registerToolKind } from '../toolRegistry';
@@ -14,7 +14,7 @@ vi.mock('../api/projectTools', async () => {
 });
 
 import { fetchToolContent, saveToolContent } from '../api/projectTools';
-import WhiteboardTool from './WhiteboardTool';
+import WhiteboardTool, { DEBOUNCE_MS } from './WhiteboardTool';
 
 const SAMPLE_STROKES = [
   { color: '#e2e8f0', width: 4, points: [{ x: 50, y: 50 }, { x: 100, y: 60 }, { x: 150, y: 45 }] },
@@ -39,12 +39,17 @@ describe('WhiteboardTool — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
   afterEach(() => {
     if (root) act(() => { root?.unmount(); });
     root = null;
     host?.remove();
     host = null;
     vi.resetAllMocks();
+    vi.useRealTimers();
   });
 
   // -----------------------------------------------------------------------
@@ -52,6 +57,9 @@ describe('WhiteboardTool — viewport regression', () => {
   // -----------------------------------------------------------------------
 
   test('renders with sample strokes without overflow at 375px', async () => {
+    // Viewport helpers settle layout via requestAnimationFrame (and page.viewport),
+    // which the global fake clock freezes — use real timers for helper-driven tests.
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { strokes: SAMPLE_STROKES },
       content_revision: 3,
@@ -64,7 +72,7 @@ describe('WhiteboardTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('canvas')).toBeTruthy();
@@ -73,6 +81,7 @@ describe('WhiteboardTool — viewport regression', () => {
   });
 
   test('renders with sample strokes without overflow at 1280px', async () => {
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { strokes: SAMPLE_STROKES },
       content_revision: 3,
@@ -86,7 +95,7 @@ describe('WhiteboardTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('canvas')).toBeTruthy();
@@ -128,7 +137,7 @@ describe('WhiteboardTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     // Should still have a canvas and controls.
     expect(host.querySelector('canvas')).toBeTruthy();
@@ -146,7 +155,7 @@ describe('WhiteboardTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Network error');
   });
@@ -166,7 +175,7 @@ describe('WhiteboardTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     // Color buttons
     const colorButtons = host.querySelectorAll('[role="radio"]');
@@ -195,19 +204,20 @@ describe('WhiteboardTool — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    await act(async () => { await vi.runAllTimersAsync(); });
 
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('canvas')).toBeTruthy();
 
     // Well beyond several debounce cycles — a reference-identity dependency
     // would have fired a continuous save loop here.
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 3000)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 3); });
 
     expect(saveToolContent).not.toHaveBeenCalled();
   });
 
   test('controls meet minimum touch target at 1280px', async () => {
+    vi.useRealTimers();
     vi.mocked(fetchToolContent).mockResolvedValue({
       content: { strokes: SAMPLE_STROKES },
       content_revision: 3,
@@ -221,7 +231,7 @@ describe('WhiteboardTool — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
-      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
   });
 });

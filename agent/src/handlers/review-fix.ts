@@ -1546,6 +1546,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   await runCodeChangeTask({
     taskId,
     prompt: enrichedPrompt,
+    taskPrompt: basePrompt,
     ws,
     statusRef,
     workBranch: branch,

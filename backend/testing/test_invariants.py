@@ -869,6 +869,38 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
 
     return violations
 
+
+def _duplicate_index_epoch_violations(
+    index_creates: dict[str, list[tuple[str, bool]]],
+    drop_revisions: dict[str, set[str]],
+    exemptions: set[tuple[str, str]],
+) -> list[str]:
+    """Return unguarded creates that repeat an index in the same live epoch."""
+    violations: list[str] = []
+    for name, creates in index_creates.items():
+        if len(creates) < 2:
+            continue
+        ordered_creates = sorted(creates)
+        prior_live_revision: str | None = None
+        for revision, guarded in ordered_creates:
+            was_dropped = prior_live_revision is not None and any(
+                prior_live_revision < drop_revision < revision
+                for drop_revision in drop_revisions.get(name, set())
+            )
+            is_reassertion = prior_live_revision is not None and not was_dropped
+            if (
+                is_reassertion
+                and not guarded
+                and (revision, name) not in exemptions
+            ):
+                violations.append(
+                    f"{revision}: creates '{name}' without IF NOT EXISTS guard "
+                    f"(still live from: {prior_live_revision})"
+                )
+            prior_live_revision = revision
+    return violations
+
+
 class TestSchemaRevisionSync:
     def test_expected_revision_matches_latest_migration(self):
         """EXPECTED_SCHEMA_REVISION must match the structural head of the alembic chain.
@@ -1622,9 +1654,7 @@ class TestSchemaRevisionSync:
                 for col_m in col_in_create_re.finditer(block):
                     migration_columns.add((table, col_m.group(1)))
 
-        # Tables whose migrations are pending (added by a sibling task in the same PR batch).
-        # Remove each entry once its migration file lands.
-        PENDING_MIGRATION_TABLES: set[str] = set()
+        from app.migration_guards import PENDING_MIGRATION_TABLES
 
         # Check each SQLModel table's columns against migrations
         missing: list[tuple[str, str]] = []
@@ -1655,7 +1685,6 @@ class TestSchemaRevisionSync:
         _models_owned_modules = {
             "app.models",
             "app.release_models",
-            "app.strategic_resident_models",
         }
         facade_missing = sorted(
             mapper.class_.__name__
@@ -1677,6 +1706,14 @@ class TestSchemaRevisionSync:
         Catches auto-generation errors like declaring a JSONB field as sa.Text().
         Comparison is by type family (String/Text compatible; JSONB must match
         JSONB; Integer, Boolean, UUID, ARRAY must each match).
+
+        The datetime family is split into two subfamilies to catch timezone
+        errors: DATETIME_TZ (NaiveUTCDateTime / sa.DateTime(timezone=True)) vs
+        DATETIME_NOTZ (bare sa.DateTime()).  A migration that creates a
+        NaiveUTCDateTime model column as sa.DateTime() will now fail here
+        instead of silently passing and breaking at runtime (0633-class bug).
+        alter_column migrations that upgrade a column to timezone=True (e.g.
+        0063, 0639) are scanned so corrective migrations are accounted for.
         """
         import glob as globmod
         import re
@@ -1701,17 +1738,30 @@ class TestSchemaRevisionSync:
                 return "INTEGER"
             if n in {"UUID", "GUID"}:
                 return "UUID"
-            # ``NAIVEUTCDATETIME`` is the round-2 audit TypeDecorator
-            # (``app.models.NaiveUTCDateTime``) whose ``impl`` is
-            # ``DateTime(timezone=True)`` — the DB column is still TIMESTAMPTZ;
-            # the decorator only strips tz on read in Python. The migration
-            # files emit ``sa.DateTime(timezone=True)`` directly, so the
-            # families must alias.
-            if n in {"DATETIME", "TIMESTAMP", "NAIVEUTCDATETIME"}:
-                return "DATETIME"
+            # Timezone-aware: NaiveUTCDateTime (TypeDecorator whose impl is
+            # DateTime(timezone=True)) and the synthetic "DateTime_tz" tag
+            # we emit when a migration uses sa.DateTime(timezone=True) or an
+            # alter_column upgrades a column to TIMESTAMPTZ.
+            if n in {"NAIVEUTCDATETIME", "DATETIME_TZ"}:
+                return "DATETIME_TZ"
+            # Timezone-naive: bare sa.DateTime() in a migration.
+            # NaiveUTCDateTime vs DATETIME_NOTZ is a detectable mismatch —
+            # exactly the class of error migration 0633 introduced and 0639 fixed.
+            if n in {"DATETIME", "TIMESTAMP", "DATETIME_NOTZ"}:
+                return "DATETIME_NOTZ"
             if n in {"NUMERIC", "DECIMAL"}:
                 return "NUMERIC"
             return n  # JSONB, JSON, BOOLEAN, FLOAT, DATE, ARRAY, ENUM, etc.
+
+        # Confirm the timezone split is active before scanning migrations.
+        assert family("NaiveUTCDateTime") != family("DateTime"), (
+            "family() must distinguish NaiveUTCDateTime (DATETIME_TZ) from "
+            "bare DateTime (DATETIME_NOTZ) to catch 0633-class migration errors"
+        )
+        assert family("NaiveUTCDateTime") == family("DateTime_tz"), (
+            "family() must map NaiveUTCDateTime and DateTime_tz to the same "
+            "family so corrective alter_column migrations (e.g. 0639) match models"
+        )
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
@@ -1719,22 +1769,52 @@ class TestSchemaRevisionSync:
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
 
         # Extract (table, col) -> type class name from migration files. Later files win.
+        # The optional (timezone=True) suffix is captured to distinguish TIMESTAMPTZ
+        # columns (recorded as "DateTime_tz") from naive TIMESTAMP ("DateTime").
         add_col_re = re.compile(
             r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]\s*,"
             r"\s*(?:sa|postgresql|sqlmodel\.sql\.sqltypes)\.(\w+)"
+            r"(\(timezone=True\))?"
         )
         create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
         col_in_create_re = re.compile(
             r"sa\.Column\(\s*['\"](\w+)['\"]\s*,"
             r"\s*(?:sa|postgresql|sqlmodel\.sql\.sqltypes)\.(\w+)"
+            r"(\(timezone=True\))?"
+        )
+
+        # alter_column scanning: patterns used to detect upgrade-to-TIMESTAMPTZ calls.
+        # We extract only the upgrade() body to avoid matching downgrade() reversals.
+        _upgrade_start_re = re.compile(r"\ndef upgrade\b")
+        _next_def_re = re.compile(r"\n(?:def |class )\w")
+        # _TABLE = "tablename" module-level constant (0639 style)
+        _table_const_re = re.compile(r"^_TABLE\s*=\s*[\"'](\w+)[\"']", re.MULTILINE)
+        # _COLUMNS = [...] list (0063 style with (table,col,...) or 0639 style with (col,...))
+        _cols_block_re = re.compile(
+            r"^_COLUMNS\s*=\s*\[(.*?)\]", re.DOTALL | re.MULTILINE
+        )
+        # First two string elements of a tuple: ("table", "col", ...)
+        _tuple_table_col_re = re.compile(r'\(\s*["\'](\w+)["\']\s*,\s*["\'](\w+)["\']')
+        # First string element of a tuple: ("col", ...)
+        _tuple_col_re = re.compile(r'\(\s*["\'](\w+)["\']')
+        # Direct: op.alter_column("table", "col", ..., type_=sa.DateTime(timezone=True))
+        _direct_alter_re = re.compile(
+            r'alter_column\(\s*["\'](\w+)["\']\s*,\s*["\'](\w+)["\']\s*,.*?'
+            r"type_=sa\.DateTime\(timezone=True\)",
+            re.DOTALL,
         )
 
         migration_types: dict[tuple[str, str], str] = {}
         for path in files:
             with open(path) as f:
                 content = f.read()
+
+            # --- add_column pass ---
             for m in add_col_re.finditer(content):
-                migration_types[(m.group(1), m.group(2))] = m.group(3)
+                type_str = m.group(3) + ("_tz" if m.group(4) else "")
+                migration_types[(m.group(1), m.group(2))] = type_str
+
+            # --- create_table pass ---
             for ct in create_table_re.finditer(content):
                 table = ct.group(1)
                 start, depth, end = ct.end(), 1, ct.end()
@@ -1744,8 +1824,154 @@ class TestSchemaRevisionSync:
                     elif content[end] == ")":
                         depth -= 1
                     end += 1
-                for col_m in col_in_create_re.finditer(content[start:end]):
-                    migration_types[(table, col_m.group(1))] = col_m.group(2)
+                block = content[start:end]
+                for col_m in col_in_create_re.finditer(block):
+                    type_str = col_m.group(2) + ("_tz" if col_m.group(3) else "")
+                    migration_types[(table, col_m.group(1))] = type_str
+
+            # --- alter_column → TIMESTAMPTZ upgrade pass ---
+            # Extract upgrade() body (stop before next top-level def/class).
+            upg_m = _upgrade_start_re.search(content)
+            if upg_m is not None:
+                upg_start = upg_m.end()
+                next_m = _next_def_re.search(content, upg_start)
+                upgrade_body = (
+                    content[upg_start : next_m.start()]
+                    if next_m
+                    else content[upg_start:]
+                )
+
+                if "DateTime(timezone=True)" in upgrade_body:
+                    # Pattern A: op.alter_column("table", "col", type_=...) with literals
+                    for m in _direct_alter_re.finditer(upgrade_body):
+                        migration_types[(m.group(1), m.group(2))] = "DateTime_tz"
+
+                    # Pattern B/C: loop over _COLUMNS with op.alter_column in the body.
+                    table_m = _table_const_re.search(content)
+                    cols_m = _cols_block_re.search(content)
+                    if cols_m:
+                        cols_block = cols_m.group(1)
+                        if table_m:
+                            # Pattern C (0639 style): _TABLE="tbl", _COLUMNS=[("col",...)]
+                            tbl = table_m.group(1)
+                            for col_m in _tuple_col_re.finditer(cols_block):
+                                migration_types[(tbl, col_m.group(1))] = "DateTime_tz"
+                        else:
+                            # Pattern B (0063 style): _COLUMNS=[("tbl","col",...)]
+                            for t_m in _tuple_table_col_re.finditer(cols_block):
+                                migration_types[
+                                    (t_m.group(1), t_m.group(2))
+                                ] = "DateTime_tz"
+
+        # Pre-existing (table, col) pairs where the original migration used bare
+        # sa.DateTime() but the model now uses NaiveUTCDateTime (TIMESTAMPTZ).
+        # These predate the timezone convention; the asyncpg session is pinned to
+        # timezone='UTC' so TIMESTAMP and TIMESTAMPTZ behave identically for our
+        # naive-UTC read paths, making this technical debt rather than a live bug.
+        # Do NOT add new columns here — fix the migration to use sa.DateTime(timezone=True)
+        # instead, or add a corrective ALTER COLUMN migration (e.g. 0063, 0639).
+        # When a column is fixed by an ALTER COLUMN migration, remove it from this set.
+        _pre_convention_notz: frozenset[tuple[str, str]] = frozenset(
+            {
+                ("alert", "acknowledged_at"),
+                ("alert", "dismissed_at"),
+                ("alert", "last_escalated_at"),
+                ("alert", "last_seen_at"),
+                ("alloweduser", "last_login_at"),
+                ("artifact", "created_at"),
+                ("artifactref", "created_at"),
+                ("artifactrefcleanupintent", "completed_at"),
+                ("artifactrefcleanupintent", "created_at"),
+                ("artifactrefcleanupintent", "lease_expires_at"),
+                ("artifactrefcleanupintent", "next_attempt_at"),
+                ("artifactrefcleanupintent", "updated_at"),
+                ("artifactrefpromotionintent", "completed_at"),
+                ("artifactrefpromotionintent", "created_at"),
+                ("artifactrefpromotionintent", "effect_deadline_at"),
+                ("artifactrefpromotionintent", "lease_expires_at"),
+                ("artifactrefpromotionintent", "next_attempt_at"),
+                ("artifactrefpromotionintent", "settle_until"),
+                ("artifactrefpromotionintent", "updated_at"),
+                ("categoryverdict", "graded_at"),
+                ("completiondebtentry", "created_at"),
+                ("completiondebtentry", "resolved_at"),
+                ("completiondebtentry", "updated_at"),
+                ("computejob", "last_heartbeat_at"),
+                ("computejobfile", "created_at"),
+                ("criterionevidence", "recorded_at"),
+                ("deploymentstate", "deployed_at"),
+                ("deploymentstate", "halted_at"),
+                ("deploymentstate", "paused_at"),
+                ("direction_event", "recorded_at"),
+                ("knowledgedocument", "consumed_at"),
+                ("knowledgedocument", "dismissed_at"),
+                ("localrunner", "created_at"),
+                ("localrunner", "last_seen_at"),
+                ("localrunner", "last_successful_job_at"),
+                ("localrunner", "token_created_at"),
+                ("maxplanaccount", "created_at"),
+                ("maxplanaccount", "daily_task_count_reset_at"),
+                ("maxplanaccount", "disabled_at"),
+                ("maxplanaccount", "token_created_at"),
+                ("maxplanaccount", "updated_at"),
+                ("notification_dead_letter", "created_at"),
+                ("orchestratorerrorack", "acknowledged_at"),
+                ("poolvm", "reservation_expires_at"),
+                ("poolvm", "reservation_hard_expires_at"),
+                ("project", "running_update_acknowledged_at"),
+                ("projectcomputeimage", "created_at"),
+                ("projectcomputeimage", "updated_at"),
+                ("projectmember", "created_at"),
+                ("projectmessage", "resolved_at"),
+                ("projecttool", "created_at"),
+                ("projecttool", "updated_at"),
+                ("qualificationdimensionresult", "computed_at"),
+                ("qualificationverdict", "post_promotion_outcome_at"),
+                ("releaseversion", "deploy_confirm_alerted_at"),
+                ("releaseversion", "deploy_confirm_deadline"),
+                ("releaseversion", "goal_updated_at"),
+                ("releaseversion", "served_at"),
+                ("residualremediationcase", "created_at"),
+                ("residualremediationcase", "first_seen_at"),
+                ("residualremediationcase", "last_seen_at"),
+                ("residualremediationcase", "last_spawned_at"),
+                ("residualremediationcase", "suspended_at"),
+                ("residualremediationcase", "updated_at"),
+                ("residualverdict", "graded_at"),
+                ("runner_heartbeat_snapshot", "captured_at"),
+                ("runner_heartbeat_snapshot", "created_at"),
+                ("runner_project_binding", "created_at"),
+                ("strategiccycle", "created_at"),
+                ("strategiccycle", "phase1_completed_at"),
+                ("strategiccycle", "phase1_started_at"),
+                ("strategiccycle", "phase2_completed_at"),
+                ("strategiccycle", "phase2_started_at"),
+                ("strategiccycle", "updated_at"),
+                ("task", "blocked_at"),
+                ("task", "completed_at"),
+                ("task", "last_heartbeat"),
+                ("task", "last_token_refresh_at"),
+                ("task", "last_tool_use_at"),
+                ("task", "recheck_after"),
+                ("task", "retry_after_until"),
+                ("task", "started_at"),
+                ("task", "vm_dispatched_at"),
+                ("task", "vm_provisioned_at"),
+                ("task", "vm_started_at"),
+                ("task", "vm_stopped_at"),
+                ("taskcontact", "last_contact_at"),
+                ("taskcontact", "last_tool_use_at"),
+                ("taskhistory", "timestamp"),
+                ("ui_load_timing_baseline", "pinned_at"),
+                ("ui_load_timing_sample", "recorded_at"),
+                ("userintegration", "created_at"),
+                ("userintegration", "updated_at"),
+                ("versionacceptancecriterion", "created_at"),
+                ("versionacceptancecriterion", "retracted_at"),
+                ("vmcontact", "last_contact_at"),
+                ("vmcontact", "last_tool_use_at"),
+            }
+        )
 
         mismatches: list[str] = []
         for table_name, table in SQLModel.metadata.tables.items():
@@ -1756,6 +1982,8 @@ class TestSchemaRevisionSync:
                 model_fam = family(type(col.type).__name__)
                 mig_fam = family(mig_type)
                 if model_fam != mig_fam:
+                    if (table_name, col.name) in _pre_convention_notz:
+                        continue  # pre-existing pre-NaiveUTCDateTime convention debt
                     mismatches.append(
                         f"  - {table_name}.{col.name}: model={type(col.type).__name__} "
                         f"({model_fam}) vs migration={mig_type} ({mig_fam})"
@@ -1764,7 +1992,10 @@ class TestSchemaRevisionSync:
         assert not mismatches, (
             "Migration column types incompatible with models.py:\n"
             + "\n".join(mismatches)
-            + "\n\nRegenerate the migration with the correct type to avoid runtime errors."
+            + "\n\nFor datetime columns: use sa.DateTime(timezone=True) when the model "
+            "uses NaiveUTCDateTime, or add a corrective ALTER COLUMN migration.\n"
+            "Do NOT add new entries to _pre_convention_notz in this test — fix the "
+            "migration instead."
         )
 
     def test_model_indexes_covered_by_migrations(self):
@@ -1926,9 +2157,7 @@ class TestSchemaRevisionSync:
                 if target:
                     effective.discard(target)
 
-        # Tables whose migrations are pending (added by a sibling task in the same PR batch).
-        # Remove each entry once its migration file lands.
-        PENDING_MIGRATION_TABLES: set[str] = set()
+        from app.migration_guards import PENDING_MIGRATION_TABLES
 
         missing: list[str] = []
         for table_name, table in SQLModel.metadata.tables.items():
@@ -1946,6 +2175,28 @@ class TestSchemaRevisionSync:
             + "\n".join(missing)
             + "\n\nAdd an op.create_index call to a migration for each missing "
             "index, or queries will silently fall back to sequential scans."
+        )
+
+    def test_pending_guards_are_eventually_resolved(self):
+        """PENDING_MIGRATION_TABLES in app.migration_guards must be empty.
+
+        Agents may temporarily add a table name to PENDING_MIGRATION_TABLES when
+        a sibling task adds a SQLModel table but its migration file lands in a
+        separate commit.  That escape hatch must be removed once the migration
+        merges — stale entries suppress the column- and index-coverage checks
+        indefinitely, hiding real drift.
+
+        This invariant fires on every CI run so forgotten entries are caught
+        automatically rather than silently accumulating.
+        """
+        from app.migration_guards import PENDING_MIGRATION_TABLES
+
+        assert PENDING_MIGRATION_TABLES == set(), (
+            "app.migration_guards.PENDING_MIGRATION_TABLES is not empty: "
+            + repr(PENDING_MIGRATION_TABLES)
+            + "\n\nRemove each entry once its migration file has landed on the "
+            "target branch.  This set is only meant to hold tables whose "
+            "migrations are in-flight in the same PR batch."
         )
 
     def test_migration_downgrade_bodies_are_substantive(self):
@@ -1986,8 +2237,18 @@ class TestSchemaRevisionSync:
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
         assert files, "No migration files found"
 
+        # Migrations with a deliberately empty/pass downgrade whose comment
+        # explains why rollback is unsafe (no durable marker, etc.). These
+        # are intentionally irreversible but predate the NotImplementedError
+        # convention; adding NIE would require modifying applied history.
+        _EMPTY_DOWNGRADE_EXEMPTIONS = {
+            "0671_restore_workday_message_session_id.py",
+        }
+
         offenders: list[str] = []
         for path in files:
+            if os.path.basename(path) in _EMPTY_DOWNGRADE_EXEMPTIONS:
+                continue
             with open(path) as f:
                 source = f.read()
             tree = ast.parse(source)
@@ -2041,6 +2302,15 @@ class TestSchemaRevisionSync:
                 # for encryption/decryption).
                 if up_calls and all(
                     c.func.attr in _DATA_ONLY_OP_ATTRS for c in up_calls
+                ):
+                    continue
+                # Truly no-op migrations: upgrade has no op.* calls AND
+                # downgrade is also empty/pass-only.  These are legitimate
+                # placeholder migrations (e.g. bump-only revisions with no
+                # schema changes) — a pass downgrade is correct, not an
+                # oversight.
+                if not up_calls and (
+                    not body or all(isinstance(n, ast.Pass) for n in body)
                 ):
                     continue
 
@@ -2143,6 +2413,13 @@ class TestSchemaRevisionSync:
             re.IGNORECASE,
         )
 
+        op_drop_re = re.compile(
+            r'op\.drop_index\(\s*[\'"](?P<name>ix_\w+)[\'"]'
+        )
+        raw_drop_re = re.compile(
+            r"DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(?P<name>ix_\w+)",
+            re.IGNORECASE,
+        )
         # Accumulate worst-case guardedness per (revision, index_name).
         # A migration that uses both Postgres raw-SQL (guarded) and a SQLite
         # op.create_index branch (unguarded) for the same index is unguarded on
@@ -2150,6 +2427,7 @@ class TestSchemaRevisionSync:
         # {(revision, name): all_creates_guarded}
         per_rev_name: dict[tuple[str, str], bool] = {}
 
+        drop_revisions: dict[str, set[str]] = {}
         for path in files:
             revision = os.path.basename(path).split("_")[0]
             with open(path) as f:
@@ -2172,23 +2450,22 @@ class TestSchemaRevisionSync:
                 key = (revision, name)
                 per_rev_name[key] = per_rev_name.get(key, True) and guarded
 
+            for m in op_drop_re.finditer(upgrade_body):
+                drop_revisions.setdefault(m.group("name"), set()).add(revision)
+
+            for m in raw_drop_re.finditer(upgrade_body):
+                drop_revisions.setdefault(m.group("name"), set()).add(revision)
+
         # Group by index name across revisions.
         index_creates: dict[str, list[tuple[str, bool]]] = {}
         for (revision, name), all_guarded in per_rev_name.items():
             index_creates.setdefault(name, []).append((revision, all_guarded))
 
-        violations: list[str] = []
-        for name, creates in index_creates.items():
-            if len(creates) < 2:
-                continue
-            other_revs = sorted(r for r, _ in creates)
-            for revision, guarded in creates:
-                if not guarded and (revision, name) not in _KNOWN_UNGUARDED_DUPLICATES:
-                    others = ", ".join(r for r in other_revs if r != revision)
-                    violations.append(
-                        f"{revision}: creates '{name}' without IF NOT EXISTS guard "
-                        f"(also created by: {others})"
-                    )
+        violations = _duplicate_index_epoch_violations(
+            index_creates,
+            drop_revisions,
+            _KNOWN_UNGUARDED_DUPLICATES,
+        )
 
         assert not violations, (
             "Duplicate index name(s) created without IF NOT EXISTS guard "
@@ -2198,6 +2475,51 @@ class TestSchemaRevisionSync:
             "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
             "an index name an earlier migration already created."
         )
+
+    def test_duplicate_index_epoch_ordering(self):
+        name = "ix_example"
+        exemptions: set[tuple[str, str]] = set()
+
+        create_create_drop = _duplicate_index_epoch_violations(
+            {name: [("0001", False), ("0002", False)]},
+            {name: {"0003"}},
+            exemptions,
+        )
+        assert create_create_drop == [
+            "0002: creates 'ix_example' without IF NOT EXISTS guard "
+            "(still live from: 0001)"
+        ]
+
+        create_drop_create = _duplicate_index_epoch_violations(
+            {name: [("0001", False), ("0003", False)]},
+            {name: {"0002"}},
+            exemptions,
+        )
+        assert create_drop_create == []
+
+        create_drop_create_create = _duplicate_index_epoch_violations(
+            {
+                name: [
+                    ("0001", False),
+                    ("0003", False),
+                    ("0004", False),
+                ]
+            },
+            {name: {"0002"}},
+            exemptions,
+        )
+        assert create_drop_create_create == [
+            "0004: creates 'ix_example' without IF NOT EXISTS guard "
+            "(still live from: 0003)"
+        ]
+
+    def test_duplicate_index_scan_ignores_downgrade_drops(self):
+        source = (
+            "def upgrade():\n    op.create_index('ix_example', 'example', ['id'])\n"
+            "def downgrade():\n    op.drop_index('ix_example')\n"
+        )
+        upgrade_body = source.split("def downgrade", 1)[0].split("def upgrade", 1)[1]
+        assert "drop_index" not in upgrade_body
 
     def test_concurrently_index_migrations_escape_transaction(self):
         """Any migration issuing CREATE/DROP INDEX CONCURRENTLY (or
@@ -5370,6 +5692,17 @@ class TestDirectionLifecycleInvariants:
             "this controls direction sprawl and must not change without approval."
         )
 
+    def test_max_parallel_research_per_project_default(self):
+        """max_parallel_research_per_project must remain at 6 — controls
+        simultaneous research task parallelism per project."""
+        from app.shared_state import runtime_config
+
+        assert runtime_config["max_parallel_research_per_project"] == 6, (
+            f"max_parallel_research_per_project changed to "
+            f"{runtime_config['max_parallel_research_per_project']} — "
+            "this limits parallel research tasks per project."
+        )
+
     def test_direction_text_limits(self):
         """DIRECTION_TEXT_MAX and COMPLETION_CRITERIA_MAX must match spec."""
         from app.routers.directions import DIRECTION_TEXT_MAX, COMPLETION_CRITERIA_MAX
@@ -5444,6 +5777,32 @@ class TestDirectionLifecycleInvariants:
             "Direction cap enforcement was lost in PR #832 and must not be removed again."
         )
 
+    def test_max_active_directions_read_site_defaults_match_registry(self):
+        """All read-sites for max_active_directions must use default 10 (matching registry).
+
+        A mismatch means unconfigured deployments silently get a different cap than declared.
+        """
+        import re
+
+        files_to_check = [
+            os.path.join(os.path.dirname(__file__), "..", "app", "directions_repo.py"),
+            os.path.join(os.path.dirname(__file__), "..", "app", "strategic_completion.py"),
+            os.path.join(os.path.dirname(__file__), "..", "app", "routers", "directions.py"),
+            os.path.join(os.path.dirname(__file__), "..", "app", "routers", "admin_agent_ops.py"),
+        ]
+        bad = []
+        for path in files_to_check:
+            with open(path) as f:
+                content = f.read()
+            for m in re.finditer(r'get\s*\(\s*["\']max_active_directions["\']\s*,\s*(\d+)\s*\)', content):
+                if m.group(1) != "10":
+                    lineno = content[: m.start()].count("\n") + 1
+                    bad.append(f"{os.path.basename(path)}:{lineno} uses default {m.group(1)!r} (want 10)")
+        assert not bad, (
+            "max_active_directions read-sites have wrong fallback defaults "
+            f"(registry declares 10): {bad}"
+        )
+
 # ── Module Size Guardrails ─────────────────────────────────────────────────
 # These are loose upper bounds to catch runaway growth, not tight ceilings.
 # If a file hits the limit, consider a refactor — but do NOT "ratchet down"
@@ -5463,6 +5822,7 @@ def _load_size_limits() -> dict:
 _SIZE_LIMITS = _load_size_limits()
 MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
 AGENT_SIZE_LIMITS = _SIZE_LIMITS["agent"]
+TESTING_SIZE_LIMITS = _SIZE_LIMITS.get("testing", {})
 
 def _size_breach_message(
     rel_path: str, count: int, limit: int, module_kind: str
@@ -5524,6 +5884,42 @@ class TestBackendModuleSizeGuardrails:
             "should stay well below 200. If the file has genuinely grown, "
             "consider whether new logic belongs in recovery_evaluating.py or "
             "recovery_post_commit.py instead."
+        )
+
+    def test_no_stale_backend_caps(self):
+        """Caps must remain close enough to actual file sizes to catch real growth.
+
+        A cap that has drifted to 3x+ the actual file size (typical after a
+        refactor shrinks the file) is no longer a meaningful guardrail — a file
+        could triple in size before CI would notice.  This test enforces that
+        every backend cap stays within max(actual + 500, actual * 2) of the
+        file's current line count.
+
+        Remedy: tighten the cap in module_size_limits.json to match the policy
+        value returned by ``check_size_limits.py --fix`` for the breaching entry.
+        Do NOT modify this test to raise the threshold.
+        """
+        app_root = os.path.join(os.path.dirname(__file__), "..", "app")
+        stale = []
+        for rel_path, cap in MODULE_SIZE_LIMITS.items():
+            abs_path = os.path.join(app_root, rel_path)
+            if not os.path.exists(abs_path):
+                continue
+            with open(abs_path, encoding="utf-8") as fh:
+                actual = len(fh.readlines())
+            allowed_cap = max(actual + 500, actual * 2)
+            if cap > allowed_cap:
+                stale.append((rel_path, actual, cap, allowed_cap))
+        assert not stale, (
+            f"{len(stale)} backend cap(s) have drifted far above actual file size "
+            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+            "the file grows to an unreasonable size:\n\n"
+            + "\n".join(
+                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+                for r, actual, cap, allowed in stale
+            )
+            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+            "and commit the updated module_size_limits.json."
         )
 
 _AGENT_SRC_ROOT = (
@@ -5669,6 +6065,65 @@ class TestFrontendSizeGuardrails:
     def test_sr_unhandled_edges_retrospectives_panel(self):
         self._check_frontend("components/SrUnhandledEdgesRetrospectivesPanel.tsx")
 
+class TestTestFileSizeGuardrails:
+    """Loose upper bounds for backend/testing/ files to catch runaway growth.
+
+    Every key in the ``testing`` section of module_size_limits.json is enforced
+    automatically — adding a key to the JSON is sufficient. These limits exist
+    to grandfather existing large test files and to catch new runaway growth.
+    """
+
+    def _check_test_file(self, relative_path: str) -> None:
+        max_lines = TESTING_SIZE_LIMITS[relative_path]
+        path = os.path.join(os.path.dirname(__file__), relative_path)
+        with open(path, encoding="utf-8") as f:
+            count = len(f.readlines())
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "testing"
+        )
+
+    @pytest.mark.parametrize("relative_path", sorted(TESTING_SIZE_LIMITS))
+    def test_test_file_within_limit(self, relative_path):
+        """Every key in the ``testing`` section of module_size_limits.json is
+        enforced automatically — adding a key to the JSON is sufficient to
+        enforce its cap, with no per-file test method to maintain."""
+        self._check_test_file(relative_path)
+
+    def test_no_stale_testing_caps(self):
+        """Caps must remain close enough to actual file sizes to catch real growth.
+
+        A cap that has drifted to 3x+ the actual file size (typical after a
+        monolith is split) is no longer a meaningful guardrail. This test
+        enforces that every testing cap stays within max(actual + 500, actual * 2).
+
+        Remedy: tighten the cap in module_size_limits.json under 'testing' to
+        match the policy value returned by ``check_size_limits.py --fix`` for
+        the breaching entry. Do NOT modify this test to raise the threshold.
+        """
+        testing_root = os.path.dirname(__file__)
+        stale = []
+        for rel_path, cap in TESTING_SIZE_LIMITS.items():
+            abs_path = os.path.join(testing_root, rel_path)
+            if not os.path.exists(abs_path):
+                continue
+            with open(abs_path, encoding="utf-8") as fh:
+                actual = len(fh.readlines())
+            allowed_cap = max(actual + 500, actual * 2)
+            if cap > allowed_cap:
+                stale.append((rel_path, actual, cap, allowed_cap))
+        assert not stale, (
+            f"{len(stale)} testing cap(s) have drifted far above actual file size "
+            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+            "the file grows to an unreasonable size:\n\n"
+            + "\n".join(
+                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+                for r, actual, cap, allowed in stale
+            )
+            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+            "and commit the updated module_size_limits.json."
+        )
+
+
 # ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────
 #
 # The per-file guardrails above only constrain files explicitly listed in
@@ -5781,6 +6236,13 @@ class TestSizeGuardrailCoverage:
             _AGENT_SRC_ROOT, AGENT_SIZE_LIMITS, (".ts",), _is_agent_excluded
         )
         assert not offenders, _missing_cap_message(offenders, "agent")
+
+    def test_testing_no_uncapped_large_file(self):
+        testing_root = os.path.normpath(os.path.dirname(__file__))
+        offenders = _scan_uncapped(
+            testing_root, TESTING_SIZE_LIMITS, (".py",), lambda _rel: False
+        )
+        assert not offenders, _missing_cap_message(offenders, "testing")
 
 # ── LLM Token Pricing Coverage ──────────────────────────────────────────────
 
@@ -7036,6 +7498,54 @@ class TestDesignDocLockInvariant:
     def test_no_new_unlocked_design_doc_writes(self):
         _check_lock_invariant("design_doc", "design_doc", "with_design_doc_locked")
 
+
+class TestGodColumnDualWrittenKeysReserved:
+    """The final God-column tranche routes three generic-KV telemetry blobs
+    (repo_overview, _broadcast_limit, _auto_remediation) through the
+    project_telemetry table while KEEPING the design_doc write leg for rollback
+    compatibility during the rolling cutover.
+
+    Because their design_doc copies persist, each key must stay in
+    _RESERVED_DESIGN_DOC_KEYS so the retained blob does not consume the
+    agent-owned write budget — the reserved-key-drift bug class that let
+    telemetry blobs silently eat the agent design_doc budget. Each must also be
+    in TELEMETRY_KEYS (recognized as KV-backed) but NOT in
+    _TELEMETRY_MIGRATED_KEYS, since strip_migrated_doc_keys() must not yet drop
+    the design_doc copy an older serving engine still reads.
+    """
+
+    _DUAL_WRITTEN_KV_KEYS = frozenset(
+        {"repo_overview", "_broadcast_limit", "_auto_remediation"}
+    )
+
+    def test_dual_written_kv_keys_reserved_and_registered(self):
+        from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+        from app.project_telemetry import (
+            TELEMETRY_KEYS,
+            _TELEMETRY_MIGRATED_KEYS,
+        )
+
+        missing_reserved = self._DUAL_WRITTEN_KV_KEYS - _RESERVED_DESIGN_DOC_KEYS
+        assert not missing_reserved, (
+            "dual-written telemetry keys missing from _RESERVED_DESIGN_DOC_KEYS "
+            f"(would consume agent write budget): {sorted(missing_reserved)}"
+        )
+
+        missing_telemetry = self._DUAL_WRITTEN_KV_KEYS - TELEMETRY_KEYS
+        assert not missing_telemetry, (
+            "dual-written telemetry keys missing from TELEMETRY_KEYS: "
+            f"{sorted(missing_telemetry)}"
+        )
+
+        prematurely_stripped = (
+            self._DUAL_WRITTEN_KV_KEYS & _TELEMETRY_MIGRATED_KEYS
+        )
+        assert not prematurely_stripped, (
+            "keys in _TELEMETRY_MIGRATED_KEYS would be stripped from design_doc, "
+            "breaking older serving engines mid-cutover: "
+            f"{sorted(prematurely_stripped)}"
+        )
+
 # ── Directions Lock Invariant ─────────────────────────────────────────────────
 
 class TestDirectionsLockInvariant:
@@ -7494,11 +8004,15 @@ class TestBehindRecoveryUpdateBranchGuard:
     ``_PENDING_GUARDS`` is a *temporary* allowlist for known unguarded sites
     that are being fixed in a parallel PR. Each entry MUST carry a TODO
     referencing the parallel work. A companion test
-    (``test_pending_guards_are_eventually_resolved``) is marked
-    ``pytest.mark.xfail(strict=True)`` so that once the parallel fix lands —
-    making the pending site actually guarded — the test xpasses, strict
-    failure fires, and the maintainer is forced to remove the corresponding
-    ``_PENDING_GUARDS`` entry in the same change.
+    (``test_pending_guards_are_eventually_resolved``) **must** be decorated
+    with ``@pytest.mark.xfail(strict=True)`` whenever ``_PENDING_GUARDS`` is
+    non-empty. Add the decorator alongside each new entry and remove both
+    together when the fix lands — the test enforces this pairing and raises
+    ``AssertionError`` if ``_PENDING_GUARDS`` is non-empty while the decorator
+    is absent. Once the parallel fix lands and the pending site becomes
+    actually guarded, the test xpasses; strict failure then fires, forcing
+    the maintainer to remove both the xfail mark and the ``_PENDING_GUARDS``
+    entry in the same change.
     """
 
     # callee identifier (final segment, whether ``ast.Name`` or
@@ -7751,17 +8265,42 @@ class TestBehindRecoveryUpdateBranchGuard:
         )
 
     def test_pending_guards_are_eventually_resolved(self):
-        """Strict-xfail tripwire that flips once every site in
-        ``_PENDING_GUARDS`` becomes actually guarded in source.
+        """Tripwire that enforces the ``_PENDING_GUARDS`` / xfail mark pairing.
+
+        **When** ``_PENDING_GUARDS`` is non-empty, this test must be decorated
+        with ``@pytest.mark.xfail(strict=True)`` — the test asserts this and
+        raises ``AssertionError`` if the decorator is absent. Add the decorator
+        alongside each new ``_PENDING_GUARDS`` entry and remove both together
+        when the fix lands.
 
         For each ``"<rel>:<fn>"`` pending entry, this test parses the file,
         finds the named function, and asserts that ``pr_is_not_behind`` is
         referenced inside it. While the parallel fix is in flight, the
-        assertion fails (expected). The instant the fix lands the assertion
-        passes — strict xfail then fails the build, forcing the maintainer
-        to remove both the xfail mark and the corresponding
-        ``_PENDING_GUARDS`` entry in the same change.
+        assertion fails (expected, per xfail). The instant the fix lands the
+        assertion passes — strict xfail then fails the build, forcing the
+        maintainer to remove both the xfail mark and the ``_PENDING_GUARDS``
+        entry in the same change.
         """
+        # Machine-enforced tripwire: _PENDING_GUARDS non-empty requires the
+        # @pytest.mark.xfail(strict=True) decorator on THIS method.  Checked
+        # via pytestmark rather than at import time so the failure message
+        # points exactly here instead of blowing up at collection.
+        if self._PENDING_GUARDS:
+            _markers = getattr(
+                self.test_pending_guards_are_eventually_resolved, "pytestmark", []
+            )
+            _has_strict_xfail = any(
+                m.name == "xfail" and m.kwargs.get("strict", False)
+                for m in _markers
+            )
+            assert _has_strict_xfail, (
+                "_PENDING_GUARDS is non-empty but "
+                "test_pending_guards_are_eventually_resolved is missing "
+                "@pytest.mark.xfail(strict=True). "
+                "Add the decorator alongside each new _PENDING_GUARDS entry "
+                "and remove both together when the fix lands."
+            )
+
         import ast
 
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
@@ -8540,7 +9079,7 @@ class TestTypedMockAssertConvention:
 # This block closes that gap using the same precedent as the SR-category mirror
 # (``AGENT_SELF_REVIEW_CATEGORIES`` / ``test_agent_categories_match_prompt_source``)
 # and the helper-exclusion scan above:
-#   1. ``AGENT_TEST_RUNNER_COMMANDS`` — a backend-resident declarative table of
+#   1. ``AGENT_TEST_RUNNER_COMMANDS`` — a backend-side declarative table of
 #      the family → emitted-command mapping the agent detector produces. Lives in
 #      the backend so it ships in CI's ``./backend`` Docker context.
 #   2. An ALWAYS-ON test pinning that table to the shared fixture (family
@@ -8973,7 +9512,7 @@ class TestAgentEnvFailureSignatureParity:
             )
 
 class TestAgentTestRunnerTableParity:
-    """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
+    """ALWAYS-ON: the backend-side agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).
 
     The backend onboarding detector is already pinned to the same fixture by
@@ -10769,12 +11308,10 @@ def test_task_type_evaluation_registry_is_consistent():
     expected_registry = {
         "create": "code-ci-review",
         "review": "none",
-        "panel_review": "structured-verdict",
         "fix": "code-ci-review",
         "plan": "none",
         "research": "forward-quality",
         "strategic_review": "forward-quality",
-        "strategic_resident_turn": "none",
         "design_doc_update": "forward-quality",
         "security_audit": "forward-quality",
         "qa": "code-ci-review",
@@ -10798,6 +11335,8 @@ def test_task_type_evaluation_registry_is_consistent():
         "repo_bootstrap": "none",
         "salvage_bundle": "code-ci-review",
         "capability_proof_trial": "none",
+        "criterion_coverage_trial": "none",
+        "walkthrough_e2e": "none",
     }
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == expected_registry, (
         "TaskType evaluation registry has drifted from the locked spec. "
@@ -11755,6 +12294,7 @@ def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
 _API_URL_RE = re.compile(r'["\'](/api/[a-z][^"\'\s?#{]*)["\']')
 
 _TEST_FUNC_DEF_RE = re.compile(r"^(?:async )?def (test_\w+)", re.MULTILINE)
+_CLASS_DEF_RE = re.compile(r"^class (Test\w+)", re.MULTILINE)
 
 def _validate_route_contract_registry(
     testing_dir: Path,
@@ -12603,4 +13143,623 @@ def test_record_task_merge_evidence_gates_on_acceptance_is_proven():
         "record_task_merge_evidence in acceptance_criteria.py. "
         "The acceptance_is_proven gate before recording CriterionEvidence rows "
         "has been removed or renamed. Restore it."
+    )
+
+
+@pytest.mark.timeout(300)
+def test_all_backend_test_files_collect_without_error():
+    """Guard that every backend/testing/test_*.py file can be collected by pytest.
+
+    Catches the class of regression where a production module has a symbol
+    deleted but a test file still imports it at module level — silently
+    dropping every test in that file from the run without any visible error.
+
+    Runs pytest --collect-only --noconftest so it works in the standalone
+    smoketest lane (no DB required) and mirrors the CI standalone gate.
+    """
+    testing_dir = Path(__file__).resolve().parent
+    backend_root = testing_dir.parent
+
+    env = os.environ.copy()
+    env.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+    env.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
+    env.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pytest",
+            "--collect-only",
+            "--noconftest",
+            "-q",
+            "--tb=line",
+            # Disable heavyweight plugins that add latency at collection time
+            # without affecting which collection errors are surfaced.
+            "-p", "no:testmon",        # skips test-impact-analysis DB scan
+            "-p", "no:rerunfailures",  # no retry logic on collect-only
+            "-p", "no:timeout",        # no per-test timers during collection
+            "-p", "no:cacheprovider",  # skip cache reads/writes
+            str(testing_dir),
+        ],
+        cwd=str(backend_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=240,
+    )
+
+    # Collection errors appear as lines starting with "ERROR collecting ..."
+    # or "ERROR testing/..." in stdout/stderr.
+    all_output = result.stdout + result.stderr
+    error_lines = [
+        line for line in all_output.splitlines()
+        if line.startswith("ERROR ")
+    ]
+
+    assert not error_lines, (
+        f"{len(error_lines)} backend test file(s) failed pytest collection "
+        "(ImportError, NameError, or other module-level error):\n"
+        + "\n".join(error_lines[:30])
+        + "\n\nFull output tail:\n"
+        + "\n".join(all_output.splitlines()[-40:])
+    )
+
+
+def test_no_set_derived_word_tokens_in_durable_writes():
+    """No app/ file may store set-derived word-tokens into a durable list via list(set(...split()...)).
+
+    The rev-1367 bug: strategic_completion.py stored direction text_tokens via
+    list(set(text.split()) - stopwords), then strategic_analysis.py re-joined them
+    with ' '.join(text_tokens), producing scrambled operator-visible text because
+    Python set iteration order is non-deterministic.
+
+    Correct pattern: sorted(set(...split()...)) for deterministic ordering, or just
+    split() without set() when dedup is not needed.
+
+    This invariant blocks the whole corruption class from recurring.
+    """
+    app_dir = BACKEND_ROOT / "app"
+    violating_files: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        source = py_file.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            # Detect: list(set(... .split() ...))
+            # i.e. a Call to 'list' whose sole arg is a Call to 'set',
+            # and somewhere inside that set(...) call is a .split() invocation.
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Name) and node.func.id == "list"):
+                continue
+            if len(node.args) != 1 or node.keywords:
+                continue
+            inner = node.args[0]
+            # Allow list(set(...) - ...) via BinOp (set difference) as well as
+            # direct list(set(...)) — walk the entire inner subtree for a set() call
+            # that itself contains a .split() call.
+            set_call = None
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "set":
+                set_call = inner
+            elif isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.Sub):
+                # list(set(...) - stopwords)
+                left = inner.left
+                if isinstance(left, ast.Call) and isinstance(left.func, ast.Name) and left.func.id == "set":
+                    set_call = left
+
+            if set_call is None:
+                continue
+
+            # Check whether the set() call's argument subtree contains a .split() call
+            contains_split = False
+            for sub in ast.walk(set_call):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "split"
+                ):
+                    contains_split = True
+                    break
+
+            if contains_split:
+                rel = py_file.relative_to(BACKEND_ROOT)
+                violating_files.append(f"  {rel}:{node.lineno}")
+                break  # one report per file
+
+    assert not violating_files, (
+        f"Found list(set(...split()...)) in {len(violating_files)} app/ file(s).\n"
+        "This pattern stores word tokens in non-deterministic set order, which\n"
+        "produces scrambled text when tokens are later re-joined with ' '.join(...).\n"
+        "Replace list(set(...)) with sorted(set(...)) to fix the ordering, or\n"
+        "use a different dedup approach that preserves insertion order.\n\n"
+        "Offending files:\n" + "\n".join(violating_files)
+    )
+
+
+def test_no_set_ordered_tokens_in_human_readable_text():
+    """No app/ file may serialize a bare set into human-readable text via join, str(), or f-strings.
+
+    Complements test_no_set_derived_word_tokens_in_durable_writes (which catches list(set(.split()...))).
+    This test catches the broader class of set→string conversions:
+
+      - <sep>.join(set(...))          — iteration order is non-deterministic; fix: <sep>.join(sorted(set(...)))
+      - str(set(...))                 — repr output order is non-deterministic
+      - f"...{set(...)}..."           — same repr issue as str(set(...))
+
+    The rev-1367 bug scrambled operator-visible text because tokens were stored from set iteration order.
+    Any of these patterns serialized into durable text (direction summaries, strategic memory notes,
+    design-doc/problem-model text) produces non-deterministic output.
+
+    Sites that use sorted(set(...)) inside join() are CORRECT and are NOT flagged.
+    """
+    app_dir = BACKEND_ROOT / "app"
+    violations: list[str] = []
+
+    def _is_set_call(node: ast.expr) -> bool:
+        """Return True if node is a bare set() call or set literal."""
+        if isinstance(node, ast.Call):
+            return isinstance(node.func, ast.Name) and node.func.id == "set"
+        return isinstance(node, ast.Set)
+
+    def _is_sorted_set(node: ast.expr) -> bool:
+        """Return True if node is sorted(set(...)) — the safe pattern."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "sorted"):
+            return False
+        if not node.args:
+            return False
+        inner = node.args[0]
+        # Allow sorted(set(...)) and sorted(set(...) - ...) etc.
+        if _is_set_call(inner):
+            return True
+        if isinstance(inner, ast.BinOp) and _is_set_call(inner.left):
+            return True
+        return False
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        source = py_file.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            # Pattern 1: <sep>.join(set(...)) — bare set, NOT wrapped in sorted()
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "join"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                arg = node.args[0]
+                if _is_set_call(arg) and not _is_sorted_set(arg):
+                    rel = py_file.relative_to(BACKEND_ROOT)
+                    violations.append(
+                        f"  {rel}:{node.lineno}: <sep>.join(set(...)) — wrap in sorted(set(...)) for deterministic order"
+                    )
+                    break  # one report per file
+
+            # Pattern 2: str(set(...))
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "str"
+                and len(node.args) == 1
+                and not node.keywords
+                and _is_set_call(node.args[0])
+            ):
+                rel = py_file.relative_to(BACKEND_ROOT)
+                violations.append(
+                    f"  {rel}:{node.lineno}: str(set(...)) — set repr order is non-deterministic; use sorted(set(...)) and join"
+                )
+                break
+
+        else:
+            # Check f-string interpolation of bare set() calls (not caught in inner loop above)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.JoinedStr):
+                    continue
+                for value in node.values:
+                    if not isinstance(value, ast.FormattedValue):
+                        continue
+                    if _is_set_call(value.value):
+                        rel = py_file.relative_to(BACKEND_ROOT)
+                        violations.append(
+                            f"  {rel}:{node.lineno}: f-string interpolates bare set(...) — set repr order is non-deterministic; use sorted(set(...))"
+                        )
+                        break
+
+    assert not violations, (
+        f"Found {len(violations)} bare set→string serialization(s) in app/ file(s).\n"
+        "Python set iteration order is non-deterministic — serializing a bare set into\n"
+        "human-readable text produces scrambled output across runs (the rev-1367 bug).\n"
+        "Fix: wrap the set in sorted(...) before joining, e.g. ', '.join(sorted(set(...))).\n\n"
+        "Offending sites:\n" + "\n".join(violations)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Problem-model write-path invariant — every project.problem_model = <expr>
+# must be provably sanitized against packer-marker pollution
+# ---------------------------------------------------------------------------
+
+
+class TestProblemModelWritePathInvariants:
+    """Structural invariant: every ``project.problem_model = <expr>`` assignment
+    in production code must trace to a provably sanitizing write path.
+
+    The test uses AST scanning to discover ALL assignment sites and then checks
+    each against a manually-reviewed allowlist of safe sites. A new write site
+    that is not in the allowlist triggers a test failure, requiring explicit
+    review. This makes the allowlist a living inventory that must be updated
+    whenever a write path is added or modified.
+    """
+
+    # Manual allowlist of safe write sites.
+    # Key: (rel_path_from_app, lineno). Each entry is the reviewed safety
+    # rationale — the scanner does NOT classify; it only discovers.
+    # When changing a file, update these line numbers.
+    _SAFE_SITES: dict[tuple[str, int], str] = {
+        # lifecycle.py: sanitize_problem_model_raw caller
+        ("lifecycle.py", 369): "sanitize_problem_model_raw(dict(project.problem_model))",
+        # task_locking.py: project.problem_model write-back inside with_problem_model_locked
+        ("task_locking.py", 1062): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
+        ("direction_lifecycle.py", 812): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
+        ("direction_lifecycle.py", 840): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
+        # strategic_completion.py: apply_agent_update (write-back)
+        ("strategic_completion.py", 4889): "apply_agent_update inline-sanitizes both current and proposed",
+        # strategic_completion.py: apply_agent_update (re-normalized)
+        ("strategic_completion.py", 4926): "apply_agent_update result, then _normalize_active_moves_writeback",
+        # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
+        ("strategic_completion.py", 6289): "parse_problem_model(…) validated pydantic model_dump",
+        # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
+        ("reaper_sweeps.py", 1123): "parse_problem_model(…) validated pydantic model_dump",
+        # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
+        ("reaper_sweeps.py", 1251): "parse_problem_model(…) validated pydantic model_dump",
+        # admin_projects.py: validated.model_dump()
+        ("routers/admin_projects.py", 759): "validated pydantic model_dump",
+        # admin_projects.py: current_model.model_dump()
+        ("routers/admin_projects.py", 1172): "current_model pydantic model_dump",
+        # admin_projects.py: current_model.model_dump()
+        ("routers/admin_projects.py", 1284): "current_model pydantic model_dump",
+        # admin_onboard.py: pm.model_dump() from parsed ProblemModel
+        ("routers/admin_onboard.py", 967): "pm parsed from ProblemModel, model_dump",
+        # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (6 sites)
+        ("routers/admin_agent_ops.py", 1659): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2006): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2436): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2549): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2804): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
+        ("routers/admin_agent_ops.py", 4224): "apply_agent_update result",
+        # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
+        ("routers/admin_agent_ops.py", 4252): "apply_agent_update result, then _normalize_active_moves_writeback",
+        # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
+        ("routers/admin_agent_ops.py", 4783): "validated current_model pydantic model_dump",
+        # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
+        ("routers/admin_agent_ops.py", 4865): "validated current_model pydantic model_dump",
+    }
+
+    def test_all_problem_model_write_paths_are_sanitized(self):
+        """Every ``project.problem_model = <expr>`` in ``backend/app/`` must
+        be in the reviewed allowlist of safe sanitized write paths."""
+        app_dir = BACKEND_ROOT / "app"
+        discovered: dict[tuple[str, int], str] = {}
+        # (rel_path, lineno) -> friendly description of the RHS
+
+        for py_file in sorted(app_dir.rglob("*.py")):
+            source = py_file.read_text(encoding="utf-8")
+            rel = py_file.relative_to(BACKEND_ROOT / "app")
+            try:
+                tree = ast.parse(source, filename=str(py_file))
+            except SyntaxError:
+                continue
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Attribute) and tgt.attr == "problem_model":
+                        lineno = node.lineno
+                        key = (str(rel), lineno)
+                        if isinstance(node.value, ast.Call) and isinstance(
+                            node.value.func, ast.Attribute
+                        ):
+                            desc = f"{node.value.func.attr}() call"
+                        elif isinstance(node.value, ast.Call) and isinstance(
+                            node.value.func, ast.Name
+                        ):
+                            desc = f"{node.value.func.id}(...) call"
+                        elif isinstance(node.value, ast.Name):
+                            desc = f"variable `{node.value.id}`"
+                        elif isinstance(node.value, ast.Subscript):
+                            desc = "subscript expression"
+                        elif isinstance(node.value, ast.Dict):
+                            desc = "dict literal"
+                        else:
+                            desc = type(node.value).__name__
+                        discovered[key] = desc
+
+        # Everything discovered must be in the allowlist
+        missing = set(discovered) - set(self._SAFE_SITES)
+        assert not missing, (
+            f"{len(missing)} project.problem_model = <expr> site(s) found "
+            "that are NOT in the reviewed SAFE_SITES allowlist.\n"
+            "Each new write path must be reviewed for packer-marker sanitization "
+            "and added to TestProblemModelWritePathInvariants._SAFE_SITES.\n\n"
+            "Unlisted sites:\n"
+            + "\n".join(
+                f"  {rel}:{ln} ({discovered.get((rel, ln), '?')})"
+                for (rel, ln) in sorted(missing)
+            )
+        )
+
+        # Warn about stale allowlist entries (sites that no longer exist)
+        stale = set(self._SAFE_SITES) - set(discovered)
+        assert not stale, (
+            f"{len(stale)} SAFE_SITES entry/entries no longer found in the codebase. "
+            "Remove or update these stale allowlist entries:\n"
+            + "\n".join(f"  {rel}:{ln}" for (rel, ln) in sorted(stale))
+        )
+
+
+# ---------------------------------------------------------------------------
+# DesignDocSizeLimitExceeded handler invariant — every handler must log
+# ---------------------------------------------------------------------------
+
+
+def _collect_design_doc_except_handlers(source: str, filename: str) -> list[tuple[int, ast.ExceptHandler]]:
+    """Return (lineno, handler) pairs where DesignDocSizeLimitExceeded is caught."""
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+    results: list[tuple[int, ast.ExceptHandler]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        if node.type is None:
+            continue
+        # Match: except DesignDocSizeLimitExceeded  (Name)
+        if isinstance(node.type, ast.Name) and node.type.id == "DesignDocSizeLimitExceeded":
+            results.append((node.lineno, node))
+            continue
+        # Match: except DesignDocSizeLimitExceeded as exc:  (Name aliased)
+        if isinstance(node.type, ast.Tuple):
+            for elt in node.type.elts:
+                if isinstance(elt, ast.Name) and elt.id == "DesignDocSizeLimitExceeded":
+                    results.append((node.lineno, node))
+                    break
+    return results
+
+
+def _handler_body_has_logger_call(handler: ast.ExceptHandler) -> bool:
+    """Return True if the handler body contains any logger.warning/error/exception call."""
+    for stmt in handler.body:
+        for subnode in ast.walk(stmt):
+            if isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Attribute):
+                # Look for logger.warning(…), logger.error(…), logger.exception(…)
+                if subnode.func.attr in {"warning", "error", "exception", "critical", "info"}:
+                    # Check that the receiver has "logger" in its name chain
+                    receiver = subnode.func.value
+                    if isinstance(receiver, ast.Name) and "logger" in receiver.id.lower():
+                        return True
+                    if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Attribute):
+                        # logging.getLogger(__name__).warning(...)
+                        if receiver.func.attr == "getLogger":
+                            return True
+                    # Also catch _log_zero.getLogger(__name__).warning(...)
+                    if isinstance(receiver, ast.Attribute) and receiver.attr == "getLogger":
+                        return True
+    return False
+
+
+def test_design_doc_size_limit_catches_are_loud():
+    """Every ``except DesignDocSizeLimitExceeded`` handler must emit a logger call.
+
+    A silent catch site is the exact failure class that produced the rev-1367
+    problem-model wipe: the caller believes a write persisted when it was silently
+    dropped. Every handler body must contain at least one ``logger.warning`` /
+    ``logger.error`` / ``logger.exception`` call so the drop is attributable.
+    """
+    app_dir = BACKEND_ROOT / "app"
+    silent_handlers: list[str] = []
+    for py_file in sorted(app_dir.rglob("*.py")):
+        if py_file.name == "__init__.py":
+            continue
+        source = py_file.read_text(encoding="utf-8")
+        rel = str(py_file.relative_to(BACKEND_ROOT))
+        handlers = _collect_design_doc_except_handlers(source, filename=str(py_file))
+        for lineno, handler in handlers:
+            if not _handler_body_has_logger_call(handler):
+                silent_handlers.append(f"  {rel}:{lineno} — handler body has no logger call")
+
+    assert not silent_handlers, (
+        "The following `except DesignDocSizeLimitExceeded` handler(s) have NO logger "
+        "call in their body. A silent catch site allows size-cap drops to pass "
+        "unnoticed — the exact failure class that produced the rev-1367 problem-model "
+        "wipe. Add a ``logger.warning`` (with project_id + exception detail) to each "
+        "handler before its fallthrough logic.\n\n"
+        + "\n".join(silent_handlers)
+    )
+
+
+def test_no_callers_pass_raise_on_size_limit_false():
+    """No production caller may pass ``raise_on_size_limit=False`` to
+    ``with_design_doc_locked`` or its aliases.
+
+    The default is ``raise_on_size_limit=True``, which is the intended behavior
+    per this direction's goal ('writes fail loudly instead of truncating'). A
+    caller that passes ``False`` opts back into the legacy silent-truncation
+    behavior. If a legitimate caller needs this, add it to the allowlist below
+    with a documented rationale.
+    """
+    # Allowlist: (rel_path, lineno, rationale). Keep as close to empty as possible — no caller
+    # should silence the size-cap guard.
+    _ALLOWLIST: frozenset[tuple[str, int, str]] = frozenset({
+        (
+            "app/efficiency_snapshot.py",
+            307,
+            "Telemetry mirror: silently skip the stale snapshot write when "
+            "the design_doc container is full — crashing the telemetry sync "
+            "is worse than a slightly stale efficiency snapshot.",
+        ),
+    })
+    app_dir = BACKEND_ROOT / "app"
+    # Known aliases for with_design_doc_locked in production code
+    _ALIASES: frozenset[str] = frozenset({
+        "with_design_doc_locked",
+        # Aliased import in admin_agent_ops.py
+    })
+    offenders: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        if py_file.name == "__init__.py":
+            continue
+        source = py_file.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+        rel = str(py_file.relative_to(BACKEND_ROOT))
+
+        # Collect local aliases via imports (e.g. "from ... import with_design_doc_locked as _with_design_doc_locked")
+        local_aliases: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "with_design_doc_locked":
+                        local_aliases.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "with_design_doc_locked":
+                        local_aliases.add(alias.asname or alias.name)
+
+        all_names = _ALIASES | local_aliases
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func_name = None
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+
+            if func_name not in all_names:
+                continue
+
+            # Check keyword arguments for raise_on_size_limit=False
+            for kw in node.keywords:
+                if kw.arg == "raise_on_size_limit":
+                    if isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                        allowlisted = any(
+                            a[0] == rel and a[1] == node.lineno
+                            for a in _ALLOWLIST
+                        )
+                        if not allowlisted:
+                            offenders.append(
+                                f"  {rel}:{node.lineno}: passes raise_on_size_limit=False to {func_name}"
+                            )
+
+    assert not offenders, (
+        "The following call site(s) pass ``raise_on_size_limit=False`` to "
+        "``with_design_doc_locked`` (or an alias), opting into the legacy "
+        "silent-truncation behavior. Per this direction's goal, all design_doc "
+        "writes must fail loudly. Remove the argument (the default is True) or "
+        "add the call site to the allowlist in this test with a reviewed "
+        "rationale.\n\n"
+        + "\n".join(offenders)
+    )
+
+
+def _collect_companion_test_duplicates(testing_dir: Path) -> list[str]:
+    """Return duplicate test-ID descriptions for companion-file pairs.
+
+    A companion file follows the pattern ``test_<prefix>__<suffix>.py`` and is
+    paired with the base file ``test_<prefix>.py``.  This function reports any
+    ``test_*`` function or ``Test*`` class that appears at module level in both
+    the base file and a companion — the "split-monolith-without-delete"
+    pathology that previously caused every test to run twice.
+    """
+    all_test_files = sorted(testing_dir.glob("test_*.py"))
+    errors: list[str] = []
+
+    # Build a mapping from base prefix (e.g. "admin_routers") to base Path + companion Paths.
+    base_to_companions: dict[str, dict[str, Path]] = {}
+    for f in all_test_files:
+        stem = f.stem  # e.g. test_admin_routers or test_admin_routers__messages
+        if "__" in stem:
+            # Companion: test_<prefix>__<suffix> → prefix = <prefix>
+            base_prefix = stem.split("__", 1)[0][5:]  # strip "test_" prefix
+            if base_prefix not in base_to_companions:
+                base_to_companions[base_prefix] = {"companions": [], "base": None}
+            base_to_companions[base_prefix]["companions"].append(f)
+        else:
+            # Base: test_<prefix> → prefix = <prefix>
+            base_prefix = stem[5:]  # strip "test_" prefix
+            if base_prefix not in base_to_companions:
+                base_to_companions[base_prefix] = {"companions": [], "base": None}
+            base_to_companions[base_prefix]["base"] = f
+
+    for prefix, group in base_to_companions.items():
+        base_path = group["base"]
+        companions = group["companions"]
+        if not companions or base_path is None:
+            continue
+
+        base_content = base_path.read_text(encoding="utf-8")
+        base_funcs = set(_TEST_FUNC_DEF_RE.findall(base_content))
+        base_classes = set(_CLASS_DEF_RE.findall(base_content))
+
+        base_name = base_path.name
+        for comp_path in companions:
+            comp_content = comp_path.read_text(encoding="utf-8")
+            comp_funcs = set(_TEST_FUNC_DEF_RE.findall(comp_content))
+            comp_classes = set(_CLASS_DEF_RE.findall(comp_content))
+
+            dup_funcs = base_funcs & comp_funcs
+            dup_classes = base_classes & comp_classes
+
+            comp_name = comp_path.name
+            if dup_funcs:
+                errors.append(
+                    f"{comp_name} shares test function(s) with {base_name}: "
+                    + ", ".join(sorted(dup_funcs))
+                )
+            if dup_classes:
+                errors.append(
+                    f"{comp_name} shares test class(es) with {base_name}: "
+                    + ", ".join(sorted(dup_classes))
+                )
+
+    return errors
+
+
+def test_no_duplicate_test_ids_across_backend_modules() -> None:
+    """Every companion test file uses test IDs (function/class names) not present
+    in its base file.
+
+    A companion file (``test_<prefix>__<suffix>.py``) that shadows a ``test_*``
+    function or ``Test*`` class from its base file (``test_<prefix>.py``) causes
+    the fixture to run twice — once from each file.  This is the
+    "split-monolith-without-delete" pathology that created the release_qualifier
+    'trio' failures.
+
+    The guard is a tripwire: a new collision fails CI immediately rather than
+    causing silent double-execution.
+    """
+    errors = _collect_companion_test_duplicates(BACKEND_ROOT / "testing")
+    assert not errors, (
+        "Companion files share test IDs with their base file:\n"
+        + "\n".join(errors)
+        + "\n\nRemove the duplicate from the base or the companion — both files "
+        "must not define the same test function or class name."
     )

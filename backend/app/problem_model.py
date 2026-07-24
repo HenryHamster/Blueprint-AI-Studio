@@ -636,6 +636,29 @@ def capability_evidence_status(cap: Capability) -> EvidenceStatus:
 
 
 
+PACKER_MARKER_KEYS: frozenset[str] = frozenset(
+    {"truncated", "_agent_view_floor_applied", "_gap_memory_trimmed"}
+)
+
+
+def sanitize_problem_model_raw(raw: dict) -> dict:
+    """Strip packer markers and unknown keys from a raw problem_model dict.
+
+    Removes any top-level key that is not a declared ``ProblemModel`` field —
+    including packer-injected markers (see :data:`PACKER_MARKER_KEYS`) and any
+    future unknowns. Safe to call on the dict before persisting it so a
+    packer-truncated view can never be written back with its poison markers
+    intact.
+
+    This is the canonical pre-write sanitizer for all non-agent write paths
+    (``with_problem_model_locked``, ``_reconcile_retired_gap``, etc.).
+    ``apply_agent_update`` does equivalent stripping inline on both current and
+    proposed; call this function for every other write path instead.
+    """
+    known = set(ProblemModel.model_fields)
+    return {k: v for k, v in raw.items() if k in known}
+
+
 def parse_problem_model(raw: dict | None) -> ProblemModel:
     """Safely parse a JSONB blob into a ProblemModel.
 
@@ -1126,42 +1149,40 @@ def _friction_count_cap(model: ProblemModel) -> list[str]:
     return evicted
 
 
-def _byte_evictable(model: ProblemModel) -> bool:
-    """Whether the byte pass can actually bring ``model`` under the budget.
 
-    The byte pass touches only reference-only / terminal state — ``archived_gaps``,
-    the ``rejected_agent_edits`` ledger, the oldest active-gap append-only tails,
-    and terminal capabilities/friction (``planned`` capabilities, ``resolved``/
-    ``mitigated`` friction). If the live/active state alone (everything that
-    survives once those are reduced to their durable floor) already exceeds the
-    budget, evicting that history cannot get the model under the cap; doing so
-    would be futile destruction of re-fetchable reference state on every mature
-    project (a healthy within-caps model carries enough active gaps/history to
-    exceed the budget on its own). So gate eviction on it actually being
-    achievable: measure the floor with the evictable collections cleared and
-    active tails trimmed, restore the model, and only let the caller evict when
-    that floor fits. The legitimate target — a model whose archived/ledger/
-    terminal cap/friction bulk is large enough to blow the cap despite a small
-    live core — still has a sub-budget floor and is GC'd normally.
+def _diagnose_live_core_oversize(model: ProblemModel) -> str:
+    """Name the largest live section dominating the byte oversize.
 
-    Crucially, the floor must drop terminal capabilities/friction too: without
-    that, a model whose bulk IS its ``planned`` capabilities or ``resolved``/
-    ``mitigated`` friction would measure an over-budget floor and the gate would
-    wrongly skip — leaving it oversized in the durable store (the precise gap
-    this backstop closes)."""
-    floor_model = model.model_copy(deep=True)
-    floor_model.archived_gaps = []
-    floor_model.rejected_agent_edits = []
-    floor_model.capabilities = [
-        c for c in floor_model.capabilities if not _is_evictable_capability(c)
+    Called after full eviction when the model is still over budget. The only
+    remaining state is the unevictable live core (active gaps, live capabilities,
+    active friction). Returns a human-readable description of the dominant section
+    so the caller's error message is actionable.
+    """
+    sections = [
+        (
+            "active_gaps",
+            len(json.dumps([g.model_dump() for g in model.gaps], default=str)),
+            len(model.gaps),
+        ),
+        (
+            "live_capabilities",
+            len(json.dumps(
+                [c.model_dump() for c in model.capabilities if not _is_evictable_capability(c)],
+                default=str,
+            )),
+            sum(1 for c in model.capabilities if not _is_evictable_capability(c)),
+        ),
+        (
+            "active_friction",
+            len(json.dumps(
+                [f.model_dump() for f in model.friction if not _is_evictable_friction(f)],
+                default=str,
+            )),
+            sum(1 for f in model.friction if not _is_evictable_friction(f)),
+        ),
     ]
-    floor_model.friction = [
-        f for f in floor_model.friction if not _is_evictable_friction(f)
-    ]
-    for gap in sorted(floor_model.gaps, key=_active_gap_recency_key):
-        _trim_gap_append_only_tail(gap)
-    floor_bytes = _serialized_model_bytes(floor_model)
-    return floor_bytes <= PROBLEM_MODEL_BYTE_BUDGET
+    name, size, count = max(sections, key=lambda x: x[1])
+    return f"{name} ({count} items, ~{size} bytes)"
 
 
 def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
@@ -1190,13 +1211,11 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
        ``planned`` capabilities) until the model fits. This guards models whose
        bulk is large individual entries or accumulated terminal cap/friction
        despite being under the count caps, so the durable model stays writable
-       back through the strategic op endpoint. The byte pass is gated on
-       :func:`_byte_evictable`: it runs ONLY when emptying the evictable
-       reference-only/terminal collections and reducing active tails to the
-       durable floor could actually bring the model under budget. A healthy
-       within-caps model can carry enough live state to exceed the budget on its
-       own, and the byte pass cannot touch that live state — so evicting
-       reference history there is futile destruction and is skipped.
+       back through the strategic op endpoint. If the model is STILL over budget
+       after all eviction (the live core alone exceeds the budget), raises
+       ``ValueError`` naming the dominant oversize section — ``active_gaps``,
+       ``live_capabilities``, or ``active_friction`` — so the caller surfaces an
+       actionable error instead of silently committing an oversized model.
 
     It deliberately does NOT touch active gaps, live capabilities
     (``working``/``partial``), active friction, or pending confirmations — those
@@ -1236,12 +1255,10 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     capabilities_evicted.extend(_cap_count_cap(model))
     friction_evicted.extend(_friction_count_cap(model))
 
-    # Byte cap: only re-order/evict when we are genuinely over budget so the
-    # no-op path leaves the model byte-identical (no spurious archived re-sort).
+    # Byte cap: evict reference-only / terminal state when over budget, then
+    # raise loudly if the live core alone is still too large.
     ledger_trimmed = 0
-    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and _byte_evictable(
-        model
-    ):
+    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
         # Oldest-first so list.pop(0) drops the oldest archived gap.
         model.archived_gaps = sorted(model.archived_gaps, key=_archived_gap_recency_key)
         while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and (
@@ -1269,6 +1286,18 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
                 capabilities_evicted.append(ident)
             else:
                 friction_evicted.append(ident)
+        # After all eviction, if still over budget the live core itself is too
+        # large.  Raise loudly so the caller surfaces an actionable error instead
+        # of silently committing an oversized model to the durable store.
+        if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
+            section = _diagnose_live_core_oversize(model)
+            raise ValueError(
+                f"gc_problem_model: live core exceeds PROBLEM_MODEL_BYTE_BUDGET "
+                f"({PROBLEM_MODEL_BYTE_BUDGET} bytes) after full eviction — "
+                f"oversize section: {section}. Reduce the size of active state "
+                f"(active gaps, live capabilities, or active friction) to bring "
+                f"the model under the byte budget."
+            )
 
     if evicted_ids:
         summary["archived_gaps_evicted"] = evicted_ids
@@ -1282,6 +1311,35 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
         summary["friction_evicted"] = friction_evicted
 
     return summary
+
+
+def enforce_problem_model_size(
+    model: ProblemModel,
+) -> tuple[dict[str, Any], str | None]:
+    """Run gc_problem_model and return (gc_summary, oversize_section_or_None).
+
+    Mutates *model* in place (same as :func:`gc_problem_model`).  Returns:
+
+    * ``(summary, None)``  — eviction brought model under
+      :data:`PROBLEM_MODEL_BYTE_BUDGET`.
+    * ``(partial_summary, section_str)`` — live core alone still exceeds the
+      budget after full eviction; *section_str* names the dominant section.
+
+    Never raises.  Callers decide whether to reject (GROW paths) or log-and-
+    persist (SHRINK / background paths).
+    """
+    try:
+        summary = gc_problem_model(model)
+        return summary, None
+    except ValueError as exc:
+        msg = str(exc)
+        section: str = msg
+        prefix = "oversize section: "
+        idx = msg.find(prefix)
+        if idx >= 0:
+            # Extract up to the first period so we get only the section name.
+            section = msg[idx + len(prefix) :].split(".")[0].strip()
+        return {}, section
 
 
 def _parse_iso_to_naive_utc(value: str | None) -> datetime | None:
@@ -1326,111 +1384,6 @@ def _deferral_is_stale(deferral: GapDeferral, now: datetime | None) -> bool:
     if created_at is not None:
         return created_at < now - timedelta(days=DEFERRAL_STALE_GRACE_DAYS)
     return False
-
-
-def lifecycle_bound_problem_model(
-    model: ProblemModel, now_iso: str
-) -> dict[str, Any]:
-    """Auto-archive/drop terminal-ish state so the durable model self-bounds
-    toward its healthy thresholds without manual strategist compaction.
-
-    Pure backend pass — mutates ``model`` in place and returns a small summary
-    of what it changed (empty dict on no-op, so the caller keeps the
-    diff/output byte-identical when nothing was touched). Runs BEFORE the
-    :func:`gc_problem_model` 200-item/byte backstop in :func:`apply_agent_update`
-    and composes cleanly with it: this pass reduces terminal state at the
-    healthy thresholds, and gc remains the generous last-resort structural cap.
-
-    Three actions, each touching ONLY terminal-ish / reference-only state —
-    the same reference-only class gc already treats as evictable, applied
-    eagerly at the healthy threshold instead of only at the 200-item backstop:
-
-    1. **Aged-deferred gaps → archive.** Each ACTIVE gap that carries a
-       ``deferral``, has no ``active_moves``, and whose deferral has aged past
-       its revisit point (see :func:`_deferral_is_stale`) is marked
-       ``abandoned`` with ``closed=now_iso`` and a ``lifecycle_auto_archived``
-       history event, then moved into ``archived_gaps`` by
-       :func:`archive_closed_gaps`. A gap with ``active_moves``, a fresh/held
-       deferral, or no deferral at all is NEVER touched. Archived gaps stay
-       re-fetchable by id, so this is reversible.
-    2. **Terminal friction surplus → drop.** Bounds total friction toward
-       :data:`MODEL_SIZE_HEALTHY_FRICTION` by dropping terminal
-       (``resolved`` then ``mitigated``) friction oldest-first, only as far as
-       needed. ALL ``active`` friction is kept, so an all-active list is left
-       untouched (and may legitimately stay above the threshold).
-    3. **Stale planned capabilities surplus → drop.** Bounds capabilities
-       toward :data:`MODEL_SIZE_HEALTHY_CAPABILITIES` by dropping ``planned``
-       (never-built) capabilities oldest-first, only as far as needed. ALL
-       ``working``/``partial`` capabilities are kept.
-
-    Returns a dict like ``{"gaps_lifecycle_archived": ["g-x"],
-    "friction_lifecycle_evicted": ["f-y"],
-    "capabilities_lifecycle_evicted": ["cap-z"]}`` — only the keys that had
-    activity are present; an all-live model returns ``{}``.
-    """
-    summary: dict[str, Any] = {}
-    now = _parse_iso_to_naive_utc(now_iso)
-
-    # 1. Aged-deferred, unstaffed gaps → mark abandoned so archive_closed_gaps
-    #    moves them into archived_gaps (reversible, re-fetchable by id).
-    archived_gap_ids: list[str] = []
-    for gap in model.gaps:
-        if gap.status != "active" or gap.active_moves or gap.deferral is None:
-            continue
-        if not _deferral_is_stale(gap.deferral, now):
-            continue
-        gap.status = "abandoned"
-        gap.closed = now_iso
-        gap.history.append(
-            GapHistoryEvent(
-                ts=now_iso,
-                event="lifecycle_auto_archived",
-                note=(
-                    "auto-archived: deferral aged past revisit point "
-                    "(lifecycle-bound pass)"
-                ),
-            )
-        )
-        archived_gap_ids.append(gap.id)
-    if archived_gap_ids:
-        archive_closed_gaps(model)
-        summary["gaps_lifecycle_archived"] = archived_gap_ids
-
-    # 2. Terminal friction surplus → drop toward the healthy friction threshold,
-    #    resolved before mitigated, oldest-first. Active friction is never
-    #    dropped, so an all-active list stays untouched.
-    friction_overage = len(model.friction) - MODEL_SIZE_HEALTHY_FRICTION
-    if friction_overage > 0:
-        resolved = [i for i, f in enumerate(model.friction) if f.status == "resolved"]
-        mitigated = [i for i, f in enumerate(model.friction) if f.status == "mitigated"]
-        evict_idx = set((resolved + mitigated)[:friction_overage])
-        if evict_idx:
-            evicted_friction: list[str] = []
-            kept_friction: list[Friction] = []
-            for i, fric in enumerate(model.friction):
-                if i in evict_idx:
-                    evicted_friction.append(fric.id)
-                else:
-                    kept_friction.append(fric)
-            model.friction = kept_friction
-            summary["friction_lifecycle_evicted"] = evicted_friction
-
-    # 3. Stale planned capabilities surplus → drop toward the healthy capability
-    #    threshold, oldest-first. working/partial capabilities are never dropped.
-    cap_overage = len(model.capabilities) - MODEL_SIZE_HEALTHY_CAPABILITIES
-    if cap_overage > 0:
-        evicted_caps: list[str] = []
-        kept_caps: list[Capability] = []
-        for cap in model.capabilities:
-            if len(evicted_caps) < cap_overage and _is_evictable_capability(cap):
-                evicted_caps.append(cap.name)
-            else:
-                kept_caps.append(cap)
-        if evicted_caps:
-            model.capabilities = kept_caps
-            summary["capabilities_lifecycle_evicted"] = evicted_caps
-
-    return summary
 
 
 def auto_archive_stale_problem_model_items(
@@ -1708,6 +1661,65 @@ def auto_clear_resolved_confirmations(
     return cleared
 
 
+PENDING_CONFIRMATION_STALE_DECAY_DAYS = 30
+"""Age (in days) after which a ``pending_user_confirmation`` item is considered stale
+and eligible for automatic removal by the reaper decay sweep, regardless of type.
+
+Applies to ALL four types: ``intent_change``, ``major_decision``,
+``credentials_needed``, and ``access_needed``.  The moot-confirmation sweep
+(:func:`auto_clear_resolved_confirmations`) remains the fast-path that clears
+credential/access items when the system can positively prove resolution; this
+constant governs the age-based fallback for items the moot sweep can never remove
+(``intent_change`` / ``major_decision``) and for credential/access items whose moot
+signal never fires."""
+
+
+def decay_stale_pending_confirmations(
+    model: ProblemModel,
+    now_iso: str,
+) -> list[str]:
+    """Remove ``pending_user_confirmation`` items older than
+    :data:`PENDING_CONFIRMATION_STALE_DECAY_DAYS`.
+
+    Pure, DB-free counterpart to :func:`auto_clear_resolved_confirmations`: it
+    round-trips the ``ProblemModel`` identically — removes the item(s), bumps
+    ``revision``, stamps ``last_updated`` / ``last_updated_by='user'``, and appends
+    one ``revision_log`` entry.  Mutates ``model`` in place and returns the ids
+    decayed (empty list => no change).
+
+    Applies to ALL four confirmation types.  Items with a missing or unparseable
+    ``created_at`` are conservatively left in place (fail-closed on ambiguous data).
+    Idempotent: removed items are already gone on a second call.
+    """
+    if not model.pending_user_confirmation:
+        return []
+    now = _parse_iso_to_naive_utc(now_iso)
+    if now is None:
+        return []
+    cutoff = now - timedelta(days=PENDING_CONFIRMATION_STALE_DECAY_DAYS)
+    decayed: list[str] = []
+    kept: list[PendingConfirmation] = []
+    for item in model.pending_user_confirmation:
+        created = _parse_iso_to_naive_utc(item.created_at)
+        if created is not None and created < cutoff:
+            decayed.append(item.id)
+        else:
+            kept.append(item)
+    if not decayed:
+        return []
+    model.pending_user_confirmation = kept
+    model.revision += 1
+    model.last_updated = now_iso
+    model.last_updated_by = "user"
+    append_revision_log(
+        model,
+        f"age-decayed {len(decayed)} stale pending confirmation(s) "
+        f"(>{PENDING_CONFIRMATION_STALE_DECAY_DAYS}d old)",
+        {"decayed_pending_confirmations": decayed},
+    )
+    return decayed
+
+
 def append_self_reflection(
     log_raw: list | None,
     entry: SelfReflectionEntry,
@@ -1752,7 +1764,7 @@ is approaching the structural limit even if entry counts look healthy."""
 
 DEFERRAL_STALE_GRACE_DAYS = 30
 """Grace window (days) before a deferred, unstaffed gap is auto-archived by
-:func:`lifecycle_bound_problem_model` when its deferral carries no usable
+:func:`auto_archive_stale_problem_model_items` when its deferral carries no usable
 ``hold_until``.
 
 A gap's ``deferral`` is an explicit "real but intentionally not staffed this
@@ -2006,26 +2018,33 @@ def _diff_summary(diff: dict[str, Any]) -> str:
 # in :func:`apply_agent_update`.
 
 
-def project_has_purpose(project) -> bool:
-    """True when the project has an established purpose.
+def resolve_project_purpose(project) -> str:
+    """Return one normalized, non-placeholder project purpose.
 
-    Canonical source is ``problem_model.intent.purpose`` (seeded at onboarding
-    by ``admin_onboard._seed_strategic_intent``); the deprecated
-    ``vision.purpose`` is honored as a legacy fallback for projects that
-    pre-date the problem model. Both the strategic force-trigger
-    (``autonomous_research``) and the autonomy-debug endpoint resolve purpose
-    through this helper so trigger behavior and "why" reporting cannot drift.
-    Reading only ``vision.purpose`` made every problem-model project look
-    purposeless — ``force_strategic`` fired on every tick and strategic
-    cycles spawned back-to-back at the cooldown rate (stsbot2, 2026-06-07:
-    6 cycles in ~3h against a frequency of 6 spawns/cycle).
+    Operator-owned ``intent.user_purpose`` wins, followed by the current
+    problem-model purpose and the two legacy vision fields.
     """
     pm = getattr(project, "problem_model", None) or {}
     intent = pm.get("intent") or {}
-    if (intent.get("purpose") or "").strip():
-        return True
     vision = getattr(project, "vision", None) or {}
-    return bool((vision.get("purpose") or "").strip())
+
+    for candidate in (
+        intent.get("user_purpose"),
+        intent.get("purpose"),
+        vision.get("user_purpose"),
+        vision.get("purpose"),
+    ):
+        if not isinstance(candidate, str):
+            continue
+        normalized = candidate.strip()
+        if not _is_placeholder_purpose(normalized):
+            return normalized
+    return ""
+
+
+def project_has_purpose(project) -> bool:
+    """True when the canonical resolver finds an established purpose."""
+    return bool(resolve_project_purpose(project))
 
 
 # ---------------------------------------------------------------------------
@@ -2721,6 +2740,58 @@ def normalize_active_moves_writeback(
     return new_pm_raw, corrections
 
 
+_WIPE_RISK_SENTINEL = object()  # detect_wipe_risk: sentinel for absent-key check
+
+
+def detect_wipe_risk(
+    current: ProblemModel,
+    proposed: ProblemModel,
+    deletions: Any,
+    *,
+    proposed_raw: dict | None = None,
+) -> dict[str, bool]:
+    """Detect a proposed full-collection wipe without explicit _deletions coverage.
+
+    Called BEFORE :func:`_merge_agent_owned_collections` so ``proposed``
+    still reflects what the agent actually submitted (pre-merge). The merge
+    itself prevents the wipe; this function surfaces the intent so callers
+    can fire an alert.
+
+    ``proposed_raw`` is the raw dict the agent submitted BEFORE pydantic
+    validation (after directives like ``_deletions`` are lifted out). When
+    supplied, a collection is only flagged when the raw dict EXPLICITLY
+    submitted an empty list for that key.  An absent key is a partial update
+    — the merge's omission=keep semantics handle it, and no alarm is needed.
+    When ``proposed_raw`` is not supplied (legacy / test callers), the
+    function falls back to checking the parsed model's empty-collection field.
+
+    Returns a dict with ``gaps_wipe_risk`` and/or ``capabilities_wipe_risk``
+    set to ``True`` when the condition fires:
+      - durable model has at least one entry
+      - proposed payload explicitly submitted an empty list for that collection
+      - ``_deletions`` carries no explicit removals for that collection
+        (a full explicit deletion is intentional and not flagged)
+    """
+    result: dict[str, bool] = {}
+
+    def _explicitly_empty(field: str) -> bool:
+        if proposed_raw is None:
+            # Fallback when raw dict is unavailable: use the parsed model.
+            return not getattr(proposed, field)
+        raw_val = proposed_raw.get(field, _WIPE_RISK_SENTINEL)
+        if raw_val is _WIPE_RISK_SENTINEL:
+            return False  # absent key is a partial update, not a wipe
+        return isinstance(raw_val, list) and len(raw_val) == 0
+
+    del_gap_ids = set(_as_str_list(deletions, "gaps"))
+    if current.gaps and _explicitly_empty("gaps") and not del_gap_ids:
+        result["gaps_wipe_risk"] = True
+    del_cap_names = set(_as_str_list(deletions, "capabilities"))
+    if current.capabilities and _explicitly_empty("capabilities") and not del_cap_names:
+        result["capabilities_wipe_risk"] = True
+    return result
+
+
 def apply_agent_update(
     current_raw: dict | None,
     proposed_raw: dict,
@@ -2878,7 +2949,7 @@ def apply_agent_update(
     # operator edit is honored and reported faithfully.
     rejected_edits: list[dict[str, Any]] = []
     if baseline_raw is not None:
-        baseline = parse_problem_model(baseline_raw)
+        baseline = parse_problem_model(sanitize_problem_model_raw(baseline_raw))
         rejected_edits = _merge_operator_owned_fields(
             baseline, current, proposed, now_iso
         )
@@ -2898,6 +2969,14 @@ def apply_agent_update(
     pm_compacted_gaps = {
         e["gap_id"] for e in compaction_events if "past_moves_watermark" in e
     }
+
+    # Detect wipe-without-deletions BEFORE the merge restores omitted entries.
+    # The merge below is non-destructive so the actual wipe is prevented, but
+    # a proposed payload with zero gaps/capabilities and no _deletions signals
+    # that the agent either truncated its view or is attempting a silent wipe.
+    # Pass proposed_raw so detect_wipe_risk can distinguish an explicit empty
+    # list (wipe-without-deletions) from an absent key (partial update).
+    _wipe_risk = detect_wipe_risk(current, proposed, deletions, proposed_raw=proposed_raw)
 
     # Non-destructive merge of agent-owned collections: an agent acting on a
     # trimmed/dropped payload view must not wipe entries it never saw. Runs
@@ -2924,6 +3003,11 @@ def apply_agent_update(
     # Surface blocked gap deletions (already filtered before merge above).
     if _blocked_gap_deletions:
         diff["gaps_deletion_blocked"] = sorted(_blocked_gap_deletions)
+    # Surface wipe-without-deletions signals detected before the merge.
+    if _wipe_risk.get("gaps_wipe_risk"):
+        diff["gaps_wipe_risk"] = True
+    if _wipe_risk.get("capabilities_wipe_risk"):
+        diff["capabilities_wipe_risk"] = True
 
     # Record compaction events in the diff for observability.
     if compaction_events:
@@ -2979,7 +3063,14 @@ def apply_agent_update(
     # are eligible) and BEFORE the revision-log append so the eviction is
     # recorded in the same revision that performed it. Folds what was dropped
     # into the diff so the GC is observable in the revision log.
-    gc_summary = gc_problem_model(proposed)
+    try:
+        gc_summary = gc_problem_model(proposed)
+    except ValueError:
+        # Live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction.
+        # Surface as a structured diff flag so callers can reject loudly (HTTP 400
+        # for the op endpoint) rather than propagating an opaque uncaught exception.
+        diff["live_core_exceeds_budget"] = _diagnose_live_core_oversize(proposed)
+        gc_summary = {}
     if gc_summary:
         diff.update(gc_summary)
 

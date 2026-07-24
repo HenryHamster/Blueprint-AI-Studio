@@ -276,10 +276,62 @@ describe('RemediationFunnelSection', () => {
   });
 
   describe('show ignored toggle', () => {
-    it.todo('renders a "Show ignored" button in the residuals panel when any fingerprint has IGNORED status');
-    it.todo('fingerprints with case_status IGNORED are hidden by default (before toggle is activated)');
-    it.todo('clicking "Show ignored" reveals fingerprints whose case_status is IGNORED');
-    it.todo('clicking "Show ignored" again hides the IGNORED fingerprints');
+    beforeEach(() => {
+      apiFetchMock.mockReset();
+    });
+
+    it('renders a "Hide ignored" toggle (aria-pressed=false) when API returns IGNORED fingerprints — ignored items shown by default', async () => {
+      apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+        baseCluster({ fingerprint: 'fp-ignored', case_status: 'IGNORED' }),
+      ])));
+      const user = userEvent.setup();
+      render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+      await act(async () => {});
+      await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+      const btn = screen.getByRole('button', { name: /Hide ignored/i });
+      expect(btn).toBeInTheDocument();
+      expect(btn).toHaveAttribute('aria-pressed', 'false');
+    });
+
+    it('fingerprints with case_status IGNORED are visible by default (showIgnored starts true)', async () => {
+      apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+        baseCluster({ fingerprint: 'fp-ignored', case_status: 'IGNORED', sample_message: 'visible ignored msg' }),
+      ])));
+      const user = userEvent.setup();
+      render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+      await act(async () => {});
+      await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+      expect(screen.getByText('visible ignored msg')).toBeInTheDocument();
+    });
+
+    it('clicking "Hide ignored" hides IGNORED fingerprints and switches button to "Show ignored" (aria-pressed=true)', async () => {
+      apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+        baseCluster({ fingerprint: 'fp-ignored', case_status: 'IGNORED', sample_message: 'hidden after toggle' }),
+      ])));
+      const user = userEvent.setup();
+      render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+      await act(async () => {});
+      await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+      await user.click(screen.getByRole('button', { name: /Hide ignored/i }));
+      expect(screen.queryByText('hidden after toggle')).toBeNull();
+      const btn = screen.getByRole('button', { name: /Show ignored/i });
+      expect(btn).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    it('clicking "Show ignored" again re-reveals IGNORED fingerprints and restores aria-pressed=false', async () => {
+      apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+        baseCluster({ fingerprint: 'fp-ignored', case_status: 'IGNORED', sample_message: 'restored msg' }),
+      ])));
+      const user = userEvent.setup();
+      render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+      await act(async () => {});
+      await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+      await user.click(screen.getByRole('button', { name: /Hide ignored/i }));
+      expect(screen.queryByText('restored msg')).toBeNull();
+      await user.click(screen.getByRole('button', { name: /Show ignored/i }));
+      expect(screen.getByText('restored msg')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Hide ignored/i })).toHaveAttribute('aria-pressed', 'false');
+    });
   });
 
   it('renders success-by-confidence rates', () => {

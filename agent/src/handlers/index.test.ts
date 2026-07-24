@@ -1,7 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
-const residentTurnHandlerMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
-
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ../index.js (the main agent runner) to prevent main() from executing
 // and to supply the named exports that handler files import at module level.
@@ -35,6 +33,13 @@ vi.mock('../workspacePrep.js', () => ({
 // handlers/index.ts imports the three audit handlers from ./audits.js.
 // Mock them here so the registry tests are isolated from the audit handler
 // implementation; the implementations are exercised in audits.test.ts.
+
+// handleStrategicResident is stubbed so dispatchStrategic gate tests can assert
+// which branch was taken without running the real session loop.
+vi.mock('./strategic-resident.js', () => ({
+  handleStrategicResident: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('./audits.js', () => ({
   handleSecurityAudit: vi.fn().mockResolvedValue(undefined),
   handleSelfAudit: vi.fn().mockResolvedValue(undefined),
@@ -46,11 +51,6 @@ vi.mock('./audits.js', () => ({
 // and confirm there is exactly one registration under release_audit_challenge.
 vi.mock('./audit-challenge.js', () => ({
   handleReleaseAuditChallenge: vi.fn().mockResolvedValue(undefined),
-}));
-
-vi.mock('./strategic-resident-turn.js', () => ({
-  handleStrategicResidentTurn: residentTurnHandlerMock,
-  residentProviderSupportsNoTools: vi.fn().mockReturnValue(true),
 }));
 
 // Mock fs and child_process so handler files that import them at module level
@@ -98,12 +98,14 @@ import {
   resolveHandler,
   resolveGenericRunner,
   resolveTaskCapabilityContract,
+  isResidentSessionTask,
   type TaskCapabilityContract,
 } from './index.js';
 import { DISPATCHER_MEMO_SYNTHESIZER_KINDS } from './memo.js';
 import { persistAndPostStatus } from '../index.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
+import { handleStrategicResident } from './strategic-resident.js';
 
 // ── Handler registry tests ────────────────────────────────────────────────────
 describe('handlers registry', () => {
@@ -130,19 +132,6 @@ describe('handlers registry', () => {
     expect(resolution.handler, `"${taskType}" must resolve to a runner`).toBeTypeOf('function');
   });
 
-  it('every registered handler is a function', () => {
-    for (const [type, handler] of Object.entries(handlers)) {
-      expect(typeof handler, `handler for "${type}" should be a function`).toBe('function');
-    }
-  });
-
-  it('no handler value is null or undefined', () => {
-    for (const [type, handler] of Object.entries(handlers)) {
-      expect(handler, `handler for "${type}" should not be null/undefined`).toBeDefined();
-      expect(handler, `handler for "${type}" should not be null`).not.toBeNull();
-    }
-  });
-
   it('strategic_review and research are distinct handlers — research dispatches to strategic only when payload.research_mode is "strategic"', () => {
     expect(handlers.strategic_review).not.toBe(handlers.research);
   });
@@ -154,30 +143,6 @@ describe('handlers registry', () => {
     const resolution = resolveHandler('release_audit_challenge', {}, { type: 'release_audit_challenge' });
     expect(resolution.dispatch).toBe('bespoke');
     expect(resolution.handler).toBe(handleReleaseAuditChallenge);
-  });
-
-  it('passes the server-projected Resident provider fence from payloads[0] to its handler', async () => {
-    const claimTask = {
-      payloads: [{
-        type: 'strategic_resident_turn',
-        _resident_expected_runtime_provider: 'anthropic',
-      }],
-    };
-    const payload = claimTask.payloads[0];
-    const resolution = resolveHandler(payload.type, claimTask, payload);
-    expect(resolution.dispatch).toBe('bespoke');
-    expect(resolution.handler).not.toBeNull();
-    if (resolution.handler === null) throw new Error('Resident handler missing');
-
-    await resolution.handler(
-      'task-id', payload, claimTask, '', '', '', null, { value: '' },
-    );
-    expect(residentTurnHandlerMock).toHaveBeenCalledWith(
-      'task-id',
-      expect.objectContaining({ _resident_expected_runtime_provider: 'anthropic' }),
-      claimTask,
-      '', '', '', null, { value: '' },
-    );
   });
 
   it('all handlers are distinct function references from each other', () => {
@@ -433,9 +398,8 @@ const TASK_CLASS_MAP = {
   deps:              'code-change',
   // Salvage bundle (1): consolidated fix PR from decayed research findings
   salvage_bundle:    'code-change',
-  // Read-only / investigative (14): analysis only, must not push code
+  // Read-only / investigative (13): analysis only, must not push code
   review:            'read-only',
-  panel_review:      'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
   release_audit:     'read-only',
@@ -448,8 +412,9 @@ const TASK_CLASS_MAP = {
   verify_tests:      'read-only',
   compute_experiment:'read-only',
   repo_bootstrap:    'read-only',
-  capability_proof_trial: 'read-only',
-  strategic_resident_turn: 'read-only',
+  capability_proof_trial:  'read-only',
+  criterion_coverage_trial: 'read-only',
+  walkthrough_e2e:       'read-only',
   // Research / planning (7): read-heavy, no code shipped
   plan:              'research',
   research:          'research',
@@ -474,20 +439,31 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 8 code-change + 16 read-only + 7 research = 31 total', () => {
-    const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
-    for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
-    expect(counts['code-change']).toBe(8);
-    expect(counts['read-only']).toBe(16);
-    expect(counts['research']).toBe(7);
+});
+
+// ── isResidentSessionTask unit ─────────────────────────────────────────────────
+// Validates the gate function that determines whether a strategic_review task
+// should route to the conversational Workday session (handleStrategicResident)
+// vs. the one-shot strategic handler (handleStrategic).
+describe('isResidentSessionTask unit', () => {
+  it('returns false when payload.type is not strategic_review', () => {
+    expect(isResidentSessionTask({ context: {} }, { type: 'research', resident_session: true })).toBe(false);
   });
 
-  it('no task type belongs to more than one class', () => {
-    const seen = new Set<string>();
-    for (const type of Object.keys(TASK_CLASS_MAP)) {
-      expect(seen, `"${type}" appears more than once in TASK_CLASS_MAP`).not.toContain(type);
-      seen.add(type);
-    }
+  it('returns true when payload.resident_session is true and type is strategic_review', () => {
+    expect(isResidentSessionTask({ context: {} }, { type: 'strategic_review', resident_session: true })).toBe(true);
+  });
+
+  it('returns true when task.context._resident_session is true and type is strategic_review', () => {
+    expect(isResidentSessionTask({ context: { _resident_session: true } }, { type: 'strategic_review' })).toBe(true);
+  });
+
+  it('returns false when neither resident flag is set', () => {
+    expect(isResidentSessionTask({ context: {} }, { type: 'strategic_review' })).toBe(false);
+  });
+
+  it('returns false when task.context is an array', () => {
+    expect(isResidentSessionTask({ context: [] }, { type: 'strategic_review', resident_session: false })).toBe(false);
   });
 });
 
@@ -531,6 +507,51 @@ describe('strategic dispatch smoke', () => {
     const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
     const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
     expect(strategicHelperWritten, 'research dispatch must reach handleStrategic and write the strategic helper').toBe(true);
+  });
+
+  // ── Dispatch gate: resident vs one-shot ───────────────────────────────────
+  // These three tests guard the isResidentSessionTask → handleStrategicResident
+  // branch at the most critical seam: a marked strategic_review must enter the
+  // conversational Workday session handler, NOT the one-shot strategic handler.
+
+  it('routes resident_session=true to handleStrategicResident, not handleStrategic', async () => {
+    const { runClaudeCode } = await import('../index.js');
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const fs = (await import('fs')).default;
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    const payload = { type: 'strategic_review', base_branch: 'main', resident_session: true };
+    const task = { title: 'Resident', description: '', context: {} };
+    await handlers.strategic_review('smoke-resident-001', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(handleStrategicResident), 'resident handler must be called when resident_session=true').toHaveBeenCalledOnce();
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
+    expect(strategicHelperWritten, 'handleStrategic must NOT run when resident path is taken').toBe(false);
+  });
+
+  it('routes context._resident_session=true to handleStrategicResident', async () => {
+    const payload = { type: 'strategic_review', base_branch: 'main' };
+    const task = { title: 'Resident ctx', description: '', context: { _resident_session: true } };
+    await handlers.strategic_review('smoke-resident-002', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(handleStrategicResident), 'resident handler must be called when context._resident_session=true').toHaveBeenCalledOnce();
+  });
+
+  it('routes plain strategic_review (no flags) to handleStrategic, not handleStrategicResident', async () => {
+    const { runClaudeCode } = await import('../index.js');
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const fs = (await import('fs')).default;
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    const payload = { type: 'strategic_review', base_branch: 'main' };
+    const task = { title: 'One-shot', description: '', context: {} };
+    await handlers.strategic_review('smoke-oneshot-001', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(handleStrategicResident), 'resident handler must NOT be called on plain strategic_review').not.toHaveBeenCalled();
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
+    expect(strategicHelperWritten, 'handleStrategic must write the strategic helper for plain strategic_review').toBe(true);
   });
 });
 

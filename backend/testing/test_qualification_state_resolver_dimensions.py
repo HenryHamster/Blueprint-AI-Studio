@@ -5,7 +5,7 @@ import pytest
 from app.qualification_state_resolver import resolve_dimension_states
 
 _ALL_KEYS = {
-    "audit", "test_erosion", "smoketest", "ci",
+    "audit", "test_erosion", "ci",
     "migration_identity", "migration_apply", "merge_grade",
     "challenge", "acceptance_window",
     "criterion_coverage", "debt_pressure", "goal_alignment",
@@ -17,9 +17,33 @@ def _by_key(states):
     return {s["key"]: s for s in states}
 
 
+def test_legacy_pending_smoketest_task_is_not_an_active_child():
+    """Retired smoke IDs remain raw history, never an active gate projection."""
+    from types import SimpleNamespace
+
+    from app.qualification_state_resolver import qualification_read_provenance
+
+    version = SimpleNamespace(
+        last_qualification={
+            "status": "pending",
+            "candidate_sha": "a" * 40,
+            "audit_task_id": "audit-task",
+            "smoketest_task_id": "legacy-smoke-task",
+        },
+        active_qualification_attempt_id=None,
+        qualification_attempts=1,
+        qualification_retry_episode=0,
+    )
+
+    provenance = qualification_read_provenance(version, None)
+
+    assert "smoketest" not in provenance["child_tasks"]
+    assert provenance["child_tasks"]["audit"]["task_id"] == "audit-task"
+    assert version.last_qualification["smoketest_task_id"] == "legacy-smoke-task"
+
 def test_none_last_qualification_returns_all_pending():
     result = resolve_dimension_states(None)
-    assert len(result) == 14
+    assert len(result) == 13
     d = _by_key(result)
     for key in _ALL_KEYS:
         assert d[key]["status"] == "pending", key
@@ -88,8 +112,8 @@ def test_pending_with_promotion_pending_not_all_pending():
     assert d["migration_identity"]["status"] == "passed"
 
 
-def test_finalized_smoketest_blocker():
-    """blocker=smoketest_startup_failed → smoketest failed, others derived."""
+def test_legacy_smoketest_blocker_is_non_gating():
+    """A stored legacy smoke blocker is readable but has no active dimension."""
     qual = {
         "status": "not_promoted",
         "blocker": "smoketest_startup_failed",
@@ -104,8 +128,7 @@ def test_finalized_smoketest_blocker():
     }
     result = resolve_dimension_states(qual)
     d = _by_key(result)
-    assert d["smoketest"]["status"] == "failed"
-    assert d["smoketest"]["reason"] == "smoketest_startup_failed"
+    assert "smoketest" not in d
     assert d["audit"]["status"] == "passed"
     assert d["audit"]["score"] == pytest.approx(0.9)
     assert d["test_erosion"]["status"] == "passed"
@@ -130,7 +153,7 @@ def test_finalized_audit_passed_with_sub_score():
     assert d["audit"]["status"] == "passed"
     assert d["audit"]["score"] == pytest.approx(0.95)
     assert d["test_erosion"]["status"] == "passed"
-    assert d["smoketest"]["status"] == "passed"
+    assert "smoketest" not in d
 
 
 def test_audit_missing_blocker_also_marks_test_erosion_unavailable():
@@ -201,7 +224,7 @@ def test_migration_apply_none_is_not_applicable():
     assert d["migration_apply"]["status"] == "not_applicable"
 
 
-def test_smoketest_disabled_not_applicable():
+def test_legacy_smoketest_fields_do_not_restore_retired_dimension():
     qual = {
         "status": "promoted",
         "blocker": None,
@@ -213,7 +236,7 @@ def test_smoketest_disabled_not_applicable():
     }
     result = resolve_dimension_states(qual)
     d = _by_key(result)
-    assert d["smoketest"]["status"] == "not_applicable"
+    assert "smoketest" not in d
 
 
 def test_env_preflight_dark_by_default_is_not_applicable():
@@ -600,7 +623,7 @@ def test_debt_pressure_when_present():
 
 def test_returns_all_13_dimensions():
     result = resolve_dimension_states(None)
-    assert len(result) == 14
+    assert len(result) == 13
     keys = {s["key"] for s in result}
     assert keys == _ALL_KEYS
 
@@ -663,7 +686,7 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     db_session.add(version)
     await db_session.flush()
 
-    # Add ledger rows for all 10 overlapping dimensions.  Use a variety of
+    # Add active ledger rows plus one archival legacy smoke row. Use a variety of
     # statuses and scores that DIFFER from the blob to prove the ledger is read.
     ledger_dims = [
         ("ci", "blocked", None, "ci_not_green"),
@@ -690,17 +713,17 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 14
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
 
-    # 10 ledger-backed dimensions use ledger values (with status mapping).
+    # Active ledger-backed dimensions use ledger values; the legacy smoke row is ignored.
     assert d["ci"]["status"] == "failed", "blocked → failed mapping"
     assert d["ci"]["reason"] == "ci_not_green"
     assert d["audit"]["status"] == "passed"
     assert d["audit"]["score"] == pytest.approx(0.95)
     assert d["test_erosion"]["status"] == "passed"
     assert d["test_erosion"]["score"] == pytest.approx(0.82)
-    assert d["smoketest"]["status"] == "unavailable"
+    assert "smoketest" not in d
     assert d["migration_identity"]["status"] == "passed"
     assert d["migration_apply"]["status"] == "passed"
     assert d["merge_grade"]["status"] == "failed"
@@ -755,14 +778,14 @@ async def test_ledger_empty_falls_back_to_blob(db_session):
     # Deliberately NO ledger rows.
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 14
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
 
     # All derived from blob — same as calling resolve_dimension_states directly.
     assert d["ci"]["status"] == "passed"
     assert d["audit"]["status"] == "passed"
     assert d["audit"]["score"] == pytest.approx(0.9)
-    assert d["smoketest"]["status"] == "passed"
+    assert "smoketest" not in d
     assert d["migration_identity"]["status"] == "passed"
     assert d["migration_apply"]["status"] == "passed"
     assert d["merge_grade"]["status"] == "passed"
@@ -813,7 +836,7 @@ async def test_ledger_different_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 14
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
 
     # CI is "passed" from blob (ci_resolution.state=green), NOT "failed" from ledger.
@@ -841,7 +864,7 @@ async def test_ledger_no_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 14
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
     assert d["ci"]["status"] == "pending"
 
@@ -974,7 +997,7 @@ async def test_proof_gate_ledger_backed_path_works(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 14
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
     assert d["capability_proof"]["status"] == "passed"
 
@@ -1176,7 +1199,7 @@ async def test_challenge_and_acceptance_window_surface_from_ledger(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 14
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
 
     # Blob would have returned "unavailable" for both; ledger overrides to "passed".

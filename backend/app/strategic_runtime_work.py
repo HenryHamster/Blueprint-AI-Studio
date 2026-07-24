@@ -23,7 +23,8 @@ from app.models import (
     TaskWakeRegistration,
     WakeDeliveryState,
 )
-from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS, _runner_health
+from app.routers.admin_runners import _runner_health
+from app.runner_health_monitors import _get_liveness_seconds
 from app.runner_project_binding import runner_allowed_for_project
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.time_utils import _utcnow
@@ -707,8 +708,8 @@ async def load_project_runners(
     """Fetch the project's non-deleted allow-listed runners, newest-seen first.
 
     Call once per strategic-state assembly and pass the result to
-    build_strategic_runtime_summary, build_resident_runner_options, and
-    build_operator_attention to avoid three identical DB round-trips.
+    build_strategic_runtime_summary and
+    build_operator_attention to avoid duplicate DB round-trips.
     """
     return list(
         (
@@ -967,7 +968,7 @@ async def build_strategic_runtime_summary(
             ),
             "active_task_runtime": active_task_runtime,
             "fallback_reason": fallback_reason,
-            "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
+            "liveness_window_seconds": _get_liveness_seconds(),
             "continuation": continuation_status,
             "runners": runner_candidates,
         },

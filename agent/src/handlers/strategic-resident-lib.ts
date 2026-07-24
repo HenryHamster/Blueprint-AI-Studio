@@ -7,6 +7,8 @@
  * surface.
  */
 
+import { createHash } from 'crypto';
+
 import { promptOps } from './strategic-ops-registry.js';
 
 /**
@@ -34,6 +36,9 @@ export const MAX_IMAGE_DOWNLOAD_BYTES = Math.floor(MAX_IMAGE_BASE64_LENGTH * 3 /
  * Larger files are truncated to this limit before being inlined as text.
  */
 export const MAX_TEXT_ATTACHMENT_BYTES = 512 * 1024; // 512 KB
+
+/** Whole-request deadline for signed attachment headers and response bodies. */
+export const ATTACHMENT_FETCH_TIMEOUT_MS = 15_000;
 
 const MODEL_IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
@@ -378,21 +383,36 @@ export function formatDirectionGroundingText(
 }
 
 /**
- * Format strategic memory notes for the bootstrap / checkpoint prompt. Each
- * entry is `{note, set_at}`; render as `- [set_at] note` so the timestamp
- * provides ordering context. Absent, non-array, or empty degrades to an empty
- * string. Shared by the session-start bootstrap and the compaction refresh so
- * both paths format identically. Pure — safe to unit-test.
+ * Format strategic memory notes for the bootstrap / checkpoint prompt.
+ *
+ * Handles two shapes backward-compatibly:
+ * - Legacy `{note, set_at}` entries: rendered as `- [set_at] note`.
+ * - KnowledgeDocument index `{title, summary, topic, created_at, ...}` entries:
+ *   rendered as `- [created_at] title — summary` (gracefully omits absent fields).
+ *
+ * Absent, non-array, or empty input degrades to an empty string without throwing.
+ * Shared by the session-start bootstrap and the compaction refresh so both paths
+ * format identically. Pure — safe to unit-test.
  */
 export function formatStrategicMemoryNotes(raw: unknown): string {
   if (!Array.isArray(raw) || raw.length === 0) return '';
   return raw
     .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
     .map((e) => {
-      const note = typeof e.note === 'string' ? e.note.trim() : '';
-      const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
-      if (!note) return '';
-      return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+      // Legacy shape: {note, set_at}
+      if (typeof e.note === 'string') {
+        const note = e.note.trim();
+        const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
+        if (!note) return '';
+        return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+      }
+      // KnowledgeDocument index shape: {title, summary, topic, created_at, ...}
+      const title = typeof e.title === 'string' ? e.title.trim() : '';
+      const summary = typeof e.summary === 'string' ? e.summary.trim() : '';
+      const createdAt = typeof e.created_at === 'string' ? e.created_at.trim() : '';
+      const text = title && summary ? `${title} — ${summary}` : title || summary;
+      if (!text) return '';
+      return createdAt ? `- [${createdAt}] ${text}` : `- ${text}`;
     })
     .filter(Boolean)
     .join('\n');
@@ -739,6 +759,14 @@ normal operator or autonomous prompt — this checkpoint is informational only.`
  */
 export const MESSAGE_POLL_LIMIT = 20;
 export const SEEN_MESSAGE_CAP = 500;
+/**
+ * One backend poll page is one atomic operator turn. Keeping the cap equal to
+ * the page size lets handled rows fall out of the next `status=open` query, so
+ * even 201 messages sharing one timestamp drain without a time-only-cursor stall.
+ */
+export const OPERATOR_MESSAGE_BATCH_CAP = MESSAGE_POLL_LIMIT;
+/** Generated helpers bound receipt reads to 16KiB; one page fits with ample headroom. */
+export const RESIDENT_REPLY_RECEIPT_MAX_BYTES = 16_384;
 /** Safety bound on re-polls within one poll cycle (drains a backlog, never loops forever). */
 export const MAX_POLL_PAGES = 100;
 
@@ -815,6 +843,13 @@ export class BoundedSeenSet {
     }
   }
 
+  delete(id: string): boolean {
+    if (!this.set.delete(id)) return false;
+    const index = this.order.indexOf(id);
+    if (index >= 0) this.order.splice(index, 1);
+    return true;
+  }
+
   get size(): number {
     return this.set.size;
   }
@@ -840,10 +875,76 @@ export function dedupNewMessages(
   return out;
 }
 
+/**
+ * Admit at most `remaining` unseen rows from one page. Only admitted ids enter
+ * the global seen-set. `fullyAdmitted=false` means a deferred unseen row was
+ * encountered, so callers must not advance their cursor across the whole page.
+ */
+export function admitMessageBatchPage(
+  msgs: ResidentInboundMessage[] | null | undefined,
+  seen: BoundedSeenSet,
+  remaining: number,
+  remainingRequiredImages: number = MAX_IMAGES_PER_TURN,
+): {
+  admitted: ResidentInboundMessage[];
+  fullyAdmitted: boolean;
+  requiredImagesAdmitted: number;
+} {
+  const admitted: ResidentInboundMessage[] = [];
+  const capacity = Math.max(0, Math.floor(remaining));
+  const requiredImageCapacity = Math.max(0, Math.floor(remainingRequiredImages));
+  let requiredImagesAdmitted = 0;
+  for (const message of Array.isArray(msgs) ? msgs : []) {
+    const id = typeof message.id === 'string' ? message.id : '';
+    if (id && seen.has(id)) continue;
+    if (admitted.length >= capacity) {
+      return { admitted, fullyAdmitted: false, requiredImagesAdmitted };
+    }
+    const requiredImages = requiredArtifactImageCount(message);
+    if (requiredImagesAdmitted + requiredImages > requiredImageCapacity) {
+      return { admitted, fullyAdmitted: false, requiredImagesAdmitted };
+    }
+    if (id) seen.add(id);
+    admitted.push(message);
+    requiredImagesAdmitted += requiredImages;
+  }
+  return { admitted, fullyAdmitted: true, requiredImagesAdmitted };
+}
+
+/** Count exact-revision ArtifactRef images that must survive into the model turn. */
+export function requiredArtifactImageCount(message: ResidentInboundMessage): number {
+  const attachments = message.context?.attachments;
+  if (!Array.isArray(attachments)) return 0;
+  return attachments.filter((attachment) => {
+    if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) return false;
+    const record = attachment as Record<string, unknown>;
+    return str(record.type) === 'image' && str(record.artifact_ref_id).trim().length > 0;
+  }).length;
+}
+
+export function rollbackMessageBatchAdmission(
+  seen: BoundedSeenSet,
+  cursorBefore: string,
+  messages: ResidentInboundMessage[],
+): string {
+  for (const message of messages) {
+    const id = typeof message.id === 'string' ? message.id : '';
+    if (id) seen.delete(id);
+  }
+  return cursorBefore;
+}
+
 /** Content block types for multimodal message delivery. */
 export interface TextBlock { type: 'text'; text: string; }
 export interface ImageBlockBase64Source { type: 'base64'; media_type: string; data: string; }
-export interface ImageBlockUrlSource { type: 'url'; url: string; media_type: string; name?: string; }
+export interface ImageBlockUrlSource {
+  type: 'url';
+  url: string;
+  media_type: string;
+  name?: string;
+  artifact_ref_id?: string;
+  image_checksum?: string;
+}
 export type ImageBlockSource = ImageBlockBase64Source | ImageBlockUrlSource;
 export interface ImageBlock { type: 'image'; source: ImageBlockSource; }
 /** Internal transport block: a text/code file to be fetched from a signed GCS URL by materializeContentBlocks. */
@@ -882,7 +983,60 @@ export interface AttachmentFetchResponse {
   arrayBuffer(): Promise<ArrayBuffer>;
 }
 
-export type AttachmentFetch = (url: string) => Promise<AttachmentFetchResponse>;
+export interface AttachmentFetchInit {
+  signal?: AbortSignal;
+}
+
+export type AttachmentFetch = (
+  url: string,
+  init?: AttachmentFetchInit,
+) => Promise<AttachmentFetchResponse>;
+
+class AttachmentFetchTimeoutError extends Error {
+  constructor() {
+    super('attachment download timed out');
+    this.name = 'AttachmentFetchTimeoutError';
+  }
+}
+
+async function withAttachmentFetchDeadline<T>(
+  url: string,
+  fetchImpl: AttachmentFetch,
+  consume: (response: AttachmentFetchResponse) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new AttachmentFetchTimeoutError());
+    }, ATTACHMENT_FETCH_TIMEOUT_MS);
+  });
+  try {
+    const response = await Promise.race([
+      fetchImpl(url, { signal: controller.signal }),
+      deadline,
+    ]);
+    return await Promise.race([consume(response), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+export class RetryableArtifactAttachmentError extends Error {
+  readonly retryable = true;
+
+  constructor(readonly artifactRefId: string, reason: string) {
+    super(`Required ArtifactRef ${artifactRefId} could not be loaded: ${reason}`);
+    this.name = 'RetryableArtifactAttachmentError';
+  }
+}
+
+export function isRetryableArtifactAttachmentError(
+  error: unknown,
+): error is RetryableArtifactAttachmentError {
+  return error instanceof RetryableArtifactAttachmentError;
+}
 
 function normalizeImageMediaType(value: unknown): string {
   const mediaType = str(value).split(';', 1)[0].trim().toLowerCase();
@@ -897,10 +1051,12 @@ export function isAllowedAttachmentDownloadUrl(value: string): boolean {
   try {
     const url = new URL(value);
     if (url.protocol !== 'https:') return false;
+    if (url.username || url.password || url.port) return false;
     const host = url.hostname.toLowerCase();
     const gcsHost = host === 'storage.googleapis.com' || host.endsWith('.storage.googleapis.com');
     if (!gcsHost) return false;
-    return url.searchParams.has('X-Goog-Signature');
+    const signatures = url.searchParams.getAll('X-Goog-Signature');
+    return signatures.length === 1 && signatures[0].trim().length > 0;
   } catch {
     return false;
   }
@@ -909,6 +1065,21 @@ export function isAllowedAttachmentDownloadUrl(value: string): boolean {
 function attachmentUnavailableBlock(source: ImageBlockUrlSource, reason: string): TextBlock {
   const label = source.name ? ` "${source.name}"` : '';
   return { type: 'text', text: `[Attached image${label} could not be loaded: ${reason}.]` };
+}
+
+function requiredArtifactIdentity(
+  attachment: Record<string, unknown>,
+): { artifactRefId: string; imageChecksum: string } | null {
+  const artifactRefId = str(attachment.artifact_ref_id).trim();
+  if (!artifactRefId) return null;
+  const imageChecksum = str(attachment.image_checksum).trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(imageChecksum)) {
+    throw new RetryableArtifactAttachmentError(
+      artifactRefId,
+      'missing or invalid image checksum',
+    );
+  }
+  return { artifactRefId, imageChecksum };
 }
 
 /**
@@ -928,12 +1099,67 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
   if (msg.context) {
     const raw = msg.context.attachments;
     if (Array.isArray(raw)) {
+      const attachments = raw as Array<Record<string, unknown>>;
+      const requiredImageIds = attachments
+        .filter(attachment => str(attachment.type) === 'image')
+        .map(attachment => str(attachment.artifact_ref_id).trim())
+        .filter(Boolean);
+      if (requiredImageIds.length > MAX_IMAGES_PER_TURN) {
+        throw new RetryableArtifactAttachmentError(
+          requiredImageIds[0],
+          'required image attachment limit exceeded',
+        );
+      }
+      const ordinaryImageBudget = MAX_IMAGES_PER_TURN - requiredImageIds.length;
       let imageCount = 0;
-      for (const att of raw as Array<Record<string, unknown>>) {
-        if (imageCount >= MAX_IMAGES_PER_TURN) break;
+      let ordinaryImageCount = 0;
+      for (const att of attachments) {
         if (str(att.type) === 'image') {
+          const requiredArtifact = requiredArtifactIdentity(att);
+          if (!requiredArtifact && ordinaryImageCount >= ordinaryImageBudget) {
+            continue;
+          }
+          if (imageCount >= MAX_IMAGES_PER_TURN) {
+            if (requiredArtifact) {
+              throw new RetryableArtifactAttachmentError(
+                requiredArtifact.artifactRefId,
+                'image attachment limit exceeded',
+              );
+            }
+            continue;
+          }
           const mediaType = normalizeImageMediaType(att.mime_type);
-          if (!mediaType) continue;
+          if (!mediaType) {
+            if (requiredArtifact) {
+              throw new RetryableArtifactAttachmentError(
+                requiredArtifact.artifactRefId,
+                'invalid image media type',
+              );
+            }
+            continue;
+          }
+          if (requiredArtifact) {
+            const url = typeof att.url === 'string' ? att.url.trim() : '';
+            if (!url || !isAllowedAttachmentDownloadUrl(url)) {
+              throw new RetryableArtifactAttachmentError(
+                requiredArtifact.artifactRefId,
+                'unsupported download URL',
+              );
+            }
+            blocks.push({
+              type: 'image',
+              source: {
+                type: 'url',
+                url,
+                media_type: mediaType,
+                name: attachmentName(att.name) || undefined,
+                artifact_ref_id: requiredArtifact.artifactRefId,
+                image_checksum: requiredArtifact.imageChecksum,
+              },
+            });
+            imageCount++;
+            continue;
+          }
           // Inline base64 data — preferred when available.
           if (typeof att.data === 'string' && att.data && att.data.length <= MAX_IMAGE_BASE64_LENGTH) {
             blocks.push({
@@ -941,6 +1167,7 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
               source: { type: 'base64', media_type: mediaType, data: att.data },
             });
             imageCount++;
+            ordinaryImageCount++;
           } else if (typeof att.url === 'string' && att.url) {
             const url = att.url.trim();
             // GCS signed URL — fallback when data is absent or oversized. The URL
@@ -957,6 +1184,7 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
                 },
               });
               imageCount++;
+              ordinaryImageCount++;
             } else {
               blocks.push(attachmentUnavailableBlock(
                 { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
@@ -997,13 +1225,14 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
 /**
  * Convert internal URL-sourced image blocks into model-ready base64 image
  * blocks. Signed URLs are never forwarded into the resident model input.
- * Download failures degrade to a text notice so the operator turn still runs.
+ * Ordinary download failures degrade to a text notice. Required ArtifactRef
+ * failures throw so the operator message can be retried without a model turn.
  */
 export async function materializeContentBlocks(
   blocks: ContentBlock[],
-  fetchImpl: AttachmentFetch = async (url: string) => {
+  fetchImpl: AttachmentFetch = async (url: string, init?: AttachmentFetchInit) => {
     if (typeof globalThis.fetch !== 'function') throw new Error('fetch unavailable');
-    return globalThis.fetch(url);
+    return globalThis.fetch(url, { signal: init?.signal });
   },
 ): Promise<ContentBlock[]> {
   const result: ContentBlock[] = [];
@@ -1014,18 +1243,24 @@ export async function materializeContentBlocks(
         continue;
       }
       try {
-        const resp = await fetchImpl(block.url);
-        if (!resp.ok) {
-          result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: download failed (${resp.status}).]` });
-          continue;
-        }
-        const bytes = Buffer.from(await resp.arrayBuffer());
-        const sliced = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? bytes.subarray(0, MAX_TEXT_ATTACHMENT_BYTES) : bytes;
-        const text = sliced.toString('utf-8');
-        const truncNote = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? '\n[... truncated]' : '';
-        result.push({ type: 'text', text: `[Attachment: ${block.name}]\n${text}${truncNote}` });
-      } catch {
-        result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: download failed.]` });
+        const materialized = await withAttachmentFetchDeadline(
+          block.url,
+          fetchImpl,
+          async (resp): Promise<TextBlock> => {
+            if (!resp.ok) {
+              return { type: 'text', text: `[Attachment "${block.name}" could not be loaded: download failed (${resp.status}).]` };
+            }
+            const bytes = Buffer.from(await resp.arrayBuffer());
+            const sliced = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? bytes.subarray(0, MAX_TEXT_ATTACHMENT_BYTES) : bytes;
+            const text = sliced.toString('utf-8');
+            const truncNote = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? '\n[... truncated]' : '';
+            return { type: 'text', text: `[Attachment: ${block.name}]\n${text}${truncNote}` };
+          },
+        );
+        result.push(materialized);
+      } catch (error) {
+        const reason = error instanceof AttachmentFetchTimeoutError ? 'download timed out' : 'download failed';
+        result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: ${reason}.]` });
       }
       continue;
     }
@@ -1035,42 +1270,73 @@ export async function materializeContentBlocks(
     }
 
     const source = block.source;
+    const requiredArtifactId = source.artifact_ref_id;
+    const requiredChecksum = source.image_checksum;
+    const failRequired = (reason: string): never => {
+      throw new RetryableArtifactAttachmentError(
+        requiredArtifactId || 'unknown',
+        reason,
+      );
+    };
     if (!isAllowedAttachmentDownloadUrl(source.url)) {
+      if (requiredArtifactId) failRequired('unsupported download URL');
       result.push(attachmentUnavailableBlock(source, 'unsupported download URL'));
       continue;
     }
     try {
-      const resp = await fetchImpl(source.url);
-      if (!resp.ok) {
-        result.push(attachmentUnavailableBlock(source, `download failed (${resp.status})`));
-        continue;
-      }
-      const lengthHeader = resp.headers.get('content-length');
-      const contentLength = lengthHeader ? Number.parseInt(lengthHeader, 10) : 0;
-      if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_DOWNLOAD_BYTES) {
-        result.push(attachmentUnavailableBlock(source, 'image is too large'));
-        continue;
-      }
-      const bytes = Buffer.from(await resp.arrayBuffer());
-      if (bytes.length > MAX_IMAGE_DOWNLOAD_BYTES) {
-        result.push(attachmentUnavailableBlock(source, 'image is too large'));
-        continue;
-      }
-      const data = bytes.toString('base64');
-      if (data.length > MAX_IMAGE_BASE64_LENGTH) {
-        result.push(attachmentUnavailableBlock(source, 'image is too large'));
-        continue;
-      }
-      const headerMediaType = normalizeImageMediaType(resp.headers.get('content-type'));
-      result.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: headerMediaType || source.media_type,
-          data,
+      const materialized = await withAttachmentFetchDeadline(
+        source.url,
+        fetchImpl,
+        async (resp): Promise<ContentBlock> => {
+          if (!resp.ok) {
+            if (requiredArtifactId) failRequired(`download failed (${resp.status})`);
+            return attachmentUnavailableBlock(source, `download failed (${resp.status})`);
+          }
+          const lengthHeader = resp.headers.get('content-length');
+          const contentLength = lengthHeader ? Number.parseInt(lengthHeader, 10) : 0;
+          if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_DOWNLOAD_BYTES) {
+            if (requiredArtifactId) failRequired('image is too large');
+            return attachmentUnavailableBlock(source, 'image is too large');
+          }
+          const bytes = Buffer.from(await resp.arrayBuffer());
+          if (bytes.length > MAX_IMAGE_DOWNLOAD_BYTES) {
+            if (requiredArtifactId) failRequired('image is too large');
+            return attachmentUnavailableBlock(source, 'image is too large');
+          }
+          const data = bytes.toString('base64');
+          if (data.length > MAX_IMAGE_BASE64_LENGTH) {
+            if (requiredArtifactId) failRequired('image is too large');
+            return attachmentUnavailableBlock(source, 'image is too large');
+          }
+          if (requiredArtifactId) {
+            if (!requiredChecksum || !/^[a-f0-9]{64}$/.test(requiredChecksum)) {
+              failRequired('missing or invalid image checksum');
+            }
+            const actualChecksum = createHash('sha256').update(bytes).digest('hex');
+            if (actualChecksum !== requiredChecksum) {
+              failRequired('image checksum mismatch');
+            }
+          }
+          const headerMediaType = normalizeImageMediaType(resp.headers.get('content-type'));
+          return {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: headerMediaType || source.media_type,
+              data,
+            },
+          };
         },
-      });
-    } catch {
+      );
+      result.push(materialized);
+    } catch (error) {
+      if (isRetryableArtifactAttachmentError(error)) throw error;
+      if (error instanceof AttachmentFetchTimeoutError) {
+        if (requiredArtifactId) failRequired('download timed out');
+        result.push(attachmentUnavailableBlock(source, 'download timed out'));
+        continue;
+      }
+      if (requiredArtifactId) failRequired('download failed');
       result.push(attachmentUnavailableBlock(source, 'download failed'));
     }
   }
@@ -1097,7 +1363,34 @@ export function combineOperatorMessages(msgs: ResidentInboundMessage[]): Content
     result.push({ type: 'text', text: `[operator message ${i + 1}/${nonEmpty.length}]\n` });
     result.push(...extractMessageTurn(nonEmpty[i]));
   }
-  return result;
+  const requiredImages = result.filter(block => (
+    block.type === 'image'
+    && block.source.type === 'url'
+    && typeof block.source.artifact_ref_id === 'string'
+    && block.source.artifact_ref_id.length > 0
+  ));
+  if (requiredImages.length > MAX_IMAGES_PER_TURN) {
+    const first = requiredImages[0];
+    const artifactRefId = first.type === 'image' && first.source.type === 'url'
+      ? first.source.artifact_ref_id || 'unknown'
+      : 'unknown';
+    throw new RetryableArtifactAttachmentError(
+      artifactRefId,
+      'required image attachment limit exceeded',
+    );
+  }
+  let ordinaryImagesRemaining = MAX_IMAGES_PER_TURN - requiredImages.length;
+  return result.filter((block) => {
+    if (block.type !== 'image') return true;
+    if (
+      block.source.type === 'url'
+      && typeof block.source.artifact_ref_id === 'string'
+      && block.source.artifact_ref_id.length > 0
+    ) return true;
+    if (ordinaryImagesRemaining <= 0) return false;
+    ordinaryImagesRemaining -= 1;
+    return true;
+  });
 }
 
 export interface BootstrapContext {
@@ -1291,8 +1584,13 @@ export interface TerminalStatusDecision {
  * `loop_error:*`) or a wedge (`turn_hard_timeout`, `session_stalled`) is FAILED
  * with a failure category — so a limped/dead session never reports success.
  */
-export function resolveTerminalStatus(stopReason: string, exitCode: number | null): TerminalStatusDecision {
+export function resolveTerminalStatus(
+  stopReason: string,
+  exitCode: number | null,
+  providerFailureCategory: 'rate_limited' | 'dead_auth' | null = null,
+): TerminalStatusDecision {
   if (CLEAN_STOP_REASONS.has(stopReason)) return { status: 'COMPLETED' };
+  if (providerFailureCategory) return { status: 'FAILED', failureCategory: providerFailureCategory };
   if (stopReason === 'session_process_exited') {
     // Orderly exit(0) is clean; non-zero or signal-kill (null) is a crash.
     return exitCode === 0

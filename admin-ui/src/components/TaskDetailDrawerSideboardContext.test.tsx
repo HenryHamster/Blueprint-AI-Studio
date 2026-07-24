@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Task } from '../types/task';
+import type { ProjectMessagePreview } from '../types/messages';
 import { TaskSideboardContextSection } from './TaskDetailDrawerSideboardContext';
 
 const BACKEND_SIDEBOARD_FIXTURE = JSON.parse(
@@ -94,7 +95,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
         items: [
           { id: 'message-1', role: 'assistant', content: 'Validated the compact sideboard rows.' },
           { id: 'message-2', role: 'user', content: 'Keep all existing task context visible.' },
-        ],
+        ] as unknown as ProjectMessagePreview[],
       },
       links: [
         {

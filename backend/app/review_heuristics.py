@@ -8,14 +8,11 @@ callers and tests that import from ``app.review_pipeline`` keep working.
 
 Contains: Jaccard stuck-cycle thresholds, issue-churn detection, the
 repeating-issues formatting helpers, drift-signal computation, feedback
-tokenization/similarity, and the auto-approval heuristic.
+tokenization/similarity, and the diff-size/test-file utilities shared with
+``review_policy`` (which owns the review-skip decisions).
 """
 
 import re
-
-from app.models import Task
-from app.shared_state import runtime_config as _runtime_config
-from app.spawn_calibration import _compute_scope_overflow_warning
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.65
@@ -513,12 +510,6 @@ def _is_test_file(path: str) -> bool:
     return ".test." in name or ".spec." in name
 
 
-# Minimum direction acceptance rate required to auto-approve a small diff.
-# Directions with poor merge history still get a full review regardless of
-# diff size — the acceptance gate is independent of the line/file thresholds.
-AUTO_APPROVE_MIN_ACCEPTANCE_RATE = 0.5
-
-
 def _diff_lines_changed(
     diff_summary: list | None, exclude_test_files: bool = False
 ) -> int | None:
@@ -542,93 +533,6 @@ def _diff_lines_changed(
     return total
 
 
-def should_auto_approve_diff(
-    source_task: Task, direction_data: dict | None
-) -> tuple[bool, str]:
-    """Decide whether to skip the review task for a trivially small/medium diff.
-
-    Returns (skip, reason). Reason is always populated — a short human-
-    readable string suitable for task status messages and operator logs.
-
-    Gates (all must pass):
-    - source task type is create, refactor, or fix
-    - scope is 'small' or 'medium' (large always gets full review). Medium
-      uses tighter line/file thresholds than small and can be disabled
-      independently via auto_approve_medium_max_lines=0.
-    - diff size known and <= per-scope max_lines
-    - non-test file count <= per-scope max_files
-    - direction acceptance_rate > AUTO_APPROVE_MIN_ACCEPTANCE_RATE when
-      direction history is available (new directions pass by default)
-    """
-    source_type = (source_task.first_payload or {}).get("type", "")
-    if source_type not in ("create", "refactor", "fix", "migrate"):
-        return (False, f"source type {source_type!r} not eligible")
-
-    ctx = source_task.context or {}
-    scope = ctx.get("scope", "medium")
-    if scope == "small":
-        max_lines = _runtime_config.get("auto_approve_max_lines", 50)
-        max_files = _runtime_config.get("auto_approve_max_files", 4)
-        if not max_lines or max_lines <= 0:
-            return (False, "auto-approve disabled (auto_approve_max_lines=0)")
-    elif scope == "medium":
-        max_lines = _runtime_config.get("auto_approve_medium_max_lines", 30)
-        max_files = _runtime_config.get("auto_approve_medium_max_files", 2)
-        if not max_lines or max_lines <= 0:
-            return (
-                False,
-                "medium auto-approve disabled (auto_approve_medium_max_lines=0)",
-            )
-    else:
-        return (False, f"scope {scope!r} not eligible (small/medium only)")
-
-    changed_files = ctx.get("_pr_changed_files") or []
-    if not changed_files:
-        return (False, "changed files unknown")
-    overflow_warning = _compute_scope_overflow_warning(changed_files, scope)
-    if overflow_warning:
-        return (
-            False,
-            "scope overflow warning present: "
-            f"{overflow_warning['non_test_file_count']} non-test files > "
-            f"{overflow_warning['threshold']} threshold",
-        )
-    non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
-    if non_test_count > max_files:
-        return (False, f"{non_test_count} non-test files > {max_files}")
-
-    lines_changed = _diff_lines_changed(
-        ctx.get("_pr_diff_summary"), exclude_test_files=True
-    )
-    if lines_changed is None:
-        return (False, "diff size unknown")
-    if lines_changed > max_lines:
-        return (False, f"{lines_changed} non-test lines > {max_lines}")
-
-    if direction_data is not None:
-        from app.research_completion import _compute_acceptance_rate
-
-        acceptance_rate = _compute_acceptance_rate(direction_data)
-        if (
-            acceptance_rate is not None
-            and acceptance_rate <= AUTO_APPROVE_MIN_ACCEPTANCE_RATE
-        ):
-            return (
-                False,
-                f"direction acceptance_rate {acceptance_rate:.0%} "
-                f"≤ {AUTO_APPROVE_MIN_ACCEPTANCE_RATE:.0%}",
-            )
-
-    return (
-        True,
-        f"auto-approve: {lines_changed} non-test lines across {non_test_count} non-test "
-        f"file(s) (≤ {max_lines}/{max_files})",
-    )
-
-
-should_auto_approve_small_diff = should_auto_approve_diff
-
-
 def _feedback_token_set(text: str) -> set[str]:
     return {t for t in _FEEDBACK_TOKEN_RE.findall(text.lower()) if len(t) >= 3}
 
@@ -641,6 +545,79 @@ def _feedback_jaccard(a: str, b: str) -> float:
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
+# ── Mechanical hedge detection (anti-hedging enforcement) ─────────────────────
+# Anti-hedging principle: new features, gates, and flags must default ON/committed,
+# not observe/off/disabled/fail-open, without documented justification.
+# This regex matches assignments where the variable name (or a keyword like
+# "default", "mode", "flag", "gate", "feature", "pilot", "lane") is followed
+# by one of the hedge string values.
+_HEDGE_DEFAULT_VALUE_RE = re.compile(
+    r"(?:default|mode|flag|gate|feature|pilot|lane)\s*[=:]\s*"
+    r"[\"'](observe|off|disabled|fail-?open)[\"']",
+    re.IGNORECASE,
+)
+
+
+def detect_hedges_in_diff(diff_files: list[dict]) -> list[dict]:
+    """Scan PR diff files for unjustified default-off/observe/fail-open hedges.
+
+    Inspects each file's ``patch`` field (unified diff text available when
+    ``get_pr_files`` is called with ``include_patch=True``) for added lines
+    that introduce a new flag, gate, or mode defaulting to ``observe``,
+    ``off``, ``disabled``, or ``fail-open``. These are the default-off/hedge
+    patterns the anti-hedging principle (ANTI_HEDGE_FOCUS / REVIEW_ANTI_HEDGE_CRITERION)
+    defines as 'guilty until proven innocent'.
+
+    Returns a list of issue dicts with ``severity`` set to ``"MAJOR"`` (so
+    they are treated as genuine blocking issues by the review pipeline's
+    reconciliation logic). Returns an empty list when no hedge patterns are
+    found.
+
+    The caller is responsible for providing ``patch`` fields (via
+    ``include_patch=True``) and for merging returned findings into the review
+    issues list.
+    """
+    findings: list[dict] = []
+    for file_entry in diff_files or []:
+        if not isinstance(file_entry, dict):
+            continue
+        filename = file_entry.get("filename", "")
+        if not isinstance(filename, str):
+            continue
+        patch = file_entry.get("patch")
+        if not isinstance(patch, str) or not patch:
+            continue
+        for raw_line in patch.splitlines():
+            if not raw_line.startswith("+"):
+                continue
+            # Strip the leading '+' to get the added line content.
+            added = raw_line[1:]
+            stripped = added.strip()
+            if not stripped:
+                continue
+            # Skip comments, docstrings, and import lines.
+            if stripped.startswith(("#", '"""', "'''", "//", "*", "/*")):
+                continue
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                continue
+            match = _HEDGE_DEFAULT_VALUE_RE.search(stripped)
+            if match:
+                hedge_value = match.group(1)
+                # Store with a descriptive issue format matching ANTI_HEDGE_FOCUS.
+                findings.append({
+                    "severity": "MAJOR",
+                    "file": filename,
+                    "line": 0,
+                    "description": (
+                        f"Unjustified hedge: new flag/gate defaults to "
+                        f"'{hedge_value}' — anti-hedging principle requires "
+                        f"new features to default ON/committed, not observe/"
+                        f"off/disabled/fail-open, without documented justification."
+                    ),
+                })
+    return findings
+
+
 # ── Per-lane iteration cap accounting ─────────────────────────────────────────
 # Review-fix iteration budget lanes — mechanical churn (conflict resolution,
 # CI fixes, second-opinion arbitration) must not crowd out review-convergence
@@ -651,7 +628,7 @@ def _feedback_jaccard(a: str, b: str) -> float:
 # Lane values:
 #   conflict         — merge_conflict or update_branch_failed fix iterations
 #   ci               — ci_failure fix iterations
-#   arbitration      — panel_review (second-opinion/dispute) iterations
+#   arbitration      — second-opinion/dispute iterations
 #   review_convergence — everything else (code-review fix + review tasks)
 LANE_CONFLICT = "conflict"
 LANE_CI = "ci"
@@ -674,17 +651,67 @@ LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci + arbitration collectively
 PERSISTENT_CONFLICT_ESCALATION_THRESHOLD = 2
 
 
+# ── Anti-hedging: detect unjustified default-off / observe / fail-open ─────────
+# A "hedge" is a newly-introduced default-off flag, observe-mode lane, or
+# fail-open behavior with no explicit written justification. The review checklist
+# instructs reviewers to flag these as MAJOR. This detector confirms the finding
+# programmatically by scanning CRITICAL/MAJOR issue descriptions for hedge-cue
+# patterns. A matching issue that also contains a justification keyword is allowed
+# through — the reviewer saw the hedge and confirmed it has a rationale.
+_HEDGE_CUE_RES = [
+    re.compile(r"default(?:s)?\s+(?:to\s+)?(?:off|false|disabled)", re.IGNORECASE),
+    re.compile(r"observe[_-]?mode", re.IGNORECASE),
+    re.compile(r"fail[_-]?open", re.IGNORECASE),
+    re.compile(r"feature\s+flag\s+.*(?:off|disabled|false)", re.IGNORECASE),
+    re.compile(r"disabled\s+by\s+default", re.IGNORECASE),
+    re.compile(r"\bunjustified\s+(?:hedge|default|flag|observe|mode)\b", re.IGNORECASE),
+    re.compile(r"no\s+(?:written\s+)?justification", re.IGNORECASE),
+    re.compile(r"without\s+(?:an?\s+)?(?:written\s+)?justification", re.IGNORECASE),
+]
+
+_HEDGE_JUSTIFIED_RE = re.compile(
+    r"\b(?:justified\s+by|justification\s+in|intentional(?:ly)?|documented\s+(?:in|reason)"
+    r"|by\s+design|staged\s+rollout|rationale\s*:)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_unjustified_hedge(issues: list) -> tuple[bool, str]:
+    """Scan reviewer issues for unjustified-hedge findings.
+
+    Returns ``(True, reason)`` when a CRITICAL or MAJOR issue description
+    matches a hedge-cue pattern (default-off, observe mode, fail-open, …) and
+    does NOT contain a justification keyword indicating the hedge was accepted
+    as intentional. Returns ``(False, "")`` otherwise.
+
+    Intended use: the review pipeline calls this after the model reviewer
+    produces its issue list to confirm the anti-hedge checklist rule fired and
+    to prevent auto-approval of PRs that introduce unjustified hedges.
+    """
+    for issue in issues or []:
+        if not isinstance(issue, dict):
+            continue
+        severity = (issue.get("severity") or "").lower()
+        if severity not in ("critical", "major"):
+            continue
+        desc = (issue.get("description") or "").strip()
+        if not desc:
+            continue
+        if _HEDGE_JUSTIFIED_RE.search(desc):
+            continue
+        for cue_re in _HEDGE_CUE_RES:
+            if cue_re.search(desc):
+                return (True, f"anti-hedge rule: {desc[:120]}")
+    return (False, "")
+
+
 def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined]  # noqa: F821
     """Classify a completed/failed pipeline task into its review-fix lane.
 
     Used to compute per-lane iteration counts so sub-caps can be applied
     alongside the global cap. The classifier is a pure function of the task's
-    payload type and ``review_loop.fix_reason``.
+    ``review_loop.fix_reason``.
     """
-    payload = (task.first_payload or {}) if hasattr(task, "first_payload") else {}
-    payload_type = payload.get("type", "")
-    if payload_type == "panel_review":
-        return LANE_ARBITRATION
     fix_reason = (
         (task.context or {}).get("review_loop", {}).get("fix_reason", "code_review")
     )

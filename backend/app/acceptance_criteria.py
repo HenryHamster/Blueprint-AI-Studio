@@ -259,6 +259,35 @@ METRICS_INTEGRITY_EVIDENCE_KIND = "metrics_integrity_sweep"
 #: Recognised as covering by :func:`_evidence_proves_covered`.
 UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND = "unverified_merge_backfill"
 
+#: ``source_kind`` for autonomous live-stack walkthrough evidence written by the
+#: qualifier-spawned ``walkthrough_e2e`` task (see
+#: :func:`record_walkthrough_e2e_evidence`). A walkthrough_e2e row earns genuine
+#: machine-verified ``covered`` coverage — but ONLY when it is BOTH SHA-pinned
+#: (``detail["candidate_sha"]`` is non-empty) AND fresh (recorded within
+#: :data:`WALKTHROUGH_E2E_WINDOW_DAYS`). A stale row, or one missing its pinned
+#: SHA, does NOT count as covering and falls back to the lower ``partial`` tier —
+#: this is the whole point of the walkthrough_e2e evidence lane: stale/committed
+#: walk evidence (e.g. 123 commits old) must stop counting as coverage.
+#: Recognised as covering by :func:`_evidence_proves_covered` via
+#: :func:`_evidence_is_walkthrough_e2e_covered`.
+WALKTHROUGH_E2E_EVIDENCE_KIND = "walkthrough_e2e"
+
+#: ``source_kind`` for genuine machine-verified ``covered`` evidence minted by the
+#: acceptance earn-loop's execution trials: a merged task's declared ``named_test``
+#: covering tests were actually EXECUTED (green) as a bounded targeted runner job
+#: (the ``criterion_coverage_trial`` task) and the completion handler ingested the
+#: green receipt via :func:`record_executed_named_test_evidence`. This is strictly
+#: ADDITIVE and sits ABOVE the lower-confidence ``backfilled`` tier
+#: (:data:`UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND`): the backfill only proves the
+#: test SHIPPED in the PR's changed files, whereas this proves it RAN and PASSED.
+#: A row earns ``covered`` ONLY when it is BOTH SHA-pinned
+#: (``detail["executed_sha"]`` is non-empty — the exact checkout the tests ran
+#: against) AND fresh (recorded within :data:`EXECUTED_NAMED_TEST_WINDOW_DAYS`); a
+#: stale or unpinned row decays to the underlying lower tier so classification is
+#: fail-closed (see :func:`_evidence_is_executed_named_test_covered`). Recognised
+#: as covering by :func:`_evidence_proves_covered`.
+EXECUTED_NAMED_TEST_EVIDENCE_KIND = "executed_named_test"
+
 # Markers that identify a criterion (or the Direction it is mapped to) as tracking
 # the data-integrity / metrics-integrity-sweep signal. Kept as a tight, specific
 # set so sweep evidence is attached ONLY to criteria whose success condition
@@ -309,6 +338,62 @@ ATTESTATION_WINDOW_DAYS = 7
 #: carry no attestation timestamp), so a stale probe decays to ``partial``.
 MACHINE_PROBE_WINDOW_DAYS = 14
 
+#: Coverage-tier constant: how long a ``walkthrough_e2e`` evidence row (a
+#: qualifier-spawned live-stack walkthrough that proved a specific flow on the
+#: candidate SHA) counts as full ``'covered'`` tier before it expires and the
+#: criterion falls back to its underlying evidence state.  The window is shorter
+#: than :data:`ATTESTATION_WINDOW_DAYS` (7 d) because e2e evidence is
+#: machine-verifiable on re-run and the release cycle is short — a stale row
+#: should decay quickly so the next qualification attempt re-verifies.  Measured
+#: from ``recorded_at``; a row with no ``recorded_at`` cannot grant perpetual
+#: trust and returns ``False`` in :func:`_evidence_is_walkthrough_e2e`.
+WALKTHROUGH_E2E_WINDOW_DAYS = 14
+
+# Legacy criterion-key aliases.  A walkthrough script may post a semantic slug
+# (e.g. 'c-workday-session-lifecycle') before the script is updated to emit the
+# canonical registered criterion key.  Both evidence-recording lanes apply this
+# map before the get_criteria_by_keys lookup so resolution is identical.
+# unmatched_keys always reports the ORIGINAL slug so alerts remain readable.
+WALKTHROUGH_LEGACY_CRITERION_ALIASES: dict[str, str] = {
+    "c-workday-session-lifecycle": "c-5214996f",
+}
+
+
+def _resolve_walkthrough_criterion_key(key: str) -> str:
+    """Return the canonical criterion key, resolving any legacy alias."""
+    return WALKTHROUGH_LEGACY_CRITERION_ALIASES.get(key, key)
+
+
+#: Coverage-tier constant: how long an ``executed_named_test`` evidence row (a
+#: green ``criterion_coverage_trial`` execution against a pinned checkout) counts
+#: as full ``'covered'`` tier before it expires and the criterion falls back to
+#: its underlying evidence state (typically ``backfilled``). Mirrors
+#: :data:`WALKTHROUGH_E2E_WINDOW_DAYS`: machine-verifiable on re-run, so a stale
+#: row should decay and be re-earned rather than coasting. Measured from
+#: ``recorded_at``; a row with no ``recorded_at`` cannot grant perpetual trust and
+#: returns ``False`` in :func:`_evidence_is_executed_named_test_covered`.
+EXECUTED_NAMED_TEST_WINDOW_DAYS = 14
+
+#: Hard cap on how many covering test files ONE ``criterion_coverage_trial`` may
+#: execute. Bounds the runner job so a task that (mis)declares a huge covering
+#: surface cannot fan out into an unbounded targeted test run. Mirrors
+#: ``capability_proof.MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES``.
+MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES = 10
+
+#: Wall-clock timeout (seconds) carried in the trial launch contract. The agent
+#: handler runs ONLY the targeted covering tests under this bound; a trial that
+#: exceeds it is a no-op (records nothing), never a demotion. Mirrors
+#: ``capability_proof.CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS``.
+CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS = 900
+
+#: Hard cap on how many ``criterion_coverage_trial`` enrollments a single
+#: :func:`backfill_merged_named_test_coverage` pass may create. Bounds test
+#: execution so the earn loop can never grow unbounded across
+#: projects × merged tasks. The reaper sweep (step 21a) threads a shrinking
+#: global budget across projects so the WHOLE pass is bounded, not just per
+#: project.
+MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS = 25
+
 #: ``source_kind`` set for machine-probe coverage evidence — a mechanism-ran
 #: signal that grants the lower-confidence, time-bounded ``'probed'`` tier via
 #: :func:`_evidence_is_probed` rather than full ``'covered'`` parity.
@@ -325,6 +410,76 @@ _MACHINE_PROBE_EVIDENCE_KINDS: frozenset[str] = frozenset(
 ATTESTATION_FUTURE_SKEW_SECONDS = 60
 
 
+def _evidence_is_walkthrough_e2e_covered(e: CriterionEvidence) -> bool:
+    """Whether a single ``walkthrough_e2e`` row is fresh AND SHA-pinned covering.
+
+    Returns ``True`` only for ``source_kind == WALKTHROUGH_E2E_EVIDENCE_KIND``
+    whose evidence is BOTH:
+
+      * **SHA-pinned** — ``detail`` is a dict carrying a non-empty
+        ``candidate_sha`` (the exact commit the walkthrough ran against). A row
+        with no ``detail``, a non-dict ``detail``, or a missing/blank
+        ``candidate_sha`` is NOT covering — it cannot prove which commit it
+        exercised, so it must not forge coverage.
+      * **fresh** — ``recorded_at`` is within :data:`WALKTHROUGH_E2E_WINDOW_DAYS`
+        of now (mirroring the machine-probe time-bounding). A stale row, or one
+        with no ``recorded_at`` at all, is NOT covering — a missing timestamp
+        cannot grant perpetual trust.
+
+    Either failure drops the row out of the ``covered`` tier; because no other
+    predicate recognises this ``source_kind`` it then classifies as ``partial``
+    (evidence exists but none is covering). This is the whole point of the
+    walkthrough_e2e lane: stale or unpinned walk evidence must stop counting.
+    """
+    if e.source_kind != WALKTHROUGH_E2E_EVIDENCE_KIND:
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    candidate_sha = detail.get("candidate_sha")
+    if not isinstance(candidate_sha, str) or not candidate_sha.strip():
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=WALKTHROUGH_E2E_WINDOW_DAYS
+    )
+
+
+def _evidence_is_executed_named_test_covered(e: CriterionEvidence) -> bool:
+    """Whether a single ``executed_named_test`` row is fresh AND SHA-pinned covering.
+
+    Returns ``True`` only for ``source_kind == EXECUTED_NAMED_TEST_EVIDENCE_KIND``
+    whose evidence is BOTH:
+
+      * **SHA-pinned** — ``detail`` is a dict carrying a non-empty
+        ``executed_sha`` (the exact checkout the covering tests ran against). A
+        row with no ``detail``, a non-dict ``detail``, or a missing/blank
+        ``executed_sha`` is NOT covering — it cannot prove which commit it
+        exercised, so it must not forge coverage.
+      * **fresh** — ``recorded_at`` is within
+        :data:`EXECUTED_NAMED_TEST_WINDOW_DAYS` of now (mirroring the
+        walkthrough_e2e time-bounding). A stale row, or one with no
+        ``recorded_at`` at all, is NOT covering — a missing timestamp cannot grant
+        perpetual trust.
+
+    Either failure drops the row out of the ``covered`` tier; because no other
+    covering predicate recognises this ``source_kind`` it then classifies at the
+    underlying lower tier (typically ``backfilled`` when a merge-backfill row also
+    exists, else ``partial``). This is the whole point of the execution-trial
+    lane: stale or unpinned executed evidence must stop counting.
+    """
+    if e.source_kind != EXECUTED_NAMED_TEST_EVIDENCE_KIND:
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    executed_sha = detail.get("executed_sha")
+    if not isinstance(executed_sha, str) or not executed_sha.strip():
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=EXECUTED_NAMED_TEST_WINDOW_DAYS
+    )
+
+
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     """Whether a single evidence record satisfies the machine-verified 'covered' condition.
 
@@ -332,6 +487,12 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     that says the merge really reached the integration branch.
     ``task_merge`` requires ``proven=True`` in ``detail`` — a bare merge badge
     without acceptance-proof is not sufficient to qualify the criterion.
+
+    ``walkthrough_e2e`` (autonomous live-stack browser walkthrough) is covering
+    ONLY when it is BOTH SHA-pinned (``detail["candidate_sha"]`` non-empty) AND
+    fresh (recorded within :data:`WALKTHROUGH_E2E_WINDOW_DAYS`) — see
+    :func:`_evidence_is_walkthrough_e2e_covered`. A stale or unpinned row is not
+    covering and falls back to ``partial``.
 
     ``acceptance_window_recompute`` and ``metrics_integrity_sweep`` are
     deliberately NOT covering here.  Both prove only that a standing MECHANISM
@@ -359,6 +520,29 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         # (backfill citing the resolving commit). Treated as covering so the
         # criterion is satisfied once the backfill writes the evidence row.
         return True
+    if e.source_kind == "walkthrough_e2e":
+        # A live-stack walkthrough that ran against a specific candidate SHA.
+        # Covering iff: (a) the row is fresh within WALKTHROUGH_E2E_WINDOW_DAYS,
+        # (b) ``detail["candidate_sha"]`` is present, and (c) if a legacy
+        # ``verdict`` field is present it must be "PASS" (FAIL/DEAD_END/None must
+        # not cover even if the SHA is pinned — fail-closed).  The autonomous
+        # ingestion endpoint only writes rows for passing criteria and omits the
+        # ``verdict`` key entirely; a present-but-non-PASS verdict indicates a
+        # legacy row that must not be treated as machine-verified.
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        if "verdict" in detail and detail.get("verdict") != "PASS":
+            return False
+        return _evidence_is_walkthrough_e2e_covered(e)
+    if e.source_kind == EXECUTED_NAMED_TEST_EVIDENCE_KIND:
+        # A merged task's declared named_test covering tests were EXECUTED green
+        # against a pinned checkout (the criterion_coverage_trial earn loop).
+        # Covering iff BOTH SHA-pinned (``detail["executed_sha"]`` present) AND
+        # fresh (within EXECUTED_NAMED_TEST_WINDOW_DAYS) — see
+        # :func:`_evidence_is_executed_named_test_covered`. A stale or unpinned
+        # row is not covering and decays to the underlying lower tier (the
+        # ``backfilled`` fallback remains). Strictly additive: this branch never
+        # weakens or reorders the tiers above it.
+        return _evidence_is_executed_named_test_covered(e)
     # Unverified-merge backfill evidence is deliberately NOT covering here.  The
     # evidence only proves that the declared named_test was in the PR's changed
     # files — i.e. the test shipped — not that the merge was CI-verified or that
@@ -487,6 +671,46 @@ def _evidence_is_probed(e: CriterionEvidence) -> bool:
     return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
         days=MACHINE_PROBE_WINDOW_DAYS
     )
+
+
+def _evidence_is_walkthrough_e2e(e: CriterionEvidence) -> bool:
+    """Whether a single evidence record is a fresh, SHA-pinned walkthrough_e2e PASS.
+
+    Returns ``True`` only when ALL of the following hold:
+
+    * ``source_kind == "walkthrough_e2e"``
+    * ``detail["candidate_sha"]`` is a non-empty string — prevents a bare or
+      malformed row from granting trust; every row written by the harness must
+      declare which exact commit it verified.
+    * ``detail["verdict"] == "PASS"`` — the harness explicitly reported success;
+      a ``FAIL`` or ``DEAD_END`` verdict must not cover the criterion.
+    * ``recorded_at`` is within :data:`WALKTHROUGH_E2E_WINDOW_DAYS` of now — a
+      stale walkthrough row decays to the underlying (partial/uncovered) state so
+      the next qualification attempt must re-verify rather than coasting on old
+      evidence.  A row with no ``recorded_at`` cannot grant perpetual trust and
+      returns ``False``.
+
+    LEGACY predicate: it additionally requires ``detail["verdict"] == "PASS"``.
+    The autonomous evidence lane no longer stores a ``verdict`` field (the
+    ingestion endpoint only writes a row for a passing criterion), so
+    :func:`_evidence_proves_covered` now delegates to
+    :func:`_evidence_is_walkthrough_e2e_covered` (SHA-pinned + fresh) instead.
+    This function is retained for the verdict-format rows written by the legacy
+    ``WALKTHROUGH_E2E_RESULT`` artifact ingestion path.
+    """
+    if e.source_kind != "walkthrough_e2e":
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    if not detail.get("candidate_sha"):
+        return False
+    if detail.get("verdict") != "PASS":
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=WALKTHROUGH_E2E_WINDOW_DAYS
+    )
+
 
 
 MAX_CRITERIA_PER_VERSION = 50
@@ -917,6 +1141,263 @@ async def get_evidence_for_criteria_batch(
     return grouped
 
 
+async def record_executed_named_test_evidence(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    criteria: list[VersionAcceptanceCriterion],
+    executed_sha: str,
+    test_refs: list[str],
+    source_task_id: str,
+) -> int:
+    """Mint machine-verified ``executed_named_test`` (``covered``-tier) evidence.
+
+    The tier-upgrade write path for the acceptance earn-loop's execution trials:
+    records one :class:`CriterionEvidence` row per criterion, **idempotently**,
+    ONLY when the caller has already confirmed a GREEN trial result (see
+    :func:`~app.ci_resolution.criterion_coverage_trial_is_green`). Each row is:
+
+      * **SHA-pinned** to the executed checkout (``detail["executed_sha"]``), and
+      * **freshness-stamped** via ``recorded_at`` (the model default),
+
+    so a stale or unpinned row decays out of the ``covered`` tier (see
+    :func:`_evidence_is_executed_named_test_covered`) and classification stays
+    fail-closed. The ``source_id`` embeds the executed SHA, so a re-verification
+    at a NEW head mints a fresh row (the old-SHA row decays by the window) while a
+    duplicate ingestion of the SAME result is an idempotent no-op (the
+    unique ``(criterion_id, source_kind, source_id)`` constraint turns the race
+    into a skip).
+
+    Best-effort and non-raising: it never demotes existing evidence — it only
+    ever ADDS covered rows for a green receipt. Returns the number of NEW rows
+    recorded.
+    """
+    sha = executed_sha.strip() if isinstance(executed_sha, str) else ""
+    if not sha:
+        logger.warning(
+            "record_executed_named_test_evidence: blank executed_sha for "
+            "source_task=%s — recording nothing",
+            source_task_id,
+        )
+        return 0
+    refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+    src = str(source_task_id)
+    evaluated_at = _utcnow().isoformat()
+    recorded = 0
+    for criterion in criteria:
+        source_id = (
+            f"executed_named_test:{src}:{criterion.criterion_key}:{sha[:12]}"
+        )
+        # Pre-check existence so a duplicate ingestion is a clean no-op: skip the
+        # redundant insert entirely rather than letting record_evidence hit the
+        # unique constraint and rollback (which would expire live ORM objects).
+        # The unique ``(criterion_id, source_kind, source_id)`` constraint still
+        # protects a genuine concurrent race inside record_evidence.
+        existing = await get_evidence_for_criterion(session, criterion.id)
+        already = any(
+            ev.source_kind == EXECUTED_NAMED_TEST_EVIDENCE_KIND
+            and ev.source_id == source_id
+            for ev in existing
+        )
+        if already:
+            continue
+        detail: dict[str, Any] = {
+            "executed_sha": sha,
+            "test_refs": refs,
+            "evaluated_at": evaluated_at,
+            "source_task_id": src,
+            "proven": True,
+        }
+        await record_evidence(
+            session,
+            criterion_id=criterion.id,
+            project_id=project_id,
+            source_kind=EXECUTED_NAMED_TEST_EVIDENCE_KIND,
+            source_id=source_id,
+            detail=detail,
+        )
+        recorded += 1
+    if recorded:
+        logger.info(
+            "record_executed_named_test_evidence: minted %d covered row(s) for "
+            "source_task=%s sha=%s (criteria=%s)",
+            recorded,
+            src,
+            sha,
+            [c.criterion_key for c in criteria],
+        )
+    return recorded
+
+
+async def enroll_criterion_coverage_trial(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    criterion_ids: list[str],
+    source_task_id: str,
+    test_refs: list[str],
+    head_sha: str | None = None,
+) -> Any:
+    """Create + persist a bounded ``criterion_coverage_trial`` Task.
+
+    The ENROLL half of the acceptance earn-loop's execution-trial lane — a
+    parallel of :func:`app.capability_proof.enroll_capability_proof_trial`, keyed
+    on acceptance criteria / merged tasks rather than capabilities (the two
+    systems are deliberately NOT entangled). The trial is a bounded, targeted
+    runner job: the agent handler runs ONLY the passed ``test_refs`` (a merged
+    task's declared ``named_test`` covering tests), and on a GREEN run the
+    ingestion completion handler mints genuine ``covered`` criterion evidence via
+    :func:`record_executed_named_test_evidence`.
+
+    Gated on the ``acceptance_earn_execution_trials_enabled`` runtime flag
+    (default OFF / dark ship); with the flag off it is a no-op returning ``None``,
+    so the surrounding backfill pass is byte-for-byte identical to today.
+
+    Bounded launch contract: ``test_refs`` is normalised and capped to
+    :data:`MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES`, and a wall-clock timeout
+    (:data:`CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS`) is stamped into the
+    payload. A trial that cannot be built cleanly (flag off, no criteria, no
+    source task, or no usable test refs) is a no-op returning ``None`` — never a
+    raise, never a fabricated evidence row.
+
+    Dedup: only blocks re-enrollment when an IN-FLIGHT (non-terminal) trial for
+    the SAME ``source_task_id`` exists. Terminal trials do not block a fresh
+    enrollment (a completed trial may be re-run after a new commit lands).
+
+    Returns the persisted Task on success, or ``None`` on any no-op/degraded path.
+    Non-raising: any error is logged at WARNING level and yields ``None``.
+    """
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        if not (_rc or {}).get("acceptance_earn_execution_trials_enabled", False):
+            return None
+
+        crit_ids = [
+            c for c in (criterion_ids or []) if isinstance(c, str) and c.strip()
+        ]
+        if not crit_ids:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial — no criterion_ids for "
+                "source_task=%r",
+                source_task_id,
+            )
+            return None
+        src = str(source_task_id).strip() if source_task_id else ""
+        if not src:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial — no source_task_id (crits=%s)",
+                crit_ids,
+            )
+            return None
+        refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+        if not refs:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial for source_task=%s — no usable "
+                "test refs",
+                src,
+            )
+            return None
+        refs = refs[:MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES]
+        # Belt-and-suspenders: the cap must never be 0, but guard defensively so
+        # a misconfigured constant can't produce a fabricated empty trial.
+        if not refs:
+            logger.warning(
+                "[CRIT_TRIAL] cannot enroll trial for source_task=%s — refs empty "
+                "after cap (MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES=%d)",
+                src,
+                MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES,
+            )
+            return None
+
+        from app.models import Task, TaskStatus
+
+        # Dedup guard: only block re-enrollment when an in-flight (non-terminal)
+        # trial exists for the same source task. A narrow TOCTOU window is
+        # tolerated (idempotent evidence recording handles the duplicate) and only
+        # risks one extra runner job per source task per sweep cycle.
+        in_flight_statuses = [
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ]
+        try:
+            existing_q = await session.execute(
+                select(Task.id).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(in_flight_statuses),
+                    Task.payloads.contains(
+                        [{"type": "criterion_coverage_trial", "source_task_id": src}]
+                    ),
+                ).limit(1)
+            )
+            if existing_q.scalar_one_or_none() is not None:
+                logger.info(
+                    "[CRIT_TRIAL] skipping duplicate enrollment for source_task=%s "
+                    "— a trial is already in-flight",
+                    src,
+                )
+                return None
+        except Exception:  # noqa: BLE001 — dedup failure is non-fatal; enroll anyway
+            logger.warning(
+                "[CRIT_TRIAL] dedup check failed for source_task=%s — proceeding "
+                "with enroll",
+                src,
+                exc_info=True,
+            )
+
+        payload: dict[str, Any] = {
+            "type": "criterion_coverage_trial",
+            "criterion_ids": crit_ids,
+            "source_task_id": src,
+            "test_refs": refs,
+            "head_sha": head_sha if isinstance(head_sha, str) else None,
+            "max_test_files": MAX_CRITERION_COVERAGE_TRIAL_TEST_FILES,
+            "wall_clock_seconds": CRITERION_COVERAGE_TRIAL_WALL_CLOCK_SECONDS,
+        }
+        task = Task(
+            project_id=project_id,
+            title=f"Criterion coverage trial: {src[:8]}",
+            description=(
+                "Execute the discovered covering tests for a merged task's declared "
+                "named_test as a targeted runner job; a green run mints "
+                "machine-verified ``covered`` criterion evidence."
+            ),
+            payloads=[payload],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        logger.info(
+            "[CRIT_TRIAL] enrolled trial task %s for source_task=%s crits=%s "
+            "refs=%s sha=%s",
+            task.id,
+            src,
+            crit_ids,
+            refs,
+            head_sha,
+        )
+        return task
+    except Exception:  # noqa: BLE001 — enrollment must degrade, never raise
+        logger.warning(
+            "[CRIT_TRIAL] failed to enroll criterion_coverage_trial for "
+            "source_task=%r",
+            source_task_id,
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CRIT_TRIAL] rollback after enroll failure also failed",
+                exc_info=True,
+            )
+        return None
+
+
 def criterion_coverage_to_evidence_status(coverage: str) -> str:
     """Map a criterion coverage string to the shared EvidenceStatus axis.
 
@@ -960,7 +1441,9 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     Returns:
       'covered'    — at least one record is machine-verified covering evidence
                      (``reachability``, ``audit_finding_backfill`` always;
-                     ``task_merge`` only with ``detail["proven"] is True``)
+                     ``task_merge`` only with ``detail["proven"] is True``;
+                     ``walkthrough_e2e`` only when SHA-pinned AND fresh — see
+                     :func:`_evidence_is_walkthrough_e2e_covered``)
       'attested'   — no machine-verified evidence, but a NON-EXPIRED operator
                      attestation is present (a lower-confidence, time-bounded
                      waiver — see :func:`_evidence_is_attested`)
@@ -990,6 +1473,40 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     if any(_evidence_is_probed(e) for e in evidence):
         return "probed"
     return "partial"
+
+
+def _evidence_providing_source_kind(evidence: list[CriterionEvidence]) -> str | None:
+    """Return the ``source_kind`` providing the highest-priority coverage, or ``None``.
+
+    Follows the same priority chain as :func:`compute_criterion_coverage`::
+
+        covered > attested > backfilled > probed > partial > uncovered
+
+    For ``covered`` this pinpoints which machine-verified evidence kind proved the
+    criterion (e.g. ``"walkthrough_e2e"`` vs ``"task_merge"``).  For the
+    lower-confidence tiers it returns the first matching source_kind within that
+    tier.  For ``uncovered`` (empty evidence list) it returns ``None``.
+
+    Callers use this to label *why* a criterion achieved its current tier without
+    re-deriving the logic.
+    """
+    if not evidence:
+        return None
+    for e in evidence:
+        if _evidence_proves_covered(e):
+            return e.source_kind
+    for e in evidence:
+        if _evidence_is_attested(e):
+            return e.source_kind
+    for e in evidence:
+        if _evidence_is_backfilled(e):
+            return e.source_kind
+    for e in evidence:
+        if _evidence_is_probed(e):
+            return e.source_kind
+    # Partial: evidence exists but none qualifies at any tier — return the
+    # first entry's source_kind so callers see what kind of evidence is present.
+    return evidence[0].source_kind
 
 
 def _compute_attestation_expires_at(evidence: list[CriterionEvidence]) -> str | None:
@@ -2311,6 +2828,533 @@ async def _resolve_acceptance_window_criteria(
     return list(targets.values())
 
 
+def _version_qualifying_candidate_sha(version: Any) -> str:
+    """Return the candidate SHA under qualification for ``version``, or ``""``.
+
+    Sourced from ``ReleaseVersion.last_qualification["candidate_sha"]`` — the
+    exact commit the qualifier is (or last was) scoring. Read defensively so a
+    missing/malformed blob yields an empty string rather than raising.
+    """
+    last_qualification = getattr(version, "last_qualification", None)
+    if not isinstance(last_qualification, dict):
+        return ""
+    return str(last_qualification.get("candidate_sha") or "").strip()
+
+
+#: Sub-criteria that must ALL appear as passed=True in a walkthrough results batch
+#: before the meta criterion (c-5214996f) may earn covered-tier evidence.
+_WALKTHROUGH_META_REQUIRED_SUBCRITERIA = frozenset({"c-dfdc9d82", "c-f52fd975", "c-workday-session-lifecycle"})
+
+
+def _walkthrough_meta_criterion_gate(results: list[dict]) -> bool:
+    """Return True only when all required sub-criteria are passed in ``results``.
+
+    Pure function (no I/O). The meta criterion c-5214996f summarises a full
+    re-walk; it MUST NOT be minted from a partial run where one or more of its
+    substantive sub-criteria failed or were absent.
+
+    Called by :func:`record_walkthrough_e2e_evidence` and
+    :func:`record_operator_walkthrough_evidence` before c-5214996f is allowed
+    into ``passed_keys``.
+    """
+    passed_in_batch = {
+        str(entry.get("criterion_key") or "").strip()
+        for entry in results
+        if isinstance(entry, dict) and entry.get("passed") is True
+    }
+    return _WALKTHROUGH_META_REQUIRED_SUBCRITERIA.issubset(passed_in_batch)
+
+
+async def record_walkthrough_e2e_evidence(
+    session: AsyncSession,
+    version: Any,
+    candidate_sha: str,
+    results: list[dict[str, Any]],
+    qualification_attempt_id: str | None = None,
+    exercised_engine_sha: str | None = None,
+) -> dict[str, Any]:
+    """Map per-criterion ``walkthrough_e2e`` results into covered-tier evidence.
+
+    Each entry in ``results`` is a ``{criterion_key, passed, notes}`` dict. For
+    every entry whose ``passed`` is truthy, this resolves ``criterion_key`` to an
+    ACTIVE criterion on ``version`` and writes one covering
+    :data:`WALKTHROUGH_E2E_EVIDENCE_KIND` :class:`CriterionEvidence` row with
+    ``detail = {candidate_sha, evaluated_at, criterion_key, passed[, notes,
+    qualification_attempt_id, exercised_engine_sha]}`` and a ``source_id`` keyed on the qualification
+    attempt + criterion (so a re-run against the same attempt is an idempotent
+    no-op via the dedup unique index).
+
+    **CRITICAL SAFETY** — covered-tier evidence is written ONLY when the posted
+    ``candidate_sha`` is non-empty AND matches the version's qualifying candidate
+    SHA (:func:`_version_qualifying_candidate_sha`). A missing or mismatched SHA
+    writes NOTHING and is reported as ``rejected`` — a walkthrough run against the
+    wrong commit (or with no pinned SHA) can never forge coverage. Only
+    ``passed=True`` results are written; failing/absent results are skipped.
+
+    Returns a summary dict::
+
+        {"status": "recorded" | "rejected",
+         "rejected_reason": str | None,  # only when status == "rejected"
+         "recorded": int,                # rows newly written
+         "skipped_not_passed": int,      # results with passed falsy
+         "unmatched_keys": list[str],    # keys not resolving to an active criterion
+         "candidate_sha": str}
+
+    Best-effort per-row: a failure recording one criterion's evidence is logged
+    and does not abort the others.
+    """
+    posted_sha = str(candidate_sha or "").strip()
+    qualifying_sha = _version_qualifying_candidate_sha(version)
+    if not posted_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: missing candidate_sha for version %s "
+            "— rejecting (no coverage written)",
+            getattr(version, "id", None),
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "missing_candidate_sha",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+    if not qualifying_sha or posted_sha != qualifying_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: posted candidate_sha %s does not "
+            "match version %s qualifying SHA %r — rejecting (no coverage written)",
+            posted_sha[:12],
+            getattr(version, "id", None),
+            qualifying_sha[:12] if qualifying_sha else qualifying_sha,
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "candidate_sha_mismatch",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    exercised_sha = str(exercised_engine_sha or "").strip()
+    if exercised_sha and exercised_sha != posted_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: exercised_engine_sha %s does not "
+            "match candidate_sha %s for version %s — rejecting (harness ran against wrong stack)",
+            exercised_sha[:12],
+            posted_sha[:12],
+            getattr(version, "id", None),
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "exercised_engine_sha_mismatch",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+    if not exercised_sha:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: exercised_engine_sha absent for version %s "
+            "— accepting unverified-engine evidence (provenance gap)",
+            getattr(version, "id", None),
+        )
+
+    project_id = version.project_id
+    release_version_id = version.id
+
+    # Only passed=True results are eligible; collect their keys (preserving order,
+    # de-duplicating) so a single query resolves all criteria at once.
+    # The meta criterion (c-5214996f) is NOT excluded here: it must still flow
+    # through alias resolution and the unmatched-key check so that a phantom post
+    # (c-5214996f not registered) surfaces as an unmatched-key alert rather than
+    # a silent drop. The meta gate is instead applied at the evidence-writing
+    # loop below, where the key has already resolved to an ACTIVE criterion — so
+    # the gate only ever suppresses covered meta evidence, never observability.
+    meta_gate_passes = _walkthrough_meta_criterion_gate(results)
+    passed_keys: list[str] = []
+    skipped_not_passed = 0
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if not key:
+            continue
+        if entry.get("passed") is True:
+            if key not in passed_keys:
+                passed_keys.append(key)
+        else:
+            skipped_not_passed += 1
+
+    if not passed_keys:
+        return {
+            "status": "recorded",
+            "rejected_reason": None,
+            "recorded": 0,
+            "skipped_not_passed": skipped_not_passed,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    # Resolve legacy aliases (e.g. 'c-workday-session-lifecycle' → 'c-5214996f')
+    # before the DB lookup.  passed_keys keeps the original slugs so that
+    # unmatched_keys reports the posted key, not the alias target.
+    resolved_keys = [_resolve_walkthrough_criterion_key(k) for k in passed_keys]
+    criteria = await get_criteria_by_keys(
+        session, project_id, resolved_keys, release_version_id=release_version_id
+    )
+    active_by_key = {c.criterion_key: c for c in criteria if c.status == "active"}
+    unmatched_keys = [
+        k for k in passed_keys
+        if _resolve_walkthrough_criterion_key(k) not in active_by_key
+    ]
+
+    # Look up the notes for each passed key from the first matching result.
+    # Index by the resolved key so the active_by_key loop can retrieve them.
+    notes_by_key: dict[str, Any] = {}
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if key and entry.get("passed") is True:
+            resolved = _resolve_walkthrough_criterion_key(key)
+            if resolved not in notes_by_key:
+                notes_by_key[resolved] = entry.get("notes")
+
+    evaluated_at = _utcnow().isoformat()
+    attempt_token = str(qualification_attempt_id or "na").strip() or "na"
+    recorded = 0
+    for key, criterion in active_by_key.items():
+        # Meta-gate: the meta criterion c-5214996f (reachable directly or via the
+        # 'c-workday-session-lifecycle' legacy alias, both of which resolve into
+        # active_by_key under the canonical key) MUST NOT earn covered evidence
+        # from a partial run where its required sub-criteria did not all pass in
+        # this same batch. Gating here (post-resolution) leaves the unmatched-key
+        # alert path intact for the not-registered case.
+        if key == "c-5214996f" and not meta_gate_passes:
+            logger.warning(
+                "record_walkthrough_e2e_evidence: skipping c-5214996f — "
+                "required sub-criteria %s not all passed in this batch "
+                "(version %s); no covered meta evidence written",
+                sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                getattr(version, "id", None),
+            )
+            skipped_not_passed += 1
+            continue
+        detail: dict[str, Any] = {
+            "candidate_sha": posted_sha,
+            "evaluated_at": evaluated_at,
+            "criterion_key": key,
+            "passed": True,
+        }
+        notes = notes_by_key.get(key)
+        if notes:
+            detail["notes"] = notes
+        if qualification_attempt_id:
+            detail["qualification_attempt_id"] = str(qualification_attempt_id)
+        # Additive: record the SHA the candidate stack actually served so a later
+        # guard can enforce it equals the qualifying candidate SHA. Never gates
+        # here — the existing candidate_sha match above is the safety boundary.
+        if exercised_sha:
+            detail["exercised_engine_sha"] = exercised_sha
+        source_id = f"walkthrough_e2e:{attempt_token}:{key}"
+        try:
+            await record_evidence(
+                session,
+                criterion_id=criterion.id,
+                project_id=project_id,
+                source_kind=WALKTHROUGH_E2E_EVIDENCE_KIND,
+                source_id=source_id,
+                detail=detail,
+            )
+            recorded += 1
+        except Exception:
+            logger.exception(
+                "record_walkthrough_e2e_evidence: failed to record evidence for "
+                "criterion %s (version %s)",
+                key,
+                getattr(version, "id", None),
+            )
+
+    if unmatched_keys:
+        logger.warning(
+            "record_walkthrough_e2e_evidence: version=%s candidate_sha=%s recorded=%d "
+            "skipped_not_passed=%d unmatched=%s — passing keys dropped, no evidence written",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
+        try:
+            from app.alert_policy import create_project_alert_if_allowed
+            from app.models import AlertSeverity
+
+            sorted_keys = sorted(unmatched_keys)
+            dedupe_key = f"walkthrough_key_unmatched:{project_id}:{release_version_id}:{','.join(sorted_keys)}"
+            title = "Walkthrough evidence dropped: unrecognised criterion key(s)"
+            message = (
+                f"record_walkthrough_e2e_evidence posted passing results for "
+                f"{len(unmatched_keys)} key(s) that resolve to no active criterion "
+                f"on version {release_version_id} (sha {posted_sha[:12]}): "
+                f"{sorted_keys}. Evidence was NOT recorded."
+            )
+            await create_project_alert_if_allowed(
+                session,
+                project_id=project_id,
+                event_type="release.walkthrough_key_unmatched",
+                severity=AlertSeverity.WARNING,
+                title=title,
+                message=message,
+                dedupe_key=dedupe_key,
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "record_walkthrough_e2e_evidence: failed to create unmatched-key alert "
+                "for version %s — continuing",
+                getattr(version, "id", None),
+            )
+    else:
+        logger.info(
+            "record_walkthrough_e2e_evidence: version=%s candidate_sha=%s recorded=%d "
+            "skipped_not_passed=%d unmatched=%s",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
+    return {
+        "status": "recorded",
+        "rejected_reason": None,
+        "recorded": recorded,
+        "skipped_not_passed": skipped_not_passed,
+        "unmatched_keys": unmatched_keys,
+        "candidate_sha": posted_sha,
+    }
+
+
+async def record_operator_walkthrough_evidence(
+    session: AsyncSession,
+    version: Any,
+    candidate_sha: str,
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Record operator-run walkthrough results as covered-tier evidence.
+
+    Mirrors :func:`record_walkthrough_e2e_evidence` but skips the SHA match
+    against ``version.last_qualification.candidate_sha``. The operator has
+    intentionally run the walkthrough against a specific commit and asserts the
+    SHA is the correct pinned commit — the function validates only that the
+    provided ``candidate_sha`` is non-empty.
+
+    Each entry in ``results`` is a ``{criterion_key, passed, notes}`` dict. For
+    every entry whose ``passed`` is truthy, this resolves ``criterion_key`` to an
+    ACTIVE criterion on ``version`` and writes one covering
+    :data:`WALKTHROUGH_E2E_EVIDENCE_KIND` :class:`CriterionEvidence` row with
+    ``detail = {candidate_sha, evaluated_at, criterion_key, passed[, notes]}``
+    and a ``source_id`` keyed on the operator-run SHA + criterion (so a re-run
+    against the same SHA is a no-op via the dedup unique index).
+
+    **SAFETY:** covered-tier evidence is written ONLY when the posted
+    ``candidate_sha`` is non-empty. A missing/empty SHA writes NOTHING and is
+    reported as ``rejected``. Only ``passed=True`` results are written;
+    failing/absent results are skipped.
+
+    Returns a summary dict::
+
+        {"status": "recorded" | "rejected",
+         "rejected_reason": str | None,  # only when status == "rejected"
+         "recorded": int,                # rows newly written
+         "skipped_not_passed": int,      # results with passed falsy
+         "unmatched_keys": list[str],    # keys not resolving to an active criterion
+         "candidate_sha": str}
+
+    Best-effort per-row: a failure recording one criterion's evidence is logged
+    and does not abort the others.
+    """
+    posted_sha = str(candidate_sha or "").strip()
+    if not posted_sha:
+        logger.warning(
+            "record_operator_walkthrough_evidence: missing candidate_sha for "
+            "version %s — rejecting (no coverage written)",
+            getattr(version, "id", None),
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "missing_candidate_sha",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    project_id = version.project_id
+    release_version_id = version.id
+
+    # Only passed=True results are eligible; collect their keys (preserving order,
+    # de-duplicating) so a single query resolves all criteria at once.
+    # The meta criterion (c-5214996f) is NOT excluded here: it must still flow
+    # through alias resolution and the unmatched-key check so that a phantom post
+    # (c-5214996f not registered) surfaces as an unmatched-key alert rather than
+    # a silent drop. The meta gate is instead applied at the evidence-writing
+    # loop below, where the key has already resolved to an ACTIVE criterion — so
+    # the gate only ever suppresses covered meta evidence, never observability.
+    meta_gate_passes = _walkthrough_meta_criterion_gate(results)
+    passed_keys: list[str] = []
+    skipped_not_passed = 0
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if not key:
+            continue
+        if entry.get("passed") is True:
+            if key not in passed_keys:
+                passed_keys.append(key)
+        else:
+            skipped_not_passed += 1
+
+    if not passed_keys:
+        return {
+            "status": "recorded",
+            "rejected_reason": None,
+            "recorded": 0,
+            "skipped_not_passed": skipped_not_passed,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    # Resolve legacy aliases before the DB lookup; report unmatched using the
+    # original slug so alerts remain human-readable.
+    resolved_keys = [_resolve_walkthrough_criterion_key(k) for k in passed_keys]
+    criteria = await get_criteria_by_keys(
+        session, project_id, resolved_keys, release_version_id=release_version_id
+    )
+    active_by_key = {c.criterion_key: c for c in criteria if c.status == "active"}
+    unmatched_keys = [
+        k for k in passed_keys
+        if _resolve_walkthrough_criterion_key(k) not in active_by_key
+    ]
+
+    # Look up the notes for each passed key from the first matching result.
+    # Index by the resolved key so the active_by_key loop can retrieve them.
+    notes_by_key: dict[str, Any] = {}
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if key and entry.get("passed") is True:
+            resolved = _resolve_walkthrough_criterion_key(key)
+            if resolved not in notes_by_key:
+                notes_by_key[resolved] = entry.get("notes")
+
+    evaluated_at = _utcnow().isoformat()
+    recorded = 0
+    for key, criterion in active_by_key.items():
+        # Meta-gate: c-5214996f (direct or via the 'c-workday-session-lifecycle'
+        # legacy alias, both resolving into active_by_key under the canonical key)
+        # MUST NOT earn covered evidence from a partial run whose required
+        # sub-criteria did not all pass in this batch. Gating post-resolution
+        # keeps the unmatched-key alert intact for the not-registered case.
+        if key == "c-5214996f" and not meta_gate_passes:
+            logger.warning(
+                "record_operator_walkthrough_evidence: skipping c-5214996f — "
+                "required sub-criteria %s not all passed in this batch "
+                "(version %s); no covered meta evidence written",
+                sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                getattr(version, "id", None),
+            )
+            skipped_not_passed += 1
+            continue
+        detail: dict[str, Any] = {
+            "candidate_sha": posted_sha,
+            "evaluated_at": evaluated_at,
+            "criterion_key": key,
+            "passed": True,
+        }
+        notes = notes_by_key.get(key)
+        if notes:
+            detail["notes"] = notes
+        source_id = f"operator_walkthrough:{posted_sha}:{key}"
+        try:
+            await record_evidence(
+                session,
+                criterion_id=criterion.id,
+                project_id=project_id,
+                source_kind=WALKTHROUGH_E2E_EVIDENCE_KIND,
+                source_id=source_id,
+                detail=detail,
+            )
+            recorded += 1
+        except Exception:
+            logger.exception(
+                "record_operator_walkthrough_evidence: failed to record evidence "
+                "for criterion %s (version %s)",
+                key,
+                getattr(version, "id", None),
+            )
+
+    if unmatched_keys:
+        logger.warning(
+            "record_operator_walkthrough_evidence: version=%s candidate_sha=%s "
+            "recorded=%d skipped_not_passed=%d unmatched=%s — passing keys dropped, no evidence written",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
+        try:
+            from app.alert_policy import create_project_alert_if_allowed
+            from app.models import AlertSeverity
+
+            sorted_keys = sorted(unmatched_keys)
+            dedupe_key = f"walkthrough_key_unmatched:{project_id}:{release_version_id}:{','.join(sorted_keys)}"
+            title = "Operator walkthrough evidence dropped: unrecognised criterion key(s)"
+            message = (
+                f"record_operator_walkthrough_evidence posted passing results for "
+                f"{len(unmatched_keys)} key(s) that resolve to no active criterion "
+                f"on version {release_version_id} (sha {posted_sha[:12]}): "
+                f"{sorted_keys}. Evidence was NOT recorded."
+            )
+            await create_project_alert_if_allowed(
+                session,
+                project_id=project_id,
+                event_type="release.walkthrough_key_unmatched",
+                severity=AlertSeverity.WARNING,
+                title=title,
+                message=message,
+                dedupe_key=dedupe_key,
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "record_operator_walkthrough_evidence: failed to create unmatched-key alert "
+                "for version %s — continuing",
+                getattr(version, "id", None),
+            )
+    else:
+        logger.info(
+            "record_operator_walkthrough_evidence: version=%s candidate_sha=%s "
+            "recorded=%d skipped_not_passed=%d unmatched=%s",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            skipped_not_passed,
+            unmatched_keys,
+        )
+    return {
+        "status": "recorded",
+        "rejected_reason": None,
+        "recorded": recorded,
+        "skipped_not_passed": skipped_not_passed,
+        "unmatched_keys": unmatched_keys,
+        "candidate_sha": posted_sha,
+    }
+
+
 async def record_acceptance_window_coverage_evidence(
     session: AsyncSession,
     version: Any,
@@ -2851,6 +3895,7 @@ async def get_version_coverage_summary(
                     'criterion_key': str,
                     'text': str,
                     'coverage': 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered',
+                    'covered_by': str | None,  # source_kind providing coverage, e.g. 'walkthrough_e2e'
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'evidence_truncated': bool,
@@ -2881,6 +3926,11 @@ async def get_version_coverage_summary(
     of uncovered active criteria whose ``stuck_reason`` is non-``None`` — i.e.
     criteria that need direction remapping or operator attestation to ever
     become covered.
+
+    ``covered_by`` pinpoints the exact ``source_kind`` that provides the
+    criterion's current coverage (e.g. ``"walkthrough_e2e"`` vs
+    ``"task_merge"`` vs ``"reachability"``).  For ``"uncovered"`` criteria —
+    or any tier whose evidence list is empty — this is ``None``.
     """
     counts: dict[str, int] = {
         "covered": 0,
@@ -2977,6 +4027,16 @@ async def get_version_coverage_summary(
     for criterion in criteria_in_order:
         evidence = evidence_by_criterion.get(criterion.id, [])
         coverage = coverage_by_criterion[criterion.id]
+        # When corroboration failed and downgraded coverage to 'partial',
+        # the evidence that earned the higher tier is no longer trusted.
+        # Report covered_by as None so it aligns with the effective 'partial'
+        # coverage — the prior source_kind is no longer providing coverage.
+        covered_by = _evidence_providing_source_kind(evidence)
+        if (
+            coverage == "partial"
+            and criterion.criterion_key in failed_corroboration
+        ):
+            covered_by = None
         stuck_reason = stuck_reasons.get(criterion.criterion_key)
         if stuck_reason is not None:
             stuck_count += 1
@@ -2986,6 +4046,7 @@ async def get_version_coverage_summary(
                 "criterion_key": criterion.criterion_key,
                 "text": criterion.text,
                 "coverage": coverage,
+                "covered_by": covered_by,
                 "status": criterion.status,
                 "evidence_count": len(evidence),
                 "evidence_truncated": evidence_truncated,
@@ -3271,3 +4332,327 @@ async def spawn_corroboration_task(
             criterion_key,
             project_id,
         )
+
+
+class NamedTestBackfillResult(int):
+    """Return of :func:`backfill_merged_named_test_coverage` — extended observably.
+
+    Subclasses :class:`int` so its integer VALUE remains the count of new
+    ``backfilled``-tier rows recorded this pass (byte-for-byte compatible with the
+    prior ``-> int`` contract and every caller/test that treats the return as that
+    count). The additional ``trials_enrolled`` attribute carries the number of
+    ``criterion_coverage_trial`` execution trials the pass enrolled, for the
+    reaper step-21a per-pass observability log. Executed/passed/minted counts are
+    produced ASYNCHRONOUSLY by the completion handler
+    (:func:`app.task_completion._handle_criterion_coverage_trial_completion`),
+    which logs its own ``covered``-row mint counts, so they are not knowable inside
+    this enrollment pass.
+    """
+
+    trials_enrolled: int
+
+    def __new__(cls, backfilled_recorded: int = 0, *, trials_enrolled: int = 0):
+        obj = super().__new__(cls, backfilled_recorded)
+        obj.trials_enrolled = int(trials_enrolled)
+        return obj
+
+
+async def backfill_merged_named_test_coverage(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    batch_size: int = 500,
+    max_trial_enrollments: int = MAX_CRITERION_COVERAGE_TRIAL_ENROLLMENTS_PER_PASS,
+) -> NamedTestBackfillResult:
+    """Backfill criterion evidence for merged tasks whose named_test shipped in changed files.
+
+    The acceptance gate classifies >95% of merged code tasks as 'unproven' because
+    the automated earn loop only mints ``path_proven`` tiers — it never executes
+    the covering tests it already discovers statically to mint the real ``proven``
+    tier.  This backfill finds merged COMPLETED tasks whose declared ``named_test``
+    acceptance evidence matches test files that shipped in the same PR, and records
+    :data:`UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND` evidence for their active
+    criteria — upgrading them from 'unproven' to at least 'backfilled' on the
+    coverage ladder.
+
+    Unlike :func:`backfill_unverified_merge_evidence`, this function processes
+    ALL merged tasks regardless of merge-verification status: a verified merge
+    whose criteria were added AFTER the merge (so ``record_task_merge_evidence``
+    never fired) also qualifies.
+
+    **Execution-trial upgrade** (gated on ``acceptance_earn_execution_trials_enabled``,
+    default OFF): when the flag is ON, for a qualifying task whose covering tests
+    are cleanly discoverable AND at least one of its active criteria is not yet
+    ``covered`` (the cadence guard — a fresh executed ``covered`` row short-circuits
+    re-enrollment), this ALSO enrolls a bounded :func:`enroll_criterion_coverage_trial`
+    to actually RUN the covering tests and earn the machine-verified ``covered``
+    tier. The ``backfilled`` row is still recorded as the fail-closed fallback, so
+    when the flag is off / no enrollment budget / not cleanly targetable /
+    enrollment fails, behaviour is byte-for-byte identical to today. Enrollments
+    are bounded by ``max_trial_enrollments`` so test execution can never grow
+    unbounded across projects × merged tasks.
+
+    Best-effort: errors are logged and swallowed so a backfill failure never blocks
+    the caller (the reaper sweep).
+
+    Returns a :class:`NamedTestBackfillResult` — an ``int`` whose value is the
+    count of new ``backfilled`` rows recorded, carrying ``.trials_enrolled`` for
+    observability.
+    """
+    trials_enrolled = 0
+    total = 0
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _trials_enabled = bool(
+            (_rc or {}).get("acceptance_earn_execution_trials_enabled", False)
+        )
+        # Remaining execution-trial enrollment budget for THIS pass. Zero when the
+        # flag is off, so the enrollment branch is a guaranteed no-op and behaviour
+        # is byte-for-byte identical to the backfilled-only path.
+        enroll_budget = (
+            max(0, int(max_trial_enrollments)) if _trials_enabled else 0
+        )
+        from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+        from app.acceptance_gate import _changed_files, _paths_match, _is_test_path
+        from app.landed_signal import is_merged_completion, landed_signal_predicate
+        from app.models import Task, TaskStatus
+        from app.payload_schemas import read_acceptance_evidence
+        from app.release_version import current_open_version as _cur_open_ver
+
+        _BATCH_LIMIT = batch_size
+        total = 0
+        offset = 0
+        open_version: Any = None
+        # Criteria (key -> text) covered by backfill this run — each gets a
+        # corroboration task so the 'backfilled' tier has an earn-up-or-downgrade
+        # path, mirroring operator attestation and unverified-merge backfill.
+        corroboration_targets: dict[str, str] = {}
+        while True:
+            query = (
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    landed_signal_predicate(session),
+                    Task.criterion_ids != None,  # noqa: E711 — SQLAlchemy IS NOT NULL
+                )
+                .order_by(Task.id)
+                .limit(_BATCH_LIMIT)
+                .offset(offset)
+            )
+
+            batch_result = await session.execute(query)
+            batch = list(batch_result.scalars().all())
+            if not batch:
+                break
+            offset += len(batch)
+
+            if open_version is None:
+                open_version = await _cur_open_ver(session, project_id)
+                if open_version is None:
+                    logger.info(
+                        "backfill_merged_named_test_coverage: no open version for "
+                        "project %s — cannot resolve active criteria",
+                        project_id,
+                    )
+                    return NamedTestBackfillResult(
+                        total, trials_enrolled=trials_enrolled
+                    )
+
+            # Batch-load all existing backfill evidence for this batch in one query.
+            task_id_strs = [str(t.id) for t in batch]
+            ev_batch_result = await session.execute(
+                select(CriterionEvidence).where(
+                    CriterionEvidence.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                    CriterionEvidence.source_id.in_(task_id_strs),
+                )
+            )
+            all_present: dict[str, set[uuid.UUID]] = {}
+            for ev in ev_batch_result.scalars().all():
+                all_present.setdefault(ev.source_id, set()).add(ev.criterion_id)
+
+            # First pass: identify qualifying tasks and collect their criterion_ids
+            # so we can fetch all criteria in a single query instead of one per task.
+            qualified: list[tuple] = []
+            all_batch_criterion_ids: set[str] = set()
+            for task in batch:
+                if not task_matches_criterion_release_version(task, open_version):
+                    continue
+                if not is_merged_completion(task):
+                    continue
+
+                # Must have at least one criterion_id to backfill.
+                task_criterion_ids: list[str] = list(
+                    getattr(task, "criterion_ids", None) or []
+                )
+                if not task_criterion_ids:
+                    continue
+
+                # Must have changed files to verify the test shipped.
+                changed = _changed_files(task)
+                if not changed:
+                    continue
+
+                # Must have declared named_test acceptance evidence.
+                evidence = read_acceptance_evidence(task.first_payload)
+                if evidence is None or evidence.kind != "named_test":
+                    continue
+                if evidence.test_path is None:
+                    continue
+
+                # ``partition`` yields the whole path when there is no ``::NODE``
+                # selector — matching acceptance_gate._evaluate_named_test's read.
+                declared_test = evidence.test_path.partition("::")[0].strip()
+                if not declared_test:
+                    continue
+
+                # Verify the test IS in changed files — it was genuinely shipped.
+                test_present = any(_paths_match(p, declared_test) for p in changed)
+                if not test_present:
+                    continue
+
+                # Must also have a production seam to exercise.
+                seam = [p for p in changed if not _is_test_path(p)]
+                if not seam:
+                    continue
+
+                qualified.append((task, task_criterion_ids, declared_test))
+                all_batch_criterion_ids.update(task_criterion_ids)
+
+            # Single criteria query for all qualifying tasks in this batch.
+            criteria_by_key: dict[str, VersionAcceptanceCriterion] = {}
+            if all_batch_criterion_ids:
+                batch_criteria = await get_criteria_by_keys(
+                    session,
+                    project_id,
+                    list(all_batch_criterion_ids),
+                    release_version_id=open_version.id,
+                )
+                criteria_by_key = {
+                    c.criterion_key: c for c in batch_criteria if c.status == "active"
+                }
+
+            if not criteria_by_key:
+                continue
+
+            # Batch-fetch evidence for all active criteria to check current coverage.
+            active_criterion_ids = list(criteria_by_key.values())
+            evidence_by_criterion = await get_evidence_for_criteria_batch(
+                session,
+                [c.id for c in active_criterion_ids],
+            )
+
+            # Second pass: record evidence for criteria not already covered.
+            evidence_batch: list[CriterionEvidence] = []
+            for task, task_criterion_ids, declared_test in qualified:
+                active = [
+                    criteria_by_key[k]
+                    for k in task_criterion_ids
+                    if k in criteria_by_key
+                ]
+                if not active:
+                    continue
+
+                already_present: set[uuid.UUID] = all_present.get(str(task.id), set())
+                task_id_str = str(task.id)
+                verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY, {})
+                proof_ref = (
+                    (isinstance(verdict, dict) and verdict.get("proof_ref"))
+                    or declared_test
+                )
+                for criterion in active:
+                    # Queue a corroboration task for every active backfilled
+                    # criterion, whether or not its evidence row is new — this
+                    # earns-up or downgrades pre-existing backfill too.
+                    corroboration_targets[criterion.criterion_key] = criterion.text
+                    if criterion.id in already_present:
+                        continue
+
+                    # Skip if the criterion is already machine-verified as covered
+                    # by other evidence (e.g. a reachability badge or a prior
+                    # task_merge with proven=True).
+                    existing = evidence_by_criterion.get(criterion.id, [])
+                    if compute_criterion_coverage(existing) == "covered":
+                        continue
+
+                    detail: dict[str, Any] = {
+                        "proven": True,
+                        "backfilled": True,
+                        "backfill_reason": "merged_named_test_matches_changed",
+                        "proof_ref": proof_ref,
+                    }
+                    evidence_batch.append(CriterionEvidence(
+                        criterion_id=criterion.id,
+                        project_id=project_id,
+                        source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                        source_id=task_id_str,
+                        detail=detail,
+                    ))
+
+                # Execution-trial upgrade (flag-gated; enroll_budget is 0 when the
+                # flag is off, making this a guaranteed no-op). The backfilled row
+                # above is the fail-closed fallback; here we ALSO enroll a bounded
+                # trial to actually RUN the covering test and earn the ``covered``
+                # tier. Cadence guard: only enroll for active criteria that are not
+                # already ``covered`` (a fresh executed ``covered`` row therefore
+                # short-circuits re-enrollment). Fail-closed: any no-op/None just
+                # leaves the ``backfilled`` fallback in place.
+                if enroll_budget > 0:
+                    uncovered_keys = [
+                        c.criterion_key
+                        for c in active
+                        if compute_criterion_coverage(
+                            evidence_by_criterion.get(c.id, [])
+                        )
+                        != "covered"
+                    ]
+                    if uncovered_keys:
+                        enrolled_task = await enroll_criterion_coverage_trial(
+                            session,
+                            project_id,
+                            criterion_ids=uncovered_keys,
+                            source_task_id=task_id_str,
+                            test_refs=[declared_test],
+                            head_sha=None,
+                        )
+                        if enrolled_task is not None:
+                            trials_enrolled += 1
+                            enroll_budget -= 1
+
+            if evidence_batch:
+                batch_recorded = await _record_evidence_batch(session, evidence_batch)
+                total += batch_recorded
+
+        # Give each backfilled criterion an earn-up path: spawn a corroboration
+        # task (deduped by the existing ``Verify: {key}`` title guard) so the
+        # lower-confidence backfill tier is re-verified toward machine-verified
+        # coverage — and downgraded to 'partial' if that verification fails.
+        for _ck, _ctext in corroboration_targets.items():
+            await spawn_corroboration_task(
+                session,
+                project_id,
+                _ck,
+                _ctext,
+                "merged named_test backfill: the declared test shipped in the PR's "
+                "changed files but may not exercise the criterion's specific condition",
+                spawned_by=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                release_version_id=open_version.id,
+            )
+
+        if total or trials_enrolled:
+            logger.info(
+                "backfill_merged_named_test_coverage: project=%s "
+                "tasks_scanned=%d recorded=%d trials_enrolled=%d",
+                project_id,
+                offset,
+                total,
+                trials_enrolled,
+            )
+        return NamedTestBackfillResult(total, trials_enrolled=trials_enrolled)
+    except Exception:
+        logger.exception(
+            "backfill_merged_named_test_coverage: failed for project %s",
+            project_id,
+        )
+        return NamedTestBackfillResult(total, trials_enrolled=trials_enrolled)

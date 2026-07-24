@@ -71,6 +71,9 @@ from app.max_plan_pool import (
     _usage_gate_should_skip,
     _usage_headroom_rank,
     _usage_headroom_settings,
+    detect_persistently_dark_meters,
+    get_meter_reliability_stats,
+    _usage_dark_reason,
     _usage_snapshot_summary,
     usage_snapshot_summary_with_fallback,
     alternate_account_recovery_deadline,
@@ -173,11 +176,10 @@ class TestCascadeDisabledModels:
         # Unknown variants must not silently cascade to the whole account.
         assert cascade_disabled_models("claude-future") == ("claude-future",)
 
-    def test_fable_isolated_on_own_meter(self):
-        # TEMPORARY model (limited availability): tracked on its own meter
-        # until we know empirically whether a fable 429 implies the shared
-        # opus bucket is exhausted. Must not cascade to opus.
-        assert cascade_disabled_models("claude-fable-5") == ("claude-fable-5",)
+    def test_fable_cascades_to_opus_after_retirement(self):
+        # fable-5 availability window elapsed; it now cascades to the shared
+        # opus-4-8 meter like other legacy entries.
+        assert cascade_disabled_models("claude-fable-5") == ("claude-opus-4-8",)
 
 
 # ── _filter_providers_by_cli ──────────────────────────────────────────────────
@@ -3031,6 +3033,95 @@ class TestUsageSnapshotSummary:
         assert out["known"] is True
 
 
+class TestUsageDarkReason:
+    """Each ineligible/failing dark-meter state has a distinct machine-readable reason."""
+
+    def test_not_oauth_reason(self):
+        # API-key account without runtime_secret is still ineligible
+        acct = _acct(auth_mode="api_key", oauth_token=None)
+        assert _usage_dark_reason(acct) == "not_oauth"
+
+    def test_not_oauth_reason_with_runtime_secret_is_never_probed(self):
+        # Anthropic API-key account WITH runtime_secret is now meter-eligible → never_probed
+        acct = _acct(
+            provider="anthropic",
+            auth_mode="api_key",
+            oauth_token=None,
+            runtime_secret="sk-ant-api-key-test",
+        )
+        assert _usage_dark_reason(acct) == "never_probed"
+
+    def test_no_secret_reason(self):
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        assert _usage_dark_reason(acct) == "no_secret"
+
+    def test_secret_fetch_failed_reason(self):
+        """secret_fetch_failed is distinct from no_secret when a fetch was attempted."""
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        acct["secret_fetch_failed"] = True
+        assert _usage_dark_reason(acct) == "secret_fetch_failed"
+
+    def test_never_probed_reason(self):
+        # OAuth + secret but no probe attempt yet — fresh account.
+        acct = _acct(auth_mode="oauth", oauth_token="tok")
+        assert _usage_dark_reason(acct) == "never_probed"
+
+    def test_endpoint_error_after_failed_probe(self):
+        now = _utcnow()
+        acct = _acct(auth_mode="oauth", oauth_token="tok")
+        acct["usage_probe_failed_at"] = now
+        assert _usage_dark_reason(acct) == "endpoint_error"
+
+    def test_endpoint_error_when_snapshot_present_but_unknown(self):
+        now = _utcnow()
+        acct = _acct(auth_mode="oauth", oauth_token="tok")
+        acct["usage_snapshot"] = UsageSnapshot.unknown("2026-01-01T00:00:00")
+        acct["usage_snapshot_at"] = now
+        acct["usage_probe_failed_at"] = now
+        assert _usage_dark_reason(acct) == "endpoint_error"
+
+    def test_known_snapshot_dark_reason_is_none_via_summary(self):
+        now = _utcnow()
+        acct = _acct_usage(_acct(), _known_snap(10.0, 20.0), at=now)
+        out = _usage_snapshot_summary(acct, now)
+        assert out["known"] is True
+        assert out["dark_reason"] is None
+
+    def test_not_oauth_surfaced_in_summary(self):
+        acct = _acct(auth_mode="api_key", oauth_token=None)
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "not_oauth"
+
+    def test_no_secret_surfaced_in_summary(self):
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "no_secret"
+
+    def test_secret_fetch_failed_surfaced_in_summary(self):
+        """secret_fetch_failed reason propagates through the summary."""
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        acct["secret_fetch_failed"] = True
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "secret_fetch_failed"
+
+    def test_never_probed_surfaced_in_summary(self):
+        acct = _acct()  # default: oauth_token="sk-ant-test", no probe done
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "never_probed"
+
+    def test_endpoint_error_surfaced_in_summary(self):
+        now = _utcnow()
+        acct = _acct()
+        acct["usage_probe_failed_at"] = now
+        out = _usage_snapshot_summary(acct, now)
+        assert out["known"] is False
+        assert out["dark_reason"] == "endpoint_error"
+
+
 def _persisted_usage_blob(five, seven, *, updated_at):
     """Mirror the blob _persist_rate_limit_usage_to_db writes to the DB."""
     return {
@@ -3632,8 +3723,38 @@ class TestSnapshotFromPersistedUsage:
         assert snap.resets_at == {"five_hour": "2026-07-11T05:00:00Z"}
         assert snap.probed_at == at.isoformat()
 
+    def test_round_trips_messages_api_header_blob(self):
+        at = _utcnow()
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": at.isoformat(),
+            "unified_5h": {"utilization": 55.0, "resets_at": "2026-07-11T05:00:00Z"},
+        }
+        parsed = _snapshot_from_persisted_usage(raw)
+        assert parsed is not None
+        snap, stamp = parsed
+        assert stamp == at
+        assert snap.known is True
+        assert snap.window_utilizations == {"five_hour": 55.0}
+        assert snap.resets_at == {"five_hour": "2026-07-11T05:00:00Z"}
+
+    def test_messages_api_header_without_utilization_returns_none(self):
+        at = _utcnow()
+        # unified_5h present but no numeric utilization → no loadbearing window → None
+        assert (
+            _snapshot_from_persisted_usage(
+                {
+                    "source": "messages_api_header",
+                    "updated_at": at.isoformat(),
+                    "unified_5h": {"status": "live"},
+                }
+            )
+            is None
+        )
+
     def test_rejects_foreign_source_and_garbage(self):
         assert _snapshot_from_persisted_usage(None) is None
+        # messages_api_header with no updated_at or unified_5h → None
         assert _snapshot_from_persisted_usage({"source": "messages_api_header"}) is None
         assert (
             _snapshot_from_persisted_usage(
@@ -3767,6 +3888,96 @@ class TestRefreshUsageMeterSnapshots:
         count = await refresh_usage_meter_snapshots(now)
         assert scheduled == ["aging"]
         assert count == 1
+
+
+class TestDetectPersistentlyDarkMeters:
+    def _register(self, acct):
+        _account_by_id[acct["id"]] = acct
+        return acct
+
+    async def test_stale_failure_appears(self):
+        now = _utcnow()
+        threshold = 1800  # 2x the 900s display stale window
+        acct = self._register(
+            _acct(
+                id="stuck",
+                provider="anthropic",
+                auth_mode="oauth",
+                usage_probe_failed_at=now - timedelta(seconds=threshold + 1),
+            )
+        )
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "stuck" in ids
+        entry = next(r for r in result if r["id"] == "stuck")
+        assert entry["dark_reason"] == "endpoint_error"
+        assert entry["dark_since"] == acct["usage_probe_failed_at"]
+
+    async def test_recent_failure_excluded(self):
+        now = _utcnow()
+        threshold = 1800
+        self._register(
+            _acct(
+                id="recent-fail",
+                provider="anthropic",
+                auth_mode="oauth",
+                usage_probe_failed_at=now - timedelta(seconds=threshold - 60),
+            )
+        )
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "recent-fail" not in ids
+
+    async def test_known_snapshot_excluded(self):
+        now = _utcnow()
+        threshold = 1800
+        acct = self._register(
+            _acct(id="known", provider="anthropic", auth_mode="oauth")
+        )
+        # Snapshot is known and old enough that it would fail if checked for staleness
+        _acct_usage(acct, _known_snap(10.0, 10.0), at=now - timedelta(seconds=threshold + 1))
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "known" not in ids
+
+    async def test_non_eligible_account_excluded(self):
+        now = _utcnow()
+        threshold = 1800
+        # API key account without runtime_secret is ineligible (no key to probe with)
+        self._register(
+            _acct(
+                id="api-key",
+                provider="anthropic",
+                auth_mode="api_key",
+                usage_probe_failed_at=now - timedelta(seconds=threshold + 1),
+            )
+        )
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "api-key" not in ids
+
+    async def test_never_probed_past_threshold_appears(self):
+        now = _utcnow()
+        threshold = 1800
+        # No stamps at all → never probed, dark_since=None → qualifies (no stamp to bound with)
+        self._register(_acct(id="never", provider="anthropic", auth_mode="oauth"))
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "never" in ids
+        entry = next(r for r in result if r["id"] == "never")
+        assert entry["dark_reason"] == "never_probed"
+        assert entry["dark_since"] is None
+
+    async def test_all_fresh_emits_empty(self):
+        now = _utcnow()
+        threshold = 1800
+        acct = self._register(
+            _acct(id="fresh-ok", provider="anthropic", auth_mode="oauth")
+        )
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now - timedelta(seconds=60))
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "fresh-ok" not in ids
 
 
 # ── record_account_startup_failure / startup-failure breaker ────────────────
@@ -4444,6 +4655,77 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         assert entry.get("startup_failure_cooldown_at") is None
 
 
+@pytest.mark.asyncio
+class TestLoadMaxPlanPoolSecretFetchFailed:
+    """load_max_plan_pool sets secret_fetch_failed=True when Secret Manager raises."""
+
+    async def _load_with_sm_acct(self, secret_ref: str, monkeypatch, side_effect):
+        from app import max_plan_pool as mpp
+
+        acct = _FakeMaxPlanAccount("acct-sm")
+        acct.secret_blob_ref = secret_ref
+
+        async def _fake_get_user_secret(_ref):
+            raise side_effect
+
+        monkeypatch.setattr(
+            "app.secrets_manager.get_user_secret",
+            _fake_get_user_secret,
+        )
+        monkeypatch.setattr(
+            mpp, "AsyncSessionLocal", lambda: _FakeLoadSession([acct])
+        )
+        await mpp.load_max_plan_pool()
+        return _account_by_id[str(acct.id)]
+
+    async def test_secret_fetch_failure_sets_flag(self, monkeypatch):
+        """When Secret Manager raises, secret_fetch_failed must be True."""
+        entry = await self._load_with_sm_acct(
+            "projects/proj/secrets/mysecret/versions/latest",
+            monkeypatch,
+            RuntimeError("secret unavailable"),
+        )
+        assert entry["secret_fetch_failed"] is True
+
+    async def test_secret_fetch_failure_clears_runtime_secret(self, monkeypatch):
+        """When Secret Manager raises, runtime_secret must be None so the meter is dark."""
+        entry = await self._load_with_sm_acct(
+            "projects/proj/secrets/mysecret/versions/latest",
+            monkeypatch,
+            RuntimeError("secret unavailable"),
+        )
+        assert entry["runtime_secret"] is None
+
+    async def test_secret_fetch_failure_emits_warning(self, monkeypatch, caplog):
+        """When Secret Manager raises, a '[POOL] Usage meter: failed to fetch secret' warning is logged."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="app.max_plan_pool"):
+            await self._load_with_sm_acct(
+                "projects/proj/secrets/mysecret/versions/latest",
+                monkeypatch,
+                RuntimeError("secret unavailable"),
+            )
+        assert any(
+            "Usage meter: failed to fetch secret" in r.message
+            and r.levelno == logging.WARNING
+            for r in caplog.records
+        )
+
+    async def test_non_sm_secret_ref_leaves_flag_false(self, monkeypatch):
+        """A plain API-key secret_blob_ref must not set secret_fetch_failed."""
+        from app import max_plan_pool as mpp
+
+        acct = _FakeMaxPlanAccount("acct-plain")
+        acct.secret_blob_ref = "sk-ant-test"
+        monkeypatch.setattr(
+            mpp, "AsyncSessionLocal", lambda: _FakeLoadSession([acct])
+        )
+        await mpp.load_max_plan_pool()
+        entry = _account_by_id[str(acct.id)]
+        assert entry["secret_fetch_failed"] is False
+
+
 class TestGetTaskLlmAccountId:
     """get_task_llm_account_id prefers the promoted Task.llm_account_id column
     when present, falling back to the context JSONB for pre-migration rows or
@@ -4663,6 +4945,87 @@ async def test_persist_rate_limit_usage_no_row_is_noop(monkeypatch):
 
     # Should not raise
     await _persist_rate_limit_usage_to_db("nonexistent-id", snap)
+
+
+@pytest.mark.asyncio
+async def test_persist_rate_limit_usage_retries_and_counts_failures(monkeypatch):
+    """On DB failure, retries once and adds account to _usage_persist_failing_accounts."""
+    import app.max_plan_pool as pool_mod
+
+    from app.max_plan_pool import _persist_rate_limit_usage_to_db
+
+    snap = UsageSnapshot(
+        known=True,
+        window_utilizations={"five_hour": 30.0},
+        resets_at={},
+        probed_at="2026-07-09T12:00:00",
+    )
+
+    commit_call_count = 0
+
+    class FakeRow:
+        rate_limit_usage = None
+        updated_at = None
+
+    class FailThenSucceedSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a, **k):
+            pass
+
+        async def get(self, model, acct_id):
+            return FakeRow()  # row exists
+
+        def add(self, obj):
+            pass
+
+        async def commit(self):
+            nonlocal commit_call_count
+            commit_call_count += 1
+            if commit_call_count == 1:
+                raise Exception("transient DB error")
+
+    monkeypatch.setattr(
+        "app.max_plan_pool.AsyncSessionLocal",
+        lambda: FailThenSucceedSession(),
+    )
+    monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+    before = len(pool_mod._usage_persist_failing_accounts)
+    await _persist_rate_limit_usage_to_db("test-id", snap)
+    after = len(pool_mod._usage_persist_failing_accounts)
+
+    # Retry fired: commit was called twice (first fails, second succeeds).
+    assert commit_call_count == 2, (
+        f"expected 2 commit calls (1 fail + 1 retry), got {commit_call_count}"
+    )
+    # The attempt-0 failure adds test-id to the failing set, but the attempt-1
+    # retry succeeds and removes it — a transient hiccup that recovers nets zero,
+    # which lets `armable` recover instead of being permanently pinned False.
+    assert after == before, (
+        f"failing-account set should net zero after a transient fail+retry-success "
+        f"(was {before}, now {after})"
+    )
+
+
+def test_get_usage_persist_failure_count_reflects_module_counter():
+    """get_usage_persist_failure_count() returns len of the per-account failing set."""
+    import app.max_plan_pool as pool_mod
+
+    from app.max_plan_pool import get_usage_persist_failure_count
+
+    original = pool_mod._usage_persist_failing_accounts.copy()
+    try:
+        pool_mod._usage_persist_failing_accounts.clear()
+        assert get_usage_persist_failure_count() == 0
+        pool_mod._usage_persist_failing_accounts.update(
+            {f"fake-acct-{i}" for i in range(7)}
+        )
+        assert get_usage_persist_failure_count() == 7
+    finally:
+        pool_mod._usage_persist_failing_accounts.clear()
+        pool_mod._usage_persist_failing_accounts.update(original)
 
 
 # ── get_project_account_usage / get_user_project_pool_summary ────────────────
@@ -5486,3 +5849,145 @@ class TestSelectLLMRuntimeFiltersByRunnerCLIs:
             assert mock_select.called
         finally:
             self._reset_pools()
+
+
+# ── get_meter_reliability_stats ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestGetMeterReliabilityStats:
+    """Fleet-wide meter reliability aggregation."""
+
+    def _reg(self, acct):
+        _account_by_id[acct["id"]] = acct
+        return acct
+
+    async def test_empty_pool_returns_zero_counts(self):
+        result = await get_meter_reliability_stats()
+        assert result["meters_eligible"] == 0
+        assert result["meters_known"] == 0
+        assert result["meters_stale"] == 0
+        assert result["meters_dark"] == 0
+        assert result["coverage_ratio"] is None
+        assert result["armable"] is False
+
+    async def test_all_fresh_known_reports_full_coverage(self):
+        import app.max_plan_pool as pool_mod
+        now = _utcnow()
+        acct = self._reg(_acct(id="ok", provider="anthropic", auth_mode="oauth"))
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now)
+        original_failing = pool_mod._usage_persist_failing_accounts.copy()
+        try:
+            pool_mod._usage_persist_failing_accounts.clear()
+            result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+            assert result["meters_eligible"] == 1
+            assert result["meters_known"] == 1
+            assert result["meters_dark"] == 0
+            assert result["coverage_ratio"] == 1.0
+            assert result["armable"] is True
+        finally:
+            pool_mod._usage_persist_failing_accounts.clear()
+            pool_mod._usage_persist_failing_accounts.update(original_failing)
+
+    async def test_dark_account_reported_with_reason(self):
+        now = _utcnow()
+        acct = self._reg(
+            _acct(id="dark", provider="anthropic", auth_mode="oauth")
+        )
+        acct["usage_probe_failed_at"] = now
+        result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+        assert result["meters_eligible"] == 1
+        assert result["meters_dark"] == 1
+        assert result["meters_known"] == 0
+        assert result["dark_by_reason"].get("endpoint_error", 0) == 1
+        assert result["coverage_ratio"] == 0.0
+        assert result["armable"] is False
+
+    async def test_ineligible_account_not_counted_in_eligible(self):
+        now = _utcnow()
+        # API key account is ineligible
+        self._reg(_acct(id="apikey", provider="anthropic", auth_mode="api_key", oauth_token=None))
+        result = await get_meter_reliability_stats(now=now)
+        assert result["meters_ineligible"] == 1
+        assert result["meters_eligible"] == 0
+
+    async def test_stale_known_counted_separately(self):
+        import app.max_plan_pool as pool_mod
+        now = _utcnow()
+        stale_seconds = pool_mod._USAGE_METER_DISPLAY_STALE_SECONDS
+        acct = self._reg(_acct(id="stale", provider="anthropic", auth_mode="oauth"))
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now - timedelta(seconds=stale_seconds + 1))
+        result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+        assert result["meters_stale"] == 1
+        assert result["meters_known"] == 0
+        assert result["meters_eligible"] == 1
+        assert result["coverage_ratio"] == 0.0
+        assert result["armable"] is False
+
+    async def test_per_reason_dark_breakdown(self):
+        now = _utcnow()
+        acct_ep = self._reg(_acct(id="ep", provider="anthropic", auth_mode="oauth"))
+        acct_ep["usage_probe_failed_at"] = now
+        self._reg(_acct(id="np", provider="anthropic", auth_mode="oauth"))
+        # never_probed: no stamps, no snapshot
+        result = await get_meter_reliability_stats(now=now)
+        assert result["dark_by_reason"].get("endpoint_error", 0) == 1
+        assert result["dark_by_reason"].get("never_probed", 0) == 1
+        assert result["meters_dark"] == 2
+
+    async def test_persist_failure_count_reflected(self):
+        import app.max_plan_pool as pool_mod
+        now = _utcnow()
+        acct = self._reg(_acct(id="ok2", provider="anthropic", auth_mode="oauth"))
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now)
+        original_failing = pool_mod._usage_persist_failing_accounts.copy()
+        try:
+            pool_mod._usage_persist_failing_accounts.update(
+                {"fake-fail-1", "fake-fail-2", "fake-fail-3"}
+            )
+            result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+            assert result["persist_failure_count"] >= 3
+            # armable requires zero persist failures
+            assert result["armable"] is False
+        finally:
+            pool_mod._usage_persist_failing_accounts.clear()
+            pool_mod._usage_persist_failing_accounts.update(original_failing)
+
+    async def test_coverage_ratio_zero_eligible_returns_none(self):
+        result = await get_meter_reliability_stats(min_coverage_pct=0)
+        assert result["coverage_ratio"] is None
+        assert result["armable"] is False
+
+    async def test_db_persisted_blob_covers_dark_in_memory_account(self, monkeypatch):
+        """Non-leader instances have no in-memory snapshot, but the leader's
+        probe is persisted to MaxPlanAccount.rate_limit_usage. The fresher-of-two
+        fallback must classify such an account as known, not dark."""
+        import app.max_plan_pool as pool_mod
+
+        now = _utcnow()
+        acct = self._reg(_acct(id="nonleader", provider="anthropic", auth_mode="oauth"))
+        # in-memory is dark (never probed on this non-leader instance)
+        assert acct.get("usage_snapshot") is None
+
+        async def _fake_blobs():
+            return {
+                "nonleader": {
+                    "source": "oauth_usage_probe",
+                    "updated_at": now.isoformat(),
+                    "five_hour": {"utilization": 12.0},
+                    "seven_day": {"utilization": 8.0},
+                }
+            }
+
+        monkeypatch.setattr(pool_mod, "_load_persisted_usage_blobs", _fake_blobs)
+        original_failing = pool_mod._usage_persist_failing_accounts.copy()
+        try:
+            pool_mod._usage_persist_failing_accounts.clear()
+            result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+            assert result["meters_known"] == 1
+            assert result["meters_dark"] == 0
+            assert result["coverage_ratio"] == 1.0
+            assert result["armable"] is True
+        finally:
+            pool_mod._usage_persist_failing_accounts.clear()
+            pool_mod._usage_persist_failing_accounts.update(original_failing)

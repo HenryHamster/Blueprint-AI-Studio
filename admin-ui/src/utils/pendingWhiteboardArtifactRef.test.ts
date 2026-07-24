@@ -34,7 +34,6 @@ function operation() {
     toolTitle: 'Board',
     revision: 4,
     intent: 'ask',
-    laneOwner: 'Operator keeps layout; Resident verifies assumptions.',
     prompt: 'Review Board revision 4 and answer my question.',
     renderedImage: {
       attachment_id: 'upload-4',
@@ -54,7 +53,7 @@ describe('pending Whiteboard ArtifactRef operation', () => {
     vi.restoreAllMocks();
   });
 
-  test('polls 202 to 201 with the exact same receipt and rendered payload', async () => {
+  test('polls 202 to ready with the exact same receipt and rendered payload', async () => {
     const pending = operation();
     expect(persistPendingWhiteboardArtifactOperation(pending)).toBe(true);
     const responses: ResidentToolArtifactCreateResponse[] = [
@@ -67,36 +66,34 @@ describe('pending Whiteboard ArtifactRef operation', () => {
       { state: 'ready', artifact_ref: ARTIFACT_REF },
     ];
     const request = vi.fn().mockImplementation(async () => responses.shift());
+    const wait = vi.fn(async () => undefined);
 
-    const result = await settlePendingWhiteboardArtifactOperation(pending, {
-      request,
-      wait: async () => undefined,
-    });
+    const result = await settlePendingWhiteboardArtifactOperation(pending, { request, wait });
 
     expect(result.state).toBe('ready');
     expect(request).toHaveBeenCalledTimes(2);
     expect(request.mock.calls[1]).toEqual(request.mock.calls[0]);
     expect(request.mock.calls[0][3]).toBe(pending.rendered_image);
+    expect(wait).toHaveBeenCalledWith(5000);
   });
 
-  test('recovers a lost 201 response by replaying the same identity', async () => {
+  test('recovers a lost ready response by replaying the same identity', async () => {
     const pending = operation();
     persistPendingWhiteboardArtifactOperation(pending);
     const request = vi.fn()
       .mockRejectedValueOnce(new TypeError('network response lost'))
       .mockResolvedValueOnce({ state: 'ready', artifact_ref: ARTIFACT_REF });
+    const wait = vi.fn(async () => undefined);
 
-    const result = await settlePendingWhiteboardArtifactOperation(pending, {
-      request,
-      wait: async () => undefined,
-    });
+    const result = await settlePendingWhiteboardArtifactOperation(pending, { request, wait });
 
     expect(result.state).toBe('ready');
     expect(request).toHaveBeenCalledTimes(2);
     expect(request.mock.calls[1]).toEqual(request.mock.calls[0]);
+    expect(wait).toHaveBeenCalledWith(2500);
   });
 
-  test('loads the full operation after a remount and resumes without rendering or uploading', async () => {
+  test('loads the full operation after remount and resumes exact receipt', async () => {
     const beforeRemount = operation();
     persistPendingWhiteboardArtifactOperation(beforeRemount);
 
@@ -104,7 +101,6 @@ describe('pending Whiteboard ArtifactRef operation', () => {
     expect(afterRemount).toMatchObject({
       operation_id: beforeRemount.operation_id,
       intent: 'ask',
-      lane_owner: beforeRemount.lane_owner,
       receipt_id: 'upload-4',
       rendered_image: beforeRemount.rendered_image,
     });
@@ -129,7 +125,33 @@ describe('pending Whiteboard ArtifactRef operation', () => {
     await expect(first).resolves.toMatchObject({ state: 'ready' });
   });
 
-  test('terminal rejection preserves user intent and receipt for an explicit fresh retry', async () => {
+  test('persists an exponential next retry so repeated Resume clicks stay below 30/minute', async () => {
+    const pending = operation();
+    persistPendingWhiteboardArtifactOperation(pending);
+    const request = vi.fn().mockRejectedValue(new TypeError('network unavailable'));
+    const waits: number[] = [];
+
+    const first = await settlePendingWhiteboardArtifactOperation(pending, {
+      request,
+      maxAttempts: 1,
+      wait: async delay => { waits.push(delay); },
+    });
+    expect(first).toMatchObject({
+      state: 'waiting',
+      operation: { attempt_count: 1 },
+    });
+    expect(first.operation.next_retry_at).toBeGreaterThanOrEqual(first.operation.updated_at + 2500);
+
+    await settlePendingWhiteboardArtifactOperation(first.operation, {
+      request,
+      maxAttempts: 1,
+      wait: async delay => { waits.push(delay); },
+    });
+    expect(waits[0]).toBeGreaterThanOrEqual(2400);
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  test('terminal rejection preserves user intent and receipt for a fresh render', async () => {
     const pending = operation();
     persistPendingWhiteboardArtifactOperation(pending);
 
@@ -143,7 +165,6 @@ describe('pending Whiteboard ArtifactRef operation', () => {
       state: 'terminal',
       operation: {
         intent: 'ask',
-        lane_owner: pending.lane_owner,
         receipt_id: 'upload-4',
         last_error: 'revision changed',
       },

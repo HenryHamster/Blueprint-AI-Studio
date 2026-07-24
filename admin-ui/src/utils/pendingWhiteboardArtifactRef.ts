@@ -9,13 +9,7 @@ import {
 
 const STORAGE_PREFIX = 'resident_whiteboard_artifact_operation:v1';
 const STORAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_SCOPED_OPERATIONS = 20;
-// The server already performs a bounded reconciliation wait before returning
-// 202. One immediate replay covers the common completion/lost-response path
-// without leaving the composer-looking control busy for several minutes.
 const DEFAULT_MAX_ATTEMPTS = 2;
-const MIN_RETRY_MS = 250;
-const MAX_RETRY_MS = 30_000;
 
 export type WhiteboardArtifactOperationState = 'pending' | 'terminal';
 
@@ -28,13 +22,13 @@ export interface PendingWhiteboardArtifactOperation {
   tool_title: string;
   revision: number;
   intent: 'share' | 'ask';
-  lane_owner?: string;
   prompt: string;
   receipt_id: string;
   rendered_image: ResidentRenderedImageReceipt;
   state: WhiteboardArtifactOperationState;
   promotion_intent_id?: string;
   retry_after_ms?: number;
+  next_retry_at?: number;
   attempt_count: number;
   last_error?: string;
   created_at: number;
@@ -42,15 +36,8 @@ export interface PendingWhiteboardArtifactOperation {
 }
 
 export type WhiteboardArtifactSettlement =
-  | {
-      state: 'ready';
-      artifactRef: ResidentToolArtifactRef;
-      operation: PendingWhiteboardArtifactOperation;
-    }
-  | {
-      state: 'waiting' | 'terminal';
-      operation: PendingWhiteboardArtifactOperation;
-    };
+  | { state: 'ready'; artifactRef: ResidentToolArtifactRef; operation: PendingWhiteboardArtifactOperation }
+  | { state: 'waiting' | 'terminal'; operation: PendingWhiteboardArtifactOperation };
 
 interface CreateOperationInput {
   actorUserId: string;
@@ -59,7 +46,6 @@ interface CreateOperationInput {
   toolTitle: string;
   revision: number;
   intent: 'share' | 'ask';
-  laneOwner?: string;
   prompt: string;
   renderedImage: ResidentRenderedImageReceipt;
 }
@@ -77,33 +63,13 @@ interface SettleOptions {
 
 const activeSettlements = new Map<string, Promise<WhiteboardArtifactSettlement>>();
 
-function encode(value: string): string {
-  return encodeURIComponent(value);
-}
-
 function scopePrefix(actorUserId: string, projectId: string, toolId: string): string {
-  return `${STORAGE_PREFIX}:${encode(actorUserId)}:${encode(projectId)}:${encode(toolId)}:`;
+  return `${STORAGE_PREFIX}:${encodeURIComponent(actorUserId)}:${encodeURIComponent(projectId)}:${encodeURIComponent(toolId)}:`;
 }
 
 function storageKey(operation: Pick<PendingWhiteboardArtifactOperation,
   'actor_user_id' | 'project_id' | 'tool_id' | 'receipt_id'>): string {
-  return `${scopePrefix(operation.actor_user_id, operation.project_id, operation.tool_id)}${encode(operation.receipt_id)}`;
-}
-
-function newOperationId(): string {
-  return globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function isRenderedImage(value: unknown): value is ResidentRenderedImageReceipt {
-  if (!value || typeof value !== 'object') return false;
-  const image = value as Partial<ResidentRenderedImageReceipt>;
-  return typeof image.attachment_id === 'string'
-    && image.attachment_id.length > 0
-    && typeof image.storage_uri === 'string'
-    && image.storage_uri.length > 0
-    && typeof image.checksum === 'string'
-    && image.checksum.length > 0;
+  return `${scopePrefix(operation.actor_user_id, operation.project_id, operation.tool_id)}${encodeURIComponent(operation.receipt_id)}`;
 }
 
 function parseOperation(
@@ -121,20 +87,16 @@ function parseOperation(
       || value.project_id !== projectId
       || value.tool_id !== toolId
       || typeof value.tool_title !== 'string'
-      || typeof value.revision !== 'number'
       || !Number.isSafeInteger(value.revision)
       || (value.intent !== 'share' && value.intent !== 'ask')
       || typeof value.prompt !== 'string'
       || typeof value.receipt_id !== 'string'
-      || !isRenderedImage(value.rendered_image)
+      || !value.rendered_image
       || value.rendered_image.attachment_id !== value.receipt_id
       || (value.state !== 'pending' && value.state !== 'terminal')
       || !Number.isSafeInteger(value.attempt_count)
-      || (value.attempt_count ?? -1) < 0
       || typeof value.created_at !== 'number'
-      || !Number.isFinite(value.created_at)
       || typeof value.updated_at !== 'number'
-      || !Number.isFinite(value.updated_at)
       || value.updated_at < Date.now() - STORAGE_TTL_MS
     ) return null;
     return value as PendingWhiteboardArtifactOperation;
@@ -149,14 +111,14 @@ export function createPendingWhiteboardArtifactOperation(
   const now = Date.now();
   return {
     version: 1,
-    operation_id: newOperationId(),
+    operation_id: globalThis.crypto?.randomUUID?.()
+      ?? `${now}-${Math.random().toString(36).slice(2)}`,
     actor_user_id: input.actorUserId,
     project_id: input.projectId,
     tool_id: input.toolId,
     tool_title: input.toolTitle,
     revision: input.revision,
     intent: input.intent,
-    ...(input.laneOwner ? { lane_owner: input.laneOwner } : {}),
     prompt: input.prompt,
     receipt_id: input.renderedImage.attachment_id,
     rendered_image: input.renderedImage,
@@ -188,9 +150,7 @@ export function removePendingWhiteboardArtifactOperation(
       ? parseOperation(raw, operation.actor_user_id, operation.project_id, operation.tool_id)
       : null;
     if (current?.operation_id === operation.operation_id) localStorage.removeItem(key);
-  } catch {
-    // A later mount can replay a ready response and acknowledge the handoff.
-  }
+  } catch { /* retry on a later mount */ }
 }
 
 export function loadPendingWhiteboardArtifactOperations(
@@ -200,41 +160,24 @@ export function loadPendingWhiteboardArtifactOperations(
 ): PendingWhiteboardArtifactOperation[] {
   const prefix = scopePrefix(actorUserId, projectId, toolId);
   const operations: PendingWhiteboardArtifactOperation[] = [];
-  const invalidKeys: string[] = [];
   try {
-    for (let index = 0; index < localStorage.length; index += 1) {
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
       const key = localStorage.key(index);
       if (!key?.startsWith(prefix)) continue;
       const raw = localStorage.getItem(key);
       const operation = raw ? parseOperation(raw, actorUserId, projectId, toolId) : null;
       if (operation) operations.push(operation);
-      else invalidKeys.push(key);
+      else localStorage.removeItem(key);
     }
-    for (const key of invalidKeys) localStorage.removeItem(key);
   } catch {
     return [];
   }
-  operations.sort((left, right) => left.created_at - right.created_at
-    || left.operation_id.localeCompare(right.operation_id));
-  const excess = operations.slice(0, Math.max(0, operations.length - MAX_SCOPED_OPERATIONS));
-  for (const operation of excess) removePendingWhiteboardArtifactOperation(operation);
-  return operations.slice(-MAX_SCOPED_OPERATIONS);
-}
-
-function retryDelay(responseDelay: number | undefined, attempt: number): number {
-  const exponential = 500 * (2 ** Math.max(0, attempt - 1));
-  return Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, responseDelay ?? exponential));
-}
-
-function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message : 'Whiteboard preparation failed.';
+  return operations.sort((left, right) => left.created_at - right.created_at);
 }
 
 function isRetryable(cause: unknown): boolean {
   if (cause instanceof ToolArtifactConflictError) return false;
   if (cause instanceof ToolArtifactRequestError) return cause.retryable;
-  // A fetch rejection has no reliable effect boundary. Retrying the exact
-  // receipt and body is the only safe way to reconcile a lost 201 response.
   return true;
 }
 
@@ -246,11 +189,13 @@ async function settle(
   const wait = options.wait ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs)));
   const maxAttempts = Math.max(1, Math.min(10, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS));
   let operation = initial;
-
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const remainingDelayMs = Math.max(0, (operation.next_retry_at ?? 0) - Date.now());
+    if (remainingDelayMs > 0) await wait(remainingDelayMs);
     operation = {
       ...operation,
       state: 'pending',
+      next_retry_at: undefined,
       attempt_count: operation.attempt_count + 1,
       updated_at: Date.now(),
     };
@@ -266,28 +211,34 @@ async function settle(
         return { state: 'ready', artifactRef: response.artifact_ref, operation };
       }
       if (response.receipt_id !== operation.receipt_id) {
-        operation = {
-          ...operation,
-          state: 'terminal',
-          last_error: 'Server returned a different Whiteboard upload receipt.',
-          updated_at: Date.now(),
-        };
+        operation = { ...operation, state: 'terminal', last_error: 'Server returned a different Whiteboard upload receipt.', updated_at: Date.now() };
         persistPendingWhiteboardArtifactOperation(operation);
         return { state: 'terminal', operation };
       }
+      const retryDelayMs = Math.max(
+        2_500,
+        response.retry_after_ms,
+        Math.min(2_500 * (2 ** Math.max(0, operation.attempt_count - 1)), 30_000),
+      );
       operation = {
         ...operation,
         promotion_intent_id: response.promotion_intent_id,
         retry_after_ms: response.retry_after_ms,
+        next_retry_at: Date.now() + retryDelayMs,
         last_error: undefined,
         updated_at: Date.now(),
       };
       persistPendingWhiteboardArtifactOperation(operation);
-      if (attempt < maxAttempts) await wait(retryDelay(response.retry_after_ms, attempt));
     } catch (cause) {
+      const retryDelayMs = Math.max(
+        2_500,
+        operation.retry_after_ms ?? 0,
+        Math.min(2_500 * (2 ** Math.max(0, operation.attempt_count - 1)), 30_000),
+      );
       operation = {
         ...operation,
-        last_error: errorMessage(cause),
+        last_error: cause instanceof Error ? cause.message : 'Whiteboard preparation failed.',
+        next_retry_at: Date.now() + retryDelayMs,
         updated_at: Date.now(),
       };
       if (!isRetryable(cause)) {
@@ -296,10 +247,8 @@ async function settle(
         return { state: 'terminal', operation };
       }
       persistPendingWhiteboardArtifactOperation(operation);
-      if (attempt < maxAttempts) await wait(retryDelay(operation.retry_after_ms, attempt));
     }
   }
-
   return { state: 'waiting', operation };
 }
 
@@ -310,9 +259,7 @@ export function settlePendingWhiteboardArtifactOperation(
   const active = activeSettlements.get(operation.operation_id);
   if (active) return active;
   const promise = settle(operation, options).finally(() => {
-    if (activeSettlements.get(operation.operation_id) === promise) {
-      activeSettlements.delete(operation.operation_id);
-    }
+    if (activeSettlements.get(operation.operation_id) === promise) activeSettlements.delete(operation.operation_id);
   });
   activeSettlements.set(operation.operation_id, promise);
   return promise;

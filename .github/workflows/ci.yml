@@ -395,12 +395,25 @@ jobs:
   backend:
     name: CI / Backend (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Hard ceiling: a balanced shard runs ~2-3.5 min, so 10 min catches a hung
-    # test fast. pytest --timeout=30 uses the thread method, which CANNOT
+    # Hard ceiling: catches a hung test instead of letting GH Actions' 360-min
+    # default stall the runner for 6h and wedge the rollup. Raised 10 -> 20
+    # (2026-07-23), then 20 -> 30 (2026-07-24): shards are balanced by even test
+    # COUNT unless a backend/.test_durations file is committed, and there isn't
+    # one, so the spread is wide — on run 30053310362 shards 3-8 finished in
+    # 3:48-8:32 while shard 2 was healthy but only 47% done when the 10-min
+    # ceiling killed it. At 20 min shard 2 got all the way to 94%, still passing,
+    # and was killed with ~2 min of work left (run 30062720109); the other seven
+    # shards finished in 4:37-8:38, so 30 leaves real headroom on the one slow leg
+    # without meaningfully delaying detection of a genuine hang.
+    # A ceiling that kills a *passing* shard silently drops its remaining tests
+    # from the merge gate, which is worse than catching a hang 10 min later
+    # (fail-fast is false, so a hung shard never blocks its siblings). The real
+    # fix is committing .test_durations so pytest-split balances by time.
+    # pytest --timeout=30 uses the thread method, which CANNOT
     # interrupt a non-Python block (real I/O / C-level / asyncio deadlock); GH
     # Actions' default job timeout is 360 min, so without this a single hang
     # stalls the runner for 6h and wedges the rollup. This is the catch-all.
-    timeout-minutes: 10
+    timeout-minutes: 30
     needs: [detect, backend-deps]
     if: needs.detect.outputs.backend == 'true'
     # Sharded: the suite (~7k tests, ~11.5 min serial) is split into 8 parallel

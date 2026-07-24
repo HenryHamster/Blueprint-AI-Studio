@@ -40,6 +40,8 @@ from app.routers.runner import (
 from app.runner_health_monitors import (
     _RUNNER_DEGRADED_FAILURE_THRESHOLD,
     _RUNNER_LIVENESS_SECONDS,
+    _get_degraded_failure_threshold,
+    _get_liveness_seconds,
     _check_post_update_silent_runners,
     _cleanup_stale_heartbeat_snapshots,
 )
@@ -107,21 +109,22 @@ async def _make_runner(session, *, version="v1", capabilities=None, last_seen_at
 
 
 def test_liveness_constant_shared_from_canonical_source():
-    """runner.py and admin_runners.py must import _RUNNER_LIVENESS_SECONDS
-    and _RUNNER_DEGRADED_FAILURE_THRESHOLD from runner_health_monitors, not
-    define their own copies — ensures a single change propagates to all consumers.
+    """Both routers must use the canonical liveness source.
+
+    The runner heartbeat keeps the static compatibility constant while the
+    admin health view intentionally calls the runtime-config-aware getter.
     """
     assert runner_mod._RUNNER_LIVENESS_SECONDS is _RUNNER_LIVENESS_SECONDS, (
         "runner.py defines its own _RUNNER_LIVENESS_SECONDS instead of importing "
         "from runner_health_monitors"
     )
-    assert admin_runners_mod._RUNNER_LIVENESS_SECONDS is _RUNNER_LIVENESS_SECONDS, (
-        "admin_runners.py defines its own _RUNNER_LIVENESS_SECONDS instead of "
-        "importing from runner_health_monitors"
-    )
-    assert admin_runners_mod._RUNNER_DEGRADED_FAILURE_THRESHOLD is _RUNNER_DEGRADED_FAILURE_THRESHOLD, (
-        "admin_runners.py defines its own degraded threshold instead of importing "
+    assert admin_runners_mod._get_liveness_seconds is _get_liveness_seconds, (
+        "admin_runners.py must import the runtime-config-aware liveness getter "
         "from runner_health_monitors"
+    )
+    assert admin_runners_mod._get_degraded_failure_threshold is _get_degraded_failure_threshold, (
+        "admin_runners.py must import the runtime-config-aware degraded threshold "
+        "getter from runner_health_monitors"
     )
     # Confirm the canonical values remain correct.
     assert _RUNNER_LIVENESS_SECONDS == 300

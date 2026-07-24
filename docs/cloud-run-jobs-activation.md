@@ -103,7 +103,7 @@ until the steps below are completed.
    healthy — append:
 
    ```text
-   review, panel_review, debug, perf
+   review, debug, perf
    ```
 
    > ⚠️ **Do NOT add `smoketest` / `verify_tests` / `compute_experiment` (or any

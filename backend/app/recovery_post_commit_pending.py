@@ -20,9 +20,11 @@ function-locally here to avoid a circular-import at module initialisation time.
 
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, text
+from sqlalchemy import case, func, or_, text
+from sqlalchemy.orm import aliased
 from sqlmodel import select
 
 from app import services
@@ -705,6 +707,168 @@ async def _sweep_post_commit_pending():
 # treated as genuinely stranded. Comfortably exceeds the _process_post_commit
 # call budget (260s) so an in-flight pass has provably ended.
 _CHILDLESS_EVALUATING_NO_MARKER_GRACE_S = 600
+_CHILDLESS_EVALUATING_MAX_RECOVERY_ATTEMPTS = 20
+_CHILDLESS_RECOVERY_CLAIM_TTL_S = 360
+_CHILDLESS_RECOVERY_META_KEY = "_childless_post_commit_recovery"
+
+
+async def _claim_childless_evaluating_recovery(task_id) -> dict | None:
+    """Atomically revalidate and claim one marker-less recovery attempt."""
+    async with services.AsyncSessionLocal() as session:
+        locked = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked is None:
+            return None
+        plan_output = locked.plan_output
+        if (
+            locked.status != TaskStatus.EVALUATING
+            or locked.post_commit_pending
+            or (locked.first_payload or {}).get("type") != "plan"
+            or not isinstance(plan_output, dict)
+            or not isinstance(plan_output.get("subtasks"), list)
+            or not plan_output.get("subtasks")
+        ):
+            return None
+        ctx = dict(locked.context or {})
+        meta = dict(ctx.get(_CHILDLESS_RECOVERY_META_KEY) or {})
+        child_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(Task.parent_task_id == task_id)
+            )
+        ).scalar_one()
+        if child_count:
+            # A previous recovery may have succeeded and then died before its
+            # caller could observe the return. Child creation is the durable
+            # success signal; remove retry metadata so successful parents do
+            # not occupy the bounded candidate page forever.
+            if _CHILDLESS_RECOVERY_META_KEY in ctx:
+                ctx.pop(_CHILDLESS_RECOVERY_META_KEY, None)
+                locked.context = ctx
+                from sqlalchemy.orm.attributes import flag_modified
+
+                flag_modified(locked, "context")
+                session.add(locked)
+                await session.commit()
+            return None
+
+        # The ten-minute grace protects only the FIRST recovery attempt. Claim
+        # and failure bookkeeping updates Task.updated_at, so applying the age
+        # guard to retries would accidentally delay every retry by ten minutes.
+        if not meta and locked.updated_at >= _utcnow() - timedelta(
+            seconds=_CHILDLESS_EVALUATING_NO_MARKER_GRACE_S
+        ):
+            return None
+        claimed_at = meta.get("claimed_at")
+        if claimed_at:
+            try:
+                claim_age_s = (
+                    _utcnow() - datetime.fromisoformat(claimed_at)
+                ).total_seconds()
+            except (TypeError, ValueError):
+                claim_age_s = _CHILDLESS_RECOVERY_CLAIM_TTL_S
+            if claim_age_s < _CHILDLESS_RECOVERY_CLAIM_TTL_S:
+                return None
+        attempts = int(meta.get("attempts") or 0)
+        if attempts >= _CHILDLESS_EVALUATING_MAX_RECOVERY_ATTEMPTS:
+            ctx["_childless_post_commit_abandoned"] = {
+                "at": _utcnow().isoformat(),
+                "after_attempts": attempts,
+                "last_error": meta.get("last_error"),
+            }
+            ctx.pop(_CHILDLESS_RECOVERY_META_KEY, None)
+            locked.context = ctx
+            locked.status = TaskStatus.FAILED
+            locked.post_commit_failed = True
+            locked.latest_status_message = (
+                "Failed: childless plan recovery exhausted "
+                f"{attempts} attempts; requeue required"
+            )
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(locked, "context")
+            session.add(locked)
+            await session.commit()
+            logger.error(
+                "[POST_COMMIT SWEEP] Marker-less childless plan %s exhausted "
+                "%s attempts; terminalized instead of retrying forever",
+                str(task_id)[:8],
+                attempts,
+            )
+            return {"terminalized": True}
+
+        claim_token = uuid.uuid4().hex
+        now_iso = _utcnow().isoformat()
+        meta.setdefault("first_attempt_at", now_iso)
+        meta["last_attempt_at"] = now_iso
+        meta["claimed_at"] = now_iso
+        meta["claim_token"] = claim_token
+        meta["attempts"] = attempts + 1
+        ctx[_CHILDLESS_RECOVERY_META_KEY] = meta
+        locked.context = ctx
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(locked, "context")
+        session.add(locked)
+        await session.commit()
+        return {
+            "plan_output": plan_output,
+            "attempts": attempts + 1,
+            "claim_token": claim_token,
+        }
+
+
+async def _record_childless_recovery_failure(
+    task_id, claim_token: str, exc: Exception
+) -> None:
+    async with services.AsyncSessionLocal() as session:
+        task = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if task is None:
+            return
+        ctx = dict(task.context or {})
+        meta = dict(ctx.get(_CHILDLESS_RECOVERY_META_KEY) or {})
+        # A cancel/requeue/archive may win after the claimed post-commit call
+        # starts (including while it is blocked on lifecycle locks). Never
+        # recreate stale attempt metadata on that newer task state.
+        if (
+            task.status != TaskStatus.EVALUATING
+            or task.archived
+            or task.post_commit_pending
+            or meta.get("claim_token") != claim_token
+        ):
+            return
+        meta["last_error"] = f"{type(exc).__name__}: {exc}"[:1000]
+        meta["last_failure_at"] = _utcnow().isoformat()
+        meta.pop("claimed_at", None)
+        if getattr(exc, "lock_scope", None):
+            meta["last_lock_scope"] = exc.lock_scope
+        ctx[_CHILDLESS_RECOVERY_META_KEY] = meta
+        task.context = ctx
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
 
 
 async def _recover_childless_evaluating_without_marker():
@@ -751,61 +915,74 @@ async def _recover_childless_evaluating_without_marker():
     now = _utcnow()
     grace_cutoff = now - timedelta(seconds=_CHILDLESS_EVALUATING_NO_MARKER_GRACE_S)
     try:
+        # Keep this transaction short: fetch only candidate ids, then release
+        # the connection before any bounded post-commit call (up to 260s).
+        # Retry metadata bypasses the initial age gate because bookkeeping
+        # writes refresh Task.updated_at; the claim transaction remains the
+        # authoritative state/lease check.
         async with services.AsyncSessionLocal() as session:
-            # Candidate parents: EVALUATING, not archived, NO pending marker
-            # (the marker-based loop owns marked rows), updated long enough ago
-            # to clear the in-flight-spawn grace. ``plan_output`` must be loaded
-            # — it is the COMPLETED-report signal and the re-run source. Bounded.
-            candidates = (
-                (
-                    await session.execute(
-                        select(Task)
-                        .where(
-                            Task.status == TaskStatus.EVALUATING,
-                            Task.archived.is_(False),
-                            Task.post_commit_pending.is_(False),
-                            Task.updated_at < grace_cutoff,
-                        )
-                        .limit(50)
-                    )
+            if resolve_dialect_name(session) == "postgresql":
+                subtasks = Task.plan_output["subtasks"]
+                subtask_count = case(
+                    (
+                        func.jsonb_typeof(subtasks) == "array",
+                        func.jsonb_array_length(subtasks),
+                    ),
+                    else_=0,
                 )
-                .scalars()
-                .all()
+            else:
+                subtask_count = case(
+                    (
+                        func.json_type(Task.plan_output, "$.subtasks") == "array",
+                        func.json_array_length(Task.plan_output, "$.subtasks"),
+                    ),
+                    else_=0,
+                )
+            nonempty_subtasks = subtask_count > 0
+            candidate_child = aliased(Task)
+            no_children = ~(
+                select(candidate_child.id)
+                .where(candidate_child.parent_task_id == Task.id)
+                .correlate(Task)
+                .exists()
             )
-            if not candidates:
-                return
-
-            for task in candidates:
-                _mark_orchestrator_progress()
-                # Only plan parents that actually reported a non-empty plan.
-                # ``plan_output`` is persisted at the COMPLETED→EVALUATING flip
-                # (plan_completion.py) and only for the spawn path; its presence
-                # with subtasks is the "saved payload.status == COMPLETED" signal
-                # for a marker-less row.
-                plan_output = task.plan_output
-                if not (
-                    isinstance(plan_output, dict)
-                    and isinstance(plan_output.get("subtasks"), list)
-                    and plan_output.get("subtasks")
-                ):
-                    continue
-                task_type = (task.first_payload or {}).get("type", "") or ""
-                if task_type != "plan":
-                    continue
-                # ZERO-children-only guard (load-bearing — avoids duplicates).
-                child_count = (
-                    await session.execute(
-                        select(func.count())
-                        .select_from(Task)
-                        .where(Task.parent_task_id == task.id)
+            retry_attempt_exists = (
+                Task.context[_CHILDLESS_RECOVERY_META_KEY]["attempts"]
+                .as_integer()
+                .is_not(None)
+            )
+            candidate_ids = (
+                await session.execute(
+                    select(Task.id)
+                    .where(
+                        Task.status == TaskStatus.EVALUATING,
+                        Task.archived.is_(False),
+                        Task.post_commit_pending.is_(False),
+                        Task.payloads[0]["type"].as_string() == "plan",
+                        Task.plan_output.is_not(None),
+                        nonempty_subtasks,
+                        no_children,
+                        or_(Task.updated_at < grace_cutoff, retry_attempt_exists),
                     )
-                ).scalar_one()
-                if child_count:
+                    .order_by(Task.updated_at.asc())
+                    .limit(50)
+                )
+            )
+            candidate_ids = candidate_ids.scalars().all()
+        if not candidate_ids:
+            return
+
+        for task_id in candidate_ids:
+            try:
+                _mark_orchestrator_progress()
+                claim = await _claim_childless_evaluating_recovery(task_id)
+                if not claim or claim.get("terminalized"):
                     continue
+                plan_output = claim["plan_output"]
 
                 logger.warning(
                     f"[POST_COMMIT SWEEP] Marker-less childless EVALUATING plan "
-                    f"{str(task.id)[:8]} (reported COMPLETED, plan_output present, "
+                    f"{str(task_id)[:8]} (reported COMPLETED, plan_output present, "
                     f"0 children, EVALUATING > "
                     f"{_CHILDLESS_EVALUATING_NO_MARKER_GRACE_S}s) — re-running "
                     f"completion handler to spawn missing children"
@@ -816,36 +993,50 @@ async def _recover_childless_evaluating_without_marker():
                 # extraction), so a JSON-serialized plan_output round-trips.
                 try:
                     synthetic = AgentStatusPayload(
-                        task_id=task.id,
+                        task_id=task_id,
                         status=TaskStatus.COMPLETED,
                         logs=json.dumps(plan_output),
                     )
                 except Exception as build_exc:
                     logger.warning(
                         f"[POST_COMMIT SWEEP] Could not build synthetic payload "
-                        f"for plan {str(task.id)[:8]}: {build_exc}"
+                        f"for plan {str(task_id)[:8]}: {build_exc}"
                     )
                     continue
                 try:
                     await services._bounded(
-                        _process_post_commit(task.id, synthetic),
+                        _process_post_commit(
+                            task_id,
+                            synthetic,
+                            _expected_childless_recovery_token=claim["claim_token"],
+                        ),
                         services._POST_COMMIT_CALL_TIMEOUT_S,
-                        what=f"childless-eval re-run {str(task.id)[:8]}",
+                        what=f"childless-eval re-run {str(task_id)[:8]}",
                     )
                     logger.info(
                         f"[POST_COMMIT SWEEP] Marker-less childless EVALUATING "
-                        f"plan {str(task.id)[:8]} re-run completed"
+                        f"plan {str(task_id)[:8]} re-run completed"
                     )
                 except Exception as rerun_exc:
+                    await _record_childless_recovery_failure(
+                        task_id,
+                        claim["claim_token"],
+                        rerun_exc,
+                    )
                     # Best-effort: next sweep retries (the parent stays childless
                     # EVALUATING until children spawn). The age guard means it is
                     # already past the in-flight window, so a retry can't race a
                     # live spawn.
                     logger.warning(
                         f"[POST_COMMIT SWEEP] Marker-less childless EVALUATING "
-                        f"plan {str(task.id)[:8]} re-run failed (will retry next "
+                        f"plan {str(task_id)[:8]} re-run failed (will retry next "
                         f"sweep): {type(rerun_exc).__name__}: {rerun_exc}"
                     )
+            except Exception:
+                logger.exception(
+                    "[POST_COMMIT SWEEP] Marker-less recovery candidate %s failed",
+                    str(task_id)[:8],
+                )
     except Exception as e:
         logger.error(
             f"[POST_COMMIT SWEEP] Marker-less childless-EVALUATING sweep query "

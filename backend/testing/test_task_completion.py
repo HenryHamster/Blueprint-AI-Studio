@@ -42,8 +42,6 @@ from app.task_completion import (
     patch_pr_body_with_blueprint_meta,
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
-    reconcile_review_second_opinion,
-    _parse_panel_review_output,
 )
 from app.models import PoolVmState, Task, TaskStatus
 from testing.factories import make_project, make_task
@@ -3720,728 +3718,11 @@ class TestConfirmAppliedPlaybookEntries:
 # ── cross-layer remediation prompt ──────────────────────────────────────────
 
 
-# ── safeguard merge-gate challenge ─────────────────────────────────────────
-
-
-class TestSafeguardMergeGateChallenge:
-    """_maybe_release_safeguard_gate respects a second-opinion challenge verdict.
-
-    When ``safeguard_challenge_enabled`` is True and a safeguard audit returns
-    critical/high findings, the gate decision is not immediately finalised —
-    an independent challenge task is spawned.  If the challenger rejects the
-    finding as a false positive or downgrades it below blocking severity, the
-    gate is released.  If the challenger confirms the finding, the gate is
-    maintained.  If the flag is off, today's behavior (block unconditionally)
-    is preserved.
-    """
-
-    async def _make_safeguard_pair(self, db_session):
-        """Return (orig_task, safeguard_task) linked by safeguard_for_task_id.
-
-        orig is EVALUATING (review approved, safeguard pending) so the gate
-        release follows the ci_waiting path rather than the fire-merge path —
-        no GitHub API calls needed.
-        """
-        from testing.factories import make_project, make_task
-
-        project = make_project(name="SafeguardChallengeProj")
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        orig = make_task(
-            project_id=project.id,
-            title="create: cross-cutting PR",
-            status=TaskStatus.EVALUATING,
-            requires_approval=True,
-            payloads=[
-                {"type": "create", "prompt": "add feature", "base_branch": "main"}
-            ],
-        )
-        db_session.add(orig)
-        await db_session.commit()
-        await db_session.refresh(orig)
-
-        safeguard = make_task(
-            project_id=project.id,
-            title="security_audit: cross-cutting safeguard",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "security_audit", "base_branch": "main"}],
-            context={
-                "safeguard_for_task_id": str(orig.id),
-                "safeguard_pr_number": "42",
-            },
-        )
-        db_session.add(safeguard)
-        await db_session.commit()
-        await db_session.refresh(safeguard)
-        return orig, safeguard
-
-    @pytest.mark.asyncio
-    async def test_safeguard_merge_gate_releases_on_challenge_rejected_high(
-        self, db_session
-    ):
-        """A high finding rejected by the challenge releases the merge gate."""
-        import app.shared_state as shared_state
-        from app.task_completion import _maybe_release_safeguard_gate
-        from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-
-        # Simulate: challenge already returned verdict "rejected" (false positive)
-        safeguard.context = {
-            **(safeguard.context or {}),
-            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
-                "outcome": "rejected",
-                "reasoning": "cited file does not contain the described vulnerability",
-                "challenge_task_id": str(_uuid_mod.uuid4()),
-            },
-        }
-        db_session.add(safeguard)
-        await db_session.commit()
-
-        findings = [
-            {
-                "severity": "high",
-                "title": "Missing auth check",
-                "description": "Endpoint lacks @require_role.",
-                "fix_prompt": "Add @require_role('admin').",
-                "file_path": "app/routers/admin.py",
-                "line_number": 7,
-            }
-        ]
-        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        assert orig.requires_approval is False, (
-            "Gate should be released when challenge rejects the finding"
-        )
-
-    @pytest.mark.asyncio
-    async def test_safeguard_gate_maintained_when_challenge_confirms(self, db_session):
-        """A finding confirmed by the challenge keeps the gate closed."""
-        from app.task_completion import _maybe_release_safeguard_gate
-        from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-
-        safeguard.context = {
-            **(safeguard.context or {}),
-            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
-                "outcome": "confirmed",
-                "reasoning": "vulnerability is real and exploitable",
-                "challenge_task_id": str(_uuid_mod.uuid4()),
-            },
-        }
-        db_session.add(safeguard)
-        await db_session.commit()
-
-        findings = [
-            {
-                "severity": "critical",
-                "title": "SQL injection",
-                "description": "Raw query.",
-                "fix_prompt": "Parameterize.",
-                "file_path": "app/db.py",
-                "line_number": 10,
-            }
-        ]
-
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        assert orig.requires_approval is True, (
-            "Gate should remain closed when challenge confirms the finding"
-        )
-
-    @pytest.mark.asyncio
-    async def test_safeguard_gate_maintained_when_mode_off(self, db_session):
-        """With safeguard_challenge_gate_mode='off', gate is maintained unconditionally."""
-        import app.shared_state as shared_state
-        from app.task_completion import _maybe_release_safeguard_gate
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-
-        findings = [
-            {
-                "severity": "high",
-                "title": "Missing auth",
-                "description": "desc",
-                "fix_prompt": "fix it",
-                "file_path": "app/routers/admin.py",
-                "line_number": 1,
-            }
-        ]
-
-        # Mode OFF (default) — no challenge spawned, gate maintained.
-        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "off"
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        assert orig.requires_approval is True, (
-            "Gate should stay closed when safeguard_challenge_gate_mode is 'off'"
-        )
-
-    @pytest.mark.asyncio
-    async def test_safeguard_gate_released_on_downgraded(self, db_session):
-        """A finding downgraded below critical/high by the challenge releases the gate."""
-        import app.shared_state as shared_state
-        from app.task_completion import _maybe_release_safeguard_gate
-        from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-
-        safeguard.context = {
-            **(safeguard.context or {}),
-            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
-                "outcome": "downgraded",
-                "reasoning": "severity is medium at most",
-                "challenge_task_id": str(_uuid_mod.uuid4()),
-            },
-        }
-        db_session.add(safeguard)
-        await db_session.commit()
-
-        findings = [
-            {
-                "severity": "high",
-                "title": "Minor info leak",
-                "description": "desc",
-                "fix_prompt": "fix it",
-                "file_path": "app/x.py",
-                "line_number": 5,
-            }
-        ]
-
-        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        assert orig.requires_approval is False, (
-            "Gate should be released when challenge downgrades the finding"
-        )
-
-    @pytest.mark.asyncio
-    async def test_maybe_release_safeguard_gate_spawns_challenge_when_enforce(
-        self, db_session
-    ):
-        """When safeguard_challenge_gate_mode='enforce' and no verdict exists, a
-        challenge task is created, the safeguard is parked EVALUATING with
-        awaiting_safeguard_challenge set, and the gate remains held."""
-        import app.shared_state as shared_state
-        from app.task_completion import _maybe_release_safeguard_gate
-        from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-        from sqlmodel import select
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-        findings = [
-            {
-                "severity": "high",
-                "title": "Missing auth",
-                "description": "Endpoint lacks @require_role.",
-                "fix_prompt": "Add decorator.",
-                "file_path": "app/routers/admin.py",
-                "line_number": 3,
-            }
-        ]
-
-        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        await db_session.refresh(safeguard)
-
-        # Gate must NOT be released while challenge is pending
-        assert orig.requires_approval is True, (
-            "Gate must not be released while challenge verdict is pending"
-        )
-        # Safeguard is parked in EVALUATING
-        assert safeguard.status == TaskStatus.EVALUATING
-        # awaiting_safeguard_challenge is set (True initially, then the challenge UUID)
-        assert (safeguard.context or {}).get("awaiting_safeguard_challenge"), (
-            "awaiting_safeguard_challenge must be set after spawn"
-        )
-
-        # A challenge task with SAFEGUARD_CHALLENGE_SOURCE_KEY pointing to the
-        # safeguard must have been created in the DB.
-        all_tasks = (
-            (
-                await db_session.execute(
-                    select(Task).where(Task.project_id == safeguard.project_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        challenge_tasks = [
-            t
-            for t in all_tasks
-            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY)
-            == str(safeguard.id)
-        ]
-        assert challenge_tasks, (
-            "A challenge task pointing to the safeguard must have been created"
-        )
-
-    @pytest.mark.asyncio
-    async def test_safeguard_observe_mode_spawns_challenge_but_maintains_gate(
-        self, db_session
-    ):
-        """In observe mode, a shadow challenge is spawned for a critical/high finding
-        but the gate is NOT released (requires_approval stays True)."""
-        import app.shared_state as shared_state
-        from app.task_completion import _maybe_release_safeguard_gate
-        from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-        from sqlmodel import select
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-        findings = [
-            {
-                "severity": "critical",
-                "title": "SQL injection",
-                "description": "Raw query in handler.",
-                "fix_prompt": "Parameterize query.",
-                "file_path": "app/db.py",
-                "line_number": 42,
-            }
-        ]
-
-        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        await db_session.refresh(safeguard)
-
-        # Gate must NOT be released in observe mode.
-        assert orig.requires_approval is True, (
-            "Gate must stay closed in observe mode even when shadow challenge is spawned"
-        )
-        # Safeguard is parked EVALUATING awaiting shadow challenge.
-        assert safeguard.status == TaskStatus.EVALUATING, (
-            "Safeguard should be parked EVALUATING while shadow challenge is in flight"
-        )
-        # awaiting_safeguard_challenge is set.
-        assert (safeguard.context or {}).get("awaiting_safeguard_challenge"), (
-            "awaiting_safeguard_challenge must be set after shadow challenge spawn"
-        )
-        # A challenge task with SAFEGUARD_CHALLENGE_SOURCE_KEY must have been created.
-        all_tasks = (
-            (
-                await db_session.execute(
-                    select(Task).where(Task.project_id == safeguard.project_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        challenge_tasks = [
-            t
-            for t in all_tasks
-            if (t.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY)
-            == str(safeguard.id)
-        ]
-        assert challenge_tasks, (
-            "A shadow challenge task must have been created in observe mode"
-        )
-
-    @pytest.mark.asyncio
-    async def test_safeguard_observe_mode_records_shadow_verdict_on_reentry(
-        self, db_session
-    ):
-        """In observe mode, when re-entered with a challenge verdict already present,
-        the verdict is copied to safeguard_observe_verdict, SAFEGUARD_CHALLENGE_VERDICT_KEY
-        is cleared, and the gate stays held."""
-        import app.shared_state as shared_state
-        from app.task_completion import _maybe_release_safeguard_gate
-        from app.task_evaluators import (
-            SAFEGUARD_CHALLENGE_VERDICT_KEY,
-            SAFEGUARD_OBSERVE_VERDICT_KEY,
-        )
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-        findings = [
-            {
-                "severity": "high",
-                "title": "Missing CSRF protection",
-                "description": "Form handler missing CSRF token.",
-                "fix_prompt": "Add CSRF middleware.",
-                "file_path": "app/routers/admin.py",
-                "line_number": 10,
-            }
-        ]
-        # Pre-stamp the binding verdict key — simulates the challenge having returned.
-        safeguard.context = {
-            **(safeguard.context or {}),
-            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
-                "outcome": "rejected",
-                "reasoning": "the cited route is internal-only, not user-facing",
-                "challenge_task_id": str(_uuid_mod.uuid4()),
-            },
-        }
-        db_session.add(safeguard)
-        await db_session.commit()
-
-        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        await db_session.refresh(safeguard)
-
-        # Gate must NOT be released even though the shadow verdict is "rejected".
-        assert orig.requires_approval is True, (
-            "Gate must stay closed in observe mode regardless of shadow verdict outcome"
-        )
-        # Shadow verdict is recorded under SAFEGUARD_OBSERVE_VERDICT_KEY.
-        observe_verdict = (safeguard.context or {}).get(SAFEGUARD_OBSERVE_VERDICT_KEY)
-        assert observe_verdict is not None, (
-            "safeguard_observe_verdict must be recorded after shadow challenge resolves"
-        )
-        assert observe_verdict.get("outcome") == "rejected", (
-            "safeguard_observe_verdict outcome must match the original challenge outcome"
-        )
-        # Binding key is cleared so a later upgrade to enforce does not replay a stale verdict.
-        assert SAFEGUARD_CHALLENGE_VERDICT_KEY not in (safeguard.context or {}), (
-            "SAFEGUARD_CHALLENGE_VERDICT_KEY must be cleared after shadow recording"
-        )
-
-    @pytest.mark.asyncio
-    async def test_safeguard_observe_mode_shadow_confirmed_also_maintains_gate(
-        self, db_session
-    ):
-        """In observe mode, even a 'confirmed' shadow verdict keeps the gate held and
-        records the shadow outcome."""
-        import app.shared_state as shared_state
-        from app.task_completion import _maybe_release_safeguard_gate
-        from app.task_evaluators import (
-            SAFEGUARD_CHALLENGE_VERDICT_KEY,
-            SAFEGUARD_OBSERVE_VERDICT_KEY,
-        )
-
-        orig, safeguard = await self._make_safeguard_pair(db_session)
-        findings = [
-            {
-                "severity": "critical",
-                "title": "RCE via deserialization",
-                "description": "Unsafe pickle load.",
-                "fix_prompt": "Replace with json.loads.",
-                "file_path": "app/utils.py",
-                "line_number": 5,
-            }
-        ]
-        safeguard.context = {
-            **(safeguard.context or {}),
-            SAFEGUARD_CHALLENGE_VERDICT_KEY: {
-                "outcome": "confirmed",
-                "reasoning": "vulnerability is real and exploitable",
-                "challenge_task_id": str(_uuid_mod.uuid4()),
-            },
-        }
-        db_session.add(safeguard)
-        await db_session.commit()
-
-        shared_state.runtime_config["safeguard_challenge_gate_mode"] = "observe"
-        await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-        await db_session.refresh(orig)
-        await db_session.refresh(safeguard)
-
-        assert orig.requires_approval is True, (
-            "Gate must stay closed in observe mode for confirmed findings too"
-        )
-        observe_verdict = (safeguard.context or {}).get(SAFEGUARD_OBSERVE_VERDICT_KEY)
-        assert observe_verdict is not None, "Shadow verdict must be recorded"
-        assert observe_verdict.get("outcome") == "confirmed"
-        assert SAFEGUARD_CHALLENGE_VERDICT_KEY not in (safeguard.context or {}), (
-            "SAFEGUARD_CHALLENGE_VERDICT_KEY must be cleared after shadow recording"
-        )
-
-    @pytest.mark.asyncio
-    async def test_spawn_safeguard_challenge_returns_none_when_verdict_exists(
-        self, db_session
-    ):
-        """spawn_safeguard_challenge returns None (single-shot guard) when a
-        challenge verdict already exists in the safeguard's context."""
-        from app.task_evaluators import (
-            spawn_safeguard_challenge,
-            SAFEGUARD_CHALLENGE_VERDICT_KEY,
-        )
-
-        project = make_project(name="SpawnGuardVerdictProj")
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        safeguard = make_task(
-            project_id=project.id,
-            payloads=[{"type": "security_audit", "base_branch": "main"}],
-            context={
-                SAFEGUARD_CHALLENGE_VERDICT_KEY: {
-                    "outcome": "confirmed",
-                    "reasoning": "pre-existing verdict",
-                    "challenge_task_id": str(_uuid_mod.uuid4()),
-                },
-            },
-        )
-        db_session.add(safeguard)
-        await db_session.commit()
-        await db_session.refresh(safeguard)
-
-        result = await spawn_safeguard_challenge(safeguard, "some findings", db_session)
-        assert result is None, "spawn must return None when a verdict already exists"
-
-    @pytest.mark.asyncio
-    async def test_spawn_safeguard_challenge_returns_none_when_already_in_flight(
-        self, db_session
-    ):
-        """spawn_safeguard_challenge returns None (single-shot guard) when a
-        challenge is already in flight (awaiting_safeguard_challenge is set)."""
-        from app.task_evaluators import spawn_safeguard_challenge
-
-        project = make_project(name="SpawnGuardInflightProj")
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        safeguard = make_task(
-            project_id=project.id,
-            payloads=[{"type": "security_audit", "base_branch": "main"}],
-            context={"awaiting_safeguard_challenge": str(_uuid_mod.uuid4())},
-        )
-        db_session.add(safeguard)
-        await db_session.commit()
-        await db_session.refresh(safeguard)
-
-        result = await spawn_safeguard_challenge(safeguard, "some findings", db_session)
-        assert result is None, (
-            "spawn must return None when a challenge is already in flight"
-        )
-
-    @pytest.mark.asyncio
-    async def test_spawn_safeguard_challenge_sets_sonnet_quality_tier(self, db_session):
-        """spawn_safeguard_challenge must set quality_tier='sonnet' in the spawned
-        challenge task's payload — regression guard against accidental tier removal."""
-        from app.task_evaluators import spawn_safeguard_challenge
-
-        project = make_project(name="SpawnGuardTierProj")
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        safeguard = make_task(
-            project_id=project.id,
-            payloads=[{"type": "security_audit", "base_branch": "main"}],
-        )
-        db_session.add(safeguard)
-        await db_session.commit()
-        await db_session.refresh(safeguard)
-
-        challenge = await spawn_safeguard_challenge(
-            safeguard, "some critical finding text", db_session
-        )
-        assert challenge is not None
-        assert (challenge.first_payload or {}).get("quality_tier") == "sonnet", (
-            "Spawned safeguard challenge must carry quality_tier='sonnet'"
-        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Review second-opinion reconciliation (reconcile_review_second_opinion)
+# review_is_high_stakes gate
 # ══════════════════════════════════════════════════════════════════════════════
-
-
-def _panel_verdict(overall, *, issues=None, lens_verdict=None, summary="ok"):
-    """Build a normalized-ready panel-review verdict object with all 4 lenses."""
-    lv = lens_verdict or overall
-    return {
-        "overall_verdict": overall,
-        "summary": summary,
-        "issues": list(issues or []),
-        "lenses": {
-            "correctness": {"verdict": lv, "summary": "c", "issues": []},
-            "security": {"verdict": lv, "summary": "s", "issues": []},
-            "code_quality": {"verdict": lv, "summary": "q", "issues": []},
-            "test_coverage": {"verdict": lv, "summary": "t", "issues": []},
-        },
-    }
-
-
-def test_reconcile_confirmed_approve():
-    """Both APPROVE → challenged_confirmed, reconciled APPROVE, no surviving issues."""
-    panel = _parse_panel_review_output(json.dumps(_panel_verdict("APPROVE")))
-    rec = reconcile_review_second_opinion("APPROVE", [], panel)
-    assert rec["state"] == "challenged_confirmed"
-    assert rec["reconciled_verdict"] == "APPROVE"
-    assert rec["surviving_issues"] == []
-    assert rec["challenge_verdict"] == "APPROVE"
-
-
-def test_reconcile_rejected_approve_overturned():
-    """Primary APPROVE, challenge REQUEST_CHANGES → challenged_rejected, must not approve."""
-    chal_issues = [{"description": "real bug", "severity": "critical"}]
-    panel = _parse_panel_review_output(
-        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=chal_issues))
-    )
-    rec = reconcile_review_second_opinion("APPROVE", [], panel)
-    assert rec["state"] == "challenged_rejected"
-    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
-    assert rec["surviving_issues"] == chal_issues
-
-
-def test_reconcile_rejected_request_changes_overturned():
-    """Primary REQUEST_CHANGES, challenge APPROVE → challenged_rejected, must not spawn fix."""
-    primary_issues = [{"description": "maybe a bug", "severity": "major"}]
-    panel = _parse_panel_review_output(json.dumps(_panel_verdict("APPROVE")))
-    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
-    assert rec["state"] == "challenged_rejected"
-    assert rec["reconciled_verdict"] == "APPROVE"
-    assert rec["surviving_issues"] == []
-
-
-def test_reconcile_confirmed_request_changes_same_issues():
-    """Both REQUEST_CHANGES with identical issue set → challenged_confirmed."""
-    issues = [{"description": "SQL injection", "file": "a.py", "line": 5}]
-    panel = _parse_panel_review_output(
-        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=issues))
-    )
-    rec = reconcile_review_second_opinion("REQUEST_CHANGES", issues, panel)
-    assert rec["state"] == "challenged_confirmed"
-    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
-    assert rec["surviving_issues"] == issues
-
-
-def test_reconcile_revised_request_changes_changed_issues():
-    """Both REQUEST_CHANGES but surviving issue set changed → challenged_revised.
-
-    The challenge upholds only one of the two primary issues; the surviving set
-    is the agreed intersection.
-    """
-    agreed = {"description": "SQL injection", "file": "a.py", "line": 5}
-    only_primary = {"description": "nit naming", "file": "b.py", "line": 9}
-    primary_issues = [agreed, only_primary]
-    panel = _parse_panel_review_output(
-        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=[agreed]))
-    )
-    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
-    assert rec["state"] == "challenged_revised"
-    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
-    assert rec["surviving_issues"] == [agreed]
-    assert only_primary not in rec["surviving_issues"]
-
-
-def test_reconcile_revised_falls_back_to_challenge_issues_when_no_overlap():
-    """Disjoint issue sets → revised, surviving falls back to the challenge's set."""
-    primary_issues = [{"description": "primary only", "file": "p.py", "line": 1}]
-    chal_issues = [{"description": "challenge only", "file": "c.py", "line": 2}]
-    panel = _parse_panel_review_output(
-        json.dumps(_panel_verdict("REQUEST_CHANGES", issues=chal_issues))
-    )
-    rec = reconcile_review_second_opinion("REQUEST_CHANGES", primary_issues, panel)
-    assert rec["state"] == "challenged_revised"
-    assert rec["surviving_issues"] == chal_issues
-
-
-def test_reconcile_confirmed_request_changes_no_issues():
-    """Both REQUEST_CHANGES with empty issue lists (prose-only verdict) → challenged_confirmed.
-
-    Regression: the condition ``if primary_sigs and primary_sigs == challenge_sigs``
-    used a truthiness guard on the first set, which is False for empty sets even
-    when both sides agree (both empty, trivially equal). Fixed by removing the
-    redundant ``primary_sigs and``.
-    """
-    panel = _parse_panel_review_output(
-        json.dumps(_panel_verdict("REQUEST_CHANGES"))
-    )
-    rec = reconcile_review_second_opinion("REQUEST_CHANGES", [], panel)
-    assert rec["state"] == "challenged_confirmed"
-    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
-    assert rec["surviving_issues"] == []
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Panel-review verdict parser tolerance tests (regression for #10096 incident)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def test_parse_panel_review_no_lenses_overall_approve():
-    """Exact shape that wedged PR #10096: overall_verdict APPROVE with prose summary,
-    no lenses key. Must resolve to a usable APPROVE, not None."""
-    raw = {
-        "overall_verdict": "APPROVE",
-        "summary": "Correctness [APPROVE]: ... Security [APPROVE]: ...",
-    }
-    panel = _parse_panel_review_output(json.dumps(raw))
-    assert panel is not None, "no-lenses APPROVE must not return None"
-    assert panel["overall_verdict"] == "APPROVE"
-    # reconcile_review_second_opinion must treat it as confirmed approve
-    rec = reconcile_review_second_opinion("APPROVE", [], panel)
-    assert rec["reconciled_verdict"] == "APPROVE"
-    assert rec["state"] == "challenged_confirmed"
-
-
-def test_parse_panel_review_prose_only_verdict_via_anchored_floor():
-    """Prose-only output with an anchored verdict token resolves via the fallback."""
-    prose = 'After reviewing all changes, my verdict is: "APPROVE"\nNo issues found.'
-    panel = _parse_panel_review_output(prose)
-    assert panel is not None, "anchored prose APPROVE must resolve"
-    assert panel["overall_verdict"] == "APPROVE"
-
-
-def test_parse_panel_review_request_changes_prose_anchored():
-    """Anchored REQUEST_CHANGES in prose resolves correctly."""
-    prose = 'verdict: "REQUEST_CHANGES"\nSee the issues list above.'
-    panel = _parse_panel_review_output(prose)
-    assert panel is not None
-    assert panel["overall_verdict"] == "REQUEST_CHANGES"
-
-
-def test_parse_panel_review_genuinely_absent_returns_none():
-    """No resolvable verdict anywhere — must return None (fail-closed escalation preserved)."""
-    assert _parse_panel_review_output("") is None
-    assert _parse_panel_review_output(None) is None
-    assert _parse_panel_review_output("The review looks fine overall.") is None
-    assert _parse_panel_review_output('{"status": "ok", "score": 9}') is None
-
-
-def test_parse_panel_review_structured_lenses_still_captured():
-    """Well-formed lenses payload still parses AND records per-lens telemetry."""
-    raw = _panel_verdict(
-        "REQUEST_CHANGES", issues=[{"description": "bug", "severity": "high"}]
-    )
-    panel = _parse_panel_review_output(json.dumps(raw))
-    assert panel is not None
-    assert panel["overall_verdict"] == "REQUEST_CHANGES"
-    # Lens telemetry must be preserved when lenses are well-formed.
-    assert "lenses" in panel
-    for lens in ("correctness", "security", "code_quality", "test_coverage"):
-        assert lens in panel["lenses"]
-        assert panel["lenses"][lens]["verdict"] == "REQUEST_CHANGES"
-    assert panel.get("issues") == [{"description": "bug", "severity": "high"}]
-
-
-def test_parse_panel_review_partial_lenses_resolves_without_error():
-    """Partial lenses (only some of the required lenses present) still resolves the verdict."""
-    raw = {
-        "overall_verdict": "APPROVE",
-        "summary": "LGTM",
-        "lenses": {
-            "correctness": {"verdict": "APPROVE", "summary": "looks right"},
-        },
-    }
-    panel = _parse_panel_review_output(json.dumps(raw))
-    assert panel is not None
-    assert panel["overall_verdict"] == "APPROVE"
-
-
-def test_parse_panel_review_embedded_json_in_prose():
-    """JSON with overall_verdict embedded in surrounding prose text resolves."""
-    prose = (
-        'After reviewing:\n\n{"overall_verdict": "APPROVE", "summary": "all good"}\n\n'
-        "Hope that helps."
-    )
-    panel = _parse_panel_review_output(prose)
-    assert panel is not None
-    assert panel["overall_verdict"] == "APPROVE"
 
 
 def test_review_is_high_stakes_approve_trunk_large_diff():
@@ -4635,54 +3916,6 @@ def test_review_is_high_stakes_observable_behavior_overrides_small_diff():
             is_observable_behavior=True,
         )
         is False
-    )
-
-
-@pytest.mark.asyncio
-async def test_spawn_review_second_opinion_uses_opus_quality_tier(db_session):
-    """spawn_review_second_opinion must NOT set quality_tier in the spawned
-    challenger task's payload, so it defaults to Opus via DEFAULT_QUALITY_TIER —
-    regression guard against re-introducing the Sonnet downgrade."""
-    from app.task_evaluators import spawn_review_second_opinion
-
-    project = make_project(name="ReviewSecondOpinionTierProj")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    review_task = make_task(
-        project_id=project.id,
-        payloads=[
-            {
-                "type": "panel_review",
-                "pr_number": 99,
-                "branch": "feat/test",
-                "base_branch": "main",
-            }
-        ],
-        status=TaskStatus.COMPLETED,
-    )
-    db_session.add(review_task)
-    await db_session.commit()
-    await db_session.refresh(review_task)
-
-    challenger = await spawn_review_second_opinion(
-        review_task,
-        db_session,
-        verdict="REQUEST_CHANGES",
-        issues=[{"description": "bug", "severity": "high"}],
-        feedback="There is a bug.",
-        pr_number=99,
-        branch="feat/test",
-        base_branch="main",
-        original_task_id=str(review_task.id),
-        original_prompt="review this PR",
-        investigated_files=None,
-    )
-    assert challenger is not None
-    assert (challenger.first_payload or {}).get("quality_tier") is None, (
-        "Spawned panel_review challenger must NOT carry an explicit quality_tier "
-        "— it should fall back to DEFAULT_QUALITY_TIER (Opus)"
     )
 
 
@@ -5097,3 +4330,423 @@ class TestHandlePerfCompletion:
         assert perf_task.status == TaskStatus.EVALUATING, (
             f"Expected parent EVALUATING after replay, got {perf_task.status}"
         )
+
+
+# ── _handle_walkthrough_e2e_completion ──────────────────────────────────────
+
+
+class TestWalkthroughE2ECompletionIngestsOrRemoved:
+    """Regression tests for _handle_walkthrough_e2e_completion.
+
+    The named test required by acceptance evidence:
+        test_walkthrough_e2e_completion_ingests_or_removed
+    """
+
+    async def _run(self, db_session, task, logs):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+
+        await _handle_walkthrough_e2e_completion(task, logs, db_session)
+
+    @pytest.mark.asyncio
+    async def test_walkthrough_e2e_completion_ingests_or_removed(self, db_session):
+        """_handle_walkthrough_e2e_completion ingests {git_sha,results} artifacts.
+
+        With a matching candidate_sha the handler delegates to
+        record_walkthrough_e2e_evidence, which writes covered-tier evidence for
+        each criterion whose passed=True.  A mismatched SHA writes nothing
+        (SHA-match safety enforcement).  The legacy {flows:[...]} schema is
+        skipped gracefully (no exception, no evidence).
+        """
+        import app.acceptance_criteria as ac
+        from app.models import ReleaseVersion
+
+        project = make_project(name="WalkthroughE2ETest")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sha = "a" * 40
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            status="open",
+            last_qualification={"status": "scoring", "candidate_sha": sha},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Create two active criteria for the project/version.
+        crit_a = await ac.create_criterion(
+            db_session, project.id, version.id, "Runner enroll flow"
+        )
+        crit_b = await ac.create_criterion(
+            db_session, project.id, version.id, "Iframe token flow"
+        )
+
+        # Build a well-formed artifact in the correct schema.
+        artifact = json.dumps(
+            {
+                "git_sha": sha,
+                "run_timestamp": "2026-01-01T00:00:00Z",
+                "results": [
+                    {"criterion_key": crit_a.criterion_key, "passed": True, "notes": "ok"},
+                    {"criterion_key": crit_b.criterion_key, "passed": False, "notes": "fail"},
+                ],
+            }
+        )
+
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Happy-path: matching SHA → evidence written for crit_a only.
+        await self._run(db_session, task, artifact)
+
+        ev_a = await ac.get_evidence_for_criterion(db_session, crit_a.id)
+        assert len(ev_a) == 1, "Expected one evidence row for the passing criterion"
+        assert ev_a[0].source_kind == ac.WALKTHROUGH_E2E_EVIDENCE_KIND
+        assert ev_a[0].detail["candidate_sha"] == sha
+        assert ev_a[0].detail["passed"] is True
+        assert ac.compute_criterion_coverage(ev_a) == "covered"
+
+        ev_b = await ac.get_evidence_for_criterion(db_session, crit_b.id)
+        assert ev_b == [], "Failed criterion must not gain evidence"
+
+        # SHA mismatch: writes nothing (SHA-match safety).
+        mismatched_artifact = json.dumps(
+            {
+                "git_sha": "b" * 40,
+                "run_timestamp": "2026-01-01T00:00:00Z",
+                "results": [
+                    {"criterion_key": crit_b.criterion_key, "passed": True, "notes": "ok"},
+                ],
+            }
+        )
+        await self._run(db_session, task, mismatched_artifact)
+        ev_b_after = await ac.get_evidence_for_criterion(db_session, crit_b.id)
+        assert ev_b_after == [], "Mismatched SHA must not write evidence"
+
+        # Legacy {flows:[...]} schema: skipped gracefully, no exception, no extra evidence.
+        legacy_artifact = json.dumps(
+            {
+                "flows": [
+                    {"flow": crit_a.criterion_key, "verdict": "PASS", "candidate_sha": sha},
+                ]
+            }
+        )
+        await self._run(db_session, task, legacy_artifact)
+        ev_a_after = await ac.get_evidence_for_criterion(db_session, crit_a.id)
+        assert len(ev_a_after) == 1, "Legacy schema must not write additional evidence"
+
+
+class TestHandleWalkthroughE2eCompletionStandalone:
+    """Standalone (no-DB) tests for _handle_walkthrough_e2e_completion guard paths.
+
+    Covers edge cases (missing git_sha, missing results list, no open version)
+    not exercised by the DB-backed integration test above.
+    """
+
+    def _make_task(self, project_id=None):
+        import uuid
+        task = MagicMock()
+        task.id = uuid.uuid4()
+        task.project_id = project_id or uuid.uuid4()
+        return task
+
+    def _make_session(self):
+        session = MagicMock()
+        session.rollback = AsyncMock()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_unparseable_artifact_is_noop(self):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        await _handle_walkthrough_e2e_completion(task, "not json", session)
+        session.rollback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_results_list_is_noop(self):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        artifact = json.dumps({"git_sha": "abc123", "run_timestamp": "2026-01-01T00:00:00Z"})
+        with patch("app.acceptance_criteria.record_walkthrough_e2e_evidence") as mock_rwe, \
+             patch("app.release_version.current_open_version", new=AsyncMock(return_value=MagicMock())):
+            await _handle_walkthrough_e2e_completion(task, artifact, session)
+            mock_rwe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_open_version_is_noop(self):
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        artifact = json.dumps({
+            "git_sha": "abc123",
+            "run_timestamp": "2026-01-01T00:00:00Z",
+            "results": [{"criterion_key": "c-abc", "passed": True}],
+        })
+        with patch("app.acceptance_criteria.record_walkthrough_e2e_evidence") as mock_rwe, \
+             patch("app.release_version.current_open_version", new=AsyncMock(return_value=None)):
+            await _handle_walkthrough_e2e_completion(task, artifact, session)
+            mock_rwe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_artifact_calls_record_walkthrough_e2e_evidence(self):
+        """The handler delegates to record_walkthrough_e2e_evidence with correct kwargs."""
+        from app.task_completion import _handle_walkthrough_e2e_completion
+        task = self._make_task()
+        session = self._make_session()
+        sha = "deadbeef1234567890abcdef"
+        results = [
+            {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "step 1 ok"},
+            {"criterion_key": "c-f52fd975", "passed": False, "notes": None},
+        ]
+        artifact = json.dumps({
+            "git_sha": sha,
+            "run_timestamp": "2026-01-01T00:00:00Z",
+            "results": results,
+        })
+        mock_version = MagicMock()
+        summary = {"status": "recorded", "recorded": 1, "skipped_not_passed": 1, "unmatched_keys": []}
+        with patch("app.acceptance_criteria.record_walkthrough_e2e_evidence", new=AsyncMock(return_value=summary)) as mock_rwe, \
+             patch("app.release_version.current_open_version", new=AsyncMock(return_value=mock_version)):
+            await _handle_walkthrough_e2e_completion(task, artifact, session)
+            mock_rwe.assert_awaited_once()
+            call_kwargs = mock_rwe.call_args.kwargs
+            assert call_kwargs["candidate_sha"] == sha, "candidate_sha must match artifact git_sha"
+            assert call_kwargs["results"] == results, "results list must be passed through"
+
+
+def test_meta_criterion_requires_substantive_subcriteria():
+    """c-5214996f is blocked when a required sub-criterion is failed or absent.
+
+    Exercises _walkthrough_meta_criterion_gate directly (pure, no DB).
+    Also verifies the gate is wired into record_walkthrough_e2e_evidence by
+    checking that c-5214996f is excluded from passed_keys when the gate fails,
+    while a fully-passing batch admits it.
+    """
+    from app.acceptance_criteria import _walkthrough_meta_criterion_gate
+
+    # Gate should pass only when ALL required sub-criteria are passed.
+    full_pass = [
+        {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-f52fd975", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(full_pass) is True, \
+        "gate must pass when c-dfdc9d82, c-f52fd975, AND c-workday-session-lifecycle are all passed"
+
+    # Missing c-f52fd975 entirely → gate fails.
+    missing_iframe = [
+        {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(missing_iframe) is False, \
+        "gate must fail when c-f52fd975 is absent"
+
+    # c-f52fd975 present but passed=False → gate fails.
+    iframe_failed = [
+        {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-f52fd975", "passed": False, "notes": "failed"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(iframe_failed) is False, \
+        "gate must fail when c-f52fd975 has passed=False"
+
+    # c-dfdc9d82 absent → gate fails.
+    missing_runner = [
+        {"criterion_key": "c-f52fd975", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(missing_runner) is False, \
+        "gate must fail when c-dfdc9d82 is absent"
+
+    # Empty batch → gate fails.
+    assert _walkthrough_meta_criterion_gate([]) is False, \
+        "gate must fail on empty results"
+
+
+# ---------------------------------------------------------------------------
+# _handle_criterion_coverage_trial_completion — acceptance earn-loop ingestion
+# ---------------------------------------------------------------------------
+
+
+async def _setup_criterion_trial(
+    db_session,
+    *,
+    enrolled_head_sha=None,
+    criterion_text="Executed-test criterion",
+    source_task_id="src-task-1",
+    test_refs=("testing/test_exec.py",),
+):
+    """Create an open version + criterion + an enrolled criterion_coverage_trial task."""
+    from app import acceptance_criteria as ac
+    from app.models import Project, ReleaseVersion
+
+    project = Project(name="CCT-Ingest", user_id="cct-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, criterion_text)
+
+    enrollment = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": source_task_id,
+        "test_refs": list(test_refs),
+        "head_sha": enrolled_head_sha,
+        "max_test_files": 10,
+        "wall_clock_seconds": 900,
+    }
+    task = make_task(
+        project_id=project.id,
+        payloads=[enrollment],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, version, crit, task
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_trial_green_mints_covered(db_session):
+    """A green trial result mints exactly one SHA-pinned covered executed row."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(db_session)
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "deadbeefcafe0001",
+        "queued_head_sha": None,
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": True},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].source_kind == ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND
+    assert ev[0].detail["executed_sha"] == "deadbeefcafe0001"
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_trial_flag_off_is_noop(db_session):
+    """Flag OFF ⇒ a green result mints nothing (no-op)."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(db_session)
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "deadbeefcafe0001",
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": False},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"passed": False},           # red run
+        {"ran": False},              # never executed
+        {"could_not_run": True},     # infra could not target the tests
+        {"head_sha": ""},            # no executed SHA to pin
+    ],
+)
+async def test_criterion_coverage_trial_non_green_mints_nothing(db_session, mutation):
+    """Red / not-run / could-not-run / no-SHA results mint nothing and never demote."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(db_session)
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "deadbeefcafe0001",
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    result.update(mutation)
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": True},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_trial_sha_mismatch_mints_nothing(db_session):
+    """A reported SHA that does not match the enrolled bound SHA mints nothing."""
+    from app import acceptance_criteria as ac
+    from app.task_completion import _handle_criterion_coverage_trial_completion
+
+    _project, _version, crit, task = await _setup_criterion_trial(
+        db_session, enrolled_head_sha="1111111111111111"
+    )
+    result = {
+        "type": "criterion_coverage_trial",
+        "criterion_ids": [crit.criterion_key],
+        "source_task_id": "src-task-1",
+        "head_sha": "2222222222222222",  # drifted from enrolled checkout
+        "test_refs": ["testing/test_exec.py"],
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+    with patch(
+        "app.task_completion._runtime_config",
+        {"acceptance_earn_execution_trials_enabled": True},
+    ):
+        await _handle_criterion_coverage_trial_completion(
+            task, json.dumps(result), db_session
+        )
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+    # The rejection is stamped for visibility, not silently dropped.
+    await db_session.refresh(task)
+    assert "criterion_coverage_trial_contradiction" in (task.context or {})

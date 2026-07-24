@@ -1,6 +1,9 @@
 """Tests for app/compute_image_remote_build.py — standalone (no conftest)."""
 
+import io
+import json
 import os
+import tarfile
 
 import pytest
 
@@ -772,3 +775,346 @@ def test_dockerfile_network_override_continuation_line_is_rejected(tmp_path, mon
     content = b"FROM python:3.11-slim\nRUN --network=default \\\n    pip install numpy\n"
     with pytest.raises(ValueError, match="network override"):
         _check_dockerfile_network_directives(content)
+
+
+
+
+
+def _make_tar(entries: dict) -> bytes:
+    """Build an uncompressed tar archive from {member_name: bytes}."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in entries.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _fake_run_save(archive_bytes: bytes):
+    """Return a _run callable that writes *archive_bytes* to the -o path."""
+
+    def _run(cmd, **kw):
+        if "-o" in cmd:
+            out_path = cmd[cmd.index("-o") + 1]
+            with open(out_path, "wb") as fh:
+                fh.write(archive_bytes)
+
+        class P:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        return P()
+
+    return _run
+
+
+def _classic_archive(file_content: bytes) -> bytes:
+    """Classic docker-save archive: <hash>/layer.tar + manifest.json."""
+    layer_tar = _make_tar({"root/.creds": file_content})
+    return _make_tar(
+        {
+            "abc123/layer.tar": layer_tar,
+            "config.json": b"{}",
+            "manifest.json": b'[{"Layers":["abc123/layer.tar"]}]',
+        }
+    )
+
+
+def _oci_archive(file_content: bytes, layer_digest: str = None, manifest_digest: str = None) -> bytes:
+    """OCI-layout docker-save archive: index.json + blobs/sha256/<digest>."""
+    layer_tar = _make_tar({"root/.creds": file_content})
+    ldig = layer_digest or ("l" * 64)
+    mdig = manifest_digest or ("m" * 64)
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": "sha256:" + ("c" * 64)},
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:" + ldig,
+                }
+            ],
+        }
+    ).encode()
+    index = json.dumps(
+        {
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:" + mdig,
+                }
+            ],
+        }
+    ).encode()
+    return _make_tar(
+        {
+            "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+            "index.json": index,
+            "blobs/sha256/" + mdig: manifest,
+            "blobs/sha256/" + ldig: layer_tar,
+            "blobs/sha256/" + ("c" * 64): b"{}",
+        }
+    )
+
+
+import app.compute_image_build as _bci_scan  # noqa: E402 — isolated import
+
+
+# ── Error / fail-closed paths ─────────────────────────────────────────────────
+
+
+def test_scan_image_layers_docker_save_oserror_raises_runtime_error():
+    """OSError from docker save is wrapped as RuntimeError so callers get a clear signal."""
+
+    def _run_oserror(cmd, **kw):
+        raise OSError("docker not found")
+
+    with pytest.raises(RuntimeError, match="docker save failed"):
+        _bci_scan.scan_image_layers_for_credentials("img:tag", _run=_run_oserror)
+
+
+def test_scan_image_layers_docker_save_nonzero_exit_raises_runtime_error():
+    """Non-zero exit from docker save is raised as RuntimeError with the exit code."""
+
+    def _run_fail(cmd, **kw):
+        class P:
+            returncode = 1
+            stdout = b""
+            stderr = b"permission denied: cannot access daemon"
+
+        return P()
+
+    with pytest.raises(RuntimeError, match=r"docker save failed \(exit 1\)"):
+        _bci_scan.scan_image_layers_for_credentials("img:tag", _run=_run_fail)
+
+
+def test_scan_image_layers_docker_save_no_archive_file_fails_closed():
+    """exit 0 but no archive written → RuntimeError (fail closed, not empty findings).
+
+    If docker save exits 0 but never writes the -o file (e.g. the daemon side-
+    channels the error), returning an empty finding list would bypass the scan
+    silently.  The scanner must raise instead.
+    """
+
+    def _run_exit0_no_file(cmd, **kw):
+        # Does NOT write the -o file.
+        class P:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        return P()
+
+    with pytest.raises(RuntimeError, match="no archive"):
+        _bci_scan.scan_image_layers_for_credentials("img:tag", _run=_run_exit0_no_file)
+
+
+# ── Layer-walk resilience ─────────────────────────────────────────────────────
+
+
+def test_scan_image_layers_corrupted_inner_layer_skipped_not_crashed():
+    """A corrupted inner layer tar is skipped; the scan continues and returns findings.
+
+    The outer archive contains two layers: one is garbage bytes (corrupted)
+    and one holds a real credential.  The scanner must skip the corrupted
+    one rather than propagating the TarError, and still return a finding
+    from the clean second layer.
+    """
+    leaked = b"export TOKEN=ghs_" + b"B" * 24 + b"\n"
+    good_layer_tar = _make_tar({"root/.secret": leaked})
+    bad_layer_bytes = b"this is not a valid tar archive !!!"
+    archive = _make_tar(
+        {
+            "bad111/layer.tar": bad_layer_bytes,
+            "good22/layer.tar": good_layer_tar,
+            "manifest.json": b'[{"Layers":["bad111/layer.tar","good22/layer.tar"]}]',
+        }
+    )
+    findings = _bci_scan.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_run_save(archive)
+    )
+    assert any("github_app_token" in f for f in findings), (
+        f"expected credential finding from the clean layer; got: {findings}"
+    )
+
+
+def test_scan_image_layers_zero_byte_and_oversized_files_skipped():
+    """Zero-byte files and files over the per-file cap are skipped entirely.
+
+    A credential hidden in a 0-byte file or in a file exceeding
+    _MAX_SCANNED_FILE_BYTES must NOT be read (the zero-byte case is simply
+    empty; the oversized case is skipped for the OOM guard).  A credential
+    in a normally-sized file in the same layer IS still found.
+    """
+    leaked = b"export TOKEN=ghs_" + b"C" * 24 + b"\n"
+    # Build a layer with three files: zero-byte, over-cap, and a normal one.
+    layer_tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=layer_tar_buf, mode="w") as ltf:
+        # 0-byte file
+        info0 = tarfile.TarInfo(name="root/empty")
+        info0.size = 0
+        ltf.addfile(info0, io.BytesIO(b""))
+        # Over-cap file: 11 MiB > _MAX_SCANNED_FILE_BYTES (10 MiB)
+        big = b"ghs_" + b"E" * 24 + b"\n" + b"\0" * (11 * 1024 * 1024)
+        info_big = tarfile.TarInfo(name="root/bigfile")
+        info_big.size = len(big)
+        ltf.addfile(info_big, io.BytesIO(big))
+        # Normal file with credential
+        info_cred = tarfile.TarInfo(name="root/.creds")
+        info_cred.size = len(leaked)
+        ltf.addfile(info_cred, io.BytesIO(leaked))
+    layer_tar_bytes = layer_tar_buf.getvalue()
+    archive = _make_tar(
+        {
+            "abc/layer.tar": layer_tar_bytes,
+            "manifest.json": b'[{"Layers":["abc/layer.tar"]}]',
+        }
+    )
+    findings = _bci_scan.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_run_save(archive)
+    )
+    assert any("github_app_token" in f for f in findings), (
+        f"expected finding from the normal credential file; got: {findings}"
+    )
+
+
+# ── OCI layout edge cases ─────────────────────────────────────────────────────
+
+
+def test_scan_image_layers_multiarch_oci_index_walks_all_manifests():
+    """A multi-arch OCI index (index of indexes / manifests) walks ALL platforms.
+
+    The outer index.json references two platform manifests (amd64 and arm64).
+    A credential baked into the arm64 layer must be caught even though the
+    amd64 layer is clean.
+    """
+    leaked = b"export TOKEN=ghs_" + b"F" * 24 + b"\n"
+    clean = b"nothing secret here\n"
+
+    def _platform_manifest_blob(ldig: str) -> bytes:
+        return json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {"digest": "sha256:" + ("c" * 64)},
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": "sha256:" + ldig,
+                    }
+                ],
+            }
+        ).encode()
+
+    amd_layer_tar = _make_tar({"root/app": clean})
+    arm_layer_tar = _make_tar({"root/.creds": leaked})
+    amd_ldig = "a" * 64
+    arm_ldig = "b" * 64
+    amd_mdig = "1" * 64
+    arm_mdig = "2" * 64
+    cfg_dig = "c" * 64
+
+    index = json.dumps(
+        {
+            "schemaVersion": 2,
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:" + amd_mdig},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:" + arm_mdig},
+            ],
+        }
+    ).encode()
+
+    archive = _make_tar(
+        {
+            "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+            "index.json": index,
+            "blobs/sha256/" + amd_mdig: _platform_manifest_blob(amd_ldig),
+            "blobs/sha256/" + arm_mdig: _platform_manifest_blob(arm_ldig),
+            "blobs/sha256/" + amd_ldig: amd_layer_tar,
+            "blobs/sha256/" + arm_ldig: arm_layer_tar,
+            "blobs/sha256/" + cfg_dig: b"{}",
+        }
+    )
+
+    findings = _bci_scan.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_run_save(archive)
+    )
+    assert any("github_app_token" in f for f in findings), (
+        f"expected credential finding from arm64 layer; got: {findings}"
+    )
+
+
+# ── Credential pattern coverage ───────────────────────────────────────────────
+
+
+def test_scan_image_layers_anthropic_key_pattern_detected():
+    """A file containing an Anthropic API key (sk-ant-...) triggers the anthropic_key finding."""
+    # sk-ant- + 20 alphanumeric chars satisfies the pattern
+    anthropic_key = b"ANTHROPIC_API_KEY=sk-ant-api03-" + b"A" * 30 + b"\n"
+    archive = _classic_archive(anthropic_key)
+    findings = _bci_scan.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_run_save(archive)
+    )
+    assert any("anthropic_key" in f for f in findings), (
+        f"expected anthropic_key finding; got: {findings}"
+    )
+
+
+def test_scan_image_layers_gcp_sa_private_key_pattern_detected():
+    """A private key header in a baked file triggers the gcp_sa_private_key finding."""
+    private_key_header = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n"
+    archive = _classic_archive(private_key_header)
+    findings = _bci_scan.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_run_save(archive)
+    )
+    assert any("gcp_sa_private_key" in f for f in findings), (
+        f"expected gcp_sa_private_key finding; got: {findings}"
+    )
+
+
+def test_scan_image_layers_openai_key_pattern_detected():
+    """A file containing an OpenAI API key (sk-...) triggers the openai_key finding.
+
+    Uses a key that does NOT start with 'sk-ant-' so the finding is unambiguously
+    openai_key rather than also matching anthropic_key.
+    """
+    openai_key = b"OPENAI_API_KEY=sk-PROJ_ABCDEFGHIJKLMNOPQRSTabcdefg\n"
+    archive = _classic_archive(openai_key)
+    findings = _bci_scan.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_run_save(archive)
+    )
+    assert any("openai_key" in f for f in findings), (
+        f"expected openai_key finding; got: {findings}"
+    )
+
+
+def test_scan_image_layers_multiple_layers_credential_in_middle_found():
+    """Classic archive with 3 layers: credential in the MIDDLE layer is found.
+
+    Regression guard: the scanner must iterate ALL layer members, not only the
+    first or last.
+    """
+    leaked = b"export TOKEN=ghs_" + b"G" * 24 + b"\n"
+    clean = b"nothing secret here\n"
+    layer1 = _make_tar({"root/app1": clean})
+    layer2 = _make_tar({"root/.creds": leaked})
+    layer3 = _make_tar({"root/app3": clean})
+    archive = _make_tar(
+        {
+            "layer1/layer.tar": layer1,
+            "layer2/layer.tar": layer2,
+            "layer3/layer.tar": layer3,
+            "manifest.json": b'[{"Layers":["layer1/layer.tar","layer2/layer.tar","layer3/layer.tar"]}]',
+        }
+    )
+    findings = _bci_scan.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_run_save(archive)
+    )
+    assert any("github_app_token" in f for f in findings), (
+        f"expected credential finding from middle layer; got: {findings}"
+    )

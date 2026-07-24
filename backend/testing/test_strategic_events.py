@@ -52,7 +52,7 @@ def test_event_name_contract_is_stable():
     assert STRATEGIC_KIND_DIRECTIONS == "directions"
     assert STRATEGIC_KIND_RUNNING_UPDATE == "running_update"
     assert STRATEGIC_KIND_PROBLEM_MODEL == "problem_model"
-    # Resident-session transcript event — also a frontend contract (useLogViewer).
+    # Strategic-session transcript event — also a frontend contract (useLogViewer).
     assert STRATEGIC_SESSION == "strategic_session"
 
 

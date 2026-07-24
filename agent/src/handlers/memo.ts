@@ -11,7 +11,8 @@
  * and tags. If the JSON is malformed, a bounded one-shot continuation repair
  * re-opens the task to fix the format.
  *
- * Memos are persisted as Artifacts (ArtifactType.MEMO) for later reference.
+ * The backend records the memo into the task's plan_output['memo'] (its sole,
+ * canonical store); no separate MEMO Artifact row is written.
  */
 
 import type WebSocket from 'ws';
@@ -73,8 +74,8 @@ const MEMO_SCHEMA_HINT =
 // Memo tasks document a piece of reasoning that strategic review can cite
 // later. The agent receives whatever context is on the payload (topic,
 // reasoning_kind, source_finding, etc.) and emits a single JSON object
-// describing the reasoning. The backend persists that object as an Artifact
-// of type MEMO. No cloning, no edits, no child spawning.
+// describing the reasoning. The backend records that object into the task's
+// plan_output['memo']. No cloning, no edits, no child spawning.
 
 // Reasoning kinds the dispatcher synthesizer handles credential-free (i.e.
 // _synthesizeDispatcherMemo returns non-null for these values). Exported so
@@ -436,10 +437,10 @@ Rules:
   // On success we deliberately OMIT artifact_type. The backend status
   // endpoint creates a generic Artifact row whenever artifact_type is set
   // (agent_status.py: `if payload.artifact_type:`). The memo completion
-  // handler (_handle_memo_completion) is the SOLE writer of the MEMO
-  // Artifact — posting artifact_type='MEMO' here would create a second,
-  // duplicate row and make citation-by-id ambiguous. Mirrors handlePlan,
-  // which also omits artifact_type on its success path.
+  // handler (_handle_memo_completion) records the memo into plan_output and
+  // writes NO Artifact row — posting artifact_type='MEMO' here would create a
+  // stray Artifact row nothing reads. Mirrors handlePlan, which also omits
+  // artifact_type on its success path.
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',

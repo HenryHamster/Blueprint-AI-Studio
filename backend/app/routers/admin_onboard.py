@@ -245,7 +245,7 @@ def _is_real_source_file(name: str) -> bool:
         return False
     if any(base.startswith(prefix) for prefix in _NON_SOURCE_FILE_PREFIXES):
         return False
-    if any(base.endswith(ext) for ext in _NON_SOURCE_FILE_EXTENSIONS):
+    if any(base.endswith(ext) for ext in _NON_SOURCE_FILE_EXTENSIONS):  # noqa: SIM103
         return False
     return True
 
@@ -910,6 +910,7 @@ def _seed_strategic_intent(
     from app.problem_model import (
         apply_user_intent_patch,
         parse_problem_model,
+        sanitize_problem_model_raw,
         Source,
     )
 
@@ -924,7 +925,14 @@ def _seed_strategic_intent(
         content=goal,
     )
 
-    pm = parse_problem_model(project.problem_model)
+    try:
+        pm = parse_problem_model(
+            sanitize_problem_model_raw(project.problem_model or {})
+        )
+    except ValidationError as ve:
+        raise HTTPException(
+            status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+        ) from None
     pm.intent.purpose = goal
     pm.intent.current_focus = goal
     pm.intent.source = Source(
@@ -948,6 +956,14 @@ def _seed_strategic_intent(
                     detail=f"Invalid initial_steering: {e}",
                 ) from e
     pm.last_updated_by = "user"
+    from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+    _gc_summary, _oversize_section = _enforce_pm_size(pm)
+    if _oversize_section:
+        raise ValueError(
+            f"Problem model live core exceeds byte budget after seeding intent: "
+            f"{_oversize_section}. Reduce the size of active state."
+        )
     project.problem_model = pm.model_dump()
     flag_modified(project, "problem_model")
 
@@ -1171,14 +1187,16 @@ async def onboard_project(
     # attributes with a stale row — this is independent of the session's
     # autoflush setting (production AsyncSessionLocal is autoflush=True; the
     # SQLite test session is autoflush=False).
+    _auto_remediation_seed = {
+        "enabled": False,
+        "branch_whitelist": branch_whitelist,
+        "max_per_hour": 2,
+        "max_concurrent": 2,
+        "require_review": True,
+    }
+
     def _seed_remediation_config(doc: dict) -> None:
-        doc["_auto_remediation"] = {
-            "enabled": False,
-            "branch_whitelist": branch_whitelist,
-            "max_per_hour": 2,
-            "max_concurrent": 2,
-            "require_review": True,
-        }
+        doc["_auto_remediation"] = _auto_remediation_seed
         doc["_issue_implementation"] = {
             "enabled": False,
             "trigger_label": "auto:implement",
@@ -1194,6 +1212,13 @@ async def onboard_project(
 
     await session.flush()
     await with_design_doc_locked(session, project.id, _seed_remediation_config)
+    # Dual-write the auto-remediation seed to project_telemetry (design_doc copy
+    # kept for rollback compatibility during the rolling God-column cutover).
+    from app.project_telemetry import set_project_telemetry
+
+    await set_project_telemetry(
+        session, project.id, "_auto_remediation", _auto_remediation_seed
+    )
 
     # Seed the user's goal + optional steering into strategic intent so the
     # first strategic cycle reasons from it. Read defensively: the OnboardPayload
@@ -1201,44 +1226,24 @@ async def onboard_project(
     seed_sequence = await lock_project_and_next_message_sequence(
         session, project.id
     )
-    seeded_message = _seed_strategic_intent(
-        project,
-        getattr(payload, "goal", None),
-        getattr(payload, "initial_steering", None),
-        actor_user_id=current_user["user_id"],
-        sequence=seed_sequence,
-    )
+    try:
+        seeded_message = _seed_strategic_intent(
+            project,
+            getattr(payload, "goal", None),
+            getattr(payload, "initial_steering", None),
+            actor_user_id=current_user["user_id"],
+            sequence=seed_sequence,
+        )
+    except ValueError as _seed_ve:
+        from app.alert_dispatch import _maybe_create_problem_model_live_core_alert
+
+        await _maybe_create_problem_model_live_core_alert(project.id, session)
+        await session.commit()
+        raise HTTPException(status_code=400, detail=str(_seed_ve)) from None
     if seeded_message is not None:
         session.add(seeded_message)
         session.add(project)
 
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-    resident = await initialize_strategic_resident(
-        session, project.id, locked_project=project
-    )
-    if seeded_message is not None:
-        from app.strategic_resident_turns import coalesce_shadow_resident_turn
-
-        try:
-            async with session.begin_nested():
-                await coalesce_shadow_resident_turn(
-                    session,
-                    project_id=project.id,
-                    lane="interactive",
-                    trigger_kind="operator_message",
-                    message_sequence=seed_sequence,
-                    locked_resident=resident,
-                )
-        except Exception:
-            # Fresh projects are legacy-owned during the shadow rollout. A
-            # projection-only enqueue failure must not reject onboarding or the
-            # durably accepted initial steering message.
-            logger.warning(
-                "[ONBOARD] shadow Resident enqueue failed for project %s",
-                project.id,
-                exc_info=True,
-            )
     await session.commit()
     await session.refresh(project)
 

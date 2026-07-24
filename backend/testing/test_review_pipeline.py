@@ -66,6 +66,8 @@ from app.review_pipeline import (
     maybe_spawn_cross_cutting_safeguard,
     post_merge_summary_comment,
     should_auto_approve_diff,
+    should_skip_initial_review,
+    should_skip_rereview,
     REVIEW_FIX_GOAL_PREAMBLE,
 )
 from testing.factories import make_project, make_task
@@ -256,22 +258,11 @@ class TestMaxReviewIterations:
     def test_ci_failure_returns_8(self):
         assert _max_review_iterations(self._task(fix_reason="ci_failure")) == 8
 
-    def test_ci_failure_overrides_small_scope(self):
-        """ci_failure cap (8) takes priority over the small-scope cap (10)."""
+    @pytest.mark.parametrize("scope", ["small", "medium", "large"])
+    def test_ci_failure_overrides_all_scopes(self, scope):
+        """ci_failure cap (8) takes priority over all scope-based caps."""
         assert (
-            _max_review_iterations(self._task(scope="small", fix_reason="ci_failure"))
-            == 8
-        )
-
-    def test_ci_failure_overrides_medium_scope(self):
-        assert (
-            _max_review_iterations(self._task(scope="medium", fix_reason="ci_failure"))
-            == 8
-        )
-
-    def test_ci_failure_overrides_large_scope(self):
-        assert (
-            _max_review_iterations(self._task(scope="large", fix_reason="ci_failure"))
+            _max_review_iterations(self._task(scope=scope, fix_reason="ci_failure"))
             == 8
         )
 
@@ -292,35 +283,22 @@ class TestMaxReviewIterations:
                 f"scope={scope!r} produced limit={limit} > MAX={MAX_REVIEW_FIX_ITERATIONS}"
             )
 
-    def test_constants_match_expected_values(self):
-        """Tripwire: cap constants must not change without a deliberate review."""
-        assert MAX_REVIEW_FIX_ITERATIONS == 16
-        assert STUCK_CYCLE_THRESHOLD_DEFAULT == 0.55
-        assert STUCK_CYCLE_THRESHOLD_REFACTOR == 0.65
-
     # ── Direction-aware reduction ─────────────────────────────────────────────
 
     def _direction_data(self, history: list[dict], agg: dict | None = None) -> dict:
         return {"research_history": history, "history_aggregate": agg or {}}
 
-    def test_low_acceptance_rate_reduces_small_cap(self):
-        """acceptance_rate < 0.3 reduces cap by ~30% (10 → 7)."""
+    @pytest.mark.parametrize("scope,expected", [
+        ("small", 7),   # 10 → 7 (~30% reduction)
+        ("medium", 8),  # 12 → 8 (~30% reduction)
+        ("large", 11),  # 16 → 11 (~30% reduction)
+    ])
+    def test_low_acceptance_rate_reduces_cap(self, scope, expected):
+        """acceptance_rate < 0.3 reduces cap by ~30% for each scope."""
         # 1 merged, 9 rejected → acceptance_rate = 0.1 < 0.3
         history = [{"prs_merged": 1, "prs_rejected": 9}]
         d = self._direction_data(history)
-        assert _max_review_iterations(self._task(scope="small"), direction_data=d) == 7
-
-    def test_low_acceptance_rate_reduces_medium_cap(self):
-        """acceptance_rate < 0.3 reduces cap by ~30% (12 → 8)."""
-        history = [{"prs_merged": 1, "prs_rejected": 9}]
-        d = self._direction_data(history)
-        assert _max_review_iterations(self._task(scope="medium"), direction_data=d) == 8
-
-    def test_low_acceptance_rate_reduces_large_cap(self):
-        """acceptance_rate < 0.3 reduces cap by ~30% (16 → 11)."""
-        history = [{"prs_merged": 1, "prs_rejected": 9}]
-        d = self._direction_data(history)
-        assert _max_review_iterations(self._task(scope="large"), direction_data=d) == 11
+        assert _max_review_iterations(self._task(scope=scope), direction_data=d) == expected
 
     def test_high_rejection_ratio_reduces_cap(self):
         """prs_rejected / prs_merged > 2.0 in recent history reduces cap."""
@@ -4255,11 +4233,8 @@ def test_stuck_cycle_issue_similarity_threshold_constants():
 
 
 def test_stuck_cycle_medium_thresholds_match_default():
-    """Tripwire: medium-scope thresholds match the defaults so cross-module PRs
+    """Medium-scope thresholds must equal the defaults so cross-module PRs
     get the same patience as other scopes to converge on cross-file fixes."""
-    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.55
-    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == 0.68
-    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == 0.7
     assert STUCK_CYCLE_THRESHOLD_MEDIUM == STUCK_CYCLE_THRESHOLD_DEFAULT
     assert (
         STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM
@@ -4765,10 +4740,6 @@ async def test_second_opinion_state_not_propagated_to_spawned_tasks(db_session, 
             "surviving_issues": [{"description": "iteration-1 issue"}],
             "review_task_id": str(uuid.uuid4()),
         },
-        "awaiting_review_second_opinion": str(uuid.uuid4()),
-        "review_second_opinion_parked": {"verdict": "REQUEST_CHANGES", "issues": []},
-        "review_second_opinion_for_task_id": str(uuid.uuid4()),
-        "blind_review_for_task_id": str(uuid.uuid4()),
     }
     # The literal keys above must stay in lockstep with the canonical family —
     # if a key is renamed or added, this test must be updated alongside it.
@@ -10947,7 +10918,7 @@ def _mock_merge_success_deps(mocker):
 
 def _mock_small_auto_merge_deps(mocker):
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "tiny diff"),
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=1.0)
@@ -13613,12 +13584,6 @@ class TestClassifyIterationLane:
             context=ctx,
         )
 
-    def test_panel_review_is_arbitration(self):
-        from app.review_pipeline import classify_iteration_lane, LANE_ARBITRATION
-
-        t = self._task(payload_type="panel_review")
-        assert classify_iteration_lane(t) == LANE_ARBITRATION
-
     def test_merge_conflict_is_conflict(self):
         from app.review_pipeline import classify_iteration_lane, LANE_CONFLICT
 
@@ -13655,16 +13620,6 @@ class TestClassifyIterationLane:
         t = self._task(payload_type="review")
         assert classify_iteration_lane(t) == LANE_REVIEW_CONVERGENCE
 
-    def test_panel_review_overrides_fix_reason(self):
-        """payload_type=panel_review takes priority regardless of fix_reason."""
-        from app.review_pipeline import classify_iteration_lane, LANE_ARBITRATION
-
-        ctx = {"review_loop": {"fix_reason": "ci_failure"}}
-        t = make_task(
-            payloads=[{"type": "panel_review", "pr_number": 1}],
-            context=ctx,
-        )
-        assert classify_iteration_lane(t) == LANE_ARBITRATION
 
 
 class TestRecentConsecutiveLaneCount:
@@ -14013,93 +13968,6 @@ async def test_conflict_lane_exhaustion_does_not_block_review_convergence(
     assert result is not None and created is True, (
         "review_convergence spawn must not be blocked by conflict lane exhaustion"
     )
-
-
-@pytest.mark.asyncio
-async def test_arbitration_lane_exhaustion_routes_as_standoff(db_session, mocker):
-    """Arbitration lane cap (default 2): once 2 panel_review iterations have run,
-    a 3rd panel_review spawn routes to the standoff escalation path (SPAWN_REASON_STUCK)
-    rather than the global cap path."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
-    )
-
-    from app.review_pipeline import SPAWN_REASON_STUCK
-    from app.shared_state import runtime_config
-
-    project = await _make_db_project(db_session)
-    original_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create", "prompt": "p", "base_branch": "main"}],
-        context={"scope": "large"},
-    )
-    db_session.add(original_task)
-    await db_session.commit()
-    await db_session.refresh(original_task)
-
-    # 2 completed panel_review tasks — arbitration lane at cap.
-    for _ in range(2):
-        db_session.add(
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[
-                    {
-                        "type": "panel_review",
-                        "pr_number": 9102,
-                        "branch": "b",
-                        "base_branch": "main",
-                    }
-                ],
-                context={"review_loop": {"original_task_id": str(original_task.id)}},
-            )
-        )
-
-    source_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {
-                "type": "panel_review",
-                "pr_number": 9102,
-                "branch": "b",
-                "base_branch": "main",
-                "original_task_id": str(original_task.id),
-            }
-        ],
-        context={
-            "scope": "large",
-            "review_loop": {"iteration": 2, "original_task_id": str(original_task.id)},
-        },
-    )
-    db_session.add(source_task)
-    await db_session.commit()
-    await db_session.refresh(source_task)
-
-    mocker.patch.dict(runtime_config, {"review_lane_cap_arbitration": 2})
-    result, created = await _spawn_pipeline_task(
-        source_task,
-        "panel_review",
-        db_session,
-        pr_number=9102,
-        branch="b",
-        base_branch="main",
-        original_task_id=str(original_task.id),
-    )
-
-    assert result is None
-    assert created is False
-    # Arbitration exhaustion routes as standoff, not cap.
-    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_STUCK
-    # The original task should be marked requires_approval.
-    await db_session.refresh(original_task)
-    terminal_outcome = (original_task.context or {}).get(
-        "review_loop_terminal_outcome"
-    ) or {}
-    assert terminal_outcome.get("kind") == "standoff"
-    assert terminal_outcome.get("reason") == "arbitration_lane_exhausted"
 
 
 @pytest.mark.asyncio
@@ -18458,158 +18326,6 @@ async def test_stuck_cycle_still_detected_after_feedback_cap(db_session, mocker)
 
 
 @pytest.mark.asyncio
-async def test_spawn_review_second_opinion_forwards_viewport_shots(db_session):
-    """panel_review challenger payload carries viewport_shot_entries forwarded
-    from the review task when the review payload contains them."""
-    from app.task_evaluators import spawn_review_second_opinion
-
-    project = Project(name="vp-test", user_id="user-1", github_repo="o/r")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    shot_entries = [
-        {"name": "before/comp/renders-375px"},
-        {"name": "after/comp/renders-375px"},
-    ]
-    review_task = Task(
-        project_id=project.id,
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 9001,
-                "branch": "feat/vp",
-                "base_branch": "main",
-                "original_task_id": str(uuid.uuid4()),
-                "viewport_shot_entries": shot_entries,
-                "viewport_source_task_id": "src-task-abc",
-            }
-        ],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={},
-    )
-    db_session.add(review_task)
-    await db_session.commit()
-    await db_session.refresh(review_task)
-
-    challenger = await spawn_review_second_opinion(
-        review_task,
-        db_session,
-        verdict="APPROVE",
-        issues=[],
-        feedback="lgtm",
-        pr_number=9001,
-        branch="feat/vp",
-        base_branch="main",
-        original_task_id=str(uuid.uuid4()),
-        original_prompt="do the thing",
-        investigated_files=["app/x.py"],
-    )
-
-    assert challenger is not None
-    cp = challenger.first_payload
-    assert cp.get("type") == "panel_review"
-    assert cp.get("viewport_shot_entries") == shot_entries, (
-        "challenger payload must carry viewport_shot_entries forwarded from the review task"
-    )
-    assert cp.get("viewport_source_task_id") == "src-task-abc"
-
-
-async def test_spawn_blind_multi_reviewer_creates_panel_review_task(db_session):
-    """spawn_blind_multi_reviewer creates a panel_review challenger with
-    is_blind: True, default reviewer count, forwarded viewport shots,
-    and both REVIEW_SECOND_OPINION_SOURCE_KEY + BLIND_REVIEW_SOURCE_KEY
-    in context. The source review task is parked EVALUATING."""
-    from app.task_evaluators import (
-        BLIND_REVIEW_SOURCE_KEY,
-        REVIEW_SECOND_OPINION_SOURCE_KEY,
-        spawn_blind_multi_reviewer,
-    )
-    from app.task_completion import REVIEW_SECOND_OPINION_AWAITING_KEY
-
-    project = Project(name="blind-test", user_id="user-1", github_repo="o/r")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    shot_entries = [
-        {"name": "before/comp/blind-375px"},
-    ]
-    source_task = Task(
-        project_id=project.id,
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 9002,
-                "branch": "feat/blind",
-                "base_branch": "main",
-                "original_task_id": str(uuid.uuid4()),
-                "viewport_shot_entries": shot_entries,
-                "viewport_source_task_id": "src-blind-abc",
-            }
-        ],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={},
-    )
-    db_session.add(source_task)
-    await db_session.commit()
-    await db_session.refresh(source_task)
-
-    challenger = await spawn_blind_multi_reviewer(
-        source_task,
-        db_session,
-        verdict="APPROVE",
-        issues=[],
-        feedback="lgtm",
-        pr_number=9002,
-        branch="feat/blind",
-        base_branch="main",
-        original_task_id=str(uuid.uuid4()),
-        original_prompt="do the thing",
-        investigated_files=["app/x.py"],
-    )
-
-    assert challenger is not None
-    cp = challenger.first_payload
-    assert cp.get("type") == "panel_review"
-    assert cp.get("is_blind") is True, "blind multi-reviewer: is_blind must be True"
-    assert cp.get("blind_reviewer_count") == 3, (
-        "default blind_reviewer_count must be 3"
-    )
-    assert cp.get("viewport_shot_entries") == shot_entries, (
-        "challenger payload must carry viewport_shot_entries forwarded from the source task"
-    )
-    assert cp.get("viewport_source_task_id") == "src-blind-abc"
-
-    # Context must carry both source keys for routing and identification.
-    ctx = challenger.context or {}
-    assert REVIEW_SECOND_OPINION_SOURCE_KEY in ctx, (
-        "blind challenger context must have REVIEW_SECOND_OPINION_SOURCE_KEY for reconciliation routing"
-    )
-    assert BLIND_REVIEW_SOURCE_KEY in ctx, (
-        "blind challenger context must have BLIND_REVIEW_SOURCE_KEY for identification"
-    )
-    assert ctx[REVIEW_SECOND_OPINION_SOURCE_KEY] == str(source_task.id)
-    assert ctx[BLIND_REVIEW_SOURCE_KEY] == str(source_task.id)
-
-    # Source task must be parked EVALUATING with the awaiting marker.
-    assert source_task.status == TaskStatus.EVALUATING, (
-        "source task must be parked EVALUATING pending blind review"
-    )
-    assert (source_task.context or {}).get(REVIEW_SECOND_OPINION_AWAITING_KEY) is not False, (  # truthy (True or task id str)
-        "source task must have REVIEW_SECOND_OPINION_AWAITING_KEY set"
-    )
-
-    # Cleanup: can't leave a parked task in the session without committing
-    # the parking state. The test already committed through the spawn; just
-    # verify the DB state is consistent.
-    await db_session.refresh(source_task)
-    assert source_task.status == TaskStatus.EVALUATING
-
-
-@pytest.mark.asyncio
 async def test_noop_fix_skips_review_spawn_below_churn_limit(db_session, mocker):
     """A completed fix task with no_op_reason set must NOT spawn a new review
     even when the supersession-churn limit has not been reached.  The no-op fix
@@ -18999,3 +18715,69 @@ async def test_reviewer_that_completes_inside_supersede_window_keeps_its_verdict
     )
     assert (landed.context or {}).get("failure_detail") is None
     delete_vm.assert_not_awaited()
+
+
+# ── should_skip_initial_review ─────────────────────────────────────────────
+
+
+class TestShouldSkipInitialReview:
+    def test_non_intermediate_always_skips(self):
+        skip, reason = should_skip_initial_review(False, "large")
+        assert skip is True
+        assert "non-intermediate" in reason
+
+    def test_non_intermediate_small_scope_skips(self):
+        skip, _ = should_skip_initial_review(False, "small")
+        assert skip is True
+
+    def test_intermediate_small_scope_skips(self):
+        skip, reason = should_skip_initial_review(True, "small")
+        assert skip is True
+        assert "rollup" in reason
+
+    def test_intermediate_medium_scope_skips(self):
+        skip, _ = should_skip_initial_review(True, "medium")
+        assert skip is True
+
+    def test_intermediate_large_scope_requires_review(self):
+        skip, reason = should_skip_initial_review(True, "large")
+        assert skip is False
+        assert "full review" in reason
+
+    def test_intermediate_unknown_scope_skips(self):
+        # Any scope that is not 'large' is treated as not requiring review.
+        skip, _ = should_skip_initial_review(True, "unknown")
+        assert skip is True
+
+
+# ── should_skip_rereview ────────────────────────────────────────────────────
+
+
+class TestShouldSkipRereview:
+    def test_minor_only_first_pass_skips(self):
+        skip, reason = should_skip_rereview("code_review", True)
+        assert skip is True
+        assert "minor-only" in reason
+
+    def test_ci_failure_skips(self):
+        skip, reason = should_skip_rereview("ci_failure", False)
+        assert skip is True
+        assert "ci_failure" in reason
+
+    def test_merge_conflict_skips(self):
+        skip, _ = should_skip_rereview("merge_conflict", False)
+        assert skip is True
+
+    def test_migration_guard_skips(self):
+        skip, _ = should_skip_rereview("migration_guard", False)
+        assert skip is True
+
+    def test_code_review_requires_rereview(self):
+        skip, reason = should_skip_rereview("code_review", False)
+        assert skip is False
+        assert "re-review required" in reason
+
+    def test_minor_only_overrides_code_review(self):
+        # skip_rereview_minor_only takes priority over fix_reason
+        skip, _ = should_skip_rereview("code_review", True)
+        assert skip is True

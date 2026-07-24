@@ -240,7 +240,10 @@ PLATFORM_WORKING_CAPABILITIES: frozenset[str] = frozenset(
 )
 
 
-def working_capability_names(problem_model: object) -> set[str]:
+def working_capability_names(
+    problem_model: object,
+    proof_records: object = None,
+) -> set[str]:
     """Return canonical names of registry capabilities declared ``working``.
 
     A ``working`` capability already exists in the codebase per the
@@ -249,14 +252,33 @@ def working_capability_names(problem_model: object) -> set[str]:
     status qualifies: ``partial`` / ``planned`` capabilities still gate, since
     the declared foundation genuinely does not (fully) exist yet.
 
-    Alias-aware: a ``working`` capability contributes its own canonical name AND
-    the canonical form of every name in its ``absorbs`` list. So after a
-    consolidation merges several old capabilities into one working survivor, a
-    prerequisite that named any absorbed old capability still resolves as
-    satisfied-by-the-codebase — exactly as it did before consolidation. Both the
-    spawn-time resolver (``research_completion``) and the blocked-resume matcher
-    (``reaper_sweeps``) consume this set via
-    :func:`registry_satisfies_capability_need`, so neither needs its own edit.
+    Alias-aware — BUT only through PLATFORM-RECORDED aliases (forwarding markers
+    in ``proof_records``), NOT the agent-writable ``absorbs`` list. When a genuine
+    consolidation merges several old capabilities into one working survivor, the
+    platform ledger holds ``absorbed_into`` forwarding markers for each absorbed
+    old name (written by
+    :func:`app.capability_proof.carry_proof_records_for_consolidation`). This
+    function folds those platform-recorded alias names in alongside the survivor's
+    own name, so a dependent that named an absorbed old capability still resolves
+    as satisfied-by-the-codebase — but an agent-declared ``absorbs`` entry with
+    no corresponding forwarding marker contributes nothing here and cannot forge
+    a name into the working set.
+
+    This ensures that capability EXISTENCE resolution (``working_capability_names``
+    + :func:`registry_satisfies_capability_need`) uses the SAME platform-ledger
+    alias authority as proof status (:func:`consumer_gate_proof_status`), closing
+    the alias-forgery bypass where an agent-declared ``absorbs`` entry could
+    previously satisfy the existence check without any platform-recorded proof
+    relationship (audit finding: existence/authority alias divergence).
+
+    Both the spawn-time resolver (``research_completion``) and the blocked-resume
+    matcher (``reaper_sweeps``) consume this set via
+    :func:`registry_satisfies_capability_need`, and both now pass
+    ``proof_records`` so the alias resolution is identical to the proof gate's.
+
+    ``proof_records`` defaults to ``None`` = EMPTY alias map = only each
+    capability's own canonical name is included (no absorbed aliases). This fails
+    CLOSED: without a ledger, no forge alias can satisfy the existence check.
 
     Platform-owned capabilities (``PLATFORM_WORKING_CAPABILITIES``) are always
     included regardless of the project model, mirroring the demand filter in
@@ -267,13 +289,23 @@ def working_capability_names(problem_model: object) -> set[str]:
     # Platform capabilities are always working — include them first so the
     # project model can only add to this set, never subtract.
     working: set[str] = set(PLATFORM_WORKING_CAPABILITIES)
-    for raw_name, status, absorbs in _iter_capability_entries(problem_model):
+    # Platform-recorded aliases: only a genuine consolidation (forwarding marker
+    # in the ledger) establishes an absorbed→survivor relationship that a
+    # capability need can trust. Without this guard, an agent-declared ``absorbs``
+    # list could forge a name into the working set and bypass the proof gate
+    # (existence/authority alias divergence).
+    forwarded_absorbed = _survivor_forwarded_absorbed(proof_records)
+    for raw_name, status, _absorbs in _iter_capability_entries(problem_model):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
         normalized = normalize_capability_name(raw_name)
         if normalized:
             working.add(normalized)
-        working.update(_normalized_absorbed_names(absorbs))
+            # Use platform-recorded aliases — NOT the agent-writable ``absorbs``
+            # list (which is now intentionally ignored here to close the
+            # alias-forgery bypass).
+            for absorbed in forwarded_absorbed.get(normalized, ()):
+                working.add(absorbed)
     return working
 
 

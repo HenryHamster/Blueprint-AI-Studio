@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AlertTriangle, ChevronRight, CheckSquare, ExternalLink, EyeOff, RefreshCw, Wand2 } from 'lucide-react';
+import { AlertTriangle, ChevronRight, ExternalLink, EyeOff, RefreshCw, Wand2 } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import type { Task } from '../types/task';
@@ -45,7 +45,7 @@ function SkeletonRow() {
   return <div className="animate-pulse bg-neutral-800/60 rounded h-10 w-full" />;
 }
 
-export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask, onPanelReviewPr, stale, degraded }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void; onPanelReviewPr?: (pr: OpenPR) => void; stale?: boolean; degraded?: boolean }) {
+export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask, stale, degraded }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void; stale?: boolean; degraded?: boolean }) {
   const [expanded, setExpanded] = useState(true);
   const [dismissedPrs, setDismissedPrs] = useState<Set<number>>(() => new Set());
   const tasksById = React.useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -156,16 +156,6 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                     )}
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
-                    {onPanelReviewPr && (
-                      <button
-                        type="button"
-                        onClick={() => onPanelReviewPr(pr)}
-                        title="Panel review"
-                        className="min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 flex items-center justify-center text-neutral-500 hover:text-neutral-300"
-                      >
-                        <CheckSquare className="w-3.5 h-3.5" />
-                      </button>
-                    )}
                     {pr.is_orphaned && onSpawnFixTask && (
                       <button
                         type="button"

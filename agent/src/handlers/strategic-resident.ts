@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { createHash } from 'crypto';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
@@ -28,10 +29,12 @@ import {
 } from './strategic-sections.js';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
-  BoundedSeenSet, dedupNewMessages, combineOperatorMessages,
-  materializeContentBlocks, buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
+  BoundedSeenSet, admitMessageBatchPage, combineOperatorMessages,
+  materializeContentBlocks, rollbackMessageBatchAdmission,
+  isRetryableArtifactAttachmentError,
+  buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
-  MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
+  MESSAGE_POLL_LIMIT, MAX_POLL_PAGES, OPERATOR_MESSAGE_BATCH_CAP, MAX_IMAGES_PER_TURN,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
@@ -60,6 +63,189 @@ const STREAM_FLUSH_MS = 100;
 // Consecutive per-turn stalls (the turn's stall watchdog fired) after which the
 // session is considered wedged and stopped as FAILED rather than spun forever.
 const MAX_CONSECUTIVE_STALLS = 3;
+const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
+// Resolve the workspace root from env here rather than from the imported
+// WORKSPACE binding: these are MODULE-LEVEL const initializers, so referencing
+// the ../index.js WORKSPACE export at import time hits a circular-import TDZ
+// ("Cannot access 'WORKSPACE' before initialization") when this module is
+// evaluated before index.ts finishes initializing its export. The value is
+// identical to WORKSPACE (index.ts: process.env.AGENT_WORKSPACE || '/tmp/workspace').
+const RESIDENT_WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+const RESIDENT_REPLY_KEY_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-idempotency-key`;
+const RESIDENT_REPLY_RECEIPT_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-receipt.json`;
+const RESIDENT_STAGED_REPLY_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-staged-message.json`;
+
+export interface ResidentReplyReceipt {
+  idempotency_key: string;
+  covered_message_ids: string[];
+}
+
+export interface ResidentStagedReply {
+  type: string;
+  content: string;
+  idempotency_key: string;
+  covered_message_ids: string[];
+  context?: Record<string, unknown>;
+}
+
+/** Read and authenticate the helper's staged intent against this immutable turn receipt. */
+export function readResidentStagedReplyAtPath(
+  stagedReplyPath: string,
+  receipt: ResidentReplyReceipt,
+): ResidentStagedReply | null {
+  const maxBytes = 65_536;
+  let fd: number | null = null;
+  let raw: string;
+  try {
+    const before = fs.lstatSync(stagedReplyPath);
+    if (!before.isFile()) throw new Error('staged Resident reply is not a regular file');
+    const noFollow = (fs.constants as Partial<typeof fs.constants>).O_NOFOLLOW ?? 0;
+    fd = fs.openSync(stagedReplyPath, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error('staged Resident reply changed identity during open');
+    }
+    if (opened.size > maxBytes) throw new Error('staged Resident reply exceeds 64KiB');
+    const buffer = Buffer.alloc(opened.size + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const count = fs.readSync(fd, buffer, bytesRead, buffer.length - bytesRead, null);
+      if (count === 0) break;
+      bytesRead += count;
+    }
+    const after = fs.fstatSync(fd);
+    if (bytesRead !== opened.size || after.size !== opened.size) {
+      throw new Error('staged Resident reply changed size during read');
+    }
+    raw = buffer.subarray(0, bytesRead).toString('utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+  const decoded: unknown = JSON.parse(raw);
+  if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new Error('staged Resident reply must be a JSON object');
+  }
+  const parsed = decoded as Record<string, unknown>;
+  const expectedIds = [...receipt.covered_message_ids].sort();
+  const rawActualIds = parsed.covered_message_ids;
+  const actualIds = Array.isArray(rawActualIds)
+    && rawActualIds.every((value): value is string => typeof value === 'string' && Boolean(value))
+    ? [...rawActualIds].sort()
+    : null;
+  if (
+    typeof parsed.type !== 'string' || !parsed.type.trim()
+    || typeof parsed.content !== 'string' || !parsed.content.trim()
+    || parsed.idempotency_key !== receipt.idempotency_key
+    || actualIds === null
+    || actualIds.length !== expectedIds.length
+    || actualIds.some((value, index) => value !== expectedIds[index])
+    || (parsed.context !== undefined && (
+      parsed.context === null || typeof parsed.context !== 'object' || Array.isArray(parsed.context)
+    ))
+  ) {
+    throw new Error('staged Resident reply does not match the active turn receipt');
+  }
+  return {
+    type: parsed.type.trim(),
+    content: parsed.content.trim(),
+    idempotency_key: parsed.idempotency_key,
+    covered_message_ids: [...receipt.covered_message_ids],
+    ...(parsed.context === undefined ? {} : { context: parsed.context as Record<string, unknown> }),
+  };
+}
+
+/**
+ * Remove the fixed reply-key path without following it. A previous resident
+ * process can die after installing the key but before its per-turn finally
+ * removes it, so every new process must clear that stale capability before it
+ * starts the model. unlinkSync removes a symlink itself rather than touching
+ * its target; errors other than an absent path are fail-closed.
+ */
+export function removeResidentReplyKeyAtPath(replyKeyPath: string): void {
+  try {
+    fs.unlinkSync(replyKeyPath);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+}
+
+/**
+ * Install one operator turn's stable reply key safely. Removing the fixed
+ * pathname first handles stale regular files and symlinks. Exclusive create
+ * then closes the unlink/create race: if anything recreates the pathname, the
+ * open fails instead of following or overwriting it and the operator turn does
+ * not start.
+ */
+export function installResidentReplyKeyAtPath(replyKeyPath: string, key: string): void {
+  removeResidentReplyKeyAtPath(replyKeyPath);
+  fs.writeFileSync(replyKeyPath, key, {
+    encoding: 'utf8',
+    flag: 'wx',
+    mode: 0o600,
+  });
+}
+
+/** Remove both ambient reply capabilities, attempting both paths fail-closed. */
+export function removeResidentReplyArtifactsAtPaths(
+  replyKeyPath: string,
+  replyReceiptPath: string,
+): void {
+  let firstError: Error | null = null;
+  for (const artifactPath of [replyKeyPath, replyReceiptPath]) {
+    try {
+      removeResidentReplyKeyAtPath(artifactPath);
+    } catch (e) {
+      firstError ??= e instanceof Error ? e : new Error(String(e));
+    }
+  }
+  if (firstError !== null) throw firstError;
+}
+
+/** Install the immutable per-turn key and covered-message receipt before model work. */
+export function installResidentReplyReceiptAtPaths(
+  replyKeyPath: string,
+  replyReceiptPath: string,
+  receipt: ResidentReplyReceipt,
+): void {
+  removeResidentReplyArtifactsAtPaths(replyKeyPath, replyReceiptPath);
+  try {
+    fs.writeFileSync(replyReceiptPath, JSON.stringify(receipt), {
+      encoding: 'utf8', flag: 'wx', mode: 0o600,
+    });
+    fs.writeFileSync(replyKeyPath, receipt.idempotency_key, {
+      encoding: 'utf8', flag: 'wx', mode: 0o600,
+    });
+  } catch (e) {
+    try { removeResidentReplyArtifactsAtPaths(replyKeyPath, replyReceiptPath); } catch { /* preserve setup error */ }
+    throw e;
+  }
+}
+
+/** Stable identity for one logical operator reply across retry batches. */
+export function oldestStableInboundMessageId(
+  messages: ResidentInboundMessage[],
+): string | null {
+  let chosen: { id: string; createdAt: number; index: number } | null = null;
+  for (const [index, message] of messages.entries()) {
+    const id = typeof message.id === 'string' ? message.id.trim() : '';
+    if (!id) continue;
+    const parsed = typeof message.created_at === 'string'
+      ? new Date(message.created_at).getTime()
+      : Number.NaN;
+    const createdAt = Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+    if (
+      chosen === null
+      || createdAt < chosen.createdAt
+      || (createdAt === chosen.createdAt && index < chosen.index)
+    ) {
+      chosen = { id, createdAt, index };
+    }
+  }
+  return chosen?.id ?? null;
+}
 
 
 /** The `kind` vocabulary the backend `strategic_session` delta accepts
@@ -335,6 +521,22 @@ export async function handleStrategicResident(
     branch: baseBranch, baseBranch, depth: 0,
   });
 
+  // A hard process/VM exit bypasses the operator turn's finally block. Clear
+  // any reply key it left behind before starting a new model process; otherwise
+  // the first autonomous turn could invoke `./messages send` with another
+  // turn's key. Any cleanup error is fatal so model work never begins with an
+  // ambiguous ambient reply capability.
+  try {
+    removeResidentReplyArtifactsAtPaths(
+      RESIDENT_REPLY_KEY_PATH,
+      RESIDENT_REPLY_RECEIPT_PATH,
+    );
+    removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+  } catch (e) {
+    sendLog(ws, `[resident] stale idempotency key cleanup failed; refusing to start: ${String(e)}\n`);
+    throw e;
+  }
+
   // ── Git read-credential refresh setup ────────────────────────────────────────
   // Write the initial token then switch the remote URL from the baked-in
   // token-embedded form to a plain HTTPS URL backed by a credential helper that
@@ -365,6 +567,9 @@ export async function handleStrategicResident(
   const sessionId = strVal(ctx.strategic_session_id)
     || strVal(payload.strategic_session_id)
     || taskId;
+  const workerGenerationRaw = Number(ctx._resident_worker_generation);
+  const workerGeneration = Number.isSafeInteger(workerGenerationRaw) && workerGenerationRaw > 0
+    ? workerGenerationRaw : 1;
 
   if (!projectId) {
     sendLog(ws, '[resident] ERROR: no project_id in task.project_metadata — cannot poll/heartbeat.\n');
@@ -505,6 +710,11 @@ export async function handleStrategicResident(
   // Bounded set of message ids already handled — with `created_at >= since` poll
   // semantics the boundary message re-appears each poll and is dropped here.
   const seen = new BoundedSeenSet();
+  let pendingOperatorAdmission: {
+    cursorBefore: string;
+    messages: ResidentInboundMessage[];
+  } | null = null;
+  let artifactRetryFailures = 0;
 
   // ── Evidence-gated autonomous tick: examination ledger + rotating focus ──────
   // Code-owned cross-tick memory the model cannot be trusted to keep. The catalog
@@ -659,7 +869,7 @@ export async function handleStrategicResident(
 
   // ── Session + streaming wiring ──────────────────────────────────────────────
   const streamer = new SessionStreamer(ws, sessionId, taskId);
-  const onSessionEvent = (ev: ResidentSessionEvent): void => {
+  const handleSessionEvent = (ev: ResidentSessionEvent): void => {
     if (ev.kind === 'text' && ev.text) {
       // Assistant reply text — the only content that reaches the durable
       // transcript (once the agent `./messages send`s it). Streams as `message`.
@@ -676,13 +886,27 @@ export async function handleStrategicResident(
       streamer.status(`error: ${ev.text}`);
     }
   };
+  // Every subprocess gets a distinct listener epoch. Invalidate the old epoch
+  // BEFORE closing a worker for forced restart: child stdout can drain after
+  // close(), and those late events must never enter the fresh worker's stream.
+  let sessionEventEpoch = 0;
+  const bindSessionEvents = (target: ResidentSession): void => {
+    const epoch = ++sessionEventEpoch;
+    target.onEvent((ev) => {
+      if (epoch !== sessionEventEpoch) return;
+      handleSessionEvent(ev);
+    });
+  };
+  const invalidateSessionEvents = (): void => { sessionEventEpoch += 1; };
   let session: ResidentSession = startResidentClaudeSession({
     model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
   });
-  session.onEvent(onSessionEvent);
+  bindSessionEvents(session);
 
   let firstTurnSent = false;
   let stopReason = 'stop_requested';
+  const terminalProviderFailure: { value: 'rate_limited' | 'dead_auth' | null } = { value: null };
+  let pendingRestartCheckpoint: string | null = null;
   // Consecutive turns whose per-turn stall watchdog fired. N in a row ⇒ the
   // session is wedged (not merely slow) ⇒ fail it rather than spin forever.
   let consecutiveStalls = 0;
@@ -718,9 +942,17 @@ export async function handleStrategicResident(
   }
 
   const runTurn = async (content: string | ContentBlock[], operator: boolean, pickupLagMs?: number | null): Promise<ResidentTurnResult> => {
-    const full: string | ContentBlock[] = typeof content === 'string'
-      ? (firstTurnSent ? content : `${bootstrapPrompt}\n\n---\n\n${content}`)
-      : (firstTurnSent ? content : [{ type: 'text', text: `${bootstrapPrompt}\n\n---\n\n` }, ...content]);
+    let turnContent = content;
+    if (pendingRestartCheckpoint !== null) {
+      const checkpointPrefix = `${pendingRestartCheckpoint}\n\n---\n\n`;
+      turnContent = typeof content === 'string'
+        ? `${checkpointPrefix}${content}`
+        : [{ type: 'text', text: checkpointPrefix }, ...content];
+      pendingRestartCheckpoint = null;
+    }
+    const full: string | ContentBlock[] = typeof turnContent === 'string'
+      ? (firstTurnSent ? turnContent : `${bootstrapPrompt}\n\n---\n\n${turnContent}`)
+      : (firstTurnSent ? turnContent : [{ type: 'text', text: `${bootstrapPrompt}\n\n---\n\n` }, ...turnContent]);
     firstTurnSent = true;
     statusRef.value = operator ? 'Responding to operator...' : 'Advancing project (autonomous)...';
     // Bracket BOTH operator and autonomous turns with lifecycle frames so the UI
@@ -770,6 +1002,46 @@ export async function handleStrategicResident(
     }
     return false;
   };
+  const providerTurnFailed = (r: ResidentTurnResult): boolean => {
+    // Child-close paths can classify the provider failure from their buffered
+    // stderr tail even when no explicit provider-failed terminal event arrived.
+    // Treat either signal as canonical so prompt-exit preemption never restarts
+    // and masks a rate-limit/dead-auth failure as a benign SIGINT boundary.
+    if (!r.providerFailed && r.failureCategory === null) return false;
+    terminalProviderFailure.value = r.failureCategory;
+    stopReason = r.failureCategory === 'rate_limited'
+      ? 'provider_rate_limited'
+      : r.failureCategory === 'dead_auth'
+        ? 'provider_dead_auth'
+        : 'provider_turn_failed';
+    return true;
+  };
+  const checkpointPrimeFailed = (
+    r: ResidentTurnResult,
+    fallbackStopReason: 'compaction_prime_failed' | 'workspace_recovery_prime_failed',
+    label: string,
+  ): boolean => {
+    if (providerTurnFailed(r)) {
+      sendLog(ws, `[resident] FATAL: ${label} failed (${stopReason})\n`);
+      return true;
+    }
+    if (r.interrupted || r.timedOut || r.hardTimedOut || r.processGone) {
+      // A prime timeout is a canonical timeout terminal, not a generic Claude
+      // process failure. Other incomplete exits retain the call-site reason.
+      stopReason = r.timedOut || r.hardTimedOut
+        ? 'turn_hard_timeout'
+        : fallbackStopReason;
+      const flags = [
+        r.interrupted ? 'interrupted' : '',
+        r.timedOut ? 'timed_out' : '',
+        r.hardTimedOut ? 'hard_timed_out' : '',
+        r.processGone ? 'process_gone' : '',
+      ].filter(Boolean).join(',');
+      sendLog(ws, `[resident] FATAL: ${label} incomplete (${flags})\n`);
+      return true;
+    }
+    return false;
+  };
 
   // ── Compaction: context-window pressure detection + subprocess restart ──
   // After each turn, check whether the latest input token count exceeds the
@@ -778,6 +1050,27 @@ export async function handleStrategicResident(
   // wire up the same event listeners, and prime it with the checkpoint as an
   // internal turn. The session continues coherently — the exam ledger, message
   // cursor, and operator conversation context survive the restart.
+  const restartSessionFromCheckpoint = (reason: string): boolean => {
+    const checkpoint = buildCompactionCheckpoint(buildCheckpointContext());
+    invalidateSessionEvents();
+    session.close();
+    try {
+      const newSession = startResidentClaudeSession({
+        model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+      });
+      bindSessionEvents(newSession);
+      session = newSession;
+      pendingRestartCheckpoint = checkpoint;
+      streamer.status(`restarting resident worker (${reason})`);
+      sendLog(ws, `[resident] worker restarted after ${reason}; checkpoint queued for next turn\n`);
+      return true;
+    } catch (e) {
+      sendLog(ws, `[resident] worker restart failed after ${reason}: ${String(e)}\n`);
+      stopReason = 'preemption_restart_failed';
+      return false;
+    }
+  };
+
   const maybeCompact = async (r: ResidentTurnResult): Promise<boolean> => {
     const threshold = compactionThreshold(model, cfg.compactionThresholdTokens);
     if (r.inputTokens <= 0 || r.inputTokens < threshold) return false;
@@ -825,6 +1118,7 @@ export async function handleStrategicResident(
     const checkpoint = buildCompactionCheckpoint(buildCheckpointContext());
 
     // Close the old subprocess and spawn a fresh one with the same params.
+    invalidateSessionEvents();
     session.close();
     lastCompactionAt = now;
     compactionCount += 1;
@@ -833,7 +1127,7 @@ export async function handleStrategicResident(
       model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
     });
     // Wire the same event listeners so the streamer keeps receiving deltas.
-    newSession.onEvent(onSessionEvent);
+    bindSessionEvents(newSession);
     session = newSession;
 
     // Prime the new session with the checkpoint as a standalone internal turn.
@@ -843,9 +1137,7 @@ export async function handleStrategicResident(
     streamer.status('priming compacted session with checkpoint');
     try {
       const primeResult = await newSession.sendTurn(checkpoint);
-      if (primeResult.processGone) {
-        sendLog(ws, '[resident] FATAL: new session died during checkpoint priming\n');
-        stopReason = 'compaction_prime_failed';
+      if (checkpointPrimeFailed(primeResult, 'compaction_prime_failed', 'checkpoint prime')) {
         return true; // caller must stop the loop
       }
       streamer.status(`session compacted (compaction #${compactionCount}) — context reset to preserve signal`);
@@ -861,18 +1153,38 @@ export async function handleStrategicResident(
   // live stream. The turn prompt REQUIRES the agent to `./messages send` its
   // answer; this is the backstop for when it did not. Autonomous turns carry no
   // operator reply, so callers only invoke it for operator turns.
-  const persistReply = async (r: ResidentTurnResult): Promise<void> => {
-    if (r.sentOperatorMessage) return; // agent already posted it itself
-    const text = r.resultText.trim();
-    if (!text) return;
+  const residentMessageKey = (kind: 'ack' | 'reply', anchorMessageId: string): string => {
+    const digest = createHash('sha256')
+      .update(`${sessionId}:${anchorMessageId}`)
+      .digest('hex');
+    return `resident-${kind}-${digest}`;
+  };
+  const persistReply = async (
+    r: ResidentTurnResult,
+    anchorMessageId: string,
+    coveredMessageIds: string[],
+    stagedReply: ResidentStagedReply | null,
+    residentTurnState: Record<string, unknown>,
+  ): Promise<boolean> => {
+    const text = stagedReply?.content.trim() || r.resultText.trim();
+    if (!text) return false;
     try {
       await apiPost('/api/agent/strategic', {
         task_id: taskId,
         op: 'create_message',
-        data: { type: 'NOTE', content: text },
+        data: {
+          type: stagedReply?.type ?? 'NOTE',
+          content: text,
+          idempotency_key: residentMessageKey('reply', anchorMessageId),
+          covered_message_ids: coveredMessageIds,
+          ...(stagedReply?.context === undefined ? {} : { context: stagedReply.context }),
+          resident_turn_state: residentTurnState,
+        },
       });
+      return true;
     } catch (e) {
-      sendLog(ws, `[resident] reply persistence failed (non-fatal): ${String(e)}\n`);
+      sendLog(ws, `[resident] reply persistence failed; leaving operator message open: ${String(e)}\n`);
+      return false;
     }
   };
 
@@ -889,6 +1201,7 @@ export async function handleStrategicResident(
     r: ResidentTurnResult,
     messageIds: string[],
     exchangeText: string,
+    stagedReplyText?: string,
   ): void => {
     if (r.interrupted || r.timedOut || r.hardTimedOut || r.processGone) {
       operatorDecisionReview = mergePendingOperatorDecisionReview(
@@ -900,7 +1213,8 @@ export async function handleStrategicResident(
       streamer.status('operator turn incomplete — durable decision review remains pending');
       return;
     }
-    const note = parseOperatorDecision(r.resultText)
+    const note = (stagedReplyText ? parseOperatorDecision(stagedReplyText) : null)
+      ?? parseOperatorDecision(r.resultText)
       ?? parseOperatorDecision(r.accumulatedTurnText);
     if (note === null) {
       recordOperatorDecisionCapture('markerless');
@@ -926,30 +1240,61 @@ export async function handleStrategicResident(
 
   const pollMessages = async (): Promise<ResidentInboundMessage[]> => {
     const collected: ResidentInboundMessage[] = [];
+    let collectedRequiredImages = 0;
+    const cursorBefore = cursor;
     try {
       for (let page = 0; page < MAX_POLL_PAGES; page++) {
         const prevCursor = cursor;
         // session_id scopes the poll to THIS session's conversation server-side
         // (messages stamped for another session are excluded; legacy/cadence
         // NULL-session rows stay visible). Omitted-value degrades to project-wide.
-        const sessionScope = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+        const sessionScope = sessionId ? `&session_id=${encodeURIComponent(sessionId)}&worker_generation=${workerGeneration}` : '';
         const q = `since=${encodeURIComponent(cursor)}&from_type=user&status=open&limit=${MESSAGE_POLL_LIMIT}${sessionScope}`;
         const resp = await apiGet(`/api/agent/projects/${projectId}/messages?${q}`) as MessagesPollResponse;
         const raw = Array.isArray(resp.messages) ? resp.messages : [];
-        collected.push(...dedupNewMessages(raw, seen));
-        // Advance to the MAX returned created_at; the >= boundary message
-        // re-appears next poll and the seen-set drops it.
-        cursor = advanceCursorFromMessages(raw, cursor);
+        const admission = admitMessageBatchPage(
+          raw,
+          seen,
+          OPERATOR_MESSAGE_BATCH_CAP - collected.length,
+          MAX_IMAGES_PER_TURN - collectedRequiredImages,
+        );
+        collected.push(...admission.admitted);
+        collectedRequiredImages += admission.requiredImagesAdmitted;
+        // Advance across the whole page only when every unseen row was admitted.
+        // If the atomic turn cap cut the page, advancing across deferred rows (or
+        // marking them seen) would suppress them forever on the next poll.
+        cursor = advanceCursorFromMessages(
+          admission.fullyAdmitted ? raw : admission.admitted,
+          cursor,
+        );
         // Short page ⇒ tail drained. A full page that did not move the cursor (a
         // whole page sharing one timestamp) can't be drained by re-polling, so
         // stop to avoid an infinite loop.
+        if (collected.length >= OPERATOR_MESSAGE_BATCH_CAP) break;
+        if (!admission.fullyAdmitted) break;
         if (raw.length < MESSAGE_POLL_LIMIT) break;
         if (cursor === prevCursor) break;
       }
     } catch (e) {
       sendLog(ws, `[resident] message poll failed (non-fatal): ${String(e)}\n`);
     }
+    if (collected.length > 0) {
+      pendingOperatorAdmission = {
+        cursorBefore,
+        messages: [...collected],
+      };
+    }
     return collected;
+  };
+
+  const rollbackPendingOperatorAdmission = () => {
+    if (!pendingOperatorAdmission) return;
+    cursor = rollbackMessageBatchAdmission(
+      seen,
+      pendingOperatorAdmission.cursorBefore,
+      pendingOperatorAdmission.messages,
+    );
+    pendingOperatorAdmission = null;
   };
 
   // progress=true renews the authority lease (applied op / operator interaction);
@@ -976,6 +1321,7 @@ export async function handleStrategicResident(
     );
     const body: Record<string, unknown> = {
       session_id: sessionId, task_id: taskId, progress, note,
+      worker_generation: workerGeneration,
       // Send the current cursor so the backend persists it; a restart will
       // restore it from task.context.message_cursor instead of falling back to
       // the 2-minute window that re-delivers already-answered messages.
@@ -1128,8 +1474,9 @@ export async function handleStrategicResident(
   };
 
   // Run one operator turn end-to-end with OPERATOR-FIRST ordering: stream the
-  // reply, persist it, record any settled decision, heartbeat (marking the
-  // consumed messages handled), and only THEN pay any context-compaction cost.
+  // reply, record any settled decision, atomically persist reply + decision
+  // state + exact handled receipt, heartbeat authority, and only THEN pay any
+  // context-compaction cost.
   // Shared by all THREE operator entry points — the top-of-loop fast path, an
   // autonomous-turn interrupt, and a message that lands during a turn's tail — so
   // none of them can regress into compacting ahead of the operator's reply. That
@@ -1140,6 +1487,38 @@ export async function handleStrategicResident(
     msgs: ResidentInboundMessage[],
   ): Promise<'stop' | 'continue'> => {
     const pickupLagMs = computePickupLagMs(msgs);
+    const coveredMessageIds = msgs
+      .map(message => typeof message.id === 'string' ? message.id.trim() : '')
+      .filter(Boolean);
+    const replyAnchorId = oldestStableInboundMessageId(msgs);
+    if (replyAnchorId === null || coveredMessageIds.length !== msgs.length) {
+      stopReason = 'operator_reply_missing_stable_message_id';
+      sendLog(ws, '[resident] operator batch has no stable message id; leaving it open for retry\n');
+      return 'stop';
+    }
+    let operatorBlocks: ContentBlock[];
+    try {
+      operatorBlocks = await materializeContentBlocks(combineOperatorMessages(msgs));
+      artifactRetryFailures = 0;
+    } catch (error) {
+      if (!isRetryableArtifactAttachmentError(error)) throw error;
+      rollbackPendingOperatorAdmission();
+      streamer.status('required Whiteboard revision temporarily unavailable — retrying');
+      sendLog(ws, `[resident] ${error.message}; restored operator message admission for retry\n`);
+      const retryMs = Math.min(
+        30_000,
+        Math.max(cfg.messagePollMs, 1_500)
+          * (2 ** Math.min(artifactRetryFailures, 4)),
+      );
+      artifactRetryFailures += 1;
+      await sleep(retryMs);
+      return 'continue';
+    }
+    const replyReceipt: ResidentReplyReceipt = {
+      idempotency_key: residentMessageKey('reply', replyAnchorId),
+      covered_message_ids: coveredMessageIds,
+    };
+
     // Threshold-gated early acknowledgment: start a timer that fires after
     // cfg.operatorAckThresholdMs so the operator sees a progress signal during
     // slow turns. If the turn completes before the threshold, the timer is
@@ -1153,32 +1532,121 @@ export async function handleStrategicResident(
         apiPost('/api/agent/strategic', {
           task_id: taskId,
           op: 'create_message',
-          data: { type: 'NOTE', content: ackText },
+          data: {
+            type: 'NOTE',
+            content: ackText,
+            idempotency_key: residentMessageKey('ack', replyAnchorId),
+          },
         }).catch((e: unknown) => {
           sendLog(ws, `[resident] early acknowledgment failed (non-fatal): ${String(e)}\n`);
         });
       }, cfg.operatorAckThresholdMs);
     }
-    const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
-    if (ackTimer !== null) clearTimeout(ackTimer);
+    let r: ResidentTurnResult;
+    let cleanupError: unknown = null;
+    try {
+      removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+      installResidentReplyReceiptAtPaths(
+        RESIDENT_REPLY_KEY_PATH,
+        RESIDENT_REPLY_RECEIPT_PATH,
+        replyReceipt,
+      );
+    } catch (e) {
+      if (ackTimer !== null) clearTimeout(ackTimer);
+      try {
+        removeResidentReplyArtifactsAtPaths(
+          RESIDENT_REPLY_KEY_PATH,
+          RESIDENT_REPLY_RECEIPT_PATH,
+        );
+      } catch { /* setup already failed; leave both for startup cleanup */ }
+      stopReason = 'operator_reply_idempotency_setup_failed';
+      sendLog(ws, `[resident] idempotency key setup failed; leaving operator message open: ${String(e)}\n`);
+      return 'stop';
+    }
+    try {
+      r = await runTurn(operatorBlocks, true, pickupLagMs);
+    } finally {
+      if (ackTimer !== null) clearTimeout(ackTimer);
+      try {
+        removeResidentReplyArtifactsAtPaths(
+          RESIDENT_REPLY_KEY_PATH,
+          RESIDENT_REPLY_RECEIPT_PATH,
+        );
+      } catch (e) {
+        cleanupError = e;
+        sendLog(ws, `[resident] reply receipt cleanup failed; stopping after this turn: ${String(e)}\n`);
+      }
+    }
+    if (providerTurnFailed(r)) return 'stop';
     if (turnWedgedSession(r)) return 'stop';
-    await persistReply(r);
-    // Collect the ids of the messages we just consumed so the backend can mark
-    // them handled — they stop counting as open backlog and won't be re-delivered
-    // to a restarted session.
-    const consumedIds = msgs
-      .map((m) => m.id)
-      .filter((id): id is string => typeof id === 'string' && id.length > 0);
-    // Capture any operator-settled correction into the durable register BEFORE the
-    // heartbeat so it is serialized in this same round-trip.
+    if (r.interrupted || r.timedOut || r.hardTimedOut || r.processGone) {
+      stopReason = r.processGone ? 'session_process_exited' : 'operator_turn_interrupted';
+      return 'stop';
+    }
+    let stagedReply: ResidentStagedReply | null;
+    try {
+      stagedReply = readResidentStagedReplyAtPath(RESIDENT_STAGED_REPLY_PATH, replyReceipt);
+    } catch (e) {
+      stopReason = 'operator_reply_staging_invalid';
+      sendLog(ws, `[resident] staged reply validation failed; leaving operator message open: ${String(e)}\n`);
+      try { removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH); } catch { /* startup cleanup retries */ }
+      return 'stop';
+    }
+    // Capture any operator-settled correction BEFORE the sole reply write. The
+    // serialized state below then lands in the same backend transaction as the
+    // reply and covered-message updates, closing the crash-before-heartbeat gap.
     recordOperatorDecision(
       r,
-      consumedIds,
+      coveredMessageIds,
       msgs.map(message => message.content?.trim() ?? '').filter(Boolean).join('\n\n'),
+      stagedReply?.content,
     );
-    const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
-    if (hb?.stop_requested) return 'stop';
-    if (r.processGone) { stopReason = 'session_process_exited'; return 'stop'; }
+    const residentTurnState: Record<string, unknown> = {
+      exam_ledger: serializeLedger(
+        examRecords,
+        examTick,
+        correctiveNextTick,
+        operatorDecisionReview !== null,
+        operatorDecisionReview,
+        getOperatorDecisionCaptureTelemetry(),
+      ),
+      decisions_reg: decisionsReg.length > 0 ? serializeDecisionsReg(decisionsReg) : null,
+      message_cursor: cursor,
+      operator_decision_summary: getOperatorDecisionCaptureTelemetry(),
+    };
+    let replyPersisted = false;
+    try {
+      replyPersisted = await persistReply(
+        r, replyAnchorId, coveredMessageIds, stagedReply, residentTurnState,
+      );
+    } finally {
+      try {
+        removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+      } catch (e) {
+        cleanupError ??= e;
+        sendLog(ws, `[resident] staged reply cleanup failed; stopping after this turn: ${String(e)}\n`);
+      }
+    }
+    if (!replyPersisted) {
+      stopReason = 'operator_reply_not_persisted';
+      return 'stop';
+    }
+    pendingOperatorAdmission = null;
+    // The create_message transaction already marked exactly this receipt's
+    // covered IDs handled and persisted the restart-critical turn metadata.
+    // The heartbeat only renews authority and reports ancillary session state;
+    // it must never expand the covered set after a crash/retry.
+    const hb = await heartbeat(true);
+    if (hb === null) {
+      stopReason = 'operator_post_reply_heartbeat_failed';
+      sendLog(ws, '[resident] post-reply heartbeat failed; stopping on a fresh worker boundary\n');
+      return 'stop';
+    }
+    if (hb.stop_requested) return 'stop';
+    if (cleanupError !== null) {
+      stopReason = 'operator_reply_receipt_cleanup_failed';
+      return 'stop';
+    }
     // Compaction runs ONLY after the reply is streamed and the handled-marking
     // heartbeat has landed — so a compaction on this turn primes the fresh session
     // WITH the settled decision and WITHOUT the just-answered message, and the
@@ -1220,11 +1688,12 @@ export async function handleStrategicResident(
 
           // Restart the subprocess so its cwd points to the new directory inode.
           // The live subprocess is still attached to the deleted inode.
+          invalidateSessionEvents();
           session.close();
           const recoverySession = startResidentClaudeSession({
             model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
           });
-          recoverySession.onEvent(onSessionEvent);
+          bindSessionEvents(recoverySession);
           session = recoverySession;
 
           // Prime with the compaction checkpoint to carry pre-loss decision context.
@@ -1233,9 +1702,11 @@ export async function handleStrategicResident(
             const primeResult = await recoverySession.sendTurn(
               buildCompactionCheckpoint(buildCheckpointContext()),
             );
-            if (primeResult.processGone) {
-              sendLog(ws, '[resident] FATAL: recovery subprocess died during checkpoint prime\n');
-              stopReason = 'workspace_recovery_prime_failed';
+            if (checkpointPrimeFailed(
+              primeResult,
+              'workspace_recovery_prime_failed',
+              'workspace recovery checkpoint prime',
+            )) {
               break;
             }
             sendLog(ws, '[resident] workspace recovery complete — subprocess restarted and primed\n');
@@ -1350,15 +1821,45 @@ export async function handleStrategicResident(
         false,
       );
       const watch = await watchTurn(turnPromise);
-      if (watch.kind !== 'done') session.interrupt();
+      let r: ResidentTurnResult;
+      if (watch.kind !== 'done') {
+        session.interrupt();
+        const settledBeforeDeadline = await Promise.race([
+          turnPromise.then(() => true),
+          new Promise<boolean>((resolve) => setTimeout(() => { resolve(false); }, OPERATOR_PREEMPT_DEADLINE_MS)),
+        ]);
+        if (!settledBeforeDeadline) {
+          invalidateSessionEvents();
+          session.close();
+          const abandoned = await turnPromise;
+          if (
+            watch.kind !== 'stop'
+            && !restartSessionFromCheckpoint('operator preemption deadline')
+          ) break;
+          r = { ...abandoned, processGone: false, interrupted: true };
+        } else {
+          r = await turnPromise;
+        }
+      } else {
+        r = await turnPromise;
+      }
 
       // Await the (possibly interrupted) autonomous turn, then renew the lease
       // ONLY if a strategic op was applied (progress) AND we still hold authority
       // — never renew a lease that lapsed mid-turn (watch === 'suspend'), and
       // never renew on bare examination (looking never renews freshness — the
       // dead-man's switch stays progress-gated).
-      const r = await turnPromise;
+      if (providerTurnFailed(r)) break;
+      if (watch.kind === 'message' && r.processGone) {
+        // SIGINT commonly makes the old CLI exit promptly. That is a successful
+        // operator preemption boundary, not a Resident terminal, provided the
+        // result was not a canonical provider failure (handled immediately
+        // above). Queue the checkpoint into a fresh subprocess before replying.
+        if (!restartSessionFromCheckpoint('operator preemption process exit')) break;
+        r = { ...r, processGone: false, interrupted: true };
+      }
       if (turnWedgedSession(r)) break;
+      if (r.processGone) { stopReason = 'session_process_exited'; break; }
       // ResidentSession reports a child that closed without a terminal result as
       // processGone while leaving interrupted false and returning any partial
       // streamed text. Treat both signals identically for classification: partial
@@ -1504,7 +2005,6 @@ export async function handleStrategicResident(
       // the loop's own applied ops (self-echo).
       lastAutonomousWorkStateRev = currentWorkStateRev;
       if (hb?.stop_requested || watch.kind === 'stop') break;
-      if (r.processGone) { stopReason = 'session_process_exited'; break; }
 
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
       if (watch.kind === 'suspend') continue;
@@ -1551,6 +2051,7 @@ export async function handleStrategicResident(
   } finally {
     clearTimeout(gitTokenRefreshTimer);
     streamer.flush();
+    invalidateSessionEvents();
     session.close();
   }
 
@@ -1561,7 +2062,11 @@ export async function handleStrategicResident(
   statusRef.value = 'Resident strategic session ended';
   sendLog(ws, `Resident strategic session ${sessionId} ended (${stopReason}).\n`);
 
-  const { status, failureCategory } = resolveTerminalStatus(stopReason, session.exitCode());
+  const { status, failureCategory } = resolveTerminalStatus(
+    stopReason,
+    session.exitCode(),
+    terminalProviderFailure.value ?? session.failureCategory?.() ?? null,
+  );
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,

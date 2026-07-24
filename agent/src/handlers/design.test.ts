@@ -435,6 +435,27 @@ describe('handleDesign', () => {
       expect(typeof s.name).toBe('string');
     }
   });
+
+  it('injects GREENFIELD CITATION MODE guidance and web-citation default rule when repo_is_empty is true', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_DOCUMENT,
+      source_citations: ['https://example.com/spec'],
+    });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design the initial architecture', topic: 'bootstrap' },
+      { ...BASE_TASK, repo_is_empty: true }, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // Greenfield guidance block from buildGreenfieldCitationGuidance must appear.
+    expect(prompt).toContain('GREENFIELD CITATION MODE');
+    // The swapped citationDefaultRule must steer away from file citations.
+    expect(prompt).toContain('Because this repo is GREENFIELD');
+    expect(prompt).toContain('cite EXTERNAL/WEB sources');
+    // The default (mature-repo) file-citation rule must NOT appear.
+    expect(prompt).not.toContain('FILE references are the default');
+  });
 });
 
 // ── Bounded self-repair on a clean-exit-but-unparseable first response ────────
@@ -698,6 +719,65 @@ describe('handleDesign — citation-grounding repair reopen', () => {
 
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
     expect(lastPostedPayload().status).toBe('FAILED');
+  });
+
+  it('uses greenfield repair instruction (replace with web citations) when repo_is_empty is true and citations do not resolve', async () => {
+    // Greenfield task with invented file path citations that cannot resolve.
+    const greenfieldDoc = {
+      ...VALID_DOCUMENT,
+      source_citations: ['src/planned/module.ts'],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...greenfieldDoc });
+    // No file paths exist — the invented path is unresolvable.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design the initial API' },
+      { ...BASE_TASK, repo_is_empty: true }, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // A reopen must be triggered (two runClaudeCode calls).
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    // The reopen prompt must use the greenfield repair instruction — not the
+    // mature-repo "fix to real file paths" instruction.
+    const reopenPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reopenPrompt).toContain('REMOVE the invented file paths');
+    expect(reopenPrompt).toContain('EXTERNAL/WEB citations');
+    expect(reopenPrompt).not.toContain('repository-relative path of a real file');
+  });
+
+  it('adopts a web-only repaired document (zero file citations, at least one URL) on greenfield', async () => {
+    // Initial document has an invented file path that cannot resolve.
+    const greenfieldDoc = {
+      ...VALID_DOCUMENT,
+      source_citations: ['src/planned/module.ts'],
+    };
+    // Repaired document uses only web citations — zero file citations.
+    const webOnlyDoc = {
+      ...VALID_DOCUMENT,
+      source_citations: ['https://example.com/spec', 'https://rfc.example.org/7230'],
+    };
+    vi.mocked(readHandlerOutput)
+      .mockReturnValueOnce({ ...greenfieldDoc })
+      .mockReturnValueOnce({ ...webOnlyDoc });
+    // No file paths resolve on a greenfield repo.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design the initial API' },
+      { ...BASE_TASK, repo_is_empty: true }, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as Record<string, unknown>;
+    // The web-only repaired document must be adopted (zero file citations → gate accepts).
+    expect(parsed.source_citations).toEqual(['https://example.com/spec', 'https://rfc.example.org/7230']);
+    // The grounding stamp reflects no file citations (web-only is acceptable).
+    const grounding = parsed._citation_grounding as Record<string, unknown>;
+    expect(grounding.file_citations).toBe(0);
+    expect(grounding.unresolved).toEqual([]);
   });
 });
 

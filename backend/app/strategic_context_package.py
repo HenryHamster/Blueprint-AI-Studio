@@ -1875,7 +1875,7 @@ def _resource_descriptor(resource: Dict[str, Any]) -> Dict[str, Any] | None:
 def _build_turn_latency_metric(
     turn_latency_summary: Dict[str, Any] | None,
 ) -> Dict[str, Any] | None:
-    """Build a turn-latency metric card entry from the resident session summary.
+    """Build a turn-latency metric card entry from the strategic session summary.
 
     Returns a ``{label, value, tone, target}`` dict when operator-turn latency
     data is present and meaningful (at least one operator turn recorded); returns

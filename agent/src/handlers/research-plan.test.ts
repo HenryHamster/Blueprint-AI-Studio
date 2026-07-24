@@ -5,7 +5,6 @@ import { CAPABILITY_DECLARATION_DOC as CAP_DOC_FROM_BLOCKS, ACCEPTANCE_EVIDENCE_
 
 const {
   INDEX_EXPORT_NAMES,
-  WORKSPACE_PREP_EXPORT_NAMES,
 } = vi.hoisted(() => ({
   INDEX_EXPORT_NAMES: [
     'AUTH_MODE',
@@ -63,6 +62,7 @@ const {
     'bootstrapPoolMode',
     'buildTargetedPytestRunners',
     'captureTestBaseline',
+    'claimTask',
     'clearLastProviderRunErrorReport',
     'clearLogBuffer',
     'clearToolTrace',
@@ -92,6 +92,7 @@ const {
     'getLlmTelemetry',
     'getOperatorDecisionCaptureTelemetry',
     'getProviderRunner',
+    'getResidentTurnLatencyTelemetry',
     'git',
     'gitAsync',
     'isBootstrapToken',
@@ -113,7 +114,6 @@ const {
     'parseStaleResultFile',
     'performWarmRetarget',
     'persistAndPostStatus',
-    'persistResidentTurnFailure',
     'pollForNextRole',
     'postTerminalStatusSync',
     'providerSupportsNativeSubagents',
@@ -125,7 +125,6 @@ const {
     'recordFormatRepairAttempt',
     'recordFormatRepairSuccess',
     'recordInitialOAuthAuthHash',
-    'getResidentTurnLatencyTelemetry',
     'recordLlmCallStart',
     'recordLlmTokens',
     'recordProviderReportedUsage',
@@ -137,7 +136,6 @@ const {
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
     'replayLogBufferRateLimited',
-    'requireClaimAgentToken',
     'requiredProviderConfigFiles',
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
@@ -162,16 +160,8 @@ const {
     'snapshotToolTrace',
     'staleResultBackoffMs',
     'strVal',
-    'taskRequiresGithubCredentials',
     'testFixLoop',
     'validateBranchName',
-  ],
-  WORKSPACE_PREP_EXPORT_NAMES: [
-    'getLastWorkspacePrepOutcome',
-    'listWorkspaceTopDirs',
-    'prepareWorkspaceForRole',
-    'resetWorkspacePrepOutcome',
-    'resolveReferenceRepo',
   ],
 }));
 
@@ -228,10 +218,10 @@ vi.mock('child_process', () => ({
   }),
 }));
 
-vi.mock('../workspacePrep.js', () => ({
-  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../telemetry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../telemetry.js')>();
@@ -2608,141 +2598,6 @@ describe('buildEfficiencySnapshotSection', () => {
     expect(result).not.toContain('LLM cost attribution');
   });
 
-  it('renders panel_review_effectiveness gate_health when present', () => {
-    const snapshot = {
-      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
-      panel_review_effectiveness: {
-        gate_health: { state: 'HEALTHY' },
-        fail_open_rate: 0.03,
-        total_challenged: 120,
-        effective_coverage: 0.85,
-      },
-    };
-    const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).toContain('Adversarial gate health:');
-    expect(result).toContain('HEALTHY');
-    expect(result).toContain('3.00%');
-    expect(result).toContain('n=120');
-    expect(result).toContain('85.0%');
-  });
-
-  it('omits Adversarial gate health line when panel_review_effectiveness is absent', () => {
-    const snapshot = {
-      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
-    };
-    const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).not.toContain('Adversarial gate health');
-  });
-
-  it('renders post-deploy gate_health when present and not INSUFFICIENT', () => {
-    const snapshot = {
-      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
-      panel_review_effectiveness: {
-        gate_health: { state: 'HEALTHY' },
-        fail_open_rate: 0.04,
-        total_challenged: 200,
-        effective_coverage: 0.80,
-      },
-      panel_review_effectiveness_post_deploy: {
-        gate_health: { state: 'HEALTHY' },
-        fail_open_rate: 0.01,
-        total_challenged: 40,
-        effective_coverage: 0.90,
-      },
-    };
-    const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).toContain('(post-deploy)');
-    expect(result).toContain('HEALTHY');
-    expect(result).toContain('1.00%');
-    expect(result).toContain('n=40');
-    expect(result).toContain('90.0%');
-    // Rolling metrics must NOT appear as the primary source
-    expect(result).not.toContain('n=200');
-  });
-
-  it('renders post-deploy gate_health with rolling fallback when INSUFFICIENT', () => {
-    const snapshot = {
-      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
-      panel_review_effectiveness: {
-        gate_health: { state: 'HEALTHY' },
-        fail_open_rate: 0.03,
-        total_challenged: 120,
-        effective_coverage: 0.85,
-      },
-      panel_review_effectiveness_post_deploy: {
-        gate_health: { state: 'INSUFFICIENT', total_invocations: 12, min_sample: 30 },
-        fail_open_rate: 0.0,
-        total_challenged: 12,
-        effective_coverage: 0.0,
-      },
-    };
-    const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).toContain('(rolling; post-deploy accumulating');
-    expect(result).toContain('12/30 invocations');
-    expect(result).toContain('HEALTHY');
-    expect(result).toContain('3.00%');
-    expect(result).toContain('n=120');
-  });
-
-  it('renders post-deploy gate_health with rolling fallback when NO_DATA', () => {
-    const snapshot = {
-      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
-      panel_review_effectiveness: {
-        gate_health: { state: 'HEALTHY' },
-        fail_open_rate: 0.03,
-        total_challenged: 120,
-        effective_coverage: 0.85,
-      },
-      panel_review_effectiveness_post_deploy: {
-        gate_health: { state: 'NO_DATA', total_invocations: 0, min_sample: 30 },
-        fail_open_rate: null,
-        total_challenged: 0,
-        effective_coverage: 0.0,
-      },
-    };
-    const result = buildEfficiencySnapshotSection(snapshot);
-    // NO_DATA post-deploy must fall back to rolling window, not surface uninformative 'NO_DATA - n/a (n=0)'
-    expect(result).toContain('(rolling; post-deploy accumulating');
-    expect(result).toContain('0/30 invocations');
-    expect(result).toContain('HEALTHY');
-    expect(result).toContain('3.00%');
-    expect(result).toContain('n=120');
-    expect(result).not.toContain('(post-deploy)');
-  });
-
-  it('renders plain label when only rolling peff present (no regression)', () => {
-    const snapshot = {
-      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
-      panel_review_effectiveness: {
-        gate_health: { state: 'HEALTHY' },
-        fail_open_rate: 0.03,
-        total_challenged: 120,
-        effective_coverage: 0.85,
-      },
-    };
-    const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).toContain('**Adversarial gate health:**');
-    expect(result).not.toContain('post-deploy');
-    expect(result).not.toContain('rolling;');
-  });
-
-  it('labels post-deploy source when rolling window absent and post-deploy low-sample', () => {
-    // No rolling peff; post-deploy present but INSUFFICIENT — primary data source is peffPd,
-    // so label must say post-deploy (low-sample), not rolling.
-    const snapshot = {
-      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
-      panel_review_effectiveness_post_deploy: {
-        gate_health: { state: 'INSUFFICIENT', total_invocations: 8, min_sample: 30 },
-        fail_open_rate: 0.05,
-        total_challenged: 8,
-        effective_coverage: 0.4,
-      },
-    };
-    const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).toContain('(post-deploy low-sample: 8/30 invocations)');
-    expect(result).not.toContain('(rolling;');
-    expect(result).not.toContain('(post-deploy)');
-  });
 });
 
 describe('Strategic executor set-retirement-critiques verification', () => {

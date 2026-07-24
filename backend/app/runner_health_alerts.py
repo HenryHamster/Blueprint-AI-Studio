@@ -774,6 +774,7 @@ async def _maybe_create_local_runner_hold_alert(
         title=_LOCAL_RUNNER_HOLD_ALERT_TITLE,
         message=msg,
         task_id=task.id,
+        event_type="runner.deactivated",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -898,6 +899,7 @@ async def _maybe_create_container_runner_hold_alert(
         title=_CONTAINER_RUNNER_HOLD_ALERT_TITLE,
         message=msg,
         task_id=task.id,
+        event_type="runner.deactivated",
     )
     session.add(alert)
     await broadcast_to_project(

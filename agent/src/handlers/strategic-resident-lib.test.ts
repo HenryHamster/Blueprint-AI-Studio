@@ -1,14 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { createHash } from 'crypto';
+import { describe, it, expect, vi } from 'vitest';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
-  BoundedSeenSet, dedupNewMessages, extractMessageTurn, combineOperatorMessages,
+  BoundedSeenSet, dedupNewMessages, admitMessageBatchPage, extractMessageTurn, combineOperatorMessages,
   materializeContentBlocks, isAllowedAttachmentDownloadUrl,
+  rollbackMessageBatchAdmission, RetryableArtifactAttachmentError,
   buildBootstrapPrompt, buildAutonomousPrompt,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
   buildStagedDirectionsText, formatDirectionGroundingText,
-  MESSAGE_POLL_LIMIT,
+  MESSAGE_POLL_LIMIT, OPERATOR_MESSAGE_BATCH_CAP, RESIDENT_REPLY_RECEIPT_MAX_BYTES,
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
   parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   mergePendingOperatorDecisionReview, advancePendingOperatorDecisionReview,
@@ -19,6 +21,7 @@ import {
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
+  ATTACHMENT_FETCH_TIMEOUT_MS,
   modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type CheckpointGrounding, type CheckpointStateResponse,
@@ -173,6 +176,135 @@ describe('BoundedSeenSet / dedupNewMessages', () => {
     expect(page2.map(m => m.id)).toEqual(['c']);
   });
 
+  it('does not mark or cursor-suppress unseen rows deferred by the atomic batch cap', () => {
+    const seen = new BoundedSeenSet();
+    const page = Array.from({ length: 21 }, (_, index) => ({
+      id: `m-${index + 1}`,
+      created_at: '2026-07-21T12:00:00Z',
+    }));
+    const first = admitMessageBatchPage(page, seen, OPERATOR_MESSAGE_BATCH_CAP);
+    expect(first.admitted).toHaveLength(MESSAGE_POLL_LIMIT);
+    expect(first.fullyAdmitted).toBe(false);
+    expect(seen.has('m-20')).toBe(true);
+    expect(seen.has('m-21')).toBe(false);
+    const second = admitMessageBatchPage([page[20]], seen, OPERATOR_MESSAGE_BATCH_CAP);
+    expect(second.admitted.map(message => message.id)).toEqual(['m-21']);
+  });
+
+  it('ignores seen boundary rows when budgeting required images and defers the first overflowing unseen row', () => {
+    const seen = new BoundedSeenSet();
+    seen.add('already-seen');
+    const createdAt = '2026-07-22T12:00:00.000Z';
+    const requiredAttachments = (count: number, prefix: string) => Array.from(
+      { length: count },
+      (_, index) => ({
+        type: 'image',
+        artifact_ref_id: `${prefix}-${index}`,
+      }),
+    );
+    const seenBoundary = {
+      id: 'already-seen',
+      created_at: createdAt,
+      context: { attachments: requiredAttachments(8, 'seen') },
+    };
+    const firstUnseen = {
+      id: 'first-unseen',
+      created_at: createdAt,
+      context: { attachments: requiredAttachments(5, 'first') },
+    };
+    const overflow = {
+      id: 'overflow',
+      created_at: createdAt,
+      context: { attachments: requiredAttachments(4, 'overflow') },
+    };
+    const later = {
+      id: 'later',
+      created_at: createdAt,
+      context: { attachments: [] },
+    };
+
+    const first = admitMessageBatchPage(
+      [seenBoundary, firstUnseen, overflow, later],
+      seen,
+      OPERATOR_MESSAGE_BATCH_CAP,
+      MAX_IMAGES_PER_TURN,
+    );
+
+    expect(first.admitted.map(message => message.id)).toEqual(['first-unseen']);
+    expect(first.requiredImagesAdmitted).toBe(5);
+    expect(first.fullyAdmitted).toBe(false);
+    expect(seen.has('first-unseen')).toBe(true);
+    expect(seen.has('overflow')).toBe(false);
+    expect(seen.has('later')).toBe(false);
+    expect(advanceCursorFromMessages(first.admitted, createdAt)).toBe(createdAt);
+
+    const second = admitMessageBatchPage(
+      [seenBoundary, firstUnseen, overflow, later],
+      seen,
+      OPERATOR_MESSAGE_BATCH_CAP,
+      MAX_IMAGES_PER_TURN,
+    );
+    expect(second.admitted.map(message => message.id)).toEqual(['overflow', 'later']);
+    expect(second.requiredImagesAdmitted).toBe(4);
+    expect(second.fullyAdmitted).toBe(true);
+  });
+
+  it('carries the remaining required-image budget from one poll page to the next', () => {
+    const seen = new BoundedSeenSet();
+    const requiredMessage = (id: string, count: number) => ({
+      id,
+      created_at: `2026-07-22T12:00:0${id === 'page-one' ? '1' : '2'}.000Z`,
+      context: {
+        attachments: Array.from({ length: count }, (_, index) => ({
+          type: 'image',
+          artifact_ref_id: `${id}-${index}`,
+        })),
+      },
+    });
+    const pageOne = requiredMessage('page-one', 5);
+    const pageTwo = requiredMessage('page-two', 4);
+
+    const first = admitMessageBatchPage(
+      [pageOne],
+      seen,
+      OPERATOR_MESSAGE_BATCH_CAP,
+      MAX_IMAGES_PER_TURN,
+    );
+    const second = admitMessageBatchPage(
+      [pageTwo],
+      seen,
+      OPERATOR_MESSAGE_BATCH_CAP - first.admitted.length,
+      MAX_IMAGES_PER_TURN - first.requiredImagesAdmitted,
+    );
+
+    expect(first.requiredImagesAdmitted).toBe(5);
+    expect(second.admitted).toEqual([]);
+    expect(second.requiredImagesAdmitted).toBe(0);
+    expect(second.fullyAdmitted).toBe(false);
+    expect(seen.has('page-two')).toBe(false);
+  });
+
+  it('rolls back required-artifact admission so the same message can retry', () => {
+    const seen = new BoundedSeenSet();
+    const cursorBefore = '2026-07-22T12:00:00.000Z';
+    const message = {
+      id: 'artifact-msg',
+      created_at: '2026-07-22T12:00:01.000Z',
+    };
+    const first = admitMessageBatchPage([message], seen, 1);
+    const advanced = advanceCursorFromMessages(first.admitted, cursorBefore);
+
+    expect(advanced).toBe(message.created_at);
+    expect(seen.has(message.id)).toBe(true);
+    expect(rollbackMessageBatchAdmission(
+      seen,
+      cursorBefore,
+      first.admitted,
+    )).toBe(cursorBefore);
+    expect(seen.has(message.id)).toBe(false);
+    expect(admitMessageBatchPage([message], seen, 1).admitted).toEqual([message]);
+  });
+
   it('passes through messages with no id (cannot dedup) but dedups those with ids', () => {
     const seen = new BoundedSeenSet();
     const out = dedupNewMessages([{ content: 'no-id' }, { id: 'a' }], seen);
@@ -219,11 +351,29 @@ describe('resolveTerminalStatus', () => {
     expect(resolveTerminalStatus('loop_error: boom', null))
       .toEqual({ status: 'FAILED', failureCategory: 'claude_code_failed' });
   });
+
+  it('preserves provider rate-limit classification for orchestrator retry', () => {
+    expect(resolveTerminalStatus('session_process_exited', 1, 'rate_limited'))
+      .toEqual({ status: 'FAILED', failureCategory: 'rate_limited' });
+    expect(resolveTerminalStatus('session_process_exited', 1, 'dead_auth'))
+      .toEqual({ status: 'FAILED', failureCategory: 'dead_auth' });
+    expect(resolveTerminalStatus('stop_requested', 0, 'rate_limited'))
+      .toEqual({ status: 'COMPLETED' });
+  });
 });
 
 describe('MESSAGE_POLL_LIMIT', () => {
   it('matches the contract page size', () => {
     expect(MESSAGE_POLL_LIMIT).toBe(20);
+    expect(OPERATOR_MESSAGE_BATCH_CAP).toBe(MESSAGE_POLL_LIMIT);
+    const largestReceipt = JSON.stringify({
+      idempotency_key: `resident-reply-${'a'.repeat(64)}`,
+      covered_message_ids: Array.from(
+        { length: OPERATOR_MESSAGE_BATCH_CAP },
+        (_, index) => `${String(index).padStart(8, '0')}-0000-4000-8000-000000000000`,
+      ),
+    });
+    expect(Buffer.byteLength(largestReceipt, 'utf8')).toBeLessThan(RESIDENT_REPLY_RECEIPT_MAX_BYTES);
   });
 });
 
@@ -427,8 +577,15 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png?X-Goog-Signature=abc123')).toBe(true);
     expect(isAllowedAttachmentDownloadUrl('https://bucket.storage.googleapis.com/a.png?X-Goog-Signature=abc123')).toBe(true);
     expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png?X-Goog-Signature=')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png?X-Goog-Signature=%20')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png?X-Goog-Signature=&X-Goog-Signature=abc')).toBe(false);
     expect(isAllowedAttachmentDownloadUrl('http://storage.googleapis.com/bucket/a.png?X-Goog-Signature=abc123')).toBe(false);
     expect(isAllowedAttachmentDownloadUrl('https://example.com/a.png?X-Goog-Signature=abc123')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com.evil.test/a.png?X-Goog-Signature=abc123')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com@evil.test/a.png?X-Goog-Signature=abc123')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://attacker@storage.googleapis.com/a.png?X-Goog-Signature=abc123')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com:444/a.png?X-Goog-Signature=abc123')).toBe(false);
 
     const r = extractMessageTurn({
       content: 'bad url',
@@ -463,6 +620,284 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     expect(r[1]).toHaveProperty('type', 'image');
     expect(r[1]).toHaveProperty('source.type', 'base64');
     expect(r[1]).toHaveProperty('source.data', '/9j/4AAQ=');
+  });
+
+  it('preserves required ArtifactRef identity and checksum for strict download', () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig';
+    const blocks = extractMessageTurn({
+      content: 'review this board',
+      context: {
+        attachments: [{
+          type: 'image',
+          mime_type: 'image/png',
+          name: 'board.png',
+          url: signedUrl,
+          artifact_ref_id: 'artifact-1',
+          image_checksum: 'ab'.repeat(32),
+        }],
+      },
+    });
+
+    expect(blocks[1]).toEqual({
+      type: 'image',
+      source: {
+        type: 'url',
+        url: signedUrl,
+        media_type: 'image/png',
+        name: 'board.png',
+        artifact_ref_id: 'artifact-1',
+        image_checksum: 'ab'.repeat(32),
+      },
+    });
+  });
+
+  it('reserves an image slot for a required ArtifactRef after ordinary images', () => {
+    const ordinary = Array.from({ length: MAX_IMAGES_PER_TURN }, (_, index) => ({
+      type: 'image',
+      mime_type: 'image/png',
+      name: `ordinary-${index}.png`,
+      data: 'AQID',
+    }));
+    const blocks = extractMessageTurn({
+      context: {
+        attachments: [
+          ...ordinary,
+          {
+            type: 'image',
+            mime_type: 'image/png',
+            name: 'required-board.png',
+            url: 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig',
+            artifact_ref_id: 'artifact-required',
+            image_checksum: 'ab'.repeat(32),
+          },
+        ],
+      },
+    });
+
+    expect(blocks).toHaveLength(MAX_IMAGES_PER_TURN);
+    expect(blocks.some(block => (
+      block.type === 'image'
+      && block.source.type === 'url'
+      && block.source.artifact_ref_id === 'artifact-required'
+    ))).toBe(true);
+  });
+
+  it('fails required ArtifactRefs before fetch when checksum or URL is invalid', () => {
+    const base = {
+      type: 'image',
+      mime_type: 'image/png',
+      artifact_ref_id: 'artifact-1',
+      image_checksum: 'ab'.repeat(32),
+    };
+    expect(() => extractMessageTurn({
+      context: { attachments: [{ ...base, image_checksum: 'bad', url: 'https://example.com/a.png' }] },
+    })).toThrow(RetryableArtifactAttachmentError);
+    expect(() => extractMessageTurn({
+      context: { attachments: [{ ...base, url: 'https://example.com/a.png?X-Goog-Signature=sig' }] },
+    })).toThrow(RetryableArtifactAttachmentError);
+  });
+
+  it('verifies a required ArtifactRef image checksum before model delivery', async () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig';
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const checksum = createHash('sha256').update(bytes).digest('hex');
+    const out = await materializeContentBlocks([{
+      type: 'image',
+      source: {
+        type: 'url',
+        url: signedUrl,
+        media_type: 'image/png',
+        artifact_ref_id: 'artifact-1',
+        image_checksum: checksum,
+      },
+    }], () => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(bytes.buffer),
+    }));
+
+    expect(out).toEqual([{
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: 'image/png',
+        data: Buffer.from(bytes).toString('base64'),
+      },
+    }]);
+  });
+
+  it('rejects a required ArtifactRef download instead of degrading to text', async () => {
+    const promise = materializeContentBlocks([{
+      type: 'image',
+      source: {
+        type: 'url',
+        url: 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig',
+        media_type: 'image/png',
+        artifact_ref_id: 'artifact-1',
+        image_checksum: 'ab'.repeat(32),
+      },
+    }], () => Promise.resolve({
+      ok: false,
+      status: 403,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+
+    await expect(promise).rejects.toBeInstanceOf(RetryableArtifactAttachmentError);
+    await expect(promise).rejects.toThrow('download failed (403)');
+  });
+
+  it('rejects a declared-oversize required ArtifactRef without reading its body', async () => {
+    let readBody = false;
+    const promise = materializeContentBlocks([{
+      type: 'image',
+      source: {
+        type: 'url',
+        url: 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig',
+        media_type: 'image/png',
+        artifact_ref_id: 'artifact-1',
+        image_checksum: 'ab'.repeat(32),
+      },
+    }], () => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => String(MAX_IMAGE_DOWNLOAD_BYTES + 1) },
+      arrayBuffer: () => {
+        readBody = true;
+        return Promise.resolve(new ArrayBuffer(0));
+      },
+    }));
+
+    await expect(promise).rejects.toThrow('image is too large');
+    expect(readBody).toBe(false);
+  });
+
+  it('rejects a required ArtifactRef checksum mismatch', async () => {
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const promise = materializeContentBlocks([{
+      type: 'image',
+      source: {
+        type: 'url',
+        url: 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig',
+        media_type: 'image/png',
+        artifact_ref_id: 'artifact-1',
+        image_checksum: 'ab'.repeat(32),
+      },
+    }], () => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(bytes.buffer),
+    }));
+
+    await expect(promise).rejects.toThrow('image checksum mismatch');
+  });
+
+  it.each(['headers', 'body'] as const)(
+    'bounds a required ArtifactRef download when %s never resolves',
+    async (stallAt) => {
+      vi.useFakeTimers();
+      try {
+        const signals: AbortSignal[] = [];
+        const fetchImpl = vi.fn((_url: string, init?: { signal?: AbortSignal }) => {
+          if (init?.signal) signals.push(init.signal);
+          if (stallAt === 'headers') {
+            return new Promise<never>(() => {});
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: { get: () => null },
+            arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+          });
+        });
+        const promise = materializeContentBlocks([{
+          type: 'image',
+          source: {
+            type: 'url',
+            url: 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig',
+            media_type: 'image/png',
+            artifact_ref_id: 'artifact-timeout',
+            image_checksum: 'ab'.repeat(32),
+          },
+        }], fetchImpl);
+        const rejection = expect(promise).rejects.toThrow(
+          'Required ArtifactRef artifact-timeout could not be loaded: download timed out',
+        );
+
+        await vi.advanceTimersByTimeAsync(ATTACHMENT_FETCH_TIMEOUT_MS);
+        await rejection;
+        expect(signals).toHaveLength(1);
+        expect(signals[0].aborted).toBe(true);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(['headers', 'body'] as const)(
+    'degrades an ordinary image to an unavailable block when %s never resolves',
+    async (stallAt) => {
+      vi.useFakeTimers();
+      try {
+        const fetchImpl = vi.fn(() => {
+          if (stallAt === 'headers') {
+            return new Promise<never>(() => {});
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: { get: () => null },
+            arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+          });
+        });
+        const promise = materializeContentBlocks([{
+          type: 'image',
+          source: {
+            type: 'url',
+            url: 'https://storage.googleapis.com/bucket/photo.png?X-Goog-Signature=sig',
+            media_type: 'image/png',
+            name: 'photo.png',
+          },
+        }], fetchImpl);
+
+        await vi.advanceTimersByTimeAsync(ATTACHMENT_FETCH_TIMEOUT_MS);
+        await expect(promise).resolves.toEqual([{
+          type: 'text',
+          text: '[Attached image "photo.png" could not be loaded: download timed out.]',
+        }]);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('caps aggregate ordinary images while preserving required images across a combined batch', () => {
+    const ordinary = Array.from({ length: MAX_IMAGES_PER_TURN }, (_, index) => ({
+      type: 'image',
+      mime_type: 'image/png',
+      data: `ordinary-${index}`,
+    }));
+    const required = Array.from({ length: 2 }, (_, index) => ({
+      type: 'image',
+      mime_type: 'image/png',
+      url: `https://storage.googleapis.com/bucket/board-${index}.png?X-Goog-Signature=sig`,
+      artifact_ref_id: `required-${index}`,
+      image_checksum: 'ab'.repeat(32),
+    }));
+    const blocks = combineOperatorMessages([
+      { id: 'ordinary', context: { attachments: ordinary } },
+      { id: 'required', context: { attachments: required } },
+    ]);
+    const images = blocks.filter(block => block.type === 'image');
+    expect(images).toHaveLength(MAX_IMAGES_PER_TURN);
+    expect(images.filter(block => (
+      block.source.type === 'url'
+      && block.source.artifact_ref_id
+    ))).toHaveLength(2);
   });
 
   it('materializes signed GCS image URLs as base64 model blocks', async () => {
@@ -2773,6 +3208,58 @@ describe('formatStrategicMemoryNotes', () => {
     expect(formatStrategicMemoryNotes([])).toBe('');
     expect(formatStrategicMemoryNotes(undefined)).toBe('');
     expect(formatStrategicMemoryNotes('nope')).toBe('');
+  });
+
+  it('renders KnowledgeDocument index entries as "- [created_at] title — summary"', () => {
+    const out = formatStrategicMemoryNotes([
+      { id: 'kd-1', title: 'Prefer concrete action', summary: 'act rather than deliberate', topic: 'behavior', created_at: '2026-07-01T00:00:00Z' },
+      { id: 'kd-2', title: 'Verify before escalating', summary: 'confirm root cause first', topic: 'process', created_at: '2026-07-02T00:00:00Z' },
+    ]);
+    expect(out).toBe(
+      '- [2026-07-01T00:00:00Z] Prefer concrete action — act rather than deliberate\n' +
+      '- [2026-07-02T00:00:00Z] Verify before escalating — confirm root cause first',
+    );
+  });
+
+  it('renders index entry with title only when summary is absent', () => {
+    expect(formatStrategicMemoryNotes([
+      { id: 'kd-3', title: 'Title only', created_at: '2026-07-03T00:00:00Z' },
+    ])).toBe('- [2026-07-03T00:00:00Z] Title only');
+  });
+
+  it('renders index entry with summary only when title is absent', () => {
+    expect(formatStrategicMemoryNotes([
+      { id: 'kd-4', summary: 'Summary only', created_at: '2026-07-04T00:00:00Z' },
+    ])).toBe('- [2026-07-04T00:00:00Z] Summary only');
+  });
+
+  it('renders index entry without timestamp when created_at is absent', () => {
+    expect(formatStrategicMemoryNotes([
+      { id: 'kd-5', title: 'No date', summary: 'no created_at field' },
+    ])).toBe('- No date — no created_at field');
+  });
+
+  it('skips index entries with no usable text (no note, title, or summary)', () => {
+    const out = formatStrategicMemoryNotes([
+      { id: 'kd-empty', topic: 'behavior', created_at: '2026-07-01T00:00:00Z' },
+      { id: 'kd-good', title: 'Kept', summary: 'has text', created_at: '2026-07-01T00:00:00Z' },
+    ]);
+    expect(out).toBe('- [2026-07-01T00:00:00Z] Kept — has text');
+  });
+
+  it('handles a mixed array of legacy and index entries without throwing', () => {
+    const out = formatStrategicMemoryNotes([
+      { note: 'legacy lesson', set_at: '2026-06-01T00:00:00Z' },
+      { id: 'kd-1', title: 'Index lesson', summary: 'from knowledge doc', created_at: '2026-07-01T00:00:00Z' },
+      'garbage',
+      null,
+      { note: 'another legacy', set_at: '2026-06-15T00:00:00Z' },
+    ]);
+    expect(out).toBe(
+      '- [2026-06-01T00:00:00Z] legacy lesson\n' +
+      '- [2026-07-01T00:00:00Z] Index lesson — from knowledge doc\n' +
+      '- [2026-06-15T00:00:00Z] another legacy',
+    );
   });
 });
 

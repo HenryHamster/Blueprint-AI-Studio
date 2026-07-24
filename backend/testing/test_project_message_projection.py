@@ -17,6 +17,7 @@ from app.models import (
 from app.project_message_projection import (
     MESSAGE_CONTEXT_PROJECTION_MAX_BYTES,
     MESSAGE_EVENT_MAX_BYTES,
+    WAKEUP_STATE_CONTEXT_KEY,
     admin_message_dict,
     admin_message_list_dict,
     agent_fetch_message_dict,
@@ -208,7 +209,12 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
             "artifact_refs": [
                 {"kind": "whiteboard", "id": "board-1", "checksum": "abc123"}
             ],
-            "operator_intent": {"kind": "verify", "lane_owner": "resident"},
+            "operator_intent": {
+                "kind": "verify",
+                "lane_owner": "operator",
+                "artifact_ref_id": "artifact-ref-1",
+                "expected_revision": 7,
+            },
             "huge": "not returned",
         }
     )
@@ -221,7 +227,9 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
     assert data["context"]["artifact_refs"][0]["checksum"] == "abc123"
     assert data["context"]["operator_intent"] == {
         "kind": "verify",
-        "lane_owner": "resident",
+        "lane_owner": "operator",
+        "artifact_ref_id": "artifact-ref-1",
+        "expected_revision": 7,
     }
     assert "huge" not in data["context"]
 
@@ -255,7 +263,7 @@ def test_visible_source_projection_strips_secrets_uris_and_unknown_metadata():
             }],
             "operator_intent": {
                 "kind": "verify",
-                "lane_owner": "resident",
+                "lane_owner": "operator",
                 "authorization": "Bearer private",
             },
         }
@@ -277,7 +285,7 @@ def test_all_full_and_agent_projections_strip_internal_receipts_and_typed_secret
     msg = _message(
         context={
             "_message_request_fingerprint": "private-fingerprint",
-            "_resident_wakeup_state": "queued",
+            WAKEUP_STATE_CONTEXT_KEY: "queued",
             "attachments": [{
                 "attachment_id": "att-1",
                 "filename": "evidence.txt",
@@ -301,7 +309,7 @@ def test_all_full_and_agent_projections_strip_internal_receipts_and_typed_secret
     ):
         serialized = json.dumps(projection, separators=(",", ":"), default=str)
         assert "private-fingerprint" not in serialized
-        assert "_resident_wakeup_state" not in serialized
+        assert WAKEUP_STATE_CONTEXT_KEY not in serialized
         assert "private-bucket" not in serialized
         assert "signed.example" not in serialized
         assert "nested-secret" not in serialized
@@ -454,7 +462,7 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
         from_type="agent",
         from_task_id=task_id,
         content="Full admin route contract",
-        context=None,
+        context={"audience": "operator-action-needed"},
         status="linked",
         resolution="Owned by task",
         resolved_at=datetime(2026, 2, 3, 4, 5, 6, tzinfo=timezone.utc),
@@ -489,6 +497,7 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
         "status",
         "resolution",
         "resolved_at",
+        "delivered_at",
         "created_at",
         "updated_at",
     }
@@ -499,6 +508,37 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
     assert item["status"] == "linked"
     assert item["resolution"] == "Owned by task"
     assert item["resolved_at"].startswith("2026-02-03T04:05:06")
+    assert item["delivered_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_messages_endpoint_eager_loads_delivered_at_under_raiseload(
+    client: AsyncClient,
+    db_session,
+):
+    """The list serializer must not touch a column omitted by its raiseload projection."""
+    project = await _make_project(db_session)
+    delivered_at = datetime(2026, 2, 4, 5, 6, 7, tzinfo=timezone.utc)
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="Delivered projection receipt",
+            status="open",
+            context={"audience": "operator-fyi"},
+            delivered_at=delivered_at,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/messages?project_id={project.id}&status=all"
+    )
+
+    assert response.status_code == 200, response.text
+    [message] = response.json()["messages"]
+    assert message["delivered_at"].startswith("2026-02-04T05:06:07")
 
 
 @pytest.mark.asyncio
@@ -518,6 +558,7 @@ async def test_activity_endpoint_excludes_conversation_projection(
             sequence=activity_sequence,
             surface=MessageSurface.ACTIVITY,
             content="activity only",
+            context={"audience": "operator-fyi"},
         ),
         # Non-operator (strategic) conversation projection: the activity list
         # excludes it. Operator-signal rows (user / FEEDBACK-BLOCKER-BUG_REPORT /
@@ -720,7 +761,7 @@ async def test_strategic_open_message_payload_keeps_agent_aliases(db_session):
                 "attachment_id": "22222222-2222-4222-8222-222222222222",
                 "filename": "evidence.txt",
                 "size_bytes": 12,
-                "storage_uri": "gs://must-not-reach-resident/private",
+                "storage_uri": "gs://must-not-reach/private",
             }],
         },
         status="open",
@@ -806,7 +847,11 @@ async def test_admin_messages_list_strips_large_context_keys(
         message_type=MessageType.BUG_REPORT,
         from_type="system",
         content="Message with large context",
-        context={"event_type": "task_failed", "strategic_session": {"version": 1, "huge": "x" * 10_000}},
+        context={
+            "event_type": "task_failed",
+            "audience": "operator-fyi",
+            "strategic_session": {"version": 1, "huge": "x" * 10_000},
+        },
         status="open",
     )
     db_session.add(msg)

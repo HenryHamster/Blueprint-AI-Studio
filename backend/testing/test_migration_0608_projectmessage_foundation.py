@@ -1,4 +1,4 @@
-"""Focused tests for ProjectMessage Resident schema/backfill revision 0608."""
+"""Focused tests for ProjectMessage schema/backfill revision 0608."""
 
 import ast
 import importlib.util
@@ -20,13 +20,13 @@ from app.models import (
 )
 
 
+def _migration_path():
+    versions = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    return next(iter(versions.glob("0608_*.py")))
+
+
 def _load_migration():
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "alembic"
-        / "versions"
-        / "0608_projectmessage_resident_foundation.py"
-    )
+    path = _migration_path()
     spec = importlib.util.spec_from_file_location("migration_0608_messages", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -309,12 +309,7 @@ def test_sequence_and_attachment_receipt_models_expose_rollout_contract():
 
 
 def test_postgresql_rollout_shape_is_low_lock_and_bounded():
-    source = (
-        Path(__file__).resolve().parents[1]
-        / "alembic"
-        / "versions"
-        / "0608_projectmessage_resident_foundation.py"
-    ).read_text(encoding="utf-8")
+    source = _migration_path().read_text(encoding="utf-8")
 
     assert "autocommit_block" in source
     assert "CREATE TEMP TABLE projectmessage_0567_backfill" in source
@@ -432,12 +427,7 @@ def test_message_mutation_sources_follow_project_first_lock_order():
     reply_row = resolve.index("select(ProjectMessage)")
     assert project_row < counter < reply_row
 
-    migration_source = (
-        Path(__file__).resolve().parents[1]
-        / "alembic"
-        / "versions"
-        / "0608_projectmessage_resident_foundation.py"
-    ).read_text(encoding="utf-8")
+    migration_source = _migration_path().read_text(encoding="utf-8")
     compat = migration_source.split("should_project :=", 1)[1].split(
         "IF should_project", 1
     )[0]

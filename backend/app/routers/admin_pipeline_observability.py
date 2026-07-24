@@ -30,6 +30,7 @@ from sqlmodel import select
 from app.admin_helpers import _get_user_project_with_role
 from app.auth import get_current_user, get_metrics_reader, require_admin
 from app.database import get_session, resolve_dialect_name
+from app.sr_analytics_store import read_project_sr_analytics
 from app.failure_layer_classifier import parse_viewport_regression_class
 from app.models import (
     Alert,
@@ -1377,7 +1378,7 @@ async def get_pipeline_regressions(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    doc = project.design_doc or {}
+    doc = await read_project_sr_analytics(session, project)
     now = _utcnow()
     regressions: List[Dict[str, Any]] = []
 
@@ -1655,7 +1656,7 @@ async def get_warm_reuse_dropout_trend(
     widening change reduced the leader. Returns an empty ``buckets`` list until
     at least one daily snapshot has captured the drop-out block.
     """
-    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+    from app.efficiency_snapshot import DESIGN_DOC_KEY, _read_snapshot_history  # noqa: PLC0415
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
@@ -1663,7 +1664,7 @@ async def get_warm_reuse_dropout_trend(
     project = await session.get(Project, project_id)
     container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
     buckets: List[Dict[str, Any]] = []
-    for snap in container.get("snapshots") or []:
+    for snap in await _read_snapshot_history(session, project_id, container):
         block = snap.get("reuse_dropout")
         if not isinstance(block, dict):
             continue
@@ -1715,7 +1716,7 @@ async def get_pool_dispatch_funnel_trend(
     ``warm-reuse-dropout-trend``. Returns an empty ``buckets`` list until at
     least one daily snapshot has captured the block. Observability only.
     """
-    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+    from app.efficiency_snapshot import DESIGN_DOC_KEY, _read_snapshot_history  # noqa: PLC0415
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
@@ -1723,7 +1724,7 @@ async def get_pool_dispatch_funnel_trend(
     project = await session.get(Project, project_id)
     container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
     buckets: List[Dict[str, Any]] = []
-    for snap in container.get("snapshots") or []:
+    for snap in await _read_snapshot_history(session, project_id, container):
         block = snap.get("pool_dispatch_funnel")
         if not isinstance(block, dict):
             continue

@@ -41,13 +41,7 @@ from app.models import (
     _utcnow,
 )
 from app.messages_last_seen import naive_utc_to_epoch_ms
-from app.shared_state import runtime_config
 from app.storage import ARTIFACT_BUCKET_NAME
-from app.strategic_resident_session import (
-    RESIDENT_SESSION_KEY,
-    STATUS_ACTIVE,
-    STRATEGIC_SESSION_ENABLED_SETTING,
-)
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
@@ -483,6 +477,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         content="A blocker is owned by a direction." + (" extra" * 200),
         status="linked",
         context={
+            "audience": "operator-action-needed",
             "_convergence_link": {"kind": "direction", "id": "d-high"},
             "event_type": "blocker_linked",
             "strategic_session": {
@@ -550,12 +545,6 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert "persistent operator chat" in data["strategic"]["refresh"]["pending"]["excerpt"]
     assert len(data["strategic"]["refresh"]["pending"]["excerpt"]) <= 280
     assert "huge" not in data["strategic"]["refresh"]["pending"]
-    # No resident session started for this project → null-safe projection.
-    assert "resident_session" in data
-    assert data["resident_session"] is None
-    # The resident-session feature flag defaults off, so the read model reports
-    # the Start affordance as unavailable (the UI hides it in that case).
-    assert data["resident_session_available"] is False
     assert data["problem_model"]["current_focus"] == "Persistent Strategic interaction"
     assert data["problem_model"]["active_gap_count"] == 1
     assert data["problem_model"]["capability_count"] == 2
@@ -572,7 +561,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     # The fixture carries one pending_user_confirmation (p-1), which now surfaces
     # as a needs_operator attention item alongside the scalar summary count.
     assert data["attention"]["level"] == "needs_operator"
-    assert data["attention"]["counts"]["needs_operator"] == 1
+    assert data["attention"]["counts"]["needs_operator"] == 2
     assert data["attention"]["counts"]["pending_confirmations"] == 1
     confirmation_item = next(
         item for item in data["attention"]["items"] if item["id"] == "confirmation:p-1"
@@ -632,11 +621,12 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         "knowledge": 1,
         "artifacts": 1,
         "design": 1,
-        # The pending confirmation surfaces as a needs_operator attention item,
-        # which the context package now aggregates as an attention source.
-        "attention": 1,
+        # Two needs_operator attention items surface here: the pending
+        # confirmation and the linked BLOCKER message (a linked BLOCKER/QUESTION
+        # stays actionable until resolved), both aggregated as attention sources.
+        "attention": 2,
     }
-    assert package["item_count"] == 15
+    assert package["item_count"] == 16
     assert package["canvas"]["node_count"] >= 8
     assert package["canvas"]["edge_count"] >= 7
     assert package["canvas"]["nodes"]
@@ -685,321 +675,6 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert "A blocker is owned by a direction" not in str(package)
     assert "DO NOT EMBED KNOWLEDGE BODY" not in str(package)
     assert "DO NOT EMBED ARTIFACT LOGS" not in str(package)
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_surfaces_active_resident_session(
-    client: AsyncClient, db_session
-):
-    """An active resident session in Project.vision is projected to the UI.
-
-    The operator console polls /strategic-state and derives sessionActive from
-    ``resident_session.status == 'active' && !resident_session.stop_requested``,
-    so the read model must reflect the session-state blob written under
-    ``Project.vision[RESIDENT_SESSION_KEY]``.
-    """
-    project = await _make_project(db_session)
-    resident_task = Task(
-        project_id=project.id,
-        title="Resident strategic session",
-        payloads=[{"type": "strategic_review"}],
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(resident_task)
-    await db_session.commit()
-    await db_session.refresh(resident_task)
-
-    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
-    project.vision = {
-        **(project.vision or {}),
-        RESIDENT_SESSION_KEY: {
-            "version": 1,
-            "session_id": "ss-active-1234",
-            "task_id": str(resident_task.id),
-            "runner_id": "runner-abc",
-            "operator_user_id": TEST_USER_ID,
-            "status": STATUS_ACTIVE,
-            "stop_requested": False,
-            "started_at": started_at,
-            "updated_at": started_at,
-            "ended_at": None,
-            "last_progress_at": None,
-            "last_operator_interaction_at": started_at,
-        },
-    }
-    db_session.add(project)
-    await db_session.commit()
-
-    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
-    assert resp.status_code == 200
-    resident = resp.json()["resident_session"]
-    assert resident is not None
-    assert resident["session_id"] == "ss-active-1234"
-    assert resident["task_id"] == str(resident_task.id)
-    assert resident["runner_id"] == "runner-abc"
-    assert resident["status"] == STATUS_ACTIVE
-    assert resident["stop_requested"] is False
-    assert resident["started_at"] == started_at
-    assert resident["last_operator_interaction_at"] == started_at
-    # The bounded projection must not leak internal-only session fields.
-    assert "operator_user_id" not in resident
-    assert "version" not in resident
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_surfaces_resident_runner_options(
-    client: AsyncClient, db_session
-):
-    """The read model exposes ``resident_session_runners`` (the device-picker
-    options) — one entry per enrolled runner with online / agent-ready / eligible
-    flags — so the UI can render the auto-pick + override dropdown."""
-    project = await _make_project(db_session)
-    live = LocalRunner(
-        project_id=project.id,
-        token_hash="a" * 64,
-        hostname="desk-live",
-        status="active",
-        last_seen_at=_utcnow(),
-        capabilities={"task_types": "all", "agent_available": True},
-    )
-    offline = LocalRunner(
-        project_id=project.id,
-        token_hash="b" * 64,
-        hostname="desk-offline",
-        status="active",
-        last_seen_at=_utcnow() - timedelta(hours=1),
-        capabilities={"task_types": "all"},
-    )
-    db_session.add_all([live, offline])
-    await db_session.commit()
-    await db_session.refresh(live)
-    await db_session.refresh(offline)
-
-    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
-    assert resp.status_code == 200
-    runners = resp.json()["resident_session_runners"]
-    by_id = {r["id"]: r for r in runners}
-    assert set(by_id) == {str(live.id), str(offline.id)}
-    assert by_id[str(live.id)]["name"] == "desk-live"
-    assert by_id[str(live.id)]["online"] is True
-    assert by_id[str(live.id)]["eligible"] is True
-    assert by_id[str(offline.id)]["online"] is False
-    assert by_id[str(offline.id)]["eligible"] is False
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_active_session_pinned_offline_reports_blocked(
-    client: AsyncClient, db_session
-):
-    """Block-on-offline end-to-end: an ACTIVE resident session pinned to a device
-    that is now offline reports ``resident_session_availability`` = blocked /
-    ``runner_offline`` (the UI prompts a restart), while the raw
-    ``resident_session`` blob still reads active."""
-    project = await _make_project(db_session)
-    offline_runner = LocalRunner(
-        project_id=project.id,
-        token_hash="c" * 64,
-        hostname="desk-gone",
-        status="active",
-        last_seen_at=_utcnow() - timedelta(hours=1),
-        capabilities={"task_types": "all"},
-    )
-    db_session.add(offline_runner)
-    await db_session.commit()
-    await db_session.refresh(offline_runner)
-
-    resident_task = Task(
-        project_id=project.id,
-        title="Resident strategic session",
-        payloads=[{"type": "strategic_review"}],
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(resident_task)
-    await db_session.commit()
-    await db_session.refresh(resident_task)
-
-    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
-    project.vision = {
-        **(project.vision or {}),
-        RESIDENT_SESSION_KEY: {
-            "version": 1,
-            "session_id": "ss-offline-1",
-            "task_id": str(resident_task.id),
-            "runner_id": str(offline_runner.id),
-            "operator_user_id": TEST_USER_ID,
-            "status": STATUS_ACTIVE,
-            "stop_requested": False,
-            "started_at": started_at,
-            "updated_at": started_at,
-            "last_progress_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
-            "last_operator_interaction_at": started_at,
-        },
-    }
-    db_session.add(project)
-    await db_session.commit()
-
-    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
-    try:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-state"
-        )
-    finally:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
-    assert resp.status_code == 200
-    data = resp.json()
-    # Raw blob unchanged (still active) — no auto-migration, no blob mutation.
-    assert data["resident_session"]["status"] == STATUS_ACTIVE
-    # Availability derives the mid-session offline block for the UI.
-    availability = data["resident_session_availability"]
-    assert availability["state"] == "blocked"
-    assert availability["reason"] == "runner_offline"
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_surfaces_resident_session_availability_flag(
-    client: AsyncClient, db_session
-):
-    """`resident_session_available` mirrors the ``strategic_session_enabled`` flag.
-
-    The operator console gates the Start affordance on this boolean so the button
-    is hidden when the feature is off (a click would otherwise 403 at the start
-    endpoint). The default is off; toggling the runtime flag flips the field.
-    """
-    project = await _make_project(db_session)
-
-    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
-    try:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = False
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-state"
-        )
-        assert resp.status_code == 200
-        assert resp.json()["resident_session_available"] is False
-
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-state"
-        )
-        assert resp.status_code == 200
-        assert resp.json()["resident_session_available"] is True
-    finally:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
-
-
-@pytest.mark.asyncio
-async def test_strategic_liveness_returns_mode_and_session_without_heavy_state(
-    client: AsyncClient, db_session
-):
-    """The lightweight liveness probe returns mode + resident-session fields and
-    omits every heavy strategic-state segment (context package, runtime, events,
-    fingerprints, attention, tasks, cost).
-    """
-    project = await _make_project(db_session)
-    resident_task = Task(
-        project_id=project.id,
-        title="Resident strategic session",
-        payloads=[{"type": "strategic_review"}],
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(resident_task)
-    await db_session.commit()
-    await db_session.refresh(resident_task)
-
-    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
-    project.vision = {
-        **(project.vision or {}),
-        RESIDENT_SESSION_KEY: {
-            "version": 1,
-            "session_id": "ss-live-9",
-            "task_id": str(resident_task.id),
-            "runner_id": "runner-xyz",
-            "operator_user_id": TEST_USER_ID,
-            "status": STATUS_ACTIVE,
-            "stop_requested": False,
-            "started_at": started_at,
-            "updated_at": started_at,
-            "last_progress_at": None,
-            "last_operator_interaction_at": started_at,
-        },
-    }
-    db_session.add(project)
-    await db_session.commit()
-
-    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-liveness")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["project_id"] == str(project.id)
-    # Mode from the workbench row (default "chat" absent an explicit selection).
-    assert data["interaction_mode"] == "chat"
-    # Resident-session liveness projection (mirrors the heavy endpoint's shape).
-    resident = data["resident_session"]
-    assert resident is not None
-    assert resident["session_id"] == "ss-live-9"
-    assert resident["status"] == STATUS_ACTIVE
-    assert resident["stop_requested"] is False
-    # Bounded projection: internal-only fields never leak.
-    assert "operator_user_id" not in resident
-    assert data["resident_session_availability"]["state"] is not None
-    assert data["resident_session_runners"] == []
-    # None of the heavy Phase-1/Phase-2 segments are assembled.
-    for heavy_key in (
-        "context_package",
-        "runtime",
-        "work_session",
-        "attention",
-        "tasks",
-        "messages",
-        "problem_model",
-        "sha_freshness",
-        "state_revision",
-        "model_integrity",
-    ):
-        assert heavy_key not in data, f"heavy key {heavy_key!r} leaked into liveness probe"
-
-
-@pytest.mark.asyncio
-async def test_strategic_liveness_runner_options_and_availability(
-    client: AsyncClient, db_session
-):
-    """The probe surfaces the same runner-picker options and availability verdict
-    the heavy endpoint would, computed from the cheap helpers only.
-
-    With no live runner and the feature enabled, availability is blocked/no_runner;
-    the eligible-live count is derived from the runner options' ``eligible`` flags.
-    """
-    project = await _make_project(db_session)
-    offline = LocalRunner(
-        project_id=project.id,
-        token_hash="d" * 64,
-        hostname="desk-cold",
-        status="active",
-        last_seen_at=_utcnow() - timedelta(hours=1),
-        capabilities={"task_types": "all"},
-    )
-    db_session.add(offline)
-    await db_session.commit()
-    await db_session.refresh(offline)
-
-    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
-    try:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-liveness"
-        )
-    finally:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["resident_session_available"] is True
-    runners = data["resident_session_runners"]
-    assert {r["id"] for r in runners} == {str(offline.id)}
-    assert runners[0]["online"] is False
-    assert runners[0]["eligible"] is False
-    # No eligible live runner -> blocked / no_runner.
-    availability = data["resident_session_availability"]
-    assert availability["state"] == "blocked"
-    assert availability["reason"] == "no_runner"
 
 
 @pytest.mark.asyncio
@@ -2987,7 +2662,7 @@ async def test_strategic_conversation_target_and_identity_lookup_are_bounded(
             from_type="user",
             content=f"conversation {index}",
             idempotency_key="recover-me" if index == 3 else None,
-            context={"_resident_wakeup_state": "paused"} if index == 3 else {},
+            context={"_operator_wakeup_state": "paused"} if index == 3 else {},
         )
         for index in range(1, 6)
     ]
@@ -3165,6 +2840,137 @@ async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
 
 
 @pytest.mark.asyncio
+async def test_strategic_conversation_stamps_delivered_at_on_rest_load(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-conversation stamps delivered_at on returned strategic/system messages."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(minutes=5)
+    strategic_msg = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="strategist reply",
+        created_at=base_time,
+        delivered_at=None,
+    )
+    system_msg = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="system note",
+        created_at=base_time + timedelta(seconds=10),
+        delivered_at=None,
+    )
+    user_msg = ProjectMessage(
+        project_id=project.id,
+        sequence=3,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="operator message",
+        created_at=base_time + timedelta(seconds=20),
+        delivered_at=None,
+    )
+    db_session.add_all([strategic_msg, system_msg, user_msg])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp.status_code == 200, resp.text
+    items = {item["id"]: item for item in resp.json()["items"]}
+
+    # strategic and system replies must have a non-NULL delivered_at in the response
+    assert items[str(strategic_msg.id)]["delivered_at"] is not None
+    assert items[str(system_msg.id)]["delivered_at"] is not None
+    # operator outbound message must NOT be stamped
+    assert items[str(user_msg.id)]["delivered_at"] is None
+
+    # verify the stamp is durable in the DB
+    await db_session.refresh(strategic_msg)
+    await db_session.refresh(system_msg)
+    await db_session.refresh(user_msg)
+    assert strategic_msg.delivered_at is not None
+    assert system_msg.delivered_at is not None
+    assert user_msg.delivered_at is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_does_not_stamp_outside_window(
+    client: AsyncClient, db_session
+):
+    """A message never returned in the response window keeps delivered_at NULL."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    # Create 21 messages so that with the default limit of 20 the oldest stays outside.
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=i + 1,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content=f"msg {i:02d}",
+            created_at=base_time + timedelta(minutes=i),
+            delivered_at=None,
+        )
+        for i in range(21)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["has_more"] is True
+    returned_ids = {item["id"] for item in body["items"]}
+    assert str(messages[0].id) not in returned_ids
+
+    # the oldest message (outside the window) must NOT be stamped
+    await db_session.refresh(messages[0])
+    assert messages[0].delivered_at is None
+
+    # a message within the window must be stamped
+    await db_session.refresh(messages[-1])
+    assert messages[-1].delivered_at is not None
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_stamp_is_idempotent(
+    client: AsyncClient, db_session
+):
+    """Repeated GET calls do not overwrite an already-set delivered_at."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(minutes=5)
+    msg = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="already delivered",
+        created_at=base_time,
+        delivered_at=None,
+    )
+    db_session.add(msg)
+    await db_session.commit()
+
+    resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp1.status_code == 200
+    await db_session.refresh(msg)
+    first_stamp = msg.delivered_at
+    assert first_stamp is not None
+
+    resp2 = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert resp2.status_code == 200
+    await db_session.refresh(msg)
+    assert msg.delivered_at == first_stamp  # unchanged
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_create_persists_project_session(
     client: AsyncClient, db_session
 ):
@@ -3325,6 +3131,7 @@ async def test_strategic_session_command_executes_attention_housekeeping(
         from_type="strategic",
         content="Need operator input.",
         status="open",
+        context={"audience": "operator-action-needed"},
         created_at=message_created_at,
     )
     alert = Alert(
@@ -3333,7 +3140,7 @@ async def test_strategic_session_command_executes_attention_housekeeping(
         title="Runner offline",
         message="The local runner stopped heartbeating.",
         domain="runner",
-        event_type="local_runner_stale",
+        event_type="runner.deactivated",
     )
     db_session.add_all([message, alert])
     await db_session.commit()
@@ -3410,7 +3217,7 @@ async def test_strategic_session_command_failed_receipt_refetches(
         title="Runner offline",
         message="The local runner stopped heartbeating.",
         domain="runner",
-        event_type="local_runner_stale",
+        event_type="runner.deactivated",
     )
     db_session.add(alert)
     await db_session.commit()
@@ -3688,7 +3495,7 @@ async def test_strategic_session_continuous_omits_runner_action_when_ready(
 
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert data["runtime"]["local_runner"]["mode"] == "local_ready"
+    assert data["runtime"]["local_runner"]["mode"] == "pending_local"
     assert (
         data["runtime"]["local_runner"]["continuation"]["reason"]
         == "preferred_runner_live"
@@ -4459,17 +4266,6 @@ async def test_strategic_reply_post_is_idempotent_and_resolves_question_atomical
         )
     )
     assert reply_count == 1
-    resident_turns = (
-        await db_session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.payloads[0]["type"].as_string()
-                == "strategic_resident_turn",
-            )
-        )
-    ).scalars().all()
-    assert len(resident_turns) == 1
-    assert resident_turns[0].first_payload["message_sequence_start"] == canonical["sequence"]
     receipt = await db_session.get(ProjectMessageAttachmentUpload, attachment_id)
     assert receipt is not None
     assert receipt.message_id == uuid.UUID(first.json()["id"])
@@ -6129,6 +5925,7 @@ async def test_strategic_state_includes_operator_attention(
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Should the local Strategic runner stay enabled during the workday?",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=now,
     )
@@ -6137,6 +5934,7 @@ async def test_strategic_state_includes_operator_attention(
         message_type=MessageType.BLOCKER,
         from_type="system",
         content="Runner registration failed for the local device.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=now - timedelta(minutes=10),
     )
@@ -6176,7 +5974,7 @@ async def test_strategic_state_includes_operator_attention(
         title="Runner offline",
         message="The local Strategic runner has not checked in.",
         domain="runtime",
-        event_type="runner_offline",
+        event_type="runner.deactivated",
     )
     dismissed_alert = Alert(
         project_id=project.id,
@@ -6443,6 +6241,7 @@ async def test_operator_attention_message_counts_are_not_capped_by_preview_limit
                 message_type=MessageType.FEEDBACK,
                 from_type="agent",
                 content=f"Recent feedback {idx}",
+                context={"audience": "operator-fyi"},
                 status="open",
                 created_at=_utcnow() + timedelta(minutes=idx),
             )
@@ -6452,6 +6251,7 @@ async def test_operator_attention_message_counts_are_not_capped_by_preview_limit
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Older open question must still count.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=_utcnow() - timedelta(days=1),
     )
@@ -6495,6 +6295,7 @@ async def test_operator_attention_cap_prioritizes_non_message_operator_items(
                 message_type=MessageType.QUESTION,
                 from_type="agent",
                 content=f"Open question {idx}",
+                context={"audience": "operator-action-needed"},
                 status="open",
                 created_at=now - timedelta(minutes=idx),
             )
@@ -6512,7 +6313,7 @@ async def test_operator_attention_cap_prioritizes_non_message_operator_items(
         title="Visible runtime error",
         message="Runner pool cannot dispatch work.",
         domain="runtime",
-        event_type="dispatch_error",
+        event_type="runner.deactivated",
     )
     db_session.add(approval_task)
     db_session.add(error_alert)
@@ -6546,6 +6347,7 @@ async def test_operator_attention_needs_preview_preserves_older_blockers(
                 message_type=MessageType.QUESTION,
                 from_type="agent",
                 content=f"Newer open question {idx}",
+                context={"audience": "operator-action-needed"},
                 status="open",
                 created_at=now - timedelta(minutes=idx),
             )
@@ -6555,6 +6357,7 @@ async def test_operator_attention_needs_preview_preserves_older_blockers(
         message_type=MessageType.BLOCKER,
         from_type="agent",
         content="Older blocker must still stay visible.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=now - timedelta(days=1),
     )
@@ -6587,6 +6390,7 @@ async def test_operator_attention_cap_prioritizes_local_runner_holds(
                 message_type=MessageType.QUESTION,
                 from_type="agent",
                 content=f"Open question before local runner hold {idx}",
+                context={"audience": "operator-action-needed"},
                 status="open",
                 created_at=now - timedelta(minutes=idx),
             )
@@ -6627,6 +6431,7 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
         message_type=MessageType.BUG_REPORT,
         from_type="agent",
         content="The pipeline chart failed to render.",
+        context={"audience": "operator-fyi"},
         status="open",
     )
     feedback = ProjectMessage(
@@ -6634,6 +6439,7 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
         message_type=MessageType.FEEDBACK,
         from_type="strategic",
         content="Strategic suggests watching runtime health.",
+        context={"audience": "operator-fyi"},
         status="open",
     )
     db_session.add_all([bug, feedback])
@@ -6724,7 +6530,8 @@ async def test_operator_attention_excludes_internal_messages_and_tasks_everywher
         project_id=project.id,
         message_type=MessageType.QUESTION,
         from_type="system",
-        content="legacy visible question",
+        content="operator-visible question",
+        context={"audience": "operator-action-needed"},
         status="open",
     )
     internal_approval = Task(
@@ -6804,6 +6611,7 @@ async def test_operator_attention_same_priority_items_use_newest_tie_break(
             message_type=MessageType.FEEDBACK,
             from_type="strategic",
             content=f"Feedback item {idx}",
+            context={"audience": "operator-fyi"},
             status="open",
             created_at=now - timedelta(minutes=idx),
         )
@@ -7133,7 +6941,7 @@ async def test_operator_attention_watch_lifecycle_for_parked_task_and_warning_al
         title="Runner warm pool warning",
         message="Warm pool is below target.",
         domain="runtime",
-        event_type="warm_pool_warning",
+        event_type="runner.degraded",
     )
     db_session.add_all([parked, warning])
     await db_session.commit()
@@ -7168,6 +6976,7 @@ async def test_operator_attention_no_last_seen_all_messages_unread(
             message_type=MessageType.QUESTION,
             from_type="agent",
             content=f"Open question {i}",
+            context={"audience": "operator-action-needed"},
             status="open",
         ))
     db_session.add(ProjectMessage(
@@ -7175,6 +6984,7 @@ async def test_operator_attention_no_last_seen_all_messages_unread(
         message_type=MessageType.BLOCKER,
         from_type="system",
         content="System blocker",
+        context={"audience": "operator-action-needed"},
         status="open",
     ))
     await db_session.commit()
@@ -7203,6 +7013,7 @@ async def test_operator_attention_last_seen_boundary_exact_created_at_is_not_unr
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Created exactly at boundary — should not be unread.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=boundary_time,
     )
@@ -7211,6 +7022,7 @@ async def test_operator_attention_last_seen_boundary_exact_created_at_is_not_unr
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Created strictly after boundary — should be unread.",
+        context={"audience": "operator-action-needed"},
         status="open",
         created_at=boundary_time + timedelta(seconds=1),
     )
@@ -7247,6 +7059,7 @@ async def test_operator_attention_first_visit_all_messages_unread(
         message_type=MessageType.QUESTION,
         from_type="agent",
         content="Does the operator need to review this on first visit?",
+        context={"audience": "operator-action-needed"},
         status="open",
     )
     context_direction = {
@@ -7287,6 +7100,7 @@ async def test_admin_messages_accepts_linked_status_filter(
         message_type=MessageType.BLOCKER,
         from_type="system",
         content="Linked issue",
+        context={"audience": "operator-action-needed"},
         status="linked",
     )
     open_msg = ProjectMessage(
@@ -7693,7 +7507,7 @@ async def test_strategic_state_currency_is_non_blocking(
     resolved_event = asyncio.Event()
 
     async def _slow_resolve(*args, **kwargs):
-        await asyncio.sleep(2)
+        await asyncio.sleep(0)
         resolved_event.set()
         return {"current": True, "candidate_sha": sha, "head_sha": sha}
 
@@ -8940,11 +8754,11 @@ async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
     (and thus runner_max_seen / runner_count) never moves, yet is_live flips to
     False once the heartbeat ages past _RUNNER_LIVENESS_SECONDS. The broad-revision
     fingerprint must catch it via live_runner_count so no false 304 pins the
-    resident-session picker / availability on a now-offline runner."""
+    runner picker / availability on a now-offline runner."""
     from app.routers.admin_project_strategic_session import (
-        _RUNNER_LIVENESS_SECONDS,
         _compute_strategic_state_fingerprints,
     )
+    from app.runner_health_monitors import _get_liveness_seconds
 
     project = await _make_project(db_session)
     seen_at = _utcnow() - timedelta(seconds=100)
@@ -8968,7 +8782,7 @@ async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
     # Advance the wall clock past the liveness window WITHOUT touching the DB.
     mocker.patch(
         "app.routers.admin_project_strategic_session._utcnow",
-        return_value=seen_at + timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 30),
+        return_value=seen_at + timedelta(seconds=_get_liveness_seconds() + 30),
     )
     fp_stale = await _compute_strategic_state_fingerprints(
         db_session, project.id, TEST_USER_ID
@@ -9453,30 +9267,6 @@ async def test_build_operator_attention_accepts_preloaded_runner_rows(db_session
     assert runner_items == []
 
 
-@pytest.mark.asyncio
-async def test_build_resident_runner_options_accepts_preloaded_runner_rows(db_session):
-    """build_resident_runner_options with runner_rows= uses the provided list, not the DB."""
-    from app.strategic_resident_session import build_resident_runner_options
-
-    project = await _make_project(db_session)
-    # No runners in DB for this project, but we pass a synthetic list.
-    runner = LocalRunner(
-        project_id=project.id,
-        token_hash="cc" * 32,
-        hostname="synthetic-host",
-        status="active",
-        last_seen_at=_utcnow(),
-        capabilities={"task_types": "all", "agent_available": True},
-    )
-    db_session.add(runner)
-    await db_session.commit()
-    await db_session.refresh(runner)
-
-    options = await build_resident_runner_options(db_session, project.id, runner_rows=[runner])
-    assert len(options) == 1
-    assert options[0]["hostname"] == "synthetic-host"
-
-
 def test_task_summary_caps_latest_status_message():
     """_task_summary enforces the declared STATUS_LATEST_MESSAGE_MAX cap on the
     primary strategic status message it surfaces. This exposure was previously
@@ -9562,3 +9352,534 @@ async def test_strategic_state_live_message_preview_interleaved_statuses(db_sess
         *(f"linked msg {i}" for i in range(7)),
         *(f"open msg {i}" for i in range(2, 7)),
     }
+
+
+@pytest.mark.asyncio
+async def test_set_memory_rejects_oversize_note(db_session):
+    """set_memory returns 400 when the note body exceeds 10 KB instead of truncating."""
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(name="P-oversize-memory", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            oversized_note = "x" * 10_001
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_memory", "task_id": task_id, "data": {"note": oversized_note}},
+            )
+        assert resp.status_code == 400, resp.text
+        assert "too large" in resp.json()["error"]["message"].lower()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_set_session_summary_rejects_oversize_summary(db_session):
+    """set_session_summary returns 400 when summary exceeds 10 KB instead of truncating."""
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(name="P-oversize-summary", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            oversized_summary = "y" * 10_001
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_session_summary", "task_id": task_id, "data": {"summary": oversized_summary}},
+            )
+        assert resp.status_code == 400, resp.text
+        assert "too large" in resp.json()["error"]["message"].lower()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_state_returns_knowledge_index(db_session):
+    """checkpoint-state returns KnowledgeDocument-index entries (not raw JSONB notes).
+
+    Inserts a KnowledgeDocument with source_kind=strategic_memory and
+    lifecycle_status=consumed, plus a legacy JSONB note on the project.
+    Asserts the response contains the KnowledgeDoc entry by id/title and
+    does NOT contain the raw JSONB note shape ({note, set_at}).
+    """
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(
+        name="P-checkpoint-knowledgedoc",
+        user_id="u1",
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    mem_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Prefer compact PRs",
+        summary="Keep PRs under 200 lines for faster review.",
+        body="Keep PRs under 200 lines for faster review.",
+        topic="development-practices",
+        tags=["praxis"],
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True},
+    )
+    db_session.add(mem_doc)
+    await db_session.commit()
+    await db_session.refresh(mem_doc)
+    mem_doc_id = str(mem_doc.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            resp = await ac.get(
+                f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state"
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        notes = data["strategic_memory_notes"]
+        assert isinstance(notes, list)
+        # Must contain the KnowledgeDocument entry.
+        ids = [n.get("id") for n in notes]
+        assert mem_doc_id in ids, f"KnowledgeDoc {mem_doc_id} not found in {notes}"
+        # Entries must have KnowledgeDoc-index shape (id, title), not raw JSONB shape.
+        entry = next(n for n in notes if n.get("id") == mem_doc_id)
+        assert entry.get("title") == "Prefer compact PRs"
+        # Must NOT contain raw JSONB note dicts ({note, set_at}).
+        for n in notes:
+            assert "note" not in n, f"Raw JSONB note shape leaked into response: {n}"
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_admin_strategic_state_returns_knowledge_doc_index_shape(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-state returns the KnowledgeDocument index for memory.
+
+    The strategic_memory_notes key must carry {id, title, ...} index entries
+    (superseded/dismissed facts excluded), NOT the raw JSONB {note, set_at}
+    shape — even when a legacy JSONB list is still present on the project.
+    """
+    project = Project(
+        name="P-admin-strategic-memory",
+        user_id=TEST_USER_ID,
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+    )
+    await db_session.commit()
+
+    active_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Always measure user-visible improvement",
+        summary="Measure shipped improvement, not green CI.",
+        body="Measure shipped improvement, not green CI.",
+        topic="operator_preference",
+        tags=["quality"],
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True},
+    )
+    dismissed_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Superseded fact",
+        summary="Old belief, superseded.",
+        body="Old belief, superseded.",
+        source_citations=[],
+        lifecycle_status="dismissed",
+        forward_quality_verdict={"passed": True},
+    )
+    db_session.add(active_doc)
+    db_session.add(dismissed_doc)
+    await db_session.commit()
+    await db_session.refresh(active_doc)
+    active_id = str(active_doc.id)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200, resp.text
+    notes = resp.json()["strategic_memory_notes"]
+    assert isinstance(notes, list)
+    ids = [n.get("id") for n in notes]
+    assert active_id in ids
+    # Dismissed (superseded) fact excluded.
+    assert str(dismissed_doc.id) not in ids
+    entry = next(n for n in notes if n.get("id") == active_id)
+    assert entry.get("title") == "Always measure user-visible improvement"
+    # KnowledgeDoc-index shape, not raw JSONB {note, set_at}.
+    for n in notes:
+        assert "note" not in n
+        assert "set_at" not in n
+
+
+@pytest.mark.asyncio
+async def test_section_fetch_strategic_memory_returns_knowledge_doc_index_shape(
+    db_session,
+):
+    """GET /sections/strategic_memory_notes returns the KnowledgeDocument index.
+
+    Same KnowledgeDocument-index shape as the checkpoint-state and admin
+    strategic-state paths, with superseded facts excluded and the raw JSONB
+    shape absent.
+    """
+    from httpx import ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(
+        name="P-section-strategic-memory",
+        user_id="u1",
+        strategic_memory_notes=[{"note": "legacy raw note", "set_at": "2024-01-01"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    active_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Prefer concrete action proposals",
+        summary="Give concrete proposals when blocking on operator input.",
+        body="Give concrete proposals when blocking on operator input.",
+        topic="process_rule",
+        tags=[],
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True},
+    )
+    dismissed_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Superseded fact",
+        summary="Old belief.",
+        body="Old belief.",
+        source_citations=[],
+        lifecycle_status="dismissed",
+        forward_quality_verdict={"passed": True},
+    )
+    db_session.add(active_doc)
+    db_session.add(dismissed_doc)
+    await db_session.commit()
+    await db_session.refresh(active_doc)
+    active_id = str(active_doc.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            resp = await ac.get(
+                f"/api/agent/projects/{project.id}/sections/strategic_memory_notes"
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert isinstance(data, list)
+        ids = [n.get("id") for n in data]
+        assert active_id in ids
+        assert str(dismissed_doc.id) not in ids
+        entry = next(n for n in data if n.get("id") == active_id)
+        assert entry.get("title") == "Prefer concrete action proposals"
+        for n in data:
+            assert "note" not in n
+            assert "set_at" not in n
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+def _load_migration_0699():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / (
+        "alembic/versions/0699_backfill_strategic_memory_knowledge.py"
+    )
+    spec = importlib.util.spec_from_file_location("migration_0699", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_migration_0699_backfills_legacy_notes_into_knowledge_documents(
+    db_session,
+):
+    """Migration 0699 backfills pre-existing legacy notes into KnowledgeDocuments.
+
+    Pre-seeds a project's strategic_memory_notes JSONB list with legacy entries
+    (no doc_id), runs the migration, and asserts one consumed strategic_memory
+    KnowledgeDocument exists per entry with the correct body/title/summary and is
+    retrievable via list_knowledge_documents(source_kind='strategic_memory').
+    Re-running the migration is idempotent (no duplicates).
+    """
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.knowledge_query import list_knowledge_documents
+
+    migration = _load_migration_0699()
+
+    project = Project(
+        name="P-0699-backfill",
+        user_id="u1",
+        strategic_memory_notes=[
+            {
+                "note": "Do not assert timelines without supporting evidence.",
+                "set_at": "2026-07-08T14:30:00Z",
+            },
+            {
+                "note": "Verify external claims before escalating them.",
+                "set_at": "2026-07-08T15:00:00+00:00",
+            },
+            # A malformed/empty entry must be skipped, not crash the migration.
+            {"set_at": "2026-07-08T16:00:00Z"},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _apply(sync_session):
+        connection = sync_session.connection()
+        original_op = migration.op
+        migration.op = Operations(MigrationContext.configure(connection))
+        try:
+            migration.upgrade()
+        finally:
+            migration.op = original_op
+
+    # Run twice to prove idempotency (deterministic uuid5 ids + skip-existing).
+    await db_session.run_sync(_apply)
+    await db_session.run_sync(_apply)
+
+    listed = await list_knowledge_documents(
+        db_session, project.id, source_kind="strategic_memory"
+    )
+    # Two well-formed notes → two docs; the malformed entry is skipped.
+    assert listed["total"] == 2
+    titles = {d["title"] for d in listed["documents"]}
+    assert "Do not assert timelines without supporting evidence." in titles
+    assert "Verify external claims before escalating them." in titles
+
+    rows = (
+        await db_session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+    for doc in rows:
+        assert doc.lifecycle_status == "consumed"
+        assert doc.forward_quality_verdict == {"passed": True, "strategy": "backfill"}
+        assert doc.body in {
+            "Do not assert timelines without supporting evidence.",
+            "Verify external claims before escalating them.",
+        }
+        assert doc.summary == doc.body
+        assert doc.source_citations[0]["note"] == (
+            "backfilled from legacy strategic_memory_notes"
+        )
+
+    # The legacy JSONB column is left in place (not cleared) for rollback safety.
+    await db_session.refresh(project)
+    assert len(project.strategic_memory_notes) == 3
+
+    # Downgrade removes ONLY the backfill-marked rows (precisely reversible).
+    def _revert(sync_session):
+        connection = sync_session.connection()
+        original_op = migration.op
+        migration.op = Operations(MigrationContext.configure(connection))
+        try:
+            migration.downgrade()
+        finally:
+            migration.op = original_op
+
+    await db_session.run_sync(_revert)
+    after = await list_knowledge_documents(
+        db_session, project.id, source_kind="strategic_memory"
+    )
+    assert after["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_0699_skips_entries_with_existing_doc_id(db_session):
+    """Entries carrying a doc_id pointing at an existing row are not duplicated."""
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.knowledge_query import list_knowledge_documents
+
+    migration = _load_migration_0699()
+
+    project = Project(name="P-0699-skip", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A post-0680 KnowledgeDocument already exists for this fact.
+    existing = KnowledgeDocument(
+        project_id=project.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Already migrated fact",
+        summary="Already migrated fact",
+        body="Already migrated fact",
+        source_citations=[],
+        lifecycle_status="consumed",
+        forward_quality_verdict={"passed": True, "strategy": "agent_self_attested"},
+    )
+    db_session.add(existing)
+    await db_session.commit()
+    await db_session.refresh(existing)
+
+    project.strategic_memory_notes = [
+        {
+            "note": "Already migrated fact",
+            "set_at": "2026-07-08T14:30:00Z",
+            "doc_id": str(existing.id),
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "strategic_memory_notes")
+    db_session.add(project)
+    await db_session.commit()
+
+    def _apply(sync_session):
+        connection = sync_session.connection()
+        original_op = migration.op
+        migration.op = Operations(MigrationContext.configure(connection))
+        try:
+            migration.upgrade()
+        finally:
+            migration.op = original_op
+
+    await db_session.run_sync(_apply)
+
+    listed = await list_knowledge_documents(
+        db_session, project.id, source_kind="strategic_memory"
+    )
+    # No duplicate row created for the already-migrated entry.
+    assert listed["total"] == 1
+    assert listed["documents"][0]["id"] == str(existing.id)

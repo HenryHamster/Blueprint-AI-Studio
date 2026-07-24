@@ -57,6 +57,85 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# --- Gap-respawn observe-mode observability ------------------------------------
+
+#: Lane discriminator for AuditLaneDecisionLog rows recording observe-mode
+#: would-have-blocked events from the direction_gap_respawn_block_mode check.
+_GAP_RESPAWN_LANE = "gap_respawn"
+
+#: Bounded in-memory ring of recent observe-mode would-have-blocked events
+#: (mirrors the pattern in evergreen_backlog / structural_health_audit).
+from collections import deque as _deque  # noqa: E402
+_GAP_RESPAWN_OBSERVE_RING: _deque = _deque(maxlen=50)  # type: ignore[type-arg]
+
+
+async def _record_gap_respawn_observe_event(
+    session: Any,
+    *,
+    ts: Any,
+    direction_text: str,
+    gap_id: str | None,
+    matched_retired_id: str,
+    match_kind: str,
+    project_id: Any,
+) -> None:
+    """Record an observe-mode would-have-blocked event durably and in-memory.
+
+    Writes one row to ``AuditLaneDecisionLog`` (lane='gap_respawn') so the
+    mode-knob graduation harness can read a durable multi-day window, and
+    appends to the bounded in-memory ring for live operator observability.
+    Best-effort: a DB error is logged and swallowed.
+    """
+    from app.models import AuditLaneDecisionLog
+
+    payload = {
+        "direction_text": direction_text[:200],
+        "gap_id": gap_id,
+        "matched_retired_id": matched_retired_id,
+        "match_kind": match_kind,
+        "project_id": str(project_id) if project_id else None,
+    }
+
+    # In-memory ring (bounded, process-local).
+    _GAP_RESPAWN_OBSERVE_RING.append({
+        "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        "direction_text": direction_text[:200],
+        "gap_id": gap_id,
+        "matched_retired_id": matched_retired_id,
+        "match_kind": match_kind,
+    })
+
+    # Durable DB row.
+    try:
+        row = AuditLaneDecisionLog(
+            ts=ts,
+            lane=_GAP_RESPAWN_LANE,
+            mode="observe",
+            tripped=True,
+            enrolled=0,
+            payload=payload,
+        )
+        session.add(row)
+        await session.flush()
+    except Exception:
+        logger.warning(
+            "[STRATEGIC] _record_gap_respawn_observe_event failed to persist",
+            exc_info=True,
+        )
+
+
+def get_gap_respawn_observability() -> dict:
+    """Return the current in-memory gap-respawn observability snapshot."""
+    return {
+        "would_have_blocked_recent": list(_GAP_RESPAWN_OBSERVE_RING),
+        "would_have_blocked_count": len(_GAP_RESPAWN_OBSERVE_RING),
+    }
+
+
+def _reset_gap_respawn_observability_for_tests() -> None:
+    """Reset the in-memory ring (test isolation only)."""
+    _GAP_RESPAWN_OBSERVE_RING.clear()
+
 
 def spawn_budget_status(
     per_review_count: int,
@@ -512,14 +591,6 @@ _HARD_BLOCK_PORTFOLIO_OPS = frozenset(
         "activate_direction",
     }
 )
-STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY = (
-    "strategic_retirement_challenge_gate_mode"
-)
-STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODES = frozenset(
-    {"observe", "advisory", "enforce"}
-)
-
-
 def _sanitize_challenge_verdict_block(
     raw: object,
     *,
@@ -818,47 +889,6 @@ def challenge_approves_evidence_progress(
     return False
 
 
-def challenge_approves_retirement(record: object, direction_id: str) -> bool:
-    """True iff the challenge record APPROVED retiring this direction_id.
-
-    Mirrors :func:`challenge_approves_evidence_progress` in fail-closed shape:
-    non-dict records, non-ok statuses, blank direction ids, rejected/uncertain
-    entries, and missing entries all return False. No caller should treat an
-    unavailable retirement second opinion as approval.
-    """
-    if not isinstance(record, dict):
-        return False
-    if record.get("status") != "ok":
-        return False
-    target_id = (direction_id or "").strip()
-    if not target_id:
-        return False
-    for item in record.get(_RETIREMENT_APPROVALS_KEY) or []:
-        if not isinstance(item, dict):
-            continue
-        if (
-            str(item.get("direction_id", "")).strip() == target_id
-            and str(item.get("verdict", "")).strip().lower() == "approved"
-        ):
-            return True
-    return False
-
-
-def strategic_retirement_challenge_gate_mode() -> str:
-    """Return the current retirement challenge rollout mode."""
-    raw = (
-        str(
-            _runtime_config.get(STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY, "observe")
-            or "observe"
-        )
-        .strip()
-        .lower()
-    )
-    if raw not in STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODES:
-        return "observe"
-    return raw
-
-
 def strategic_challenge_summary(record: object) -> dict | None:
     """Derive a compact, websocket-safe summary of a strategic-judgment challenge.
 
@@ -948,9 +978,7 @@ def strategic_challenge_summary(record: object) -> dict | None:
     mode_raw = str(record.get("status", "")).strip().lower()
     mode = mode_raw if mode_raw in {"ok", "blocked", "invalid"} else "invalid"
 
-    if mode != "ok":
-        verdict = "blocked"
-    elif blocked:
+    if mode != "ok" or blocked:
         verdict = "blocked"
     elif warned:
         verdict = "warned"
@@ -1407,7 +1435,7 @@ async def _apply_qualify_request(
     open ``ReleaseVersion``, gates on
     ``phase == "stabilize"``, verifies the current automain HEAD is not blocked
     by CI-compliance violations, and calls ``release_qualifier.run_qualification``
-    (which snapshots the candidate SHA + spawns the audit/smoketest children;
+    (which snapshots the candidate SHA + spawns the active qualifier children;
     the caller's surrounding commit persists its version-row writes). When
     CI-compliance blocks qualification, the cap-bump remediation task is spawned
     before returning.
@@ -1501,7 +1529,7 @@ async def _apply_qualify_request(
                         }
                         flag_modified(open_ver, "last_qualification")
                         session.add(open_ver)
-                    except Exception:  # noqa: BLE001 — recording must never block the gate
+                    except Exception:
                         logger.exception(
                             "[STRATEGIC] Task %s (%s path): failed to record "
                             "qualify_request CI-compliance block on ReleaseVersion",
@@ -1561,7 +1589,7 @@ async def _apply_qualify_request(
                 }
                 flag_modified(open_ver, "last_qualification")
                 session.add(open_ver)
-            except Exception:  # noqa: BLE001 — recording must never re-raise
+            except Exception:
                 logger.exception(
                     "[STRATEGIC] Task %s (%s path): also failed to record "
                     "qualify_request error on ReleaseVersion — failure lost",
@@ -2053,7 +2081,7 @@ async def _spawn_retirement_memos(
                     "kind": "retired",
                 },
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "[STRATEGIC] completion-debt record failed for retired "
                 "direction %s (non-fatal)",
@@ -3413,9 +3441,9 @@ def record_retired_direction_memory(
     existing callers that omit it keep the previous entry shape unchanged.
     """
     text = direction.get("text") or ""
-    tokens = list(
-        set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
-    )[:_RETIRED_TEXT_TOKEN_CAP]
+    tokens = [
+        w for w in text.lower().split() if w not in _DIRECTION_DEDUP_STOPWORDS
+    ][:_RETIRED_TEXT_TOKEN_CAP]
 
     metrics = _retired_direction_outcome_metrics(direction)
     classification = classify_retired_direction_outcome(
@@ -3425,6 +3453,7 @@ def record_retired_direction_memory(
 
     entry: dict = {
         "id": direction.get("id", ""),
+        "text": text[:_RETIRED_OUTCOME_CHAR_CAP],
         "text_tokens": tokens,
         "retired_at": _utcnow().isoformat(),
         "reason": reason,
@@ -3853,7 +3882,7 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         capability_count: int = size_signal["capability_count"]
         gap_count: int = size_signal["active_gap_count"]
         model_size_status: str = size_signal["model_size_status"]
-    except Exception:
+    except Exception:  # noqa: BLE001
         model_bytes = len(json.dumps(raw_pm, default=str).encode())
         capability_count = len(raw_pm.get("capabilities") or [])
         gap_count = len(
@@ -3869,8 +3898,11 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
     try:
         first_payload = task.first_payload or {}
         packer_meta = first_payload.get("_packer_meta") or {}
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to read packer metadata from task.first_payload",
+            exc_info=True,
+        )
 
     dropped: list = packer_meta.get("dropped") or []
     trimmed: list = packer_meta.get("trimmed") or []
@@ -4004,7 +4036,7 @@ async def _apply_qualify_request_post_commit(
     GitHub error) is logged and swallowed — the durable completion already
     committed, so a failure here can never requeue the task or discard the
     agent's work.
-    """
+    """  # noqa: RUF002
     if not request or not isinstance(request, dict):
         return
     from app.database import AsyncSessionLocal
@@ -4018,7 +4050,7 @@ async def _apply_qualify_request_post_commit(
                 return
             await _apply_qualify_request(request, task, project, fresh, path=path)
             await fresh.commit()
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[STRATEGIC_COMPLETION] _apply_qualify_request_post_commit: qualify_request "
             "side-effect failed for task %s project %s (%s path) — non-fatal; the "
@@ -4240,12 +4272,6 @@ async def _handle_strategic_completion(
             _retirement_critiques = (task.context or {}).get(
                 "_strategic_retirement_critiques"
             )
-            _retirement_gate_verdicts = (task.context or {}).get(
-                "_strategic_retirement_gate_verdicts"
-            )
-            _retirement_deferrals = (task.context or {}).get(
-                "_strategic_retirement_deferrals"
-            )
             _extra: dict = {
                 "created_direction_ids": created_ids,
                 "retired_direction_ids": retired_ids,
@@ -4293,10 +4319,6 @@ async def _handle_strategic_completion(
                 )
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
-            if _retirement_gate_verdicts is not None:
-                _extra["retirement_gate_verdicts"] = _retirement_gate_verdicts
-            if _retirement_deferrals is not None:
-                _extra["retirement_deferrals"] = _retirement_deferrals
             # Copy the bounded, versioned strategic judgment challenge record
             # (evidence_progress / retirement / portfolio-shape second opinion)
             # verbatim into cycle_metadata so the challenge pass is durably
@@ -4360,7 +4382,7 @@ async def _handle_strategic_completion(
             _knowledge_available = 0
             _knowledge_cited = 0
             try:
-                from app.knowledge_query import build_knowledge_index  # noqa: PLC0415
+                from app.knowledge_query import build_knowledge_index
 
                 _knowledge_index = await build_knowledge_index(session, project.id)
                 _knowledge_available = len(_knowledge_index)
@@ -4850,68 +4872,96 @@ async def _handle_strategic_completion(
                     f"keeping prior state. Error: {pm_err}"
                 )
             else:
-                project.problem_model = new_pm_raw
-                flag_modified(project, "problem_model")
-                # Surface blocked gap deletions (active direction still references).
-                _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
-                if _blocked_dels:
-                    logger.warning(
-                        f"[STRATEGIC] Task {task.id}: gap deletion(s) blocked — "
-                        f"still referenced by active direction(s): {_blocked_dels}"
+                if pm_diff.get("live_core_exceeds_budget"):
+                    logger.error(
+                        f"[STRATEGIC] Task {task.id}: problem_model live core exceeds "
+                        f"byte budget — rejecting write to prevent oversized durable state "
+                        f"(rev-1367 wipe precondition avoided); section: "
+                        f"{pm_diff['live_core_exceeds_budget']}"
                     )
-                # Normalize stale active_moves via shared helper so both write
-                # paths (op-endpoint + log-parse fallback) stay converged.
-                _active_dir_ids = {
-                    str(d.get("id"))
-                    for d in (project.directions or [])
-                    if d.get("status") == "active"
-                }
-                new_pm_raw, _norm = _normalize_active_moves_writeback(
-                    new_pm_raw, _active_dir_ids, _utcnow().isoformat()
-                )
-                if _norm:
-                    logger.info(
-                        f"[STRATEGIC] Task {task.id}: auto-normalized active_moves: {_norm}"
+                    from app.alert_dispatch import (
+                        _maybe_create_problem_model_live_core_alert,
                     )
+                    await _maybe_create_problem_model_live_core_alert(
+                        project.id, session
+                    )
+                else:
                     project.problem_model = new_pm_raw
                     flag_modified(project, "problem_model")
-                logger.info(
-                    f"[STRATEGIC] Updated problem_model for project {project.id} "
-                    f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
-                )
-                # Carry proof records and adoption verdicts onto survivor keys
-                # when a capability consolidation occurred in this write.
-                _consolidated = (
-                    pm_diff.get("capabilities_consolidated") if pm_diff else None
-                )
-                if _consolidated:
-                    from app.capability_proof import (
-                        carry_proof_records_for_consolidation,
+                    # Surface blocked gap deletions (active direction still references).
+                    _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
+                    if _blocked_dels:
+                        logger.warning(
+                            f"[STRATEGIC] Task {task.id}: gap deletion(s) blocked — "
+                            f"still referenced by active direction(s): {_blocked_dels}"
+                        )
+                    for _wipe_field in ("gaps", "capabilities"):
+                        if pm_diff.get(f"{_wipe_field}_wipe_risk"):
+                            logger.warning(
+                                f"[STRATEGIC] Task {task.id}: problem_model {_wipe_field} "
+                                f"wipe-without-deletions detected — agent proposed empty "
+                                f"{_wipe_field} with no _deletions directive; existing "
+                                f"{_wipe_field} preserved via non-destructive merge"
+                            )
+                            from app.alert_dispatch import (
+                                _maybe_create_problem_model_wipe_alert,
+                            )
+                            await _maybe_create_problem_model_wipe_alert(
+                                project.id, session, field=_wipe_field
+                            )
+                    # Normalize stale active_moves via shared helper so both write
+                    # paths (op-endpoint + log-parse fallback) stay converged.
+                    _active_dir_ids = {
+                        str(d.get("id"))
+                        for d in (project.directions or [])
+                        if d.get("status") == "active"
+                    }
+                    new_pm_raw, _norm = _normalize_active_moves_writeback(
+                        new_pm_raw, _active_dir_ids, _utcnow().isoformat()
                     )
-                    from app.capability_trial_verdict import (
-                        carry_adoption_verdicts_for_consolidation,
+                    if _norm:
+                        logger.info(
+                            f"[STRATEGIC] Task {task.id}: auto-normalized active_moves: {_norm}"
+                        )
+                        project.problem_model = new_pm_raw
+                        flag_modified(project, "problem_model")
+                    logger.info(
+                        f"[STRATEGIC] Updated problem_model for project {project.id} "
+                        f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
                     )
+                    # Carry proof records and adoption verdicts onto survivor keys
+                    # when a capability consolidation occurred in this write.
+                    _consolidated = (
+                        pm_diff.get("capabilities_consolidated") if pm_diff else None
+                    )
+                    if _consolidated:
+                        from app.capability_proof import (
+                            carry_proof_records_for_consolidation,
+                        )
+                        from app.capability_trial_verdict import (
+                            carry_adoption_verdicts_for_consolidation,
+                        )
 
-                    if not isinstance(
-                        getattr(project, "capability_proof_records", None), dict
-                    ):
-                        project.capability_proof_records = {}
-                    project.capability_proof_records = (
-                        carry_proof_records_for_consolidation(
-                            _consolidated, project.capability_proof_records
+                        if not isinstance(
+                            getattr(project, "capability_proof_records", None), dict
+                        ):
+                            project.capability_proof_records = {}
+                        project.capability_proof_records = (
+                            carry_proof_records_for_consolidation(
+                                _consolidated, project.capability_proof_records
+                            )
                         )
-                    )
-                    flag_modified(project, "capability_proof_records")
-                    if not isinstance(
-                        getattr(project, "capability_adoption_verdicts", None), dict
-                    ):
-                        project.capability_adoption_verdicts = {}
-                    project.capability_adoption_verdicts = (
-                        carry_adoption_verdicts_for_consolidation(
-                            _consolidated, project.capability_adoption_verdicts
+                        flag_modified(project, "capability_proof_records")
+                        if not isinstance(
+                            getattr(project, "capability_adoption_verdicts", None), dict
+                        ):
+                            project.capability_adoption_verdicts = {}
+                        project.capability_adoption_verdicts = (
+                            carry_adoption_verdicts_for_consolidation(
+                                _consolidated, project.capability_adoption_verdicts
+                            )
                         )
-                    )
-                    flag_modified(project, "capability_adoption_verdicts")
+                        flag_modified(project, "capability_adoption_verdicts")
         except Exception:
             logger.exception(
                 "[STRATEGIC] Failed to apply problem_model update (non-fatal)"
@@ -5197,6 +5247,19 @@ async def _handle_strategic_completion(
                         _gap_block_reason,
                         _gap_block_mode,
                     )
+                    # In observe mode, record the would-have-blocked event durably
+                    # so the mode-knob graduation harness can measure lift over a
+                    # multi-day window (direction_gap_respawn_block_mode).
+                    if _gap_block_mode == "observe":
+                        await _record_gap_respawn_observe_event(
+                            session,
+                            ts=_utcnow(),
+                            direction_text=text,
+                            gap_id=op_entry.get("gap_id"),
+                            matched_retired_id=_retired_direction_id,
+                            match_kind=_gap_match_kind,
+                            project_id=project.id,
+                        )
                     if _gap_block_mode == "enforce":
                         continue
                 success_evidence = str(op_entry.get("success_evidence", "")).strip()
@@ -5358,7 +5421,7 @@ async def _handle_strategic_completion(
                 current_active = sum(
                     1 for d in directions if d.get("status") == "active"
                 )
-                if current_active >= _runtime_config.get("max_active_directions", 5):
+                if current_active >= _runtime_config.get("max_active_directions", 10):
                     logger.warning(
                         f"[STRATEGIC] Skipping direction create: active count {current_active} >= cap"
                     )
@@ -5822,7 +5885,7 @@ async def _handle_strategic_completion(
                                 "_strategic_dirs_staged", 0
                             )
                             + 1,
-                            "_strategic_staged_ids": list(
+                            "_strategic_staged_ids": list(  # noqa: RUF005
                                 ctx.get("_strategic_staged_ids", [])
                             )
                             + [dir_id],
@@ -5875,7 +5938,7 @@ async def _handle_strategic_completion(
                     )
                     continue
                 active_count = sum(1 for d in directions if d.get("status") == "active")
-                max_active = _runtime_config.get("max_active_directions", 5)
+                max_active = _runtime_config.get("max_active_directions", 10)
                 if active_count >= max_active:
                     logger.info(
                         "[STRATEGIC] Task %s: fallback approve_direction skipped for %s because active count %s/%s reached cap",
@@ -5917,7 +5980,7 @@ async def _handle_strategic_completion(
                     + 1,
                     "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0)
                     + 1,
-                    "_strategic_updated_ids": list(
+                    "_strategic_updated_ids": list(  # noqa: RUF005
                         ctx.get("_strategic_updated_ids", [])
                     )
                     + [dir_id],
@@ -6016,7 +6079,7 @@ async def _handle_strategic_completion(
                     + 1,
                     "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0)
                     + 1,
-                    "_strategic_retired_ids": list(
+                    "_strategic_retired_ids": list(  # noqa: RUF005
                         ctx.get("_strategic_retired_ids", [])
                     )
                     + [dir_id],
@@ -6074,7 +6137,7 @@ async def _handle_strategic_completion(
                     )
                     continue
                 active_count = sum(1 for d in directions if d.get("status") == "active")
-                max_active = _runtime_config.get("max_active_directions", 5)
+                max_active = _runtime_config.get("max_active_directions", 10)
                 if active_count >= max_active:
                     logger.info(
                         "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because active count %s/%s reached cap",
@@ -6111,7 +6174,7 @@ async def _handle_strategic_completion(
                 task.context = {
                     **ctx,
                     "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
-                    "_strategic_updated_ids": list(
+                    "_strategic_updated_ids": list(  # noqa: RUF005
                         ctx.get("_strategic_updated_ids", [])
                     ) + [dir_id],
                 }
@@ -6142,7 +6205,7 @@ async def _handle_strategic_completion(
                 fresh_ids = {str(d.get("id") or "") for d in fresh}
                 for new_dir in _fb_created:
                     if str(new_dir.get("id") or "") not in fresh_ids:
-                        result.append(new_dir)
+                        result.append(new_dir)  # noqa: PERF401
                 # Enforce the 20-tombstone cap on "rejected" entries so the
                 # fallback path stays consistent with the HTTP reject path
                 # (admin_agent_ops.py) and rejected entries never accumulate
@@ -6204,6 +6267,25 @@ async def _handle_strategic_completion(
                             _result.model_dump(),
                         )
                 if _pm_changed:
+                    from app.problem_model import (
+                        enforce_problem_model_size as _enforce_pm_size,
+                    )
+
+                    _gc_summary, _oversize_section = _enforce_pm_size(_pm_model)
+                    if _oversize_section:
+                        from app.alert_dispatch import (
+                            _maybe_create_problem_model_live_core_alert,
+                        )
+
+                        logger.error(
+                            "[STRATEGIC] Task %s: problem_model live core exceeds "
+                            "byte budget after gap-staffing reconciliation: %s",
+                            task.id,
+                            _oversize_section,
+                        )
+                        await _maybe_create_problem_model_live_core_alert(
+                            task.project_id, session
+                        )
                     project.problem_model = _pm_model.model_dump()
                     flag_modified(project, "problem_model")
 
@@ -6398,7 +6480,18 @@ async def _handle_strategic_completion(
             if warning:
                 _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         _event_type = _msg_ctx.get("event_type")
-        _msg_ctx = stamp_message_audience(_msg_ctx, _event_type or "strategic_message")
+        # When replying to a specific message (reply_to present) and no explicit
+        # event_type was supplied, default to "question_answer" (OPERATOR_FYI)
+        # instead of "strategic_message" (STRATEGIST_INTERNAL).  Without this,
+        # the operator never receives a notification that a reply arrived.
+        _default_event_type = (
+            "question_answer"
+            if _event_type is None and _msg_ctx.get("reply_to") is not None
+            else "strategic_message"
+        )
+        _msg_ctx = stamp_message_audience(
+            _msg_ctx, _event_type or _default_event_type, message_type=msg_type.value
+        )
         _conversation_reply = _event_type not in _ROUTINE_EVENT_TYPES
         _reply_to_id: uuid.UUID | None = None
         _raw_reply_to = _msg_ctx.get("reply_to")
@@ -6445,7 +6538,7 @@ async def _handle_strategic_completion(
         )
         session.add(new_msg)
         _collect_message_event(new_msg)
-        if _event_type:
+        if _event_type:  # noqa: SIM102
             if _event_type in _ROUTINE_EVENT_TYPES:
                 _append_routine_digest(project, _event_type, content)
         msgs_created += 1
@@ -6472,7 +6565,7 @@ async def _handle_strategic_completion(
         try:
             _raw_id = _entry.get("id") if isinstance(_entry, dict) else str(_entry)
             _msg_ids.append(uuid.UUID(str(_raw_id)))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError):  # noqa: PERF203
             pass
     if _msg_ids:
         _batch_result = await session.execute(
@@ -6589,12 +6682,13 @@ async def _handle_strategic_completion(
                             from app.notification_dispatch import (
                                 post_question_answer,
                             )
+
                             from app.strategic_resident_session import (
                                 read_resident_session,
                                 resident_session_is_active,
                             )
 
-                            _resident_blob = read_resident_session(project.vision)
+                            resident_blob = read_resident_session(project.vision)
                             reply = await post_question_answer(
                                 session,
                                 project.id,
@@ -6602,9 +6696,9 @@ async def _handle_strategic_completion(
                                 msg.resolution or "Addressed by strategic review",
                                 task.id,
                                 resident_session_id=(
-                                    _resident_blob.get("session_id")
-                                    if isinstance(_resident_blob, dict)
-                                    and resident_session_is_active(_resident_blob)
+                                    str(resident_blob.get("session_id"))
+                                    if resident_session_is_active(resident_blob)
+                                    and resident_blob.get("session_id")
                                     else None
                                 ),
                                 sequence=next(reserved_message_sequences, None),
@@ -6697,7 +6791,7 @@ async def _handle_strategic_completion(
                 "message_created" if status is None else "message_updated",
                 message_event_payload(message, status=status),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, PERF203
             # The durable sequence lets reconnect/cursor fetch repair a missed
             # realtime notification. Never requeue an already-committed
             # strategic completion because a websocket fanout failed.

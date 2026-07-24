@@ -2,21 +2,19 @@
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
 import re
-import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import Uuid, and_, bindparam, func, or_, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -31,7 +29,6 @@ from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
 from app.landed_signal import is_merged_completion
 from app.models import (
     Project,
-    StrategicResident,
     Task,
     TaskStatus,
     TaskHistory,
@@ -77,13 +74,14 @@ from app.github import (
     get_pull_request,
 )
 from app.broadcast import broadcast_to_project
-from app.claim_analytics import stamp_cold_claim_timing
+from app.claim_analytics import ClaimResponseTiming, stamp_cold_claim_timing
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_themes,
     aggregate_sr_co_failure_pairs,
     safe_check_results,
 )
 from app.pipeline_health import compute_pipeline_health_summary
+from app.sr_analytics_store import read_project_sr_analytics
 from app.knowledge_query import (
     get_knowledge_document as kq_get_knowledge_document,
     list_knowledge_documents as kq_list_knowledge_documents,
@@ -105,6 +103,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 _COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")
+_CLAIM_REPLAY_CONTEXT_KEY = "_agent_claim_replay"
+_CLAIM_REPLAY_WINDOW = timedelta(minutes=5)
+
+
+def _claim_replay_is_valid(
+    task: Task,
+    token: dict,
+    *,
+    now: datetime,
+) -> bool:
+    """Return whether this exact token may replay the task's bounded claim."""
+    record = (task.context or {}).get(_CLAIM_REPLAY_CONTEXT_KEY)
+    if not isinstance(record, dict):
+        return False
+    token_jti = str(token.get("jti") or "")
+    if not token_jti or record.get("token_jti") != token_jti:
+        return False
+    claimed_at_raw = record.get("claimed_at")
+    if not isinstance(claimed_at_raw, str):
+        return False
+    try:
+        claimed_at = _to_naive_utc(
+            datetime.fromisoformat(claimed_at_raw.replace("Z", "+00:00"))
+        )
+    except (TypeError, ValueError):
+        return False
+    return now - _CLAIM_REPLAY_WINDOW <= claimed_at <= now
 
 
 def _truncate_vm_instance_id(vm_instance_id: object) -> str:
@@ -335,22 +360,6 @@ _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset(
     }
 )
 
-_RESIDENT_AGENT_ALLOWED_PATHS = frozenset(
-    {
-        "/api/agent/claim",
-        "/api/agent/heartbeat",
-        "/api/agent/refresh-token",
-        "/api/agent/resident-turn/complete",
-        "/api/agent/resident-turn/context",
-        "/api/agent/resident-turn/artifact",
-        "/api/agent/resident-turn/capability",
-        "/api/agent/resident-turn/mutate",
-        "/api/agent/resident-turn/fail",
-        "/api/agent/task-capabilities",
-    }
-)
-
-
 async def verify_agent_token(
     request: Request,
     x_agent_token: str = Header(
@@ -375,16 +384,6 @@ async def verify_agent_token(
     """
     payload = verify_agent_jwt(x_agent_token)
     task_id = payload.get("sub")
-    is_resident_token = payload.get("task_type") == "strategic_resident_turn"
-    if is_resident_token and request.url.path not in _RESIDENT_AGENT_ALLOWED_PATHS:
-        _log_agent_auth_reject(
-            "resident_endpoint_not_allowed",
-            path=request.url.path,
-            task_id=task_id,
-            token_vm_instance_id=payload.get("vm_instance_id"),
-            token_project_id=payload.get("project_id"),
-        )
-        raise HTTPException(status_code=403, detail="resident_endpoint_not_allowed")
     # VM-scoped (taskless / warm-pool) token: a pool VM that has not yet claimed
     # any task. It carries no task ``sub`` — only ``vm_instance_id`` + project
     # scope, tagged ``token_scope == "vm"``. Accept it here (so the taskless
@@ -416,7 +415,6 @@ async def verify_agent_token(
         "/api/agent/credentials/rotate",
         "/api/agent/next-role",
         "/api/agent/vm-heartbeat",
-        "/api/agent/resident-turn/fail",
     ) or (
         # Self-merge: an automatic fresh-reviewer pass runs AFTER ./done has
         # already posted the task's terminal status, then persists its findings
@@ -544,46 +542,6 @@ async def verify_agent_token(
                     token_project_id=token_project,
                 )
                 raise HTTPException(status_code=403, detail="vm_instance_mismatch")
-            if is_resident_token and request.url.path not in (
-                "/api/agent/claim",
-                "/api/agent/task-capabilities",
-            ):
-                resident_context = task.context if isinstance(task.context, dict) else {}
-                persisted_nonce = str(
-                    resident_context.get("_strategic_resident_claim_nonce") or ""
-                )
-                presented_nonce = str(payload.get("claim_nonce") or "")
-                failure = resident_context.get("_resident_failure")
-                terminal_failure_replay = bool(
-                    request.url.path == "/api/agent/resident-turn/fail"
-                    and task.status == TaskStatus.FAILED
-                    and isinstance(failure, dict)
-                    and presented_nonce
-                    and secrets.compare_digest(
-                        hashlib.sha256(presented_nonce.encode()).hexdigest(),
-                        str(failure.get("claim_nonce_hash") or ""),
-                    )
-                )
-                if (
-                    not terminal_failure_replay
-                    and (
-                        not persisted_nonce
-                        or not presented_nonce
-                        or not secrets.compare_digest(
-                            presented_nonce, persisted_nonce
-                        )
-                    )
-                ):
-                    _log_agent_auth_reject(
-                        "resident_claim_nonce_stale",
-                        path=request.url.path,
-                        task_id=task_id,
-                        token_vm_instance_id=token_vm,
-                        token_project_id=token_project,
-                    )
-                    raise HTTPException(
-                        status_code=403, detail="resident_claim_nonce_stale"
-                    )
             if task.status in _AGENT_INACTIVE_TASK_STATUSES:
                 _terminated_task_ids[task_id] = time.time()
                 # Same-VM idempotent retry on terminal task is OK; different
@@ -696,50 +654,7 @@ async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:
     """
     task_id = token["sub"]
     vm_id = token["vm_instance_id"]
-    is_resident_turn = token.get("task_type") == "strategic_resident_turn"
-    project_id = None
-    if is_resident_turn:
-        from app.strategic_resident_agent_binding import (
-            ResidentAgentAuthorityError,
-            ResidentAgentBinding,
-            ResidentAgentBindingError,
-            ResidentAgentTaskNotFound,
-            load_live_resident_agent_task_locked,
-        )
-
-        try:
-            project_id = uuid.UUID(str(token.get("project_id")))
-            resident_binding = ResidentAgentBinding(
-                task_id=uuid.UUID(task_id),
-                project_id=project_id,
-                vm_instance_id=str(vm_id or ""),
-                task_type=str(token.get("task_type") or ""),
-                claim_nonce=str(token.get("claim_nonce") or ""),
-            )
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=403, detail="complete Resident task token required"
-            ) from None
-        try:
-            task = await load_live_resident_agent_task_locked(
-                session,
-                resident_binding,
-                allowed_statuses=frozenset(
-                    {
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.QUEUED,
-                    }
-                ),
-            )
-        except ResidentAgentTaskNotFound as exc:
-            raise HTTPException(status_code=404, detail="task_not_found") from exc
-        except ResidentAgentAuthorityError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ResidentAgentBindingError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-    else:
-        task = await session.get(Task, uuid.UUID(task_id))
+    task = await session.get(Task, uuid.UUID(task_id))
     if task is None:
         raise HTTPException(status_code=404, detail="task_not_found")
     if task.vm_instance_id != vm_id:
@@ -789,9 +704,6 @@ async def agent_refresh_token(
         vm_id,
         task_type=token.get("task_type", ""),
         project_id=token.get("project_id", "") or str(task.project_id),
-        claim_nonce=str(
-            (task.context or {}).get("_strategic_resident_claim_nonce") or ""
-        ),
     )
     expires_at = datetime.now(timezone.utc) + timedelta(hours=AGENT_TOKEN_TTL_HOURS)
     return {"token": new_token, "token_expires_at": expires_at.isoformat()}
@@ -806,9 +718,9 @@ async def agent_git_read_token(
 ):
     """Return a fresh GitHub App installation read token for the task's repo.
 
-    Called periodically by the strategic resident VM to keep its local
-    git remote credential fresh (resident needs `git fetch origin` for
-    automain verification; it never pushes — push credentials are per-task).
+    Called periodically by the agent VM to keep its local git remote
+    credential fresh (`git fetch origin` for automain verification; it never
+    pushes — push credentials are per-task).
 
     Uses `get_repo_installation_read_token` (contents:read scoped, cached 50 min
     per repo) so a warm cache costs zero GitHub API calls.
@@ -839,7 +751,7 @@ async def _stamp_reviewer_recovery_count(
     high_iter_rows,
 ) -> None:
     """Count tasks tagged as reviewer-recovery-after-incomplete-SR and stamp the
-    aggregate onto ``Project.design_doc.sr_catch_rate_trends``.
+    aggregate onto ``ProjectSRAnalytics.data['sr_catch_rate_trends']``.
 
     Detection scans both the top-level ``reviewer_recovery_origin`` marker and
     per-category ``check_results[*].origin`` entries — the marker can land in
@@ -864,18 +776,14 @@ async def _stamp_reviewer_recovery_count(
     )
     if recovery_count <= 0:
         return
-    from app.task_locking import project_lock
+    from app.task_locking import with_sr_analytics_locked
 
-    async with project_lock(session, project_id, skip_locked=True) as proj:
-        if proj is None:
-            return
-        doc = dict(proj.design_doc or {})
-        trends = dict(doc.get("sr_catch_rate_trends") or {})
+    def _update(data: dict) -> None:
+        trends = dict(data.get("sr_catch_rate_trends") or {})
         trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
-        doc["sr_catch_rate_trends"] = trends
-        proj.design_doc = doc
-        flag_modified(proj, "design_doc")
-        session.add(proj)
+        data["sr_catch_rate_trends"] = trends
+
+    await with_sr_analytics_locked(session, project_id, _update)
 
 
 async def _refresh_sr_catch_rate(
@@ -988,8 +896,11 @@ async def claim_task(
         401: Invalid or expired token
 
     Rate limit: 200 requests/minute.
-    Idempotency: Replays last successful claim within 5 minutes if present.
+    Idempotency: Replays the last successful claim for the same token within
+    5 minutes. The immutable persisted claim record, not mutable heartbeat
+    liveness, bounds this recovery window.
     """
+    claim_timing = ClaimResponseTiming()
     vm_id = token.get("vm_instance_id")
     # Scope the claim to the JWT's task, never "any task pinned to this VM".
     # Persistent runners pin MANY tasks to one shared vm_instance_id
@@ -1006,33 +917,6 @@ async def claim_task(
         raise HTTPException(
             status_code=403, detail="task-scoped token required to claim"
         ) from None
-    is_resident_claim = token.get("task_type") == "strategic_resident_turn"
-    claim_project_id = None
-    claim_resident = None
-    if is_resident_claim:
-        try:
-            claim_project_id = uuid.UUID(str(token.get("project_id")))
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=403, detail="complete Resident task token required"
-            ) from None
-        claim_project = (
-            await session.execute(
-                select(Project)
-                .where(Project.id == claim_project_id)
-                .with_for_update(key_share=True)
-            )
-        ).scalar_one_or_none()
-        claim_resident = (
-            await session.execute(
-                select(StrategicResident)
-                .where(StrategicResident.project_id == claim_project_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-        if claim_project is None or claim_resident is None:
-            raise HTTPException(status_code=409, detail="Resident authority is stale")
     stmt = (
         select(Task)
         .where(
@@ -1069,24 +953,28 @@ async def claim_task(
         # IN_PROGRESS server-side before the response was lost. Without this
         # replay, the retry hits the QUEUED/PROVISIONING filter, returns 404,
         # and the agent dies with PRE_CLAIM_FAILED on a task that was actually
-        # claimed successfully. Match this VM's just-claimed task (last heartbeat
-        # within 5 min — covers slow GCP provisioning and the agent's worst-case
-        # retry window of API_TIMEOUT * API_MAX_RETRIES with backoff) and replay
-        # the same response. Same sub-scoping so a retry replays only the token's
-        # own task, not a sibling's.
-        replay_cutoff = _utcnow() - timedelta(minutes=5)
+        # claimed successfully. Replay only when the original claim's persisted,
+        # immutable timestamp is within 5 minutes AND its token JTI matches this
+        # request. Heartbeats must not extend the window, and a separately minted
+        # token/process must not join an already-running task.
         replay_stmt = (
             select(Task)
             .where(
                 Task.id == token_task_uuid,
                 Task.vm_instance_id == vm_id,
                 Task.status == TaskStatus.IN_PROGRESS,
-                Task.last_heartbeat >= replay_cutoff,
             )
             .with_for_update(skip_locked=True)
             .execution_options(populate_existing=True)
         )
-        task = (await session.execute(replay_stmt)).scalars().first()
+        replay_candidate = (await session.execute(replay_stmt)).scalars().first()
+        replay_now = _utcnow()
+        task = (
+            replay_candidate
+            if replay_candidate
+            and _claim_replay_is_valid(replay_candidate, token, now=replay_now)
+            else None
+        )
         if not task:
             # Distinguish "task gone / not pinned here" (404) from "task exists
             # but is terminal / reaped / doomed" (409). A 409 tells the agent to
@@ -1115,94 +1003,18 @@ async def claim_task(
             )
         idempotent_replay = True
 
-    first_payload = task.first_payload if isinstance(task.first_payload, dict) else {}
-    if first_payload.get("type") == "strategic_resident_turn":
-        from app.strategic_resident_runtime import is_authoritative_resident_turn
-        from app.strategic_resident_runner_policy import (
-            resident_local_claim_route_matches,
-        )
-
-        if not resident_local_claim_route_matches(task, vm_id):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Local-only Resident turn was not claimed through its "
-                    "selected compatible runner"
-                ),
-            )
-
-        if not is_authoritative_resident_turn(
-            task,
-            project_id=task.project_id,
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Resident turn is shadow-only, mutable, stale, or lacks "
-                    "authoritative mutation scope"
-                ),
-            )
-        if (
-            not is_resident_claim
-            or task.project_id != claim_project_id
-            or claim_resident is None
-            or claim_resident.engine_owner != "strategic_resident"
-            or claim_resident.active_turn_task_id != task.id
-            or int(first_payload.get("authority_generation") or -1)
-            != int(claim_resident.authority_generation)
-        ):
-            raise HTTPException(status_code=409, detail="Resident authority is stale")
-
-    resident_claim_nonce = ""
-    if is_resident_claim:
-        task_context = dict(task.context or {})
-        incoming_attempt_jti = str(token.get("jti") or "")
-        if not incoming_attempt_jti:
-            raise HTTPException(
-                status_code=403, detail="Resident claim attempt identity required"
-            )
-        persisted_nonce = str(
-            task_context.get("_strategic_resident_claim_nonce") or ""
-        )
-        persisted_attempt_jti = str(
-            task_context.get("_strategic_resident_claim_attempt_jti") or ""
-        )
-        if idempotent_replay:
-            if (
-                not persisted_nonce
-                or not persisted_attempt_jti
-                or not secrets.compare_digest(
-                    incoming_attempt_jti, persisted_attempt_jti
-                )
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Resident claim attempt has been superseded",
-                )
-            resident_claim_nonce = persisted_nonce
-        else:
-            presented_nonce = str(token.get("claim_nonce") or "")
-            if persisted_nonce and (
-                not presented_nonce
-                or not secrets.compare_digest(presented_nonce, persisted_nonce)
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Resident claim predecessor has been superseded",
-                )
-            resident_claim_nonce = secrets.token_urlsafe(32)
-            task_context["_strategic_resident_claim_attempt_jti"] = (
-                incoming_attempt_jti
-            )
-        task_context["_strategic_resident_claim_nonce"] = resident_claim_nonce
-        task.context = task_context
-
     if not idempotent_replay:
+        claim_started_at = _utcnow()
         task.status = TaskStatus.IN_PROGRESS
-        task.last_heartbeat = (
-            _utcnow()
-        )  # Immediate heartbeat — don't wait 30s for agent interval
-        stamp_cold_claim_timing(task)
+        task.last_heartbeat = claim_started_at
+        claim_context = dict(task.context or {})
+        claim_context[_CLAIM_REPLAY_CONTEXT_KEY] = {
+            "claimed_at": claim_started_at.isoformat(),
+            "token_jti": str(token.get("jti") or ""),
+        }
+        task.context = claim_context
+        # Immediate heartbeat — don't wait 30s for agent interval.
+        stamp_cold_claim_timing(task, claimed_at=claim_started_at)
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -1231,9 +1043,47 @@ async def claim_task(
     _claimed_context = dict(task.context or {})
     _claimed_payloads = list(task.payloads or [])
     _claimed_first_payload = task.first_payload
+    # An idempotent replay still owns the IN_PROGRESS Task row lock. Skip the
+    # Project -> Task clear there to avoid lock-order inversion; the original
+    # successful claim or first resident heartbeat performs the same clear.
+    if not idempotent_replay and _claimed_context.get("_resident_session") is True:
+        try:
+            from app.strategic_resident_session import (
+                clear_resident_worker_retry_wait,
+            )
+
+            if session.bind is None:
+                raise RuntimeError("Claim session has no bind for projection clear")
+            projection_factory = async_sessionmaker(
+                bind=session.bind,
+                expire_on_commit=False,
+            )
+            async with projection_factory() as projection_session:
+                await clear_resident_worker_retry_wait(
+                    projection_session,
+                    project_id=_claimed_project_id,
+                    task_id=_claimed_task_id,
+                    session_id=str(
+                        _claimed_context.get("strategic_session_id") or ""
+                    ),
+                    worker_generation=int(
+                        _claimed_context.get("_resident_worker_generation") or 1
+                    ),
+                )
+        except Exception:
+            # Claim is already durable. A projection clear must never turn that
+            # success into a PRE_CLAIM_FAILED response. The isolated session is
+            # closed/rolled back here while the main claim session stays usable;
+            # the first exact-generation heartbeat performs the same safe clear.
+            logger.warning(
+                "[RESIDENT_SESSION] claim retry-wait clear failed for task %s",
+                _claimed_task_id,
+                exc_info=True,
+            )
     # Record liveness only after the durable claim/JTI/predecessor boundary
     # has succeeded. Rejected stale tokens must not keep a VM pin alive.
     _shared_state.record_vm_heartbeat(vm_id)
+    claim_timing.mark("claim_transition")
 
     # Broadcast status change to frontend
     await broadcast_to_project(
@@ -1248,8 +1098,6 @@ async def claim_task(
         for k, v in _claimed_context.items()
         if not k.startswith("max_plan_")
         and not k.startswith("llm_")
-        and k != "_strategic_resident_claim_nonce"
-        and k != "_strategic_resident_claim_attempt_jti"
     }
     # Resolve per-project branch metadata once so we can inject it into both
     # project_metadata and each payload entry the agent sees. Agent handlers
@@ -1266,20 +1114,12 @@ async def claim_task(
     )
 
     _claim_runtime_model = _claimed_context.get("llm_model")
-    _claim_runtime_provider = _claimed_context.get("llm_provider")
     _claim_runtime_execution_mode = _claimed_context.get("llm_execution_mode")
 
     response_payloads: list = []
     for entry in _claimed_payloads:
         if isinstance(entry, dict):
             patched = dict(entry)
-            patched.pop("_resident_expected_runtime_provider", None)
-            if patched.get("type") == "strategic_resident_turn" and isinstance(
-                _claim_runtime_provider, str
-            ) and _claim_runtime_provider.strip():
-                patched["_resident_expected_runtime_provider"] = (
-                    _claim_runtime_provider.strip().lower()
-                )
             if isinstance(_claim_runtime_model, str) and _claim_runtime_model.strip():
                 patched["model"] = _claim_runtime_model.strip()
             if (
@@ -1314,15 +1154,6 @@ async def claim_task(
             _project_verdicts, "related_tests", 0.0
         ),
     }
-    if resident_claim_nonce:
-        response["agent_token"] = create_agent_token(
-            str(_claimed_task_id),
-            str(vm_id or ""),
-            task_type="strategic_resident_turn",
-            project_id=str(_claimed_project_id),
-            claim_nonce=resident_claim_nonce,
-        )
-
     # Add project metadata so agents can adapt to different project structures
     if project:
         _build_cfg = project.build_config or {}
@@ -1449,6 +1280,7 @@ async def claim_task(
                 _migration_reservation.provisional_down_revision
             ),
         }
+    claim_timing.mark("execution_contract")
     if (
         task_type in ("research", "plan", "create", "fix", "refactor", "review")
         or task_type in _PEER_CODE_ANALYSIS_TYPES
@@ -2384,6 +2216,8 @@ async def claim_task(
         "docs",
     }
 
+    claim_timing.mark("project_history")
+
     # Inject playbook for ALL task types (outside the project_context gate).
     # First, recover the shared session once, centrally. The best-effort
     # enrichment above (SR-trend analytics, review effectiveness) runs on this
@@ -2776,6 +2610,18 @@ async def claim_task(
                 ) as _pb_proj:
                     if _pb_proj is not None:
                         doc = dict(_pb_proj.design_doc or {})
+
+                        # Hydrate playbook_archive from telemetry —
+                        # strip_migrated_doc_keys removes this key from
+                        # design_doc at write time, so the retire functions
+                        # below see the real archive data.
+                        from app.project_telemetry import get_project_telemetry as _get_pb_archive
+
+                        _pb_archive = await _get_pb_archive(
+                            session, _pb_proj.id, "playbook_archive",
+                        )
+                        if _pb_archive is not None:
+                            doc["playbook_archive"] = list(_pb_archive)
                         for short_key in playbook_entries:
                             full_key = f"playbook/{short_key}"
                             if full_key in doc and isinstance(doc[full_key], dict):
@@ -2916,9 +2762,30 @@ async def claim_task(
                             logger.debug(
                                 "[AGENT] Low-success-rate retirement skipped (non-critical)"
                             )
+                        # Strip migrated telemetry keys before persist.
+                        from app.project_telemetry import (
+                            set_project_telemetry,
+                            strip_migrated_doc_keys,
+                        )
+
+                        _archive = strip_migrated_doc_keys(doc).pop(
+                            "playbook_archive", None
+                        )
                         _pb_proj.design_doc = doc
                         flag_modified(_pb_proj, "design_doc")
                         session.add(_pb_proj)
+                        if _archive is not None:
+                            try:
+                                await set_project_telemetry(
+                                    session,
+                                    _pb_proj.id,
+                                    "playbook_archive",
+                                    _archive,
+                                )
+                            except Exception:  # noqa: BLE001 — best-effort
+                                logger.debug(
+                                    "[AGENT] playbook_archive telemetry write skipped"
+                                )
                 # Store shown playbook keys in task context for outcome tracking at completion
                 task_ctx = dict(task.context or {})
                 task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
@@ -3300,9 +3167,11 @@ async def claim_task(
                 direction_first_attempt_feedback: Dict[str, int] | None = None
                 dfa_entry: dict = {}
                 try:
-                    dfa_all = (project_for_playbook.design_doc or {}).get(
-                        "direction_first_attempt_feedback"
-                    ) or {}
+                    from app.review_learning import (  # noqa: PLC0415
+                        read_direction_first_attempt_feedback as _read_dfa,
+                    )
+
+                    dfa_all = await _read_dfa(session, project_for_playbook)
                     dfa_entry = dfa_all.get(str(direction_id)) or {}
                     dfa_cats = {
                         k: v
@@ -3563,12 +3432,12 @@ async def claim_task(
                 research_dfa_entry: dict = {}
                 try:
                     if project_for_playbook and current_direction_id:
-                        research_dfa_entry = (
-                            (project_for_playbook.design_doc or {}).get(
-                                "direction_first_attempt_feedback"
-                            )
-                            or {}
-                        ).get(str(current_direction_id)) or {}
+                        from app.review_learning import (  # noqa: PLC0415
+                            read_direction_first_attempt_feedback as _read_dfa_r,
+                        )
+
+                        _dfa_all = await _read_dfa_r(session, project_for_playbook)
+                        research_dfa_entry = _dfa_all.get(str(current_direction_id)) or {}
                 except Exception:
                     logger.exception(
                         "[AGENT] Failed to read direction_first_attempt_feedback for research (non-critical)"
@@ -3601,9 +3470,11 @@ async def claim_task(
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         related_files = _claimed_context.get("related_files", [])
         if related_files:
-            cochange_index = (project_for_playbook.design_doc or {}).get(
-                "cochange_index"
+            from app.direction_outcomes import (  # noqa: PLC0415
+                read_cochange_index as _read_cochange_index,
             )
+
+            cochange_index = await _read_cochange_index(session, project_for_playbook)
             if cochange_index:
                 cochange_scores: dict[str, float] = {}
                 related_set = set(related_files)
@@ -3630,9 +3501,11 @@ async def claim_task(
     if task_type == "plan" and project_for_playbook:
         plan_related_files = _claimed_context.get("related_files", [])
         if plan_related_files:
-            cochange_index = (project_for_playbook.design_doc or {}).get(
-                "cochange_index"
-            ) or {}
+            from app.direction_outcomes import (  # noqa: PLC0415
+                read_cochange_index as _read_cochange_index_plan,
+            )
+
+            cochange_index = await _read_cochange_index_plan(session, project_for_playbook) or {}
             cochange_hints: dict[str, dict[str, float]] = {}
             related_set = set(plan_related_files)
             for rf in plan_related_files:
@@ -3690,7 +3563,11 @@ async def claim_task(
 
     # Inject per-module review feedback warnings for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
-        module_feedback = (project_for_playbook.design_doc or {}).get("module_feedback")
+        from app.project_telemetry import read_telemetry_or_doc as _read_tel
+
+        module_feedback = await _read_tel(
+            session, project_for_playbook.id, project_for_playbook.design_doc, "module_feedback"
+        )
         if module_feedback:
             task_related_files = _claimed_context.get("related_files", [])
             module_warnings = []
@@ -3727,13 +3604,21 @@ async def claim_task(
                     module_warnings
                 )
 
+    _sr_analytics_data: dict = {}
+    if project_for_playbook and task_type in CODE_REVIEW_GATED_TASK_TYPES:
+        try:
+            _sr_analytics_data = await read_project_sr_analytics(
+                session, project_for_playbook
+            )
+        except Exception:
+            _sr_analytics_data = dict(project_for_playbook.design_doc or {})
+            logger.exception("[AGENT] Failed to load SR analytics (non-critical)")
+
     # Inject SR catch-rate blind spots for every code-review-gated task type
     # (create/fix/refactor/migrate/qa/docs/deps) — all ship reviewed code.
     if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
         try:
-            sr_trends = (project_for_playbook.design_doc or {}).get(
-                "sr_catch_rate_trends"
-            )
+            sr_trends = _sr_analytics_data.get("sr_catch_rate_trends")
             if sr_trends and isinstance(sr_trends.get("categories"), dict):
 
                 def _cat_entry(data: dict) -> dict:
@@ -3966,9 +3851,7 @@ async def claim_task(
     # when the direction has no qualifying data in by_direction.
     if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
         try:
-            _miss_trends = (project_for_playbook.design_doc or {}).get(
-                "sr_catch_rate_trends"
-            )
+            _miss_trends = _sr_analytics_data.get("sr_catch_rate_trends")
             if _miss_trends and isinstance(_miss_trends.get("categories"), dict):
                 # Resolve candidate categories: prefer direction-scoped when available.
                 _direction_id = _claimed_context.get("direction_id")
@@ -4033,15 +3916,13 @@ async def claim_task(
                 "[AGENT] Failed to inject sr_recent_miss_examples (non-critical)"
             )
 
-    # Inject pre-computed SR vs fresh-reviewer disagreements. Stored by
-    # compute_sr_reviewer_disagreements into design_doc["sr_reviewer_disagreements"].
+    # Inject pre-computed SR vs fresh-reviewer disagreements from the dedicated
+    # SR analytics row.
     # Shape: project_context.sr_reviewer_disagreements =
     #   {window_days, disagreements: [{category, task_type, count, examples?}]}
     if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
         try:
-            _disagreements_raw = (project_for_playbook.design_doc or {}).get(
-                "sr_reviewer_disagreements"
-            )
+            _disagreements_raw = _sr_analytics_data.get("sr_reviewer_disagreements")
             if (
                 isinstance(_disagreements_raw, dict)
                 and isinstance(_disagreements_raw.get("disagreements"), list)
@@ -4150,6 +4031,8 @@ async def claim_task(
                 "[AGENT] Failed to inject rejection_patterns (non-critical)"
             )
 
+    claim_timing.mark("task_guidance")
+
     # Inject project-declared skills from .blueprint/tools.json manifest.
     # Skills are shell-command procedures the project's agent can invoke.
     # Fetched for the same task types that receive playbook entries.
@@ -4168,7 +4051,6 @@ async def claim_task(
         "research",
         "plan",
         "investigate",
-        "panel_review",
     }
     if project_for_playbook and task_type in _SKILLS_TASK_TYPES:
         try:
@@ -4309,7 +4191,14 @@ async def claim_task(
         "strategic_review",
     }
     if task_type in _REPO_OVERVIEW_TASK_TYPES and project_for_playbook:
-        _raw_overview = (project_for_playbook.design_doc or {}).get("repo_overview")
+        from app.project_telemetry import read_telemetry_or_doc as _read_tel
+
+        _raw_overview = await _read_tel(
+            session,
+            project_for_playbook.id,
+            project_for_playbook.design_doc,
+            "repo_overview",
+        )
         if (
             isinstance(_raw_overview, dict)
             and isinstance(_raw_overview.get("tech_stack"), str)
@@ -4371,7 +4260,7 @@ async def claim_task(
                     "summary": _domain_doc.summary,
                     "body": _domain_doc.body,
                 }
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
@@ -4440,6 +4329,22 @@ async def claim_task(
             _bg_tasks.add(_check_run_fut)
             _check_run_fut.add_done_callback(_bg_tasks.discard)
 
+    claim_timing.mark("skills_and_intent")
+    _claim_metrics = claim_timing.finish(response)
+    logger.info(
+        "[CLAIM_TIMING] task=%s type=%s vm=%s replay=%s total_ms=%s "
+        "response_bytes_approx=%s size_measurement_ms=%s phase_ms=%s",
+        _claimed_task_id,
+        task_type or "unknown",
+        _truncate_vm_instance_id(vm_id),
+        idempotent_replay,
+        _claim_metrics["total_ms"],
+        _claim_metrics["response_bytes_approx"],
+        _claim_metrics["size_measurement_ms"],
+        json.dumps(
+            _claim_metrics["phase_ms"], sort_keys=True, separators=(",", ":")
+        ),
+    )
     return response
 
 
@@ -4511,9 +4416,9 @@ async def get_agent_artifact_download_url(
     try:
         url = await generate_download_signed_url(artifact.storage_uri)
     except StorageUriError:
-        raise HTTPException(status_code=400, detail="Invalid artifact reference")
-    except Exception:
-        raise HTTPException(status_code=503, detail="Artifact storage unavailable")
+        raise HTTPException(status_code=400, detail="Invalid artifact reference")  # noqa: B904
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")  # noqa: B904
     return ArtifactDownloadResponse(url=url)
 
 
@@ -4595,7 +4500,7 @@ class ViewportScreenshotUploadUrlRequest(BaseModel):
     name: str = Field(max_length=200)
     width: int = Field(ge=1, le=4096)
     phase: Literal["before", "after", "diff"]
-    magnitude: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    magnitude: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 @router.post("/viewport/screenshot-upload-url")
@@ -4726,14 +4631,14 @@ async def get_viewport_failure_screenshot_download_url_agent(
         logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
         raise HTTPException(
             status_code=400, detail="Invalid screenshot reference"
-        ) from exc  # noqa: B904
-    except Exception as exc:  # noqa: BLE001
+        ) from exc
+    except Exception as exc:
         logger.warning(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(
             status_code=503, detail="Artifact storage unavailable"
-        ) from exc  # noqa: B904
+        ) from exc
     return {"url": url}
 
 
@@ -4774,14 +4679,14 @@ async def get_viewport_screenshot_download_url_agent(
         logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
         raise HTTPException(
             status_code=400, detail="Invalid screenshot reference"
-        ) from exc  # noqa: B904
-    except Exception as exc:  # noqa: BLE001
+        ) from exc
+    except Exception as exc:
         logger.warning(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(
             status_code=503, detail="Artifact storage unavailable"
-        ) from exc  # noqa: B904
+        ) from exc
     return {"url": url}
 
 
@@ -5095,36 +5000,6 @@ async def agent_heartbeat(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-    resident_task = None
-    if token.get("task_type") == "strategic_resident_turn":
-        from app.strategic_resident_agent_binding import (
-            ResidentAgentAuthorityError,
-            ResidentAgentBinding,
-            ResidentAgentBindingError,
-            ResidentAgentTaskNotFound,
-            load_live_resident_agent_task_locked,
-        )
-
-        try:
-            binding = ResidentAgentBinding(
-                task_id=uuid.UUID(str(token.get("sub"))),
-                project_id=uuid.UUID(str(token.get("project_id"))),
-                vm_instance_id=str(token.get("vm_instance_id") or ""),
-                task_type=str(token.get("task_type") or ""),
-                claim_nonce=str(token.get("claim_nonce") or ""),
-            )
-            resident_task = await load_live_resident_agent_task_locked(
-                session,
-                binding,
-                allowed_statuses=frozenset({TaskStatus.IN_PROGRESS}),
-            )
-        except ResidentAgentTaskNotFound as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ResidentAgentAuthorityError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except (ResidentAgentBindingError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-
     # Phase 2c Race A mitigation: every backend contact from a VM is a
     # liveness signal. Without this, the orchestrator's skip-provision
     # branch could clear a freshly-written warm pin before the agent's
@@ -5156,10 +5031,9 @@ async def agent_heartbeat(
     # sibling reads as "progressing" forever. ``req.task_id`` is already proven
     # equal to the JWT ``sub`` above, so this key is as trusted as the vm id.
     _latest_tool_use_at = _parse_latest_tool_use_at(req.tool_trace)
-    if resident_task is None:
-        await _record_vm_contact(
-            token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
-        )
+    await _record_vm_contact(
+        token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
+    )
 
     # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
     # (processing completion/pipeline), skip instead of blocking.  Blocking
@@ -5191,22 +5065,16 @@ async def agent_heartbeat(
         Task.format_compliance_summary,
         raiseload=True,
     )
-    if resident_task is not None:
-        task = resident_task
-        await _record_vm_contact(
-            token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
+    stmt = (
+        select(Task)
+        .where(
+            Task.id == req.task_id,
+            Task.vm_instance_id == token.get("vm_instance_id"),
         )
-    else:
-        stmt = (
-            select(Task)
-            .where(
-                Task.id == req.task_id,
-                Task.vm_instance_id == token.get("vm_instance_id"),
-            )
-            .options(_hb_load_only)
-            .with_for_update(skip_locked=True)
-        )
-        task = (await session.execute(stmt)).scalars().first()
+        .options(_hb_load_only)
+        .with_for_update(skip_locked=True)
+    )
+    task = (await session.execute(stmt)).scalars().first()
 
     if not task:
         # Row is either locked (skip_locked skipped it) or vm_instance_id changed.
@@ -5222,7 +5090,10 @@ async def agent_heartbeat(
         if not check_task:
             raise HTTPException(status_code=404, detail="Task not found")
         if check_task.vm_instance_id != token.get("vm_instance_id"):
-            raise HTTPException(status_code=404, detail="Task not found for this VM")
+            raise HTTPException(
+                status_code=404,
+                detail={"detail": "Task not found for this VM", "reason": "vm_reassigned"},
+            )
         # Row exists but was locked — tell agent to retry next cycle
         return JSONResponse(
             status_code=409,
@@ -6160,7 +6031,7 @@ async def agent_write_back_build_config_commands(
             new_entry: dict = {"path": norm}
             for key, value in confirmed_values.items():
                 if value is not None:
-                    new_entry[key] = value
+                    new_entry[key] = value  # noqa: PERF403
             new_entry["commands_confirmed_at"] = now_iso
             new_entry["confirming_task_id"] = task_id_str
             index_by_path[norm] = len(directories)
@@ -6242,7 +6113,7 @@ async def agent_build_config_discovery(
         return {"persisted": persisted, "emptiness_redetected": redetected}
     except HTTPException:
         raise
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[BUILD_CONFIG] build-config-discovery endpoint error for token sub=%s",
             token.get("sub"),

@@ -5038,7 +5038,12 @@ async def test_starvation_auto_creates_direction_after_five_cycles(
     )
     await _handle_strategic_completion(task, "", strategic_db)
 
-    await strategic_db.refresh(project)
+    # Use a full-column reload to avoid raiseload contamination set by
+    # with_vision_locked's project_lock(load_columns=[...], raiseload=True).
+    from sqlmodel import select as _select
+    await strategic_db.execute(
+        _select(Project).where(Project.id == project.id).execution_options(populate_existing=True)
+    )
     # Counter should be reset to 0 and override cleared
     assert project.vision.get("_direction_starvation_count") == 0
     assert "_strategic_frequency_override" not in project.vision

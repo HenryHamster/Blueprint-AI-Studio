@@ -255,6 +255,21 @@ def test_needs_action_message_types_are_question_and_blocker():
     )
 
 
+def test_needs_action_types_parity_with_operator_attention():
+    # operator_attention._NEEDS_OPERATOR_MESSAGE_TYPES now derives from
+    # NEEDS_ACTION_MESSAGE_TYPES, so these two cannot drift at import time.
+    # This test is a regression guard: if someone removes the derivation and
+    # re-introduces a separate definition, it catches the divergence.
+    from app.operator_attention import _NEEDS_OPERATOR_MESSAGE_TYPES
+
+    assert NEEDS_ACTION_MESSAGE_TYPES == frozenset(
+        mt.value for mt in _NEEDS_OPERATOR_MESSAGE_TYPES
+    ), (
+        "NEEDS_ACTION_MESSAGE_TYPES in message_convergence diverged from "
+        "_NEEDS_OPERATOR_MESSAGE_TYPES in operator_attention — update both together"
+    )
+
+
 def test_derive_needs_action_true_for_open_question_and_blocker():
     assert derive_needs_action(_msg(MessageType.QUESTION, "open")) is True
     assert derive_needs_action(_msg(MessageType.BLOCKER, "linked")) is True

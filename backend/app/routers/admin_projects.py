@@ -606,6 +606,10 @@ async def update_project(
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "user"
         doc["_meta"] = meta
+        # Strip migrated telemetry keys before persist (safety net).
+        from app.project_telemetry import strip_migrated_doc_keys as _strip_migrated_keys
+
+        _strip_migrated_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
     if payload.build_config is not None:
@@ -690,7 +694,11 @@ async def update_project(
         # so the agent can distinguish user edits during its next cycle.
         from pydantic import ValidationError as _PmValidationError
 
-        from app.problem_model import apply_user_intent_patch, parse_problem_model
+        from app.problem_model import (
+            apply_user_intent_patch,
+            parse_problem_model,
+            sanitize_problem_model_raw,
+        )
 
         # Stale-write guard runs first so a concurrent writer is reported as a
         # 409 before we attempt the merge. The editable-subset validation and
@@ -698,7 +706,14 @@ async def update_project(
         # so onboarding and this editor save share one correct path (the inline
         # shallow merge used to drop intent.source, silently un-protecting an
         # operator-edited purpose against the next strategic cycle).
-        current = parse_problem_model(project.problem_model)
+        try:
+            current = parse_problem_model(
+                sanitize_problem_model_raw(project.problem_model or {})
+            )
+        except _PmValidationError as ve:
+            raise HTTPException(
+                status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+            ) from None
         if (
             payload.problem_model_base_revision is not None
             and payload.problem_model_base_revision != current.revision
@@ -713,7 +728,7 @@ async def update_project(
             )
         try:
             validated = apply_user_intent_patch(
-                project.problem_model,
+                sanitize_problem_model_raw(project.problem_model or {}),
                 payload.problem_model_patch,
                 _utcnow().isoformat(),
             )
@@ -723,6 +738,24 @@ async def update_project(
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model patch: {ve}"
             ) from None
+        from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+        _gc_summary, _oversize_section = _enforce_pm_size(validated)
+        if _oversize_section:
+            from app.alert_dispatch import (
+                _maybe_create_problem_model_live_core_alert,
+            )
+
+            await _maybe_create_problem_model_live_core_alert(project.id, session)
+            await session.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Problem model live core exceeds byte budget after applying "
+                    f"patch: {_oversize_section}. Reduce the size of active state "
+                    f"(active gaps, live capabilities, or active friction)."
+                ),
+            )
         project.problem_model = validated.model_dump()
         flag_modified(project, "problem_model")
 
@@ -860,7 +893,10 @@ async def grant_capability_proof_exemption(
         raise HTTPException(
             status_code=400, detail="capability_name is blank or unnormalizable"
         )
-    working = working_capability_names(project.problem_model or {})
+    working = working_capability_names(
+        project.problem_model or {},
+        proof_records=getattr(project, "capability_proof_records", None),
+    )
     if normalized not in working:
         raise HTTPException(
             status_code=404,
@@ -1079,7 +1115,9 @@ async def dismiss_pending_confirmation(
     An optional ``note`` in the request body is recorded in the revision log
     so the strategist can see the operator's response on its next cycle.
     """
-    from app.problem_model import append_revision_log, parse_problem_model
+    from pydantic import ValidationError as _DismissVE
+
+    from app.problem_model import append_revision_log, parse_problem_model, sanitize_problem_model_raw
     from app.time_utils import _utcnow
 
     project = await _get_user_project_with_role(
@@ -1087,7 +1125,14 @@ async def dismiss_pending_confirmation(
     )
     project = await lock_project_or_429(session, project.id)
     await session.refresh(project, attribute_names=["problem_model"])
-    current_model = parse_problem_model(project.problem_model)
+    try:
+        current_model = parse_problem_model(
+            sanitize_problem_model_raw(project.problem_model or {})
+        )
+    except _DismissVE as ve:
+        raise HTTPException(
+            status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+        ) from None
     matched = next(
         (p for p in current_model.pending_user_confirmation if p.id == pending_id),
         None,
@@ -1108,6 +1153,22 @@ async def dismiss_pending_confirmation(
             "dismissal_note": payload.note,
         }
         append_revision_log(current_model, f"operator dismissed {matched.type}", changes)
+    # SHRINK path: always persist; alert when live core is still over budget.
+    from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+    _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+    if _oversize_section:
+        from app.alert_dispatch import (
+            _maybe_create_problem_model_live_core_alert,
+        )
+
+        logger.warning(
+            "dismiss_pending_confirmation: project %s problem_model live core "
+            "still over budget after gc: %s",
+            project_id,
+            _oversize_section,
+        )
+        await _maybe_create_problem_model_live_core_alert(project_id, session)
     project.problem_model = current_model.model_dump()
     flag_modified(project, "problem_model")
     session.add(project)
@@ -1136,10 +1197,13 @@ async def accept_pending_confirmation(
     - major_decision: records the operator's answer in the revision log and clears the item.
     - credentials_needed / access_needed: signals provided and clears the item.
     """
+    from pydantic import ValidationError as _AcceptVE
+
     from app.problem_model import (
         apply_user_intent_patch,
         append_revision_log,
         parse_problem_model,
+        sanitize_problem_model_raw,
     )
     from app.time_utils import _utcnow
 
@@ -1148,7 +1212,14 @@ async def accept_pending_confirmation(
     )
     project = await lock_project_or_429(session, project.id)
     await session.refresh(project, attribute_names=["problem_model"])
-    current_model = parse_problem_model(project.problem_model)
+    try:
+        current_model = parse_problem_model(
+            sanitize_problem_model_raw(project.problem_model or {})
+        )
+    except _AcceptVE as ve:
+        raise HTTPException(
+            status_code=400, detail=f"Stored problem_model is malformed: {ve}"
+        ) from None
 
     matched = next(
         (p for p in current_model.pending_user_confirmation if p.id == pending_id),
@@ -1164,7 +1235,7 @@ async def accept_pending_confirmation(
     if matched.type == "intent_change":
         # Apply the proposed text as the new operator-set intent.purpose.
         current_model = apply_user_intent_patch(
-            project.problem_model,
+            sanitize_problem_model_raw(project.problem_model or {}),
             {"intent": {"purpose": matched.proposal}},
             now,
         )
@@ -1194,6 +1265,22 @@ async def accept_pending_confirmation(
             changes["decision_question"] = matched.proposal
         append_revision_log(current_model, f"operator accepted {matched.type}", changes)
 
+    # SHRINK path: always persist; alert when live core is still over budget.
+    from app.problem_model import enforce_problem_model_size as _enforce_pm_size
+
+    _gc_summary, _oversize_section = _enforce_pm_size(current_model)
+    if _oversize_section:
+        from app.alert_dispatch import (
+            _maybe_create_problem_model_live_core_alert,
+        )
+
+        logger.warning(
+            "accept_pending_confirmation: project %s problem_model live core "
+            "still over budget after gc: %s",
+            project_id,
+            _oversize_section,
+        )
+        await _maybe_create_problem_model_live_core_alert(project_id, session)
     project.problem_model = current_model.model_dump()
     flag_modified(project, "problem_model")
     session.add(project)
@@ -1725,18 +1812,12 @@ async def set_project_paused(
 
     project.paused = bool(payload["paused"])
     session.add(project)
-    from app.strategic_resident_wakeups import sync_resident_background_policy
-
-    wake = await sync_resident_background_policy(
-        session,
-        project_id=project.id,
-        paused=project.paused,
-        now=_utcnow(),
-    )
+    # [RESIDENT-REMOVAL] resident background-policy wakeup removed with the
+    # resident subsystem (#15963); pause/resume no longer arms a resident wakeup.
     await session.commit()
     return {
         "paused": project.paused,
-        "resident_wakeup_state": wake.state if wake is not None else None,
+        "resident_wakeup_state": None,
     }
 
 

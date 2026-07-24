@@ -212,7 +212,7 @@ async def flush_pending_branch_alerts(session) -> int:
     from sqlalchemy import tuple_
     from sqlmodel import select
 
-    from app.broadcast import broadcast_to_project
+    from app.alert_policy import create_project_alert_if_allowed
     from app.models import Alert, AlertSeverity
 
     created = 0
@@ -254,25 +254,22 @@ async def flush_pending_branch_alerts(session) -> int:
                 severity = AlertSeverity(item.get("severity") or "ERROR")
             except ValueError:
                 severity = AlertSeverity.ERROR
-            alert = Alert(
+            # Route through create_project_alert_if_allowed so the event_type is
+            # validated against the audience registry at creation time (policy gate)
+            # rather than stored as a raw dynamic value that bypasses the AST guard.
+            _alert, _created, _decision = await create_project_alert_if_allowed(
+                session,
                 project_id=project_id,
+                event_type=item.get("event_type") or "",
                 severity=severity,
                 title=title,
                 message=item.get("message") or title,
-                event_type=item.get("event_type"),
+                broadcast=True,
             )
-            session.add(alert)
-            created += 1
-            existing_keys.add((project_id, title))
-            await broadcast_to_project(
-                str(project_id),
-                "alert_created",
-                {
-                    "alert_id": str(alert.id),
-                    "severity": severity.value,
-                    "title": title,
-                },
-            )
+            if _created:
+                created += 1
+            if _alert is not None:
+                existing_keys.add((project_id, title))
         except Exception:  # noqa: BLE001
             failed.append(item)
             logger.warning(

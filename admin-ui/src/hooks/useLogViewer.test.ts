@@ -25,7 +25,9 @@ class MockWebSocket {
   onclose: ((e: { code: number; reason: string }) => void) | null = null;
   send = vi.fn();
   close = vi.fn();
-  constructor(public url: string) {
+  url: string;
+  constructor(url: string) {
+    this.url = url;
     MockWebSocket.instances.push(this);
   }
   emit(data: unknown) {
@@ -185,6 +187,7 @@ describe('useLogViewer strategist events', () => {
 
     expect(refreshMessages).toHaveBeenCalledTimes(1);
     expect(refreshMessages).toHaveBeenCalledWith(canonical, false);
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'message_ack', message_id: 'msg-2' }));
   });
 
   it('marks a truncated realtime message projection for canonical refetch', async () => {

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
+import type { Task } from './TaskCard';
 
 const { apiFetchMock } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
@@ -372,6 +373,7 @@ describe('OrchestratorHealthBar deploy state', () => {
       deploy_state: {
         status: 'PAUSED',
         rollback_count: 0,
+        rollback_reason: null,
         pause_reason: 'External dependency down: payment service unavailable',
         monitoring_since: '2026-05-06T20:00:00Z',
         recent_outcomes: [],
@@ -399,10 +401,15 @@ describe('OrchestratorHealthBar stale heartbeat warning', () => {
     } as Response);
   });
 
-  function tasksWithStaleHeartbeats(count: number) {
+  function tasksWithStaleHeartbeats(count: number): Task[] {
     return Array.from({ length: count }, (_, idx) => ({
       id: `task-${idx + 1}`,
-      status: 'IN_PROGRESS',
+      title: `Task ${idx + 1}`,
+      description: '',
+      created_by: 'test',
+      requires_approval: false,
+      created_at: '2026-05-06T00:00:00Z',
+      status: 'IN_PROGRESS' as const,
       last_heartbeat: '2026-05-06T22:30:00Z',
     }));
   }

@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -332,7 +331,7 @@ class AcceptanceEvidence(BaseModel):
     (empty descriptions, a ``test`` path that is not a test file, placeholders
     like ``test_true`` / ``assert True``) are rejected here, fail-closed, so the
     declaration cannot be gamed at validation time.
-    """
+    """  # noqa: RUF002
 
     model_config = ConfigDict(extra="forbid")
 
@@ -403,13 +402,13 @@ class AcceptanceEvidence(BaseModel):
             if self.viewport_width is None:
                 raise ValueError(
                     "visual acceptance_evidence requires viewport_width to be set "
-                    f"(must be an integer in {VIEWPORT_WIDTH_MIN}–{VIEWPORT_WIDTH_MAX})"
+                    f"(must be an integer in {VIEWPORT_WIDTH_MIN}–{VIEWPORT_WIDTH_MAX})"  # noqa: RUF001
                 )
         elif self.kind == "coverage_delta":
             if self.threshold is None:
                 raise ValueError(
                     "coverage_delta acceptance_evidence requires a numeric "
-                    "threshold (coverage percentage 0–100)"
+                    "threshold (coverage percentage 0–100)"  # noqa: RUF001
                 )
         return self
 
@@ -567,10 +566,6 @@ class ReviewPayload(BasePayload):
         return _validate_branch_name(v)  # type: ignore[return-value]
 
 
-class PanelReviewPayload(ReviewPayload):
-    """Read-only PR review payload for the fixed multi-agent panel workflow."""
-
-
 # ---------------------------------------------------------------------------
 # fix — requires prompt + pr_number + branch
 # ---------------------------------------------------------------------------
@@ -700,88 +695,6 @@ class StrategicReviewPayload(_SystemPopulated):
     # >= what byte-packing surfaces, so the agent can reliably distinguish a
     # dropped inbox from a genuinely empty one and knows to ./fetch messages.
     open_message_count: int | None = None
-    # Open FOUND leads from the resident session's examination ledger: surfaces
-    # keyed by the latest FOUND verdict that has not been superseded by a later
-    # CLEAR/advanced/unevidenced on the same surface. Compact shape per entry:
-    # {surfaceKey, note, at}. Optional + default None; injected only when the
-    # ledger is present and has at least one open FOUND entry, so existing
-    # payloads and callers are unaffected.
-    resident_exam_leads: list[dict[str, Any]] | None = None
-
-
-class StrategicResidentTurnPayload(BasePayload):
-    """Bounded cursor-only input identity for one Resident turn.
-
-    Raw conversation text and evidence never ride in Task.payloads/context. The
-    worker reconstructs them from the durable checkpoint and the revisioned
-    sequence/cursor bounds below.
-    """
-
-    resident_id: str = Field(..., min_length=36, max_length=36)
-    lane: Literal["interactive", "background"]
-    authority_generation: int = Field(..., ge=1)
-    engine_owner: Literal["legacy", "strategic_resident"] = "legacy"
-    shadow_only: bool = True
-    trigger_kind: Literal[
-        "operator_message",
-        "project_change",
-        "deadline",
-        "follow_up",
-        "migration_shadow",
-    ]
-    trigger_count: int = Field(default=1, ge=1, le=10_000)
-    message_sequence_start: int | None = Field(default=None, ge=1)
-    message_sequence_end: int | None = Field(default=None, ge=1)
-    project_change_cursor: dict[str, int | str | None] | None = None
-    checkpoint_version: int = Field(..., ge=1)
-    checkpoint_hash: str = Field(
-        ...,
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    manifest_version: Literal["resident-turn-input-v1"] = "resident-turn-input-v1"
-
-    @model_validator(mode="after")
-    def _validate_cursor_bounds(self) -> "StrategicResidentTurnPayload":
-        start = self.message_sequence_start
-        end = self.message_sequence_end
-        if (start is None) != (end is None):
-            raise ValueError(
-                "message_sequence_start and message_sequence_end must be supplied together"
-            )
-        if start is not None and end is not None and end < start:
-            raise ValueError("message_sequence_end must be >= message_sequence_start")
-        if self.lane == "interactive" and start is None:
-            raise ValueError("interactive Resident turns require a message sequence range")
-        cursor = self.project_change_cursor
-        if cursor is not None:
-            if len(cursor) > 16:
-                raise ValueError("project_change_cursor may contain at most 16 keys")
-            for key, value in cursor.items():
-                if not isinstance(key, str) or not key or len(key) > 80:
-                    raise ValueError(
-                        "project_change_cursor keys must be non-empty strings up to 80 characters"
-                    )
-                if isinstance(value, bool):
-                    raise ValueError("project_change_cursor boolean values are not allowed")
-                if isinstance(value, int) and value < 0:
-                    raise ValueError(
-                        "project_change_cursor integer values must be non-negative"
-                    )
-                if isinstance(value, str) and len(value) > 160:
-                    raise ValueError(
-                        "project_change_cursor string values may contain at most 160 characters"
-                    )
-        return self
-
-    @field_validator("resident_id")
-    @classmethod
-    def _canonical_resident_id(cls, value: str) -> str:
-        try:
-            return str(uuid.UUID(value))
-        except (TypeError, ValueError, AttributeError) as exc:
-            raise ValueError("resident_id must be a canonical UUID") from exc
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -849,6 +762,25 @@ class ReleaseMergeGradePayload(_SystemPopulated):
     version_goal: str | None = None
     merged_prs: list[int] | None = None
     prompt: str | None = None
+
+
+class WalkthroughE2EPayload(_SystemPopulated):
+    """Payload for the internal qualifier-spawned ``walkthrough_e2e`` task.
+
+    Mirrors the other qualifier-spawned verification types (release_audit /
+    release_merge_grade): the task scores ONE pinned candidate commit
+    (``candidate_sha``) by running the live-stack browser walkthrough against it
+    and posting SHA-pinned CriterionEvidence. Fields are optional because
+    ``_SystemPopulated`` / BasePayload are extra-field tolerant (``extra='allow'``)
+    and the backend populates them at spawn time; the ingestion endpoint — not
+    this schema — enforces the SHA-match safety gate before writing covered-tier
+    evidence, so validation only needs to accept the shape cleanly.
+    """
+
+    candidate_sha: str | None = None
+    qualification_attempt_id: str | None = None
+    release_version_id: str | None = None
+    project_id: str | None = None
 
 
 class QAPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
@@ -961,7 +893,7 @@ class ComputeSuccessCriterion(BaseModel):
     min_file_count: int = 1
 
     @model_validator(mode="after")
-    def _check_kind_fields(self) -> "ComputeSuccessCriterion":
+    def _check_kind_fields(self) -> ComputeSuccessCriterion:
         if self.kind == "metric":
             if not isinstance(self.metric, str) or not self.metric.strip():
                 raise ValueError("metric is required and non-empty when kind='metric'")
@@ -1315,11 +1247,9 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.migrate: MigratePayload,
     TaskType.investigate: InvestigatePayload,
     TaskType.review: ReviewPayload,
-    TaskType.panel_review: PanelReviewPayload,
     TaskType.fix: FixPayload,
     TaskType.research: ResearchPayload,
     TaskType.strategic_review: StrategicReviewPayload,
-    TaskType.strategic_resident_turn: StrategicResidentTurnPayload,
     TaskType.design_doc_update: DesignDocUpdatePayload,
     TaskType.security_audit: SecurityAuditPayload,
     TaskType.qa: QAPayload,
@@ -1338,6 +1268,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.web_research: WebResearchPayload,
     TaskType.design: DesignPayload,
     TaskType.repo_bootstrap: RepoBootstrapPayload,
+    TaskType.walkthrough_e2e: WalkthroughE2EPayload,
     TaskType.salvage_bundle: BasePayload,
     # capability_proof_trial carries a small free-form payload ({cap, test_refs,
     # head_sha, max_test_files, wall_clock_seconds}); the extra-field-tolerant
@@ -1345,6 +1276,12 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     # salvage_bundle). The bounded caps are enforced at enrollment + in the agent
     # handler, not by the schema.
     TaskType.capability_proof_trial: BasePayload,
+    # criterion_coverage_trial carries a small free-form payload ({criterion_ids,
+    # source_task_id, test_refs, head_sha, max_test_files, wall_clock_seconds});
+    # the extra-field-tolerant BasePayload validates it without constraining the
+    # shape (mirrors capability_proof_trial). Bounded caps are enforced at
+    # enrollment + in the agent handler, not by the schema.
+    TaskType.criterion_coverage_trial: BasePayload,
 }
 
 

@@ -66,7 +66,6 @@ def test_task_capability_ui_subsets_only_reference_known_types():
     assert USER_LAUNCHABLE_TASK_TYPES == (
         "create",
         "review",
-        "panel_review",
         "fix",
         "plan",
         "research",
@@ -119,7 +118,6 @@ def test_completion_handler_declarations_match_legacy_dispatch():
     task_lifecycle is behaviour-preserving."""
     assert COMPLETION_HANDLER_BY_TASK_TYPE == {
         "plan": "plan",
-        "panel_review": "panel_review",
         "design_doc_update": "design_doc",
         "strategic_review": "strategic",
         "research": "research",
@@ -132,6 +130,8 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "design": "design",
         "repo_bootstrap": "repo_bootstrap",
         "capability_proof_trial": "capability_proof_trial",
+        "criterion_coverage_trial": "criterion_coverage_trial",
+        "walkthrough_e2e": "walkthrough_e2e",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.
     needs_project = {
@@ -171,9 +171,7 @@ def test_strategic_local_runner_preset_tracks_registry():
     assert set(admin_runners._STRATEGIC_LOCAL_TASK_TYPES) == set(
         STRATEGIC_LOCAL_AGENT_TASK_TYPES
     )
-    assert STRATEGIC_LOCAL_AGENT_TASK_TYPES == (
-        STRATEGIC_TASK_TYPES | {"strategic_resident_turn"}
-    )
+    assert STRATEGIC_LOCAL_AGENT_TASK_TYPES == STRATEGIC_TASK_TYPES
 
 
 def test_strategic_phase_ordering_is_registry_declared():
@@ -233,7 +231,6 @@ def test_code_pr_types_keep_code_ci_review_gate():
         assert EVALUATION_STRATEGY_BY_TASK_TYPE[t] == "forward-quality"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["perf"] == "metric"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["compute_experiment"] == "artifact-delivery"
-    assert EVALUATION_STRATEGY_BY_TASK_TYPE["panel_review"] == "structured-verdict"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
 
 
@@ -274,9 +271,6 @@ def test_every_capability_declares_a_valid_run_shape():
     for cap in TASK_CAPABILITIES:
         assert cap.run_shape in valid, (cap.id, cap.run_shape)
     assert set(RUN_SHAPE_BY_TASK_TYPE) == ALL_TASK_TYPES
-    assert RUN_SHAPE_BY_TASK_TYPE == {
-        cap.id.value: cap.run_shape for cap in TASK_CAPABILITIES
-    }
 
 
 def test_run_shape_for_accessor_and_honest_per_type_shapes():
@@ -294,16 +288,8 @@ def test_run_shape_for_accessor_and_honest_per_type_shapes():
 
 
 def test_experiment_loop_is_a_valid_declarable_run_shape():
-    """`experiment_loop` is part of the closed run-shape vocabulary and is now
-    DECLARED by the reference compute_experiment type (the long-running
-    launch-and-poll experiment). Assert both that the value is declarable on the
-    dataclass and that compute_experiment is the registered type using it."""
-    from app.task_capabilities import TaskCapability, TaskType
-
-    cap = TaskCapability(
-        TaskType.investigate, "X", "read_only", run_shape="experiment_loop"
-    )
-    assert cap.run_shape == "experiment_loop"
+    """`experiment_loop` is part of the closed run-shape vocabulary declared by
+    compute_experiment — assert the registry-level invariant."""
     # compute_experiment is the registered type that runs the experiment loop.
     assert RUN_SHAPE_BY_TASK_TYPE["compute_experiment"] == "experiment_loop"
     assert run_shape_for("compute_experiment") == "experiment_loop"
@@ -611,21 +597,6 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
     }
-    assert by_id["strategic_resident_turn"]["execution_owner"] == "agent"
-    assert by_id["strategic_resident_turn"]["filter_visible"] is False
-    assert by_id["strategic_resident_turn"]["provider_configurable"] is True
-    assert by_id["strategic_resident_turn"]["user_launchable"] is False
-    assert by_id["strategic_resident_turn"]["requires_code"] is False
-    assert by_id["strategic_resident_turn"]["cost_ceiling_usd"] == 4.0
-    # Panel review is a multi-agent workflow producing a verdict artifact with a
-    # higher cost ceiling than the normal review path and is now launchable
-    # because the executable workflow is live.
-    assert by_id["panel_review"]["run_shape"] == "workflow"
-    assert by_id["panel_review"]["output_kind"] == "verdict"
-    assert by_id["panel_review"]["user_launchable"] is True
-    assert by_id["panel_review"]["cost_ceiling_usd"] > by_id["review"][
-        "cost_ceiling_usd"
-    ]
 
 
 def test_enrichment_leaves_agent_mode_derived_sets_consistent():
@@ -642,7 +613,6 @@ def test_every_capability_declares_valid_run_shape_and_catalog_round_trips():
         assert capability.run_shape in _VALID_RUN_SHAPES, capability.id.value
         expected_by_id[capability.id.value] = capability.run_shape
 
-    assert expected_by_id["panel_review"] == "workflow"
     assert {
         entry["id"]: entry["run_shape"] for entry in task_type_catalog()
     } == expected_by_id

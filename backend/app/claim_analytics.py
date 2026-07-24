@@ -8,10 +8,59 @@ samples.
 
 from __future__ import annotations
 
+import json
+import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from app.models import _utcnow
+
+
+class ClaimResponseTiming:
+    """Collect coarse, in-process timings for one ``/claim`` response.
+
+    This deliberately stays request-local: it adds no persistence or lifecycle
+    state, and callers emit a single structured log only after the response has
+    been assembled. Phase values are durations between consecutive ``mark``
+    calls, which makes the slow section visible without logging task contents.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.perf_counter) -> None:
+        self._clock = clock
+        self._started_at = clock()
+        self._last_mark_at = self._started_at
+        self._phase_ms: dict[str, int] = {}
+
+    def mark(self, phase: str) -> None:
+        now = self._clock()
+        self._phase_ms[phase] = max(0, round((now - self._last_mark_at) * 1000))
+        self._last_mark_at = now
+
+    def finish(self, response: object) -> dict[str, Any]:
+        """Return log-safe timing and approximate serialized-size metrics."""
+
+        measurement_started_at = self._clock()
+        response_bytes: int | None
+        try:
+            response_bytes = len(
+                json.dumps(
+                    response,
+                    default=str,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, OverflowError):
+            response_bytes = None
+        finished_at = self._clock()
+        return {
+            "total_ms": max(0, round((finished_at - self._started_at) * 1000)),
+            "phase_ms": dict(self._phase_ms),
+            "response_bytes_approx": response_bytes,
+            "size_measurement_ms": max(
+                0, round((finished_at - measurement_started_at) * 1000)
+            ),
+        }
 
 
 def stamp_cold_claim_timing(task: Any, *, claimed_at: datetime | None = None) -> bool:
@@ -72,4 +121,8 @@ def stamp_warm_claim_timing(
     return updated
 
 
-__all__ = ["stamp_cold_claim_timing", "stamp_warm_claim_timing"]
+__all__ = [
+    "ClaimResponseTiming",
+    "stamp_cold_claim_timing",
+    "stamp_warm_claim_timing",
+]

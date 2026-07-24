@@ -13,7 +13,7 @@ import uuid
 from collections import Counter
 from datetime import datetime
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -26,6 +26,21 @@ from app.inline_llm import (
 )
 from app.models import Project, Task, _utcnow
 from app.playbook_capacity import maybe_archive_for_capacity, _mark_stale_review_entries
+from app.playbook_sr_metrics import (
+    _FLOOR_MIN_CONSECUTIVE_WINDOWS,
+    _PRECISION_RECALL_QUADRANT_THRESHOLD,
+    _SR_ENGAGEMENT_MIN_PASSES,
+    _SR_ENGAGEMENT_THRESHOLD,
+    _SR_FLOOR_THRESHOLD,
+    _SR_SEVERITY_DELTA_THRESHOLDS,
+    _TREND_DELTA_THRESHOLD,
+)
+from app.project_telemetry import (
+    get_project_telemetry,
+    read_telemetry_or_doc,
+    set_project_telemetry,
+    strip_migrated_doc_keys,
+)
 from app.time_utils import _to_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -214,19 +229,6 @@ _DIRECTION_FIRST_ATTEMPT_DECAY_HALF_LIFE_DAYS = 14
 _REVIEW_PLAYBOOK_REFRESH_DAYS = 30
 
 _MIN_REVIEW_SAMPLE = 10
-# SR catch-rate trend constants live in app.playbook_sr_metrics — re-exported
-# here so existing callers that do ``from app.review_learning import X`` keep
-# working and the modularity tripwire in test_playbook_learning_modularity.py
-# sees the canonical objects via every facade.
-from app.playbook_sr_metrics import (  # noqa: E402,F401
-    _FLOOR_MIN_CONSECUTIVE_WINDOWS,
-    _PRECISION_RECALL_QUADRANT_THRESHOLD,
-    _SR_ENGAGEMENT_MIN_PASSES,
-    _SR_ENGAGEMENT_THRESHOLD,
-    _SR_FLOOR_THRESHOLD,
-    _SR_SEVERITY_DELTA_THRESHOLDS,
-    _TREND_DELTA_THRESHOLD,
-)
 
 
 def _categorize_review_issues_keyword(review_history: list) -> dict[str, list[dict]]:
@@ -265,7 +267,7 @@ def _categorize_review_issues_keyword(review_history: list) -> dict[str, list[di
 
 def _categorize_review_issues(
     review_history: list,
-    cached: Optional[dict] = None,
+    cached: dict | None = None,
 ) -> dict[str, list[dict]]:
     """Scan review_history entries and bucket issues by category."""
     if cached is not None:
@@ -372,7 +374,7 @@ async def cache_first_attempt_classification(
         buckets = _keyword_from_flat(issues)
     else:
         try:
-            import anthropic as _anthropic  # noqa: PLC0415
+            import anthropic as _anthropic
 
             _anthropic
             buckets = await categorize_review_issues_llm(issues)
@@ -395,8 +397,8 @@ def compute_recurring_first_review_descriptions(
     task_filter=None,
     min_tasks: int = 0,
     count_unique_tasks: bool = False,
-    extra_fields: Optional[dict] = None,
-) -> Optional[list[dict]]:
+    extra_fields: dict | None = None,
+) -> list[dict] | None:
     """Top recurring issue descriptions from first-review (iteration 0) history."""
     desc_counter: Counter = Counter()
     desc_to_cat: dict = {}
@@ -579,7 +581,7 @@ def _maybe_auto_playbook_from_first_attempt(
     threshold: int = _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
 ) -> list[str]:
     """Create playbook entries for direction categories that hit the threshold."""
-    from app.playbook_learning import _is_auto_playbook_suppressed  # noqa: PLC0415
+    from app.playbook_learning import _is_auto_playbook_suppressed
 
     tally = (doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {}).get(direction_key) or {}
     created: list[str] = []
@@ -635,6 +637,28 @@ async def extract_review_feedback_to_playbook(
         return []
 
     doc = dict(project.design_doc or {})
+
+    # Hydrate archive from project_telemetry (with design_doc fallback) so
+    # suppression checks and capacity-eviction see the real archive data.
+    existing_archive = await get_project_telemetry(
+        session, task.project_id, "playbook_archive", design_doc_fallback=doc
+    )
+    doc["playbook_archive"] = list(existing_archive or [])
+
+    # Hydrate migrated telemetry keys that strip_migrated_doc_keys removes
+    # from design_doc at write time. Without this, _update_module_feedback_profiles
+    # and _accumulate_direction_first_attempt would start from empty data.
+    existing_module_feedback = await get_project_telemetry(
+        session, task.project_id, "module_feedback", design_doc_fallback=doc
+    )
+    if existing_module_feedback is not None:
+        doc["module_feedback"] = dict(existing_module_feedback)
+    existing_dfa = await get_project_telemetry(
+        session, task.project_id, "direction_first_attempt_feedback", design_doc_fallback=doc
+    )
+    if existing_dfa is not None:
+        doc["direction_first_attempt_feedback"] = dict(existing_dfa)
+
     buckets = _categorize_review_issues(review_history)
     related_files: list[str] = list((task.context or {}).get("related_files") or [])
     module_profiles_updated = bool(related_files and buckets)
@@ -748,9 +772,40 @@ async def extract_review_feedback_to_playbook(
         meta["last_updated"] = _utcnow().isoformat()
         meta["updated_by"] = "review-playbook"
         doc["_meta"] = meta
+        # Capture the migrated telemetry blobs BEFORE strip_migrated_doc_keys
+        # removes them from doc — the set_project_telemetry writes below read
+        # these values, and reading them after the strip persists empty dicts
+        # (silent data loss for downstream telemetry consumers).
+        updated_archive = list(doc.get("playbook_archive") or [])
+        module_feedback_blob = dict(doc.get(_MODULE_FEEDBACK_KEY) or {})
+        direction_tally_blob = dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {})
+        doc = strip_migrated_doc_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
         session.add(project)
+
+        await set_project_telemetry(
+            session,
+            task.project_id,
+            "playbook_archive",
+            updated_archive,
+        )
+
+        if module_profiles_updated:
+            await set_project_telemetry(
+                session,
+                task.project_id,
+                _MODULE_FEEDBACK_KEY,
+                module_feedback_blob,
+            )
+
+        if direction_tally_updated:
+            await set_project_telemetry(
+                session,
+                task.project_id,
+                _DIRECTION_FIRST_ATTEMPT_KEY,
+                direction_tally_blob,
+            )
 
         if created_keys:
             logger.info(
@@ -764,11 +819,32 @@ async def extract_review_feedback_to_playbook(
     return created_keys
 
 
+async def read_direction_first_attempt_feedback(
+    session: AsyncSession,
+    project: Project,
+) -> dict:
+    """Return the direction first-attempt feedback tally, preferring the KV table.
+
+    Prefers the ``project_telemetry`` row (key
+    ``direction_first_attempt_feedback``) written by
+    :func:`extract_review_feedback_to_playbook`, falling back to
+    ``project.design_doc['direction_first_attempt_feedback']`` when the row is
+    absent (pre-backfill or post-rollback). Returns ``{}`` when neither exists.
+    """
+    value = await read_telemetry_or_doc(
+        session,
+        project.id,
+        project.design_doc,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
+    return value or {}
+
+
 async def compute_review_effectiveness(
     project_id: uuid.UUID,
     session: AsyncSession,
     all_tasks: list,
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Compare review issue category rates across two consecutive 14-day windows."""
     now = _utcnow()
     cutoff_14d = now - timedelta(days=14)
@@ -888,7 +964,7 @@ async def compute_review_effectiveness(
 
     doc = dict(project.design_doc or {})
     existing_eff: dict = dict(doc.get("review_effectiveness") or {})
-    existing_computed_at: Optional[str] = existing_eff.get("computed_at")
+    existing_computed_at: str | None = existing_eff.get("computed_at")
     is_new_window = True
     if existing_computed_at:
         try:
@@ -941,29 +1017,30 @@ async def compute_review_effectiveness(
 
 
 __all__ = [
-    "_REVIEW_CATEGORIES",
-    "_VALID_CATEGORIES",
-    "_MODULE_FEEDBACK_KEY",
     "_DIRECTION_FIRST_ATTEMPT_KEY",
     "_FIRST_ATTEMPT_PLAYBOOK_THRESHOLD",
-    "_MIN_REVIEW_SAMPLE",
-    "_TREND_DELTA_THRESHOLD",
-    "_PRECISION_RECALL_QUADRANT_THRESHOLD",
-    "_SR_SEVERITY_DELTA_THRESHOLDS",
-    "_SR_FLOOR_THRESHOLD",
     "_FLOOR_MIN_CONSECUTIVE_WINDOWS",
-    "_SR_ENGAGEMENT_THRESHOLD",
+    "_MIN_REVIEW_SAMPLE",
+    "_MODULE_FEEDBACK_KEY",
+    "_PRECISION_RECALL_QUADRANT_THRESHOLD",
+    "_REVIEW_CATEGORIES",
     "_SR_ENGAGEMENT_MIN_PASSES",
-    "_categorize_review_issues_keyword",
-    "_categorize_review_issues",
-    "_keyword_from_flat",
-    "_decay_module_feedback_entry",
-    "_update_module_feedback_profiles",
+    "_SR_ENGAGEMENT_THRESHOLD",
+    "_SR_FLOOR_THRESHOLD",
+    "_SR_SEVERITY_DELTA_THRESHOLDS",
+    "_TREND_DELTA_THRESHOLD",
+    "_VALID_CATEGORIES",
     "_accumulate_direction_first_attempt",
+    "_categorize_review_issues",
+    "_categorize_review_issues_keyword",
+    "_decay_module_feedback_entry",
+    "_keyword_from_flat",
     "_maybe_auto_playbook_from_first_attempt",
-    "categorize_review_issues_llm",
+    "_update_module_feedback_profiles",
     "cache_first_attempt_classification",
+    "categorize_review_issues_llm",
     "compute_recurring_first_review_descriptions",
-    "extract_review_feedback_to_playbook",
     "compute_review_effectiveness",
+    "extract_review_feedback_to_playbook",
+    "read_direction_first_attempt_feedback",
 ]

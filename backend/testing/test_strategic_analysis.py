@@ -1,5 +1,13 @@
 """Tests for _build_outcome_evaluation and _compute_prediction_calibration_factor in app.strategic_analysis."""
 
+import uuid
+import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel
+
 from app.strategic_analysis import (
     _build_outcome_evaluation as _real_build_outcome_evaluation,
     _compute_prediction_calibration_factor as _real_compute_prediction_calibration_factor,
@@ -11,6 +19,7 @@ from app.strategic_analysis import (
     _RETIRED_MAX_COUNT,
     _RETIRED_PER_ENTRY_CHAR_CAP,
 )
+from app.strategic_completion import record_retired_direction_memory
 from app.direction_metrics import (
     _compute_difficulty_index,
     _compute_lifetime_generalized_outcome_state,
@@ -3486,13 +3495,21 @@ def test_direction_knowledge_capped_at_five():
 
 def test_retired_directions_summary_includes_durable_memory_entries():
     """Direction in vision['_recently_retired_directions'] but pruned from the
-    live directions list still appears in the retired-directions summary."""
+    live directions list still appears in the retired-directions summary.
+
+    When the memory entry carries a ``text`` field (written by
+    ``record_retired_direction_memory`` since the scramble fix), the summary
+    must surface the original human-readable text, NOT a stopword-stripped
+    token-bag join.
+    """
+    readable_text = "Improve the authentication flow for users to log in faster"
     project = _make_project(
         directions=[],  # direction already pruned from live list
         vision={
             "_recently_retired_directions": [
                 {
                     "id": "d-pruned",
+                    "text": readable_text,
                     "text_tokens": ["improve", "auth", "performance"],
                     "retired_at": "2026-06-01T00:00:00",
                     "reason": "saturation",
@@ -3507,8 +3524,10 @@ def test_retired_directions_summary_includes_durable_memory_entries():
     assert entry["id"] == "d-pruned"
     assert entry["status"] == "retired"
     assert entry["retirement_reason"] == "saturation"
-    # text reconstructed from tokens
-    assert "auth" in entry["text"]
+    # Full readable text must be used, not a stopword-stripped token join.
+    assert entry["text"] == readable_text
+    # Sanity: the scrambled token-join form must NOT appear as the full text.
+    assert entry["text"] != "improve auth performance"
 
 
 def test_retired_directions_summary_surfaces_outcome():
@@ -3819,3 +3838,213 @@ def test_success_rate_same_population_denominator():
     assert result["overall"]["merged"] == 3
     assert result["overall"]["failed"] == 3  # raw count includes all tasks
     assert result["overall"]["success_rate"] == 1.0  # only counts PR-eligible failures
+
+
+# ---------------------------------------------------------------------------
+# Word-order preservation in retired_directions_summary
+# ---------------------------------------------------------------------------
+
+
+def test_retired_directions_summary_preserves_text_order():
+    """Text reconstructed from text_tokens must preserve original word order,
+    not scramble it as set() iteration would."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-order",
+                    # Tokens stored in a specific order that differs from
+                    # alphabetical and reverse-alphabetical, so any set-based
+                    # reconstruction will reliably produce a different order.
+                    "text_tokens": ["zebra", "mango", "apple", "kite"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    text = result[0]["text"]
+    # Exact left-to-right token order must be preserved
+    assert text == "zebra mango apple kite", (
+        f"Expected 'zebra mango apple kite', got {text!r} — "
+        "set() may have scrambled word order"
+    )
+
+
+def test_record_retired_direction_memory_text_tokens_ordered():
+    """record_retired_direction_memory must store text_tokens in the same
+    left-to-right order as the source direction text (excluding stopwords)."""
+    vision: dict = {}
+    direction = {
+        "id": "d-tok-order",
+        # "strengthen" is a content word; "the" and "for" are stopwords.
+        "text": "strengthen the authentication flow for users",
+    }
+    record_retired_direction_memory(vision, direction, reason="saturation")
+
+    entries = vision.get("_recently_retired_directions") or []
+    assert len(entries) == 1
+    tokens = entries[0]["text_tokens"]
+    # Stopwords "the", "for" removed; remaining words in original order
+    assert tokens == ["strengthen", "authentication", "flow", "users"], (
+        f"Expected ordered tokens, got {tokens!r}"
+    )
+
+
+# ── repair_retired_direction_memory_texts — async DB tests ───────────────────
+
+
+@pytest_asyncio.fixture()
+async def repair_db():
+    """Isolated in-memory SQLite DB for repair_retired_direction_memory_texts tests."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
+
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_repair_retired_direction_memory_texts_backfills_text(repair_db):
+    """Legacy entries with text_tokens but no text are backfilled from the
+    DirectionEvent trail. The function returns True and patches text in-place."""
+    from app.models import DirectionEvent
+    from app.direction_event_trail import repair_retired_direction_memory_texts
+    from app.time_utils import _utcnow
+
+    project_id = uuid.uuid4()
+    direction_key = "d-legacy-1"
+    full_text = "Add rate limiting to the public API endpoints"
+
+    # Insert a DirectionEvent row carrying the full direction text in snapshot_data.
+    event = DirectionEvent(
+        project_id=project_id,
+        direction_key=direction_key,
+        event_kind="status_changed",
+        prior_status="active",
+        new_status="retired",
+        actor=None,
+        reason="saturation",
+        snapshot_data={"id": direction_key, "text": full_text, "status": "retired"},
+        recorded_at=_utcnow(),
+    )
+    repair_db.add(event)
+    await repair_db.commit()
+
+    # Vision with a legacy entry: text_tokens present, text absent.
+    vision = {
+        "_recently_retired_directions": [
+            {
+                "id": direction_key,
+                "text_tokens": ["add", "rate", "limiting", "public", "api", "endpoints"],
+                "retired_at": "2026-06-01T00:00:00",
+                "reason": "saturation",
+            }
+        ]
+    }
+    patched = await repair_retired_direction_memory_texts(repair_db, project_id, vision)
+    assert patched is True, "Expected True when at least one entry was repaired"
+
+    entry = vision["_recently_retired_directions"][0]
+    assert entry["text"] == full_text, (
+        f"Expected full readable text, got {entry['text']!r}"
+    )
+    # text_tokens must remain unchanged (repair is additive, not destructive).
+    assert entry["text_tokens"] == ["add", "rate", "limiting", "public", "api", "endpoints"]
+
+
+@pytest.mark.asyncio
+async def test_repair_retired_direction_memory_texts_skips_already_text(repair_db):
+    """Entries that already have a non-empty text field must not be touched,
+    and the function returns False when nothing needs repair."""
+    from app.direction_event_trail import repair_retired_direction_memory_texts
+
+    project_id = uuid.uuid4()
+    vision = {
+        "_recently_retired_directions": [
+            {
+                "id": "d-has-text",
+                "text": "Already readable direction text",
+                "text_tokens": ["already", "readable"],
+                "retired_at": "2026-06-01T00:00:00",
+                "reason": "saturation",
+            }
+        ]
+    }
+    original_text = vision["_recently_retired_directions"][0]["text"]
+    patched = await repair_retired_direction_memory_texts(repair_db, project_id, vision)
+    assert patched is False, "Expected False when no entries needed repair"
+    assert vision["_recently_retired_directions"][0]["text"] == original_text
+
+
+@pytest.mark.asyncio
+async def test_repair_retired_direction_memory_texts_no_snapshot(repair_db):
+    """When no DirectionEvent exists for a key, the entry is left unchanged and
+    the function returns False."""
+    from app.direction_event_trail import repair_retired_direction_memory_texts
+
+    project_id = uuid.uuid4()
+    vision = {
+        "_recently_retired_directions": [
+            {
+                "id": "d-no-event",
+                "text_tokens": ["some", "tokens"],
+                "retired_at": "2026-06-01T00:00:00",
+                "reason": "saturation",
+            }
+        ]
+    }
+    patched = await repair_retired_direction_memory_texts(repair_db, project_id, vision)
+    assert patched is False, "Expected False when event trail has no snapshot"
+    # Entry must not have a text key added (no snapshot = nothing to backfill).
+    assert "text" not in vision["_recently_retired_directions"][0]
+
+
+def test_retired_directions_summary_legacy_entry_no_text_falls_back_to_tokens():
+    """When a legacy entry has text_tokens but no text, _build_retired_directions_summary
+    falls back to joining the tokens so the summary never returns an empty text field."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-legacy-tokens",
+                    "text_tokens": ["zebra", "mango", "apple"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    # Without a text field the summary falls back to joining text_tokens.
+    assert result[0]["text"] == "zebra mango apple", (
+        f"Expected token join fallback, got {result[0]['text']!r}"
+    )

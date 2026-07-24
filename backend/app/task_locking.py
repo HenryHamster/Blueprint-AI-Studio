@@ -36,17 +36,46 @@ from typing import AsyncIterator, Callable
 
 import uuid
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import func, inspect as sa_inspect, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import resolve_dialect_name
 from app.models import DeploymentState, Project, Task
+from app.sr_analytics_store import LEGACY_SR_ANALYTICS_KEYS
 
 logger = logging.getLogger(__name__)
 
+# Agent-owned write ceiling for project.design_doc. The God-column
+# decomposition (design 52f97baa) is migrating the code-written telemetry blobs
+# out to dedicated tables so design_doc converges on architectural content only
+# (<50KB target). The cochange_* blobs are still the largest remaining
+# transitional payload in design_doc, so the ceiling stays at 500KB until the
+# remaining keys are cut over; it can be lowered once design_doc holds
+# architectural content alone.
 DESIGN_DOC_MAX_BYTES = 500_000
+
+
+class DesignDocSizeLimitExceeded(Exception):
+    """Raised by with_design_doc_locked when a write would grow the agent-owned
+    portion of design_doc past DESIGN_DOC_MAX_BYTES and raise_on_size_limit=True.
+
+    Callers that need to surface the failure to the strategist (e.g. HTTP
+    handlers) should pass raise_on_size_limit=True and catch this exception
+    to return a visible error rather than a silent False.
+    """
+
+    def __init__(self, project_id, old_size: int, new_size: int, ceiling: int):
+        self.project_id = project_id
+        self.old_size = old_size
+        self.new_size = new_size
+        self.ceiling = ceiling
+        super().__init__(
+            f"design_doc size limit exceeded for project {project_id}: "
+            f"would grow from {old_size} to {new_size} bytes (ceiling {ceiling})"
+        )
 
 # Keys in project.design_doc that are owned by internal orchestration (code-side
 # writers) and are excluded from the agent-write size cap. These keys have their
@@ -54,16 +83,41 @@ DESIGN_DOC_MAX_BYTES = 500_000
 # This is the authoritative set — mirror of the guard in
 # admin_agent_ops.py (which imports from here). Keep in sync with the set/delete
 # guard in that module so the two never diverge.
+#
+# Specialized stores are authoritative for efficiency, lane, and SR analytics,
+# but their legacy design_doc values remain as per-key/rollback fallbacks during
+# the rolling cutover. Those retained code-owned values stay exempt from the
+# agent-write cap until the fallbacks are intentionally removed.
 _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
     {
+        # Originally reserved
         "playbook_archive",
         "proposed_changes",
-        "lane_baselines",
         "module_feedback",
-        "sr_catch_rate_trends",
-        "efficiency_baseline",
         "retired_diagnoses_archive",
+        # Co-change index written by direction_outcomes.py (~38KB); excluded so
+        # it doesn't consume the agent-write 500KB budget.
+        "cochange_index",
+        "cochange_applied_prs",
+        # Per-direction first-attempt review feedback tallies.  Dual-written to
+        # project_telemetry; exempted from agent budget during the transition.
+        "direction_first_attempt_feedback",
+        # Completion-debt-ledger system description seeded by completion_debt.py.
+        "systems/completion-debt-ledger",
+        # Analytics/sweep keys written by background code (not by agents)
+        "repo_overview",
+        "review_effectiveness",
+        "playbook_deleted_keys",
+        # Generic-KV telemetry blobs dual-written to project_telemetry during the
+        # final God-column cutover tranche; exempt from the agent-write cap while
+        # their design_doc copies are retained for rollback compatibility.
+        "_broadcast_limit",
+        "_auto_remediation",
+        # Retained specialized-store fallbacks.
+        "efficiency_baseline",
+        "lane_baselines",
     }
+    | LEGACY_SR_ANALYTICS_KEYS
 )
 
 
@@ -182,9 +236,63 @@ async def deployment_state_lock(
         ds.version = starting_version + 1
 
 
+def _undo_projection_downgrade(instance) -> None:
+    """Undo the loader damage a ``load_only(..., raiseload=True)`` lock does to an
+    instance that was ALREADY more fully loaded than the projection.
+
+    A projection lock is supposed to be a cheap read of a few columns. What it
+    actually does to a shared identity-mapped instance is permanent: the SELECT
+    stores its loader options on the ``InstanceState`` (``state.load_options``)
+    and installs a deferred/raiseload callable for every non-projected column
+    (``state.callables``). The column VALUES already in ``state.dict`` survive —
+    so nothing looks wrong, and sync reads keep working right after the lock.
+
+    The damage only detonates later. Anything that expires the instance — an
+    explicit ``session.expire()``, a ``session.refresh()``, a ``rollback()`` —
+    hands control to those stored loaders, so the reload fetches ONLY the
+    projected columns and leaves everything else expired. (A bare ``commit()``
+    does NOT expire here: the app configures ``expire_on_commit=False``, which
+    is why several completion paths call ``session.expire()`` by hand to drop a
+    stale snapshot — those are the detonation sites.) The next SYNC read then
+    lazy-loads
+    outside the asyncpg greenlet → ``MissingGreenlet``. Worse, if the lock also
+    left a column dirty, the reload SELECT autoflushes that UPDATE from sync
+    context, and the resulting MG poisons the whole session so the traceback
+    surfaces at an unrelated downstream reader.
+
+    This restores the invariant a lock owes its caller: **acquiring a lock must
+    not leave the instance less loaded than it found it.** Dropping the stored
+    options and the now-stale callables is pure in-memory bookkeeping — no IO,
+    no extra SELECT — and a later refresh/expire then behaves normally.
+
+    Deliberately a no-op for a genuinely cold instance (one the lock itself
+    brought into the session). There, every non-projected column is legitimately
+    unloaded, the raiseload is the intended guard, and keeping the projection is
+    the whole point of ``load_columns``. The discriminator is exact: a stale
+    callable is one whose attribute ALSO has a live value in ``state.dict``,
+    which can only happen if the instance was loaded more fully before the lock.
+    """
+    if instance is None:
+        return
+    state = sa_inspect(instance)
+    callables = getattr(state, "callables", None) or {}
+    stale = [key for key in callables if key in state.dict]
+    if not stale:
+        # Cold instance (or no projection applied) — nothing was downgraded.
+        return
+    for key in stale:
+        del callables[key]
+    # The callables above are re-derived from the stored loader options on every
+    # expire cycle, so clearing them alone is not enough — the projection grows
+    # back on the next refresh. This is the actual persistent carrier.
+    state.load_options = ()
+
+
 async def lock_project_or_429(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    load_columns: list | None = None,
 ) -> Project:
     """Acquire a row lock on a Project for atomic read-modify-write (handler path).
 
@@ -199,8 +307,14 @@ async def lock_project_or_429(
     Use this from request handlers where the user can retry on 429. For
     background loops or post-commit chains that should not bubble up an
     HTTPException, use ``project_lock`` instead.
+
+    ``load_columns``: when provided, only those columns are loaded from the
+    Project row (``raiseload=True`` guards against accidental access of other
+    columns). Pass only the columns the caller actually reads or mutates to
+    avoid deserializing the 500KB+ design_doc on paths that don't need it.
+    Default ``None`` loads all columns (safe for callers with varied needs).
     """
-    result = await session.execute(
+    stmt = (
         select(Project)
         .where(Project.id == project_id)
         # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
@@ -208,8 +322,12 @@ async def lock_project_or_429(
         .with_for_update(skip_locked=True, key_share=True)
         .execution_options(populate_existing=True)
     )
+    if load_columns is not None:
+        stmt = stmt.options(load_only(*load_columns, raiseload=True))
+    result = await session.execute(stmt)
     project = result.scalars().first()
     if project is not None:
+        _undo_projection_downgrade(project)
         return project
     # Distinguish "row locked" from "row missing" with a non-locking read.
     exists = (
@@ -299,6 +417,7 @@ async def project_lock(
     *,
     skip_locked: bool = True,
     timeout: float = 30.0,
+    load_columns: list | None = None,
 ) -> AsyncIterator[Project | None]:
     """Acquire SELECT FOR UPDATE on a project row, yield freshly-loaded Project or None.
 
@@ -319,6 +438,11 @@ async def project_lock(
         skip_locked: If True (default), yield ``None`` when the row is
             held; if False, wait up to ``timeout`` and raise on timeout.
         timeout: Max seconds to wait when ``skip_locked=False``.
+        load_columns: When provided, only those columns are fetched from
+            the Project row (``raiseload=True`` guards accidental access).
+            Pass only the columns the caller actually reads or mutates to
+            avoid deserializing the 500KB+ design_doc unnecessarily.
+            Default ``None`` loads all columns (safe for generic callers).
 
     Yields:
         The freshly-loaded Project object, or None if held under skip_locked.
@@ -338,6 +462,8 @@ async def project_lock(
         .with_for_update(skip_locked=skip_locked, key_share=True)
         .execution_options(populate_existing=True)
     )
+    if load_columns is not None:
+        stmt = stmt.options(load_only(*load_columns, raiseload=True))
     try:
         result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)
     except asyncio.TimeoutError as e:
@@ -348,7 +474,18 @@ async def project_lock(
             skip_locked,
         )
         raise OperationalError("project_lock acquisition timed out", None, e) from e
-    yield result.scalar_one_or_none()
+    project = result.scalar_one_or_none()
+    try:
+        yield project
+    finally:
+        # In a finally, not just on the success path: the error path is where
+        # this matters most. An exception inside the lock body is usually
+        # followed by a rollback, and a rollback is exactly the expire cycle
+        # that detonates a leaked projection. This is IO-free in-memory
+        # bookkeeping, so it is safe to run while the stack is unwinding.
+        # See ``_undo_projection_downgrade`` — a projection lock must not leave
+        # the shared instance less loaded than it found it.
+        _undo_projection_downgrade(project)
 
 
 @asynccontextmanager
@@ -507,7 +644,12 @@ async def _with_project_locked_list_mutation(
     *,
     skip_locked: bool,
 ) -> bool:
-    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        load_columns=[Project.id, Project.directions],
+    ) as project:
         if project is None:
             return False
         directions = list(project.directions or [])
@@ -543,6 +685,7 @@ async def with_design_doc_locked(
     mutate_fn: Callable[[dict], None],
     *,
     skip_locked: bool = False,
+    raise_on_size_limit: bool = True,
 ) -> bool:
     """Atomic read-modify-write of project.design_doc under a project row lock.
 
@@ -557,24 +700,37 @@ async def with_design_doc_locked(
             by another session — preserves best-effort / non-blocking
             semantics for hot dispatch paths where lock contention should
             degrade gracefully rather than block.
+        raise_on_size_limit: When True (the default), raise
+            DesignDocSizeLimitExceeded when the agent-owned portion of
+            design_doc would exceed DESIGN_DOC_MAX_BYTES — ensuring callers
+            do not silently believe a write persisted when it was dropped.
+            Pass False explicitly to opt back into the legacy silent-return
+            behavior.
 
     Returns:
         True if mutate_fn was applied, False if the row was held and
-        skip_locked=True caused an immediate skip.
+        skip_locked=True caused an immediate skip (or raise_on_size_limit is
+        explicitly False and the size cap was hit — use the default
+        raise_on_size_limit=True to distinguish cap failures from lock-skip
+        failures via the exception type).
 
     This is the canonical helper for all design_doc mutations. Using it
     consistently prevents concurrent writers from clobbering each other's
     keys via stale read-modify-write races.
     """
-    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        load_columns=[Project.id, Project.design_doc],
+    ) as project:
         if project is None:
             return False
         doc = dict(project.design_doc or {})
 
-        # Compute agent-owned size: reserved keys (code-side blobs like
-        # efficiency_baseline, lane_baselines, etc.) have their own retention
-        # caps and must not block agent writes.  Measure only the non-reserved
-        # portion so the cap reflects what agents can control.
+        # Compute agent-owned size: reserved keys (code-side blobs with their own
+        # retention caps) must not block agent writes.  Measure only the
+        # non-reserved portion so the cap reflects what agents can control.
         def _agent_owned_size(d: dict) -> int:
             return len(
                 json.dumps(
@@ -594,10 +750,154 @@ async def with_design_doc_locked(
                 new_agent_size,
                 DESIGN_DOC_MAX_BYTES,
             )
+            if raise_on_size_limit:
+                raise DesignDocSizeLimitExceeded(
+                    project_id, old_agent_size, new_agent_size, DESIGN_DOC_MAX_BYTES
+                )
             return False
+        # Strip migrated telemetry keys before persist — these are now written
+        # exclusively via project_telemetry.set_project_telemetry / upsert_telemetry.
+        from app.project_telemetry import strip_migrated_doc_keys as _strip_migrated_doc_keys
+
+        _strip_migrated_doc_keys(doc)
         project.design_doc = doc
         flag_modified(project, "design_doc")
         session.add(project)
+    return True
+
+
+@asynccontextmanager
+async def project_telemetry_value_lock(
+    session: AsyncSession,
+    project_id,
+    key: str,
+    *,
+    design_doc_fallback: dict | None = None,
+    skip_locked: bool = False,
+) -> AsyncIterator[dict | None]:
+    """Lock and yield one mutable ``project_telemetry`` value.
+
+    Missing rows are seeded from the legacy design-doc value. The updated
+    dictionary is written back before the context exits; the database row lock
+    remains held until the caller commits or rolls back.
+    """
+    from app.models import ProjectTelemetry
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    seed: dict = {}
+    if design_doc_fallback is not None:
+        seed = dict(design_doc_fallback.get(key) or {})
+
+    await session.execute(
+        pg_insert(ProjectTelemetry)
+        .values(
+            id=uuid.uuid4(),
+            project_id=project_id,
+            key=key,
+            value=seed,
+            updated_at=func.now(),
+        )
+        .on_conflict_do_nothing(index_elements=["project_id", "key"])
+    )
+    result = await session.execute(
+        select(ProjectTelemetry)
+        .where(
+            ProjectTelemetry.project_id == project_id,
+            ProjectTelemetry.key == key,
+        )
+        .with_for_update(skip_locked=skip_locked)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        yield None
+        return
+
+    value = dict(row.value or {})
+    yield value
+    row.value = value
+    row.updated_at = func.now()
+    flag_modified(row, "value")
+    session.add(row)
+
+
+async def with_project_telemetry_locked(
+    session: AsyncSession,
+    project_id,
+    key: str,
+    mutate_fn: Callable[[dict], None],
+    *,
+    design_doc_fallback: dict | None = None,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of a ``project_telemetry`` value.
+
+    The row is keyed by ``(project_id, key)``. If it does not exist, seed it
+    from ``design_doc_fallback[key]`` so the first post-migration mutation
+    preserves a legacy container instead of replacing it with an empty dict.
+    Caller commits.
+    """
+    async with project_telemetry_value_lock(
+        session,
+        project_id,
+        key,
+        design_doc_fallback=design_doc_fallback,
+        skip_locked=skip_locked,
+    ) as value:
+        if value is None:
+            return False
+        mutate_fn(value)
+    return True
+
+
+async def with_sr_analytics_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of ProjectSRAnalytics.data.
+
+    Mirrors with_design_doc_locked but targets the dedicated SR analytics row.
+    During a rolling cutover, a missing or empty dedicated row is seeded from
+    documented legacy ``design_doc`` SR keys before mutation so a new write
+    cannot mask data that has not been backfilled yet.
+    """
+    from app.models import Project, ProjectSRAnalytics
+    from app.sr_analytics_store import legacy_sr_analytics_payload
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    legacy_seed: dict = {}
+    project = await session.get(Project, project_id)
+    if project is not None:
+        legacy_seed = legacy_sr_analytics_payload(project.design_doc)
+
+    await session.execute(
+        pg_insert(ProjectSRAnalytics)
+        .values(project_id=project_id, data=legacy_seed, updated_at=func.now())
+        .on_conflict_do_nothing(
+            index_elements=[ProjectSRAnalytics.project_id]
+        )
+    )
+
+    stmt = (
+        select(ProjectSRAnalytics)
+        .where(ProjectSRAnalytics.project_id == project_id)
+        .with_for_update(skip_locked=skip_locked)
+    )
+    result = await session.execute(stmt)
+    sr_row = result.scalar_one_or_none()
+    if sr_row is None:
+        return False
+
+    data = dict(sr_row.data or {})
+    for key, value in legacy_seed.items():
+        data.setdefault(key, value)
+    mutate_fn(data)
+    sr_row.data = data
+    sr_row.updated_at = func.now()
+    flag_modified(sr_row, "data")
+    session.add(sr_row)
     return True
 
 
@@ -608,6 +908,7 @@ async def with_vision_locked(
     *,
     skip_locked: bool = False,
     timeout: float = 30.0,
+    _locked_project: Project | None = None,
 ) -> bool:
     """Atomic read-modify-write of project.vision under a project row lock.
 
@@ -629,16 +930,35 @@ async def with_vision_locked(
     same lost-update class already eliminated for ``design_doc`` and
     ``directions``.
     """
-    async with project_lock(
-        session, project_id, skip_locked=skip_locked, timeout=timeout
-    ) as project:
-        if project is None:
-            return False
+
+    # _locked_project is the narrow re-entrant bridge for code that already
+    # holds the canonical Project row lock while also holding a dependent Task
+    # lock. It prevents a second Project acquire and the resulting self-deadlock
+    # while keeping every vision assignment centralized in this helper. Callers
+    # must only pass the exact project row yielded by project_lock.
+    def _apply(project: Project) -> None:
         vision = dict(project.vision or {})
         mutate_fn(vision)
         project.vision = vision
         flag_modified(project, "vision")
         session.add(project)
+
+    if _locked_project is not None:
+        if str(_locked_project.id) != str(project_id):
+            raise ValueError("_locked_project does not match project_id")
+        _apply(_locked_project)
+        return True
+
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        timeout=timeout,
+        load_columns=[Project.id, Project.vision],
+    ) as project:
+        if project is None:
+            return False
+        _apply(project)
     return True
 
 
@@ -659,8 +979,7 @@ async def with_task_context_locked(
 
     ``Task.context`` is a whole-column JSON blob written from several
     strategic-API paths (``routers/admin_agent_ops.py``) and the
-    resident-session heartbeat ledger/cursor mirror
-    (``strategic_resident_session.renew_resident_session_lease``). Each writer
+    heartbeat ledger/cursor mirror. Each writer
     sets a *disjoint* set of keys (``_strategic_api_called`` /
     ``_strategic_vision_set`` on one side, ``_exam_ledger`` /
     ``message_cursor`` on the other) but did so via a stale-read whole-column
@@ -672,7 +991,7 @@ async def with_task_context_locked(
     CANONICAL LOCK ORDER: this helper takes ONLY the task row lock. Callers that
     also need the project row lock MUST acquire the project lock FIRST
     (Project→Task — see :func:`lock_project_then_task`); taking the task lock
-    first risks the C1 cross-table deadlock. The resident-heartbeat caller
+    first risks the C1 cross-table deadlock. The heartbeat caller
     already holds the project lock (via :func:`with_vision_locked`) when it
     invokes this, so ordering is preserved.
 
@@ -729,11 +1048,16 @@ async def with_problem_model_locked(
     lost-update class already eliminated for ``vision`` and ``directions``.
     """
     async with project_lock(
-        session, project_id, skip_locked=skip_locked, timeout=timeout
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        timeout=timeout,
+        load_columns=[Project.id, Project.problem_model],
     ) as project:
         if project is None:
             return False
-        problem_model = dict(project.problem_model or {})
+        from app.problem_model import sanitize_problem_model_raw  # noqa: PLC0415
+        problem_model = sanitize_problem_model_raw(dict(project.problem_model or {}))
         mutate_fn(problem_model)
         project.problem_model = problem_model
         flag_modified(project, "problem_model")

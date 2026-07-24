@@ -55,9 +55,10 @@ describe('StrategicSessionEvents', () => {
   function render(events: StrategicWorkSessionEvent[] = EVENTS, onOpenTarget = vi.fn()) {
     host = document.createElement('div');
     document.body.appendChild(host);
-    root = createRoot(host);
+    const currentRoot = createRoot(host);
+    root = currentRoot;
     act(() => {
-      root!.render(
+      currentRoot.render(
         <StrategicSessionEvents
           events={events}
           limit={1}
@@ -89,9 +90,10 @@ describe('StrategicSessionEvents', () => {
   test('renders an empty label when requested', () => {
     host = document.createElement('div');
     document.body.appendChild(host);
-    root = createRoot(host);
+    const currentRoot = createRoot(host);
+    root = currentRoot;
     act(() => {
-      root!.render(
+      currentRoot.render(
         <StrategicSessionEvents
           events={[]}
           emptyLabel="No recent flow"

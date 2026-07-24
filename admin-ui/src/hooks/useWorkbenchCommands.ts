@@ -3,7 +3,7 @@ import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import { SETTINGS_SECTION_HOMES } from '../components/OperatorWorkspaceSections';
 import type { SectionId } from '../components/settingsSections';
-import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
+import type { StrategicInteractionMode } from '../utils/strategicWorkbenchSession';
 import { executeStrategicWorkSessionCommand } from '../strategicStateApi';
 import type {
   StrategicContextArtifactEvidence,
@@ -62,12 +62,12 @@ interface UseWorkbenchCommandsOptions {
   problemModelRevision?: number | null;
   hasDesignDoc?: boolean;
   designRevision?: number | null;
-  strategicInteractionMode: StrategicInteractionMode;
+  strategicInteractionMode?: StrategicInteractionMode;
   strategicState?: StrategicStateResponse | null;
   strategicWorkbenchState?: StrategicWorkbenchState | null;
   savingStrategicWorkbench?: boolean;
   checkingInStrategicSession?: boolean;
-  switchStrategicInteractionMode: (mode: StrategicInteractionMode) => void;
+  switchStrategicInteractionMode?: (mode: StrategicInteractionMode) => void;
   markStrategicChecked?: () => void;
   focusStrategicComposer: () => void;
   openStrategicContextTarget?: (target?: StrategicContextTarget | null) => void;
@@ -586,7 +586,7 @@ export function useWorkbenchCommands({
       closePalette();
     };
     const setStrategicModeAndOpenChat = (mode: StrategicInteractionMode) => {
-      switchStrategicInteractionMode(mode);
+      switchStrategicInteractionMode?.(mode);
       closePalette();
     };
     const selectedRefs = strategicWorkbenchState?.selected_refs ?? strategicState?.work_session?.selected_refs ?? strategicState?.workbench?.selected_refs ?? [];
@@ -1183,24 +1183,26 @@ export function useWorkbenchCommands({
         run: focusStrategicComposer,
       },
       ...workSessionDescriptorCommands,
-      ...(workSessionCommandIds.has('session.check_in') ? [] : [{
+      ...(markStrategicChecked && !workSessionCommandIds.has('session.check_in') ? [{
         id: 'strategic.check_in.mark',
         label: 'Mark Strategic checked',
         section: 'Strategic',
         detail: strategicCheckInDetail,
         keywords: ['check-in', 'check in', 'checked', 'daily', 'status', 'since last', 'strategic'],
-        disabled: projectDisabled || checkingInStrategicSession || !markStrategicChecked,
-        run: markStrategicChecked ? () => runAndClose(markStrategicChecked) : closePalette,
-      }]),
-      ...strategicModeCommands.filter(command => !workSessionCommandModes.has(command.mode)).map((command): WorkbenchCommand => ({
-        id: command.id,
-        label: command.label.replace('Switch Strategic to', 'Set Strategic mode:'),
-        section: 'Strategic',
-        detail: command.mode === strategicInteractionMode ? 'Current mode' : command.detail,
-        keywords: ['mode', 'session', 'interaction', 'strategic', ...command.keywords],
-        disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
-        run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
-      })),
+        disabled: projectDisabled || checkingInStrategicSession,
+        run: () => runAndClose(markStrategicChecked),
+      }] : []),
+      ...(switchStrategicInteractionMode
+        ? strategicModeCommands.filter(command => !workSessionCommandModes.has(command.mode)).map((command): WorkbenchCommand => ({
+            id: command.id,
+            label: command.label.replace('Switch Strategic to', 'Set Strategic mode:'),
+            section: 'Strategic',
+            detail: command.mode === strategicInteractionMode ? 'Current mode' : command.detail,
+            keywords: ['mode', 'session', 'interaction', 'strategic', ...command.keywords],
+            disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
+            run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
+          }))
+        : []),
       ...workSessionActionCommands,
       ...attentionCommandEntries,
       {

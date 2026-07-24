@@ -85,6 +85,29 @@ _RUNNER_HEARTBEAT_RETENTION_DAYS_DEFAULT = 7
 _RUNNER_POST_UPDATE_SILENCE_SECONDS_DEFAULT = 600  # 10 minutes
 
 
+def _get_liveness_seconds() -> int:
+    """Return the runtime-config-driven liveness window, falling back to the module default.
+
+    The module-level ``_RUNNER_LIVENESS_SECONDS`` stays as the compile-time default so
+    re-exports from ``orchestrator_runner_dispatch`` and direct importers
+    (``reaper_sweeps``, ``admin_runners``, ``runner.py``) keep resolving.
+    """
+    return int(_runtime_config.get("runner_liveness_seconds", _RUNNER_LIVENESS_SECONDS))
+
+
+def _get_degraded_failure_threshold() -> int:
+    """Return the runtime-config-driven degraded threshold, falling back to the module default.
+
+    The module-level ``_RUNNER_DEGRADED_FAILURE_THRESHOLD`` stays as the compile-time
+    default so re-exports keep resolving.
+    """
+    return int(
+        _runtime_config.get(
+            "runner_degraded_failure_threshold", _RUNNER_DEGRADED_FAILURE_THRESHOLD
+        )
+    )
+
+
 async def _cleanup_stale_heartbeat_snapshots(session: AsyncSession) -> int:
     """Delete RunnerHeartbeatSnapshot rows older than the retention window.
 
@@ -151,7 +174,7 @@ async def _check_post_update_silent_runners(session: AsyncSession) -> None:
         )
     )
     now = _utcnow()
-    liveness_cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    liveness_cutoff = now - timedelta(seconds=_get_liveness_seconds())
 
     runners = (
         await session.execute(
@@ -353,7 +376,7 @@ async def _check_low_disk_runners(session: AsyncSession) -> None:
         )
     )
 
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    cutoff = _utcnow() - timedelta(seconds=_get_liveness_seconds())
     active_rows = (
         await session.execute(
             select(
@@ -456,7 +479,7 @@ async def _check_idle_gpu_runners(session: AsyncSession) -> None:
         )
     )
 
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    cutoff = _utcnow() - timedelta(seconds=_get_liveness_seconds())
     active_rows = (
         await session.execute(
             select(
@@ -565,7 +588,7 @@ async def _check_low_memory_runners(session: AsyncSession) -> None:
         )
     )
 
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    cutoff = _utcnow() - timedelta(seconds=_get_liveness_seconds())
     active_rows = (
         await session.execute(
             select(
@@ -876,7 +899,7 @@ async def _check_fleet_no_healthy_runner(
     from app.runner_health_alerts import _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE
 
     now = _utcnow()
-    cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    cutoff = now - timedelta(seconds=_get_liveness_seconds())
 
     # Single pass over all registered runners to classify per-project health.
     all_rows = (await session.execute(select(LocalRunner))).scalars().all()
@@ -976,7 +999,7 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
     from app.models import Alert
 
     now = _utcnow()
-    cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    cutoff = now - timedelta(seconds=_get_liveness_seconds())
 
     # 1. Alert for each actively-degraded runner.
     degraded_runners = (
@@ -985,7 +1008,7 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
                 LocalRunner.status == "active",
                 LocalRunner.last_seen_at.is_not(None),
                 LocalRunner.last_seen_at >= cutoff,
-                LocalRunner.consecutive_job_failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+                LocalRunner.consecutive_job_failures >= _get_degraded_failure_threshold(),
             )
         )
     ).scalars().all()

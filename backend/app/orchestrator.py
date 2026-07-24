@@ -36,7 +36,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
-from sqlalchemy import and_, func as _func, inspect as sa_inspect, or_
+from sqlalchemy import func as _func, inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -98,16 +98,13 @@ from app.stall_alert_diagnostics import (
     _compute_retry_after_escalation_action,
     _missing_runtime_credentials_stall_reason,
 )
-from app.strategic_resident_saturated_dispatch import (
-    dispatch_local_required_resident_turns_without_cloud_slots,
-)
 from app.state_persistence import (
     _persist_circuit_breakers,  # noqa: F401 — re-exported; callers import via app.orchestrator
     _persist_zone_health,
     _persist_self_healing_state_bundle,
 )
 from app.storage import upload_json_payload  # noqa: F401 — app.orchestrator patch surface
-from app.monthly_budget_alerts import check_monthly_budget  # noqa: F401 — re-export for tests patching app.orchestrator.check_monthly_budget
+from app.monthly_budget_alerts import check_monthly_budget, check_daily_budget  # noqa: F401, RUF100
 import app.shared_state as _shared_state
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -134,16 +131,7 @@ def _agent_executed_task_type_filter():
     """Registry-owned dispatch fence for backend-managed control-plane Tasks."""
 
     task_type = Task.payloads[0]["type"].as_string()
-    generic_types = set(AGENT_EXECUTED_TASK_TYPES) - {"strategic_resident_turn"}
-    return or_(
-        task_type.in_(sorted(generic_types)),
-        and_(
-            task_type == "strategic_resident_turn",
-            Task.payloads[0]["shadow_only"].as_boolean().is_(False),
-            Task.context["_resident_mutation_authorized"].as_boolean().is_(True),
-            Task.context["_resident_input_frozen"].as_boolean().is_(True),
-        ),
-    )
+    return task_type.in_(sorted(set(AGENT_EXECUTED_TASK_TYPES)))
 
 
 def _dispatch_gate_metadata(row: tuple) -> dict:
@@ -556,6 +544,7 @@ _last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
 _last_budget_gate_log: datetime | None = None
+_last_daily_budget_gate_log: datetime | None = None
 _last_concurrency_broadcast: datetime | None = None
 _last_type_throttle_broadcast: dict[str, datetime | None] = {}
 _last_type_unthrottle_broadcast: dict[str, datetime | None] = {}
@@ -834,7 +823,24 @@ async def _project_resource_dispatch_defer_message(
                 # Healthy cache hits remain query-free (no expired attributes).
                 await session.refresh(project)
     else:
-        project = await session.get(Project, task.project_id)
+        _proj_row = await session.execute(
+            select(Project)
+            .where(Project.id == task.project_id)
+            .options(
+                load_only(
+                    Project.id,
+                    Project.build_config,
+                    Project.paused,
+                    Project.archived,
+                    Project.github_owner,
+                    Project.github_repo,
+                    Project.capability_adoption_verdicts,
+                    Project.capability_proof_records,
+                    raiseload=True,
+                )
+            )
+        )
+        project = _proj_row.scalar_one_or_none()
         if project_cache is not None:
             project_cache[task.project_id] = project
     if project is None:
@@ -978,19 +984,6 @@ async def _filter_project_resource_dispatch_eligible(
                 _project.paused = True
                 project_pause_mutated = True
                 session.add(_project)
-                # Project pause is the operator-visible source of truth.
-                # Keep an authoritative Resident's background policy in
-                # the same transaction so the spend guard cannot leave
-                # autonomous Resident wakeups running behind a paused UI.
-                from app.strategic_resident_wakeups import (
-                    sync_resident_background_policy,
-                )
-
-                await sync_resident_background_policy(
-                    session,
-                    project_id=_project.id,
-                    paused=True,
-                )
                 logger.info(
                     "[ORCHESTRATOR] Hard-pausing project %s — "
                     "spend ceiling exceeded and pause_on_ceiling_exceeded is set",
@@ -1011,12 +1004,12 @@ async def _filter_project_resource_dispatch_eligible(
     for _pid in _current_ceiling_deferred - _prev:
         try:
             await broadcast_to_project(_pid, "project_spend_ceiling_deferred", {"project_id": _pid})
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_deferred for %s", _pid)
     for _pid in _prev - _current_ceiling_deferred:
         try:
             await broadcast_to_project(_pid, "project_spend_ceiling_restored", {"project_id": _pid})
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_restored for %s", _pid)
     _shared_state.project_ceiling_deferred_ids = _current_ceiling_deferred
 
@@ -1035,7 +1028,7 @@ async def _filter_project_resource_dispatch_eligible(
             await broadcast_to_project(
                 _pid, "project_monthly_budget_deferred", {"project_id": _pid}
             )
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception(
                 "[ORCHESTRATOR] Failed to broadcast monthly_budget_deferred for %s", _pid
             )
@@ -1044,15 +1037,15 @@ async def _filter_project_resource_dispatch_eligible(
             await broadcast_to_project(
                 _pid, "project_monthly_budget_restored", {"project_id": _pid}
             )
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception(
                 "[ORCHESTRATOR] Failed to broadcast monthly_budget_restored for %s", _pid
             )
     _shared_state.monthly_budget_deferred_project_ids = _current_monthly_deferred
 
-    # A SELECT in Resident policy sync can autoflush the Project UPDATE and
-    # empty session.dirty before this transaction boundary. Retain the explicit
-    # mutation bit so projects without a Resident are still durably paused.
+    # A prior SELECT can autoflush the Project UPDATE and empty session.dirty
+    # before this transaction boundary. Retain the explicit mutation bit so
+    # paused projects are still durably committed.
     if session.dirty or project_pause_mutated:
         await session.commit()
     return filtered
@@ -1193,7 +1186,11 @@ async def orchestrator_worker():
     """
     # Late imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
+        detect_persistently_dark_meters,
+        get_usage_persist_failure_count,
+        get_usage_persist_failing_accounts,
         load_max_plan_pool,
+        reconcile_usage_headroom_arming,
         refresh_usage_meter_snapshots,
         release_max_plan_account,
         recheck_disabled_accounts,
@@ -1210,7 +1207,6 @@ async def orchestrator_worker():
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
-    from app.strategic_resident_provider_policy import ResidentProviderPolicyHold
     from app.vm_lifecycle import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
@@ -1233,6 +1229,8 @@ async def orchestrator_worker():
         _maybe_create_failure_alert,
         _maybe_create_cascade_cancel_alert,
         _create_orchestrator_error_alerts,
+        _maybe_create_usage_meter_dark_alert,
+        _resolve_usage_meter_dark_alert,
     )
     from app.routers.agent_status import record_task_result
     from app.deploy_health import (
@@ -1266,7 +1264,8 @@ async def orchestrator_worker():
         _last_runner_degraded_sweep, \
         _last_runner_escalation_sweep, \
         _last_local_runner_hold_sweep, \
-        _last_budget_gate_log
+        _last_budget_gate_log, \
+        _last_daily_budget_gate_log
     while True:
         queued_tasks = []
         # Reset at the very top of the loop body (before the try) — REQUIRED for
@@ -1298,6 +1297,58 @@ async def orchestrator_worker():
             # probes; never blocks dispatch.
             if _is_cadence_due(_last_usage_meter_refresh, 300):
                 await refresh_usage_meter_snapshots()
+                dark = await detect_persistently_dark_meters()
+                persist_failures = get_usage_persist_failure_count()
+                failing_accts = get_usage_persist_failing_accounts() if persist_failures else []
+                if dark:
+                    names = ", ".join(
+                        f"{d['name'] or d['id']} ({d['dark_reason']})" for d in dark
+                    )
+                    logger.warning(
+                        "[POOL] usage meter: %d account(s) persistently dark: %s"
+                        " (persist_failures=%d)",
+                        len(dark),
+                        names,
+                        persist_failures,
+                    )
+                elif persist_failures:
+                    failing_names = ", ".join(
+                        a["name"] for a in failing_accts
+                    )
+                    logger.warning(
+                        "[POOL] usage meter: persist_failures=%d accounts=[%s] (no dark accounts)",
+                        persist_failures,
+                        failing_names,
+                    )
+                try:
+                    async with AsyncSessionLocal() as _meter_alert_session:
+                        if dark or persist_failures:
+                            await _maybe_create_usage_meter_dark_alert(
+                                _meter_alert_session,
+                                dark_count=len(dark),
+                                persist_failures=persist_failures,
+                                persist_failing_account_names=[
+                                    a["name"] for a in failing_accts
+                                ],
+                            )
+                        else:
+                            await _resolve_usage_meter_dark_alert(_meter_alert_session)
+                        await _meter_alert_session.commit()
+                except Exception:
+                    logger.exception(
+                        "[POOL] Failed to create/resolve usage-meter-dark alerts"
+                    )
+                # Close the loop: autonomously arm/disarm the usage_headroom gate
+                # from sustained meter reliability. Leader-only (this is the leader
+                # dispatch cycle, and the observation-window marker is
+                # leader-memory). Fire-and-forget; a failure here must never block
+                # or crash dispatch, exactly like the neighbors above.
+                try:
+                    await reconcile_usage_headroom_arming()
+                except Exception:
+                    logger.exception(
+                        "[POOL] usage_headroom auto-arm reconciler failed"
+                    )
                 _last_usage_meter_refresh = _utcnow()
 
             # Periodic zone health persist — prevents retry storms after restart
@@ -1665,25 +1716,6 @@ async def orchestrator_worker():
                 )
                 _shared_state.tasks_active_gauge = active_count
                 if slots_available == 0:
-                    # Local runners do not consume GCP VM slots. Service the
-                    # bounded local-only Resident lane before the cloud-capacity
-                    # early exit so compatible idle capacity remains usable.
-                    (
-                        _resident_local_pinned,
-                        _resident_local_held,
-                    ) = await dispatch_local_required_resident_turns_without_cloud_slots(
-                        session,
-                        lock_dispatchable_task=_lock_dispatchable_task_for_mutation,
-                    )
-                    _cycle_dispatched += _resident_local_pinned
-                    if _resident_local_pinned or _resident_local_held:
-                        logger.info(
-                            "resident_local_dispatch_while_cloud_saturated",
-                            extra={
-                                "resident_tasks_pinned": _resident_local_pinned,
-                                "resident_tasks_held": _resident_local_held,
-                            },
-                        )
                     # Update queued gauge even when we skip dispatching
                     _shared_state.tasks_queued_gauge = (
                         await session.execute(
@@ -1726,7 +1758,7 @@ async def orchestrator_worker():
                             "cycle_duration_seconds": round(
                                 time.monotonic() - cycle_start, 3
                             ),
-                            "tasks_dispatched": _resident_local_pinned,
+                            "tasks_dispatched": 0,
                             # No slots ⇒ no window was scanned. Keeps the
                             # orchestrator_cycle_complete schema identical across both
                             # emit sites so consumers never see a missing key.
@@ -2121,27 +2153,27 @@ async def orchestrator_worker():
                         )
                     ).all()
                     for _pid, _uid in _proj_rows:
-                        _project_user_cache[_pid] = _uid
+                        _project_user_cache[_pid] = _uid  # noqa: PERF403
 
                 async def _user_has_available_account(task: Task) -> bool:
                     user_id = task.launched_by_user_id
                     if not user_id:
-                        cached = _project_user_cache.get(task.project_id)
+                        cached = _project_user_cache.get(task.project_id)  # noqa: B023
                         if cached is not None:
                             user_id = cached
                         else:
-                            proj = await session.get(Project, task.project_id)
+                            proj = await session.get(Project, task.project_id)  # noqa: B023
                             user_id = proj.user_id if proj else ""
-                            _project_user_cache[task.project_id] = user_id
+                            _project_user_cache[task.project_id] = user_id  # noqa: B023
                     model = _extract_task_model(task)
                     cache_key = (user_id, model)
-                    if cache_key in _user_pool_available:
-                        return _user_pool_available[cache_key]
+                    if cache_key in _user_pool_available:  # noqa: B023
+                        return _user_pool_available[cache_key]  # noqa: B023
                     pool = _max_plan_pools.get(user_id, [])
                     available = any(
                         _account_available_for_model(a, model) for a in pool
                     )
-                    _user_pool_available[cache_key] = available
+                    _user_pool_available[cache_key] = available  # noqa: B023
                     return available
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
@@ -2316,7 +2348,7 @@ async def orchestrator_worker():
 
                     # Persist remap of requeue-cancelled dep IDs → replacement clone IDs
                     # so future orchestrator cycles skip the _replaced_by_task_id lookup.
-                    if deps_remapped and not any_failed:
+                    if deps_remapped and not any_failed:  # noqa: SIM102
                         if await _persist_requeue_dep_remap(task, deps_remapped):
                             logger.info(
                                 f"[ORCHESTRATOR] Remapped {len(deps_remapped)} requeue-cancelled "
@@ -2464,7 +2496,7 @@ async def orchestrator_worker():
                                     _entry["prereq_task"],
                                     _entry["count"],
                                 )
-                            except Exception:
+                            except Exception:  # noqa: PERF203
                                 logger.exception(
                                     "[ORCHESTRATOR] Failed to raise cascade-cancel "
                                     "alert for prereq %s",
@@ -2495,7 +2527,7 @@ async def orchestrator_worker():
                             for d in stask.depends_on or []:
                                 try:
                                     dep_uuids.add(uuid.UUID(d))
-                                except (ValueError, AttributeError):
+                                except (ValueError, AttributeError):  # noqa: PERF203
                                     continue
                             task_dep_uuids[stask.id] = dep_uuids
                             all_dep_ids.update(dep_uuids)
@@ -2791,13 +2823,22 @@ async def orchestrator_worker():
                         "[ORCHESTRATOR] Monthly budget check failed — treating as not exhausted"
                     )
 
+                # Daily budget gate: same fail-open pattern alongside monthly.
+                try:
+                    daily_budget_exhausted, daily_usage_ratio = await check_daily_budget(session)
+                except Exception:
+                    daily_budget_exhausted = False
+                    logger.exception(
+                        "[ORCHESTRATOR] Daily budget check failed — treating as not exhausted"
+                    )
+
                 eligible_ids = await _filter_project_resource_dispatch_eligible(
                     session,
                     eligible_ids,
                     candidate_tasks,
                     project_active_counts,
                     broadcast_to_project,
-                    budget_exhausted=budget_exhausted,
+                    budget_exhausted=budget_exhausted or daily_budget_exhausted,
                 )
 
                 # Fleet-wide monthly-budget informational broadcast (follows
@@ -2826,6 +2867,30 @@ async def orchestrator_worker():
                             )
                 elif not budget_exhausted:
                     _shared_state.monthly_budget_gate_engaged = False
+
+                # Fleet-wide daily-budget informational broadcast.
+                if daily_budget_exhausted:
+                    _shared_state.daily_budget_gate_engaged = True
+                    if _is_cadence_due(_last_daily_budget_gate_log, 60, _utcnow()):
+                        _last_daily_budget_gate_log = _utcnow()
+                        logger.info(
+                            "[ORCHESTRATOR] Daily budget exhausted (%.1f%% of target) — deferring eligible tasks",
+                            daily_usage_ratio * 100 if daily_usage_ratio else 100.0,
+                        )
+                        try:
+                            await ws_manager.broadcast_to_all(
+                                "pipeline_throttle",
+                                {
+                                    "reason": "daily_budget",
+                                    "detail": "Daily spend budget reached",
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[ORCHESTRATOR] Failed to broadcast daily_budget throttle"
+                            )
+                else:
+                    _shared_state.daily_budget_gate_engaged = False
 
                 # Respect the slot limit after conflict filtering — but scan PAST it so
                 # candidates that turn out to be non-dispatchable this cycle (held /
@@ -3095,6 +3160,7 @@ async def orchestrator_worker():
                                         severity=AlertSeverity.ERROR,
                                         title=_all_blocked_title,
                                         message=_all_blocked_msg,
+                                        event_type="capacity.all_accounts_blocked",
                                     )
                                     session.add(_alert)
                                     await broadcast_to_project(
@@ -3164,15 +3230,25 @@ async def orchestrator_worker():
                 # and cannot serve the resource-envelope checks below.
                 # Pre-seeding absent ids with None also prevents a concurrently
                 # deleted project from falling back to a point lookup.
-                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = {
-                    project_id: None for project_id in _all_candidate_pids
-                }
+                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = dict.fromkeys(_all_candidate_pids)
                 if _all_candidate_pids:
                     _dispatch_projects = (
                         (
                             await session.execute(
-                                select(Project).where(
-                                    Project.id.in_(_all_candidate_pids)
+                                select(Project)
+                                .where(Project.id.in_(_all_candidate_pids))
+                                .options(
+                                    load_only(
+                                        Project.id,
+                                        Project.build_config,
+                                        Project.paused,
+                                        Project.archived,
+                                        Project.github_owner,
+                                        Project.github_repo,
+                                        Project.capability_adoption_verdicts,
+                                        Project.capability_proof_records,
+                                        raiseload=True,
+                                    )
                                 )
                             )
                         )
@@ -3621,27 +3697,17 @@ async def orchestrator_worker():
                         _effective_blacklist = (
                             list({*(_blacklist or []), *_sticky}) or None
                         )
-                        try:
-                            runtime_selection = await select_llm_runtime_for_task(
-                                user_id=dispatch_user_id,
-                                task=task,
-                                runtime_config=_runtime_config,
-                                blacklist=_effective_blacklist,
-                                project_id=(
-                                    str(task.project_id) if task.project_id else None
-                                ),
-                                # Cloud VMs have every supported provider CLI.
-                                runner_available_clis=None,
-                                raise_resident_policy_hold=True,
-                            )
-                        except ResidentProviderPolicyHold as exc:
-                            task.latest_status_message = (
-                                "Waiting for configured Resident provider policy — "
-                                f"{exc}"
-                            )
-                            session.add(task)
-                            await session.commit()
-                            continue
+                        runtime_selection = await select_llm_runtime_for_task(
+                            user_id=dispatch_user_id,
+                            task=task,
+                            runtime_config=_runtime_config,
+                            blacklist=_effective_blacklist,
+                            project_id=(
+                                str(task.project_id) if task.project_id else None
+                            ),
+                            # Cloud VMs have every supported provider CLI.
+                            runner_available_clis=None,
+                        )
                         # From here until ownership transfers, the containment
                         # handler owns releasing the slot this selection
                         # pre-incremented (select_max_plan_account).
@@ -4066,6 +4132,7 @@ async def orchestrator_worker():
                                                 title=_stuck_title,
                                                 message=_stuck_msg,
                                                 task_id=task.id,
+                                                event_type="task.blocked",
                                             )
                                             session.add(_stuck_alert)
                                             await broadcast_to_project(
@@ -4512,7 +4579,7 @@ async def orchestrator_worker():
                             # Streak exhausted — no longer plausibly transient.
                             _dispatch_prep_contention_streak.pop(_cont_key, None)
                             _force_quarantine = True
-                            logger.error(
+                            logger.error(  # noqa: TRY400
                                 "[ORCHESTRATOR] Task %s hit DB contention on "
                                 "dispatch prep %d consecutive cycles (threshold "
                                 "%d) — no longer treating as transient; "
@@ -4872,7 +4939,7 @@ async def orchestrator_worker():
             if _is_cadence_due(_last_v22_finding_backfill, 600):
                 _last_v22_finding_backfill = _utcnow()
                 try:
-                    from app.release_readiness import (  # noqa: PLC0415
+                    from app.release_readiness import (
                         _sweep_v22_finding_backfill,
                     )
 

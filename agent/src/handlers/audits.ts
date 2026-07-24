@@ -87,7 +87,7 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
  *
  * The release qualifier (backend/app/release_qualifier.py) snapshots
  * `automain` HEAD as a full 40-char SHA and passes it as `candidate_sha`
- * into BOTH the `release_audit` and qualifier-`smoketest` task payloads, so
+ * into the `release_audit` and other SHA-pinned qualifier task payloads, so
  * the agent scores the EXACT pinned commit rather than whatever `automain`
  * has drifted to by the time the agent VM starts. The qualifier also stamps
  * `task.context.candidate_sha`; we accept that as a fallback so the handler

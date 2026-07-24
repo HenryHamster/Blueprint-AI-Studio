@@ -4,8 +4,7 @@ Covers the registry-driven strategy resolver and the synchronous strategy
 implementations (none / forward-quality / metric / artifact-delivery /
 code-ci-review sentinel).
 The completion-path integration (memo/perf handlers acting on a failed gate)
-is exercised in test_memo_completion.py, test_perf_completion.py, and
-test_panel_review_completion.py.
+is exercised in test_memo_completion.py and test_perf_completion.py.
 """
 
 import json
@@ -24,7 +23,6 @@ from app.task_evaluators import (
     ForwardQualityStrategy,
     MetricStrategy,
     NoneStrategy,
-    StructuredVerdictStrategy,
     _declared_success_criterion,
     evaluate_terminal_output,
     record_failed_gate,
@@ -61,12 +59,10 @@ def test_evaluation_declarations_match_expected_assignment():
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == {
         "create": "code-ci-review",
         "review": "none",
-        "panel_review": "structured-verdict",
         "fix": "code-ci-review",
         "plan": "none",
         "research": "forward-quality",
         "strategic_review": "forward-quality",
-        "strategic_resident_turn": "none",
         "design_doc_update": "forward-quality",
         "security_audit": "forward-quality",
         "qa": "code-ci-review",
@@ -90,6 +86,8 @@ def test_evaluation_declarations_match_expected_assignment():
         "repo_bootstrap": "none",
         "salvage_bundle": "code-ci-review",
         "capability_proof_trial": "none",
+        "criterion_coverage_trial": "none",
+        "walkthrough_e2e": "none",
     }
 
 
@@ -563,95 +561,6 @@ def test_compute_malformed_criterion_is_ignored():
     assert v.passed is True
 
 
-# ── StructuredVerdictStrategy ───────────────────────────────────────────────
-
-
-def test_structured_verdict_no_verdict_signal_fails():
-    # A payload with no APPROVE/REQUEST_CHANGES signal anywhere — truly absent,
-    # no anchored token, no overall_verdict — must fail the gate.
-    v = StructuredVerdictStrategy().evaluate(
-        _task("panel_review"), '{"analysis":"looks good","confidence":0.9}'
-    )
-    assert v.passed is False
-    assert "structured verdict" in v.reason.lower()
-
-
-def test_structured_verdict_verdict_field_resolves_via_fallback():
-    # {"verdict":"APPROVE"} uses the wrong field name (not overall_verdict) but
-    # the anchored-prose floor resolves "verdict":"APPROVE" as a clear signal.
-    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), '{"verdict":"APPROVE"}')
-    assert v.passed is True
-
-
-def test_structured_verdict_valid_panel_review_passes():
-    payload = json.dumps(
-        {
-            "overall_verdict": "APPROVE",
-            "summary": "All four review lenses passed.",
-            "lenses": {
-                "correctness": {"verdict": "APPROVE", "summary": "Logic checks clean."},
-                "security": {"verdict": "APPROVE", "summary": "No auth or injection regressions."},
-                "code_quality": {"verdict": "APPROVE", "summary": "Patterns remain consistent."},
-                "test_coverage": {"verdict": "APPROVE", "summary": "Changed behavior is covered."},
-            },
-        }
-    )
-    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
-    assert v.passed is True
-    assert v.strategy == "structured-verdict"
-
-
-def _panel_lenses(*, drop_field: tuple[str, str] | None = None) -> dict:
-    lenses = {
-        "correctness": {"verdict": "APPROVE", "summary": "Logic checks clean."},
-        "security": {"verdict": "APPROVE", "summary": "No auth or injection regressions."},
-        "code_quality": {"verdict": "APPROVE", "summary": "Patterns remain consistent."},
-        "test_coverage": {"verdict": "APPROVE", "summary": "Changed behavior is covered."},
-    }
-    if drop_field is not None:
-        lens_name, field_name = drop_field
-        lenses[lens_name].pop(field_name, None)
-    return lenses
-
-
-def test_structured_verdict_incomplete_lens_verdict_still_passes():
-    # Lenses are optional telemetry — a lens with a missing verdict field is
-    # skipped, but the overall_verdict still resolves and the gate passes.
-    payload = json.dumps(
-        {
-            "overall_verdict": "APPROVE",
-            "summary": "All four review lenses present.",
-            "lenses": _panel_lenses(drop_field=("correctness", "verdict")),
-        }
-    )
-    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
-    assert v.passed is True
-    assert v.strategy == "structured-verdict"
-
-
-def test_structured_verdict_incomplete_lens_summary_still_passes():
-    # A lens with a missing summary field is skipped; overall_verdict resolves.
-    payload = json.dumps(
-        {
-            "overall_verdict": "APPROVE",
-            "summary": "All four review lenses present.",
-            "lenses": _panel_lenses(drop_field=("security", "summary")),
-        }
-    )
-    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
-    assert v.passed is True
-    assert v.strategy == "structured-verdict"
-
-
-def test_structured_verdict_non_json_garbage_fails():
-    v = StructuredVerdictStrategy().evaluate(
-        _task("panel_review"), "This PR looks fine to me, approving!"
-    )
-    assert v.passed is False
-    assert "structured verdict" in v.reason.lower()
-    assert "empty" not in v.reason.lower()
-
-
 # ── record_failed_gate ──────────────────────────────────────────────────────
 
 
@@ -706,125 +615,6 @@ def test_grader_prompt_adds_relevance_lens_with_question():
     assert "state of quantum computing" in prompt
     assert "REQUEST START" in prompt
 
-
-# ── parse_safeguard_challenge_outcome ─────────────────────────────────────────
-
-
-def test_parse_safeguard_challenge_outcome_fail_closed_when_not_completed():
-    """completed=False forces 'confirmed' regardless of log content (fail-closed)."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    result = parse_safeguard_challenge_outcome(
-        '{"outcome": "rejected", "reasoning": "false positive"}', completed=False
-    )
-    assert result["outcome"] == "confirmed"
-
-
-def test_parse_safeguard_challenge_outcome_fail_closed_on_none_logs():
-    """None logs → fail-closed 'confirmed'."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    assert parse_safeguard_challenge_outcome(None)["outcome"] == "confirmed"
-
-
-def test_parse_safeguard_challenge_outcome_fail_closed_on_empty_logs():
-    """Empty string logs → fail-closed 'confirmed'."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    assert parse_safeguard_challenge_outcome("")["outcome"] == "confirmed"
-
-
-def test_parse_safeguard_challenge_outcome_fail_closed_on_whitespace_logs():
-    """Whitespace-only logs → fail-closed 'confirmed'."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    assert parse_safeguard_challenge_outcome("   \n  ")["outcome"] == "confirmed"
-
-
-def test_parse_safeguard_challenge_outcome_parses_confirmed():
-    """Valid JSON with outcome='confirmed' is parsed correctly."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    result = parse_safeguard_challenge_outcome(
-        '{"outcome": "confirmed", "reasoning": "real vulnerability"}'
-    )
-    assert result == {"outcome": "confirmed", "reasoning": "real vulnerability"}
-
-
-def test_parse_safeguard_challenge_outcome_parses_rejected():
-    """Valid JSON with outcome='rejected' is parsed and reasoning preserved."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    result = parse_safeguard_challenge_outcome(
-        '{"outcome": "rejected", "reasoning": "false positive, no such function"}'
-    )
-    assert result["outcome"] == "rejected"
-    assert result["reasoning"] == "false positive, no such function"
-
-
-def test_parse_safeguard_challenge_outcome_parses_downgraded():
-    """Valid JSON with outcome='downgraded' is parsed correctly."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    result = parse_safeguard_challenge_outcome(
-        '{"outcome": "downgraded", "reasoning": "severity is medium at most"}'
-    )
-    assert result["outcome"] == "downgraded"
-    assert result["reasoning"] == "severity is medium at most"
-
-
-def test_parse_safeguard_challenge_outcome_fail_closed_on_invalid_outcome_value():
-    """An unrecognised outcome value (not confirmed/rejected/downgraded) → fail-closed."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    result = parse_safeguard_challenge_outcome('{"outcome": "maybe", "reasoning": "unsure"}')
-    assert result["outcome"] == "confirmed"
-
-
-def test_parse_safeguard_challenge_outcome_fail_closed_on_no_outcome_key():
-    """JSON with no 'outcome' key → fail-closed 'confirmed'."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    result = parse_safeguard_challenge_outcome('{"verdict": "rejected", "reasoning": "fp"}')
-    assert result["outcome"] == "confirmed"
-
-
-def test_parse_safeguard_challenge_outcome_truncates_reasoning():
-    """reasoning is capped at 480 characters."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    long_reasoning = "x" * 600
-    result = parse_safeguard_challenge_outcome(
-        json.dumps({"outcome": "rejected", "reasoning": long_reasoning})
-    )
-    assert result["outcome"] == "rejected"
-    assert len(result["reasoning"]) == 480
-
-
-def test_parse_safeguard_challenge_outcome_keyword_fallback_rejected():
-    """Keyword fallback: anchored 'outcome': 'rejected' found in non-JSON text."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    # The brace-scan loop finds {... "outcome": "rejected" ...} with invalid JSON.
-    # Then the keyword fallback detects the anchored pattern.
-    text = 'Analysis complete. "outcome": "rejected" — the finding is a false positive.'
-    result = parse_safeguard_challenge_outcome(text)
-    assert result["outcome"] == "rejected"
-    assert result["reasoning"] == "outcome keyword found (anchored)"
-
-
-def test_parse_safeguard_challenge_outcome_embedded_json_in_prose():
-    """Extracts outcome from a JSON object embedded in surrounding prose."""
-    from app.task_evaluators import parse_safeguard_challenge_outcome
-
-    text = (
-        "After careful review I have concluded the following:\n\n"
-        '{"outcome": "downgraded", "reasoning": "only medium severity"}\n\n'
-        "No further action is needed."
-    )
-    result = parse_safeguard_challenge_outcome(text)
-    assert result["outcome"] == "downgraded"
-    assert result["reasoning"] == "only medium severity"
 
 
 # ── per-finding challenge: prompt builder (read-only, single finding) ─────────

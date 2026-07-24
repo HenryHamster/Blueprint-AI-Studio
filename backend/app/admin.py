@@ -2311,7 +2311,6 @@ class CreateTaskPayload(BaseModel):
             self.task_type
             in (
                 TaskType.review,
-                TaskType.panel_review,
                 TaskType.fix,
             )
             and self.pr_number is None
@@ -2323,7 +2322,6 @@ class CreateTaskPayload(BaseModel):
             self.task_type
             in (
                 TaskType.review,
-                TaskType.panel_review,
                 TaskType.fix,
             )
             and not self.branch
@@ -2542,13 +2540,9 @@ async def create_task_manually(
         )
         session.add(project)
         await session.flush()
-        from app.strategic_resident_checkpointing import (
-            initialize_strategic_resident,
-        )
-
-        await initialize_strategic_resident(
-            session, project.id, locked_project=project
-        )
+        # [RESIDENT-REMOVAL] strategic-resident initialization removed with the
+        # resident subsystem (#15963); project creation no longer bootstraps a
+        # resident session.
         await session.commit()
         await session.refresh(project)
         # Auto-add owner membership
@@ -2586,7 +2580,6 @@ async def create_task_manually(
         payload.task_type
         in (
             TaskType.review,
-            TaskType.panel_review,
             TaskType.fix,
         )
         and payload.pr_number is not None
@@ -2594,7 +2587,7 @@ async def create_task_manually(
     ):
         task_payload["pr_number"] = payload.pr_number
         task_payload["branch"] = payload.branch
-        if payload.task_type in (TaskType.review, TaskType.panel_review):
+        if payload.task_type == TaskType.review:
             task_payload["original_prompt"] = payload.prompt
     # Research tasks auto-include project directions. For ad-hoc manual
     # spawns we ship lightweight direction summaries (id/text/priority/
@@ -3328,13 +3321,9 @@ async def create_compute_experiment_task(
         )
         session.add(project)
         await session.flush()
-        from app.strategic_resident_checkpointing import (
-            initialize_strategic_resident,
-        )
-
-        await initialize_strategic_resident(
-            session, project.id, locked_project=project
-        )
+        # [RESIDENT-REMOVAL] strategic-resident initialization removed with the
+        # resident subsystem (#15963); project creation no longer bootstraps a
+        # resident session.
         await session.commit()
         await session.refresh(project)
         session.add(

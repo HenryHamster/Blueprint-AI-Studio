@@ -16,8 +16,6 @@ function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
 }
 
 const bubbleProps: MessagesListViewProps['bubbleProps'] = {
-  resolvingId: null,
-  resolveInput: '',
   deletingIds: new Set(),
   creatingDirectionIds: new Set(),
   investigatingId: null,
@@ -28,11 +26,7 @@ const bubbleProps: MessagesListViewProps['bubbleProps'] = {
   onToggleSelect: () => { /* no-op */ },
   onCreateDirection: () => { /* no-op */ },
   onCreateInvestigation: () => { /* no-op */ },
-  onResolve: () => { /* no-op */ },
   onDelete: () => { /* no-op */ },
-  onStartResolve: () => { /* no-op */ },
-  onCancelResolve: () => { /* no-op */ },
-  onSetResolveInput: () => { /* no-op */ },
   onStartInvestigate: () => { /* no-op */ },
   onCancelInvestigate: () => { /* no-op */ },
   onReply: () => { /* no-op */ },
@@ -78,7 +72,6 @@ function baseProps(overrides: Partial<MessagesListViewProps> = {}): MessagesList
     setShowTempMuteMenu: () => { /* no-op */ },
     addTemporaryMute: () => { /* no-op */ },
     getTop3NoisyEventTypes: () => [],
-    handleResolveGroup: () => { /* no-op */ },
     handleBulkDeleteResolved: () => { /* no-op */ },
     scrollToBottom: () => { /* no-op */ },
     ...overrides,
@@ -242,6 +235,23 @@ describe('MessagesListView — viewport regression', () => {
         routineExpanded: false,
       }));
     });
+  });
+
+  test('scrollToBottom scrolls to the last row via list API', async () => {
+    const messages = Array.from({ length: 10 }, (_, index) => makeMsg({
+      id: `scroll-test-${index + 1}`,
+      sequence: index + 1,
+      from_type: index % 2 ? 'strategic' : 'user',
+      content: `Scroll message ${index + 1}`,
+      surface: 'conversation',
+    }));
+    const conversationListRef = createRef<ConversationListImperativeApi>();
+    await renderView(baseProps({ presentation: 'conversation', messages, conversationListRef }));
+    await vi.waitFor(() => {
+      expect(conversationListRef.current?.scrollToBottom).toBeDefined();
+    });
+    // Calling scrollToBottom should not throw
+    expect(() => conversationListRef.current?.scrollToBottom()).not.toThrow();
   });
 });
 

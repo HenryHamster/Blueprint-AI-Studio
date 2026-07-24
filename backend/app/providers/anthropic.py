@@ -28,6 +28,49 @@ _USAGE_PROBE_BETA_HEADER = "oauth-2025-04-20"
 _USAGE_PROBE_TIMEOUT_SECONDS = 5.0
 
 
+def _snapshot_from_rate_limit_data(
+    rate_limit_data: dict[str, Any], probed_at: str | None
+) -> UsageSnapshot:
+    """Convert a normalize_rate_limit_data() blob to a UsageSnapshot.
+
+    Maps ``unified_5h`` → ``five_hour`` and ``unified_7d`` → ``seven_day``
+    so the Messages-API header path produces the same window keys used by the
+    OAuth probe path.  Returns unknown when the blob is missing or lacks a
+    numeric five_hour utilization (five_hour is load-bearing; seven_day is
+    additive when present and its absence is documented — the API-key header
+    path may not carry it on all response types).
+    """
+    if not isinstance(rate_limit_data, dict):
+        return UsageSnapshot.unknown(probed_at)
+    entry_5h = rate_limit_data.get("unified_5h")
+    if not isinstance(entry_5h, dict):
+        return UsageSnapshot.unknown(probed_at)
+    util_5h = entry_5h.get("utilization")
+    if isinstance(util_5h, bool) or not isinstance(util_5h, (int, float)):
+        return UsageSnapshot.unknown(probed_at)
+    resets: dict[str, str | None] = {}
+    reset_5h = entry_5h.get("resets_at")
+    if isinstance(reset_5h, str) and reset_5h:
+        resets["five_hour"] = reset_5h
+    window_utilizations: dict[str, float] = {"five_hour": float(util_5h)}
+    # unified_7d is absent from most API-key response types (the header is not
+    # guaranteed); map it additively when present and numeric.
+    entry_7d = rate_limit_data.get("unified_7d")
+    if isinstance(entry_7d, dict):
+        util_7d = entry_7d.get("utilization")
+        if not isinstance(util_7d, bool) and isinstance(util_7d, (int, float)):
+            window_utilizations["seven_day"] = float(util_7d)
+            reset_7d = entry_7d.get("resets_at")
+            resets["seven_day"] = reset_7d if isinstance(reset_7d, str) and reset_7d else None
+    return UsageSnapshot(
+        known=True,
+        window_utilizations=window_utilizations,
+        resets_at=resets,
+        probed_at=probed_at,
+        raw_rate_limit_blob=rate_limit_data,
+    )
+
+
 def _coerce_utilization(raw: Any) -> float | None:
     """Coerce a utilization field to a float, rejecting bools and non-numerics."""
     if isinstance(raw, bool):
@@ -137,13 +180,6 @@ _DEFAULT_TIER_MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
-# TEMPORARY: claude-fable-5 is a limited-availability model (expected window
-# ~2 weeks from 2026-06-09). Removal plan: PATCH the runtime-config max cell
-# back to claude-opus-4-8 FIRST, then drop the enum/set entries here at
-# leisure — enum membership only gates settings writes, and the
-# _MODEL_FALLBACKS entry below keeps any task still pinned to fable
-# requeueing onto opus instead of dying when the model stops resolving.
-
 # Advisor-class model IDs the executor may run as (opus-tier or above).
 # Advisor pairing is gated on this set (an advisor-class executor silently
 # ignores an opus advisor); keeping prior opus versions here means a version
@@ -151,7 +187,6 @@ _DEFAULT_TIER_MODELS = {
 # older opus.
 _OPUS_MODELS: frozenset[str] = frozenset(
     {
-        "claude-fable-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
     }
@@ -165,7 +200,6 @@ _OPUS_MODELS: frozenset[str] = frozenset(
 # model can't use it.
 _1M_CONTEXT_MODELS: frozenset[str] = frozenset(
     {
-        "claude-fable-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
@@ -179,9 +213,8 @@ _1M_CONTEXT_MODELS: frozenset[str] = frozenset(
 # Used by the dispatcher when no pool account can run the requested model
 # (e.g. plan doesn't include it, or the provider retires it): the task
 # requeues on the GA counterpart with the downgrade recorded on task.context.
-# This is also the removal-safety net for temporary models like fable — see
-# the TEMPORARY note above.
 _MODEL_FALLBACKS: dict[str, str] = {
+    # Safety net for in-flight tasks still carrying the retired fable-5 model id.
     "claude-fable-5": "claude-opus-4-8",
 }
 
@@ -257,21 +290,25 @@ class AnthropicProvider(LLMProvider):
         auth_mode: LLMAuthMode,
         provider_metadata: Mapping[str, Any] | None = None,
     ) -> UsageSnapshot:
-        """Probe the OAuth usage-headroom endpoint. Advisory; never raises.
+        """Probe for usage-headroom data. Advisory; never raises.
 
-        Only OAuth accounts have this source; API-key auth has no equivalent
-        usage endpoint, so it resolves to unknown. Any HTTP/auth/timeout error
-        or schema drift also resolves to unknown so a probe failure can never
+        OAuth accounts probe the /api/oauth/usage endpoint.
+        API-key accounts make a minimal messages.create call to capture
+        rate-limit headers from the response.  Any HTTP/auth/timeout error
+        or schema drift resolves to unknown so a probe failure can never
         block, delay, or fail a claim.
         """
         self.ensure_supported_auth_mode(auth_mode)
-        if auth_mode != LLMAuthMode.OAUTH or not secret:
+        if not secret:
             return UsageSnapshot.unknown()
-        # Stamp probed_at locally so the snapshot is timestamped even on the
-        # failure path (the cache uses its own wall-clock TTL separately).
         from app.time_utils import _utcnow
 
         probed_at = _utcnow().isoformat()
+        if auth_mode == LLMAuthMode.API_KEY:
+            return await self._probe_usage_api_key(secret, probed_at)
+        if auth_mode != LLMAuthMode.OAUTH:
+            return UsageSnapshot.unknown()
+        # Stamp probed_at already set above for API_KEY path; re-use here.
         try:
             import httpx
         except ImportError:
@@ -297,6 +334,34 @@ class AnthropicProvider(LLMProvider):
             return UsageSnapshot.unknown(probed_at)
         return _normalize_anthropic_usage(data, probed_at)
 
+    async def _probe_usage_api_key(
+        self, api_key: str, probed_at: str
+    ) -> UsageSnapshot:
+        """Probe usage via a minimal messages.create call for API-key accounts.
+
+        Makes a 1-token completion solely to capture the rate-limit headers
+        returned by every Anthropic Messages API response. Advisory and
+        never-raises — any error resolves to unknown.
+        """
+        try:
+            from app.direct_llm_client import call_direct_llm
+        except ImportError:
+            logger.warning("[ANTHROPIC] direct_llm_client unavailable; skipping API-key usage probe")
+            return UsageSnapshot.unknown(probed_at)
+        try:
+            _text, rate_limit_data = await call_direct_llm(
+                api_key,
+                messages=[{"role": "user", "content": "1"}],
+                max_tokens=1,
+                timeout=_USAGE_PROBE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 — unknown is the contract
+            logger.info(
+                "[ANTHROPIC] API-key usage probe failed: %s (returning unknown)", exc
+            )
+            return UsageSnapshot.unknown(probed_at)
+        return _snapshot_from_rate_limit_data(rate_limit_data, probed_at)
+
     def settings_schema(self) -> dict[str, Any]:
         # Permission mode is intentionally NOT exposed: anything other than
         # bypassPermissions stalls the agent VM waiting on an approval that
@@ -308,7 +373,6 @@ class AnthropicProvider(LLMProvider):
                 "model": {
                     "type": "string",
                     "enum": [
-                        "claude-fable-5",
                         "claude-opus-4-8",
                         "claude-opus-4-7",
                         "claude-sonnet-5",
@@ -317,9 +381,7 @@ class AnthropicProvider(LLMProvider):
                     ],
                     "description": (
                         "Concrete model. Leave blank to inherit the tier mapping from "
-                        "provider_tier_model_map. claude-fable-5 is TEMPORARY "
-                        "(limited availability) — pair it with fallback_model so "
-                        "tasks survive its retirement."
+                        "provider_tier_model_map."
                     ),
                 },
                 "effort": {
@@ -338,7 +400,7 @@ class AnthropicProvider(LLMProvider):
                     "description": (
                         "Opt into the 1M-token context window. Appends `[1m]` to "
                         "the model ID so Claude Code routes to the 1M variant. "
-                        "Requires fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-5, "
+                        "Requires opus-4-8, opus-4-7, opus-4-6, sonnet-5, "
                         "or sonnet-4-6 — haiku ignores the suffix (we drop it with "
                         "an unsupported marker). 1M costs more and is only worth it "
                         "when the prompt or exploration genuinely needs the extra "
@@ -358,7 +420,6 @@ class AnthropicProvider(LLMProvider):
                 "fallback_model": {
                     "type": "string",
                     "enum": [
-                        "claude-fable-5",
                         "claude-opus-4-8",
                         "claude-opus-4-7",
                         "claude-sonnet-5",
@@ -425,7 +486,7 @@ class AnthropicProvider(LLMProvider):
             elif use_1m:
                 unsupported.append(
                     f"use_1m_context=true requires a 1M-capable model "
-                    f"(fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-5, sonnet-4-6); "
+                    f"(opus-4-8, opus-4-7, opus-4-6, sonnet-5, sonnet-4-6); "
                     f"effective model {model!r} — suffix dropped, plain --model sent"
                 )
                 args += ["--model", model]

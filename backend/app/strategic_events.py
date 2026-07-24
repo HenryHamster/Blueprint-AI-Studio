@@ -34,16 +34,16 @@ from app.workbench_events import (
 STRATEGIC_CYCLE_STARTED = "strategic_cycle_started"
 STRATEGIC_CYCLE_COMPLETED = "strategic_cycle_completed"
 STRATEGIC_UPDATED = "strategic_updated"
-# Resident strategic-session live transcript delta (warm standing agent). Each
+# Strategic-session live transcript delta. Each
 # emission is one coarsened per-sentence / per-turn chunk streamed to the operator
 # chat. Contract with admin-ui/src/hooks/useLogViewer.ts — do not rename.
 STRATEGIC_SESSION = "strategic_session"
 
 # Allowed ``kind`` values for a ``strategic_session`` delta. Scopes what the
-# resident agent may stream: chunk of reasoning, an applied strategic action, a
+# strategic agent may stream: chunk of reasoning, an applied strategic action, a
 # tool call, a lifecycle status line, or an assistant message. The five
 # "activity" kinds (command / file / read / subagent / tool_result) are the
-# compact one-liners the resident handler emits for the LIVE, ephemeral activity
+# compact one-liners the handler emits for the LIVE, ephemeral activity
 # strip (a Bash command, a file edit, a read, a spawned sub-agent, a tool
 # result); they are never persisted (only ``message`` reaches the durable
 # transcript, and only as a ProjectMessage — never via this event).
@@ -480,7 +480,7 @@ async def emit_strategic_session_delta(
     project_id,
     payload: Mapping[str, Any] | None,
 ) -> None:
-    """Broadcast one resident-session transcript delta (post-commit).
+    """Broadcast one strategic-session transcript delta (post-commit).
 
     ``payload`` carries ``{ session_id, task_id, seq, kind, text, ts }`` where
     ``kind`` is one of reasoning / action / tool / status / message. ``text`` is

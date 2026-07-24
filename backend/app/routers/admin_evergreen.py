@@ -178,34 +178,52 @@ async def get_observe_mode_verdict(
 
 @router.get("/structural-health-observability")
 async def get_structural_health(
+    window_hours: int = Query(24, ge=1, le=168),
     current_user: dict = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
 ) -> Dict[str, Any]:
-    """Bounded in-memory structural-health audit measurements + decisions.
+    """Structural-health audit observability — in-memory snapshot + durable DB aggregate.
 
     Surfaces the recurring resource/scalability audit's view: the largest
     measured ``task.context`` rows, the most-recent per-cycle decision, and a
-    bounded ring of recent decisions. Structural findings flow into the same
-    evergreen ledger (see the backlog endpoints above), so the audit's
-    observability lives alongside the fill observability here rather than in a
-    parallel surface.
+    bounded ring of recent decisions (in-memory), PLUS a durable cross-deploy
+    aggregate from the AuditLaneDecisionLog table (tripped_count / cycles over
+    the trailing window_hours, surviving process restarts).
     """
-    from app.structural_health_audit import get_structural_health_observability
+    from app.structural_health_audit import (
+        get_structural_health_observability,
+        get_structural_health_observability_from_db,
+    )
 
-    return get_structural_health_observability()
+    snapshot = get_structural_health_observability()
+    db_obs = await get_structural_health_observability_from_db(
+        session, window_hours=window_hours
+    )
+    snapshot["observe_window_db"] = db_obs
+    return snapshot
 
 
 @router.get("/metrics-integrity-observability")
 async def get_metrics_integrity(
+    window_hours: int = Query(24, ge=1, le=168),
     current_user: dict = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
 ) -> Dict[str, Any]:
-    """Bounded in-memory metrics-integrity sweep recent-results snapshot.
+    """Metrics-integrity sweep observability — in-memory snapshot + durable DB aggregate.
 
     Surfaces the standing self-audit's view: recent ticks, the most-recent tick's
-    flags, and lifetime counters (flags/errors/enrolled). The sweep recomputes
-    selected self-reported counters from ground truth and flags drift WITHOUT
-    mutating the audited source; enforce-mode drift findings flow into the same
-    evergreen ledger surfaced by the backlog endpoints above.
+    flags, and lifetime counters (flags/errors/enrolled) from the in-memory ring,
+    PLUS a durable cross-deploy aggregate from the AuditLaneDecisionLog table
+    (tripped_count / ticks over the trailing window_hours, surviving process restarts).
     """
-    from app.metrics_integrity_sweep import get_metrics_integrity_observability
+    from app.metrics_integrity_sweep import (
+        get_metrics_integrity_observability,
+        get_metrics_integrity_observability_from_db,
+    )
 
-    return get_metrics_integrity_observability()
+    snapshot = get_metrics_integrity_observability()
+    db_obs = await get_metrics_integrity_observability_from_db(
+        session, window_hours=window_hours
+    )
+    snapshot["observe_window_db"] = db_obs
+    return snapshot

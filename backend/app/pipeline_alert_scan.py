@@ -38,10 +38,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.project_telemetry import read_telemetry_or_doc as _read_telemetry_or_doc
 from app.models import (
     Alert,
     AlertSeverity,
     Project,
+    ProjectSRAnalytics,
     Task,
     TaskStatus,
 )
@@ -135,10 +137,14 @@ async def _run_signal_staleness_watchdog(
     doc = project_design_doc or {}
     now = _utcnow()
     windows = _SIGNAL_STALENESS_WINDOWS
+    _sr_catch_rate_trends = (
+        await _read_telemetry_or_doc(session, project_id, doc, "sr_catch_rate_trends")
+        or {}
+    )
     specs: list[tuple[str, Any, timedelta]] = [
         (
             "sr_catch_rate",
-            (doc.get("sr_catch_rate_trends") or {}).get("last_sufficient_computed_at"),
+            _sr_catch_rate_trends.get("last_sufficient_computed_at"),
             windows["sr_catch_rate"],
         ),
         (
@@ -185,11 +191,12 @@ async def _run_signal_staleness_watchdog(
                     severity=AlertSeverity.WARNING,
                     title=title,
                     message=message,
+                    event_type="sr.signal_stale",
                 )
             )
             created += 1
     # Frozen-signal sub-alert: heartbeat is fresh but the real data is stale.
-    sr_trends = doc.get("sr_catch_rate_trends") or {}
+    sr_trends = _sr_catch_rate_trends
     signal_ts = sr_trends.get("signal_last_computed_at")
     sufficient_ts = sr_trends.get("last_sufficient_computed_at")
     if signal_ts and sufficient_ts:
@@ -215,6 +222,7 @@ async def _run_signal_staleness_watchdog(
                         severity=AlertSeverity.WARNING,
                         title=title,
                         message=message,
+                        event_type="sr.signal_stale",
                     )
                 )
                 created += 1
@@ -304,6 +312,7 @@ async def _emit_agent_vm_resource_alert(
             severity=AlertSeverity.WARNING,
             title=title,
             message=message[:1000],
+            event_type="vm.low_memory",
         )
     )
     return 1
@@ -362,6 +371,7 @@ async def _emit_pipeline_success_rate_alert(
             severity=AlertSeverity.WARNING,
             title=title,
             message=message[:1000],
+            event_type="task.failed",
         )
     )
     return 1
@@ -384,7 +394,12 @@ async def run_pipeline_alert_scan_once(
     project = await session.get(Project, project_id)
     if project is None:
         return 0
-    design_doc = project.design_doc
+    _pas_sr_row = await session.get(ProjectSRAnalytics, project_id)
+    _pas_sr_data = _pas_sr_row.data if _pas_sr_row else None
+    # _pas_sr_data is the ProjectSRAnalytics row (canonical source for SR analytics
+    # keys) or None. When the dedicated table has data, prefer it; fall back to the
+    # design_doc God-column for projects that haven't been migrated yet.
+    sr_data_or_design_doc = _pas_sr_data or (project.design_doc or {})
 
     created = 0
     emitters: list[tuple[str, Any]] = [
@@ -397,7 +412,7 @@ async def run_pipeline_alert_scan_once(
     for name, fn in emitters:
         try:
             if name == "signal_staleness":
-                added = await fn(session, project_id, design_doc) or 0
+                added = await fn(session, project_id, sr_data_or_design_doc) or 0
                 await session.commit()
                 created += added
             elif name in ("sr_catch_rate_targets", "lone_checker"):

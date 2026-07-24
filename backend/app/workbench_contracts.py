@@ -174,6 +174,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
     "legacy_compatibility": (
         "backend/app/admin_task_mutations.py",
         "backend/app/agent_status_spawn.py",
+        "backend/app/routers/agent_strategic_messages.py",
         "backend/app/alert_dispatch.py",
         "backend/app/alert_policy.py",
         "backend/app/autonomous_research.py",
@@ -189,6 +190,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/knowledge_completion.py",
         "backend/app/message_supersession.py",
         "backend/app/monthly_budget_alerts.py",
+        "backend/app/operator_inbox_liveness.py",
         "backend/app/orchestrator.py",
         "backend/app/orchestrator_ci_monitor.py",
         "backend/app/orchestrator_provision.py",
@@ -208,13 +210,12 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/recovery_post_commit_orphans.py",
         "backend/app/research_direction_state.py",
         "backend/app/strategic_completion.py",
-        "backend/app/strategic_resident_realtime.py",
-        "backend/app/strategic_resident_terminal.py",
         "backend/app/review_pipeline.py",
         "backend/app/rollup_management.py",
         "backend/app/routers/admin_agent_ops.py",
         "backend/app/routers/admin_debug.py",
         "backend/app/routers/admin_notifications.py",
+        "backend/app/routers/agent_strategic_messages.py",
         "backend/app/routers/admin_project_strategic_session.py",
         "backend/app/routers/agent.py",
         "backend/app/routers/agent_status.py",
@@ -949,8 +950,7 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
                     # Mirrors the live continuation status default, which now reads
                     # the ``strategic_continuation_ttl_seconds`` runtime setting
                     # (default 1500s / 25 min) — REPLACES the old hardcoded 12h
-                    # (43200) wall that the resident-session dead-man's switch
-                    # removed.
+                    # (43200) wall that the dead-man's switch removed.
                     "ttl_seconds": 1500,
                     "updated_at": None,
                 },

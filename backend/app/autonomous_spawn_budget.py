@@ -337,6 +337,58 @@ async def compute_autonomous_spawn_budget_snapshot(
     )
 
 
+async def compute_autonomous_spawn_budget_counterfactual(
+    session: AsyncSession,
+    *,
+    runtime_config: Mapping[str, Any],
+    now: datetime | None = None,
+    window: timedelta = timedelta(hours=24),
+) -> dict[str, Any]:
+    """Compute the observe-mode counterfactual for ``autonomous_spawn_budget_mode``.
+
+    This is the MEASURED evidence the shared mode-knob graduation harness
+    (:mod:`app.mode_knob_graduation`) consumes to decide GRADUATE / CUT / HOLD for
+    the initiative spawn-budget knob.  It answers "if the tighter initiative cap
+    were flipped to ``enforce`` over the trailing window, how often would it have
+    actually bound?" — the real signal that the enforce branch has lift.
+
+    Delegates the accounting to :func:`compute_autonomous_spawn_budget_snapshot`
+    (the single classification source of truth) and derives, without mutating any
+    counter:
+
+    * ``initiative_count`` / ``servicing_count`` / ``other_count`` / ``total_count``
+    * ``initiative_cap`` / ``initiative_headroom``
+    * ``would_have_blocked`` — how many initiative spawns exceeded the cap in the
+      window (``max(0, initiative_count - initiative_cap)``); the count the enforce
+      branch WOULD have blocked
+    * ``pressure`` — ``initiative_count / initiative_cap`` (the scalar graduation
+      signal compared against thresholds), or ``None`` when the cap is zero so the
+      ratio is undefined and the harness must HOLD rather than divide by zero.
+
+    Read-only and bounded (inherits the snapshot query's bounds).
+    """
+    snapshot = await compute_autonomous_spawn_budget_snapshot(
+        session, runtime_config=runtime_config, now=now, window=window
+    )
+    initiative_cap = snapshot.initiative_cap
+    would_have_blocked = max(0, snapshot.initiative_count - initiative_cap)
+    pressure = (
+        snapshot.initiative_count / initiative_cap if initiative_cap > 0 else None
+    )
+    return {
+        "mode": snapshot.mode,
+        "window_hours": window.total_seconds() / 3600.0,
+        "initiative_count": snapshot.initiative_count,
+        "servicing_count": snapshot.servicing_count,
+        "other_count": snapshot.other_count,
+        "total_count": snapshot.total_count,
+        "initiative_cap": initiative_cap,
+        "initiative_headroom": snapshot.initiative_headroom,
+        "would_have_blocked": would_have_blocked,
+        "pressure": pressure,
+    }
+
+
 def build_autonomous_spawn_budget_guard(
     *,
     snapshot: AutonomousSpawnBudgetSnapshot,

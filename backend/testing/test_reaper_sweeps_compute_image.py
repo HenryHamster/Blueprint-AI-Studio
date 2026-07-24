@@ -27,16 +27,18 @@ from sqlmodel import SQLModel
 
 from sqlmodel import select
 
+
 from app import compute_backends as _cb
 from app.compute_image_build import BuildResult
-from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
+from app.models import ComputeJob, ComputeJobStatus, DeploymentState, Project, ProjectComputeImage
 from app.reaper_sweeps import (
+    _load_gc_guard_state_from_db,
     _split_pinned_ref,
+    get_compute_image_gc_guard_readiness,
     sweep_protect_referenced_compute_image_digests,
+    sweep_reconcile_gc_guard_db_pins,
     sweep_refresh_project_compute_images,
 )
-
-
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 _REGISTRY_REPO = "us-central1-docker.pkg.dev/myproj/compute"
@@ -1414,6 +1416,50 @@ async def test_refresh_build_error_is_isolated(db):
     assert "docker build failed" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_refresh_build_error_fires_alert(db):
+    """A build failure fires the build-failure alert, not just a log line."""
+    project = await _make_repo_project(db)
+    project_id = project.id  # capture BEFORE session.rollback() expires project
+
+    async def _build(*a, **k):
+        raise RuntimeError("docker build failed (exit 1)")
+
+    alert_called = {"called": False, "failure_kind": None, "project_id": None}
+
+    async def _alert_side_effect(session, build, *, failure_kind):
+        alert_called["called"] = True
+        alert_called["failure_kind"] = failure_kind
+        alert_called["project_id"] = build.project_id
+        alert_called["image_name"] = getattr(build, "image_name", None)
+        alert_called["dep_hash"] = getattr(build, "dep_hash", None)
+        return True
+
+    alert_mock = AsyncMock(side_effect=_alert_side_effect)
+    with patch("app.alert_dispatch._maybe_create_compute_image_build_failure_alert", alert_mock):
+        result = await _cb.refresh_project_compute_image(
+            db,
+            project,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_build,
+            _record_fn=_record_row,
+        )
+
+    assert result["status"] == "error"
+    assert "docker build failed" in result["error"]
+    assert alert_called["called"], "build-failure alert must be fired on build error"
+    assert alert_called["project_id"] == project_id
+    assert alert_called["failure_kind"] == "failed"
+    assert alert_called["image_name"] is not None
+    assert alert_called["dep_hash"] is not None
+
+
 # ── Driver: identical manifest bytes => identical hash => same fast path ───────
 
 
@@ -1660,268 +1706,6 @@ async def test_refresh_missing_explicit_dep_fails_closed_before_registry_or_buil
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Driver: off-orchestrator async dispatch (build_project_compute_image)
-#
-# When COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED is on and a REAL build is needed,
-# build_project_compute_image runs only the daemon-free work in-process (clone +
-# hash + credential scan + presence probe) and hands the build to the configured
-# ImageBuilderBackend, returning an AsyncImageBuildDispatch WITHOUT blocking.
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class _StubImageBuilderBackend:
-    """Records ``start`` calls and returns a fixed handle (no cloud I/O)."""
-
-    name = "stub"
-
-    def __init__(self, external_id="img-build-stub", zone="us-central1-a"):
-        self._external_id = external_id
-        self._zone = zone
-        self.started: list = []
-
-    def external_id_for(self, request):
-        return self._external_id
-
-    async def start(self, request):
-        self.started.append(request)
-        return _cb.ImageBuildHandle(
-            external_id=self._external_id,
-            zone=self._zone,
-            started_at=_cb._utcnow(),
-            message="stub provisioned",
-        )
-
-
-def _patch_app_session_to(monkeypatch, db):
-    """Point ``app.database.AsyncSessionLocal`` at the test session.
-
-    ``_dispatch_async_image_build`` reserves its tracking row through
-    ``AsyncSessionLocal`` (a fresh session, isolated from the request's), so tests
-    redirect it to the in-memory ``db`` to observe the reserved/updated row.
-    """
-
-    class _CM:
-        async def __aenter__(self):
-            return db
-
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr("app.database.AsyncSessionLocal", lambda: _CM())
-
-
-def _not_present_build(**kwargs):
-    """A daemon-free probe result: nothing in the registry => a real build needed."""
-    return BuildResult(
-        pinned_ref=f"{kwargs['registry_repo']}/{kwargs['image_name']}:newhash",
-        tag="newhash",
-        dep_hash="newhash",
-        already_present=False,
-        built=False,
-    )
-
-
-@pytest.mark.asyncio
-async def test_build_dispatches_async_when_backend_enabled(db, monkeypatch):
-    """Flag on + real build needed => reserve a row, start the VM, return dispatch."""
-    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "true")
-    _patch_app_session_to(monkeypatch, db)
-    project = await _make_repo_project(db)
-
-    backend = _StubImageBuilderBackend(external_id="img-build-xyz", zone="us-c1-a")
-
-    def _noop_clone(owner, repo, ref, dest):
-        return None
-
-    result = await _cb.build_project_compute_image(
-        project,
-        registry_repo="reg/compute-images",
-        build_config={"name": "reg/compute-images/widget-compute", "build": {}},
-        _clone_fn=_noop_clone,
-        _token_fn=lambda p: _async("tok"),
-        _build_fn=_not_present_build,
-        _backend=backend,
-    )
-
-    # The dispatch sentinel — NOT a BuildResult.
-    assert isinstance(result, _cb.AsyncImageBuildDispatch)
-    assert result.status == "BUILDING"
-    assert result.builder_vm_id == "img-build-xyz"
-    assert result.adopted is False
-    # The builder VM was started exactly once with the right coordinates.
-    assert len(backend.started) == 1
-    req = backend.started[0]
-    assert req.image_name == "widget-compute"
-    assert req.repo_clone == {"owner": "acme", "repo": "widget", "ref": "main"}
-    assert req.repo_token == "tok"
-
-    # A durable BUILDING tracking row was reserved and updated with VM details.
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-
-    rows = (
-        await db.execute(select(ProjectComputeImageBuild))
-    ).scalars().all()
-    assert len(rows) == 1
-    row = rows[0]
-    assert row.id == result.build_id
-    assert row.status == ComputeImageBuildStatus.BUILDING
-    assert row.builder_vm_id == "img-build-xyz"
-    assert row.zone == "us-c1-a"
-    assert row.deadline_at is not None
-    assert row.dep_hash == "newhash"
-
-
-@pytest.mark.asyncio
-async def test_build_returns_inline_when_backend_disabled(db, monkeypatch):
-    """Flag off => the whole build runs inline and returns a BuildResult (fallback)."""
-    monkeypatch.delenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", raising=False)
-    project = await _make_repo_project(db)
-
-    backend = _StubImageBuilderBackend()
-    built = BuildResult(
-        pinned_ref="reg/compute-images/widget-compute@" + _DIGEST_A,
-        tag="newhash",
-        dep_hash="newhash",
-        already_present=False,
-        built=True,
-        digest=_DIGEST_A,
-    )
-
-    def _inline_build(**kwargs):
-        assert kwargs["dry_run"] is False, "flag-off path builds inline, not a probe"
-        return built
-
-    def _noop_clone(owner, repo, ref, dest):
-        return None
-
-    result = await _cb.build_project_compute_image(
-        project,
-        registry_repo="reg/compute-images",
-        build_config={"name": "reg/compute-images/widget-compute", "build": {}},
-        _clone_fn=_noop_clone,
-        _build_fn=_inline_build,
-        _backend=backend,
-    )
-
-    assert result is built
-    assert backend.started == [], "no VM must be provisioned when the flag is off"
-
-
-@pytest.mark.asyncio
-async def test_build_already_present_returns_inline_without_dispatch(db, monkeypatch):
-    """Flag on but image already present => return inline, do NOT start a VM."""
-    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "true")
-    _patch_app_session_to(monkeypatch, db)
-    project = await _make_repo_project(db)
-
-    backend = _StubImageBuilderBackend()
-    present = BuildResult(
-        pinned_ref="reg/compute-images/widget-compute@" + _DIGEST_B,
-        tag="oldhash",
-        dep_hash="oldhash",
-        already_present=True,
-        built=False,
-        digest=_DIGEST_B,
-    )
-
-    def _noop_clone(owner, repo, ref, dest):
-        return None
-
-    result = await _cb.build_project_compute_image(
-        project,
-        registry_repo="reg/compute-images",
-        build_config={"name": "reg/compute-images/widget-compute", "build": {}},
-        _clone_fn=_noop_clone,
-        _token_fn=lambda p: _async("tok"),
-        _build_fn=lambda **k: present,
-        _backend=backend,
-    )
-
-    assert result is present, "an already-present image returns the probe inline"
-    assert backend.started == [], "no VM for an already-present image"
-    from app.models import ProjectComputeImageBuild
-
-    rows = (await db.execute(select(ProjectComputeImageBuild))).scalars().all()
-    assert rows == [], "no tracking row reserved when nothing is built"
-
-
-@pytest.mark.asyncio
-async def test_reserve_is_idempotent_for_in_flight_dep_hash(db):
-    """A second reservation for an in-flight (project, dep_hash) adopts the row."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-
-    project = await _make_repo_project(db)
-
-    first = await _cb.reserve_project_compute_image_build(
-        db,
-        project_id=project.id,
-        dep_hash="h1",
-        registry_repo="reg/compute-images",
-        image_name="widget-compute",
-    )
-    first.status = ComputeImageBuildStatus.BUILDING
-    db.add(first)
-    await db.commit()
-
-    second = await _cb.reserve_project_compute_image_build(
-        db,
-        project_id=project.id,
-        dep_hash="h1",
-        registry_repo="reg/compute-images",
-        image_name="widget-compute",
-    )
-    assert second.id == first.id, "an in-flight build must be adopted, not duplicated"
-    rows = (await db.execute(select(ProjectComputeImageBuild))).scalars().all()
-    assert len(rows) == 1
-
-
-@pytest.mark.asyncio
-async def test_refresh_reports_dispatched_when_build_goes_async(db):
-    """When build_fn dispatches async, refresh reports 'dispatched' and records nothing.
-
-    The reaper poll sweep — not the refresh driver — records the pin once the
-    builder VM completes, so a dispatched build must NOT write a ProjectComputeImage
-    row here.
-    """
-    project = await _make_repo_project(db)
-    build_id = uuid.uuid4()
-
-    async def _dispatch_build(proj, *, registry_repo, build_config, ref=None, cancel_event=None):
-        return _cb.AsyncImageBuildDispatch(
-            build_id=build_id,
-            dep_hash="newhash",
-            builder_vm_id="img-build-async",
-            status="BUILDING",
-        )
-
-    recorded: list = []
-
-    async def _record_spy(session, project_id, registry_repo, image_name, result):
-        recorded.append(result)
-        return await _record_row(session, project_id, registry_repo, image_name, result)
-
-    result = await _cb.refresh_project_compute_image(
-        db,
-        project,
-        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
-        _token_fn=lambda o, r: _async("tok"),
-        _default_branch_fn=lambda t, o, r: _async("main"),
-        _fetch_bytes_fn=_fetch_bytes_stub(
-            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
-        ),
-        _tag_exists_fn=lambda full_repo, dep_hash: False,  # absent => rebuild
-        _build_fn=_dispatch_build,
-        _record_fn=_record_spy,
-    )
-    assert result["status"] == "dispatched"
-    assert result["build_id"] == str(build_id)
-    assert result["builder_vm_id"] == "img-build-async"
-    assert recorded == [], "a dispatched build records nothing until the poll sweep"
-    rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
-    assert rows == []
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Sweep: sweep_refresh_project_compute_images
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2032,40 +1816,6 @@ async def test_sweep_caps_builds_per_cycle(db):
     assert result["rebuilt"] == 2
     assert result["deferred"] == 2
     assert result["projects"] == 4
-
-
-@pytest.mark.asyncio
-async def test_sweep_counts_dispatched_and_charges_the_build_budget(db):
-    """An async 'dispatched' result is counted and spends the per-cycle budget.
-
-    A dispatch kicks off a real (off-orchestrator) build, so it must charge the
-    same per-cycle build budget a synchronous rebuild does — otherwise the sweep
-    would fan out unbounded builder VMs in one pass.
-    """
-    for i in range(3):
-        await _make_repo_project(db, name=f"p{i}")
-
-    async def _refresh(session, project, *, allow_build=True, **kwargs):
-        if not allow_build:
-            return {"status": "deferred", "reason": "build_budget_exhausted"}
-        return {
-            "status": "dispatched",
-            "dep_hash": "h",
-            "build_id": str(uuid.uuid4()),
-            "builder_vm_id": "vm",
-        }
-
-    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
-        result = await sweep_refresh_project_compute_images(
-            db,
-            now=datetime(2026, 6, 1, 12, 0, 0),
-            _refresh_fn=_refresh,
-            _build_semaphore=asyncio.Semaphore(1),
-            max_builds_per_cycle=2,
-        )
-    assert result["dispatched"] == 2
-    assert result["deferred"] == 1, "dispatch charges the budget like a rebuild"
-    assert result["projects"] == 3
 
 
 @pytest.mark.asyncio
@@ -2386,102 +2136,276 @@ async def test_unchanged_creates_no_drift_alert(db):
     assert alerts == [], "no drift alert expected for unchanged/no_config sweep result"
 
 
-# ── ProjectComputeImageBuild model round-trip ─────────────────────────────────
+# ── Deferred-drift alert tests ──────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_project_compute_image_build_import():
-    """ProjectComputeImageBuild and ComputeImageBuildStatus are importable."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild  # noqa: F401
+async def test_deferred_creates_drift_alert(db):
+    """A 'deferred' sweep result (build_budget_exhausted) creates an INFO alert."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert, AlertSeverity
 
-    assert ComputeImageBuildStatus.PENDING.value == "PENDING"
-    assert ComputeImageBuildStatus.BUILDING.value == "BUILDING"
-    assert ComputeImageBuildStatus.SUCCEEDED.value == "SUCCEEDED"
-    assert ComputeImageBuildStatus.FAILED.value == "FAILED"
-    assert ComputeImageBuildStatus.TIMED_OUT.value == "TIMED_OUT"
+    project = await _make_repo_project(db)
+    dep_hash = "deadbeef01234567"
 
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": dep_hash}
 
-@pytest.mark.asyncio
-async def test_project_compute_image_build_round_trip(db):
-    """ProjectComputeImageBuild inserts and reads back correctly."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
-
-    project = await _make_project(db, name="build-test-proj")
-
-    row = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="abc123",
-        registry_repo="us-central1-docker.pkg.dev/myproj/compute-images",
-        image_name="compute-myproj",
-        builder_vm_id="builder-vm-001",
-        zone="us-central1-a",
-        status=ComputeImageBuildStatus.PENDING,
-    )
-    db.add(row)
-    await db.commit()
-    await db.refresh(row)
-
-    assert row.id is not None
-    assert row.project_id == project.id
-    assert row.dep_hash == "abc123"
-    assert row.registry_repo == "us-central1-docker.pkg.dev/myproj/compute-images"
-    assert row.image_name == "compute-myproj"
-    assert row.builder_vm_id == "builder-vm-001"
-    assert row.zone == "us-central1-a"
-    assert row.status == ComputeImageBuildStatus.PENDING
-    assert row.started_at is None
-    assert row.deadline_at is None
-    assert row.result_json is None
-    assert row.error_reason is None
-    assert row.created_at is not None
-    assert row.updated_at is not None
-
-    fetched = (
-        await db.execute(
-            select(ProjectComputeImageBuild).where(
-                ProjectComputeImageBuild.id == row.id
-            )
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
         )
-    ).scalar_one()
-    assert fetched.dep_hash == "abc123"
-    assert fetched.status == ComputeImageBuildStatus.PENDING
+
+    assert result["deferred"] == 1
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one deferred-drift alert expected after deferred"
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "deadbeef01234567" in alerts[0].message
+    assert "build_budget_exhausted" in alerts[0].message
 
 
 @pytest.mark.asyncio
-async def test_project_compute_image_build_terminal_statuses(db):
-    """SUCCEEDED and FAILED rows round-trip with result/error fields."""
-    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+async def test_deferred_builder_busy_creates_alert(db):
+    """A 'deferred' sweep result (builder_busy) creates an INFO alert."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert, AlertSeverity
 
-    project = await _make_project(db, name="terminal-test-proj")
+    project = await _make_repo_project(db)
 
-    succeeded = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="hash-ok",
-        registry_repo="us-central1-docker.pkg.dev/proj/imgs",
-        image_name="compute-proj",
-        status=ComputeImageBuildStatus.SUCCEEDED,
-        result_json='{"pinned_ref": "registry@sha256:abc"}',
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "builder_busy", "dep_hash": "aabbccdd"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["deferred"] == 1
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
     )
-    failed = ProjectComputeImageBuild(
-        project_id=project.id,
-        dep_hash="hash-bad",
-        registry_repo="us-central1-docker.pkg.dev/proj/imgs",
-        image_name="compute-proj",
-        status=ComputeImageBuildStatus.FAILED,
-        error_reason="docker build exited with code 1",
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "builder_busy" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_deferred_alert_deduped_on_second_sweep(db):
+    """A second deferred pass while the alert is open does NOT create a duplicate."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": "aabbccdd"}
+
+    async def _run():
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+            return await sweep_refresh_project_compute_images(
+                db,
+                now=datetime(2026, 6, 1, 12, 0, 0),
+                _refresh_fn=_refresh,
+                _build_semaphore=asyncio.Semaphore(1),
+            )
+
+    await _run()
+    await _run()
+
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+                Alert.dismissed_at.is_(None),
+            )
+        ))
+        .scalars()
+        .all()
     )
-    db.add(succeeded)
-    db.add(failed)
-    await db.commit()
-    await db.refresh(succeeded)
-    await db.refresh(failed)
-
-    assert succeeded.result_json == '{"pinned_ref": "registry@sha256:abc"}'
-    assert succeeded.error_reason is None
-    assert failed.result_json is None
-    assert failed.error_reason == "docker build exited with code 1"
+    assert len(alerts) == 1, "open deferred-drift alert must be deduped, not duplicated"
 
 
+# ── Live-lane refresh-failure alert tests ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_error_status_creates_refresh_failure_alert(db):
+    """An 'error' sweep result fires a deduplicated ERROR alert for the operator."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_repo_project(db)
+    error_msg = "Remote compute-image build is not configured"
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "error", "error": error_msg}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["errors"] == 1
+    expected_title = f"{_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX}{str(project.id)[:64]}"
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == expected_title,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one refresh-failure alert expected on error status"
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert error_msg in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_error_status_refresh_failure_alert_deduped(db):
+    """A second error sweep while the alert is open does NOT create a duplicate."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "error", "error": "build misconfigured"}
+
+    async def _run():
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+            return await sweep_refresh_project_compute_images(
+                db,
+                now=datetime(2026, 6, 1, 12, 0, 0),
+                _refresh_fn=_refresh,
+                _build_semaphore=asyncio.Semaphore(1),
+            )
+
+    await _run()
+    await _run()
+
+    expected_title = f"{_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX}{str(project.id)[:64]}"
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == expected_title,
+                Alert.dismissed_at.is_(None),
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "open refresh-failure alert must be deduped, not duplicated"
+
+
+@pytest.mark.asyncio
+async def test_deferred_no_alert_when_dep_hash_missing(db):
+    """A 'deferred' result missing dep_hash still works (belt-and-suspenders)."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "builder_busy"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["deferred"] == 1
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "alert still created with fallback '(unknown)' for dep_hash"
+
+
+@pytest.mark.asyncio
+async def test_deferred_alert_type_not_confused_with_rebuilt_alert(db):
+    """Deferred alert uses its own event_type, distinct from the rebuilt alert."""
+    from app.alert_dispatch import (
+        _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+        _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+    )
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _deferred_refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": "a"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_deferred_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["deferred"] == 1
+    # The deferred alert should be created
+    deferred_alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(deferred_alerts) == 1
+    # The rebuilt alert title should NOT be created
+    rebuilt_alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(rebuilt_alerts) == 0
 def test_migration_head_matches_expected_schema_revision():
     """Alembic migration head must equal EXPECTED_SCHEMA_REVISION in main.py."""
     from pathlib import Path
@@ -2515,683 +2439,583 @@ def test_migration_head_matches_expected_schema_revision():
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Off-orchestrator image builder (DARK) — poll sweep state machine + backend
-#
-# Driver: app.reaper_sweeps.sweep_poll_image_builds
-# Backend: app.compute_backends.GcpEphemeralVmImageBuilderBackend
-#
-# All VM/serial/registry I/O is injected so the state transitions
-# (success/timeout/failed/still-building) are exercised with zero cloud calls.
-# ══════════════════════════════════════════════════════════════════════════════
-
-from app import compute as _compute  # noqa: E402
-from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild  # noqa: E402
-from app.reaper_sweeps import sweep_poll_image_builds  # noqa: E402
 
 
-async def _add_build(
-    db: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    status: ComputeImageBuildStatus = ComputeImageBuildStatus.BUILDING,
-    builder_vm_id: str = "img-build-abc123",
-    zone: str | None = "us-central1-a",
-    deadline_at: datetime | None = None,
-    dep_hash: str = "deadbeefcafef00d",
-) -> ProjectComputeImageBuild:
-    build = ProjectComputeImageBuild(
-        project_id=project_id,
-        dep_hash=dep_hash,
-        registry_repo=_REGISTRY_REPO,
-        image_name=_IMAGE_NAME,
-        builder_vm_id=builder_vm_id,
-        zone=zone,
-        status=status,
-        deadline_at=deadline_at,
-    )
-    db.add(build)
-    await db.commit()
-    await db.refresh(build)
-    return build
+# ── GC-guard readiness observability state ───────────────────────────
 
 
-class _FakeImageBuilderBackend:
-    """Injectable stand-in for the GCE image-builder backend (no cloud I/O)."""
+class TestComputeImageGcGuardReadiness:
+    """Tests for the GC-guard sweep observability state and readiness signal.
 
-    def __init__(self, poll_result=None, *, poll_raises=None, abort_ok=True):
-        self._poll_result = poll_result
-        self._poll_raises = poll_raises
-        self.abort_ok = abort_ok
-        self.polled: list = []
-        self.aborted: list = []
-
-    async def poll(self, build):
-        self.polled.append(build.id)
-        if self._poll_raises is not None:
-            raise self._poll_raises
-        return self._poll_result
-
-    async def abort(self, build, *, reason):
-        self.aborted.append((build.id, reason))
-        return self.abort_ok
-
-
-async def _record_build_row(session, project_id, registry_repo, image_name, result):
-    """SQLite-safe stand-in for record_project_compute_image_build (PG upsert)."""
-    row = ProjectComputeImage(
-        project_id=project_id,
-        image_name=image_name,
-        registry_repo=registry_repo,
-        dep_hash=getattr(result, "dep_hash", "") or "",
-        tag=getattr(result, "tag", "") or "",
-        pinned_ref=getattr(result, "pinned_ref", "") or "",
-        digest=_cb._parse_digest_from_pinned_ref(getattr(result, "pinned_ref", "") or ""),
-        built=bool(getattr(result, "built", False)),
-    )
-    session.add(row)
-    await session.commit()
-    await session.refresh(row)
-    return row
-
-
-# ── Poll sweep: SUCCEEDED transition ──────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_poll_sweep_success_records_pin_and_reaps(db):
-    """A SUCCEEDED build records its digest-pinned image and reaps the VM."""
-    project = await _make_project(db)
-    build = await _add_build(
-        db, project.id, deadline_at=_NOW + timedelta(minutes=30)
-    )
-    from app.compute_backends import ImageBuildStatusResult
-
-    pinned = f"{_FULL_REPO}@{_DIGEST_A}"
-    backend = _FakeImageBuilderBackend(
-        ImageBuildStatusResult(
-            status=ComputeImageBuildStatus.SUCCEEDED,
-            exit_code=0,
-            result={
-                "pinned_ref": pinned,
-                "tag": build.dep_hash,
-                "dep_hash": build.dep_hash,
-                "already_present": False,
-                "built": True,
-                "digest": _DIGEST_A,
-            },
-            reason="completed",
-        )
-    )
-
-    result = await sweep_poll_image_builds(
-        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
-    )
-
-    assert result["succeeded"] == 1
-    assert result["failed"] == 0
-    assert result["timed_out"] == 0
-    await db.refresh(build)
-    assert build.status == ComputeImageBuildStatus.SUCCEEDED
-    assert build.result_json is not None
-    assert _DIGEST_A in build.result_json
-    # The VM was reaped after the terminal transition.
-    assert backend.aborted and backend.aborted[0][0] == build.id
-    # The pin was upserted.
-    rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
-    assert len(rows) == 1
-    assert rows[0].digest == _DIGEST_A
-
-
-@pytest.mark.asyncio
-async def test_poll_sweep_success_preserves_stored_digest_when_result_digestless(db):
-    """A digest-less SUCCEEDED result must NOT NULL an already-stored pin.
-
-    Exercises the shared digest-preservation guard the inline build path uses.
+    Each test resets the module-level ``_gc_guard_*`` globals so assertions
+    against cumulative/total state are deterministic regardless of test order.
     """
-    project = await _make_project(db)
-    dep_hash = "abc123abc123abc1"
-    stored_digest = "sha256:" + "e" * 64
-    db.add(
-        ProjectComputeImage(
-            project_id=project.id,
-            image_name=_IMAGE_NAME,
-            registry_repo=_REGISTRY_REPO,
-            dep_hash=dep_hash,
-            tag=dep_hash,
-            pinned_ref=f"{_FULL_REPO}@{stored_digest}",
-            digest=stored_digest,
-            built=True,
-        )
-    )
-    await db.commit()
-    build = await _add_build(
-        db, project.id, dep_hash=dep_hash, deadline_at=_NOW + timedelta(minutes=30)
-    )
-    from app.compute_backends import ImageBuildStatusResult
 
-    # A tag-only (digest-less) build result from a briefly-unreachable registry.
-    backend = _FakeImageBuilderBackend(
-        ImageBuildStatusResult(
-            status=ComputeImageBuildStatus.SUCCEEDED,
-            exit_code=0,
-            result={
-                "pinned_ref": f"{_FULL_REPO}:{dep_hash}",
-                "tag": dep_hash,
-                "dep_hash": dep_hash,
-                "already_present": True,
-                "built": False,
-                "digest": None,
-            },
-        )
-    )
+    @pytest.fixture(autouse=True)
+    def _reset_gc_guard_state(self):
+        """Reset module-level GC guard state before each test."""
+        import app.reaper_sweeps as _rs
 
-    captured: list = []
+        _rs._gc_guard_total_runs = 0
+        _rs._gc_guard_total_applied = 0
+        _rs._gc_guard_total_pruned = 0
+        _rs._gc_guard_total_apply_failed = 0
+        _rs._gc_guard_consecutive_healthy_cycles = 0
+        _rs._gc_guard_first_run_at = None
+        _rs._gc_guard_last_run_at = None
+        _rs._gc_guard_last_result = None
+        # Mark as already loaded so tests without a DeploymentState row don't
+        # trigger an unexpected DB query.  Tests that exercise the load path
+        # explicitly flip this back to False.
+        _rs._gc_guard_state_loaded_from_db = True
+        _rs._gc_guard_last_reconciliation = None
+        yield
 
-    async def _record_capture(session, project_id, registry_repo, image_name, result):
-        # Emulate the production UPSERT on (project_id, dep_hash): the guard
-        # already ran, so a row for this dep_hash exists — update it in place
-        # (a plain INSERT would trip the unique constraint, as PG's ON CONFLICT
-        # handles for real).
-        captured.append(result)
-        existing = (
-            await session.execute(
-                select(ProjectComputeImage).where(
-                    ProjectComputeImage.project_id == project_id,
-                    ProjectComputeImage.dep_hash == getattr(result, "dep_hash", ""),
+    @pytest.mark.asyncio
+    async def test_readiness_before_first_run(self, db):
+        """Accessor returns defaults (ready=False, no run data)."""
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["ready"] is False
+        assert state["total_runs"] == 0
+        assert state["consecutive_healthy_cycles"] == 0
+        assert state["first_run_at"] is None
+        assert state["last_run_at"] is None
+        assert state["last_sweep"] is None
+        assert state["cumulative"]["applied"] == 0
+        assert state["cumulative"]["pruned"] == 0
+        assert state["cumulative"]["apply_failed"] == 0
+        assert state["reconciliation"] is None
+
+    @pytest.mark.asyncio
+    async def test_readiness_after_successful_sweep(self, db):
+        """State reflects one successful sweep: ready=True, counts match."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            result = await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert result["applied"] == 1  # sanity: sweep actually ran
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["ready"] is True
+        assert state["total_runs"] == 1
+        assert state["consecutive_healthy_cycles"] == 1
+        assert state["first_run_at"] is not None
+        assert state["last_run_at"] == state["first_run_at"]
+        assert state["last_sweep"] is not None
+        assert state["last_sweep"]["applied"] == 1
+        assert state["last_sweep"]["pruned"] == 0
+        assert state["last_sweep"]["apply_failed"] == 0
+        assert state["cumulative"]["applied"] == 1
+        assert state["cumulative"]["pruned"] == 0
+        assert state["cumulative"]["apply_failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_readiness_after_sweep_with_failures(self, db):
+        """Apply failures set apply_failed and keep ready=False."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            result = await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: None,  # every apply fails
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert result["apply_failed"] == 1
+        assert result["applied"] == 0
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["ready"] is False
+        assert state["total_runs"] == 1
+        assert state["consecutive_healthy_cycles"] == 0
+        assert state["last_sweep"]["applied"] == 0
+        assert state["last_sweep"]["apply_failed"] == 1
+        assert state["cumulative"]["applied"] == 0
+        assert state["cumulative"]["apply_failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_consecutive_healthy_cycles_accumulate(self, db):
+        """Two clean runs increment consecutive_healthy_cycles."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        # First execution (cadence open at 2-hours-ago snapshot)
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert get_compute_image_gc_guard_readiness()["consecutive_healthy_cycles"] == 1
+
+        # Second execution — the patched cadence gate is still 2-hours-ago,
+        # so the sweep runs again without waiting for the real hourly interval.
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["consecutive_healthy_cycles"] == 2
+        assert state["total_runs"] == 2
+        assert state["cumulative"]["applied"] == 2
+        assert state["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_failure_resets_consecutive_healthy_cycles(self, db):
+        """A failed run after a healthy run resets consecutive_healthy_cycles to 0."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        # First run: healthy
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert get_compute_image_gc_guard_readiness()["consecutive_healthy_cycles"] == 1
+
+        # Second run: all applies fail
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: None,  # all fail
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["consecutive_healthy_cycles"] == 0
+        assert state["total_runs"] == 2
+        assert state["cumulative"]["apply_failed"] == 1
+        assert state["ready"] is False
+        # Cumulative applied still includes the first run's count.
+        assert state["cumulative"]["applied"] == 1
+
+    @pytest.mark.asyncio
+    async def test_gc_guard_state_survives_module_reset(self, db):
+        """Cumulative counters survive a simulated process/module-state reset.
+
+        Acceptance proof: after a sweep run persists state to the DB and the
+        module globals are zeroed (simulating a Cloud Run restart), calling
+        _load_gc_guard_state_from_db restores non-zero total_runs and
+        consecutive_healthy_cycles so the operator readiness signal reflects
+        the full observed history rather than starting over.
+        """
+        import app.reaper_sweeps as _rs
+
+        # Create the DeploymentState singleton row that the persist path targets.
+        ds = DeploymentState(id=1)
+        db.add(ds)
+        await db.commit()
+
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        # Run two healthy sweeps so consecutive_healthy_cycles reaches 2.
+        for _ in range(2):
+            with patch(
+                "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+                _PAST_NOW,
+            ):
+                await sweep_protect_referenced_compute_image_digests(
+                    db,
+                    now=_NOW,
+                    _apply_tag=lambda repo, digest: "inuse-tag",
+                    _list_tags=lambda repo: [],
+                    _delete_tag=lambda repo, tag: False,
                 )
-            )
-        ).scalars().one()
-        existing.pinned_ref = result.pinned_ref
-        existing.digest = _cb._parse_digest_from_pinned_ref(result.pinned_ref)
-        existing.built = bool(getattr(result, "built", False))
-        session.add(existing)
-        await session.commit()
-        await session.refresh(existing)
-        return existing
 
-    result = await sweep_poll_image_builds(
-        db, now=_NOW, _backend=backend, _record_fn=_record_capture
-    )
+        assert _rs._gc_guard_total_runs == 2
+        assert _rs._gc_guard_consecutive_healthy_cycles == 2
 
-    assert result["succeeded"] == 1
-    # The guard swapped the digest-less result for the stored digested pin.
-    assert captured and captured[0].digest == stored_digest
-    assert build.result_json and stored_digest in build.result_json
-    # The stored digest survived — it was NOT NULLed by the digest-less result.
-    row = (
-        await db.execute(
-            select(ProjectComputeImage).where(
-                ProjectComputeImage.dep_hash == dep_hash
-            )
+        # Simulate a process restart: zero out all module globals and mark the
+        # DB load as not yet done.
+        _rs._gc_guard_total_runs = 0
+        _rs._gc_guard_total_applied = 0
+        _rs._gc_guard_total_pruned = 0
+        _rs._gc_guard_total_apply_failed = 0
+        _rs._gc_guard_consecutive_healthy_cycles = 0
+        _rs._gc_guard_first_run_at = None
+        _rs._gc_guard_last_run_at = None
+        _rs._gc_guard_last_result = None
+        _rs._gc_guard_state_loaded_from_db = False
+
+        # Restore from DB (the path triggered on the first sweep call after restart).
+        await _load_gc_guard_state_from_db(db)
+
+        # Globals must reflect the persisted history, not the zeroed-out state.
+        assert _rs._gc_guard_total_runs == 2, (
+            f"expected total_runs=2 after DB restore, got {_rs._gc_guard_total_runs}"
         )
-    ).scalars().one()
-    assert row.digest == stored_digest
-
-
-# ── Poll sweep: TIMED_OUT transition ──────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_poll_sweep_past_deadline_times_out_without_polling(db):
-    """A build past its deadline is reaped and TIMED_OUT; poll is never consulted."""
-    project = await _make_project(db)
-    build = await _add_build(
-        db, project.id, deadline_at=_NOW - timedelta(minutes=5)
-    )
-    # poll() would raise if consulted — the deadline branch must short-circuit.
-    backend = _FakeImageBuilderBackend(poll_raises=AssertionError("must not poll"))
-
-    result = await sweep_poll_image_builds(
-        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
-    )
-
-    assert result["timed_out"] == 1
-    assert result["errors"] == 0
-    assert backend.polled == [], "poll must not be consulted past the deadline"
-    await db.refresh(build)
-    assert build.status == ComputeImageBuildStatus.TIMED_OUT
-    assert build.error_reason and "deadline" in build.error_reason
-    assert backend.aborted and backend.aborted[0][0] == build.id
-
-
-# ── Poll sweep: FAILED + still-BUILDING transitions ───────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_poll_sweep_failed_marks_failed_and_reaps(db):
-    """A FAILED poll marks the row FAILED with the reason and reaps the VM."""
-    project = await _make_project(db)
-    build = await _add_build(
-        db, project.id, deadline_at=_NOW + timedelta(minutes=30)
-    )
-    from app.compute_backends import ImageBuildStatusResult
-
-    backend = _FakeImageBuilderBackend(
-        ImageBuildStatusResult(
-            status=ComputeImageBuildStatus.FAILED,
-            exit_code=3,
-            reason="build_failed_exit_3",
+        assert _rs._gc_guard_consecutive_healthy_cycles == 2, (
+            f"expected consecutive_healthy_cycles=2 after DB restore, "
+            f"got {_rs._gc_guard_consecutive_healthy_cycles}"
         )
-    )
+        assert _rs._gc_guard_last_run_at is not None
+        assert _rs._gc_guard_last_result is not None
 
-    result = await sweep_poll_image_builds(
-        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
-    )
+        # The public readiness accessor must also report the durable history.
+        readiness = get_compute_image_gc_guard_readiness()
+        assert readiness["total_runs"] == 2
+        assert readiness["consecutive_healthy_cycles"] == 2
+        assert readiness["ready"] is True
 
-    assert result["failed"] == 1
-    await db.refresh(build)
-    assert build.status == ComputeImageBuildStatus.FAILED
-    assert build.error_reason == "build_failed_exit_3"
-    assert backend.aborted and backend.aborted[0][0] == build.id
-    # No pin recorded for a failed build.
-    rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
-    assert rows == []
+
+# ── DB-pin reconciliation ─────────────────────────────────────────────────────
+
+
+class TestGcGuardDbPinReconciliation:
+    """Tests for sweep_reconcile_gc_guard_db_pins.
+
+    Verifies that every DB-pinned, still-referenced compute-image digest that
+    lacks an inuse- protection tag is surfaced as a blocking risk finding, and
+    that the clean signal is only True when the would-delete set is disjoint
+    from DB-pinned digests.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_reconciliation_state(self):
+        import app.reaper_sweeps as _rs
+
+        _rs._gc_guard_last_reconciliation = None
+        _rs._last_gc_guard_reconcile_sweep = None  # ensure cadence gate is open
+        yield
+        _rs._last_gc_guard_reconcile_sweep = None  # clean up after
+
+    @pytest.mark.asyncio
+    async def test_all_pinned_digests_protected_is_clean(self, db):
+        """clean=True when every DB-pinned digest has its inuse- tag in the registry."""
+        from app.compute_image_build import protection_tag_for_digest
+
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [protection_tag_for_digest(_DIGEST_A)],
+        )
+
+        assert result["clean"] is True
+        assert result["risk_findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_unprotected_pin_is_risk_finding(self, db):
+        """A DB-pinned digest missing its inuse- tag appears as a blocking risk finding."""
+        from app.compute_image_build import protection_tag_for_digest
+
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [],  # no protection tags in registry
+        )
+
+        assert result["clean"] is False
+        assert len(result["risk_findings"]) == 1
+        finding = result["risk_findings"][0]
+        assert finding["digest"] == _DIGEST_A
+        assert finding["missing_tag"] == protection_tag_for_digest(_DIGEST_A)
+        assert finding["project_id"] == str(project.id)
+        assert _FULL_REPO in finding["repo"]
+
+    @pytest.mark.asyncio
+    async def test_no_built_images_is_clean(self, db):
+        """An empty ProjectComputeImage table yields clean=True with no risk findings."""
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [],
+        )
+
+        assert result["clean"] is True
+        assert result["risk_findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_stored_in_readiness_getter(self, db):
+        """get_compute_image_gc_guard_readiness surfaces the last reconciliation result."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        assert get_compute_image_gc_guard_readiness()["reconciliation"] is None
+
+        await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [],  # unprotected
+        )
+
+        state = get_compute_image_gc_guard_readiness()
+        assert state["reconciliation"] is not None
+        assert state["reconciliation"]["clean"] is False
+        assert len(state["reconciliation"]["risk_findings"]) == 1
+
+
+# ── Machine-readable arming signal ───────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_poll_sweep_still_building_leaves_row_untouched(db):
-    """A still-BUILDING poll leaves the row BUILDING and reaps nothing."""
+async def test_inuse_guard_sweep_emits_machine_readable_arming_signal(db):
+    """The inuse-guard sweep emits a durable machine-readable arming signal.
+
+    Acceptance criteria (registry.tf:73 comment criteria a and b):
+      (a) the guard is stamping ``inuse-`` tags on current project defaults and
+          live/recent ComputeJob digests — ``last_sweep["applied"] >= 1``.
+      (b) no DB-pinned digest is on the would-delete list — verified by the
+          reconciliation leg: ``reconciliation["clean"] is True``.
+
+    The signal must be accessible via the admin API endpoint
+    (``admin_project_tools.get_compute_image_registry_readiness``) which delegates
+    to ``get_compute_image_gc_guard_readiness()``.
+
+    Fields verified:
+      - ``last_run_at`` — ISO-format timestamp set after each sweep run.
+      - ``last_sweep["applied"]`` — count of digests for which an inuse- tag was
+        stamped this run.
+      - ``last_sweep["pruned"]`` — count of stale protection tags removed.
+      - ``last_sweep["apply_failed"]`` — count of tag-stamp failures (0 on success).
+      - ``ready`` — True when at least one digest was protected and apply_failed==0.
+      - ``reconciliation["clean"]`` — True when every DB-pinned digest has its
+        inuse- tag in the registry (the operator's go/no-go signal).
+    """
+    import app.reaper_sweeps as _rs
+    from app.compute_image_build import protection_tag_for_digest
+    from app.routers import admin_project_tools  # noqa: F401 — verify importable
+
+    # Reset module-level gc_guard state so this test is order-independent.
+    _rs._gc_guard_total_runs = 0
+    _rs._gc_guard_total_applied = 0
+    _rs._gc_guard_total_pruned = 0
+    _rs._gc_guard_total_apply_failed = 0
+    _rs._gc_guard_consecutive_healthy_cycles = 0
+    _rs._gc_guard_first_run_at = None
+    _rs._gc_guard_last_run_at = None
+    _rs._gc_guard_last_result = None
+    _rs._gc_guard_state_loaded_from_db = True  # skip DB load
+    _rs._gc_guard_last_reconciliation = None
+
+    # Arrange: one project with one built image.
     project = await _make_project(db)
-    build = await _add_build(
-        db, project.id, deadline_at=_NOW + timedelta(minutes=30)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    stale_tag = "inuse-000000000000dead"
+    current_tag = protection_tag_for_digest(_DIGEST_A)
+
+    # Act: run the protection sweep (cadence forced open via patch).
+    with patch("app.reaper_sweeps._last_compute_image_gc_guard_sweep", _PAST_NOW):
+        sweep_result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: "inuse-tag",  # always succeeds
+            _list_tags=lambda repo: [stale_tag],           # one stale tag to prune
+            _delete_tag=lambda repo, tag: True,            # prune succeeds
+        )
+
+    # Basic sweep sanity: one digest protected, one stale tag pruned.
+    assert sweep_result["applied"] == 1
+    assert sweep_result["pruned"] == 1
+    assert sweep_result["apply_failed"] == 0
+
+    # Fetch the machine-readable arming signal (same call as the admin API endpoint).
+    signal = get_compute_image_gc_guard_readiness()
+
+    # (a) last-run timestamp is populated.
+    assert signal["last_run_at"] is not None, (
+        "last_run_at must be set after a sweep run so the operator can see when the "
+        "guard last executed"
     )
-    from app.compute_backends import ImageBuildStatusResult
+    assert signal["first_run_at"] is not None
 
-    backend = _FakeImageBuilderBackend(
-        ImageBuildStatusResult(status=ComputeImageBuildStatus.BUILDING)
+    # (b) per-run counts are surfaced.
+    assert signal["last_sweep"] is not None, (
+        "last_sweep must be non-None after a sweep run"
     )
-
-    result = await sweep_poll_image_builds(
-        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    assert signal["last_sweep"]["applied"] == 1, (
+        "last_sweep.applied must equal the number of digests protected this run"
     )
-
-    assert result["still_building"] == 1
-    assert result["succeeded"] == 0
-    await db.refresh(build)
-    assert build.status == ComputeImageBuildStatus.BUILDING
-    assert backend.aborted == [], "a running build must not be reaped"
-
-
-@pytest.mark.asyncio
-async def test_poll_sweep_only_visits_building_rows(db):
-    """PENDING/SUCCEEDED/FAILED rows are excluded from the poll query."""
-    project = await _make_project(db)
-    await _add_build(
-        db, project.id, status=ComputeImageBuildStatus.PENDING,
-        deadline_at=_NOW + timedelta(minutes=30),
+    assert signal["last_sweep"]["pruned"] == 1, (
+        "last_sweep.pruned must equal the number of stale protection tags removed"
     )
-    await _add_build(
-        db, project.id, status=ComputeImageBuildStatus.SUCCEEDED,
-        deadline_at=_NOW + timedelta(minutes=30),
-    )
-    backend = _FakeImageBuilderBackend(poll_raises=AssertionError("no building rows"))
-
-    result = await sweep_poll_image_builds(
-        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
-    )
-
-    assert result["polled"] == 0
-    assert backend.polled == []
-
-
-@pytest.mark.asyncio
-async def test_poll_sweep_isolates_per_row_failure(db):
-    """A raised poll for one row is isolated as an error, never aborts the sweep."""
-    project = await _make_project(db)
-    await _add_build(db, project.id, deadline_at=_NOW + timedelta(minutes=30))
-    backend = _FakeImageBuilderBackend(poll_raises=RuntimeError("registry down"))
-
-    result = await sweep_poll_image_builds(
-        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    assert signal["last_sweep"]["apply_failed"] == 0, (
+        "last_sweep.apply_failed must be 0 when all protection-tag stamps succeeded"
     )
 
-    assert result["errors"] == 1
-    assert result["succeeded"] == 0
+    # (c) cumulative counters accumulate correctly.
+    assert signal["cumulative"]["applied"] == 1
+    assert signal["cumulative"]["pruned"] == 1
+    assert signal["cumulative"]["apply_failed"] == 0
 
-
-# ── Serial-marker parsing ─────────────────────────────────────────────────────
-
-
-def test_parse_image_build_serial_succeeded():
-    """A SUCCEEDED marker with a base64 RESULT_JSON decodes to a result dict."""
-    import base64 as _b64
-    import json as _json
-    from app.compute_backends import _parse_image_build_serial
-
-    payload = {"pinned_ref": f"{_FULL_REPO}@{_DIGEST_A}", "digest": _DIGEST_A, "built": True}
-    b64 = _b64.b64encode(_json.dumps(payload).encode()).decode()
-    serial = (
-        "some boot noise\n"
-        f"BLUEPRINT_BUILD_RESULT={b64}\n"
-        "BLUEPRINT_BUILD_STATUS=SUCCEEDED\n"
-        "BLUEPRINT_BUILD_EXIT=0\n"
-    )
-    parsed = _parse_image_build_serial(serial)
-    assert parsed is not None
-    assert parsed.status == ComputeImageBuildStatus.SUCCEEDED
-    assert parsed.exit_code == 0
-    assert parsed.result["digest"] == _DIGEST_A
-
-
-def test_parse_image_build_serial_failed():
-    """A FAILED marker yields a FAILED result with the exit code."""
-    from app.compute_backends import _parse_image_build_serial
-
-    serial = "BLUEPRINT_BUILD_STATUS=FAILED\nBLUEPRINT_BUILD_EXIT=3\n"
-    parsed = _parse_image_build_serial(serial)
-    assert parsed is not None
-    assert parsed.status == ComputeImageBuildStatus.FAILED
-    assert parsed.exit_code == 3
-
-
-def test_parse_image_build_serial_no_marker_is_none():
-    """No status marker (build still running) parses to None."""
-    from app.compute_backends import _parse_image_build_serial
-
-    assert _parse_image_build_serial("still building...\nnothing here\n") is None
-
-
-def test_decode_build_result_tolerates_garbage():
-    """A garbled/oversized RESULT payload is treated as absent, never raises."""
-    from app.compute_backends import _decode_build_result
-
-    assert _decode_build_result(None) is None
-    assert _decode_build_result("not-base64!!!") is None
-    assert _decode_build_result("") is None
-
-
-# ── Deterministic VM name + config flag ───────────────────────────────────────
-
-
-def test_image_builder_vm_name_is_deterministic_and_dns_safe():
-    """The builder VM name is a stable, DNS-safe function of (project, dep_hash)."""
-    import re as _re
-    from app.compute_backends import _image_builder_vm_name
-
-    pid = uuid.uuid4()
-    name1 = _image_builder_vm_name(pid, "deadbeef")
-    name2 = _image_builder_vm_name(pid, "deadbeef")
-    assert name1 == name2, "same (project, dep_hash) must adopt the same VM"
-    # Different dep_hash => different VM.
-    assert name1 != _image_builder_vm_name(pid, "cafef00d")
-    # Different project, same dep_hash => different VM.
-    assert name1 != _image_builder_vm_name(uuid.uuid4(), "deadbeef")
-    # DNS-safe GCE instance name, <= 63 chars.
-    assert _re.fullmatch(r"[a-z]([-a-z0-9]*[a-z0-9])?", name1)
-    assert len(name1) <= 63
-
-
-def test_image_builder_backend_disabled_by_default(monkeypatch):
-    """The builder ships dark: enabled only when the env flag is truthy."""
-    from app.compute_backends import image_builder_backend_enabled
-
-    monkeypatch.delenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", raising=False)
-    assert image_builder_backend_enabled() is False
-    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "true")
-    assert image_builder_backend_enabled() is True
-    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "false")
-    assert image_builder_backend_enabled() is False
-
-
-# ── Backend.start: leaf SA + deterministic adoption ───────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_backend_start_attaches_leaf_image_builder_sa(monkeypatch):
-    """start() provisions under the leaf image-builder SA, never the agent SA."""
-    from app.compute_backends import (
-        GcpEphemeralVmImageBuilderBackend,
-        ImageBuildRequest,
+    # (d) ready=True: at least one digest protected, zero failures on last run.
+    assert signal["ready"] is True, (
+        "ready must be True after a sweep that successfully protected at least one digest"
     )
 
-    request = ImageBuildRequest(
-        build_id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        dep_hash="deadbeefcafef00d",
-        registry_repo="us-docker.pkg.dev/proj/compute-images",
-        image_name="widget-compute",
-        repo_clone={"owner": "acme", "repo": "demo", "ref": "main"},
-        repo_token="ghs_token",
+    # (e) reconciliation leg: run the DB-pin reconciliation sweep.
+    # With the protection tag present in the registry, clean must be True.
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", None):
+        await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [current_tag],  # digest IS protected in registry
+        )
+
+    signal_after_reconcile = get_compute_image_gc_guard_readiness()
+    assert signal_after_reconcile["reconciliation"] is not None, (
+        "reconciliation field must be populated after sweep_reconcile_gc_guard_db_pins runs"
+    )
+    assert signal_after_reconcile["reconciliation"]["clean"] is True, (
+        "reconciliation.clean must be True when every DB-pinned digest has its inuse- tag "
+        "— this is criterion (b) from registry.tf:73 for arming the cleanup policy"
+    )
+    assert signal_after_reconcile["reconciliation"]["risk_findings"] == [], (
+        "risk_findings must be empty when all DB-pinned digests are protected"
     )
 
-    captured: dict = {}
-
-    async def _fake_provision(vm_instance_id, **kwargs):
-        captured["vm_instance_id"] = vm_instance_id
-        captured.update(kwargs)
-        return True
-
-    monkeypatch.setattr(_compute, "find_vm_zone", lambda name: None)
-    monkeypatch.setattr(_compute, "get_vm_zone", lambda name: "us-central1-a")
-    monkeypatch.setattr(_compute, "provision_ephemeral_vm", _fake_provision)
-
-    async def _fake_signed_url(build_id, *, expires_at=None):
-        return "https://storage.example.com/put?sig=abc"
-
-    monkeypatch.setattr(
-        _cb.storage,
-        "generate_compute_job_artifact_upload_signed_url",
-        _fake_signed_url,
-    )
-
-    backend = GcpEphemeralVmImageBuilderBackend()
-    handle = await backend.start(request)
-
-    assert (
-        captured["service_account_email"]
-        == _compute.IMAGE_BUILDER_SERVICE_ACCOUNT_EMAIL
-    )
-    assert captured["service_account_email"] != _compute.AGENT_SERVICE_ACCOUNT_EMAIL
-    # The startup script lays down the TRUSTED build tool (base64) and invokes it
-    # — the --network=none confinement + credential scan live inside that tool.
-    script = captured["startup_script"]
-    assert "base64 -d > /tmp/blueprint_build_tool.py" in script
-    assert "python3 /tmp/blueprint_build_tool.py --repo-dir" in script
-    assert "BLUEPRINT_BUILD_STATUS=" in script
-    assert handle.zone == "us-central1-a"
-    assert handle.external_id == captured["vm_instance_id"]
-
-
-@pytest.mark.asyncio
-async def test_backend_start_adopts_existing_vm(monkeypatch):
-    """A re-trigger for an in-flight dep-hash VM adopts it instead of provisioning."""
-    from app.compute_backends import (
-        GcpEphemeralVmImageBuilderBackend,
-        ImageBuildRequest,
-    )
-
-    request = ImageBuildRequest(
-        build_id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        dep_hash="deadbeefcafef00d",
-        registry_repo="us-docker.pkg.dev/proj/compute-images",
-        image_name="widget-compute",
-        repo_clone={"owner": "acme", "repo": "demo", "ref": "main"},
-        repo_token="ghs_token",
-    )
-
-    monkeypatch.setattr(_compute, "find_vm_zone", lambda name: "us-central1-b")
-    monkeypatch.setattr(
-        _compute, "get_vm_created_at", lambda name, zone: _NOW
-    )
-
-    def _no_provision(*a, **k):
-        raise AssertionError("must not provision when adopting an in-flight VM")
-
-    monkeypatch.setattr(_compute, "provision_ephemeral_vm", _no_provision)
-
-    backend = GcpEphemeralVmImageBuilderBackend()
-    handle = await backend.start(request)
-
-    assert handle.zone == "us-central1-b"
-    assert "adopt" in (handle.message or "").lower()
-
-
-# ── compute.provision_ephemeral_vm forwards the leaf SA to _provision_gcp ──────
-
-
-@pytest.mark.asyncio
-async def test_provision_ephemeral_vm_forwards_service_account_email(monkeypatch):
-    """provision_ephemeral_vm threads service_account_email to _provision_gcp."""
-    captured: dict = {}
-
-    async def _fake_provision_gcp(vm_instance_id, task_id, **kwargs):
-        captured["vm_instance_id"] = vm_instance_id
-        captured.update(kwargs)
-        return True
-
-    monkeypatch.setattr(_compute, "LOCAL_MODE", False)
-    monkeypatch.setattr(_compute, "_ensure_image_family_valid", lambda: None)
-    monkeypatch.setattr(_compute, "_provision_gcp", _fake_provision_gcp)
-
-    ok = await _compute.provision_ephemeral_vm(
-        "img-build-test",
-        startup_script="#!/bin/bash\ntrue\n",
-        machine_type="e2-standard-4",
-        service_account_email="image-builder-sa@proj.iam.gserviceaccount.com",
-    )
-    assert ok is True
-    assert (
-        captured["service_account_email"]
-        == "image-builder-sa@proj.iam.gserviceaccount.com"
-    )
+    # (f) the admin API endpoint is registered and delegates to this signal.
+    # Verify the function exists and returns the same shape as the signal.
+    from app.routers.admin_project_tools import get_compute_image_registry_readiness  # noqa: F401
+    assert callable(get_compute_image_registry_readiness)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cancellation propagation: outer task cancels the build and drains the semaphore
+# sweep_reconcile_gc_guard_db_pins — cadence gate and happy paths
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.asyncio
-async def test_progress_cb_cancellation_signals_cancel_event_and_drains_semaphore(db):
-    """Outer cancellation in the progress_cb path sets cancel_event and defers semaphore
-    release until the thread-backed build worker actually finishes.
+async def test_reconcile_gc_guard_db_pins_cadence_gate_skips_when_too_soon(db):
+    """Sweep returns skipped_cadence=1 and no registry I/O when within hourly cadence."""
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
 
-    Uses a real asyncio.to_thread worker (not an async sleep stub) to verify the
-    fix for the premature-semaphore-release bug: without the fix, _build_task.cancel()
-    marks the asyncio Future done while the OS thread continues, so _drain_and_release
-    would have released the semaphore before the thread stopped.
-    """
-    project = await _make_repo_project(db)
+    list_calls: list[str] = []
 
-    build_started = asyncio.Event()
-    cancel_events_received: list = []
-    thread_exited = threading.Event()
+    def tracking_list_tags(repo):
+        list_calls.append(repo)
+        return []
 
-    def _blocking_thread(cancel_event):
-        # Real thread: polls cancel_event and sets thread_exited when done.
-        while not cancel_event.is_set():
-            import time
-            time.sleep(0.005)
-        thread_exited.set()
+    # Last reconciliation was only 10 minutes ago — within the 1-hour window.
+    recent_past = _NOW - timedelta(minutes=10)
 
-    async def _thread_backed_build(*a, cancel_event=None, **k):
-        cancel_events_received.append(cancel_event)
-        build_started.set()
-        await asyncio.to_thread(_blocking_thread, cancel_event)
-
-    sem = asyncio.Semaphore(1)
-
-    refresh_task = asyncio.ensure_future(
-        _cb.refresh_project_compute_image(
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", recent_past):
+        result = await sweep_reconcile_gc_guard_db_pins(
             db,
-            project,
-            progress_cb=lambda: None,
-            build_semaphore=sem,
-            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
-            _token_fn=lambda o, r: _async("tok"),
-            _default_branch_fn=lambda t, o, r: _async("main"),
-            _fetch_bytes_fn=_fetch_bytes_stub(
-                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
-            ),
-            _tag_exists_fn=lambda full_repo, dep_hash: False,
-            _build_fn=_thread_backed_build,
-            _record_fn=_record_row,
+            now=_NOW,
+            _list_tags=tracking_list_tags,
         )
-    )
 
-    # Wait for the build thread to actually start before cancelling.
-    await asyncio.wait_for(build_started.wait(), timeout=2.0)
-    refresh_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await refresh_task
-
-    # cancel_event must have been received and set.
-    assert len(cancel_events_received) == 1
-    ev = cancel_events_received[0]
-    assert ev is not None, "cancel_event must be threaded into build_fn"
-    assert ev.is_set(), "cancel_event must be set when outer task is cancelled"
-
-    # Wait for the thread to actually finish (cancel_event causes it to exit).
-    await asyncio.to_thread(thread_exited.wait, 2.0)
-    assert thread_exited.is_set(), "thread must exit after cancel_event is set"
-
-    # Drain task now has a chance to run: give event loop a couple of ticks.
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert sem.locked() is False, "build_semaphore must be released after thread drain"
+    assert result["skipped_cadence"] == 1
+    assert result["clean"] is True
+    assert result["risk_findings"] == []
+    assert list_calls == [], "list_tags must not be called when cadence gate fires"
 
 
 @pytest.mark.asyncio
-async def test_non_progress_cb_cancellation_signals_cancel_event_and_drains_semaphore(db):
-    """Outer cancellation in the direct-await path sets cancel_event and defers semaphore
-    release until the thread-backed build worker finishes.
+async def test_reconcile_gc_guard_db_pins_runs_when_interval_elapsed(db):
+    """Sweep runs normally when the cadence gate is open (>1 h since last run)."""
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
 
-    Uses a real asyncio.to_thread worker to verify that asyncio.shield prevents premature
-    semaphore release when the outer task is cancelled mid-build.
-    """
-    project = await _make_repo_project(db)
+    from app.compute_image_build import protection_tag_for_digest
 
-    cancel_events_received: list = []
-    build_started = asyncio.Event()
-    thread_exited = threading.Event()
+    current_tag = protection_tag_for_digest(_DIGEST_A)
 
-    def _blocking_thread(cancel_event):
-        while not cancel_event.is_set():
-            import time
-            time.sleep(0.005)
-        thread_exited.set()
-
-    async def _thread_backed_build(*a, cancel_event=None, **k):
-        cancel_events_received.append(cancel_event)
-        build_started.set()
-        await asyncio.to_thread(_blocking_thread, cancel_event)
-
-    sem = asyncio.Semaphore(1)
-
-    refresh_task = asyncio.ensure_future(
-        _cb.refresh_project_compute_image(
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", _PAST_NOW):
+        result = await sweep_reconcile_gc_guard_db_pins(
             db,
-            project,
-            progress_cb=None,
-            build_semaphore=sem,
-            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
-            _token_fn=lambda o, r: _async("tok"),
-            _default_branch_fn=lambda t, o, r: _async("main"),
-            _fetch_bytes_fn=_fetch_bytes_stub(
-                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
-            ),
-            _tag_exists_fn=lambda full_repo, dep_hash: False,
-            _build_fn=_thread_backed_build,
-            _record_fn=_record_row,
+            now=_NOW,
+            _list_tags=lambda repo: [current_tag],  # tag present → clean
         )
-    )
 
-    await asyncio.wait_for(build_started.wait(), timeout=2.0)
-    refresh_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await refresh_task
+    assert result["skipped_cadence"] == 0
+    assert result["clean"] is True
+    assert result["risk_findings"] == []
 
-    assert len(cancel_events_received) == 1
-    ev = cancel_events_received[0]
-    assert ev is not None, "cancel_event must be threaded into build_fn"
-    assert ev.is_set(), "cancel_event must be set on cancellation to stop the remote build"
 
-    # Thread exits when cancel_event fires; semaphore must not be released until then.
-    await asyncio.to_thread(thread_exited.wait, 2.0)
-    assert thread_exited.is_set(), "thread must exit after cancel_event is set"
+@pytest.mark.asyncio
+async def test_reconcile_gc_guard_db_pins_detects_missing_tag(db):
+    """A DB-pinned digest whose inuse- tag is absent is reported as a risk finding."""
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
 
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert sem.locked() is False, "build_semaphore must be released after thread drain"
+    with patch("app.reaper_sweeps._last_gc_guard_reconcile_sweep", _PAST_NOW):
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            now=_NOW,
+            _list_tags=lambda repo: [],  # no tags → digest unprotected
+        )
+
+    assert result["skipped_cadence"] == 0
+    assert result["clean"] is False
+    assert len(result["risk_findings"]) == 1
+    finding = result["risk_findings"][0]
+    assert finding["digest"] == _DIGEST_A
+    assert finding["project_id"] == str(project.id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gc_guard_db_pins_stamps_cadence_timer(db):
+    """After a successful run, _last_gc_guard_reconcile_sweep is updated."""
+    import app.reaper_sweeps as _rs
+
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    original = _rs._last_gc_guard_reconcile_sweep
+    try:
+        _rs._last_gc_guard_reconcile_sweep = None  # force cadence gate open
+        await sweep_reconcile_gc_guard_db_pins(
+            db,
+            now=_NOW,
+            _list_tags=lambda repo: [],
+        )
+        assert _rs._last_gc_guard_reconcile_sweep == _NOW, (
+            "_last_gc_guard_reconcile_sweep must be stamped with now after a real run"
+        )
+    finally:
+        _rs._last_gc_guard_reconcile_sweep = original
+

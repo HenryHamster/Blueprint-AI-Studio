@@ -86,9 +86,10 @@ vi.mock('../index.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../workspacePrep.js', () => ({
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
@@ -108,9 +109,10 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../build-config.js', () => ({
-  resolveBuildConfig: vi.fn().mockReturnValue(undefined),
-}));
+vi.mock('../build-config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../build-config.js')>();
+  return { ...actual, resolveBuildConfig: vi.fn().mockReturnValue(undefined) };
+});
 
 vi.mock('../telemetry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../telemetry.js')>();
@@ -124,8 +126,41 @@ vi.mock('../telemetry.js', async (importOriginal) => {
 
 // Mock the code-change module so handleMigrate tests can assert on what was
 // passed to runCodeChangeTask without exercising the marker-detection branches.
-vi.mock('./code-change.js', () => ({
-  runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
+vi.mock('./code-change.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./code-change.js')>();
+  return { ...actual, runCodeChangeTask: vi.fn().mockResolvedValue(undefined) };
+});
+
+// The walkthrough_e2e handler boots an ephemeral candidate stack via
+// CandidateStackController. Mock it so the handler tests below never touch
+// docker/vite/fetch — boot() resolves a fake stack, teardown() is a no-op. The
+// module's own boot/teardown/fail-closed behavior is unit-tested in
+// walkthrough-stack.test.ts; here we only exercise the handler wiring.
+const {
+  walkthroughBootMock,
+  walkthroughTeardownMock,
+  walkthroughControllerMock,
+  deriveComposeProjectMock,
+} = vi.hoisted(() => {
+  const walkthroughBootMock = vi.fn();
+  const walkthroughTeardownMock = vi.fn().mockResolvedValue(undefined);
+  const walkthroughControllerMock = vi.fn(function CandidateStackControllerMock() {
+    return {
+      boot: walkthroughBootMock,
+      teardown: walkthroughTeardownMock,
+    };
+  });
+  const deriveComposeProjectMock = vi.fn();
+  return {
+    walkthroughBootMock,
+    walkthroughTeardownMock,
+    walkthroughControllerMock,
+    deriveComposeProjectMock,
+  };
+});
+vi.mock('./walkthrough-stack.js', () => ({
+  CandidateStackController: walkthroughControllerMock,
+  deriveComposeProject: deriveComposeProjectMock,
 }));
 
 // fs is consumed by both default + namespace imports across the modules under
@@ -185,9 +220,10 @@ import {
   isCommandMemoryOutcome,
   assembleRepoBootstrapPrompt,
 } from './specialized.js';
+import { handleWalkthroughE2e } from './walkthrough-e2e.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
-  git, listOpenPullRequestsForBranch, sendLog,
+  git, listOpenPullRequestsForBranch, sendLog, apiPost,
 } from '../index.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -373,7 +409,7 @@ describe('handleSmoketest — URL health checks', () => {
     expect(stored.env_preflight_error).toBeTruthy();
   });
 
-  it('reports FAILED when smoketestResult.passed is false', async () => {
+  it('reports FAILED with SMOKETEST_RESULT for an ordinary genuine test failure', async () => {
     const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
     vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
 
@@ -382,7 +418,22 @@ describe('handleSmoketest — URL health checks', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
+    expect(call.failure_category).toBeUndefined();
+    const stored = JSON.parse(call.logs as string) as { passed: boolean };
+    expect(stored.passed).toBe(false);
   });
+
+  it('instructs setup and execution blockers to use error rather than skip', async () => {
+    const smoketestResult = { passed: false, tests: [{ name: 'setup', status: 'error', message: 'database unavailable' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('Use status "error" for collection, setup, environment, or command-execution failures');
+    expect(prompt).toContain('Use status "skip" only when a test is intentionally inapplicable');
+  });
+
 
   it('appends passing URL health check results and keeps passed=true', async () => {
     const smoketestResult = { passed: true, tests: [] as Array<{ name: string; status: string; message: string }> };
@@ -402,6 +453,24 @@ describe('handleSmoketest — URL health checks', () => {
     expect(stored.tests).toHaveLength(1);
     expect(stored.tests[0].name).toBe('HTTP GET https://example.com/health');
     expect(stored.tests[0].status).toBe('pass');
+  });
+
+  it('does not let a passing URL health check erase an earlier test failure', async () => {
+    const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+
+    await handleSmoketest(
+      TASK_ID,
+      { ...BASE_PAYLOAD, health_check_urls: ['https://example.com/health'] },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const stored = JSON.parse(call.logs as string) as { passed: boolean; tests: Array<{ status: string }> };
+    expect(stored.passed).toBe(false);
+    expect(stored.tests).toHaveLength(2);
+    expect(stored.tests[1].status).toBe('pass');
   });
 
   it('appends failing URL health check results and flips passed to false', async () => {
@@ -445,6 +514,21 @@ describe('handleSmoketest — URL health checks', () => {
   it('sets failure_category to smoketest_result_unparseable when exitCode=0 but result file is missing', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'output but no result file', lastResultText: '' });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('smoketest_result_unparseable');
+  });
+
+  it('rejects a non-boolean top-level passed value as unparseable', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      passed: 'false',
+      tests: [{ name: 'health', status: 'pass', message: '' }],
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'wrote malformed result', lastResultText: '' });
 
     await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
@@ -2313,130 +2397,6 @@ describe('specialized handler task-specific content contracts', () => {
   });
 });
 
-// ── handleSmoketest — qualifier-smoketest candidate-SHA pinning (C4) ──────────
-//
-// The qualifier-smoketest must run against ONE pinned candidate commit, not
-// whatever `automain` has drifted to by the time the agent VM starts. The
-// backend passes the snapshotted `candidate_sha` in the task payload. Since
-// `git clone --branch <X>` cannot accept a SHA, the handler clones the branch
-// normally then `git fetch origin <sha>` + `git checkout --detach <sha>`.
-describe('handleSmoketest — candidate-SHA pinning', () => {
-  const CANDIDATE_SHA = 'b2c3d4e5f60718293a4b5c6d7e8f901234567890';
-  const QUALIFIER_PAYLOAD = { base_branch: 'automain', candidate_sha: CANDIDATE_SHA };
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    vi.mocked(git).mockReturnValue('');
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
-    vi.mocked(readHandlerOutput).mockReturnValue({ passed: true, tests: [] });
-  });
-
-  it('clones with FULL history (depth 0) when a candidate_sha is pinned', async () => {
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
-    expect(opts.branch).toBe('automain');
-    // depth 0 → full clone; the snapshotted commit may predate a shallow depth.
-    expect(opts.depth).toBe(0);
-  });
-
-  it('fetches and detaches onto the EXACT candidate commit', async () => {
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const gitExec = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'git');
-    const fetchCall = gitExec.find(c => (c[1] as string[])[0] === 'fetch');
-    const checkoutCall = gitExec.find(c => (c[1] as string[])[0] === 'checkout');
-    expect(fetchCall?.[1]).toEqual(['fetch', 'origin', CANDIDATE_SHA]);
-    // Detached checkout pins the working tree onto the exact commit.
-    expect(checkoutCall?.[1]).toEqual(['checkout', '--detach', CANDIDATE_SHA]);
-    // The smoketest still runs after pinning.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
-  });
-
-  it('reads candidate_sha from task.context as a fallback', async () => {
-    const taskWithCtx = { ...BASE_TASK, context: { candidate_sha: CANDIDATE_SHA } };
-    await handleSmoketest(
-      TASK_ID, { base_branch: 'automain' }, taskWithCtx, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
-    );
-
-    const checkoutCall = vi.mocked(execFileSync).mock.calls.find(
-      c => c[0] === 'git' && (c[1] as string[])[0] === 'checkout',
-    );
-    expect(checkoutCall?.[1]).toEqual(['checkout', '--detach', CANDIDATE_SHA]);
-  });
-
-  it('does NOT fetch/checkout a SHA for a plain post-merge smoketest (no candidate_sha)', async () => {
-    // BASE_PAYLOAD carries no candidate_sha — the plain post-merge smoketest
-    // path must be untouched: a shallow clone and no SHA pinning.
-    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
-    expect(opts.depth).toBe(100); // unchanged shallow clone
-    const checkoutCall = vi.mocked(execFileSync).mock.calls.find(
-      c => c[0] === 'git' && (c[1] as string[])[0] === 'checkout',
-    );
-    expect(checkoutCall).toBeUndefined();
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
-  });
-
-  it('FAILS LOUD when the candidate-SHA fetch fails — does not run the smoketest', async () => {
-    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
-      const a = args as string[];
-      if (Array.isArray(a) && a[0] === 'fetch') throw new Error('fatal: remote unreachable');
-      return Buffer.from('');
-    });
-
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    // A smoketest of the wrong commit is meaningless — the handler must abort.
-    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.artifact_type).toBe('ERROR_LOG');
-    expect(call.failure_category).toBe('clone_failed');
-    expect(call.logs).toContain(CANDIDATE_SHA);
-  });
-
-  it('FAILS LOUD when the candidate-SHA checkout fails', async () => {
-    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
-      const a = args as string[];
-      if (Array.isArray(a) && a[0] === 'checkout') throw new Error('fatal: reference is not a tree');
-      return Buffer.from('');
-    });
-
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.failure_category).toBe('clone_failed');
-  });
-
-  it('sanitizes GitHub token embedded in git error message before persisting logs', async () => {
-    const rawToken = 'ghp_realTokenABC123XYZ456789ABCDEF';
-    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
-      const a = args as string[];
-      if (Array.isArray(a) && a[0] === 'fetch') {
-        throw new Error(
-          `fatal: unable to access 'https://x-access-token:${rawToken}@github.com/owner/repo.git': Could not resolve host`,
-        );
-      }
-      return Buffer.from('');
-    });
-
-    await handleSmoketest(TASK_ID, QUALIFIER_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.failure_category).toBe('clone_failed');
-    // The raw token must never appear in the persisted log.
-    expect(call.logs).not.toContain(rawToken);
-    // The URL credential pattern must be masked.
-    expect(call.logs).not.toContain('x-access-token:ghp_');
-  });
-});
-
 // ── PARALLEL_AUDIT_GUIDANCE injection ────────────────────────────────────────
 describe('Parallel audit guidance injection', () => {
   const PARALLEL_TASK = { ...BASE_TASK, project_metadata: { enable_parallel_review: true } };
@@ -2622,5 +2582,357 @@ describe('read-only specialized handlers — Bash write note present in prompt',
     await handleRepoBootstrap(TASK_ID, { ...BASE_PAYLOAD, repo_url: 'https://github.com/example/repo' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+});
+
+// ── handleWalkthroughE2e — live-stack walkthrough evidence lane ──────────────
+describe('handleWalkthroughE2e — live-stack walkthrough evidence lane', () => {
+  const WALKTHROUGH_TASK_ID = 'task-walkthrough-1';
+  // 40-char hex string matching FULL_SHA_RE in resolveCandidateSha
+  const CANDIDATE_SHA = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';
+
+  const WALKTHROUGH_PAYLOAD = {
+    base_branch: 'main',
+    candidate_sha: CANDIDATE_SHA,
+    project_id: 'proj-123',
+    qualification_attempt_id: 'qa-456',
+    release_version_id: 'rv-789',
+  };
+
+  const VALID_RESULT = {
+    git_sha: CANDIDATE_SHA,
+    run_timestamp: '2026-07-22T12:00:00Z',
+    results: [
+      { criterion_key: 'c-dfdc9d82', passed: true, notes: 'Runner enrollment OK' },
+      { criterion_key: 'c-f52fd975', passed: true, notes: 'iframe token OK' },
+      { criterion_key: 'c-5214996f', passed: true, notes: 'Walkthrough completed' },
+    ],
+  };
+
+  const FAKE_STACK = {
+    backendUrl: 'http://127.0.0.1:8080',
+    frontendUrl: 'http://localhost:3001',
+    adminToken: 'wt-admin-token',
+    databaseUrl: 'postgresql+asyncpg://postgres:pw@127.0.0.1:5432/postgres',
+    exercisedEngineSha: CANDIDATE_SHA,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(apiPost).mockResolvedValue({ recorded: 3, skipped_not_passed: 0 });
+    // Default execFileSync: succeed for git/python/node calls
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    // Candidate stack boots cleanly by default; teardown is a no-op.
+    walkthroughBootMock.mockResolvedValue(FAKE_STACK);
+    walkthroughTeardownMock.mockResolvedValue(undefined);
+  });
+
+  it('clones with full history (depth=0) and pins to the candidate SHA', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    // Full-history clone
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalledWith(
+      expect.objectContaining({ depth: 0 }),
+    );
+
+    // git fetch + checkout of candidate SHA
+    const gitCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git',
+    );
+    const fetchCall = gitCalls.find(c => {
+      const args = c[1] as string[];
+      return Array.isArray(args) && args.includes('fetch');
+    });
+    expect(fetchCall).toBeDefined();
+    const checkoutCall = gitCalls.find(c => {
+      const args = c[1] as string[];
+      return Array.isArray(args) && args.includes('checkout');
+    });
+    expect(checkoutCall).toBeDefined();
+  });
+
+  it('fails with clone_failed when candidate SHA checkout throws', async () => {
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const argsArr = args as string[];
+      if (cmd === 'git' && Array.isArray(argsArr) && argsArr.includes('checkout')) {
+        throw new Error('fatal: reference is not a tree');
+      }
+      return Buffer.from('');
+    });
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('clone_failed');
+  });
+
+  it('throws when project_id is missing from the payload', async () => {
+    await expect(
+      handleWalkthroughE2e(
+        WALKTHROUGH_TASK_ID,
+        { candidate_sha: CANDIDATE_SHA },
+        BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      ),
+    ).rejects.toThrow(/project_id/);
+  });
+
+  it('throws when candidate_sha is missing from the payload', async () => {
+    await expect(
+      handleWalkthroughE2e(
+        WALKTHROUGH_TASK_ID,
+        { project_id: 'proj-123' },
+        BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      ),
+    ).rejects.toThrow(/candidate_sha/);
+  });
+
+  it('runs the walkthrough harness node script with correct env vars', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const harnessCall = vi.mocked(execFileSync).mock.calls.find(c => {
+      if (c[0] !== 'node') return false;
+      const args = c[1] as string[];
+      return Array.isArray(args) && args.some((s: string) => s.includes('v26-live-walkthrough'));
+    });
+    expect(harnessCall).toBeDefined();
+    // harnessCall is guaranteed defined after assertion above
+    const harnessOpts = (harnessCall as unknown[])[2] as { env?: Record<string, string> } | undefined;
+    const env = harnessOpts?.env;
+    expect(env?.WALKTHROUGH_RESULT_FILE).toContain(WALKTHROUGH_TASK_ID);
+    expect(env?.WALKTHROUGH_PROJECT_ID).toBe('proj-123');
+    expect(env?.GIT_SHA).toBe(CANDIDATE_SHA);
+  });
+
+  it('posts per-criterion evidence to the walkthrough-e2e-evidence ingestion endpoint', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const evidenceCall = vi.mocked(apiPost).mock.calls.find(c =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCall).toBeDefined();
+    // evidenceCall is guaranteed defined after assertion above
+    const evidenceCallPath = (evidenceCall as unknown[])[0] as string;
+    expect(evidenceCallPath).toContain('proj-123');
+
+    const body = (evidenceCall as unknown[])[1] as Record<string, unknown>;
+    expect(body.candidate_sha).toBe(CANDIDATE_SHA);
+    expect(body.qualification_attempt_id).toBe('qa-456');
+    expect(Array.isArray(body.results)).toBe(true);
+    expect((body.results as Array<Record<string, unknown>>)).toHaveLength(3);
+
+    const firstResult = (body.results as Array<Record<string, unknown>>)[0];
+    expect(firstResult.criterion_key).toBe('c-dfdc9d82');
+    expect(firstResult.passed).toBe(true);
+  });
+
+  it('resolves project_id from task.project_metadata (canonical spawner path)', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+
+    // The qualifier spawner does NOT thread project_id through the payload; the
+    // backend populates it on task.project_metadata for every task type.
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID,
+      { base_branch: 'main', candidate_sha: CANDIDATE_SHA, qualification_attempt_id: 'qa-456' },
+      { ...BASE_TASK, project_metadata: { project_id: 'proj-from-metadata' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const evidenceCall = vi.mocked(apiPost).mock.calls.find(c =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCall).toBeDefined();
+    expect((evidenceCall as unknown[])[0] as string).toContain('proj-from-metadata');
+  });
+
+  it('omits qualification_attempt_id from evidence body when not present in payload', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID,
+      { ...WALKTHROUGH_PAYLOAD, qualification_attempt_id: undefined },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const evidenceCall = vi.mocked(apiPost).mock.calls.find(c =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCall).toBeDefined();
+    const body = (evidenceCall as unknown[])[1] as Record<string, unknown>;
+    expect(body.qualification_attempt_id).toBeUndefined();
+  });
+
+  it('persists COMPLETED with WALKTHROUGH_E2E_REPORT artifact on success', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('WALKTHROUGH_E2E_REPORT');
+    // Logs carry the walkthrough result plus the SHA the candidate stack served.
+    expect(call.logs).toBe(
+      JSON.stringify({ ...VALID_RESULT, exercised_engine_sha: CANDIDATE_SHA }),
+    );
+  });
+
+  it('persists FAILED with walkthrough_result_unparseable when result file is missing', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects invalid result shape (missing git_sha field)', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      results: [{ criterion_key: 'c-dfdc9d82', passed: true }],
+    });
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects result with non-array results field', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      git_sha: CANDIDATE_SHA,
+      run_timestamp: '2026-07-22T12:00:00Z',
+      results: 'not-an-array',
+    });
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('persists FAILED with walkthrough_harness_failed when harness crashes with no result file', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const argsArr = args as string[];
+      if (cmd === 'node' && Array.isArray(argsArr) && argsArr.some((s: string) => s.includes('v26-live-walkthrough'))) {
+        throw new Error('harness process crash');
+      }
+      return Buffer.from('');
+    });
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('walkthrough_harness_failed');
+  });
+
+  it('still persists COMPLETED even when evidence POST fails (non-fatal)', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_RESULT);
+    vi.mocked(apiPost).mockRejectedValue(new Error('network error'));
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    // Task succeeds even though evidence posting failed — the report is still
+    // captured in the artifact for the backend completion handler.
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('WALKTHROUGH_E2E_REPORT');
+  });
+
+  it('posts c-dfdc9d82 as passed=false when heartbeat step yielded not-passed', async () => {
+    // Simulates the strengthened predicate: step 1d (daemon heartbeat) failed
+    // so the walkthrough script emits passed=false for c-dfdc9d82.
+    const resultWithFailedHeartbeat = {
+      ...VALID_RESULT,
+      results: [
+        { criterion_key: 'c-dfdc9d82', passed: false, notes: 'daemon heartbeat: DEAD_END' },
+        { criterion_key: 'c-f52fd975', passed: true, notes: 'iframe token OK' },
+        { criterion_key: 'c-5214996f', passed: true, notes: 'Walkthrough completed' },
+      ],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(resultWithFailedHeartbeat);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const evidenceCall = vi.mocked(apiPost).mock.calls.find(c =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCall).toBeDefined();
+    const body = (evidenceCall as unknown[])[1] as Record<string, unknown>;
+    const enrollmentResult = (body.results as Array<Record<string, unknown>>)
+      .find(r => r.criterion_key === 'c-dfdc9d82');
+    // Handler faithfully propagates passed=false — heartbeat absence is not-passed.
+    expect(enrollmentResult?.passed).toBe(false);
+  });
+
+  it('posts c-f52fd975 as passed=false when valid-JWT 200 assertion (step 2g) not passed', async () => {
+    // Simulates the strengthened predicate: step 2g (real token → 200) failed
+    // so the walkthrough script emits passed=false for c-f52fd975.
+    const resultWithFailedAssetFetch = {
+      ...VALID_RESULT,
+      results: [
+        { criterion_key: 'c-dfdc9d82', passed: true, notes: 'Runner enrollment OK' },
+        { criterion_key: 'c-f52fd975', passed: false, notes: 'valid-JWT 200 assertion: DEAD_END' },
+        { criterion_key: 'c-5214996f', passed: true, notes: 'Walkthrough completed' },
+      ],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(resultWithFailedAssetFetch);
+
+    await handleWalkthroughE2e(
+      WALKTHROUGH_TASK_ID, WALKTHROUGH_PAYLOAD, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const evidenceCall = vi.mocked(apiPost).mock.calls.find(c =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCall).toBeDefined();
+    const body = (evidenceCall as unknown[])[1] as Record<string, unknown>;
+    const iframeResult = (body.results as Array<Record<string, unknown>>)
+      .find(r => r.criterion_key === 'c-f52fd975');
+    // Handler faithfully propagates passed=false — 401-only (no 200) is not-passed.
+    expect(iframeResult?.passed).toBe(false);
   });
 });

@@ -390,6 +390,7 @@ async def maybe_spawn_smoketest_fix(
                                 )
                                 + (suite_detail if suite_detail else ""),
                                 task_id=task.id,
+                                event_type="task.failed",
                             )
                             session.add(alert)
 
@@ -533,6 +534,7 @@ async def maybe_spawn_smoketest_fix(
                             f"Operator must manually create a plan task to address the smoketest failures."
                         )[:1000],
                         task_id=_task_pk,
+                        event_type="task.failed",
                     )
                     session.add(spawn_alert)
                     await broadcast_to_project(

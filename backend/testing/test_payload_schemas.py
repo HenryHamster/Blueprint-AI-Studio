@@ -304,12 +304,10 @@ def test_parse_acceptance_evidence_context_vocab_unchanged_by_normalization():
 EXPECTED_TYPES = {
     "create",
     "review",
-    "panel_review",
     "fix",
     "plan",
     "research",
     "strategic_review",
-    "strategic_resident_turn",
     "design_doc_update",
     "security_audit",
     "qa",
@@ -333,6 +331,8 @@ EXPECTED_TYPES = {
     "repo_bootstrap",
     "salvage_bundle",
     "capability_proof_trial",
+    "criterion_coverage_trial",
+    "walkthrough_e2e",
 }
 
 
@@ -411,6 +411,7 @@ def test_fix_passes():
         "release_merge_grade",
         "verify_tests",
         "compute_experiment",
+        "walkthrough_e2e",
     ],
 )
 def test_system_populated_types_pass_with_no_extra_fields(task_type):

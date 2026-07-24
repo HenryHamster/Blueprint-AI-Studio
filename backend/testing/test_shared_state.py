@@ -525,19 +525,21 @@ class TestProjectBranchResolvers:
 
         session = _flush_session()
         with patch(
-            "app.broadcast.broadcast_to_project", new=AsyncMock()
-        ) as mock_broadcast:
+            "app.alert_policy.create_project_alert_if_allowed",
+            new=AsyncMock(return_value=(SimpleNamespace(), True, None)),
+        ) as mock_policy:
             created = await branch_resolution.flush_pending_branch_alerts(session)
 
         assert created == 2
-        assert session.add.call_count == 2
+        session.add.assert_not_called()
         # Queue drained on success.
         assert branch_resolution._pending_durable_branch_alerts == []
-        titles = {call.args[0].title for call in session.add.call_args_list}
+        assert mock_policy.await_count == 2
+        titles = {call.kwargs["title"] for call in mock_policy.await_args_list}
         assert titles == {"Missing integration_branch", "Missing promotion_target"}
-        for call in session.add.call_args_list:
-            assert call.args[0].severity == AlertSeverity.ERROR
-        assert mock_broadcast.await_count == 2
+        for call in mock_policy.await_args_list:
+            assert call.kwargs["severity"] == AlertSeverity.ERROR
+            assert call.kwargs["broadcast"] is True
 
     @pytest.mark.asyncio
     async def test_flush_is_idempotent_across_simulated_restart(self):
@@ -548,7 +550,10 @@ class TestProjectBranchResolvers:
         _shared_state.get_project_promotion_target(project)
 
         # First flush persists both alerts.
-        with patch("app.broadcast.broadcast_to_project", new=AsyncMock()):
+        with patch(
+            "app.alert_policy.create_project_alert_if_allowed",
+            new=AsyncMock(return_value=(SimpleNamespace(), True, None)),
+        ):
             assert (
                 await branch_resolution.flush_pending_branch_alerts(
                     _flush_session()
@@ -574,11 +579,15 @@ class TestProjectBranchResolvers:
             project_id=project.id, title="Missing promotion_target"
         )
         session = _flush_session(existing_alerts=[existing_int, existing_promo])
-        with patch("app.broadcast.broadcast_to_project", new=AsyncMock()):
+        with patch(
+            "app.alert_policy.create_project_alert_if_allowed",
+            new=AsyncMock(),
+        ) as second_policy:
             created = await branch_resolution.flush_pending_branch_alerts(session)
 
         assert created == 0
         session.add.assert_not_called()
+        second_policy.assert_not_awaited()
 
     def test_populating_column_stops_the_signal(self):
         import app.branch_resolution as branch_resolution

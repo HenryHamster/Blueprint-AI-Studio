@@ -41,6 +41,8 @@ import {
 // { strokes } shape on load.
 // ---------------------------------------------------------------------------
 
+export const DEBOUNCE_MS = 1200;
+
 interface Point {
   x: number;
   y: number;
@@ -379,7 +381,6 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         projectId: operation.project_id,
         artifactRef: settlement.artifactRef,
         intent: operation.intent,
-        laneOwner: operation.lane_owner,
         prompt: operation.prompt,
       });
       if (handedOff) {
@@ -389,7 +390,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       }
       const retained = {
         ...settlement.operation,
-        last_error: 'Resident handoff could not be stored. Resume to retry safely.',
+        last_error: 'Conversation handoff could not be stored. Resume to retry safely.',
         updated_at: Date.now(),
       };
       persistPendingWhiteboardArtifactOperation(retained);
@@ -404,7 +405,6 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
 
   const createAndSettleArtifactPreparation = useCallback(async (
     intent: ToolResidentHandoffIntent,
-    laneOwner?: string,
     replaces?: PendingWhiteboardArtifactOperation,
   ) => {
     let saved = await flush();
@@ -447,7 +447,6 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       toolTitle: tool.title,
       revision,
       intent,
-      laneOwner,
       prompt: intent === 'ask'
         ? `Review Whiteboard "${tool.title}" revision ${revision} and answer my question.`
         : `Use Whiteboard "${tool.title}" revision ${revision} as exact project context.`,
@@ -472,10 +471,9 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
     }
   }, [flush, projectId, settleArtifactPreparation, tool.id, tool.title]);
 
-  const handoffToResident = useCallback(async (
+  const handoffToConversation = useCallback(async (
     intent: ToolResidentHandoffIntent,
-    laneOwner?: string,
-  ) => createAndSettleArtifactPreparation(intent, laneOwner), [createAndSettleArtifactPreparation]);
+  ) => createAndSettleArtifactPreparation(intent), [createAndSettleArtifactPreparation]);
 
   // Pending preparation belongs to the operator/project/tool, not this mounted
   // tab. Resume it on remount and when another tab persists the same operation.
@@ -492,10 +490,26 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         await settleArtifactPreparation(operation);
       }
     };
+    const clearMissingStoredOperation = () => {
+      const operations = loadPendingWhiteboardArtifactOperations(actorUserId, projectId, tool.id);
+      setArtifactPreparation(current => {
+        if (current.status !== 'waiting' && current.status !== 'terminal') return current;
+        return operations.some(item => item.operation_id === current.operation.operation_id)
+          ? current
+          : { status: 'idle' };
+      });
+    };
     void resumeStored();
     const onStorage = (event: StorageEvent) => {
       if (isPendingWhiteboardArtifactStorageKey(event.key, actorUserId, projectId, tool.id)) {
-        void resumeStored();
+        if (event.newValue === null) {
+          // A storage event can race with a replacement write. Re-read the
+          // scoped queue and clear stale recovery chrome only when this exact
+          // operation is genuinely gone.
+          clearMissingStoredOperation();
+        } else {
+          void resumeStored();
+        }
       }
     };
     window.addEventListener('storage', onStorage);
@@ -511,7 +525,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
     if (loadState.status !== 'ready' || !dirty) return;
     const timer = setTimeout(() => {
       void flush();
-    }, 1200);
+    }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [content, dirty, loadState.status, flush]);
 
@@ -1105,7 +1119,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
                   : null
         }
         preparing={artifactPreparation.status === 'preparing'}
-        onHandoff={handoffToResident}
+        onHandoff={handoffToConversation}
       />
 
       {artifactPreparation.status === 'waiting' && (
@@ -1131,7 +1145,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       {artifactPreparation.status === 'terminal' && (
         <div className="rounded border border-amber-500/30 bg-amber-950/20 p-2 text-xs text-amber-200" role="alert">
           <p>{artifactPreparation.operation.last_error || 'Whiteboard preparation needs a fresh render.'}</p>
-          <p className="mt-1 text-amber-300/80">Your Share/Ask intent and lane ownership are preserved.</p>
+          <p className="mt-1 text-amber-300/80">Your Share/Ask intent is preserved.</p>
           <button
             type="button"
             className="mt-1 min-h-[44px] rounded border border-amber-500/40 px-2 hover:bg-amber-500/10"
@@ -1140,7 +1154,6 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
               setActionError(null);
               void createAndSettleArtifactPreparation(
                 previous.intent,
-                previous.lane_owner,
                 previous,
               ).catch(cause => {
                 if (mountedRef.current) {

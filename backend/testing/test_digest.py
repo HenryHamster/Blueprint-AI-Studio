@@ -10609,3 +10609,39 @@ async def test_digest_fresh_compute_annotates_served_stale_false(client: AsyncCl
     data = response.json()
     assert data["served_stale"] is False
     assert data["completed_count"] == 7
+
+@pytest.mark.asyncio
+async def test_digest_prefers_dedicated_sr_analytics_over_legacy_design_doc(
+    client: AsyncClient, db_session
+):
+    from app.models import ProjectSRAnalytics
+
+    project = make_project()
+    project.design_doc = {
+        "sr_false_attestation_trends": {
+            "computed_at": "2026-06-01T00:00:00",
+            "source": "legacy",
+        }
+    }
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        ProjectSRAnalytics(
+            project_id=project.id,
+            data={
+                "sr_false_attestation_trends": {
+                    "computed_at": "2026-07-22T00:00:00",
+                    "source": "dedicated",
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+
+    assert response.status_code == 200
+    assert response.json()["sr_false_attestation_trends"] == {
+        "computed_at": "2026-07-22T00:00:00",
+        "source": "dedicated",
+    }

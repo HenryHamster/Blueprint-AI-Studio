@@ -1,5 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 // ── Hoisted mock sinks ────────────────────────────────────────────────────────
 const { mockSendWsFrame, mockSendLog } = vi.hoisted(() => ({
@@ -13,7 +15,7 @@ const { mockSendWsFrame, mockSendLog } = vi.hoisted(() => ({
 // owns the pure FrameCoalescer) is left REAL so the queue policy is exercised.
 vi.mock('../index.js', () => ({
   normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
-  WORKSPACE: '',
+  WORKSPACE: '/tmp',
   strVal: vi.fn((v: unknown) => (typeof v === 'string' ? v : '')),
   sanitize: vi.fn((s: string) => s),
   sendLog: mockSendLog,
@@ -90,10 +92,12 @@ vi.mock('./strategic-sections.js', () => ({
 // ── Import after mocks ────────────────────────────────────────────────────────
 import {
   SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
-  recloneResidentWorkspace,
+  recloneResidentWorkspace, installResidentReplyKeyAtPath,
+  readResidentStagedReplyAtPath,
 } from './strategic-resident.js';
 import {
-  apiGet, apiPost, recordOperatorDecisionCapture, recordResidentTurnLatency,
+  apiGet, apiPost, persistAndPostStatus,
+  recordOperatorDecisionCapture, recordResidentTurnLatency,
 } from '../index.js';
 import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -102,8 +106,12 @@ import { writeStrategicHelpers } from './strategic-helpers.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
-  ResidentSession, ResidentSessionEvent, ResidentTurnResult,
+  ResidentSessionEvent, ResidentTurnResult,
 } from '../providers/resident-session.js';
+import {
+  ATTACHMENT_FETCH_TIMEOUT_MS,
+  MAX_IMAGES_PER_TURN,
+} from './strategic-resident-lib.js';
 
 // The coalescing drain emits at most one frame per this window (see
 // STREAM_FLUSH_MS in strategic-resident.ts); mirrored here for the timing math.
@@ -231,19 +239,17 @@ function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult 
     totalToolCallDurationMs: 0,
     meanInterTokenMs: null,
     inputTokens: 0,
+    providerFailed: false,
+    failureCategory: null,
     ...over,
   };
-}
-
-interface MockSession extends ResidentSession {
-  _emit: (ev: ResidentSessionEvent) => void;
 }
 
 /** Build a mock ResidentSession whose sendTurn is fully scripted. */
 function makeSession(
   sendTurn: (text: string | Array<Record<string, unknown>>) => Promise<ResidentTurnResult>,
   alive: () => boolean,
-): MockSession {
+) {
   let cb: ((ev: ResidentSessionEvent) => void) | null = null;
   return {
     sendTurn: vi.fn(sendTurn),
@@ -255,9 +261,11 @@ function makeSession(
     sessionId: vi.fn(() => 'cli-sess'),
     isAlive: vi.fn(alive),
     exitCode: vi.fn(() => 0),
-    _emit: (ev) => { if (cb) cb(ev); },
+    _emit: (ev: ResidentSessionEvent) => { if (cb) cb(ev); },
   };
 }
+
+type MockSession = ReturnType<typeof makeSession>;
 
 describe('handleStrategicResident — operator-turn compaction includes settled decision and drops answered message', () => {
   beforeEach(() => {
@@ -273,7 +281,97 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it('primes the compacted session WITH the settled operator decision and WITHOUT the answered message, and marks the message handled before fetching checkpoint state', async () => {
+  it('removes stale reply artifacts before the session starts or autonomous work runs', async () => {
+    const events: string[] = [];
+    const residentWorkspace = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+    vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+      expect([
+        residentWorkspace + '/.resident-reply-idempotency-key',
+        residentWorkspace + '/.resident-reply-receipt.json',
+        residentWorkspace + '/.resident-reply-staged-message.json',
+      ]).toContain(file);
+      events.push(`stale-artifact-removed:${path.basename(String(file))}`);
+    });
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    let alive = true;
+    const session = makeSession(
+      () => {
+        events.push('autonomous-turn');
+        alive = false;
+        return Promise.resolve(turnResult({ appliedStrategicOp: true }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockImplementation(() => {
+      events.push('session-started');
+      return session;
+    });
+
+    await handleStrategicResident(
+      'task-stale-reply-key',
+      { project_name: 'Proj', open_messages: [] },
+      { project_metadata: { project_id: 'proj-stale-reply-key' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(events).toEqual([
+      'stale-artifact-removed:.resident-reply-idempotency-key',
+      'stale-artifact-removed:.resident-reply-receipt.json',
+      'stale-artifact-removed:.resident-reply-staged-message.json',
+      'session-started',
+      'autonomous-turn',
+    ]);
+  });
+
+  it('unlinks a pre-existing reply-key symlink and exclusively creates a file without touching its target', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'resident-reply-key-'));
+    const targetPath = path.join(tempDir, 'symlink-target');
+    const replyKeyPath = path.join(tempDir, '.resident-reply-idempotency-key');
+    try {
+      fs.writeFileSync(targetPath, 'do-not-overwrite');
+      fs.symlinkSync(targetPath, replyKeyPath, 'file');
+      const writeSpy = vi.spyOn(fs, 'writeFileSync');
+
+      installResidentReplyKeyAtPath(replyKeyPath, 'operator-reply-key');
+
+      expect(fs.readFileSync(targetPath, 'utf8')).toBe('do-not-overwrite');
+      expect(fs.lstatSync(replyKeyPath).isSymbolicLink()).toBe(false);
+      expect(fs.readFileSync(replyKeyPath, 'utf8')).toBe('operator-reply-key');
+      expect(writeSpy).toHaveBeenCalledWith(
+        replyKeyPath,
+        'operator-reply-key',
+        expect.objectContaining({ flag: 'wx', mode: 0o600 }),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects symlinked and oversized staged replies before reading their contents', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'resident-staged-read-'));
+    const stagedPath = path.join(tempDir, '.resident-reply-staged-message.json');
+    const targetPath = path.join(tempDir, 'target.json');
+    const receipt = { idempotency_key: 'receipt-key', covered_message_ids: ['m1'] };
+    try {
+      fs.writeFileSync(targetPath, JSON.stringify({
+        type: 'NOTE', content: 'must not follow', ...receipt,
+      }));
+      fs.symlinkSync(targetPath, stagedPath, 'file');
+      expect(() => readResidentStagedReplyAtPath(stagedPath, receipt)).toThrow(/regular file|identity/);
+      fs.unlinkSync(stagedPath);
+      fs.writeFileSync(stagedPath, 'x'.repeat(65_537));
+      expect(() => readResidentStagedReplyAtPath(stagedPath, receipt)).toThrow(/exceeds 64KiB/);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('primes the compacted session WITH the settled operator decision and WITHOUT the answered message after atomic reply handling', async () => {
     // The single operator message whose content must NOT survive into the
     // post-compaction checkpoint once it has been answered + marked handled.
     const OPERATOR_MSG = {
@@ -285,6 +383,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     const DECISION_NOTE = 'settled on approach X per operator';
 
     // Backend-side handled set + a call-order trace shared across the mocks.
+    // The real messages helper inserts the reply and marks its immutable
+    // covered IDs handled in one transaction.
     const handledIds: string[] = [];
     const events: string[] = [];
     let capturedCheckpoint = '';
@@ -329,10 +429,14 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // subprocess; it captures the checkpoint prompt and is not alive, so the loop
     // exits after priming.
     const session1 = makeSession(
-      () => Promise.resolve(turnResult({
-        resultText: `Answered the operator.\nOPERATOR-DECISION: ${DECISION_NOTE}`,
-        inputTokens: 5_000, // >= the 100-token threshold set below
-      })),
+      () => {
+        handledIds.push(OPERATOR_MSG.id);
+        events.push('reply:atomically-handled');
+        return Promise.resolve(turnResult({
+          resultText: `Answered the operator.\nOPERATOR-DECISION: ${DECISION_NOTE}`,
+          inputTokens: 5_000, // >= the 100-token threshold set below
+        }));
+      },
       () => true,
     );
     const session2 = makeSession(
@@ -366,9 +470,9 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       'task-1', payload, task, 'ghtok', 'owner', 'repo', null, { value: '' },
     );
 
-    // (1) The answered message was marked handled (heartbeat) BEFORE checkpoint
+    // (1) The answered message was marked handled with the reply BEFORE checkpoint
     //     state was fetched, and BEFORE the fresh subprocess was primed.
-    const iHandled = events.indexOf('heartbeat:handled');
+    const iHandled = events.indexOf('reply:atomically-handled');
     const iCheckpoint = events.indexOf('checkpoint-state');
     const iPrime = events.indexOf('prime');
     expect(iHandled).toBeGreaterThanOrEqual(0);
@@ -626,10 +730,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // subprocess restarted: startResidentClaudeSession called once at startup + once for recovery
     expect(mockStartSession).toHaveBeenCalledTimes(2);
     // old subprocess was closed before the new one was started
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session1.close).toHaveBeenCalled();
     // recovery session received the prime (compaction checkpoint)
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
     // helpers were re-provisioned into the recreated checkout (startup + recovery = 2 calls each)
     expect(mockWritePlaybookHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
@@ -669,7 +771,6 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     )).resolves.toBeUndefined();
 
     // The prime was the only turn on session2 — no operator/autonomous turns followed.
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
   });
 
@@ -918,12 +1019,89 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     );
 
     // The recovery subprocess received a prime with the checkpoint.
-    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
     // The checkpoint must carry the operator purpose / constraints.
     expect(capturedCheckpoint).toContain('Operator Purpose: autonomous research.');
     expect(capturedCheckpoint).toContain('Constraints: no prod writes.');
     expect(capturedCheckpoint).toContain('v26 fix wave');
+  });
+
+  it.each([
+    { label: 'soft timeout', flags: { timedOut: true } },
+    { label: 'hard timeout', flags: { hardTimedOut: true } },
+  ] as const)('fails workspace recovery with canonical timeout on $label during checkpoint prime', async ({ label, flags }) => {
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) return Promise.resolve({ token: 'fresh-read-token' });
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+    const oldSession = makeSession(() => Promise.resolve(turnResult()), () => false);
+    const recoverySession = makeSession(
+      () => Promise.resolve(turnResult({ interrupted: true, ...flags })),
+      () => true,
+    );
+    mockStartSession.mockReturnValueOnce(oldSession).mockReturnValueOnce(recoverySession);
+
+    await handleStrategicResident(
+      `task-recovery-prime-${label}`,
+      { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: `proj-recovery-prime-${label}` }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(recoverySession.sendTurn).toHaveBeenCalledTimes(1);
+    expect(mockSendLog.mock.calls.flat().join(' ')).toContain('workspace recovery checkpoint prime incomplete');
+    const terminal = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(terminal).toMatchObject({ status: 'FAILED', failure_category: 'timeout' });
+  });
+
+  it('preserves canonical provider classification when compaction checkpoint prime rate-limits', async () => {
+    const operatorMessage = {
+      id: 'msg-prime-rate-limit', content: 'trigger compaction',
+      created_at: new Date().toISOString(), from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/heartbeat')) return Promise.resolve({ authority_held: true });
+      return Promise.resolve({});
+    });
+    const oldSession = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'reply', inputTokens: 100 })),
+      () => true,
+    );
+    const compactedSession = makeSession(
+      () => Promise.resolve(turnResult({
+        providerFailed: true,
+        failureCategory: 'rate_limited',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValueOnce(oldSession).mockReturnValueOnce(compactedSession);
+
+    await handleStrategicResident(
+      'task-compaction-prime-rate-limit',
+      {
+        project_name: 'P', open_messages: [],
+        strategic_session_compaction_threshold_tokens: 1,
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-compaction-prime-rate-limit' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    const terminal = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(terminal).toMatchObject({ status: 'FAILED', failure_category: 'rate_limited' });
+    expect(compactedSession.sendTurn).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1042,11 +1220,16 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
       }
       return Promise.resolve(null);
     });
-    mockApiPost.mockImplementation((url: string) => {
+    const postOrder: string[] = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('heartbeat')) {
+        postOrder.push('heartbeat');
         return Promise.resolve({ authority_held: true, stop_requested: true });
       }
       if (url.includes('strategic')) {
+        if (body?.op === 'create_message') {
+          postOrder.push('create_message');
+        }
         return Promise.resolve({});
       }
       return Promise.resolve({});
@@ -1065,11 +1248,18 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
       'ghtok', 'owner', 'repo', null, { value: '' },
     );
 
-    expect(mockApiPost).toHaveBeenLastCalledWith(
-      expect.stringContaining('heartbeat'),
-      expect.objectContaining({ handled_message_ids: ['msg-captured'] }),
-    );
+    const heartbeatCalls = mockApiPost.mock.calls.filter(([url]) =>
+      url.includes('heartbeat'));
+    expect(heartbeatCalls.length).toBeGreaterThan(0);
+    expect(heartbeatCalls.every(([, body]) =>
+      !body || !('handled_message_ids' in body))).toBe(true);
     expect(recordOperatorDecisionCapture).toHaveBeenCalledWith('captured');
+    expect(postOrder.slice(0, 2)).toEqual(['create_message', 'heartbeat']);
+    const createCall = mockApiPost.mock.calls.find(([, body]) => body?.op === 'create_message');
+    const replyData = createCall?.[1]?.data as Record<string, unknown> | undefined;
+    const turnState = replyData?.resident_turn_state as Record<string, unknown> | undefined;
+    expect(String(turnState?.decisions_reg)).toContain('use approach Y, not X');
+    expect(String(turnState?.exam_ledger)).toContain('operatorDecisionCapture');
   });
 
   it('keeps an earlier markerless exchange pending when a later marked turn arrives before the corrective tick', async () => {
@@ -1765,7 +1955,7 @@ describe('handleStrategicResident — early operator-turn acknowledgment', () =>
     expect(JSON.stringify(strategicPosts[0])).toContain('On it');
 
     // Resolve the slow turn; handler should proceed to the heartbeat and stop
-    resolveTurn(turnResult({ sentOperatorMessage: true }));
+    resolveTurn(turnResult({ sentOperatorMessage: true, resultText: 'operator reply' }));
     await vi.advanceTimersByTimeAsync(1000);
     await handlerDone;
   });
@@ -1848,7 +2038,12 @@ describe('handleStrategicResident — early operator-turn acknowledgment', () =>
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       // Ack post fails — must be non-fatal
       if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
-        return Promise.reject(new Error('ack post failed'));
+        const data = body.data as Record<string, unknown> | undefined;
+        if (typeof data?.idempotency_key === 'string'
+          && data.idempotency_key.startsWith('resident-ack-')) {
+          return Promise.reject(new Error('ack post failed'));
+        }
+        return Promise.resolve({});
       }
       if (url.includes('heartbeat')) {
         heartbeatCount += 1;
@@ -1875,11 +2070,869 @@ describe('handleStrategicResident — early operator-turn acknowledgment', () =>
     await vi.advanceTimersByTimeAsync(3000);
 
     // Handler must still complete normally after the ack failure
-    resolveTurn(turnResult({ sentOperatorMessage: true }));
+    resolveTurn(turnResult({ sentOperatorMessage: true, resultText: 'operator reply' }));
     await vi.advanceTimersByTimeAsync(1000);
     await handlerDone;
 
     // The heartbeat (proof the turn completed) must have been reached
     expect(heartbeatCount).toBeGreaterThanOrEqual(1);
   });
+});
+
+describe('handleStrategicResident - failed-turn recovery', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
+    mockSendLog.mockReset();
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true);
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('does not persist or mark an operator message handled after a provider error', async () => {
+    const operatorMessage = {
+      id: 'msg-rate-limited',
+      content: 'Please answer this after recovery',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+
+    const posts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body) posts.push(body);
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'partial error text',
+        accumulatedTurnText: 'partial error text',
+        sentOperatorMessage: false,
+        providerFailed: true,
+        failureCategory: 'rate_limited',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-provider-failure',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-provider-failure' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(0);
+    expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it('re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply', async () => {
+    vi.useFakeTimers();
+    const signedUrl = 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig';
+    const operatorMessage = {
+      id: 'msg-required-artifact-retry',
+      content: 'Review this exact revision',
+      created_at: '2026-07-22T12:00:00.000Z',
+      from_type: 'user',
+      context: {
+        attachments: [{
+          type: 'image',
+          mime_type: 'image/png',
+          name: 'board.png',
+          url: signedUrl,
+          artifact_ref_id: 'artifact-ref-1',
+          image_checksum: 'ab'.repeat(32),
+        }],
+      },
+    };
+    let alive = true;
+    const messagePollUrls: string[] = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        messagePollUrls.push(url);
+        if (messagePollUrls.length === 2) alive = false;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      return Promise.resolve(null);
+    });
+    const posts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body) posts.push(body);
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const attachmentFetch = vi.fn(() => Promise.resolve({
+      ok: false,
+      status: 503,
+      headers: { get: (_name: string) => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+    vi.stubGlobal('fetch', attachmentFetch);
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'must never run' })),
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    const done = handleStrategicResident(
+      'task-required-artifact-retry',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+        strategic_session_message_poll_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-required-artifact-retry' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(6_000);
+    await done;
+
+    expect(messagePollUrls).toHaveLength(2);
+    expect(messagePollUrls[1]).toBe(messagePollUrls[0]);
+    expect(attachmentFetch).toHaveBeenCalledTimes(2);
+    expect(session.sendTurn).not.toHaveBeenCalled();
+    expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(0);
+    expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+  });
+
+  it.each(['headers', 'body'] as const)(
+    'retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects',
+    async (stallAt) => {
+      vi.useFakeTimers();
+      try {
+        const signedUrl = 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig';
+        const operatorMessage = {
+          id: `msg-required-artifact-${stallAt}-timeout`,
+          content: 'Review this exact revision',
+          created_at: '2026-07-22T12:00:00.000Z',
+          from_type: 'user',
+          context: {
+            attachments: [{
+              type: 'image',
+              mime_type: 'image/png',
+              name: 'board.png',
+              url: signedUrl,
+              artifact_ref_id: `artifact-${stallAt}-timeout`,
+              image_checksum: 'ab'.repeat(32),
+            }],
+          },
+        };
+        let alive = true;
+        const messagePollUrls: string[] = [];
+        mockApiGet.mockImplementation((url: string) => {
+          if (url.includes('/messages?')) {
+            messagePollUrls.push(url);
+            if (messagePollUrls.length === 2) alive = false;
+            return Promise.resolve({ messages: [operatorMessage] });
+          }
+          return Promise.resolve(null);
+        });
+        const posts: Array<Record<string, unknown>> = [];
+        mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+          if (body) posts.push(body);
+          return Promise.resolve({ authority_held: true, stop_requested: false });
+        });
+        const signals: AbortSignal[] = [];
+        const attachmentFetch = vi.fn((
+          _url: string | URL | Request,
+          init?: RequestInit,
+        ) => {
+          if (init?.signal) signals.push(init.signal);
+          if (stallAt === 'headers') {
+            return new Promise<never>(() => {});
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: { get: (_name: string) => null },
+            arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+          });
+        });
+        vi.stubGlobal('fetch', attachmentFetch);
+        const session = makeSession(
+          () => Promise.resolve(turnResult({ resultText: 'must never run' })),
+          () => alive,
+        );
+        mockStartSession.mockReturnValue(session);
+
+        const done = handleStrategicResident(
+          `task-required-artifact-${stallAt}-timeout`,
+          {
+            project_name: 'P',
+            open_messages: [],
+            strategic_session_operator_ack_threshold_seconds: 0,
+            strategic_session_message_poll_seconds: 0,
+          },
+          {
+            project_metadata: { project_id: `proj-required-artifact-${stallAt}-timeout` },
+            context: {},
+          },
+          'ghtok', 'owner', 'repo', null, { value: '' },
+        );
+        await vi.advanceTimersByTimeAsync((ATTACHMENT_FETCH_TIMEOUT_MS * 2) + 10_000);
+        await done;
+
+        expect(messagePollUrls).toHaveLength(2);
+        expect(messagePollUrls[1]).toBe(messagePollUrls[0]);
+        expect(attachmentFetch).toHaveBeenCalledTimes(2);
+        expect(signals).toHaveLength(2);
+        expect(signals.every(signal => signal.aborted)).toBe(true);
+        expect(session.sendTurn).not.toHaveBeenCalled();
+        expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(0);
+        expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it('splits an aggregate required-image overflow into bounded same-timestamp model turns', async () => {
+    const sharedCreatedAt = '2026-07-22T12:00:00.000Z';
+    const emptySha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    const makeRequiredMessage = (id: string, prefix: string) => ({
+      id,
+      content: `Review ${prefix}`,
+      created_at: sharedCreatedAt,
+      from_type: 'user',
+      context: {
+        attachments: Array.from({ length: 5 }, (_, index) => ({
+          type: 'image',
+          mime_type: 'image/png',
+          name: `${prefix}-${index}.png`,
+          url: `https://storage.googleapis.com/bucket/${prefix}-${index}.png?X-Goog-Signature=sig`,
+          artifact_ref_id: `${prefix}-artifact-${index}`,
+          image_checksum: emptySha256,
+        })),
+      },
+    });
+    const open = [
+      makeRequiredMessage('required-batch-one', 'one'),
+      makeRequiredMessage('required-batch-two', 'two'),
+    ];
+    const pollUrls: string[] = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        pollUrls.push(url);
+        return Promise.resolve({ messages: [...open] });
+      }
+      return Promise.resolve(null);
+    });
+    const replyBatches: string[][] = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body?.op === 'create_message') {
+        const data = body.data as Record<string, unknown>;
+        const covered = [...(data.covered_message_ids as string[])];
+        replyBatches.push(covered);
+        for (const id of covered) {
+          const index = open.findIndex(message => message.id === id);
+          if (index >= 0) open.splice(index, 1);
+        }
+      }
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const attachmentFetch = vi.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: (_name: string) => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+    vi.stubGlobal('fetch', attachmentFetch);
+    const modelTurns: Array<Array<Record<string, unknown>>> = [];
+    const session = makeSession(
+      (input) => {
+        if (Array.isArray(input)) modelTurns.push(input);
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the exact revisions.',
+          sentOperatorMessage: false,
+        }));
+      },
+      () => open.length > 0,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    try {
+      await handleStrategicResident(
+        'task-required-artifact-split',
+        {
+          project_name: 'P',
+          open_messages: [],
+          strategic_session_operator_ack_threshold_seconds: 0,
+        },
+        {
+          project_metadata: { project_id: 'proj-required-artifact-split' },
+          context: { message_cursor: sharedCreatedAt },
+        },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(replyBatches).toEqual([
+      ['required-batch-one'],
+      ['required-batch-two'],
+    ]);
+    expect(modelTurns).toHaveLength(2);
+    const imageCounts = modelTurns.map(turn => turn.filter(block => block.type === 'image').length);
+    expect(imageCounts).toEqual([5, 5]);
+    expect(imageCounts.every(count => count <= MAX_IMAGES_PER_TURN)).toBe(true);
+    expect(attachmentFetch).toHaveBeenCalledTimes(10);
+    expect(pollUrls.length).toBeGreaterThanOrEqual(2);
+    expect(pollUrls[1]).toBe(pollUrls[0]);
+    expect(open).toHaveLength(0);
+  });
+
+  it('does not start the model turn when the stable idempotency key cannot be installed', async () => {
+    const operatorMessage = {
+      id: 'msg-idempotency-file-failure',
+      content: 'Retry me on a healthy worker',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    const posts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body) posts.push(body);
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => {
+      throw new Error('workspace is read-only');
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'must never run' })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-idempotency-file-failure',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-idempotency-file-failure' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(session.sendTurn).not.toHaveBeenCalled();
+    expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(0);
+    expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it('uses distinct immutable receipts when M2 arrives after atomic M1 reply', async () => {
+    const m1 = {
+      id: 'msg-anchor-m1',
+      content: 'first operator message',
+      created_at: '2026-07-21T20:00:00.000Z',
+      from_type: 'user',
+    };
+    const m2 = {
+      id: 'msg-newer-m2',
+      content: 'second operator message',
+      created_at: '2026-07-21T20:01:00.000Z',
+      from_type: 'user',
+    };
+    const installedKeys: string[] = [];
+    const installedReceipts: Array<{ idempotency_key: string; covered_message_ids: string[] }> = [];
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data) => {
+      const written = typeof data === 'string'
+        ? data
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString();
+      if (String(file).endsWith('.resident-reply-idempotency-key')) {
+        installedKeys.push(written);
+      }
+      if (String(file).endsWith('.resident-reply-receipt.json')) {
+        installedReceipts.push(JSON.parse(written));
+      }
+    });
+
+    const runAttempt = async (
+      messages: Array<typeof m1>,
+      heartbeatResult: 'fail' | 'stop',
+    ): Promise<MockSession> => {
+      let delivered = false;
+      mockApiGet.mockImplementation((url: string) => {
+        if (url.includes('/messages?') && !delivered) {
+          delivered = true;
+          return Promise.resolve({ messages });
+        }
+        if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+        return Promise.resolve(null);
+      });
+      mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+        if (url.includes('/heartbeat')) {
+          heartbeatBodies.push(body ?? {});
+          return heartbeatResult === 'fail'
+            ? Promise.reject(new Error('heartbeat transport dropped after durable reply'))
+            : Promise.resolve({ authority_held: false, stop_requested: true });
+        }
+        return Promise.resolve({});
+      });
+      const session = makeSession(
+        () => Promise.resolve(turnResult({ sentOperatorMessage: true, resultText: 'operator reply' })),
+        () => true,
+      );
+      mockStartSession.mockReturnValue(session);
+      await handleStrategicResident(
+        'task-stable-batch-retry',
+        {
+          project_name: 'P',
+          open_messages: [],
+          strategic_session_operator_ack_threshold_seconds: 0,
+          strategic_session_id: 'stable-logical-session',
+        },
+        { project_metadata: { project_id: 'proj-stable-batch-retry' }, context: {} },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+      return session;
+    };
+
+    const crashed = await runAttempt([m1], 'fail');
+    expect(crashed.sendTurn).toHaveBeenCalledTimes(1);
+    expect(crashed.close).toHaveBeenCalled();
+
+    mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
+    // Atomic reply creation already handled M1, so the restarted poll exposes
+    // only the newly-arrived M2 rather than joining it to an old retry batch.
+    const retried = await runAttempt([m2], 'stop');
+    expect(retried.sendTurn).toHaveBeenCalledTimes(1);
+
+    expect(installedKeys).toHaveLength(2);
+    expect(installedKeys[1]).not.toBe(installedKeys[0]);
+    expect(installedReceipts).toEqual([
+      { idempotency_key: installedKeys[0], covered_message_ids: ['msg-anchor-m1'] },
+      { idempotency_key: installedKeys[1], covered_message_ids: ['msg-newer-m2'] },
+    ]);
+    expect(heartbeatBodies).toHaveLength(2);
+    expect(heartbeatBodies.every(body => !('handled_message_ids' in body))).toBe(true);
+  });
+
+  it('drains 201 same-timestamp operator messages as atomic one-page batches without suppressing deferred rows', async () => {
+    const sharedCreatedAt = '2026-07-21T20:00:00.000Z';
+    const open = Array.from({ length: 201 }, (_, index) => ({
+      id: `same-time-${String(index + 1).padStart(3, '0')}`,
+      content: `operator message ${index + 1}`,
+      created_at: sharedCreatedAt,
+      from_type: 'user',
+    }));
+    const replyBatches: string[][] = [];
+    let heartbeatCount = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) return Promise.resolve({ messages: open.slice(0, 20) });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (body?.op === 'create_message') {
+        const data = body.data as Record<string, unknown>;
+        const covered = [...(data.covered_message_ids as string[])];
+        replyBatches.push(covered);
+        for (const id of covered) {
+          const index = open.findIndex(message => message.id === id);
+          if (index >= 0) open.splice(index, 1);
+        }
+        return Promise.resolve({});
+      }
+      if (url.includes('/heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatCount >= 11,
+        });
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'Handled this bounded operator batch.',
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-same-timestamp-backlog',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      {
+        project_metadata: { project_id: 'proj-same-timestamp-backlog' },
+        context: { message_cursor: sharedCreatedAt },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(replyBatches).toHaveLength(11);
+    expect(replyBatches.slice(0, 10).every(batch => batch.length === 20)).toBe(true);
+    expect(replyBatches[10]).toHaveLength(1);
+    expect(replyBatches.flat()).toHaveLength(201);
+    expect(new Set(replyBatches.flat()).size).toBe(201);
+    expect(open).toHaveLength(0);
+  });
+
+  it('stops before any further model work when reply receipt cleanup fails after a turn', async () => {
+    const operatorMessage = {
+      id: 'msg-cleanup-failure',
+      content: 'Answer once, then stop if receipt cleanup is unsafe',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true, stop_requested: false });
+
+    let turnFinished = false;
+    let cleanupFailed = false;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
+    vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+      if (
+        turnFinished
+        && !cleanupFailed
+        && String(file).endsWith('.resident-reply-idempotency-key')
+      ) {
+        cleanupFailed = true;
+        throw Object.assign(new Error('receipt cleanup denied'), { code: 'EACCES' });
+      }
+    });
+
+    const session = makeSession(
+      () => {
+        turnFinished = true;
+        return Promise.resolve(turnResult({ sentOperatorMessage: true }));
+      },
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-cleanup-failure',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-cleanup-failure' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(cleanupFailed).toBe(true);
+    expect(session.sendTurn).toHaveBeenCalledTimes(1);
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it('fails closed before the model when an operator batch has no stable message id', async () => {
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [{
+          content: 'missing id must retry from the backend',
+          created_at: new Date().toISOString(),
+          from_type: 'user',
+        }] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'must never run' })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-missing-stable-id',
+      { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: 'proj-missing-stable-id' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(session.sendTurn).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
+  });
+  it('leaves inbound messages open when the reply backstop POST fails', async () => {
+    const operatorMessage = {
+      id: 'msg-backstop-failure',
+      content: 'Do not lose this reply',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+
+    const posts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body) posts.push(body);
+      if (body?.op === 'create_message') {
+        return Promise.reject(new Error('reply store unavailable'));
+      }
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'A complete answer that needs the backstop',
+        accumulatedTurnText: 'A complete answer that needs the backstop',
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-backstop-failure',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-backstop-failure' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(1);
+    expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+    expect(session.close).toHaveBeenCalled();
+  });
+  it('folds the checkpoint into the first operator turn after bounded wedged preemption', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-preempt',
+      content: 'Answer me now',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        messagePolls += 1;
+        return Promise.resolve({ messages: messagePolls === 2 ? [operatorMessage] : [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatCount >= 3,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    let resolveAutonomous!: (result: ResidentTurnResult) => void;
+    const autonomous = new Promise<ResidentTurnResult>((resolve) => {
+      resolveAutonomous = resolve;
+    });
+    const firstSession = makeSession(() => autonomous, () => true);
+    vi.mocked(firstSession.close).mockImplementation(() => {
+      resolveAutonomous(turnResult({ processGone: true }));
+    });
+    let resolveOperator!: (result: ResidentTurnResult) => void;
+    const operatorTurn = new Promise<ResidentTurnResult>((resolve) => {
+      resolveOperator = resolve;
+    });
+    const secondSession = makeSession(() => operatorTurn, () => true);
+    mockStartSession
+      .mockReturnValueOnce(firstSession)
+      .mockReturnValueOnce(secondSession);
+
+    const handlerDone = handleStrategicResident(
+      'task-preemption',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_message_poll_seconds: 0.75,
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-preemption' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(secondSession.sendTurn).toHaveBeenCalledTimes(1);
+
+    mockSendWsFrame.mockClear();
+    firstSession._emit({ kind: 'text', text: 'LATE_OLD_SESSION_TEXT' });
+    await vi.advanceTimersByTimeAsync(STREAM_FLUSH_MS * 2);
+    expect(JSON.stringify(mockSendWsFrame.mock.calls)).not.toContain('LATE_OLD_SESSION_TEXT');
+
+    resolveOperator(turnResult({ resultText: 'operator reply' }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await handlerDone;
+
+    expect(firstSession.interrupt).toHaveBeenCalled();
+    expect(firstSession.close).toHaveBeenCalled();
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    const freshTurn = vi.mocked(secondSession.sendTurn).mock.calls[0][0];
+    expect(JSON.stringify(freshTurn)).toContain('Session checkpoint');
+    expect(JSON.stringify(freshTurn)).toContain('Answer me now');
+  });
+
+  it('restarts after prompt SIGINT process exit and answers the queued operator message', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-prompt-exit', content: 'Answer after prompt exit',
+      created_at: new Date().toISOString(), from_type: 'user',
+    };
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        messagePolls += 1;
+        return Promise.resolve({ messages: messagePolls === 2 ? [operatorMessage] : [] });
+      }
+      return Promise.resolve(null);
+    });
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({ authority_held: true, stop_requested: heartbeatCount >= 3 });
+      }
+      return Promise.resolve({});
+    });
+    let resolveAutonomous!: (result: ResidentTurnResult) => void;
+    const autonomous = new Promise<ResidentTurnResult>((resolve) => { resolveAutonomous = resolve; });
+    const oldSession = makeSession(() => autonomous, () => true);
+    vi.mocked(oldSession.interrupt).mockImplementation(() => {
+      resolveAutonomous(turnResult({ processGone: true, interrupted: true }));
+    });
+    const freshSession = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'operator reply after restart' })),
+      () => true,
+    );
+    mockStartSession.mockReturnValueOnce(oldSession).mockReturnValueOnce(freshSession);
+
+    const done = handleStrategicResident(
+      'task-prompt-exit-preemption',
+      {
+        project_name: 'P', open_messages: [],
+        strategic_session_message_poll_seconds: 0.75,
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-prompt-exit-preemption' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await done;
+
+    expect(oldSession.interrupt).toHaveBeenCalled();
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    expect(freshSession.sendTurn).toHaveBeenCalledTimes(1);
+    const freshTurn = vi.mocked(freshSession.sendTurn).mock.calls[0][0];
+    expect(JSON.stringify(freshTurn)).toContain('Session checkpoint');
+    expect(JSON.stringify(freshTurn)).toContain('Answer after prompt exit');
+    const create = mockApiPost.mock.calls.find(([, body]) => body?.op === 'create_message');
+    expect((create?.[1]?.data as Record<string, unknown> | undefined)?.covered_message_ids).toEqual(['msg-prompt-exit']);
+  });
+
+  it.each(['rate_limited', 'dead_auth'] as const)(
+    'does not restart or mask a queued-message child close classified as %s',
+    async (failureCategory) => {
+      vi.useFakeTimers();
+      const operatorMessage = {
+        id: `msg-classified-${failureCategory}`,
+        content: 'must remain queued after classified provider failure',
+        created_at: new Date().toISOString(),
+        from_type: 'user',
+      };
+      let messagePolls = 0;
+      mockApiGet.mockImplementation((url: string) => {
+        if (url.includes('/messages?')) {
+          messagePolls += 1;
+          return Promise.resolve({ messages: messagePolls === 2 ? [operatorMessage] : [] });
+        }
+        return Promise.resolve(null);
+      });
+      mockApiPost.mockImplementation((url: string) => {
+        if (url.includes('/heartbeat')) return Promise.resolve({ authority_held: true });
+        return Promise.resolve({});
+      });
+      let resolveAutonomous!: (result: ResidentTurnResult) => void;
+      const autonomous = new Promise<ResidentTurnResult>((resolve) => { resolveAutonomous = resolve; });
+      const failedSession = makeSession(() => autonomous, () => true);
+      vi.mocked(failedSession.interrupt).mockImplementation(() => {
+        resolveAutonomous(turnResult({
+          processGone: true,
+          interrupted: true,
+          providerFailed: false,
+          failureCategory,
+        }));
+      });
+      mockStartSession.mockReturnValue(failedSession);
+
+      const done = handleStrategicResident(
+        `task-classified-${failureCategory}`,
+        {
+          project_name: 'P', open_messages: [],
+          strategic_session_message_poll_seconds: 0.75,
+          strategic_session_operator_ack_threshold_seconds: 0,
+        },
+        { project_metadata: { project_id: `proj-classified-${failureCategory}` }, context: {} },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      await done;
+
+      expect(failedSession.interrupt).toHaveBeenCalled();
+      expect(mockStartSession).toHaveBeenCalledTimes(1);
+      expect(mockApiPost.mock.calls.some(([, body]) => body?.op === 'create_message')).toBe(false);
+      const terminal = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(terminal).toMatchObject({ status: 'FAILED', failure_category: failureCategory });
+    },
+  );
 });

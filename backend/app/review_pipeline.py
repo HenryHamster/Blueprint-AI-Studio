@@ -53,7 +53,6 @@ from app.issue_ledger import (  # noqa: F401
 # are re-exported here so existing callers/tests that import them from
 # app.review_pipeline keep working unchanged.
 from app.review_heuristics import (  # noqa: F401
-    AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     EARLY_NONCONVERGENCE_ESCALATE_AT,
     ISSUE_CHURN_WINDOW,
     LANE_ARBITRATION,
@@ -89,9 +88,24 @@ from app.review_heuristics import (  # noqa: F401
     compute_drift_signal,
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
+    detect_hedges_in_diff,
+    detect_unjustified_hedge,
     fix_all_occurrences_directive,
+)
+
+# Review-skip decisions live in review_policy (the single documented home for
+# all review-skip policy). Re-exported here so existing callers/tests that
+# import them from app.review_pipeline keep working unchanged.
+from app.review_policy import (  # noqa: F401
+    AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
+    ReviewSkipDecision,
+    evaluate_auto_approve_small_main,
+    is_first_pass_minor_only,
     should_auto_approve_diff,
     should_auto_approve_small_diff,
+    should_skip_initial_review,
+    should_skip_re_review,
+    should_skip_rereview,
 )
 
 # Review<->fix outer-loop convergence machinery (scope-pressure / narrow-focus
@@ -1529,7 +1543,7 @@ async def _check_fix_mid_retry_defer(
                 ):
                     continue
             return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.debug(
             "[PIPELINE] _check_fix_mid_retry_defer lookup failed for "
             f"PR #{pr_number} — allowing review spawn",
@@ -1576,9 +1590,7 @@ def task_counts_toward_review_cap(task: Task) -> bool:
         fc = (task.context or {}).get("failure_category")
         if fc in INFRA_CLASSES:
             return False
-    if (task.context or {}).get("_review_stale_head"):
-        return False
-    return True
+    return not (task.context or {}).get("_review_stale_head")
 
 
 def _recent_consecutive_lane_count(
@@ -2074,7 +2086,7 @@ async def _spawn_pipeline_task(
     # supersessions do.
     _source_noop_fix = False
     _source_is_fix = source_task.first_payload.get("type") == "fix"
-    if source_task.status in (
+    if source_task.status in (  # noqa: SIM102
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
@@ -2662,12 +2674,12 @@ async def _spawn_pipeline_task(
             func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
         )
         type_match = func.json_extract(Task.payloads, "$[0].type").in_(
-            ("review", "fix", "panel_review")
+            ("review", "fix")
         )
     else:
         pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
         type_match = (
-            Task.payloads[0]["type"].as_string().in_(("review", "fix", "panel_review"))
+            Task.payloads[0]["type"].as_string().in_(("review", "fix"))
         )
     pr_pipeline_tasks = (
         (
@@ -2923,9 +2935,7 @@ async def _spawn_pipeline_task(
     # For the upcoming spawn, fix_reason and task_type determine the lane more
     # precisely than source_task's completed context (which may be from a prior
     # review or a different fix iteration). Override with spawn parameters.
-    if task_type == "panel_review":
-        _spawn_lane = LANE_ARBITRATION
-    elif fix_reason in ("merge_conflict", "update_branch_failed", "migration_guard"):
+    if fix_reason in ("merge_conflict", "update_branch_failed", "migration_guard"):
         _spawn_lane = LANE_CONFLICT
     elif fix_reason == "ci_failure":
         _spawn_lane = LANE_CI
@@ -3690,7 +3700,7 @@ async def _spawn_pipeline_task(
     if new_review_history:
         _issue_ledger = build_issue_ledger(new_review_history)
         _contested = _issue_ledger.get("contested") or []
-        if _contested:
+        if _contested:  # noqa: SIM102
             if task_type == "fix":
                 contested_fix_prefix = format_contested_regions_for_fix(
                     _contested, base_branch

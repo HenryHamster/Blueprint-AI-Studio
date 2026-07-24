@@ -222,12 +222,27 @@ def test_build_from_source_startup_check_names():
     ]
 
 
-def test_build_from_source_returns_none_for_none_source():
-    """None source produces None (evidence unavailable)."""
-    from app.env_preflight_evidence import build_env_preflight_from_source
+def test_build_from_source_absent_manifest_yields_empty_requirements():
+    """None source (manifest absent from candidate tree) returns an empty-requirements
+    artifact rather than None.  Absent manifest = no prerequisites declared; it is
+    not the same as evidence unavailable.  This keeps external / greenfield repos
+    that lack the Blueprint-specific manifest promotable.
+    """
+    from app.env_preflight_evidence import build_env_preflight_from_source, MANIFEST_SOURCE
 
-    assert build_env_preflight_from_source(None) is None
-    assert build_env_preflight_from_source(None, smoketest_yaml_source="a: b") is None
+    art = build_env_preflight_from_source(None)
+    assert art is not None
+    assert art["required_env"] == []
+    assert isinstance(art["startup_check_names"], list)
+    assert art["manifest_source"] == MANIFEST_SOURCE
+
+    # smoketest YAML is still parsed even when the env manifest is absent
+    art2 = build_env_preflight_from_source(
+        None, smoketest_yaml_source="suites:\n  startup:\n    commands:\n    - check_boot"
+    )
+    assert art2 is not None
+    assert art2["required_env"] == []
+    assert art2["startup_check_names"] == ["check_boot"]
 
 
 def test_build_from_source_malformed_source_graceful():

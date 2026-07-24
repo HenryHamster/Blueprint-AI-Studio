@@ -185,9 +185,10 @@ def get_message_link(msg: "ProjectMessage") -> dict | None:
 # Terminal status string for a resolved message.
 RESOLVED_STATUS = "resolved"
 
-# Message types that constitute an operator "needs action" item — mirror of
-# operator_attention._NEEDS_OPERATOR_MESSAGE_TYPES, kept as string values here so
-# this IO-light module stays import-cheap. needs_action is DERIVED, not stored.
+# Message types that constitute an operator "needs action" item — single source
+# of truth (operator_attention._NEEDS_OPERATOR_MESSAGE_TYPES derives from this).
+# Kept as string values here so this IO-light module stays import-cheap.
+# needs_action is DERIVED, not stored.
 NEEDS_ACTION_MESSAGE_TYPES: frozenset[str] = frozenset(
     {MessageType.QUESTION.value, MessageType.BLOCKER.value}
 )

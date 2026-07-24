@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { SystemMaturityCard, SystemMaturityRow } from './SystemMaturityCard';
+import { SystemMaturityCard } from './SystemMaturityCard';
+import type { SystemMaturityRow } from './SystemMaturityCard';
 
 function makeRow(overrides: Partial<SystemMaturityRow> = {}): SystemMaturityRow {
   return {

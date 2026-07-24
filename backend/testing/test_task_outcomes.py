@@ -23,12 +23,10 @@ from app.task_outcomes import (
     KIND_MEMO_ARTIFACT,
     KIND_READ_ONLY_UNCLASSIFIED,
     KIND_RESEARCH_QUALITY,
-    KIND_REVIEW_VERDICT,
     KIND_UNKNOWN,
     KIND_VERIFICATION_VERDICT,
     OUTCOME_EVALUATORS,
     TaskOutcome,
-    _panel_lens_passed,
     build_task_evaluation_summary,
     evaluate_task_outcome,
     is_successful_outcome,
@@ -443,58 +441,6 @@ def test_compute_experiment_missing_result_completed_is_neutral():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Panel-review family
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_panel_review_approve_verdict_is_success():
-    task = _make_task(
-        "panel_review",
-        plan_output={
-            "overall_verdict": "APPROVE",
-            "summary": "PR looks good",
-            "lenses": {
-                "correctness": {"verdict": "pass", "summary": "Logic is correct"},
-                "security": {"verdict": "pass", "summary": "No security issues"},
-                "style": {"verdict": "pass", "summary": "Code style is good"},
-                "testing": {"verdict": "pass", "summary": "Tests are adequate"},
-            },
-        },
-    )
-    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_REVIEW_VERDICT)
-    assert is_successful_outcome(task) is True
-
-
-def test_panel_review_request_changes_verdict_is_neutral():
-    task = _make_task(
-        "panel_review",
-        plan_output={
-            "overall_verdict": "REQUEST_CHANGES",
-            "summary": "Needs minor fixes",
-            "lenses": {
-                "correctness": {"verdict": "fail", "summary": "Logic issue"},
-                "security": {"verdict": "pass", "summary": "No security issues"},
-                "style": {"verdict": "pass", "summary": "Code style is good"},
-                "testing": {"verdict": "pass", "summary": "Tests are adequate"},
-            },
-        },
-    )
-    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_REVIEW_VERDICT)
-    assert is_successful_outcome(task) is False
-
-
-def test_panel_review_no_verdict_is_neutral():
-    # COMPLETED panel_review with no usable verdict → neutral.
-    task = _make_task("panel_review", plan_output={})
-    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_REVIEW_VERDICT)
-
-
-def test_panel_review_failed_is_failure():
-    task = _make_task("panel_review", status=TaskStatus.FAILED, plan_output={})
-    assert evaluate_task_outcome(task) == TaskOutcome("failure", KIND_REVIEW_VERDICT)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Web-research / knowledge-document family
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -887,123 +833,6 @@ def test_summary_web_research_empty_title_uses_other_evidence():
     assert summary is not None
     assert summary["verdict"] == "recorded"
     assert summary["evidence"][0] == {"label": "Summary", "value": "x"}
-
-
-def _panel_review_verdict_plan(
-    overall: str,
-    *,
-    lenses: dict | None = None,
-    issues: list | None = None,
-    investigated_files: list | None = None,
-) -> dict:
-    """A normalized panel_review verdict as stored on plan_output."""
-    plan: dict = {
-        "overall_verdict": overall,
-        "summary": "Synthesized panel verdict",
-        "lenses": lenses
-        if lenses is not None
-        else {
-            "correctness": {
-                "verdict": "APPROVE",
-                "summary": "Logic correct",
-                "issues": [],
-            },
-            "security": {"verdict": "APPROVE", "summary": "No issues", "issues": []},
-            "code_quality": {"verdict": "APPROVE", "summary": "Clean", "issues": []},
-            "test_coverage": {"verdict": "APPROVE", "summary": "Covered", "issues": []},
-        },
-        "investigated_files": investigated_files
-        if investigated_files is not None
-        else ["a.py", "b.py"],
-    }
-    if issues is not None:
-        plan["issues"] = issues
-    return plan
-
-
-def test_summary_panel_review_clean_approve_is_not_none():
-    # A clean APPROVE with no issues must still produce a summary — the verdict
-    # itself is the signal — never an empty/None result.
-    task = _make_task("panel_review", plan_output=_panel_review_verdict_plan("APPROVE"))
-    summary = build_task_evaluation_summary(task)
-    assert summary is not None
-    assert summary["verdict"] == "approve"
-    assert summary["evidence"][0] == {"label": "Decision", "value": "APPROVE"}
-    assert summary["evidence"][1] == {"label": "Lenses", "value": "4/4 passed"}
-    assert summary["evidence"][2] == {
-        "label": "Issues",
-        "value": "0 total (critical: 0, major: 0, minor: 0)",
-    }
-    assert summary["evidence"][3] == {"label": "Files reviewed", "value": "2"}
-    assert {"label": "Correctness", "value": "pass"} in summary["highlights"]
-    assert len(summary["highlights"]) == 3  # capped at 3
-
-
-def test_summary_panel_review_request_changes_counts_all_severities():
-    # REQUEST_CHANGES with major/minor issues — severities the generic fallback
-    # would drop must be counted honestly here.
-    plan = _panel_review_verdict_plan(
-        "REQUEST_CHANGES",
-        lenses={
-            "correctness": {
-                "verdict": "REQUEST_CHANGES",
-                "summary": "Bug",
-                "issues": [],
-            },
-            "security": {"verdict": "APPROVE", "summary": "ok", "issues": []},
-            "code_quality": {"verdict": "APPROVE", "summary": "ok", "issues": []},
-            "test_coverage": {"verdict": "APPROVE", "summary": "ok", "issues": []},
-        },
-        issues=[
-            {"severity": "critical", "description": "crash"},
-            {"severity": "major", "description": "leak"},
-            {"severity": "minor", "description": "nit"},
-            {"severity": "minor", "description": "nit2"},
-        ],
-    )
-    task = _make_task("panel_review", plan_output=plan)
-    summary = build_task_evaluation_summary(task)
-    assert summary is not None
-    assert summary["verdict"] == "request_changes"
-    assert summary["evidence"][1] == {"label": "Lenses", "value": "3/4 passed"}
-    assert summary["evidence"][2] == {
-        "label": "Issues",
-        "value": "4 total (critical: 1, major: 1, minor: 2)",
-    }
-    assert {"label": "Correctness", "value": "fail"} in summary["highlights"]
-
-
-def test_summary_panel_review_counts_lens_issues_without_top_level():
-    # When only per-lens issues are present (no top-level deduped list), the
-    # count is still honest.
-    plan = _panel_review_verdict_plan(
-        "REQUEST_CHANGES",
-        lenses={
-            "correctness": {
-                "verdict": "REQUEST_CHANGES",
-                "summary": "Bug",
-                "issues": [{"severity": "major", "description": "x"}],
-            },
-            "security": {
-                "verdict": "REQUEST_CHANGES",
-                "summary": "Risk",
-                "issues": [{"severity": "minor", "description": "y"}],
-            },
-            "code_quality": {"verdict": "APPROVE", "summary": "ok", "issues": []},
-            "test_coverage": {"verdict": "APPROVE", "summary": "ok", "issues": []},
-        },
-    )
-    task = _make_task("panel_review", plan_output=plan)
-    summary = build_task_evaluation_summary(task)
-    assert summary["evidence"][2] == {
-        "label": "Issues",
-        "value": "2 total (critical: 0, major: 1, minor: 1)",
-    }
-
-
-def test_summary_panel_review_no_verdict_is_none():
-    task = _make_task("panel_review", plan_output={})
-    assert build_task_evaluation_summary(task) is None
 
 
 # --- write/PR task evaluation summary (merge + reproduce verdict) ------------
@@ -1447,56 +1276,6 @@ def test_summary_acceptance_evidence_absent_no_findings_stays_none():
     """No declaration AND no findings ⇒ summary stays None (unchanged)."""
     task = _make_task("create", status=TaskStatus.COMPLETED, context={})
     assert build_task_evaluation_summary(task) is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# _panel_lens_passed: full synonym-table coverage
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestPanelLensPassed:
-    """_panel_lens_passed normalizes panel-review lens verdicts to True/False/None.
-
-    The production set is {approve, pass, passed, ok} -> True and
-    {request_changes, fail, failed} -> False; everything else -> None.
-    Tests here document the exact contract and catch divergence when the
-    synonym table changes.
-    """
-
-    def test_pass_tokens_return_true(self):
-        for token in ("approve", "pass", "passed", "ok"):
-            assert _panel_lens_passed(token) is True, (
-                f"token {token!r} should return True"
-            )
-
-    def test_fail_tokens_return_false(self):
-        for token in ("request_changes", "fail", "failed"):
-            assert _panel_lens_passed(token) is False, (
-                f"token {token!r} should return False"
-            )
-
-    def test_case_insensitive(self):
-        assert _panel_lens_passed("APPROVE") is True
-        assert _panel_lens_passed("REQUEST_CHANGES") is False
-        assert _panel_lens_passed("Pass") is True
-        assert _panel_lens_passed("Failed") is False
-
-    def test_absent_aliases_return_none(self):
-        """Tokens present in other parsers but not this one must return None."""
-        for token in ("accept", "approved", "reject", "rejected"):
-            result = _panel_lens_passed(token)
-            assert result is None, (
-                f"token {token!r} is not in _panel_lens_passed synonym table; "
-                f"expected None, got {result!r}"
-            )
-
-    def test_empty_and_none_return_none(self):
-        assert _panel_lens_passed("") is None
-        assert _panel_lens_passed(None) is None
-
-    def test_unrecognized_token_returns_none(self):
-        assert _panel_lens_passed("unknown") is None
-        assert _panel_lens_passed("yes") is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

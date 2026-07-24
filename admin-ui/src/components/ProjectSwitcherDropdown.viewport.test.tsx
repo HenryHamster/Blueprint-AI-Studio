@@ -6,9 +6,9 @@ import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } 
 import type { Project } from '../types/project';
 
 const PROJECTS: Project[] = [
-  { id: 'proj-1', name: 'Blueprint AI Studio', status: 'active', github_owner: 'HenryHamster', github_repo: 'BlueprintAIStudio', autonomous_enabled: true },
-  { id: 'proj-2', name: 'Mobile Responsive Operator Dashboard Redesign', status: 'active', github_owner: 'HenryHamster', github_repo: 'dashboard-redesign', autonomous_enabled: false },
-  { id: 'proj-3', name: 'another-repo', status: 'active', github_owner: 'org', github_repo: 'another-repo', autonomous_enabled: false },
+  { id: 'proj-1', name: 'Blueprint AI Studio', status: 'active', github_owner: 'HenryHamster', github_repo: 'BlueprintAIStudio', autonomous_enabled: true, created_at: '2026-01-01T00:00:00Z' },
+  { id: 'proj-2', name: 'Mobile Responsive Operator Dashboard Redesign', status: 'active', github_owner: 'HenryHamster', github_repo: 'dashboard-redesign', autonomous_enabled: false, created_at: '2026-01-01T00:00:00Z' },
+  { id: 'proj-3', name: 'another-repo', status: 'active', github_owner: 'org', github_repo: 'another-repo', autonomous_enabled: false, created_at: '2026-01-01T00:00:00Z' },
 ];
 
 describe('ProjectSwitcherDropdown — viewport regression', () => {

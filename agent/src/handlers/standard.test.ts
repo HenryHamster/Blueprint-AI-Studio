@@ -10,14 +10,12 @@ const {
   PROMPT_MOCK_EXPORTS,
   CODE_CHANGE_MOCK_EXPORTS,
   PRIOR_KNOWLEDGE_MOCK_EXPORTS,
-  BUILD_CONFIG_MOCK_EXPORTS,
 } = vi.hoisted(() => {
   type IndexExportKey = keyof typeof import('../index.js');
   type TestFixLoopExportKey = keyof typeof import('../utils/test-fix-loop.js');
   type PromptExportKey = keyof typeof import('../prompt.js');
   type CodeChangeExportKey = keyof typeof import('./code-change.js');
   type PriorKnowledgeExportKey = keyof typeof import('./prior-knowledge.js');
-  type BuildConfigExportKey = keyof typeof import('../build-config.js');
 
   return {
     INDEX_MOCK_EXPORTS: [
@@ -42,13 +40,11 @@ const {
     PRIOR_KNOWLEDGE_MOCK_EXPORTS: [
       'fetchKnowledgeDocumentById', 'fetchArtifactDownloadUrl',
     ] satisfies readonly PriorKnowledgeExportKey[],
-    BUILD_CONFIG_MOCK_EXPORTS: [
-    ] satisfies readonly BuildConfigExportKey[],
   };
 });
 
 // Used for type checking only; suppress "unused" warnings
-void INDEX_MOCK_EXPORTS; void TEST_FIX_LOOP_MOCK_EXPORTS; void PROMPT_MOCK_EXPORTS; void CODE_CHANGE_MOCK_EXPORTS; void PRIOR_KNOWLEDGE_MOCK_EXPORTS; void BUILD_CONFIG_MOCK_EXPORTS;
+void INDEX_MOCK_EXPORTS; void TEST_FIX_LOOP_MOCK_EXPORTS; void PROMPT_MOCK_EXPORTS; void CODE_CHANGE_MOCK_EXPORTS; void PRIOR_KNOWLEDGE_MOCK_EXPORTS;
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // 2026-05-04: standard.ts no longer drives lint/test/push/PR via wrapper helpers
@@ -131,8 +127,15 @@ vi.mock('../prompt.js', async (importOriginal) => {
 // Mock the code-change module so handler tests can assert on what was passed
 // to runCodeChangeTask without exercising the marker-detection branches. The
 // marker tests at the bottom unmock + re-import the real implementation.
+// Full-replacement (not importOriginal) is intentional: the marker-detection
+// tests call vi.importActual('./code-change.js') which, combined with an
+// importOriginal factory, causes the real runClaudeCode to run (the async
+// factory loads code-change.js before index.js's mock is fully resolved).
+// All three runtime exports are listed explicitly so the factory cannot drift.
 vi.mock('./code-change.js', () => ({
   runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
+  augmentSelfReview: vi.fn(),
+  maybeRunIncompleteReviewRecovery: vi.fn().mockResolvedValue(undefined),
 }));
 
 // The '../index.js' mock above uses importOriginal, which loads the REAL index
@@ -151,18 +154,15 @@ vi.mock('./prior-knowledge.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../build-config.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../build-config.js')>();
-  return { ...actual };
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
 });
 
-vi.mock('../workspacePrep.js', () => ({
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
-
-vi.mock('../prompts/diagnostics-after-edit-hook.js', () => ({
-  writeDiagnosticsAfterEditHook: vi.fn().mockReturnValue(true),
-}));
+vi.mock('../prompts/diagnostics-after-edit-hook.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompts/diagnostics-after-edit-hook.js')>();
+  return { ...actual, writeDiagnosticsAfterEditHook: vi.fn().mockReturnValue(true) };
+});
 
 // Spy on the read-only ./fetch writer while keeping buildFetchGuidance and the
 // PLAN_FETCH_VERBS constant real, so prompt-guidance assertions exercise the
