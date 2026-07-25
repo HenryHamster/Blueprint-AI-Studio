@@ -9,7 +9,10 @@ import {
   parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks, encodeInterrupt,
   isStrategicMutation, isMessageSend, type ResidentStreamEvent,
 } from './resident-stream.js';
-import { getProviderRunner, matchesAuthFailure, matchesRateLimit } from './runners.js';
+import {
+  getProviderRunner, matchesAuthFailure, matchesRateLimit,
+  probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
+} from './runners.js';
 
 // ── Resident (persistent, streaming, interactive) Claude session ─────────────
 //
@@ -130,6 +133,11 @@ export interface ResidentSession {
   exitCode(): number | null;
   /** Classified terminal provider failure from bounded stderr/stream errors. */
   failureCategory?(): 'rate_limited' | 'dead_auth' | null;
+  /**
+   * Bounded, redacted diagnostic for a child-process exit when startup fails
+   * before the resident can accept a turn.
+   */
+  exitDiagnostic?(): string | null;
 }
 
 export interface ResidentSessionOptions {
@@ -225,7 +233,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // command already carries -p / --output-format stream-json / --verbose /
   // --include-partial-messages / --dangerously-skip-permissions / --model / --effort
   // / --disallowedTools, so we only add the input side.
-  const args = [...base.args, '--input-format', 'stream-json'];
+  // Keep resident launch compatible with the installed Claude binary just like
+  // the ordinary one-shot runner path.
+  const capabilities = probeClaudeCapabilities(base.command, base.env);
+  const compatibleBaseArgs = stripUnsupportedClaudeOptionalArgs(base.args, capabilities);
+  const args = [...compatibleBaseArgs, '--input-format', 'stream-json'];
 
   // Guarantee the live token file exists with the CURRENT token before the
   // long-lived subprocess (and its bash helpers) start reading it. Refreshes
@@ -247,6 +259,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   let alive = true;
   let closed = false;
   let exitCodeVal: number | null = null;
+  let exitSignalVal: NodeJS.Signals | null = null;
   let terminalFailureCategory: 'rate_limited' | 'dead_auth' | null = null;
   let failureTextTail = '';
   const appendFailureText = (text: string): void => {
@@ -646,7 +659,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (activeTurn) settleTurn('', true);
     resolveIdleWaiters();
   });
-  child.on('close', (code: number | null) => {
+  child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
     // Some Claude CLI failures (notably the OAuth weekly-limit banner) are
     // written as bare stdout without a final newline. Feed that final fragment
     // through the ordinary parser before classifying this process exit.
@@ -657,6 +670,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     }
     alive = false;
     exitCodeVal = code ?? null;
+    exitSignalVal = signal ?? null;
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     // No further results can arrive from a dead child; drop any pending swallows
     // so a subsequent (post-restart) result is never wrongly discarded.
@@ -783,5 +797,13 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     isAlive: () => alive && !closed,
     exitCode: () => exitCodeVal,
     failureCategory: () => terminalFailureCategory ?? classifyFailure(failureTextTail),
+    exitDiagnostic: () => {
+      if (alive) return null;
+      const parts = [`exit_code=${exitCodeVal ?? 'null'}`];
+      if (exitSignalVal) parts.push(`exit_signal=${exitSignalVal}`);
+      const evidence = sanitize(failureTextTail).trim();
+      if (evidence) parts.push(`provider_output_tail=${evidence.slice(-2_000)}`);
+      return parts.join('; ');
+    },
   };
 }
