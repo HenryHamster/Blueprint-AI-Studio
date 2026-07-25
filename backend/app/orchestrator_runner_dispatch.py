@@ -301,6 +301,7 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_gpu_passthrough_blocker,
     _runner_handles_task_type,
     _runner_has_container_capability,
+    _runner_container_image_storage,
     _runner_has_free_disk,
     _runner_has_free_vram,
     _runner_has_project_verification,
@@ -317,7 +318,8 @@ from app.runner_eligibility import (  # noqa: F401
 # ``_RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT`` alert threshold — the alert warns
 # an operator, this gate keeps a doomed job from ever being claimed. Overridable
 # via runtime_config ``container_image_min_free_disk_bytes``. Absent
-# ``disk_free_bytes`` telemetry is treated as eligible (backward compatible).
+# Missing workspace/image-store telemetry is treated as eligible (backward
+# compatible); when reported, both filesystems must satisfy the floor.
 _CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT = 10_737_418_240  # 10 GiB
 
 
@@ -1060,13 +1062,17 @@ async def _diagnose_strict_runner_pin_hold(
         if container_image:
             disk_floor = _container_image_min_free_disk_bytes()
             if not _runner_has_free_disk(snapshot, disk_floor):
-                reported = (snapshot.capabilities or {}).get("disk_free_bytes")
+                storage = _runner_container_image_storage(snapshot)
+                runtime = storage["image_store_runtime"] or "container"
+                image_path = storage["image_store_path"] or "unknown path"
                 return (
                     "insufficient_disk",
                     f"job declares container_image {container_image!r} (a multi-GB "
-                    f"image pull) but the runner reports only {reported} free disk "
-                    f"bytes, below the {disk_floor}-byte fit floor — the pull would "
-                    "fail mid-download",
+                    "image pull) but the runner has "
+                    f"workspace_free_bytes={storage['workspace_free_bytes']} and "
+                    f"{runtime}_image_store_free_bytes="
+                    f"{storage['image_store_free_bytes']} at {image_path}; both known "
+                    f"filesystems must clear the {disk_floor}-byte fit floor",
                 )
         if min_compute_capability and not _runner_meets_min_compute_capability(
             snapshot, min_compute_capability
@@ -2104,11 +2110,13 @@ async def _dispatch_compute_experiment_directly(
         )
         if disk_blocked:
             hold_msg = (
-                "Waiting for a runner with enough free disk: job declares "
+                "Waiting for a runner with enough capacity: job declares "
                 f"container_image={container_image!r} (a multi-GB image pull) but "
-                "every container-capable runner reports free disk below the "
-                f"{disk_floor}-byte fit floor. Free space on a runner and it will "
-                "claim the job."
+                "every container-capable runner reports workspace or container "
+                "image-store capacity below the "
+                f"{disk_floor}-byte fit floor. A low Docker image store triggers "
+                "stale-image cleanup on the runner; the job will claim after both "
+                "known filesystems clear the floor."
             )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None

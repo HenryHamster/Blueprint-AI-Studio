@@ -1419,6 +1419,10 @@ class _TelemetryState:
         self._lock = threading.Lock()
         self.last_successful_job_at: str | None = None
         self.consecutive_job_failures: int = 0
+        # Last best-effort Docker image-store reclaim. This is separate from job
+        # health so an operator can see that a blocked container job triggered a
+        # cleanup attempt even when no job was claimed.
+        self._last_container_image_reclaim: dict | None = None
         self._pause_start_at: float | None = None
 
     def record_success(self) -> None:
@@ -1430,6 +1434,32 @@ class _TelemetryState:
     def record_failure(self) -> None:
         with self._lock:
             self.consecutive_job_failures += 1
+
+    def record_container_image_reclaim(self, store: dict, result: dict) -> None:
+        """Record a bounded image-store cleanup result for the next heartbeat."""
+        root = store.get("root")
+        after = _disk_free_bytes(root) if isinstance(root, str) else None
+        reason = result.get("reason") or result.get("output")
+        with self._lock:
+            self._last_container_image_reclaim = {
+                "attempted_at": _utc_now_iso(),
+                "runtime": store.get("runtime"),
+                "store_root": root,
+                "free_bytes_before": store.get("free_bytes"),
+                "free_bytes_after": after,
+                "removed": result.get("removed"),
+                "kept": result.get("kept"),
+                "in_use_skipped": result.get("in_use_skipped"),
+                "reason": str(reason)[:500] if reason else None,
+            }
+
+    def container_image_reclaim_snapshot(self) -> dict | None:
+        with self._lock:
+            return (
+                dict(self._last_container_image_reclaim)
+                if self._last_container_image_reclaim is not None
+                else None
+            )
 
     def snapshot(self) -> tuple[str | None, int]:
         with self._lock:
@@ -1625,12 +1655,71 @@ def _min_free_disk_bytes() -> int:
         return 0
 
 
+# Must match the server-side container-image admission default. This is
+# intentionally independent from BLUEPRINT_RUNNER_MIN_DISK_BYTES: operators can
+# leave bwrap/imageless workspace work enabled below this level while Docker
+# image-store recovery still runs before a container pull is admitted.
+_CONTAINER_IMAGE_RECLAIM_MIN_FREE_BYTES_DEFAULT = 10_737_418_240  # 10 GiB
+
+
+def _container_image_reclaim_min_free_bytes() -> int:
+    """Hard cleanup floor for Docker image storage (never below 10 GiB)."""
+    raw = os.environ.get("BLUEPRINT_RUNNER_CONTAINER_IMAGE_MIN_DISK_BYTES", "").strip()
+    try:
+        configured = int(raw) if raw else 0
+    except ValueError:
+        configured = 0
+    return max(
+        _CONTAINER_IMAGE_RECLAIM_MIN_FREE_BYTES_DEFAULT,
+        _min_free_disk_bytes(),
+        configured,
+    )
+
+
 def _disk_below_min(root: str | None, min_free_bytes: int) -> bool:
     """True iff *root*'s free space is known and below *min_free_bytes* (>0)."""
     if min_free_bytes <= 0:
         return False
     free = _disk_free_bytes(root)
     return free is not None and free < min_free_bytes
+
+
+def _container_image_store(
+    caps: "iso.Capabilities | None", *, _run=subprocess.run
+) -> dict | None:
+    """Describe the local container image store, including its own free space.
+
+    Container layers are written to a runtime-managed data root, not necessarily
+    to the runner workspace. Keep the measurements separate: compute scratch,
+    clones, and artifacts need the workspace filesystem; a container image pull
+    needs the image-store filesystem. An unknown store remains ``None`` so an
+    older/remote/misconfigured runtime does not create a false disk gate.
+
+    Docker is the common case (``DockerRootDir``); podman uses its graph root.
+    Other container runtimes are intentionally not guessed here because their
+    storage layouts are deployment-specific.
+    """
+    if caps is None:
+        return None
+    runtime = caps.preferred_container()
+    if runtime == iso.BACKEND_DOCKER:
+        argv = ["docker", "info", "--format", "{{.DockerRootDir}}"]
+    elif runtime == iso.BACKEND_PODMAN:
+        argv = ["podman", "info", "--format", "{{.Store.GraphRoot}}"]
+    else:
+        return None
+    try:
+        result = _run(argv, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    root = (result.stdout or "").strip()
+    if result.returncode != 0 or not root or not os.path.isabs(root):
+        return None
+    return {
+        "runtime": runtime,
+        "root": root,
+        "free_bytes": _disk_free_bytes(root),
+    }
 
 
 def _compute_image_keep_days() -> int:
@@ -3467,6 +3556,11 @@ def _heartbeat_loop(
                 else None
             )
             gpu_memory = _gpu_memory_mib() if has_gpu else None
+            # Container layers may live on a different filesystem than compute
+            # scratch. Report both so dispatch can gate image pulls on the real
+            # limiting capacity while bwrap work remains workspace-only.
+            workspace_free_bytes = _disk_free_bytes(workspace_root)
+            container_image_store = _container_image_store(caps)
             # Per-project docker image-cache accounting. Only probed when docker
             # (or podman) is the selected compute backend — a bwrap-only / GCP
             # runner has no docker image cache to account, and we skip the two
@@ -3503,7 +3597,22 @@ def _heartbeat_loop(
                 # pegged CPU.
                 "last_successful_job_at": last_success_at,
                 "consecutive_job_failures": consecutive_failures,
-                "disk_free_bytes": _disk_free_bytes(workspace_root),
+                # Legacy field remains the workspace filesystem for existing
+                # low-disk health telemetry and imageless/bwrap behavior.
+                "disk_free_bytes": workspace_free_bytes,
+                "workspace_free_bytes": workspace_free_bytes,
+                "container_image_store_runtime": (
+                    container_image_store.get("runtime") if container_image_store else None
+                ),
+                "container_image_store_path": (
+                    container_image_store.get("root") if container_image_store else None
+                ),
+                "container_image_store_free_bytes": (
+                    container_image_store.get("free_bytes") if container_image_store else None
+                ),
+                "container_image_reclaim": (
+                    telemetry.container_image_reclaim_snapshot() if telemetry else None
+                ),
                 # Per-project docker image-cache accounting (multi-project
                 # runners share one image cache; this attributes its size back
                 # to the project that pulled each image). Omitted when docker is
@@ -6056,22 +6165,34 @@ def _run_compute_job(
         _release_capacity(capacity)
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
-        # Cache hygiene: reclaim Docker image storage if disk is low. No-op when
-        # free space is above threshold; protects in-use and recently-used images
-        # (last-use/pull recency, not upstream image creation date).
+        # Cache hygiene: Docker layers live under the runtime data-root, which
+        # can be distinct from the job workspace. Do not run Docker cleanup for
+        # a Podman store: it cannot free Podman's graph-root filesystem.
         try:
-            prune_result = _prune_docker_images(
-                _workspace_root(), _min_free_disk_bytes()
-            )
-            if prune_result.get("pruned"):
-                print(
-                    f"[compute] job {job_id}: Docker image hygiene (low disk) "
-                    f"keep_days={prune_result.get('keep_days')} "
-                    f"removed={prune_result.get('removed')} "
-                    f"kept={prune_result.get('kept')} "
-                    f"in_use_skipped={prune_result.get('in_use_skipped')}",
-                    flush=True,
+            image_store = _container_image_store(caps)
+            if image_store is None or image_store.get("runtime") == iso.BACKEND_DOCKER:
+                prune_root = (
+                    image_store.get("root") if image_store else _workspace_root()
                 )
+                prune_floor = (
+                    _container_image_reclaim_min_free_bytes()
+                    if image_store is not None
+                    else _min_free_disk_bytes()
+                )
+                prune_result = _prune_docker_images(prune_root, prune_floor)
+                if image_store is not None and telemetry is not None:
+                    telemetry.record_container_image_reclaim(
+                        image_store, prune_result
+                    )
+                if prune_result.get("pruned"):
+                    print(
+                        f"[compute] job {job_id}: Docker image hygiene (low disk) "
+                        f"keep_days={prune_result.get('keep_days')} "
+                        f"removed={prune_result.get('removed')} "
+                        f"kept={prune_result.get('kept')} "
+                        f"in_use_skipped={prune_result.get('in_use_skipped')}",
+                        flush=True,
+                    )
         except Exception:  # noqa: BLE001 — cache hygiene must never fail a job
             pass
 
@@ -6121,42 +6242,71 @@ def _compute_poll_loop(
                 time.sleep(poll_interval)
                 continue
 
-            # Low-disk guard: don't claim compute work when the workspace
-            # filesystem is nearly full. A baked container-image job must PULL a
-            # multi-GB image before it can start; claiming it on a nearly-full
-            # box means the pull dies "no space left on device" and the claim is
-            # wasted. Before giving up, reclaim stale images once per minute:
-            # otherwise low disk can prevent every claim and leave cleanup with no
-            # path to run. The fit floor remains mandatory after the reclaim pass.
+            # Keep workspace pressure and container-image pressure separate. An
+            # imageless/bwrap job only needs workspace scratch, while a Docker
+            # image pull consumes the runtime data-root. Reclaim stale Docker
+            # images even when the server correctly refuses to hand us an
+            # under-floor image job; otherwise no claim means no cleanup path.
             workspace_root = _workspace_root()
             min_free_disk_bytes = _min_free_disk_bytes()
-            if _disk_below_min(workspace_root, min_free_disk_bytes):
+            workspace_low = _disk_below_min(workspace_root, min_free_disk_bytes)
+            image_store = _container_image_store(capabilities)
+            image_store_min_free_bytes = _container_image_reclaim_min_free_bytes()
+            image_store_low = bool(
+                image_store
+                and image_store.get("runtime") == iso.BACKEND_DOCKER
+                and _disk_below_min(
+                    image_store.get("root"), image_store_min_free_bytes
+                )
+            )
+            reclaim_store = image_store if image_store_low else None
+            reclaim_min_free_bytes = (
+                image_store_min_free_bytes if image_store_low else min_free_disk_bytes
+            )
+            if reclaim_store is None and workspace_low and image_store is None:
+                # Older/docker-info-unavailable runners retain the prior best-
+                # effort workspace-root cleanup behavior.
+                reclaim_store = {
+                    "runtime": iso.BACKEND_DOCKER,
+                    "root": workspace_root,
+                    "free_bytes": _disk_free_bytes(workspace_root),
+                }
+            if reclaim_store is not None:
+                reclaim_root = reclaim_store.get("root")
                 now_monotonic = time.monotonic()
-                if now_monotonic - last_low_disk_reclaim_at >= 60.0:
+                if (
+                    isinstance(reclaim_root, str)
+                    and now_monotonic - last_low_disk_reclaim_at >= 60.0
+                ):
                     last_low_disk_reclaim_at = now_monotonic
                     try:
                         prune_result = _prune_docker_images(
-                            workspace_root, min_free_disk_bytes
+                            reclaim_root, reclaim_min_free_bytes
                         )
+                        if telemetry is not None:
+                            telemetry.record_container_image_reclaim(
+                                reclaim_store, prune_result
+                            )
                         prune_detail = (
                             prune_result.get("reason")
                             or prune_result.get("output")
                             or "completed"
                         )
                         print(
-                            "[compute] low-disk pre-claim image hygiene "
+                            "[compute] low-disk pre-claim image-store hygiene "
                             f"({prune_detail})",
                             flush=True,
                         )
                     except Exception as exc:
                         print(
-                            f"[compute] low-disk pre-claim image hygiene failed: {exc}",
+                            "[compute] low-disk pre-claim image-store hygiene "
+                            f"failed: {exc}",
                             flush=True,
                         )
             if _disk_below_min(workspace_root, min_free_disk_bytes):
                 _release_capacity(capacity)
                 print(
-                    f"[compute] low disk on {workspace_root} "
+                    f"[compute] low disk on workspace {workspace_root} "
                     f"(< {min_free_disk_bytes} bytes free) — skipping compute claim.",
                     flush=True,
                 )

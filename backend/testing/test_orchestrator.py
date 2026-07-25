@@ -1252,6 +1252,20 @@ def test_runner_has_free_disk_present_absent_malformed():
         id=uuid.uuid4(), project_id=uuid.uuid4(),
         capabilities={"disk_free_bytes": "lots"},
     )
+    docker_store_full = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "workspace_free_bytes": 20_000,
+            "container_image_store_free_bytes": 5_000,
+        },
+    )
+    workspace_full = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "workspace_free_bytes": 5_000,
+            "container_image_store_free_bytes": 20_000,
+        },
+    )
 
     assert _runner_has_free_disk(roomy, floor) is True
     assert _runner_has_free_disk(full, floor) is False
@@ -1259,13 +1273,19 @@ def test_runner_has_free_disk_present_absent_malformed():
     assert _runner_has_free_disk(absent, floor) is True
     # Malformed telemetry ⇒ not gated (do not trust unparseable data).
     assert _runner_has_free_disk(malformed, floor) is True
+    # A container pull needs BOTH its checkout workspace and runtime data-root.
+    assert _runner_has_free_disk(docker_store_full, floor) is False
+    assert _runner_has_free_disk(workspace_full, floor) is False
     # A non-positive floor is no floor.
     assert _runner_has_free_disk(full, 0) is True
 
 
 def test_select_eligible_runner_disk_filter_excludes_full_runner():
-    """A container-image job is NOT dispatched to a container-capable runner whose
-    reported free disk is below the fit floor."""
+    """A container-image job is NOT dispatched when Docker's data-root is full.
+
+    The workspace remains roomy in this case; the image-store filesystem is the
+    limiting capacity and must independently clear the hard fit floor.
+    """
     from app.orchestrator_runner_dispatch import (
         _select_eligible_runner,
         RunnerDispatchSnapshot,
@@ -1278,7 +1298,11 @@ def test_select_eligible_runner_disk_filter_excludes_full_runner():
         capabilities={
             "task_types": "all",
             "isolation_backends": {"docker_usable": True},
-            "disk_free_bytes": 1_000_000,  # ~1 MB free — below the multi-GB floor
+            "disk_free_bytes": 20_000_000,
+            "workspace_free_bytes": 20_000_000,
+            "container_image_store_runtime": "docker",
+            "container_image_store_path": "/var/lib/docker",
+            "container_image_store_free_bytes": 1_000_000,  # ~1 MB free — below the multi-GB floor
         },
     )
     cache = {project_id: [full_runner]}
@@ -1311,7 +1335,11 @@ def test_select_eligible_runner_disk_filter_selects_roomy_runner():
         capabilities={
             "task_types": "all",
             "isolation_backends": {"docker_usable": True},
-            "disk_free_bytes": 1_000_000,
+            "disk_free_bytes": 20_000_000,
+            "workspace_free_bytes": 20_000_000,
+            "container_image_store_runtime": "docker",
+            "container_image_store_path": "/var/lib/docker",
+            "container_image_store_free_bytes": 1_000_000,
         },
     )
     roomy_runner = RunnerDispatchSnapshot(
@@ -1414,7 +1442,11 @@ def test_diagnose_strict_pin_hold_reports_insufficient_disk():
         capabilities={
             "task_types": "all",
             "isolation_backends": {"docker_usable": True},
-            "disk_free_bytes": 1_000_000,
+            "disk_free_bytes": 20_000_000,
+            "workspace_free_bytes": 20_000_000,
+            "container_image_store_runtime": "docker",
+            "container_image_store_path": "/var/lib/docker",
+            "container_image_store_free_bytes": 1_000_000,
         },
     )
     cache = {project_id: [full_runner]}
@@ -1433,7 +1465,8 @@ def test_diagnose_strict_pin_hold_reports_insufficient_disk():
     assert reason == "insufficient_disk", (
         f"expected insufficient_disk, got {reason!r}: {detail}"
     )
-    assert "free disk" in detail
+    assert "docker_image_store_free_bytes=1000000" in detail
+    assert "/var/lib/docker" in detail
 
 
 # ── GPU-in-container-capability gating (image + accelerator) ──────────────────
