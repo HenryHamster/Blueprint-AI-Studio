@@ -6,7 +6,7 @@ import {
 import { writeAgentTokenFile } from '../token-file.js';
 import { PROCESS_KILL_GRACE_MS } from '../constants.js';
 import {
-  parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks, encodeInterrupt,
+  parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks,
   isStrategicMutation, isMessageSend, type ResidentStreamEvent,
 } from './resident-stream.js';
 import {
@@ -116,7 +116,7 @@ export interface ResidentSession {
     stallTimeoutMs?: number;
     hardTimeoutMs?: number;
   }): Promise<ResidentTurnResult>;
-  /** Cooperatively pre-empt the in-flight turn (control_request, SIGINT fallback). */
+  /** Cooperatively pre-empt the in-flight turn with SIGINT. */
   interrupt(): void;
   /** Subscribe to parsed stream events (text deltas, tool_use, errors). */
   onEvent(cb: (ev: ResidentSessionEvent) => void): void;
@@ -694,24 +694,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (!alive || closed) return;
     const t = activeTurn;
     if (t) t.interrupted = true;
-    let wroteControl = false;
-    try {
-      if (!child.stdin.destroyed) {
-        child.stdin.write(encodeInterrupt(`int-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`));
-        wroteControl = true;
-      }
-    } catch { /* fall through to SIGINT */ }
-    const sigint = () => {
-      // Never SIGTERM/SIGKILL a resident turn — SIGINT to the claude process only
-      // cancels the current turn and keeps the warm session usable.
-      try { if (typeof pid === 'number') process.kill(pid, 'SIGINT'); } catch { /* ignore */ }
-    };
-    if (!wroteControl) {
-      sigint();
-    } else if (t && !t.interruptTimer) {
-      // Fall back to SIGINT if the control_request did not end the turn in time.
-      t.interruptTimer = setTimeout(() => { if (activeTurn === t) sigint(); }, RESIDENT_INTERRUPT_SIGINT_GRACE_MS);
-    }
+    // Claude's stream-json input accepts only user frames. Sending a synthetic
+    // control_request makes the CLI exit instead of cancelling the active
+    // turn, so always use the process-level cooperative interrupt.
+    try { if (typeof pid === 'number') process.kill(pid, 'SIGINT'); } catch { /* ignore */ }
   }
 
   function close(): void {

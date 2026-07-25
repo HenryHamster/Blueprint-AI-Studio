@@ -123,6 +123,10 @@ export interface ResidentConfig {
    *  a turn starts promptly after the operator sends — the "faster pickup" knob —
    *  while heartbeats stay paced at idleTickMs so we don't hammer the backend. */
   messagePollMs: number;
+  /**
+   * Operator response-progress target (ms). Crossing this threshold only
+   * updates the activity status; it never interrupts or replaces a session.
+   */
   turnTimeoutMs: number;
   /** false disables the autonomous self-prompt path (e.g. a read-only monitor mode) */
   autonomousEnabled: boolean;
@@ -265,7 +269,9 @@ export function buildStagedDirectionsText(
  * Resolve the resident loop's timing knobs from the strategic payload the
  * backend ships (runtime settings surfaced onto the payload). Defaults: 5s idle
  * (heartbeat) tick, 1.5s inbound-message poll (fast operator pickup), 120s
- * per-turn timeout, 600s floor tick, 300s autonomous stall budget, 3 ops/turn.
+ * operator response-progress target, 600s floor tick, 300s autonomous stall
+ * budget, 3 ops/turn. The response-progress target is deliberately
+ * non-destructive: a slow but healthy reply must remain usable.
  */
 export function residentConfig(payload: Record<string, unknown>): ResidentConfig {
   const idleTickSec = num(payload.strategic_session_idle_tick_seconds, 5);
