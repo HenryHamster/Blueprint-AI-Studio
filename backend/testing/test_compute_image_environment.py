@@ -408,6 +408,116 @@ async def test_compute_image_heartbeat_renews_owned_lease(db_session):
 
 
 @pytest.mark.asyncio
+async def test_local_task_registry_never_overrides_durable_build_claim(
+    db_session, monkeypatch
+):
+    """A local old task cannot block a changed-recipe durable reclaim."""
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    environment = {
+        "state": "declared_needs_build",
+        "action": "build",
+        "manifest_image": "registry.example/project:latest",
+        "dockerfile": "Dockerfile",
+    }
+    old_manifest = {
+        "compute": {
+            "image": {
+                "name": "registry.example/project:latest",
+                "build": {
+                    "dockerfile": "Dockerfile",
+                    "deps": ["requirements.txt"],
+                    "build_args": {"CUDA": "12.1"},
+                },
+            }
+        }
+    }
+    changed_manifest = {
+        "compute": {
+            "image": {
+                "name": "registry.example/project:latest",
+                "build": {
+                    "dockerfile": "Dockerfile",
+                    "deps": ["requirements.txt"],
+                    "build_args": {"CUDA": "12.4"},
+                },
+            }
+        }
+    }
+
+    from app import compute_backends
+    from app.project_telemetry import set_project_telemetry
+    from app.routers import agent_strategic_fetch
+
+    current_manifest = old_manifest
+
+    async def manifest_fn(_project):
+        return current_manifest
+
+    async def prehash_failure(*_args, **_kwargs):
+        return {"dep_hash": None, "reason": "manifest_probe_failed"}
+
+    launched: list[str] = []
+
+    async def fake_runner(_project_id, request_id):
+        launched.append(request_id)
+
+    monkeypatch.setattr(
+        compute_backends,
+        "resolve_project_compute_image_dependency_identity",
+        prehash_failure,
+    )
+    monkeypatch.setattr(
+        agent_strategic_fetch,
+        "_run_agent_requested_compute_image_build",
+        fake_runner,
+    )
+
+    old_recipe_identity = agent_strategic_fetch._compute_image_recipe_identity(
+        environment, old_manifest
+    )
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        "compute_image_build_state",
+        {
+            "request_id": "old-local-worker",
+            "status": "requested",
+            "recipe_identity": old_recipe_identity,
+            "requested_at": "2026-07-25T00:00:00+00:00",
+            "lease_expires_at": "2099-07-25T00:00:00+00:00",
+        },
+    )
+    await db_session.commit()
+
+    release_old_task = asyncio.Event()
+
+    async def active_local_task():
+        await release_old_task.wait()
+
+    old_task = asyncio.create_task(active_local_task())
+    agent_strategic_fetch._agent_compute_image_build_tasks[project.id] = old_task
+    try:
+        assert await agent_strategic_fetch._request_agent_compute_image_build(
+            db_session, project, environment, manifest_fn=manifest_fn
+        ) == "already_requested"
+        assert launched == []
+
+        current_manifest = changed_manifest
+        assert await agent_strategic_fetch._request_agent_compute_image_build(
+            db_session, project, environment, manifest_fn=manifest_fn
+        ) == "requested"
+        await asyncio.sleep(0)
+        assert len(launched) == 1
+    finally:
+        release_old_task.set()
+        await old_task
+        agent_strategic_fetch._agent_compute_image_build_tasks.pop(project.id, None)
+
+
+@pytest.mark.asyncio
 async def test_agent_compute_environment_recovers_stale_requested_hash(
     client: AsyncClient, db_session, monkeypatch
 ):
