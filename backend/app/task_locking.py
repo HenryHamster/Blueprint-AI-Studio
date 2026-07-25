@@ -102,6 +102,8 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         # Per-direction first-attempt review feedback tallies.  Dual-written to
         # project_telemetry; exempted from agent budget during the transition.
         "direction_first_attempt_feedback",
+        # Durable compute-image build lease/state; maintained by product code.
+        "compute_image_build_state",
         # Completion-debt-ledger system description seeded by completion_debt.py.
         "systems/completion-debt-ledger",
         # Analytics/sweep keys written by background code (not by agents)
