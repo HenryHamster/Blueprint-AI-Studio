@@ -6364,6 +6364,47 @@ class TestBatchedDepRowsSurviveCommit:
         db_session.expunge(detached_dep)
         assert "plan_output" not in detached_dep.__dict__
         assert await _verify_pr_merged(detached_dep, db_session) is True
+
+    @pytest.mark.asyncio
+    async def test_project_dispatch_projection_loads_integration_branch(
+        self, db_session
+    ):
+        """Capability-proof HEAD resolution may read the projected branch."""
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+
+        from app.branch_resolution import get_project_integration_branch
+        from app.orchestrator import PROJECT_RESOURCE_DISPATCH_COLUMNS
+
+        project = make_project(
+            name="Projected Capability Branch",
+            user_id="u1",
+            integration_branch="release/capability-proof",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        project_id = project.id
+        db_session.expunge(project)
+        projected = (
+            await db_session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .options(
+                    _load_only(
+                        *PROJECT_RESOURCE_DISPATCH_COLUMNS,
+                        raiseload=True,
+                    )
+                )
+            )
+        ).scalar_one()
+
+        assert (
+            get_project_integration_branch(projected)
+            == "release/capability-proof"
+        )
+
     def test_dep_batch_projection_excludes_heavy_columns(self):
         """The dep-batch load_only must exclude plan_output/status_log/depends_on
         and retain status/context/payloads needed by _check_candidate_task_deps."""

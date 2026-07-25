@@ -788,6 +788,21 @@ BLOCKED_CONFLICT_LIGHT_COLUMNS = (
     Task.payloads,
 )
 
+PROJECT_RESOURCE_DISPATCH_COLUMNS = (
+    Project.id,
+    Project.build_config,
+    Project.paused,
+    Project.archived,
+    Project.github_owner,
+    Project.github_repo,
+    # Capability-proof HEAD validation resolves the project's real source
+    # branch before dispatch. Keep this branch column in the same projection as
+    # the capability state it validates.
+    Project.integration_branch,
+    Project.capability_adoption_verdicts,
+    Project.capability_proof_records,
+)
+
 # PROJECTION CONTRACT: all load_only() calls in backend/app pass raiseload=True so
 # that any code path accessing an unprojected column raises InvalidRequestError
 # synchronously at test time instead of MissingGreenlet at runtime.  When a new
@@ -828,14 +843,7 @@ async def _project_resource_dispatch_defer_message(
             .where(Project.id == task.project_id)
             .options(
                 load_only(
-                    Project.id,
-                    Project.build_config,
-                    Project.paused,
-                    Project.archived,
-                    Project.github_owner,
-                    Project.github_repo,
-                    Project.capability_adoption_verdicts,
-                    Project.capability_proof_records,
+                    *PROJECT_RESOURCE_DISPATCH_COLUMNS,
                     raiseload=True,
                 )
             )
@@ -3239,14 +3247,7 @@ async def orchestrator_worker():
                                 .where(Project.id.in_(_all_candidate_pids))
                                 .options(
                                     load_only(
-                                        Project.id,
-                                        Project.build_config,
-                                        Project.paused,
-                                        Project.archived,
-                                        Project.github_owner,
-                                        Project.github_repo,
-                                        Project.capability_adoption_verdicts,
-                                        Project.capability_proof_records,
+                                        *PROJECT_RESOURCE_DISPATCH_COLUMNS,
                                         raiseload=True,
                                     )
                                 )
