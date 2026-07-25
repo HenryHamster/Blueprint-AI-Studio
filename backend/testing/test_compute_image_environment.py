@@ -172,6 +172,48 @@ async def test_agent_compute_environment_is_project_scoped(client: AsyncClient, 
 
 
     assert response.json()["data"]["build_status"] == "not_running"
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_environment_retains_terminal_build_outcome(
+    client: AsyncClient, db_session, monkeypatch
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="env-agent-outcome",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    async def fake_resolver(*_args, **_kwargs):
+        return {"state": "declared_needs_build", "action": "build"}
+
+    from app import compute_image_environment
+    from app.routers import agent_strategic_fetch
+
+    monkeypatch.setattr(
+        compute_image_environment,
+        "resolve_project_compute_image_environment",
+        fake_resolver,
+    )
+    monkeypatch.setattr(
+        agent_strategic_fetch,
+        "_agent_compute_image_build_last_outcomes",
+        {project.id: {"status": "deferred", "reason": "builder_busy", "completed_at": "2026-07-25T00:00:00+00:00"}},
+    )
+    token = create_agent_token(str(task.id), "env-agent-outcome", task_type="strategic_review")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/compute-environment",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["build_status"] == "not_running"
+    assert response.json()["data"]["last_build_outcome"]["reason"] == "builder_busy"
 @pytest.mark.asyncio
 async def test_agent_compute_image_build_rejects_non_strategic_task(client: AsyncClient, db_session):
     project = _project()
