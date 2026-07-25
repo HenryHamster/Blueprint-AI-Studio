@@ -109,6 +109,7 @@ function makeControllableChild() {
     proc: proc as unknown as SpawnMock,
     stdinWrites,
     pushLine: (obj: unknown) => dataCb?.(Buffer.from(JSON.stringify(obj) + '\n')),
+    pushRawStdout: (text: string) => dataCb?.(Buffer.from(text)),
     pushStderr: (text: string) => stderrCb?.(Buffer.from(text)),
     triggerClose: (code = 0) => { proc.exitCode = code; closeCb?.(code, null); },
   };
@@ -203,6 +204,19 @@ describe('startResidentClaudeSession', () => {
     });
     expect(session.failureCategory?.()).toBe('rate_limited');
     session.close();
+  });
+  it('classifies an unterminated raw stdout weekly-limit banner before any turn', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    // This is the production shape observed from Claude Code at resident
+    // startup: it can exit after printing plain text, with no NDJSON frame or
+    // trailing newline, before the handler has sent the first user turn.
+    ctl.pushRawStdout("You've hit your weekly limit · resets Jul 26, 9pm (UTC)");
+    ctl.triggerClose(1);
+
+    expect(session.failureCategory?.()).toBe('rate_limited');
   });
   it('clears transient failure evidence after a successful turn', async () => {
     const ctl = makeControllableChild();
