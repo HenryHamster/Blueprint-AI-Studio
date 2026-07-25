@@ -2418,6 +2418,28 @@ describe('buildLocalRunnerSection runner inventory', () => {
     expect(section).toContain('Use `strict: true` ONLY');
   });
 
+  it('renders stale-active runners as offline rather than active', () => {
+    const section = buildLocalRunnerSection({
+      ever_registered: true,
+      active_total: 0,
+      active_gpu: 0,
+      runners: [{
+        runner_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        hostname: 'dgx-1',
+        status: 'active',
+        live: false,
+        last_heartbeat_at: '2026-07-24T11:00:00',
+        gpu_count: 1,
+        container_ok: true,
+        gpu_in_container_ok: true,
+        active_compute_jobs: 0,
+      }],
+    });
+
+    expect(section).toContain('STALE/OFFLINE (persisted status: active)');
+    expect(section).not.toContain('dgx-1 [aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]: LIVE');
+  });
+
   it('does not render runner pin guidance without a project inventory', () => {
     const section = buildLocalRunnerSection({
       ever_registered: true,
