@@ -523,6 +523,22 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       }
       case 'result': {
         if (!ev.isTurnResult) break;
+        // Claude's OAuth usage-limit banner is sometimes delivered as a
+        // successful-looking top-level result (rather than an error event or
+        // stderr) and then the CLI stays alive. Treat that exact provider
+        // evidence as terminal before the ordinary-success path below clears
+        // the failure tail; otherwise a resident keeps accepting turns from an
+        // exhausted account and the pool never gets a rate-limit signal to
+        // rotate away from it.
+        const resultFailure = ev.text ? classifyFailure(ev.text) : null;
+        if (resultFailure) {
+          appendFailureText(ev.text ?? '');
+          terminalFailureCategory = resultFailure;
+          if (activeTurn) {
+            activeTurn.providerFailed = true;
+            activeTurn.failureCategory = resultFailure;
+          }
+        }
         // Per-turn token telemetry: record usage on EVERY top-level result (even
         // a swallowed stale one — the tokens were still spent) so a multi-hour
         // session reports real totals instead of 1 call / 0 tokens.
@@ -548,10 +564,18 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         // A successful result proves earlier warnings were transient. Scope the
         // evidence to the current terminal failure so an old warning cannot
         // poison an unrelated process exit later in the session.
-        if (!ev.isError) clearFailureEvidence();
+        if (!ev.isError && !resultFailure) clearFailureEvidence();
         if (ev.isError && activeTurn) {
           activeTurn.providerFailed = true;
           activeTurn.failureCategory = classifyFailure(failureTextTail);
+        }
+        if (resultFailure && !ev.isError) {
+          // Do not render the quota banner as an assistant reply. It is an
+          // operational error, and SessionStreamer surfaces this as status text
+          // while the handler terminates with provider_rate_limited.
+          emit({ kind: 'error', text: ev.text });
+          settleTurn('', false);
+          break;
         }
         settleTurn(ev.text ?? '', false);
         break;

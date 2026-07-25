@@ -46,7 +46,7 @@ vi.mock('./runners.js', () => ({
   __resetClaudeCapabilityCacheForTesting: vi.fn(),
   probeClaudeCapabilities: vi.fn(() => null),
   stripUnsupportedClaudeOptionalArgs: vi.fn((args: readonly string[]) => [...args]),
-  matchesRateLimit: vi.fn((text: string) => /rate limit/i.test(text)),
+  matchesRateLimit: vi.fn((text: string) => /rate limit|weekly limit/i.test(text)),
   matchesAuthFailure: vi.fn((text: string) => /unauthorized/i.test(text)),
   getProviderRunner: vi.fn(() => ({
     provider: 'anthropic',
@@ -178,6 +178,32 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
+  it('treats a successful-looking weekly-limit result as a provider failure', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+    const events: Array<{ kind: string; text?: string }> = [];
+    session.onEvent((event) => events.push(event));
+
+    const turn = session.sendTurn('hello');
+    ctl.pushLine({
+      type: 'result',
+      result: "You've hit your weekly limit · resets Jul 26, 9pm (UTC)",
+      is_error: false,
+    });
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: true,
+      failureCategory: 'rate_limited',
+      resultText: '',
+    });
+    expect(events).toContainEqual({
+      kind: 'error',
+      text: "You've hit your weekly limit · resets Jul 26, 9pm (UTC)",
+    });
+    expect(session.failureCategory?.()).toBe('rate_limited');
+    session.close();
+  });
   it('clears transient failure evidence after a successful turn', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
