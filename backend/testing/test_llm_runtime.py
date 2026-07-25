@@ -1393,7 +1393,7 @@ def test_runtime_fallback_seam_no_circular_import_and_identical_symbols():
     assert orch._ENV_FALLBACK_DEFAULT_MODELS is env._ENV_FALLBACK_DEFAULT_MODELS
     assert callable(orch._sync_task_payload_runtime_fields)
     assert env._ENV_FALLBACK_DEFAULT_MODELS == {
-        "anthropic": "claude-opus-4-8",
+        "anthropic": "claude-opus-5",
         "openai": "gpt-5.4",
         "gemini": "gemini-2.5-pro",
         "zai": "glm-5.2",

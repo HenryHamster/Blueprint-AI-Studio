@@ -7599,11 +7599,22 @@ async def test_operator_inbox_needs_action_liveness_ok_when_all_actionable(db):
 
 
 @pytest.mark.asyncio
-async def test_operator_inbox_needs_action_liveness_flags_nonactionable_notice(db):
-    """An open NULL-audience NOTE (non-actionable, non-fyi) triggers FLAGGED with delta=1."""
+async def test_operator_inbox_needs_action_liveness_excludes_null_audience(db):
+    """A NULL-audience NOTE never reaches this check — the fetch is fail-closed.
+
+    Before #16202 a NULL ``context['audience']`` fell THROUGH to the operator
+    inbox (legacy fail-open), so this check counted such a NOTE as a forward
+    leak. ``operator_visible_message_audience_filter`` is now an explicit
+    IN-allowlist over {operator-fyi, operator-action-needed}, so un-stamped rows
+    are excluded from the operator surface entirely and there is nothing here to
+    flag. Asserting that exclusion is the point: a NULL-audience row must not
+    reach an operator-facing count.
+
+    Detecting and healing those rows moved to the standalone
+    ``operator_inbox_liveness`` signal in #16346 — covered by
+    ``test_operator_inbox_null_audience_counted_as_reply_audience_quarantine``.
+    """
     project = await _project(db)
-    # NOTE with no audience (NULL) is operator-visible (legacy fallthrough) but not
-    # needs-action and not operator-fyi — should be flagged as a forward leak.
     _inbox_message(db, project, message_type=MessageType.NOTE, audience=None)
     await db.commit()
 
@@ -7612,13 +7623,12 @@ async def test_operator_inbox_needs_action_liveness_flags_nonactionable_notice(d
     results = await mis.check_operator_inbox_needs_action_liveness(ctx)
 
     pid = str(project.id)
-    flagged = [r for r in results if r.flagged and r.subject == pid]
-    assert len(flagged) == 1, f"expected FLAGGED, got {results}"
-    f = flagged[0]
-    assert f.self_reported == 1
-    assert f.ground_truth == 0
-    assert f.delta == 1
-    assert "non-actionable" in f.detail or "not genuinely needs-action" in f.detail
+    project_results = [r for r in results if r.subject == pid]
+    assert len(project_results) == 1
+    r = project_results[0]
+    assert r.status == CheckStatus.SKIPPED, (
+        f"NULL-audience message must not reach the operator inbox: {r.detail}"
+    )
 
 
 @pytest.mark.asyncio
@@ -7670,12 +7680,26 @@ async def test_operator_inbox_needs_action_liveness_ignores_user_messages(db):
 
 @pytest.mark.asyncio
 async def test_operator_inbox_needs_action_liveness_enforce_enrolls_finding(db):
-    """In enforce mode, a non-actionable NULL-audience open message enrolls an EvergreenBacklogItem."""
+    """In enforce mode, a FLAGGED inbox-liveness result enrolls an EvergreenBacklogItem."""
     _rc["metrics_integrity_sweep_mode"] = "enforce"
     project = await _project(db)
-    # NULL-audience NOTE: operator-visible (legacy fallthrough) but not needs-action
-    # and not operator-fyi → forward leak → FLAGGED → enrolled in enforce mode.
+    # NULL-audience NOTE. This used to be the flagging seed: it was
+    # operator-visible by legacy fail-open, non-actionable and non-fyi, so it
+    # counted as a forward leak. Since #16202 the audience filter is a
+    # fail-closed IN-allowlist, so this row is excluded from the fetch and
+    # contributes nothing. Kept so the enrolment path is still exercised with a
+    # NULL-audience row present, alongside a seed that genuinely flags today.
     _inbox_message(db, project, message_type=MessageType.NOTE, audience=None)
+    # Undismissed INFO-severity alert on a REGISTERED operator-visible
+    # event_type ("direction_staged_activated" → operator-fyi): non-actionable
+    # alert noise, which is the check's live flagging dimension.
+    db.add(Alert(
+        project_id=project.id,
+        severity=AlertSeverity.INFO,
+        title="Staged direction activated",
+        message="Direction moved from staged to active",
+        event_type="direction_staged_activated",
+    ))
     await db.commit()
 
     now = _utcnow()
@@ -7738,14 +7762,19 @@ async def test_operator_inbox_liveness_covers_alerts_and_bidirectional_drift(db)
         audience="operator-fyi",
     )
 
-    # INFO-severity alert with NULL event_type: operator-visible (fails open on NULL)
-    # but non-actionable → alert channel noise detected by the check.
+    # INFO-severity alert on a REGISTERED operator-visible event_type
+    # ("direction_staged_activated" → operator-fyi): operator-visible but
+    # non-actionable → alert-channel noise detected by the check.
+    # This carried event_type=None before #16202, when NULL fell OPEN into the
+    # operator alert channel. operator_visible_alert_filter is now a fail-closed
+    # IN-allowlist over the audience registry, so a NULL/unregistered event_type
+    # is excluded outright and can no longer exercise the alert channel.
     db.add(Alert(
         project_id=project.id,
         severity=AlertSeverity.INFO,
-        title="Build completed",
-        message="Image build finished successfully",
-        event_type=None,
+        title="Staged direction activated",
+        message="Direction moved from staged to active",
+        event_type="direction_staged_activated",
     ))
     await db.commit()
 
@@ -7789,14 +7818,25 @@ def _clean_liveness():
 
 
 @pytest.mark.asyncio
-async def test_operator_inbox_leak_signal_counts_null_audience_noise(db, _clean_liveness):
-    """Standalone liveness check counts NULL-audience non-actionable messages as
-    forward-leak noise and fires even when metrics_integrity_sweep_mode is 'off'.
+async def test_operator_inbox_null_audience_counted_as_reply_audience_quarantine(
+    db, _clean_liveness
+):
+    """Standalone liveness check counts NULL-audience messages as reverse-audience
+    quarantine and fires even when metrics_integrity_sweep_mode is 'off'.
 
     This is the acceptance test for the always-on operator-inbox liveness signal:
-    a NULL-audience open NOTE (operator-visible by legacy fail-open, but not
-    needs-action and not operator-fyi) must appear in ``forward_leaked`` regardless
-    of the sweep mode, proving the signal is independent of the cuttable sweep.
+    a NULL-audience open NOTE must still be detected regardless of sweep mode,
+    proving the signal is independent of the cuttable sweep.
+
+    The DIMENSION it lands in changed. It used to be ``forward_leaked``, back when
+    a NULL audience fell OPEN into the operator inbox. Since #16202 the audience
+    filter is a fail-closed IN-allowlist, so a NULL-audience row is excluded from
+    the operator-visible fetch and ``forward_leaked`` cannot see it; #16346 then
+    widened the reverse-audience detector to cover NULL alongside the explicitly
+    quarantined non-operator audiences, precisely because a NULL-audience row is
+    a silent dead-letter that the backfill would otherwise bury as
+    STRATEGIST_INTERNAL. So the row is now counted in
+    ``reply_audience_quarantined`` and healed, which is what this asserts.
     """
     from app.operator_inbox_liveness import run_operator_inbox_liveness_check
 
@@ -7829,13 +7869,20 @@ async def test_operator_inbox_leak_signal_counts_null_audience_noise(db, _clean_
     assert r.status == "flagged", (
         f"expected 'flagged' for NULL-audience NOTE, got '{r.status}': {r.detail}"
     )
-    assert r.forward_leaked == 1, (
-        f"expected forward_leaked=1, got {r.forward_leaked}: {r.detail}"
+    assert r.reply_audience_quarantined == 1, (
+        f"expected reply_audience_quarantined=1, got "
+        f"{r.reply_audience_quarantined}: {r.detail}"
+    )
+    # Fail-closed audience filter: the NULL-audience row never enters the
+    # operator-visible fetch, so the forward-leak dimension cannot see it.
+    assert r.forward_leaked == 0, (
+        f"expected forward_leaked=0 under the fail-closed filter, got "
+        f"{r.forward_leaked}: {r.detail}"
     )
     assert r.badge_invisible == 0
     assert r.info_alert_noise == 0
-    assert "forward leak" in r.detail or "not genuinely needs-action" in r.detail, (
-        f"expected forward-leak mention in detail: {r.detail}"
+    assert "quarantined" in r.detail, (
+        f"expected reply-audience quarantine mention in detail: {r.detail}"
     )
 
 

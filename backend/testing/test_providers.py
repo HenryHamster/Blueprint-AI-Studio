@@ -795,11 +795,13 @@ class TestGeminiLegacyAliases:
         assert provider.fallback_model("") is None
 
     def test_anthropic_fallback_map_covers_fable_only(self):
-        """fable-5 → opus-4-8 fallback is retained as a safety net for any
+        """fable-5 → opus-tier fallback is retained as a safety net for any
         in-flight tasks still carrying the retired model; GA models have no
-        fallback entry."""
+        fallback entry. The target tracks the current opus default, so it
+        moved opus-4-8 → opus-5 with the Opus 5 rollout."""
         provider = get_provider(LLMProviderName.ANTHROPIC)
-        assert provider.fallback_model("claude-fable-5") == "claude-opus-4-8"
+        assert provider.fallback_model("claude-fable-5") == "claude-opus-5"
+        assert provider.fallback_model("claude-opus-5") is None
         assert provider.fallback_model("claude-opus-4-8") is None
         assert provider.fallback_model("claude-opus-4-7") is None
         assert provider.fallback_model(None) is None

@@ -16,6 +16,79 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# Cross-test isolation
+# ---------------------------------------------------------------------------
+
+# Attributes the tests in this file assign directly onto sys.modules entries.
+_PATCHED_MODULE_ATTRS = (
+    ("app.github", "get_repo_installation_token"),
+    ("app.shared_state", "get_project_integration_branch"),
+    ("app.routers.admin_onboard", "_detect_build_config"),
+)
+
+# Every sys.modules key _install_stub_modules may create and _reload_bcd may
+# swap. Restored wholesale so neither a leftover stub (installed when the real
+# module happened not to be imported yet) nor the reloaded
+# build_config_detection object outlives the test that made it.
+_TOUCHED_MODULES = (
+    "app.github",
+    "app.shared_state",
+    "app.routers",
+    "app.routers.admin_onboard",
+    "app.schemas",
+    "app.build_config_detection",
+    "pydantic",
+    "sqlalchemy",
+    "sqlalchemy.orm",
+    "sqlalchemy.orm.attributes",
+)
+
+_MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def _restore_directly_patched_modules():
+    """Undo this file's direct ``sys.modules[...].attr = mock`` assignments.
+
+    ``_install_stub_modules`` registers its stubs with ``sys.modules.setdefault``,
+    which is a NO-OP once the real modules are already imported — i.e. in every
+    full-suite run. The tests below then assign ``AsyncMock``s onto whatever is
+    in ``sys.modules``, which in that case is the REAL ``app.github`` /
+    ``app.shared_state`` / ``app.routers.admin_onboard``, and nothing ever puts
+    them back.
+
+    That leaked a ``get_repo_installation_token`` returning ``"tok"`` into the
+    rest of the session, so every later test that mints a GitHub token got
+    ``"tok"`` instead of a real mint (``assert 'tok' == 'ghs_mint_1'`` in
+    test_github_token_resolver), and a ``_detect_build_config`` stuck on this
+    file's canned payload. Snapshot-and-restore keeps the assignments working
+    exactly as written while confining them to the test that makes them.
+    """
+    saved_attrs = [
+        (sys.modules[mod_name], attr, getattr(sys.modules[mod_name], attr, _MISSING))
+        for mod_name, attr in _PATCHED_MODULE_ATTRS
+        if mod_name in sys.modules
+    ]
+    saved_modules = [
+        (name, sys.modules.get(name, _MISSING)) for name in _TOUCHED_MODULES
+    ]
+
+    yield
+
+    for mod, attr, original in saved_attrs:
+        if original is _MISSING:
+            if hasattr(mod, attr):
+                delattr(mod, attr)
+        else:
+            setattr(mod, attr, original)
+    for name, original in saved_modules:
+        if original is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

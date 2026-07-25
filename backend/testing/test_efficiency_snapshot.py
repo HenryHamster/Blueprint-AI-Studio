@@ -128,6 +128,37 @@ def _make_merged_task(project_id, *, reason: str | None = None):
     )
 
 
+async def _read_container(session, project):
+    """Read the efficiency container from its authoritative store.
+
+    Storage moved off ``design_doc[DESIGN_DOC_KEY]`` onto the keyed
+    ``project_telemetry`` row; ``design_doc`` survives only as a seed for
+    projects that predate the back-fill. Mirrors the production read in
+    ``read_baseline_with_drift``. Returns None when no container has been
+    written yet, so ``is not None`` checks stay meaningful.
+    """
+    from app.project_telemetry import get_project_telemetry
+
+    return await get_project_telemetry(
+        session,
+        project.id,
+        DESIGN_DOC_KEY,
+        design_doc_fallback=project.design_doc,
+    )
+
+
+async def _require_container(session, project):
+    """``_read_container`` that fails when the container is absent.
+
+    Stands in for the old design-doc subscript so negative assertions
+    (``assert key not in container``) cannot pass vacuously against a
+    container that was never written.
+    """
+    container = await _read_container(session, project)
+    assert container is not None, "efficiency telemetry container was never written"
+    return container
+
+
 @pytest.mark.asyncio
 async def test_compute_current_axes_returns_all_keys(db_session):
     project = make_project()
@@ -652,7 +683,7 @@ async def test_first_snapshot_seeds_baseline(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = (project.design_doc or {}).get(DESIGN_DOC_KEY)
+    container = await _read_container(db_session, project)
     assert container is not None
     assert container["baseline"]["captured_at"] == snap["captured_at"]
     assert (
@@ -688,7 +719,7 @@ async def test_subsequent_snapshots_do_not_clobber_baseline(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     # Baseline frozen at first snapshot's value.
     assert (
         container["baseline"][AXIS_COST_PER_MERGED_PR] == first[AXIS_COST_PER_MERGED_PR]
@@ -737,7 +768,7 @@ async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
 
     # Old stale value must be gone; re-seeded from the new snapshot.
@@ -781,7 +812,7 @@ async def test_write_snapshot_reseeds_cleared_baseline_axis(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
     # Cleared axis re-seeded from the fresh snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 20000.0
@@ -821,7 +852,7 @@ async def test_write_snapshot_migrates_cold_start_baseline_v2_to_v3(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
     # Stale provision-confirm-anchored value must be gone; re-seeded from new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
@@ -853,7 +884,7 @@ async def test_read_baseline_with_drift_returns_drift_pct(db_session):
 
     from app.models import ProjectEfficiencySnapshot
 
-    base_cpm = project.design_doc[DESIGN_DOC_KEY]["baseline"][AXIS_COST_PER_MERGED_PR]
+    base_cpm = (await _require_container(db_session, project))["baseline"][AXIS_COST_PER_MERGED_PR]
     latest_row = (
         await db_session.execute(
             _select(ProjectEfficiencySnapshot)
@@ -1853,7 +1884,7 @@ async def test_write_snapshot_migrates_review_iterations_baseline(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
 
     # Stale value replaced by the corrected snapshot value.
@@ -1889,9 +1920,10 @@ async def test_write_snapshot_preserves_other_design_doc_keys(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    # The efficiency baseline key must be written.
-    assert DESIGN_DOC_KEY in project.design_doc
-    # Pre-existing sibling key must be intact.
+    # The efficiency container must be written (now on the project_telemetry
+    # row rather than design_doc).
+    assert await _read_container(db_session, project) is not None
+    # Pre-existing sibling design_doc key must be intact.
     assert project.design_doc.get("some_other_key") == {"value": 42}
 
 
@@ -2743,7 +2775,7 @@ async def test_schema_version_v3_migrates_llm_axis(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
 
     # Stale value must be gone; re-seeded from the new snapshot.
@@ -4229,7 +4261,7 @@ async def test_payoff_cost_regression_is_suppressed_from_operator_alerts(
 
     # Suppression must not advance the durable operator-alert marker.
     await db_session.refresh(project)
-    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
+    assert LAST_ALERTED_PAYOFF_KEY not in await _require_container(db_session, project)
 
 
 @pytest.mark.asyncio
@@ -4261,7 +4293,7 @@ async def test_payoff_transition_does_not_advance_marker_without_alert(
 
     assert fired is None
     await db_session.refresh(project)
-    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
+    assert LAST_ALERTED_PAYOFF_KEY not in await _require_container(db_session, project)
     assert await _payoff_alerts(db_session, project.id) == []
 
 
@@ -4298,7 +4330,7 @@ async def test_payoff_internal_verdict_remains_suppressed_across_ticks(
     assert second is None
     assert await _payoff_alerts(db_session, project_id) == []
     await db_session.refresh(project)
-    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
+    assert LAST_ALERTED_PAYOFF_KEY not in await _require_container(db_session, project)
 
 
 @pytest.mark.asyncio
@@ -4509,7 +4541,7 @@ async def test_routing_adopt_is_suppressed_from_operator_alerts(db_session, mock
 
     # Suppression must not advance the durable operator-alert marker.
     await db_session.refresh(project)
-    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
+    assert LAST_ALERTED_ROUTING_KEY not in await _require_container(db_session, project)
 
 
 @pytest.mark.asyncio
@@ -4530,7 +4562,7 @@ async def test_routing_reject_is_suppressed_from_operator_alerts(db_session, moc
     assert await _routing_alerts(db_session, project.id) == []
     bcast.assert_not_awaited()
     await db_session.refresh(project)
-    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
+    assert LAST_ALERTED_ROUTING_KEY not in await _require_container(db_session, project)
 
 
 @pytest.mark.asyncio
@@ -4556,7 +4588,7 @@ async def test_routing_internal_verdict_remains_suppressed_across_ticks(
     assert second is None
     assert await _routing_alerts(db_session, project_id) == []
     await db_session.refresh(project)
-    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
+    assert LAST_ALERTED_ROUTING_KEY not in await _require_container(db_session, project)
 
 
 @pytest.mark.asyncio
@@ -4874,7 +4906,7 @@ async def test_unpriced_alert_fires_when_coverage_degrades(db_session, mocker):
     bcast.assert_awaited()
 
     await db_session.refresh(project)
-    assert project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_UNPRICED_KEY] == "degraded"
+    assert (await _require_container(db_session, project))[LAST_ALERTED_UNPRICED_KEY] == "degraded"
 
 
 @pytest.mark.asyncio
@@ -5122,7 +5154,7 @@ async def test_agent_timeout_rate_backfilled_into_preexisting_baseline(db_sessio
     # reloads the persisted baseline rather than discarding the pending write.
     await db_session.commit()
     await db_session.refresh(project)
-    baseline = project.design_doc["efficiency_baseline"]["baseline"]
+    baseline = (await _require_container(db_session, project))["baseline"]
     assert baseline.get("agent_timeout_rate") is not None
     assert baseline["agent_timeout_rate"]["overall_rate"] == 0.5
 
@@ -5193,7 +5225,7 @@ async def test_format_compliance_backfilled_into_preexisting_baseline(db_session
 
     await db_session.commit()
     await db_session.refresh(project)
-    baseline = project.design_doc[DESIGN_DOC_KEY]["baseline"]
+    baseline = (await _require_container(db_session, project))["baseline"]
     assert baseline[FORMAT_COMPLIANCE_KEY][FORMAT_COMPLIANCE_RATE_KEY] == 0.5
 
     drift = await read_baseline_with_drift(db_session, project.id)
@@ -7052,7 +7084,7 @@ async def test_first_snapshot_seeds_provenance(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
     prov = baseline.get("_member_provenance") or {}
 
@@ -7109,7 +7141,7 @@ async def test_reseed_after_migration_records_new_provenance(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
     prov = baseline.get("_member_provenance") or {}
 
@@ -7154,7 +7186,7 @@ async def test_backfilled_baseline_members_carry_seed_provenance(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
     prov = baseline.get("_member_provenance") or {}
 
@@ -7254,7 +7286,7 @@ async def test_retroactive_provenance_inference_for_existing_baseline(db_session
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
     prov = baseline.get("_member_provenance") or {}
 
@@ -7871,7 +7903,7 @@ async def test_schema_version_v5_migrates_lane_axes(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     baseline = container["baseline"]
 
     # Schema bumped from 5 to 6.
@@ -7905,7 +7937,7 @@ async def test_snapshot_carries_serving_sha(db_session, monkeypatch):
     )
     # Verify it is persisted in the stored snapshot too.
     await db_session.refresh(project)
-    stored_snaps = project.design_doc[DESIGN_DOC_KEY]["snapshots"]
+    stored_snaps = (await _require_container(db_session, project))["snapshots"]
     assert stored_snaps[-1].get("serving_sha") == "abc1234def5678"
 
 
@@ -7984,7 +8016,7 @@ async def test_format_compliance_by_type_persisted_in_snapshot(db_session):
     assert by_type["research"]["format_compliance_rate"] == 1.0
 
     # The persisted snapshot in design_doc must also carry the by_type block.
-    container = project.design_doc[DESIGN_DOC_KEY]
+    container = await _require_container(db_session, project)
     persisted_snap = container["snapshots"][-1]
     assert "format_compliance_by_type" in persisted_snap
     assert persisted_snap["format_compliance_by_type"]["create"]["tasks_measured"] == 2
@@ -9719,7 +9751,7 @@ async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
 
     # Verify the marker was set to "elevated"
     await db_session.refresh(project)
-    marker = project.design_doc.get(DESIGN_DOC_KEY, {}).get(
+    marker = (await _read_container(db_session, project) or {}).get(
         LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
     )
     assert marker == "elevated"
@@ -9776,7 +9808,7 @@ async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
 
     # Verify the marker was set to "healthy"
     await db_session.refresh(project)
-    marker = project.design_doc.get(DESIGN_DOC_KEY, {}).get(
+    marker = (await _read_container(db_session, project) or {}).get(
         LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
     )
     assert marker == "healthy"
@@ -11485,7 +11517,7 @@ async def test_read_baseline_prefers_table_over_design_doc(db_session):
     # Insert a NEWER snapshot into the table only, with a sentinel cost value
     # that is absent from any design_doc snapshot.
     await db_session.refresh(project)
-    container = dict(project.design_doc[DESIGN_DOC_KEY])
+    container = dict(await _require_container(db_session, project))
     latest_doc = container["snapshots"][-1]
     table_only = dict(latest_doc)
     table_only["captured_at"] = (_utcnow() + timedelta(minutes=1)).isoformat()

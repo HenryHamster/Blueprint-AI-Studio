@@ -1,7 +1,7 @@
 """Backfill legacy strategic_memory_notes into KnowledgeDocument rows.
 
 Revision ID: 0699
-Revises: 0695
+Revises: 0698
 Create Date: 2026-07-23
 
 Data migration (design 2812f1ed, completing the KnowledgeDocument cutover for
