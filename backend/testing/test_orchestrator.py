@@ -6405,6 +6405,47 @@ class TestBatchedDepRowsSurviveCommit:
             == "release/capability-proof"
         )
 
+    @pytest.mark.asyncio
+    async def test_branch_context_refreshes_raiseloaded_integration_branch(
+        self, db_session, mocker
+    ):
+        """A partial Project already in the identity map must be repairable."""
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+
+        from app.source_ref_validation import resolve_branch_verification_context
+
+        project = make_project(
+            name="Projected Runner Branch",
+            user_id="u1",
+            integration_branch="release/runner-pull",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        project_id = project.id
+        db_session.expunge(project)
+        projected = (
+            await db_session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .options(_load_only(Project.id, raiseload=True))
+            )
+        ).scalar_one()
+        assert "integration_branch" not in projected.__dict__
+
+        mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            return_value=None,
+        )
+        context = await resolve_branch_verification_context(db_session, projected)
+
+        assert context == {
+            "branch": "release/runner-pull",
+            "project_id": str(project_id),
+        }
+
     def test_dep_batch_projection_excludes_heavy_columns(self):
         """The dep-batch load_only must exclude plan_output/status_log/depends_on
         and retain status/context/payloads needed by _check_candidate_task_deps."""
