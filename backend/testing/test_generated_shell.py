@@ -944,15 +944,15 @@ def test_packer_pins_claude_cli_with_version_gate():
         for line in hcl.splitlines()
         if "npm install -g" in line and "@anthropic-ai/claude-code" in line
     )
-    assert "@anthropic-ai/claude-code@2.1.197" in install
+    assert "@anthropic-ai/claude-code@2.1.219" in install
     gate = next(
         line.strip()
         for line in hcl.splitlines()
-        if "Claude Code 2.1.197 required for fleet config compatibility" in line
+        if "Claude Code 2.1.219 required for claude-opus-5 support" in line
     )
     assert gate.startswith('"claude_version=$(claude --version | awk')
     assert "awk '{print $1}'" in gate
-    assert 'test \\"$claude_version\\" = 2.1.197' in gate
+    assert 'test \\"$claude_version\\" = 2.1.219' in gate
     assert "exit 1; }" in gate
 
 

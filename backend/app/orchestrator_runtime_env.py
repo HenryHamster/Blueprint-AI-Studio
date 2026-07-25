@@ -24,7 +24,7 @@ logger = logging.getLogger("blueprint")
 
 
 _ENV_FALLBACK_DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-8",
+    "anthropic": "claude-opus-5",
     "openai": "gpt-5.4",
     "gemini": "gemini-2.5-pro",
     "zai": "glm-5.2",

@@ -217,7 +217,8 @@ _1M_CONTEXT_MODELS: frozenset[str] = frozenset(
 # requeues on the GA counterpart with the downgrade recorded on task.context.
 _MODEL_FALLBACKS: dict[str, str] = {
     # Safety net for in-flight tasks still carrying the retired fable-5 model id.
-    "claude-fable-5": "claude-opus-4-8",
+    # Tracks the opus-tier default, so this moves with opus-4-8 -> opus-5.
+    "claude-fable-5": "claude-opus-5",
 }
 
 
