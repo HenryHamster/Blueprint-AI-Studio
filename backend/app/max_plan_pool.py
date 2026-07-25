@@ -765,7 +765,19 @@ def resolve_task_provider_settings(
     if not merged:
         return {}
     provider = get_provider(provider_name)
-    return provider.validate_settings(merged)
+    try:
+        return provider.validate_settings(merged)
+    except ValueError:
+        # A persisted settings cell can outlive a limited-availability model.
+        # Retry only the provider-declared counterpart; other schema errors still
+        # fail closed during the second validation.
+        model = _settings_bag_model(merged)
+        fallback = provider.fallback_model(model)
+        if not fallback or fallback == model:
+            raise
+        fallback_settings = dict(merged)
+        fallback_settings["model"] = fallback
+        return provider.validate_settings(fallback_settings)
 
 
 def _settings_bag_model(settings: Mapping[str, Any] | None) -> str | None:

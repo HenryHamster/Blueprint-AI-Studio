@@ -626,9 +626,9 @@ async def agent_task_capabilities(
     single backend-owned registry instead of a hand-maintained agent table,
     so adding a backend task type does not require an agent-side edit.
     """
-    from app.task_capabilities import task_capability_contract
+    from app.task_capabilities import agent_task_capability_contract
 
-    return {"task_capabilities": task_capability_contract()}
+    return {"task_capabilities": agent_task_capability_contract()}
 
 
 async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:

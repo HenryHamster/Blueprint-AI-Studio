@@ -307,6 +307,7 @@ def _fake_docker(
     pull_rc=0,
     tag_rc=0,
     info_rc=0,
+    image_revision=None,
     record=None,
 ):
     """Return a fake ``subprocess.run`` that dispatches on the docker subcommand.
@@ -327,7 +328,8 @@ def _fake_docker(
             "tag": tag_rc,
             "info": info_rc,
         }.get(sub, 0)
-        return MagicMock(returncode=rc)
+        stdout = image_revision if sub == "image" and "--format" in argv else ""
+        return MagicMock(returncode=rc, stdout=stdout)
 
     return run
 
@@ -396,6 +398,39 @@ class EnsureAgentImageTests(unittest.TestCase):
         self.assertEqual(res.image, "blueprint-agent:local")
         self.assertTrue(res.active)
         self.assertFalse(any(c[1] == "build" for c in calls), "build must NOT run when present")
+
+    def test_stale_image_rebuilds_with_current_source_revision(self):
+        calls = []
+        old_revision = "a" * 40
+        new_revision = "b" * 40
+        run = _fake_docker(
+            present=True,
+            image_revision=old_revision,
+            record=calls,
+        )
+
+        res = br.ensure_agent_image(
+            tag="blueprint-agent:local",
+            docker_usable=True,
+            agent_dir=self.agent_dir,
+            source_revision=new_revision,
+            _run=run,
+        )
+
+        self.assertEqual(res.image, "blueprint-agent:local")
+        self.assertTrue(res.active)
+        self.assertIn(
+            [
+                "docker",
+                "build",
+                "-t",
+                "blueprint-agent:local",
+                "--label",
+                f"{br._AGENT_SOURCE_LABEL}={new_revision}",
+                self.agent_dir,
+            ],
+            calls,
+        )
 
     def test_image_absent_triggers_build_with_right_args(self):
         calls = []
