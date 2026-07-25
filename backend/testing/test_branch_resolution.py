@@ -74,6 +74,29 @@ class _RepoIdentityProject:
         self.is_self_repo = is_self_repo
 
 
+class _RaiseloadProjectShape:
+    """Project-like object whose unloaded descriptors must not be invoked."""
+
+    integration_branch = "develop"
+
+    @property
+    def promotion_target(self):
+        raise AssertionError("shape detection invoked unloaded promotion_target")
+
+    @property
+    def is_self_repo(self):
+        raise AssertionError("shape detection invoked unloaded is_self_repo")
+
+    @property
+    def github_repo(self):
+        raise AssertionError("shape detection invoked unloaded github_repo")
+
+
+def test_integration_branch_shape_detection_does_not_invoke_descriptors():
+    """Static shape detection must tolerate raiseloaded Project columns."""
+    assert get_project_integration_branch(_RaiseloadProjectShape()) == "develop"
+
+
 class TestBlueprintNamespaceByRepoIdentity:
     """The 'blueprint' task-branch namespace is granted by repo identity, not by
     the raw ``is_self_repo`` flag — so a non-Blueprint self-hosted repo keeps its
