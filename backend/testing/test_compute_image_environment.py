@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -171,11 +172,11 @@ async def test_agent_compute_environment_is_project_scoped(client: AsyncClient, 
     assert response.json()["data"]["action"] == "use_bare_compute"
 
 
-    assert response.json()["data"]["build_status"] == "not_running"
+    assert response.json()["data"]["build_status"] == "not_applicable"
 
 
 @pytest.mark.asyncio
-async def test_agent_compute_environment_retains_terminal_build_outcome(
+async def test_agent_compute_environment_reads_durable_current_terminal_outcome(
     client: AsyncClient, db_session, monkeypatch
 ):
     project = _project()
@@ -193,18 +194,36 @@ async def test_agent_compute_environment_retains_terminal_build_outcome(
         return {"state": "declared_needs_build", "action": "build"}
 
     from app import compute_image_environment
-    from app.routers import agent_strategic_fetch
+    from app import compute_backends
+    from app.project_telemetry import set_project_telemetry
 
     monkeypatch.setattr(
         compute_image_environment,
         "resolve_project_compute_image_environment",
         fake_resolver,
     )
+    async def matching_identity(*_args, **_kwargs):
+        return {"dep_hash": "dep-current", "status": "deferred"}
+
     monkeypatch.setattr(
-        agent_strategic_fetch,
-        "_agent_compute_image_build_last_outcomes",
-        {project.id: {"status": "deferred", "reason": "builder_busy", "completed_at": "2026-07-25T00:00:00+00:00"}},
+        compute_backends,
+        "resolve_project_compute_image_dependency_identity",
+        matching_identity,
     )
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        "compute_image_build_state",
+        {
+            "request_id": "durable-request",
+            "status": "deferred",
+            "reason": "builder_busy",
+            "dep_hash": "dep-current",
+            "requested_at": "2026-07-25T00:00:00+00:00",
+            "completed_at": "2026-07-25T00:01:00+00:00",
+        },
+    )
+    await db_session.commit()
     token = create_agent_token(str(task.id), "env-agent-outcome", task_type="strategic_review")
     response = await client.get(
         f"/api/agent/projects/{project.id}/compute-environment",
@@ -213,7 +232,198 @@ async def test_agent_compute_environment_retains_terminal_build_outcome(
 
     assert response.status_code == 200, response.text
     assert response.json()["data"]["build_status"] == "not_running"
+    assert response.json()["data"]["build_identity_status"] == "current"
     assert response.json()["data"]["last_build_outcome"]["reason"] == "builder_busy"
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_environment_suppresses_stale_terminal_outcome(
+    client: AsyncClient, db_session, monkeypatch
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="env-agent-stale-outcome",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    async def fake_resolver(*_args, **_kwargs):
+        return {"state": "declared_needs_build", "action": "build"}
+
+    from app import compute_image_environment
+    from app import compute_backends
+    from app.project_telemetry import set_project_telemetry
+
+    monkeypatch.setattr(
+        compute_image_environment,
+        "resolve_project_compute_image_environment",
+        fake_resolver,
+    )
+
+    async def changed_identity(*_args, **_kwargs):
+        return {"dep_hash": "dep-new", "status": "deferred"}
+
+    monkeypatch.setattr(
+        compute_backends,
+        "resolve_project_compute_image_dependency_identity",
+        changed_identity,
+    )
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        "compute_image_build_state",
+        {"request_id": "old-request", "status": "error", "dep_hash": "dep-old"},
+    )
+    await db_session.commit()
+    token = create_agent_token(str(task.id), "env-agent-stale-outcome", task_type="strategic_review")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/compute-environment",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["build_status"] == "not_requested"
+    assert response.json()["data"]["build_identity_status"] == "stale"
+    assert "last_build_outcome" not in response.json()["data"]
+
+
+def _shared_session_factory(session):
+    """Return a lightweight factory for testing a detached worker's DB writes."""
+
+    class SharedSessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+    return SharedSessionContext
+
+
+@pytest.mark.asyncio
+async def test_background_compute_image_build_persists_completion(db_session, monkeypatch):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    from app import compute_backends
+    from app.project_telemetry import read_telemetry
+    from app.routers import agent_strategic_fetch
+
+    monkeypatch.setattr(
+        agent_strategic_fetch,
+        "AsyncSessionLocal",
+        _shared_session_factory(db_session),
+    )
+
+    async def completed(*_args, **_kwargs):
+        return {"status": "rebuilt", "dep_hash": "dep-completed"}
+
+    monkeypatch.setattr(compute_backends, "refresh_project_compute_image", completed)
+    request_id = "completion-request"
+    await agent_strategic_fetch._persist_agent_compute_image_build_state(
+        project.id, request_id, status="requested"
+    )
+    await agent_strategic_fetch._run_agent_requested_compute_image_build(
+        project.id, request_id
+    )
+
+    state = await read_telemetry(
+        db_session, project.id, "compute_image_build_state"
+    )
+    assert state is not None
+    assert state["request_id"] == request_id
+    assert state["status"] == "rebuilt"
+    assert state["dep_hash"] == "dep-completed"
+    assert state["completed_at"]
+
+
+@pytest.mark.asyncio
+async def test_background_compute_image_build_persists_deferred_result(
+    db_session, monkeypatch
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    from app import compute_backends
+    from app.project_telemetry import read_telemetry
+    from app.routers import agent_strategic_fetch
+
+    monkeypatch.setattr(
+        agent_strategic_fetch,
+        "AsyncSessionLocal",
+        _shared_session_factory(db_session),
+    )
+
+    async def deferred(*_args, **_kwargs):
+        return {
+            "status": "deferred",
+            "dep_hash": "dep-deferred",
+            "reason": "builder_busy",
+        }
+
+    monkeypatch.setattr(compute_backends, "refresh_project_compute_image", deferred)
+    request_id = "deferred-request"
+    await agent_strategic_fetch._persist_agent_compute_image_build_state(
+        project.id, request_id, status="requested"
+    )
+    await agent_strategic_fetch._run_agent_requested_compute_image_build(
+        project.id, request_id
+    )
+
+    state = await read_telemetry(
+        db_session, project.id, "compute_image_build_state"
+    )
+    assert state is not None
+    assert state["status"] == "deferred"
+    assert state["dep_hash"] == "dep-deferred"
+    assert state["reason"] == "builder_busy"
+
+
+@pytest.mark.asyncio
+async def test_background_compute_image_build_persists_interruption(
+    db_session, monkeypatch
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    from app import compute_backends
+    from app.project_telemetry import read_telemetry
+    from app.routers import agent_strategic_fetch
+
+    monkeypatch.setattr(
+        agent_strategic_fetch,
+        "AsyncSessionLocal",
+        _shared_session_factory(db_session),
+    )
+
+    async def cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(compute_backends, "refresh_project_compute_image", cancelled)
+    request_id = "cancelled-request"
+    await agent_strategic_fetch._persist_agent_compute_image_build_state(
+        project.id, request_id, status="requested"
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await agent_strategic_fetch._run_agent_requested_compute_image_build(
+            project.id, request_id
+        )
+
+    state = await read_telemetry(
+        db_session, project.id, "compute_image_build_state"
+    )
+    assert state is not None
+    assert state["status"] == "interrupted"
+    assert state["reason"] == "build_cancelled; reaper will retry"
+
+
 @pytest.mark.asyncio
 async def test_agent_compute_image_build_rejects_non_strategic_task(client: AsyncClient, db_session):
     project = _project()
@@ -255,9 +465,9 @@ async def test_agent_compute_image_build_returns_accepted_without_foreground_bui
 
     requests: list[uuid.UUID] = []
 
-    def fake_request(project_id: uuid.UUID) -> str:
+    async def fake_request(project_id: uuid.UUID) -> str:
         requests.append(project_id)
-        return "started"
+        return "requested"
 
     from app import compute_image_environment
     from app.routers import agent_strategic_fetch
@@ -281,5 +491,5 @@ async def test_agent_compute_image_build_returns_accepted_without_foreground_bui
     assert response.status_code == 202, response.text
     body = response.json()
     assert body["status"] == "accepted"
-    assert body["environment"]["build_status"] == "in_progress"
+    assert body["environment"]["build_status"] == "requested"
     assert requests == [project.id]

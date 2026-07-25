@@ -61,40 +61,69 @@ _RECENT_CLOSED_VERSIONS_KEEP = 5
 # registry only coalesces duplicate requests while this process is alive.
 _agent_compute_image_build_tasks: dict[uuid.UUID, asyncio.Task] = {}
 
-# A completed foreground request must not disappear into "not_running": retain
-# a small per-process terminal outcome so a later resident turn can choose the
-# next action. The existing reaper remains the durable post-restart retry path.
-_AGENT_COMPUTE_IMAGE_BUILD_OUTCOME_LIMIT = 100
-_agent_compute_image_build_last_outcomes: dict[uuid.UUID, dict[str, str]] = {}
+# ProjectTelemetry is shared across Cloud Run instances and survives restarts.
+# It stores one latest request/outcome per project; a terminal record carries the
+# exact dep_hash calculated by the canonical refresh driver.
+_COMPUTE_IMAGE_BUILD_STATE_KEY = "compute_image_build_state"
 
 
-def _remember_agent_compute_image_build_outcome(
-    project_id: uuid.UUID, result: dict[str, Any]
-) -> None:
-    """Store one bounded, JSON-safe terminal build outcome for status reads."""
-    outcome = {
-        "status": str(result.get("status") or "error"),
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    }
-    reason = result.get("reason") or result.get("error")
-    if isinstance(reason, str) and reason:
-        outcome["reason"] = reason
+async def _persist_agent_compute_image_build_state(
+    project_id: uuid.UUID,
+    request_id: str,
+    *,
+    status: str,
+    result: dict[str, Any] | None = None,
+    reason: str | None = None,
+) -> bool:
+    """Durably persist a request or matching terminal outcome.
 
-    _agent_compute_image_build_last_outcomes.pop(project_id, None)
-    _agent_compute_image_build_last_outcomes[project_id] = outcome
-    while len(_agent_compute_image_build_last_outcomes) > _AGENT_COMPUTE_IMAGE_BUILD_OUTCOME_LIMIT:
-        _agent_compute_image_build_last_outcomes.pop(
-            next(iter(_agent_compute_image_build_last_outcomes))
+    A late worker from an older request must not overwrite a newer request's
+    state. The write uses the existing project_telemetry upsert and commits in
+    its own session so a completed HTTP response is visible on every instance.
+    """
+    from app.project_telemetry import read_telemetry, set_project_telemetry
+
+    async with AsyncSessionLocal() as state_session:
+        previous = await read_telemetry(
+            state_session, project_id, _COMPUTE_IMAGE_BUILD_STATE_KEY
         )
+        if (
+            status != "requested"
+            and isinstance(previous, dict)
+            and previous.get("request_id") != request_id
+        ):
+            return False
+
+        now = datetime.now(timezone.utc).isoformat()
+        state: dict[str, Any] = {
+            "request_id": request_id,
+            "status": status,
+            "requested_at": (
+                now if status == "requested" else previous.get("requested_at", now)
+                if isinstance(previous, dict)
+                else now
+            ),
+        }
+        if status != "requested":
+            state["completed_at"] = now
+        source = result or {}
+        dep_hash = source.get("dep_hash")
+        if isinstance(dep_hash, str) and dep_hash:
+            state["dep_hash"] = dep_hash
+        outcome_reason = reason or source.get("reason") or source.get("error")
+        if isinstance(outcome_reason, str) and outcome_reason:
+            state["reason"] = outcome_reason
+
+        await set_project_telemetry(
+            state_session, project_id, _COMPUTE_IMAGE_BUILD_STATE_KEY, state
+        )
+        await state_session.commit()
+    return True
 
 
-def _agent_compute_image_build_last_outcome(project_id: uuid.UUID) -> dict[str, str] | None:
-    outcome = _agent_compute_image_build_last_outcomes.get(project_id)
-    return dict(outcome) if outcome is not None else None
-
-
-
-async def _run_agent_requested_compute_image_build(project_id: uuid.UUID) -> None:
+async def _run_agent_requested_compute_image_build(
+    project_id: uuid.UUID, request_id: str
+) -> None:
     """Run the existing refresh pipeline in an independent background session."""
     from app.compute_backends import refresh_project_compute_image
     from app.routers.admin_project_tools import (
@@ -109,7 +138,12 @@ async def _run_agent_requested_compute_image_build(project_id: uuid.UUID) -> Non
         async with AsyncSessionLocal() as build_session:
             project = await build_session.get(Project, project_id)
             if project is None:
-                _remember_agent_compute_image_build_outcome(project_id, {"status": "error", "reason": "project_missing"})
+                await _persist_agent_compute_image_build_state(
+                    project_id,
+                    request_id,
+                    status="error",
+                    reason="project_missing",
+                )
                 logger.warning(
                     "[COMPUTE-IMAGE] agent-requested build skipped: project=%s missing",
                     project_id,
@@ -123,34 +157,54 @@ async def _run_agent_requested_compute_image_build(project_id: uuid.UUID) -> Non
                 progress_cb=lambda: None,
                 _manifest_fn=fresh_manifest,
             )
-            _remember_agent_compute_image_build_outcome(project_id, result)
+            await _persist_agent_compute_image_build_state(
+                project_id,
+                request_id,
+                status=str(result.get("status") or "error"),
+                result=result,
+            )
             logger.info(
                 "[COMPUTE-IMAGE] agent-requested build finished: project=%s status=%s",
                 project_id,
                 result.get("status"),
             )
     except asyncio.CancelledError:
-        _remember_agent_compute_image_build_outcome(project_id, {"status": "error", "reason": "build_cancelled; reaper will retry"})
+        await _persist_agent_compute_image_build_state(
+            project_id,
+            request_id,
+            status="interrupted",
+            reason="build_cancelled; reaper will retry",
+        )
         logger.warning(
             "[COMPUTE-IMAGE] agent-requested build cancelled during shutdown: project=%s",
             project_id,
         )
         raise
     except Exception:  # noqa: BLE001 - periodic refresh will retry later
-        _remember_agent_compute_image_build_outcome(project_id, {"status": "error", "reason": "build_refresh_exception; reaper will retry"})
+        await _persist_agent_compute_image_build_state(
+            project_id,
+            request_id,
+            status="error",
+            reason="build_refresh_exception; reaper will retry",
+        )
         logger.exception(
             "[COMPUTE-IMAGE] agent-requested build failed: project=%s", project_id
         )
 
 
-def _request_agent_compute_image_build(project_id: uuid.UUID) -> str:
-    """Start or reuse a detached build; never make a resident await it."""
+async def _request_agent_compute_image_build(project_id: uuid.UUID) -> str:
+    """Persist a request, then start or locally reuse its detached worker."""
     existing = _agent_compute_image_build_tasks.get(project_id)
     if existing is not None and not existing.done():
-        return "already_running"
-    _agent_compute_image_build_last_outcomes.pop(project_id, None)
+        return "already_requested"
 
-    build_task = asyncio.create_task(_run_agent_requested_compute_image_build(project_id))
+    request_id = str(uuid.uuid4())
+    await _persist_agent_compute_image_build_state(
+        project_id, request_id, status="requested"
+    )
+    build_task = asyncio.create_task(
+        _run_agent_requested_compute_image_build(project_id, request_id)
+    )
     _agent_compute_image_build_tasks[project_id] = build_task
 
     def _clear_completed(task: asyncio.Task) -> None:
@@ -158,13 +212,101 @@ def _request_agent_compute_image_build(project_id: uuid.UUID) -> str:
             _agent_compute_image_build_tasks.pop(project_id, None)
 
     build_task.add_done_callback(_clear_completed)
-    return "started"
+    return "requested"
 
 
-def _agent_compute_image_build_in_progress(project_id: uuid.UUID) -> bool:
-    """Whether this process currently owns a detached build for *project_id*."""
-    task = _agent_compute_image_build_tasks.get(project_id)
-    return task is not None and not task.done()
+async def _apply_agent_compute_image_build_state(
+    session: AsyncSession,
+    project: Project,
+    environment: dict[str, Any],
+) -> None:
+    """Attach durable, identity-checked build state to an environment response.
+
+    The resolver remains the source of truth for a usable image. A persisted
+    terminal outcome is shown only when its dependency hash exactly matches the
+    current manifest inputs, so an old failure cannot discourage a changed image
+    recipe. ``requested`` deliberately does not claim a live worker: a Cloud
+    Run instance may have exited after accepting the request.
+    """
+    from app.compute_image_environment import ComputeImageEnvironmentState
+
+    state_name = environment.get("state")
+    if state_name == ComputeImageEnvironmentState.READY:
+        environment["build_status"] = "ready"
+        return
+    if (
+        state_name != ComputeImageEnvironmentState.DECLARED_NEEDS_BUILD
+        or environment.get("action") != "build"
+    ):
+        environment["build_status"] = "not_applicable"
+        return
+
+    from app.project_telemetry import read_telemetry
+
+    persisted = await read_telemetry(
+        session, project.id, _COMPUTE_IMAGE_BUILD_STATE_KEY
+    )
+    if not isinstance(persisted, dict):
+        environment["build_status"] = "not_requested"
+        return
+
+    request = {
+        key: persisted[key]
+        for key in ("request_id", "requested_at")
+        if isinstance(persisted.get(key), str) and persisted[key]
+    }
+    if persisted.get("status") == "requested":
+        environment["build_status"] = "requested"
+        if request:
+            environment["build_request"] = request
+        return
+
+    stored_dep_hash = persisted.get("dep_hash")
+    if not isinstance(stored_dep_hash, str) or not stored_dep_hash:
+        environment["build_status"] = "not_requested"
+        environment["build_identity_status"] = "unknown"
+        return
+
+    from app.compute_backends import resolve_project_compute_image_dependency_identity
+    from app.routers.admin_project_tools import _discover_manifest_tools
+
+    async def fresh_manifest(project_arg: Project) -> dict[str, Any]:
+        return await _discover_manifest_tools(project_arg, force_refresh=True)
+
+    try:
+        identity = await resolve_project_compute_image_dependency_identity(
+            session, project, manifest_fn=fresh_manifest
+        )
+    except Exception:  # noqa: BLE001 - never make a status read a new failure mode
+        logger.warning(
+            "[COMPUTE-IMAGE] unable to validate persisted build outcome: project=%s",
+            project.id,
+            exc_info=True,
+        )
+        identity = {"dep_hash": None, "reason": "identity_check_failed"}
+
+    current_dep_hash = identity.get("dep_hash")
+    if not isinstance(current_dep_hash, str) or not current_dep_hash:
+        environment["build_status"] = "not_requested"
+        environment["build_identity_status"] = "unknown"
+        reason = identity.get("reason")
+        if isinstance(reason, str) and reason:
+            environment["build_identity_reason"] = reason
+        return
+    if current_dep_hash != stored_dep_hash:
+        environment["build_status"] = "not_requested"
+        environment["build_identity_status"] = "stale"
+        return
+
+    environment["build_status"] = "not_running"
+    environment["build_identity_status"] = "current"
+    outcome = {
+        key: persisted[key]
+        for key in ("status", "reason", "dep_hash", "requested_at", "completed_at")
+        if persisted.get(key) is not None
+    }
+    if outcome:
+        environment["last_build_outcome"] = outcome
 
 
 def _iso(dt: Any) -> str | None:
@@ -399,14 +541,7 @@ async def agent_fetch_compute_environment(
     from app.compute_image_environment import resolve_project_compute_image_environment
 
     environment = await resolve_project_compute_image_environment(session, project)
-    environment["build_status"] = (
-        "in_progress"
-        if _agent_compute_image_build_in_progress(project.id)
-        else "not_running"
-    )
-    last_outcome = _agent_compute_image_build_last_outcome(project.id)
-    if last_outcome is not None:
-        environment["last_build_outcome"] = last_outcome
+    await _apply_agent_compute_image_build_state(session, project, environment)
 
     return {"status": "success", "data": environment}
 
@@ -465,8 +600,8 @@ async def agent_build_project_compute_image(
                 f"{environment.get('state')}"
             ),
         )
-    launch_status = _request_agent_compute_image_build(project.id)
-    environment["build_status"] = "in_progress"
+    launch_status = await _request_agent_compute_image_build(project.id)
+    environment["build_status"] = "requested"
     response.status_code = 202
     return {
         "status": "accepted",

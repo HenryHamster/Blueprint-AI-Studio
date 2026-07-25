@@ -62,6 +62,9 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         # Completion-debt-ledger system description seeded by completion_debt.py.
         # God-column cutover COMPLETE: the seeder now persists SOLELY to this
         # row; the design_doc write leg is cut. Retained here for budget
+        # Durable latest request/terminal outcome for Strategic-triggered baked
+        # compute-image builds; keyed by the exact dependency hash when known.
+        "compute_image_build_state",
         # exemption / regrowth guarding during the transition (migration 0695
         # backfills and strips the stale design_doc key).
         "systems/completion-debt-ledger",
