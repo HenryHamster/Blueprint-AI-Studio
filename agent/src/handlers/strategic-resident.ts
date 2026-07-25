@@ -988,9 +988,10 @@ export async function handleStrategicResident(
     } else {
       residentInput = full;
     }
-    const r = await session.sendTurn(
-      residentInput,
-      operator ? undefined : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs });
+    const turnOptions = operator
+      ? { hardTimeoutMs: cfg.turnTimeoutMs }
+      : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs };
+    const r = await session.sendTurn(residentInput, turnOptions);
     streamer.flush();
     streamer.done();
     recordResidentTurnLatency({

@@ -644,7 +644,35 @@ describe('startResidentClaudeSession', () => {
     expect(killSpy.mock.calls.some(([p]) => p === -4242)).toBe(true);
   });
 
+
+  it('honors a per-turn hard deadline despite continuous streamed output', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({
+      turnTimeoutMs: 60_000,
+      hardTurnTimeoutMs: 60_000,
+    });
+    const turn = session.sendTurn('operator turn that keeps polling', { hardTimeoutMs: 5_000 });
+
+    // These deltas continuously re-arm the inactivity watchdog. They must not
+    // extend the operator turn's separate wall-clock deadline.
+    for (let i = 0; i < 4; i += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      ctl.pushLine({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: `progress-${i}` } },
+      });
+    }
+
+    await vi.advanceTimersByTimeAsync(8_000);
+    const result = await turn;
+    expect(result.hardTimedOut).toBe(true);
+    expect(result.processGone).toBe(true);
+    expect(session.isAlive()).toBe(false);
+  });
+
   it('does not let a force-settled turn’s late result resolve a NEWER turn', async () => {
+
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
     // Large hard ceiling so only the stall→interrupt→force-settle path runs here.

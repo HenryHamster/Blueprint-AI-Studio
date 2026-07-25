@@ -286,9 +286,8 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     ? num(payload.strategic_session_compaction_threshold_tokens, 0)
     : undefined;
   const compactionCooldownSec = num(payload.strategic_session_compaction_cooldown_seconds, 300);
-  const ackThresholdSec = num(payload.strategic_session_operator_ack_threshold_seconds, 10);
-  // 0 or negative disables the early ack; positive values clamp to a 1s floor.
-  const operatorAckThresholdMs = ackThresholdSec <= 0 ? 0 : Math.max(1000, Math.round(ackThresholdSec * 1000));
+  // Operator replies must be substantive; canned durable acknowledgements are disabled.
+  const operatorAckThresholdMs = 0;
   return {
     idleTickMs,
     // Poll operator messages faster than the heartbeat tick so a turn starts
@@ -1450,12 +1449,19 @@ conversation with the operator in memory. You operate at two speeds:
 
 - **Interactive (operator chat):** when the operator sends a message, answer it
   directly and conversationally, take a quick action if they ask, and keep it
-  tight. First priority is always a live operator message. You MUST post your
+  tight. You may do small fact-finding needed for accuracy, but before any
+  foreground command, schema probe, polling loop, or wait likely to take longer
+  than a quick inspection, send the operator a substantive answer, decision, or
+  concrete plan. First priority is always a live operator message. You MUST post your
   conversational answer to the operator with \`./messages send '<answer>'\` or,
   for apostrophe-heavy or multiline replies, \`./messages send --stdin\` with a
   heredoc or pipe. The live stream is a transcript, but the durable chat reply
   the operator reads is the message you send. Every reply to an operator
   message REQUIRES a \`./messages send\`; do not answer only in the stream.
+  Launch long-running work asynchronously; never sit in a foreground sleep or
+  polling loop waiting for it. Report again only for a meaningful lifecycle event:
+  launch accepted, material blocker, run started, material result/progress, or a
+  failure that needs operator intervention — never heartbeat or timer chatter.
   When the operator's message SETTLES or CORRECTS a course — rejects an option,
   reverses a call, fixes a fact, or gives a standing instruction — end your turn
   with one trailing marker line \`OPERATOR-DECISION: <the settled fact, stated as

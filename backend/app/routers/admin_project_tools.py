@@ -543,6 +543,8 @@ def _discover_manifest_tools_local() -> Dict[str, Any]:
 
 async def _discover_manifest_tools(
     project: Project,
+    *,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """Fetch and parse ``.blueprint/tools.json`` from the project's connected repo.
 
@@ -564,7 +566,7 @@ async def _discover_manifest_tools(
     # Check manifest cache.
     _prune_manifest_cache()
     cached = _manifest_cache.get(cache_key)
-    if cached is not None and _time.monotonic() < cached[0]:
+    if not force_refresh and cached is not None and _time.monotonic() < cached[0]:
         return cached[1]
 
     try:

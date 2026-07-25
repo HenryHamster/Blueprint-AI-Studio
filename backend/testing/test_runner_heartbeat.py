@@ -156,6 +156,21 @@ async def test_heartbeat_persists_snapshot_row(db_session):
         agent_available=True,
         gpu_utilization_pct=73,
         disk_free_bytes=5_000_000_000,
+        workspace_free_bytes=5_000_000_000,
+        container_image_store_runtime="docker",
+        container_image_store_path="/var/lib/docker",
+        container_image_store_free_bytes=4_000_000_000,
+        container_image_reclaim={
+            "attempted_at": "2026-07-24T12:00:00Z",
+            "runtime": "docker",
+            "store_root": "/var/lib/docker",
+            "free_bytes_before": 1_000_000,
+            "free_bytes_after": 4_000_000_000,
+            "removed": 3,
+            "kept": 1,
+            "in_use_skipped": 2,
+            "reason": "removed stale images",
+        },
         memory_free_bytes=2_000_000_000,
         cpu_load_avg=1.25,
         version="v1",
@@ -185,8 +200,71 @@ async def test_heartbeat_persists_snapshot_row(db_session):
     await db_session.refresh(runner)
     assert runner.capabilities["gpu_utilization_pct"] == 73
     assert runner.capabilities["active_task_ids"] == ["t1", "t2"]
+    assert runner.capabilities["workspace_free_bytes"] == 5_000_000_000
+    assert runner.capabilities["container_image_store_runtime"] == "docker"
+    assert runner.capabilities["container_image_store_path"] == "/var/lib/docker"
+    assert runner.capabilities["container_image_store_free_bytes"] == 4_000_000_000
+    assert runner.capabilities["container_image_reclaim"] == {
+        "attempted_at": "2026-07-24T12:00:00Z",
+        "runtime": "docker",
+        "store_root": "/var/lib/docker",
+        "free_bytes_before": 1_000_000,
+        "free_bytes_after": 4_000_000_000,
+        "removed": 3,
+        "kept": 1,
+        "in_use_skipped": 2,
+        "reason": "removed stale images",
+    }
 
 
+@pytest.mark.asyncio
+async def test_explicit_null_image_store_telemetry_clears_stale_capacity(db_session):
+    """A transient Docker-info failure must not retain an old low data-root."""
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": "all",
+            "disk_free_bytes": 20_000_000_000,
+            "workspace_free_bytes": 20_000_000_000,
+            "container_image_store_runtime": "docker",
+            "container_image_store_path": "/var/lib/docker",
+            "container_image_store_free_bytes": 1_000_000,
+            "container_image_reclaim": {"reason": "old cleanup result"},
+        },
+    )
+
+    # Omitted fields preserve compatibility with older runners and must not
+    # erase a still-valid report.
+    await heartbeat(
+        payload=HeartbeatRequest(agent_available=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["container_image_store_free_bytes"] == 1_000_000
+
+    # local_runner sends each field as explicit null when the data-root probe is
+    # unavailable. That must clear the old low reading so the legacy workspace
+    # measurement is not permanently shadowed by stale Docker telemetry.
+    await heartbeat(
+        payload=HeartbeatRequest(
+            container_image_store_runtime=None,
+            container_image_store_path=None,
+            container_image_store_free_bytes=None,
+            container_image_reclaim=None,
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["workspace_free_bytes"] == 20_000_000_000
+    for key in (
+        "container_image_store_runtime",
+        "container_image_store_path",
+        "container_image_store_free_bytes",
+        "container_image_reclaim",
+    ):
+        assert key not in runner.capabilities
 @pytest.mark.asyncio
 async def test_heartbeat_persists_agent_unavailable_legs(db_session):
     """The per-leg breakdown map rides in capabilities JSONB alongside the

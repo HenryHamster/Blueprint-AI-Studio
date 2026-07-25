@@ -47,7 +47,7 @@ describe('residentConfig', () => {
     expect(c.maxOpsPerTurn).toBe(3);
     expect(c.compactionThresholdTokens).toBeUndefined(); // model-derived by default
     expect(c.compactionCooldownMs).toBe(300_000); // 5 min default
-    expect(c.operatorAckThresholdMs).toBe(10_000); // 10s default
+    expect(c.operatorAckThresholdMs).toBe(0); // canned acknowledgements stay disabled
   });
 
   it('reads the payload knobs (seconds → ms)', () => {
@@ -66,14 +66,13 @@ describe('residentConfig', () => {
     expect(c.minTickMs).toBe(120_000);
     expect(c.autonomousTurnTimeoutMs).toBe(180_000);
     expect(c.maxOpsPerTurn).toBe(5);
-    expect(c.operatorAckThresholdMs).toBe(30_000);
+    expect(c.operatorAckThresholdMs).toBe(0);
   });
 
-  it('disables early ack when threshold is set to 0 or negative, and clamps to 1s floor', () => {
+  it('keeps canned acknowledgements disabled regardless of stale payload settings', () => {
     expect(residentConfig({ strategic_session_operator_ack_threshold_seconds: 0 }).operatorAckThresholdMs).toBe(0);
     expect(residentConfig({ strategic_session_operator_ack_threshold_seconds: -5 }).operatorAckThresholdMs).toBe(0);
-    // Small positive values clamp to the 1s floor
-    expect(residentConfig({ strategic_session_operator_ack_threshold_seconds: 0.1 }).operatorAckThresholdMs).toBe(1000);
+    expect(residentConfig({ strategic_session_operator_ack_threshold_seconds: 30 }).operatorAckThresholdMs).toBe(0);
   });
 
   it('clamps to safe minimums', () => {
@@ -1104,6 +1103,10 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('all good');
     expect(p).toContain('- d1 active');
     expect(p).toContain('CTX');
+    expect(p).toContain('substantive answer, decision, or');
+    expect(p).toContain('Launch long-running work asynchronously');
+    expect(p).toContain('meaningful lifecycle event');
+    expect(p).toContain('never heartbeat or timer chatter');
   });
 
   it('bootstrap_prompt_uses_quote_safe_message_delivery', () => {

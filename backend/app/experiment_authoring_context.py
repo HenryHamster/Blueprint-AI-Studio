@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,6 +56,16 @@ DEVICES_MAX_RUNNERS = 8
 DEVICES_MAX_GPU_MODELS = 4
 DEVICES_MAX_VRAM_ENTRIES = 8
 _DEVICE_NAME_MAX_CHARS = 64
+
+# Runner inventory is deliberately a separate, compact surface from ``devices``.
+# ``devices`` gives detailed hardware sizing guidance for live runners; this
+# inventory gives the strategist the stable runner id needed to intentionally
+# use the existing ``runner_target`` launch-contract field. It includes stale
+# and paused project-allowed runners too, so an agent can see why a strict pin
+# would hold instead of inferring that an omitted runner does not exist.
+RUNNER_INVENTORY_MAX_RUNNERS = 8
+_RUNNER_STATUS_MAX_CHARS = 24
+_RUNNER_BACKEND_MAX_CHARS = 40
 
 # Experiment-ledger bounds.
 EXPERIMENT_LEDGER_MAX_ROWS = 15
@@ -207,6 +218,107 @@ def build_runner_devices(live_runners: list[LocalRunner]) -> list[dict[str, Any]
         ),
     )
     return [build_runner_device(r) for r in ordered[:DEVICES_MAX_RUNNERS]]
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    """Return a non-negative integer telemetry value, or ``None`` if unknown."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return None
+
+
+def _runner_max_concurrent_compute(caps: dict[str, Any]) -> int | None:
+    """Prefer the daemon-applied compute limit, falling back for old runners.
+
+    ``max_concurrent_compute`` is the relevant separate compute pool. Older
+    runners did not report the applied configuration, so their general
+    ``max_concurrent`` remains useful as a clearly best-effort capacity hint.
+    """
+    applied = caps.get("applied_config")
+    if isinstance(applied, dict):
+        value = _nonnegative_int(applied.get("max_concurrent_compute"))
+        if value is not None:
+            return value
+    for key in ("max_concurrent_compute", "max_concurrent"):
+        value = _nonnegative_int(caps.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def build_runner_inventory(
+    runners: list[LocalRunner], *, liveness_cutoff: datetime
+) -> list[dict[str, Any]]:
+    """Render a bounded, project-scoped inventory for compute authoring.
+
+    This is advisory data only; dispatch remains the sole authority for final
+    eligibility. Every input runner is already selected with
+    ``runner_allowed_for_project`` by the caller, so no cross-project fleet
+    identity is leaked into a Strategic payload.
+    """
+    def _is_live(runner: LocalRunner) -> bool:
+        return (
+            runner.status == "active"
+            and runner.last_seen_at is not None
+            and runner.last_seen_at > liveness_cutoff
+        )
+
+    def _gpu_count(runner: LocalRunner) -> int:
+        return _nonnegative_int((runner.capabilities or {}).get("gpu_count")) or 0
+
+    ordered = sorted(
+        runners,
+        key=lambda runner: (
+            not _is_live(runner),
+            -_gpu_count(runner),
+            -(runner.last_seen_at.timestamp() if runner.last_seen_at else 0.0),
+            (runner.hostname or "").lower(),
+            str(runner.id),
+        ),
+    )
+    inventory: list[dict[str, Any]] = []
+    for runner in ordered[:RUNNER_INVENTORY_MAX_RUNNERS]:
+        caps = runner.capabilities or {}
+        container_ok, gpu_in_container_ok = _container_flags(caps)
+        active_jobs = caps.get("active_compute_job_ids")
+        hostname = runner.hostname or f"runner-{str(runner.id)[:8]}"
+        entry: dict[str, Any] = {
+            "runner_id": str(runner.id),
+            "hostname": _clamp(hostname, _DEVICE_NAME_MAX_CHARS),
+            "status": _clamp(str(runner.status or "unknown"), _RUNNER_STATUS_MAX_CHARS),
+            "live": _is_live(runner),
+            "gpu_count": _gpu_count(runner),
+            "container_ok": container_ok,
+            "gpu_in_container_ok": gpu_in_container_ok,
+            "active_compute_jobs": len(active_jobs) if isinstance(active_jobs, list) else 0,
+        }
+        if runner.last_seen_at is not None:
+            entry["last_heartbeat_at"] = runner.last_seen_at.isoformat()
+        max_compute = _runner_max_concurrent_compute(caps)
+        if max_compute is not None:
+            entry["max_concurrent_compute"] = max_compute
+        workspace_free = _nonnegative_int(caps.get("workspace_free_bytes"))
+        if workspace_free is not None:
+            entry["workspace_free_bytes"] = workspace_free
+        else:
+            # Pre-storage-telemetry runners only have generic disk telemetry;
+            # keep its original name so the agent does not mistake it for an
+            # independently measured workspace mount.
+            disk_free = _nonnegative_int(caps.get("disk_free_bytes"))
+            if disk_free is not None:
+                entry["disk_free_bytes"] = disk_free
+        image_store_free = _nonnegative_int(caps.get("container_image_store_free_bytes"))
+        if image_store_free is not None:
+            entry["container_image_store_free_bytes"] = image_store_free
+        image_store_runtime = caps.get("container_image_store_runtime")
+        if isinstance(image_store_runtime, str) and image_store_runtime.strip():
+            entry["container_image_store_runtime"] = _clamp(
+                image_store_runtime, _RUNNER_BACKEND_MAX_CHARS
+            )
+        inventory.append(entry)
+    return inventory
 
 
 # ---------------------------------------------------------------------------

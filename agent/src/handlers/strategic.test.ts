@@ -593,6 +593,7 @@ import {
   resolveStrategicPurpose,
   buildStagedDirectionsSection,
   renderDesignDocIndexOverview,
+  buildLocalRunnerSection,
   handleStrategic,
   formatRelativeDays,
 } from './strategic.js';
@@ -2176,6 +2177,25 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
     // declared_metric documents what the command emits
     expect(executorPrompt).toContain('declared_metric');
   });
+
+  it('instructs output-preserving experiments to use the durable artifact contract', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-durable-output-contract',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toContain('require_durable_artifact: true');
+    expect(executorPrompt).toContain('$BLUEPRINT_ARTIFACT_DIR');
+    expect(executorPrompt).toContain('manifest.json');
+  });
 });
 
 describe('handleStrategic create-direction recovery prompt', () => {
@@ -2382,5 +2402,69 @@ describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
     expect(recoveryPrompt).toContain('reject-direction');
 
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+});
+
+describe('buildLocalRunnerSection runner inventory', () => {
+  it('renders project runner UUIDs with safe soft-pin guidance', () => {
+    const section = buildLocalRunnerSection({
+      ever_registered: true,
+      active_total: 1,
+      active_gpu: 1,
+      runners: [{
+        runner_id: '11111111-2222-3333-4444-555555555555',
+        hostname: 'iconlab',
+        status: 'active',
+        live: true,
+        last_heartbeat_at: '2026-07-24T12:00:00',
+        gpu_count: 7,
+        container_ok: true,
+        gpu_in_container_ok: true,
+        active_compute_jobs: 1,
+        max_concurrent_compute: 2,
+        workspace_free_bytes: 1024 ** 3,
+        container_image_store_free_bytes: 2 * 1024 ** 3,
+      }],
+    });
+
+    expect(section).toContain('11111111-2222-3333-4444-555555555555');
+    expect(section).toContain('iconlab');
+    expect(section).toContain('LIVE');
+    expect(section).toContain('compute 1/2');
+    expect(section).toContain('workspace/disk 1.0 GiB');
+    expect(section).toContain('image store 2.0 GiB');
+    expect(section).toContain('"runner_target": {"runner_id": "<UUID>", "strict": false}');
+    expect(section).toContain('Use `strict: true` ONLY');
+  });
+
+  it('renders stale-active runners as offline rather than active', () => {
+    const section = buildLocalRunnerSection({
+      ever_registered: true,
+      active_total: 0,
+      active_gpu: 0,
+      runners: [{
+        runner_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        hostname: 'dgx-1',
+        status: 'active',
+        live: false,
+        last_heartbeat_at: '2026-07-24T11:00:00',
+        gpu_count: 1,
+        container_ok: true,
+        gpu_in_container_ok: true,
+        active_compute_jobs: 0,
+      }],
+    });
+
+    expect(section).toContain('STALE/OFFLINE (persisted status: active)');
+    expect(section).not.toContain('dgx-1 [aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]: LIVE');
+  });
+
+  it('does not render runner pin guidance without a project inventory', () => {
+    const section = buildLocalRunnerSection({
+      ever_registered: true,
+      active_total: 0,
+      active_gpu: 0,
+    });
+    expect(section).not.toContain('"runner_target"');
   });
 });

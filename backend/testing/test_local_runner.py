@@ -8547,6 +8547,10 @@ class TestLocalRunnerStatusForStrategist:
         assert status["ever_registered"] is True
         assert status["active_total"] == 0
         assert status["active_gpu"] == 0
+        # Inventory intentionally retains stale project runners: it explains
+        # why a strict runner_target would wait rather than implying no runner
+        # exists for this project.
+        assert status["runners"][0]["live"] is False
         # Field IS included now (ever_registered True) so the agent sees the
         # hardware is down (active_gpu == 0) and can hold GPU experiments.
         payload_fragment = (
@@ -8619,8 +8623,7 @@ class TestLocalRunnerStatusForStrategist:
 
     @pytest.mark.asyncio
     async def test_devices_absent_when_no_live_runner(self, db_session):
-        """The additive `devices` key is OMITTED when no runner is live, so the
-        load-bearing 3-key shape is preserved for existing consumers."""
+        """Stale runners retain inventory but do not appear as live devices."""
         project = await _make_project(db_session)
         # Registered-but-stale runner → ever_registered True, no live devices.
         await _make_runner(
@@ -8634,12 +8637,11 @@ class TestLocalRunnerStatusForStrategist:
         from app.strategic_spawning import _load_local_runner_status
 
         status = await _load_local_runner_status(db_session, project.id)
-        assert status == {
-            "ever_registered": True,
-            "active_total": 0,
-            "active_gpu": 0,
-        }
+        assert status["ever_registered"] is True
+        assert status["active_total"] == 0
+        assert status["active_gpu"] == 0
         assert "devices" not in status
+        assert status["runners"][0]["live"] is False
 
     @pytest.mark.asyncio
     async def test_devices_block_for_live_gpu_runner(self, db_session):
@@ -8647,7 +8649,7 @@ class TestLocalRunnerStatusForStrategist:
         name, gpu_count, deduped models, per-GPU VRAM (when advertised),
         container capability, and current load."""
         project = await _make_project(db_session)
-        await _make_runner(
+        runner, _ = await _make_runner(
             db_session,
             project.id,
             status="active",

@@ -110,9 +110,12 @@ export interface ResidentSession {
    *  Accepts a plain text string or an array of content blocks (text + image) for
    *  multimodal operator messages. `opts.stallTimeoutMs` overrides the per-active-turn
    *  stall budget for THIS turn only (autonomous turns get a deeper budget so a long
-   *  read/verify step isn't killed mid-thought); the absolute hard ceiling and interrupt
-   *  ladder are unchanged. */
-  sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult>;
+   *  read/verify step isn't killed mid-thought). `opts.hardTimeoutMs` overrides the
+   *  absolute wall-clock ceiling for this turn, which is never reset by output. */
+  sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: {
+    stallTimeoutMs?: number;
+    hardTimeoutMs?: number;
+  }): Promise<ResidentTurnResult>;
   /** Cooperatively pre-empt the in-flight turn (control_request, SIGINT fallback). */
   interrupt(): void;
   /** Subscribe to parsed stream events (text deltas, tool_use, errors). */
@@ -176,6 +179,8 @@ interface ActiveTurn {
   sawDeltaThisMessage: boolean;
   /** per-active-turn stall budget for THIS turn (may override the session default). */
   stallTimeoutMs: number;
+  /** absolute wall-clock ceiling for THIS turn; output never extends it. */
+  hardTimeoutMs: number;
   stallTimer: NodeJS.Timeout | null;
   forceTimer: NodeJS.Timeout | null;
   hardTimer: NodeJS.Timeout | null;
@@ -403,7 +408,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (t.hardTimer) clearTimeout(t.hardTimer);
     t.hardTimer = setTimeout(() => {
       if (activeTurn !== t) return;
-      log(`[resident] turn hard-timeout — no terminal result within ${Math.round(hardTurnTimeoutMs / 1000)}s; force-killing session`);
+      log(`[resident] turn hard-timeout — no terminal result within ${Math.round(t.hardTimeoutMs / 1000)}s; force-killing session`);
       t.timedOut = true;
       t.hardTimedOut = true;
       try { interrupt(); } catch { /* fall through to the kill below */ }
@@ -412,7 +417,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         // close() kills the group and settles this turn with processGone=true.
         if (activeTurn === t) close();
       }, RESIDENT_INTERRUPT_SIGINT_GRACE_MS + 1_000);
-    }, hardTurnTimeoutMs);
+    }, t.hardTimeoutMs);
   };
 
   const handleEvent = (ev: ResidentStreamEvent): void => {
@@ -726,7 +731,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     resolveIdleWaiters();
   }
 
-  function sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult> {
+  function sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: {
+    stallTimeoutMs?: number;
+    hardTimeoutMs?: number;
+  }): Promise<ResidentTurnResult> {
     if (!alive || closed) {
       return Promise.resolve({
         resultText: '', accumulatedTurnText: '', interrupted: false, timedOut: false, hardTimedOut: false,
@@ -747,6 +755,12 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     const stallTimeoutMs = typeof opts?.stallTimeoutMs === 'number' && Number.isFinite(opts.stallTimeoutMs)
       ? Math.max(turnTimeoutMs, opts.stallTimeoutMs)
       : turnTimeoutMs;
+    // An interactive turn must not extend its wall-clock ceiling merely because
+    // it keeps producing tool activity. Autonomous callers deliberately omit
+    // this override and retain the session's deeper default hard ceiling.
+    const turnHardTimeoutMs = typeof opts?.hardTimeoutMs === 'number' && Number.isFinite(opts.hardTimeoutMs)
+      ? Math.max(1, Math.round(opts.hardTimeoutMs))
+      : hardTurnTimeoutMs;
     const startedAtMs = Date.now();
     return new Promise<ResidentTurnResult>((resolve) => {
       const turn: ActiveTurn = {
@@ -754,7 +768,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         sawToolUse: false, appliedStrategicOp: false, sentOperatorMessage: false,
         pendingMessageSendIds: new Set<string>(),
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
-        stallTimeoutMs,
+        stallTimeoutMs, hardTimeoutMs: turnHardTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
         startedAtMs, firstTokenAtMs: null, toolCallCount: 0, totalToolCallDurationMs: 0,
         providerFailed: false, failureCategory: null,

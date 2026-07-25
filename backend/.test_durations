@@ -3325,7 +3325,6 @@
   "testing/test_compute_experiment_spawn.py::test_strategist_spawn_compute_experiment_arms_e2e": 0.331947105000836,
   "testing/test_compute_experiment_spawn.py::test_strategist_spawn_compute_experiment_below_threshold_no_approval": 0.34093221800048923,
   "testing/test_compute_experiment_spawn.py::test_strategist_spawn_compute_experiment_invalid_contract_rejected": 0.32033784900067985,
-  "testing/test_compute_experiment_spawn.py::test_success_always_spawns_followon_without_opt_in": 0.3536607610003557,
   "testing/test_compute_experiment_spawn.py::test_sweep_aggregate_includes_failed_arm_results": 0.45696113200028776,
   "testing/test_compute_experiment_spawn.py::test_sweep_aggregate_spawn_is_idempotent": 0.6078038659998128,
   "testing/test_compute_experiment_spawn.py::test_sweep_arm_suppresses_per_arm_disposition_while_siblings_pending": 0.39049570800034417,
