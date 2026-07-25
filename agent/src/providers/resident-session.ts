@@ -397,13 +397,19 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (
       staleResultsPending === 0
       && !ev.nested
+      // OAuth quota exhaustion can arrive before the first input turn as a
+      // bare stdout line rather than a stream-json result/error frame. Treat
+      // that raw provider output as terminal evidence too; otherwise the
+      // child exits and the resident is retried generically against the same
+      // exhausted account.
       && (ev.kind === 'error'
+        || ev.kind === 'other'
         || (ev.kind === 'result' && ev.isError && ev.isTurnResult)) && ev.text
     ) {
       appendFailureText(ev.text);
       const category = classifyFailure(failureTextTail);
       if (category) terminalFailureCategory = category;
-      if (activeTurn && ev.kind === 'result' && ev.isError && ev.isTurnResult) {
+      if (activeTurn && category) {
         activeTurn.providerFailed = true;
         activeTurn.failureCategory = category;
       }
@@ -621,6 +627,14 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     resolveIdleWaiters();
   });
   child.on('close', (code: number | null) => {
+    // Some Claude CLI failures (notably the OAuth weekly-limit banner) are
+    // written as bare stdout without a final newline. Feed that final fragment
+    // through the ordinary parser before classifying this process exit.
+    if (carry.trim()) {
+      const trailing = carry;
+      carry = '';
+      handleLine(trailing);
+    }
     alive = false;
     exitCodeVal = code ?? null;
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
