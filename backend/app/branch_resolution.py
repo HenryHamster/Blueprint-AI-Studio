@@ -7,6 +7,7 @@ a thin facade so existing importers are unaffected. Behaviour-preserving.
 """
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Dict
 
@@ -432,8 +433,26 @@ def _uses_legacy_branch_resolver_shape(project) -> bool:
     detached shapes so the runtime safety hardening only applies to real
     project-like objects.
     """
-    return project is not None and not any(
-        hasattr(project, attr)
+    if project is None:
+        return False
+
+    # `hasattr(instance, column)` invokes SQLAlchemy's descriptor. When a
+    # real Project row came from load_only(..., raiseload=True), that shape
+    # probe attempted to fetch an intentionally omitted column and raised
+    # InvalidRequestError. Static inspection sees instance/class attributes
+    # without invoking descriptors, while preserving the legacy-stub contract.
+    missing = object()
+
+    def _has_shape_attr(attr: str) -> bool:
+        if inspect.getattr_static(project, attr, missing) is not missing:
+            return True
+        # Preserve support for dynamic proxy/test shapes that expose fields via
+        # __getattr__. Real SQLAlchemy descriptors were found statically above,
+        # so this fallback cannot trigger their raiseload behavior.
+        return hasattr(project, attr)
+
+    return not any(
+        _has_shape_attr(attr)
         for attr in ("promotion_target", "is_self_repo", "github_repo")
     )
 

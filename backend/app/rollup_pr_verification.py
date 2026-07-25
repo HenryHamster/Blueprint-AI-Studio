@@ -273,10 +273,17 @@ async def _hold_childless_plan_for_post_commit(
     and spawned children. Overriding that stale credit lets recovery own the row
     instead of allowing the ancestor rollup to converge on work never spawned.
     """
+    # Dependency rows in the orchestrator are deliberately detached with a
+    # lightweight projection that excludes the large plan_output JSON column.
+    # Most callers are create tasks, so reject non-plans before touching that
+    # deferred attribute; reading it first raises DetachedInstanceError and
+    # aborts the entire dispatch cycle.
+    if (task.first_payload or {}).get("type") != "plan":
+        return False
+
     plan_output = task.plan_output
     if not (
-        (task.first_payload or {}).get("type") == "plan"
-        and isinstance(plan_output, dict)
+        isinstance(plan_output, dict)
         and isinstance(plan_output.get("subtasks"), list)
         and plan_output.get("subtasks")
     ):
