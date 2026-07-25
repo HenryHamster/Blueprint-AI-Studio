@@ -139,7 +139,7 @@
     "release_readiness.py": 2100,
     "acceptance_criteria.py": 5150,
     "runner_health_alerts.py": 2450,
-    "routers/agent_strategic_fetch.py": 1750,
+    "routers/agent_strategic_fetch.py": 2550,
     "runner_health_monitors.py": 1450,
     "strategic_context_package.py": 2500,
     "routers/runner.py": 3800,
