@@ -5426,7 +5426,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                "version_hint": "v99-abcdef01",
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             }
 
         def fake_print(*args, **kwargs):
@@ -5440,19 +5440,19 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
-                              return_value="v1-oldversion"), \
+                              side_effect=["v25-1-g4f5a6b7", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"]), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes", return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes", return_value=None), \
+                 patch.object(local_runner, "_container_image_store", return_value=None), \
                  patch.object(local_runner.br, "do_update",
-                              return_value=0), \
-                 patch.object(os, "_exit"), \
-                 patch.object(os, "execv"), \
+                              return_value=0) as update_mock, \
+                 patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
                  patch("builtins.print", side_effect=fake_print):
-                # BOTH exits are stubbed: after a successful update the runner
-                # either exits for its supervisor OR re-execs in place, and which
-                # branch it takes depends on the HOST running the tests. An
-                # unstubbed os.execv replaces the pytest process itself, silently
-                # truncating the run (exit 0, remaining tests never reported).
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
@@ -5465,6 +5465,52 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             "auto-updating",
             combined,
             "Expected auto-update message when runner is idle and version differs",
+        )
+        update_mock.assert_called_once()
+        reexec_mock.assert_called_once()
+
+    def test_noop_auto_update_keeps_healthy_runner_alive(self):
+        """A no-op update must not restart-loop against a lagging server SHA."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            }
+
+        def fake_print(*args, **kwargs):
+            output_lines.append(" ".join(str(arg) for arg in args))
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes", return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes", return_value=None), \
+                 patch.object(local_runner, "_container_image_store", return_value=None), \
+                 patch.object(local_runner.br, "do_update", return_value=0) as update_mock, \
+                 patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        update_mock.assert_called_once()
+        reexec_mock.assert_not_called()
+        self.assertIn(
+            "continuing without restart",
+            " ".join(output_lines).lower(),
         )
 
     def test_version_hint_mismatch_skips_auto_update_when_compute_busy(self):
