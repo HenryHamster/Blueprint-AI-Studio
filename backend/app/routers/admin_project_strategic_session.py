@@ -1185,13 +1185,9 @@ _SESSION_OUTPUT_LIMIT = 8
 
 
 def _session_conversation_predicate():
-    # NULL-audience leak guard: exclude messages with an explicitly non-operator
-    # audience (strategist-internal / pipeline-log) that accidentally landed on the
-    # CONVERSATION surface.  NULL-audience rows are allowed through — they are either
-    # user-authored messages (which are never audience-stamped) or un-backfilled
-    # strategic messages awaiting the hourly NULL-audience sweep.  Fail-closed
-    # exclusion of ONLY the explicit non-operator classes avoids filtering out
-    # legitimate user messages.
+    # Keep Strategic's own replies visible in the conversation even if a stale
+    # audience stamp classifies them as strategist-internal. The CONVERSATION
+    # surface is the user-facing transcript; system-internal rows remain hidden.
     _non_operator = [STRATEGIST_INTERNAL, PIPELINE_LOG]
     return and_(
         ProjectMessage.surface == MessageSurface.CONVERSATION,
@@ -1200,6 +1196,7 @@ def _session_conversation_predicate():
             ProjectMessage.context["event_type"].as_string() != _CHECK_IN_EVENT_TYPE,
         ),
         or_(
+            ProjectMessage.from_type == "strategic",
             ProjectMessage.context["audience"].as_string().is_(None),
             ~ProjectMessage.context["audience"].as_string().in_(_non_operator),
         ),

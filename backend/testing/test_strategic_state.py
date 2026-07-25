@@ -2615,6 +2615,55 @@ async def test_strategic_conversation_cursor_is_sequence_stable_and_excludes_act
 
 
 @pytest.mark.asyncio
+async def test_strategic_conversation_keeps_strategic_reply_with_internal_audience(
+    client: AsyncClient, db_session
+):
+    """A reply in the user-facing transcript must not disappear due to its stamp."""
+    project = await _make_project(db_session)
+    db_session.add_all([
+        ProjectMessage(
+            project_id=project.id,
+            sequence=1,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="internal bookkeeping",
+            context={"audience": "strategist-internal"},
+        ),
+        ProjectMessage(
+            project_id=project.id,
+            sequence=2,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="hi",
+        ),
+        ProjectMessage(
+            project_id=project.id,
+            sequence=3,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="Hi — what can I help with?",
+            context={
+                "event_type": "strategic_message",
+                "audience": "strategist-internal",
+            },
+        ),
+    ])
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?limit=2"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert [item["content"] for item in resp.json()["items"]] == [
+        "hi",
+        "Hi — what can I help with?",
+    ]
+
+@pytest.mark.asyncio
 async def test_strategic_conversation_after_sequence_closes_realtime_gap(
     client: AsyncClient, db_session
 ):
