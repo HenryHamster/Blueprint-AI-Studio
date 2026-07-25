@@ -1671,6 +1671,27 @@ async def heartbeat(
         caps["disk_free_bytes"] = max(0, int(payload.disk_free_bytes))
     if payload.workspace_free_bytes is not None:
         caps["workspace_free_bytes"] = max(0, int(payload.workspace_free_bytes))
+
+    # New runners explicitly send these as ``null`` when Docker/Podman info is
+    # unavailable or their active isolation backend changes. That is different
+    # from an older runner omitting the field: discard only an explicit-null
+    # value, otherwise a transient probe failure would leave a stale low Docker
+    # root in capabilities and hold future image jobs indefinitely.
+    reported_fields = getattr(payload, "model_fields_set", None)
+    if reported_fields is None:  # Pydantic v1 compatibility.
+        reported_fields = getattr(payload, "__fields_set__", set())
+    if not isinstance(reported_fields, (set, frozenset)):
+        reported_fields = set()
+    image_store_fields = (
+        "container_image_store_runtime",
+        "container_image_store_path",
+        "container_image_store_free_bytes",
+        "container_image_reclaim",
+    )
+    for field_name in image_store_fields:
+        if field_name in reported_fields and getattr(payload, field_name) is None:
+            caps.pop(field_name, None)
+
     if payload.container_image_store_free_bytes is not None:
         caps["container_image_store_free_bytes"] = max(
             0, int(payload.container_image_store_free_bytes)

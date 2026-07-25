@@ -218,6 +218,54 @@ async def test_heartbeat_persists_snapshot_row(db_session):
 
 
 @pytest.mark.asyncio
+async def test_explicit_null_image_store_telemetry_clears_stale_capacity(db_session):
+    """A transient Docker-info failure must not retain an old low data-root."""
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": "all",
+            "disk_free_bytes": 20_000_000_000,
+            "workspace_free_bytes": 20_000_000_000,
+            "container_image_store_runtime": "docker",
+            "container_image_store_path": "/var/lib/docker",
+            "container_image_store_free_bytes": 1_000_000,
+            "container_image_reclaim": {"reason": "old cleanup result"},
+        },
+    )
+
+    # Omitted fields preserve compatibility with older runners and must not
+    # erase a still-valid report.
+    await heartbeat(
+        payload=HeartbeatRequest(agent_available=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["container_image_store_free_bytes"] == 1_000_000
+
+    # local_runner sends each field as explicit null when the data-root probe is
+    # unavailable. That must clear the old low reading so the legacy workspace
+    # measurement is not permanently shadowed by stale Docker telemetry.
+    await heartbeat(
+        payload=HeartbeatRequest(
+            container_image_store_runtime=None,
+            container_image_store_path=None,
+            container_image_store_free_bytes=None,
+            container_image_reclaim=None,
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["workspace_free_bytes"] == 20_000_000_000
+    for key in (
+        "container_image_store_runtime",
+        "container_image_store_path",
+        "container_image_store_free_bytes",
+        "container_image_reclaim",
+    ):
+        assert key not in runner.capabilities
+@pytest.mark.asyncio
 async def test_heartbeat_persists_agent_unavailable_legs(db_session):
     """The per-leg breakdown map rides in capabilities JSONB alongside the
     compound reason string, so the fleet panel can render a per-leg checklist."""
