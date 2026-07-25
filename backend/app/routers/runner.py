@@ -895,11 +895,37 @@ async def _resolve_pool_credentials_for_dispatch(
             else project.user_id
         )
 
+        # Local runners resolve credentials at claim time rather than through
+        # the cloud dispatcher. Preserve the same rate-limit and provisioning
+        # exclusions here, or a resident retry can be handed the account that
+        # just exhausted its quota.
+        task_context = task.context or {}
+        rate_limited_accounts = task_context.get("blacklisted_accounts") or []
+        provision_failed_accounts = (
+            task_context.get("provision_failed_accounts") or []
+        )
+        effective_blacklist = list(
+            dict.fromkeys(
+                [
+                    *(
+                        rate_limited_accounts
+                        if isinstance(rate_limited_accounts, list)
+                        else []
+                    ),
+                    *(
+                        provision_failed_accounts
+                        if isinstance(provision_failed_accounts, list)
+                        else []
+                    ),
+                ]
+            )
+        ) or None
         failure_reasons: list[str] = []
         selection = await select_llm_runtime_for_task(
             user_id=dispatch_user_id,
             task=task,
             runtime_config=_rc_dict,
+            blacklist=effective_blacklist,
             project_id=str(task.project_id) if task.project_id else None,
             runner_available_clis=(runner.capabilities or {}).get("llm_clis"),
             failure_reasons=failure_reasons,
