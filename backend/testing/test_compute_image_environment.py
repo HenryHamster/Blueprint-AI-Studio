@@ -291,6 +291,243 @@ async def test_agent_compute_environment_suppresses_stale_terminal_outcome(
     assert "last_build_outcome" not in response.json()["data"]
 
 
+@pytest.mark.asyncio
+async def test_durable_compute_image_claim_allows_only_one_active_worker(db_session):
+    """Two Cloud Run instances racing the same recipe get exactly one owner."""
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    from app.routers import agent_strategic_fetch
+
+    async def claim(request_id: str) -> bool:
+        return await agent_strategic_fetch._claim_agent_compute_image_build_request(
+            project.id,
+            request_id,
+            dep_hash="dep-race",
+            recipe_identity="recipe-race",
+        )
+
+    claims = await asyncio.gather(claim("worker-a"), claim("worker-b"))
+    assert claims.count(True) == 1
+    assert claims.count(False) == 1
+
+
+@pytest.mark.asyncio
+async def test_late_compute_image_worker_cannot_overwrite_newer_claim(db_session):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    from app.project_telemetry import read_telemetry
+    from app.routers import agent_strategic_fetch
+
+    assert await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        "old-worker",
+        dep_hash="dep-old",
+        recipe_identity="recipe-old",
+    )
+    # A changed recipe legitimately reclaims an otherwise active old lease.
+    assert await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        "new-worker",
+        dep_hash="dep-new",
+        recipe_identity="recipe-new",
+    )
+    assert not await agent_strategic_fetch._persist_agent_compute_image_build_terminal_state(
+        project.id,
+        "old-worker",
+        status="error",
+        reason="late_old_worker",
+    )
+
+    state = await read_telemetry(
+        db_session, project.id, "compute_image_build_state"
+    )
+    assert state is not None
+    assert state["request_id"] == "new-worker"
+    assert state["status"] == "requested"
+
+
+@pytest.mark.asyncio
+async def test_expired_compute_image_lease_can_be_reclaimed(db_session):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    from app.project_telemetry import set_project_telemetry
+    from app.routers import agent_strategic_fetch
+
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        "compute_image_build_state",
+        {
+            "request_id": "crashed-worker",
+            "status": "requested",
+            "dep_hash": "dep-current",
+            "recipe_identity": "recipe-current",
+            "requested_at": "2026-07-25T00:00:00+00:00",
+            "lease_expires_at": "2026-07-25T00:01:00+00:00",
+        },
+    )
+    await db_session.commit()
+
+    assert await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        "recovery-worker",
+        dep_hash="dep-current",
+        recipe_identity="recipe-current",
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_image_heartbeat_renews_owned_lease(db_session):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+
+    from app.routers import agent_strategic_fetch
+
+    assert await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        "heartbeat-worker",
+        dep_hash="dep-heartbeat",
+        recipe_identity="recipe-heartbeat",
+    )
+    assert await agent_strategic_fetch._renew_agent_compute_image_build_lease(
+        project.id, "heartbeat-worker"
+    )
+    assert not await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        "second-worker",
+        dep_hash="dep-heartbeat",
+        recipe_identity="recipe-heartbeat",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_environment_recovers_stale_requested_hash(
+    client: AsyncClient, db_session, monkeypatch
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="env-agent-stale-request",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    environment = {"state": "declared_needs_build", "action": "build"}
+    from app import compute_backends, compute_image_environment
+    from app.project_telemetry import set_project_telemetry
+    from app.routers import agent_strategic_fetch
+
+    async def fake_resolver(*_args, **_kwargs):
+        return dict(environment)
+
+    async def changed_identity(*_args, **_kwargs):
+        return {"dep_hash": "dep-new", "status": "deferred"}
+
+    monkeypatch.setattr(
+        compute_image_environment,
+        "resolve_project_compute_image_environment",
+        fake_resolver,
+    )
+    monkeypatch.setattr(
+        compute_backends,
+        "resolve_project_compute_image_dependency_identity",
+        changed_identity,
+    )
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        "compute_image_build_state",
+        {
+            "request_id": "stale-request",
+            "status": "requested",
+            "dep_hash": "dep-old",
+            "recipe_identity": agent_strategic_fetch._compute_image_recipe_identity(
+                environment
+            ),
+            "requested_at": "2026-07-25T00:00:00+00:00",
+            "lease_expires_at": "2099-07-25T00:00:00+00:00",
+        },
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "env-agent-stale-request", task_type="strategic_review")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/compute-environment",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["build_status"] == "not_requested"
+    assert response.json()["data"]["build_identity_status"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_environment_keeps_current_prehash_failure_actionable(
+    client: AsyncClient, db_session, monkeypatch
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="env-agent-prehash-error",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    environment = {"state": "declared_needs_build", "action": "build"}
+    from app import compute_image_environment
+    from app.project_telemetry import set_project_telemetry
+    from app.routers import agent_strategic_fetch
+
+    async def fake_resolver(*_args, **_kwargs):
+        return dict(environment)
+
+    monkeypatch.setattr(
+        compute_image_environment,
+        "resolve_project_compute_image_environment",
+        fake_resolver,
+    )
+    await set_project_telemetry(
+        db_session,
+        project.id,
+        "compute_image_build_state",
+        {
+            "request_id": "prehash-error",
+            "status": "error",
+            "recipe_identity": agent_strategic_fetch._compute_image_recipe_identity(
+                environment
+            ),
+            "reason": "manifest_probe_failed",
+            "requested_at": "2026-07-25T00:00:00+00:00",
+            "completed_at": "2026-07-25T00:01:00+00:00",
+        },
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "env-agent-prehash-error", task_type="strategic_review")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/compute-environment",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["build_status"] == "not_running"
+    assert response.json()["data"]["build_identity_status"] == "current_recipe"
+    assert response.json()["data"]["last_build_outcome"]["reason"] == "manifest_probe_failed"
+
+
 def _shared_session_factory(session):
     """Return a lightweight factory for testing a detached worker's DB writes."""
 
@@ -325,8 +562,11 @@ async def test_background_compute_image_build_persists_completion(db_session, mo
 
     monkeypatch.setattr(compute_backends, "refresh_project_compute_image", completed)
     request_id = "completion-request"
-    await agent_strategic_fetch._persist_agent_compute_image_build_state(
-        project.id, request_id, status="requested"
+    assert await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        request_id,
+        dep_hash="dep-completed",
+        recipe_identity="recipe-completed",
     )
     await agent_strategic_fetch._run_agent_requested_compute_image_build(
         project.id, request_id
@@ -369,8 +609,11 @@ async def test_background_compute_image_build_persists_deferred_result(
 
     monkeypatch.setattr(compute_backends, "refresh_project_compute_image", deferred)
     request_id = "deferred-request"
-    await agent_strategic_fetch._persist_agent_compute_image_build_state(
-        project.id, request_id, status="requested"
+    assert await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        request_id,
+        dep_hash="dep-deferred",
+        recipe_identity="recipe-deferred",
     )
     await agent_strategic_fetch._run_agent_requested_compute_image_build(
         project.id, request_id
@@ -408,8 +651,11 @@ async def test_background_compute_image_build_persists_interruption(
 
     monkeypatch.setattr(compute_backends, "refresh_project_compute_image", cancelled)
     request_id = "cancelled-request"
-    await agent_strategic_fetch._persist_agent_compute_image_build_state(
-        project.id, request_id, status="requested"
+    assert await agent_strategic_fetch._claim_agent_compute_image_build_request(
+        project.id,
+        request_id,
+        dep_hash="dep-cancelled",
+        recipe_identity="recipe-cancelled",
     )
     with pytest.raises(asyncio.CancelledError):
         await agent_strategic_fetch._run_agent_requested_compute_image_build(
@@ -465,8 +711,8 @@ async def test_agent_compute_image_build_returns_accepted_without_foreground_bui
 
     requests: list[uuid.UUID] = []
 
-    async def fake_request(project_id: uuid.UUID) -> str:
-        requests.append(project_id)
+    async def fake_request(_session, project: Project, _environment, **_kwargs) -> str:
+        requests.append(project.id)
         return "requested"
 
     from app import compute_image_environment
