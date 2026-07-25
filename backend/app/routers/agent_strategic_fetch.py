@@ -18,9 +18,11 @@ no change.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -65,9 +67,81 @@ _agent_compute_image_build_tasks: dict[uuid.UUID, asyncio.Task] = {}
 # It stores one latest request/outcome per project; a terminal record carries the
 # exact dep_hash calculated by the canonical refresh driver.
 _COMPUTE_IMAGE_BUILD_STATE_KEY = "compute_image_build_state"
+_COMPUTE_IMAGE_BUILD_LEASE = timedelta(minutes=15)
 
 
-async def _persist_agent_compute_image_build_state(
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _compute_image_recipe_identity(environment: dict[str, Any]) -> str:
+    """Fingerprint the declared recipe without treating it as a build hash."""
+    payload = {
+        key: environment.get(key)
+        for key in (
+            "state",
+            "action",
+            "manifest_image",
+            "dockerfile",
+            "candidate_dockerfile",
+        )
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _lease_is_expired(state: dict[str, Any], *, now: str | None = None) -> bool:
+    lease_expires_at = state.get("lease_expires_at")
+    return not isinstance(lease_expires_at, str) or lease_expires_at <= (
+        now or _utc_iso()
+    )
+
+
+async def _claim_agent_compute_image_build_request(
+    project_id: uuid.UUID,
+    request_id: str,
+    *,
+    dep_hash: str | None,
+    recipe_identity: str,
+    identity_reason: str | None = None,
+) -> bool:
+    """Atomically claim one durable build lease for a project.
+
+    The conflict-guarded UPSERT is the cross-instance gate. A process-local
+    task registry can only coalesce within one Cloud Run instance; this lease
+    decides whether any instance may actually start a worker.
+    """
+    from app.project_telemetry import claim_project_telemetry_lease
+
+    requested_at = _utc_iso()
+    lease_expires_at = (
+        datetime.now(timezone.utc) + _COMPUTE_IMAGE_BUILD_LEASE
+    ).isoformat()
+    state: dict[str, Any] = {
+        "request_id": request_id,
+        "status": "requested",
+        "requested_at": requested_at,
+        "lease_expires_at": lease_expires_at,
+        "recipe_identity": recipe_identity,
+    }
+    if isinstance(dep_hash, str) and dep_hash:
+        state["dep_hash"] = dep_hash
+    if isinstance(identity_reason, str) and identity_reason:
+        state["identity_reason"] = identity_reason
+    async with AsyncSessionLocal() as state_session:
+        claimed = await claim_project_telemetry_lease(
+            state_session,
+            project_id,
+            _COMPUTE_IMAGE_BUILD_STATE_KEY,
+            state,
+            lease_expires_before=requested_at,
+        )
+        if claimed:
+            await state_session.commit()
+        return claimed
+
+
+async def _persist_agent_compute_image_build_terminal_state(
     project_id: uuid.UUID,
     request_id: str,
     *,
@@ -75,50 +149,91 @@ async def _persist_agent_compute_image_build_state(
     result: dict[str, Any] | None = None,
     reason: str | None = None,
 ) -> bool:
-    """Durably persist a request or matching terminal outcome.
-
-    A late worker from an older request must not overwrite a newer request's
-    state. The write uses the existing project_telemetry upsert and commits in
-    its own session so a completed HTTP response is visible on every instance.
-    """
-    from app.project_telemetry import read_telemetry, set_project_telemetry
+    """CAS a terminal result only if this worker still owns the request."""
+    from app.project_telemetry import (
+        compare_and_set_project_telemetry_request,
+        read_telemetry,
+    )
 
     async with AsyncSessionLocal() as state_session:
         previous = await read_telemetry(
             state_session, project_id, _COMPUTE_IMAGE_BUILD_STATE_KEY
         )
         if (
-            status != "requested"
-            and isinstance(previous, dict)
-            and previous.get("request_id") != request_id
+            not isinstance(previous, dict)
+            or previous.get("request_id") != request_id
+            or previous.get("status") != "requested"
         ):
             return False
 
-        now = datetime.now(timezone.utc).isoformat()
+        source = result or {}
         state: dict[str, Any] = {
             "request_id": request_id,
             "status": status,
-            "requested_at": (
-                now if status == "requested" else previous.get("requested_at", now)
-                if isinstance(previous, dict)
-                else now
-            ),
+            "requested_at": previous.get("requested_at", _utc_iso()),
+            "completed_at": _utc_iso(),
         }
-        if status != "requested":
-            state["completed_at"] = now
-        source = result or {}
-        dep_hash = source.get("dep_hash")
-        if isinstance(dep_hash, str) and dep_hash:
-            state["dep_hash"] = dep_hash
+        for key in ("recipe_identity", "dep_hash", "identity_reason"):
+            value = source.get(key) or previous.get(key)
+            if isinstance(value, str) and value:
+                state[key] = value
         outcome_reason = reason or source.get("reason") or source.get("error")
         if isinstance(outcome_reason, str) and outcome_reason:
             state["reason"] = outcome_reason
 
-        await set_project_telemetry(
-            state_session, project_id, _COMPUTE_IMAGE_BUILD_STATE_KEY, state
+        persisted = await compare_and_set_project_telemetry_request(
+            state_session,
+            project_id,
+            _COMPUTE_IMAGE_BUILD_STATE_KEY,
+            request_id,
+            state,
         )
-        await state_session.commit()
-    return True
+        if persisted:
+            await state_session.commit()
+        return persisted
+
+
+async def _renew_agent_compute_image_build_lease(
+    project_id: uuid.UUID, request_id: str
+) -> bool:
+    """Extend an owned request lease from the refresh pipeline heartbeat."""
+    from app.project_telemetry import (
+        compare_and_set_project_telemetry_request,
+        read_telemetry,
+    )
+
+    try:
+        async with AsyncSessionLocal() as state_session:
+            previous = await read_telemetry(
+                state_session, project_id, _COMPUTE_IMAGE_BUILD_STATE_KEY
+            )
+            if (
+                not isinstance(previous, dict)
+                or previous.get("request_id") != request_id
+                or previous.get("status") != "requested"
+            ):
+                return False
+            state = dict(previous)
+            state["lease_expires_at"] = (
+                datetime.now(timezone.utc) + _COMPUTE_IMAGE_BUILD_LEASE
+            ).isoformat()
+            renewed = await compare_and_set_project_telemetry_request(
+                state_session,
+                project_id,
+                _COMPUTE_IMAGE_BUILD_STATE_KEY,
+                request_id,
+                state,
+            )
+            if renewed:
+                await state_session.commit()
+            return renewed
+    except Exception:  # noqa: BLE001 - next heartbeat/lease expiry recovers safely
+        logger.warning(
+            "[COMPUTE-IMAGE] lease heartbeat failed: project=%s",
+            project_id,
+            exc_info=True,
+        )
+        return False
 
 
 async def _run_agent_requested_compute_image_build(
@@ -134,11 +249,20 @@ async def _run_agent_requested_compute_image_build(
     async def fresh_manifest(project_arg: Project) -> dict[str, Any]:
         return await _discover_manifest_tools(project_arg, force_refresh=True)
 
+    lease_renewal_task: asyncio.Task | None = None
+
+    def renew_lease_on_progress() -> None:
+        nonlocal lease_renewal_task
+        if lease_renewal_task is None or lease_renewal_task.done():
+            lease_renewal_task = asyncio.create_task(
+                _renew_agent_compute_image_build_lease(project_id, request_id)
+            )
+
     try:
         async with AsyncSessionLocal() as build_session:
             project = await build_session.get(Project, project_id)
             if project is None:
-                await _persist_agent_compute_image_build_state(
+                await _persist_agent_compute_image_build_terminal_state(
                     project_id,
                     request_id,
                     status="error",
@@ -154,10 +278,10 @@ async def _run_agent_requested_compute_image_build(
                 project,
                 allow_build=True,
                 build_semaphore=_compute_image_build_semaphore,
-                progress_cb=lambda: None,
+                progress_cb=renew_lease_on_progress,
                 _manifest_fn=fresh_manifest,
             )
-            await _persist_agent_compute_image_build_state(
+            await _persist_agent_compute_image_build_terminal_state(
                 project_id,
                 request_id,
                 status=str(result.get("status") or "error"),
@@ -169,7 +293,7 @@ async def _run_agent_requested_compute_image_build(
                 result.get("status"),
             )
     except asyncio.CancelledError:
-        await _persist_agent_compute_image_build_state(
+        await _persist_agent_compute_image_build_terminal_state(
             project_id,
             request_id,
             status="interrupted",
@@ -181,7 +305,7 @@ async def _run_agent_requested_compute_image_build(
         )
         raise
     except Exception:  # noqa: BLE001 - periodic refresh will retry later
-        await _persist_agent_compute_image_build_state(
+        await _persist_agent_compute_image_build_terminal_state(
             project_id,
             request_id,
             status="error",
@@ -192,24 +316,51 @@ async def _run_agent_requested_compute_image_build(
         )
 
 
-async def _request_agent_compute_image_build(project_id: uuid.UUID) -> str:
-    """Persist a request, then start or locally reuse its detached worker."""
-    existing = _agent_compute_image_build_tasks.get(project_id)
+async def _request_agent_compute_image_build(
+    session: AsyncSession,
+    project: Project,
+    environment: dict[str, Any],
+    *,
+    manifest_fn=None,
+) -> str:
+    """Claim a durable lease, then start one detached worker if we own it."""
+    existing = _agent_compute_image_build_tasks.get(project.id)
     if existing is not None and not existing.done():
         return "already_requested"
 
+    from app.compute_backends import resolve_project_compute_image_dependency_identity
+
+    try:
+        identity = await resolve_project_compute_image_dependency_identity(
+            session, project, manifest_fn=manifest_fn
+        )
+    except Exception:  # noqa: BLE001 - failure becomes an actionable terminal result
+        logger.warning(
+            "[COMPUTE-IMAGE] unable to precompute build identity: project=%s",
+            project.id,
+            exc_info=True,
+        )
+        identity = {"dep_hash": None, "reason": "identity_check_failed"}
+
     request_id = str(uuid.uuid4())
-    await _persist_agent_compute_image_build_state(
-        project_id, request_id, status="requested"
+    claimed = await _claim_agent_compute_image_build_request(
+        project.id,
+        request_id,
+        dep_hash=identity.get("dep_hash"),
+        recipe_identity=_compute_image_recipe_identity(environment),
+        identity_reason=identity.get("reason"),
     )
+    if not claimed:
+        return "already_requested"
+
     build_task = asyncio.create_task(
-        _run_agent_requested_compute_image_build(project_id, request_id)
+        _run_agent_requested_compute_image_build(project.id, request_id)
     )
-    _agent_compute_image_build_tasks[project_id] = build_task
+    _agent_compute_image_build_tasks[project.id] = build_task
 
     def _clear_completed(task: asyncio.Task) -> None:
-        if _agent_compute_image_build_tasks.get(project_id) is task:
-            _agent_compute_image_build_tasks.pop(project_id, None)
+        if _agent_compute_image_build_tasks.get(project.id) is task:
+            _agent_compute_image_build_tasks.pop(project.id, None)
 
     build_task.add_done_callback(_clear_completed)
     return "requested"
@@ -223,68 +374,121 @@ async def _apply_agent_compute_image_build_state(
     """Attach durable, identity-checked build state to an environment response.
 
     The resolver remains the source of truth for a usable image. A persisted
-    terminal outcome is shown only when its dependency hash exactly matches the
-    current manifest inputs, so an old failure cannot discourage a changed image
-    recipe. ``requested`` deliberately does not claim a live worker: a Cloud
-    Run instance may have exited after accepting the request.
+    request is a lease rather than evidence of a live worker. Build-linked
+    terminal outcomes require an exact dependency-hash match; pre-hash failures
+    instead require the declared recipe fingerprint to match current state.
     """
     from app.compute_image_environment import ComputeImageEnvironmentState
+    from app.project_telemetry import read_telemetry
 
     state_name = environment.get("state")
     if state_name == ComputeImageEnvironmentState.READY:
         environment["build_status"] = "ready"
         return
-    if (
-        state_name != ComputeImageEnvironmentState.DECLARED_NEEDS_BUILD
-        or environment.get("action") != "build"
-    ):
-        environment["build_status"] = "not_applicable"
-        return
-
-    from app.project_telemetry import read_telemetry
+    is_buildable = (
+        state_name == ComputeImageEnvironmentState.DECLARED_NEEDS_BUILD
+        and environment.get("action") == "build"
+    )
 
     persisted = await read_telemetry(
         session, project.id, _COMPUTE_IMAGE_BUILD_STATE_KEY
     )
     if not isinstance(persisted, dict):
-        environment["build_status"] = "not_requested"
+        environment["build_status"] = "not_requested" if is_buildable else "not_applicable"
         return
 
+    recipe_identity = _compute_image_recipe_identity(environment)
+    stored_recipe_identity = persisted.get("recipe_identity")
+    recipe_matches = (
+        isinstance(stored_recipe_identity, str)
+        and stored_recipe_identity == recipe_identity
+    )
     request = {
         key: persisted[key]
-        for key in ("request_id", "requested_at")
+        for key in ("request_id", "requested_at", "lease_expires_at")
         if isinstance(persisted.get(key), str) and persisted[key]
     }
+    stored_dep_hash = persisted.get("dep_hash")
+
+    async def current_dependency_identity() -> dict[str, Any]:
+        from app.compute_backends import (
+            resolve_project_compute_image_dependency_identity,
+        )
+        from app.routers.admin_project_tools import _discover_manifest_tools
+
+        async def fresh_manifest(project_arg: Project) -> dict[str, Any]:
+            return await _discover_manifest_tools(project_arg, force_refresh=True)
+
+        try:
+            return await resolve_project_compute_image_dependency_identity(
+                session, project, manifest_fn=fresh_manifest
+            )
+        except Exception:  # noqa: BLE001 - status reads must not fail closed
+            logger.warning(
+                "[COMPUTE-IMAGE] unable to validate persisted build outcome: project=%s",
+                project.id,
+                exc_info=True,
+            )
+            return {"dep_hash": None, "reason": "identity_check_failed"}
+
     if persisted.get("status") == "requested":
+        if not recipe_matches:
+            environment["build_status"] = "not_requested"
+            environment["build_identity_status"] = "stale"
+            return
+        if _lease_is_expired(persisted):
+            environment["build_status"] = "not_requested"
+            environment["build_identity_status"] = "lease_expired"
+            return
+        if isinstance(stored_dep_hash, str) and stored_dep_hash:
+            identity = await current_dependency_identity()
+            current_dep_hash = identity.get("dep_hash")
+            if isinstance(current_dep_hash, str) and current_dep_hash:
+                if current_dep_hash != stored_dep_hash:
+                    environment["build_status"] = "not_requested"
+                    environment["build_identity_status"] = "stale"
+                    return
+                environment["build_identity_status"] = "current"
+            else:
+                environment["build_identity_status"] = "unknown"
+                reason = identity.get("reason")
+                if isinstance(reason, str) and reason:
+                    environment["build_identity_reason"] = reason
+        else:
+            environment["build_identity_status"] = "current_recipe"
         environment["build_status"] = "requested"
         if request:
             environment["build_request"] = request
         return
 
-    stored_dep_hash = persisted.get("dep_hash")
+    outcome = {
+        key: persisted[key]
+        for key in ("status", "reason", "dep_hash", "requested_at", "completed_at")
+        if persisted.get(key) is not None
+    }
     if not isinstance(stored_dep_hash, str) or not stored_dep_hash:
-        environment["build_status"] = "not_requested"
-        environment["build_identity_status"] = "unknown"
+        # A manifest/probe failure can happen before a dependency hash exists.
+        # Surface it only for the same declared recipe; never let an unkeyed old
+        # error become a permanent blocker after the recipe changes.
+        if recipe_matches and persisted.get("status") not in {
+            "rebuilt",
+            "unchanged",
+            "deferred",
+        }:
+            environment["build_status"] = "not_running" if is_buildable else "not_applicable"
+            environment["build_identity_status"] = "current_recipe"
+            if outcome:
+                environment["last_build_outcome"] = outcome
+            return
+        environment["build_status"] = "not_requested" if is_buildable else "not_applicable"
+        environment["build_identity_status"] = "stale" if stored_recipe_identity else "unknown"
         return
 
-    from app.compute_backends import resolve_project_compute_image_dependency_identity
-    from app.routers.admin_project_tools import _discover_manifest_tools
+    if not is_buildable:
+        environment["build_status"] = "not_applicable"
+        return
 
-    async def fresh_manifest(project_arg: Project) -> dict[str, Any]:
-        return await _discover_manifest_tools(project_arg, force_refresh=True)
-
-    try:
-        identity = await resolve_project_compute_image_dependency_identity(
-            session, project, manifest_fn=fresh_manifest
-        )
-    except Exception:  # noqa: BLE001 - never make a status read a new failure mode
-        logger.warning(
-            "[COMPUTE-IMAGE] unable to validate persisted build outcome: project=%s",
-            project.id,
-            exc_info=True,
-        )
-        identity = {"dep_hash": None, "reason": "identity_check_failed"}
-
+    identity = await current_dependency_identity()
     current_dep_hash = identity.get("dep_hash")
     if not isinstance(current_dep_hash, str) or not current_dep_hash:
         environment["build_status"] = "not_requested"
@@ -300,11 +504,6 @@ async def _apply_agent_compute_image_build_state(
 
     environment["build_status"] = "not_running"
     environment["build_identity_status"] = "current"
-    outcome = {
-        key: persisted[key]
-        for key in ("status", "reason", "dep_hash", "requested_at", "completed_at")
-        if persisted.get(key) is not None
-    }
     if outcome:
         environment["last_build_outcome"] = outcome
 
@@ -600,7 +799,9 @@ async def agent_build_project_compute_image(
                 f"{environment.get('state')}"
             ),
         )
-    launch_status = await _request_agent_compute_image_build(project.id)
+    launch_status = await _request_agent_compute_image_build(
+        session, project, environment, manifest_fn=fresh_manifest
+    )
     environment["build_status"] = "requested"
     response.status_code = 202
     return {
