@@ -18,8 +18,9 @@ no change.
 """
 
 import asyncio
-import uuid
 import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -60,6 +61,38 @@ _RECENT_CLOSED_VERSIONS_KEEP = 5
 # registry only coalesces duplicate requests while this process is alive.
 _agent_compute_image_build_tasks: dict[uuid.UUID, asyncio.Task] = {}
 
+# A completed foreground request must not disappear into "not_running": retain
+# a small per-process terminal outcome so a later resident turn can choose the
+# next action. The existing reaper remains the durable post-restart retry path.
+_AGENT_COMPUTE_IMAGE_BUILD_OUTCOME_LIMIT = 100
+_agent_compute_image_build_last_outcomes: dict[uuid.UUID, dict[str, str]] = {}
+
+
+def _remember_agent_compute_image_build_outcome(
+    project_id: uuid.UUID, result: dict[str, Any]
+) -> None:
+    """Store one bounded, JSON-safe terminal build outcome for status reads."""
+    outcome = {
+        "status": str(result.get("status") or "error"),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    reason = result.get("reason") or result.get("error")
+    if isinstance(reason, str) and reason:
+        outcome["reason"] = reason
+
+    _agent_compute_image_build_last_outcomes.pop(project_id, None)
+    _agent_compute_image_build_last_outcomes[project_id] = outcome
+    while len(_agent_compute_image_build_last_outcomes) > _AGENT_COMPUTE_IMAGE_BUILD_OUTCOME_LIMIT:
+        _agent_compute_image_build_last_outcomes.pop(
+            next(iter(_agent_compute_image_build_last_outcomes))
+        )
+
+
+def _agent_compute_image_build_last_outcome(project_id: uuid.UUID) -> dict[str, str] | None:
+    outcome = _agent_compute_image_build_last_outcomes.get(project_id)
+    return dict(outcome) if outcome is not None else None
+
+
 
 async def _run_agent_requested_compute_image_build(project_id: uuid.UUID) -> None:
     """Run the existing refresh pipeline in an independent background session."""
@@ -76,6 +109,7 @@ async def _run_agent_requested_compute_image_build(project_id: uuid.UUID) -> Non
         async with AsyncSessionLocal() as build_session:
             project = await build_session.get(Project, project_id)
             if project is None:
+                _remember_agent_compute_image_build_outcome(project_id, {"status": "error", "reason": "project_missing"})
                 logger.warning(
                     "[COMPUTE-IMAGE] agent-requested build skipped: project=%s missing",
                     project_id,
@@ -89,18 +123,21 @@ async def _run_agent_requested_compute_image_build(project_id: uuid.UUID) -> Non
                 progress_cb=lambda: None,
                 _manifest_fn=fresh_manifest,
             )
+            _remember_agent_compute_image_build_outcome(project_id, result)
             logger.info(
                 "[COMPUTE-IMAGE] agent-requested build finished: project=%s status=%s",
                 project_id,
                 result.get("status"),
             )
     except asyncio.CancelledError:
+        _remember_agent_compute_image_build_outcome(project_id, {"status": "error", "reason": "build_cancelled; reaper will retry"})
         logger.warning(
             "[COMPUTE-IMAGE] agent-requested build cancelled during shutdown: project=%s",
             project_id,
         )
         raise
     except Exception:  # noqa: BLE001 - periodic refresh will retry later
+        _remember_agent_compute_image_build_outcome(project_id, {"status": "error", "reason": "build_refresh_exception; reaper will retry"})
         logger.exception(
             "[COMPUTE-IMAGE] agent-requested build failed: project=%s", project_id
         )
@@ -111,6 +148,7 @@ def _request_agent_compute_image_build(project_id: uuid.UUID) -> str:
     existing = _agent_compute_image_build_tasks.get(project_id)
     if existing is not None and not existing.done():
         return "already_running"
+    _agent_compute_image_build_last_outcomes.pop(project_id, None)
 
     build_task = asyncio.create_task(_run_agent_requested_compute_image_build(project_id))
     _agent_compute_image_build_tasks[project_id] = build_task
@@ -366,6 +404,10 @@ async def agent_fetch_compute_environment(
         if _agent_compute_image_build_in_progress(project.id)
         else "not_running"
     )
+    last_outcome = _agent_compute_image_build_last_outcome(project.id)
+    if last_outcome is not None:
+        environment["last_build_outcome"] = last_outcome
+
     return {"status": "success", "data": environment}
 
 

@@ -1270,7 +1270,9 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #   - declared_needs_build: the recipe is already in the repo; run
 #     './compute-image build' ONCE. It returns accepted/reused promptly; do NOT
 #     wait or foreground-poll it. Re-check status in a later resident turn
-#     before launching, and do not retry it in a loop.
+#     before launching. A 'last_build_outcome' there is the terminal result of
+#     that detached request (including deferred/error reason): resolve its cause
+#     before a single later request if needed, never retry it in a loop.
 #   - no_candidate: no credible repository Dockerfile was found. Bare compute is
 #     still valid; do NOT block a normal command or manufacture an image solely
 #     to satisfy this resolver.
