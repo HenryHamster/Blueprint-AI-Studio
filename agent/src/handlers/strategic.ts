@@ -258,7 +258,10 @@ export function buildLocalRunnerSection(status: unknown): string {
       const runnerId = typeof r.runner_id === 'string' ? r.runner_id : '';
       if (!runnerId) continue;
       const hostname = typeof r.hostname === 'string' && r.hostname ? r.hostname : `runner-${runnerId.slice(0, 8)}`;
-      const state = r.live === true ? 'LIVE' : `${typeof r.status === 'string' ? r.status : 'not live'}`;
+      const persistedStatus = typeof r.status === 'string' ? r.status : 'unknown';
+      // A row can remain status=active after its heartbeat has expired. Never
+      // present that stale persisted state as evidence that the host is usable.
+      const state = r.live === true ? 'LIVE' : `STALE/OFFLINE (persisted status: ${persistedStatus})`;
       const heartbeat = typeof r.last_heartbeat_at === 'string' ? `; last heartbeat ${r.last_heartbeat_at}` : '';
       const gpuCount = typeof r.gpu_count === 'number' ? r.gpu_count : 0;
       const container = r.container_ok === true
