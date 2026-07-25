@@ -240,6 +240,48 @@ export function buildLocalRunnerSection(status: unknown): string {
       );
     }
   }
+  // Project-scoped runner ids make the existing compute_experiment
+  // runner_target contract usable without exposing the global fleet. This is
+  // advisory telemetry: eligibility is rechecked by dispatch when the job is
+  // claimed, so a host can change state after this prompt was built.
+  const runners: unknown[] = Array.isArray(s.runners) ? s.runners : [];
+  if (runners.length > 0) {
+    const formatBytes = (value: unknown): string | null => (
+      typeof value === 'number' && value >= 0
+        ? `${(value / (1024 ** 3)).toFixed(1)} GiB`
+        : null
+    );
+    lines.push('- Project runner inventory (use the exact UUID only when a host preference is useful):');
+    for (const entry of runners.slice(0, 8)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const r = entry as Record<string, unknown>;
+      const runnerId = typeof r.runner_id === 'string' ? r.runner_id : '';
+      if (!runnerId) continue;
+      const hostname = typeof r.hostname === 'string' && r.hostname ? r.hostname : `runner-${runnerId.slice(0, 8)}`;
+      const state = r.live === true ? 'LIVE' : `${typeof r.status === 'string' ? r.status : 'not live'}`;
+      const heartbeat = typeof r.last_heartbeat_at === 'string' ? `; last heartbeat ${r.last_heartbeat_at}` : '';
+      const gpuCount = typeof r.gpu_count === 'number' ? r.gpu_count : 0;
+      const container = r.container_ok === true
+        ? (r.gpu_in_container_ok === true ? 'containers+GPU OK' : 'containers OK, GPU passthrough unverified')
+        : 'no container runtime';
+      const active = typeof r.active_compute_jobs === 'number' ? r.active_compute_jobs : 0;
+      const max = typeof r.max_concurrent_compute === 'number' ? r.max_concurrent_compute : null;
+      const workspace = formatBytes(r.workspace_free_bytes) ?? formatBytes(r.disk_free_bytes);
+      const imageStore = formatBytes(r.container_image_store_free_bytes);
+      const storage = [
+        workspace ? `workspace/disk ${workspace}` : null,
+        imageStore ? `image store ${imageStore}` : null,
+      ].filter((part): part is string => part !== null).join(', ');
+      lines.push(
+        `  - ${hostname} [${runnerId}]: ${state}${heartbeat}; ${gpuCount} GPU(s); ${container}; `
+        + `compute ${active}${max !== null ? `/${max}` : ''}`
+        + (storage ? `; ${storage}` : ''),
+      );
+    }
+    lines.push(
+      '  To prefer one listed host, add `"runner_target": {"runner_id": "<UUID>", "strict": false}` to a compute_experiment spawn. Soft is the default: dispatch falls back when that host is busy/offline. Use `strict: true` ONLY when the experiment genuinely cannot run on another allowed runner; it intentionally waits for that exact host.',
+    );
+  }
   // Per-device hardware detail (backend-bounded per-runner AND in total under
   // the experiment-authoring shared budget) so the strategist can reason about
   // VRAM fit, device counts, and container capability when sizing experiments.

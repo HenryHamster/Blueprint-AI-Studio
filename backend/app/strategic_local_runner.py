@@ -17,7 +17,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.experiment_authoring_context import build_runner_devices
+from app.experiment_authoring_context import build_runner_devices, build_runner_inventory
 from app.models import LocalRunner, Project, ProjectComputeImage
 from app.runner_project_binding import runner_allowed_for_project
 from app.time_utils import _utcnow
@@ -49,6 +49,11 @@ async def _load_local_runner_status(
     offline. Informational only — there is NO dispatch effect or hard block.
 
     Returns ``{"ever_registered": bool, "active_total": int, "active_gpu": int}``:
+    when the project has project-allowed runners it also includes a bounded
+    ``runners`` inventory. That inventory holds only runner UUID, hostname,
+    liveness, compact GPU/container/storage telemetry, and current compute
+    load so Strategic can intentionally use the existing optional
+    ``runner_target`` launch-contract field.
 
     * ``ever_registered`` — the project has >=1 non-deleted ``LocalRunner`` row
       (operator set up local hardware at some point).
@@ -62,10 +67,7 @@ async def _load_local_runner_status(
     VRAM when advertised, container capability, current load) built by
     :func:`app.experiment_authoring_context.build_runner_devices` — so
     authoring agents can reason about VRAM fit and device counts. The key is
-    OMITTED when no runner is live, keeping the exact 3-key shape above for
-    its existing consumers and tests (the shape is load-bearing:
-    ``strategic_spawning`` merges ``require_local_runner`` at the call site
-    and agent-side renderers read the three counters by name).
+    OMITTED when no runner is live.
 
     One query (non-deleted runners for the project — a small set); the liveness
     + GPU filtering is done in Python to stay dialect-agnostic over the JSONB
@@ -95,6 +97,9 @@ async def _load_local_runner_status(
         "active_total": active_total,
         "active_gpu": active_gpu,
     }
+    inventory = build_runner_inventory(rows, liveness_cutoff=cutoff)
+    if inventory:
+        status["runners"] = inventory
     if live_runners:
         devices = build_runner_devices(live_runners)
         if devices:
