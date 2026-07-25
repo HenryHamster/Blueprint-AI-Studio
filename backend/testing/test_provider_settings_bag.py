@@ -599,9 +599,11 @@ def test_resolve_task_provider_settings_uses_declared_model_fallback():
         },
     }
 
+    # The retired fable-5 id falls back to the current opus tier, so this
+    # target moved opus-4-8 -> opus-5 with the Opus 5 rollout.
     assert resolve_task_provider_settings(
         _make_task("strategic_review"), runtime_config, "anthropic"
-    ) == {"model": "claude-opus-4-8", "effort": "max"}
+    ) == {"model": "claude-opus-5", "effort": "max"}
 
 
 def test_resolve_task_provider_settings_fallback_keeps_other_errors_fail_closed():
