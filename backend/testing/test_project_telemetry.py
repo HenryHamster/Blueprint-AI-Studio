@@ -301,6 +301,7 @@ def test_telemetry_keys_set():
         "playbook_archive",
         "proposed_changes",
         "direction_first_attempt_feedback",
+        "compute_image_build_state",
         "systems/completion-debt-ledger",
         # Final God-column tranche: dual-written generic-KV blobs.
         "repo_overview",
