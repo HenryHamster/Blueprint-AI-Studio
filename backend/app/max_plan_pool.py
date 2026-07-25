@@ -765,7 +765,19 @@ def resolve_task_provider_settings(
     if not merged:
         return {}
     provider = get_provider(provider_name)
-    return provider.validate_settings(merged)
+    try:
+        return provider.validate_settings(merged)
+    except ValueError:
+        # A persisted settings cell can outlive a limited-availability model.
+        # Retry only the provider-declared counterpart; other schema errors still
+        # fail closed during the second validation.
+        model = _settings_bag_model(merged)
+        fallback = provider.fallback_model(model)
+        if not fallback or fallback == model:
+            raise
+        fallback_settings = dict(merged)
+        fallback_settings["model"] = fallback
+        return provider.validate_settings(fallback_settings)
 
 
 def _settings_bag_model(settings: Mapping[str, Any] | None) -> str | None:
@@ -844,6 +856,13 @@ RATE_LIMIT_PATTERNS = list(
 #     so haiku tracking normalizes to opus via _normalize_rl_model().
 _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-8": ("claude-opus-4-8",),
+    # Opus 5 is the opus-tier default but still books against the opus-4-8
+    # meter head. The API gives Opus 5 its own rate-limit bucket, but this pool
+    # tracks the *Max-plan session* quota, which is shared across tiers — and
+    # opus-4-8 is the single head (_OPUS_MODEL) that health_check_primitives,
+    # fleet_utilization, and deploy_health_alerts summarize. Giving Opus 5 its
+    # own head would make those blind to opus-5 429s.
+    "claude-opus-5": ("claude-opus-4-8",),
     # Sonnet shares the Max-plan session bucket with Opus (see note above), so
     # a Sonnet 5 429 books against the shared opus-4-8 meter like sonnet-4-6.
     "claude-sonnet-5": ("claude-opus-4-8",),

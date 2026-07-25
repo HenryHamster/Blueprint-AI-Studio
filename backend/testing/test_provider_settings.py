@@ -20,7 +20,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert "providers" in body
     assert "provider_settings_defaults" in body
     assert "task_type_provider_overrides" in body
-    assert body["provider_tier_model_map"]["anthropic"]["opus"] == "claude-opus-4-8"
+    assert body["provider_tier_model_map"]["anthropic"]["opus"] == "claude-opus-5"
     assert body["provider_tier_model_map"]["openai"] == {
         "opus": "gpt-5.6-sol",
         "sonnet": "gpt-5.6-terra",

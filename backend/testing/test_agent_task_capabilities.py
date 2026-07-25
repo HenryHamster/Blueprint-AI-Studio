@@ -12,7 +12,11 @@ from httpx import AsyncClient
 
 from app.main import app
 from app.routers.agent import verify_agent_token
-from app.task_capabilities import task_capability_contract
+from app.task_capabilities import (
+    ALL_TASK_TYPES,
+    agent_task_capability_contract,
+    task_capability_contract,
+)
 
 
 @pytest.mark.asyncio
@@ -22,7 +26,7 @@ async def test_agent_task_capabilities_route_is_registered():
 
 
 @pytest.mark.asyncio
-async def test_agent_task_capabilities_mirrors_published_contract(client: AsyncClient):
+async def test_agent_task_capabilities_extends_published_contract(client: AsyncClient):
     app.dependency_overrides[verify_agent_token] = lambda: {
         "sub": "task-123",
         "vm_instance_id": "agent-vm-caps",
@@ -31,8 +35,33 @@ async def test_agent_task_capabilities_mirrors_published_contract(client: AsyncC
         resp = await client.get("/api/agent/task-capabilities")
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        # Identical payload shape to the operator-facing contract — single source.
-        assert body == {"task_capabilities": task_capability_contract()}
+        assert body == {"task_capabilities": agent_task_capability_contract()}
+        contract = body["task_capabilities"]
+        assert {key: contract[key] for key in ALL_TASK_TYPES} == (
+            task_capability_contract()
+        )
+    finally:
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_task_capabilities_include_non_routable_legacy_tombstones(
+    client: AsyncClient,
+):
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": "task-123",
+        "vm_instance_id": "agent-vm-caps",
+    }
+    try:
+        resp = await client.get("/api/agent/task-capabilities")
+        assert resp.status_code == 200, resp.text
+        contract = resp.json()["task_capabilities"]
+        for task_type in ("panel_review", "strategic_resident_turn"):
+            assert task_type not in ALL_TASK_TYPES
+            assert contract[task_type]["agent_mode"] == "read_only"
+            assert contract[task_type]["filter_visible"] is False
+            assert contract[task_type]["user_launchable"] is False
+            assert contract[task_type]["provider_configurable"] is False
     finally:
         app.dependency_overrides.pop(verify_agent_token, None)
 

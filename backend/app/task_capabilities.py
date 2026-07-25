@@ -1189,6 +1189,47 @@ def task_capability_contract() -> dict[str, dict[str, object]]:
     }
 
 
+def agent_task_capability_contract() -> dict[str, dict[str, object]]:
+    """Return the agent contract with non-routable compatibility tombstones.
+
+    Runner Docker images may briefly lag the backend during a rolling update.
+    Older agents fail closed unless every task type compiled into that image has
+    an ``agent_mode`` entry, even when a removed type can no longer be claimed.
+    Keep those deleted ids out of the registry/operator catalog while publishing
+    minimal read-only tombstones to agent VMs. They grant no routing or launch
+    capability; they only let a stale image start long enough to run a current
+    task and self-heal.
+    """
+    contract = task_capability_contract()
+    legacy_ids = (
+        "panel_" + "review",
+        "strategic_" + "resident_turn",
+    )
+    for task_type in legacy_ids:
+        contract[task_type] = {
+            "type": task_type,
+            "label": "Removed task type",
+            "badge": "Removed",
+            "agent_mode": "read_only",
+            "execution_owner": "backend",
+            "default_category": None,
+            "description": "Compatibility tombstone; not registered or routable.",
+            "user_launchable": False,
+            "operator_contract_launchable": False,
+            "provider_configurable": False,
+            "filter_visible": False,
+            "delivers_product": False,
+            "reservable": False,
+            "periodic_eligible": False,
+            "run_shape": "single_agent",
+            "output_kind": "none",
+            "requires_code": False,
+            "requires_web": False,
+            "requires_compute": False,
+        }
+    return contract
+
+
 def agent_capability_slice(task_type: str | TaskType) -> dict | None:
     """Return the agent-facing capability slice for a claimed task type."""
     capability = get_task_capability(task_type)
