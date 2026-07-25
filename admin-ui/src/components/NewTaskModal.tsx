@@ -1013,6 +1013,7 @@ export function NewTaskModal({
                     <option value="">Default</option>
                     {/* TEMPORARY: fable-5 limited availability ~2 weeks from 2026-06-09 */}
                     <option value="claude-fable-5">claude-fable-5</option>
+                    <option value="claude-opus-5">claude-opus-5</option>
                     <option value="claude-opus-4-8">claude-opus-4-8</option>
                     <option value="claude-opus-4-7">claude-opus-4-7</option>
                     <option value="claude-sonnet-5">claude-sonnet-5</option>
