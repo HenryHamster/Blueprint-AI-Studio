@@ -3366,6 +3366,7 @@ def _heartbeat_loop(
     version = _runner_version()
     consecutive_401 = 0
     consecutive_network_failures = 0
+    deferred_auto_update_hint: str | None = None
     # Whether ANY heartbeat has ever authenticated (200/204). A token that has
     # never authenticated and gets a 401 is definitively bad (wrong/revoked, or a
     # deleted runner) — the daemon fast-fails on that first 401 rather than
@@ -3671,7 +3672,7 @@ def _heartbeat_loop(
                             else:
                                 has_compute = False
 
-                            if not has_tasks and not has_compute:
+                            if not has_tasks and not has_compute and deferred_auto_update_hint != version_hint:
                                 print(
                                     f"[runner] version mismatch ({version!r} vs "
                                     f"{version_hint!r}) and runner is idle — "
@@ -3685,15 +3686,36 @@ def _heartbeat_loop(
                                     _update_in_progress.clear()
                                     raise
                                 if result == 0:
-                                    # Update succeeded. _restart_runner_service
-                                    # (called inside do_update) will kill this
-                                    # process via systemctl restart if a service
-                                    # unit is installed. If still alive (no
-                                    # systemd), _reexec_after_update re-execs in
-                                    # place when NO supervisor is detected (the
-                                    # manual tmux/nohup launch that otherwise
-                                    # dies silently), else exits for restart.
-                                    _reexec_after_update()
+                                    refreshed_version = _runner_version()
+                                    refreshed_sha = _describe_sha(refreshed_version)
+                                    refreshed_matches = (
+                                        bool(refreshed_sha)
+                                        and version_hint.startswith(refreshed_sha)
+                                    ) or (
+                                        bool(refreshed_version)
+                                        and version_hint in refreshed_version
+                                    )
+                                    if refreshed_matches:
+                                        # Update succeeded and the checkout now
+                                        # matches the server. _restart_runner_service
+                                        # (called inside do_update) may already have
+                                        # killed this process; otherwise re-exec here.
+                                        _reexec_after_update()
+                                    else:
+                                        # ``do_update`` returns 0 for a no-op when
+                                        # origin/main is already newer than the
+                                        # deployed orchestrator. Exiting here used
+                                        # to make a systemd runner hit its start
+                                        # limit even though it was healthy.
+                                        deferred_auto_update_hint = version_hint
+                                        _update_in_progress.clear()
+                                        print(
+                                            "[runner] update completed but the runner "
+                                            "still differs from the orchestrator; "
+                                            "continuing without restart until its "
+                                            "version hint changes.",
+                                            flush=True,
+                                        )
                                 else:
                                     print(
                                         f"[runner] auto-update failed "
@@ -3702,7 +3724,7 @@ def _heartbeat_loop(
                                         flush=True,
                                     )
                                     _update_in_progress.clear()
-                            else:
+                            elif has_tasks or has_compute:
                                 print(
                                     f"[runner] WARNING: runner version {version!r} "
                                     f"does not match orchestrator version hint "
@@ -3710,6 +3732,8 @@ def _heartbeat_loop(
                                     "tasks are still executing.",
                                     flush=True,
                                 )
+                        else:
+                            deferred_auto_update_hint = None
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
