@@ -2451,6 +2451,53 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(session.close).toHaveBeenCalled();
   });
 
+  it('sends the first text-only operator turn as one stream-json content item', async () => {
+    const message = {
+      id: 'msg-single-content-item',
+      content: 'hi. respond to me as soon as you are ready.',
+      created_at: '2026-07-25T04:47:18.384Z',
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        if (!delivered) {
+          delivered = true;
+          return Promise.resolve({ messages: [message] });
+        }
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/heartbeat')) {
+        return Promise.resolve({ authority_held: false, stop_requested: true });
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'ready' })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-single-content-item',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-single-content-item' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    const input = session.sendTurn.mock.calls[0]?.[0];
+    expect(session.sendTurn).toHaveBeenCalledTimes(1);
+    expect(typeof input).toBe('string');
+    expect(input).toEqual(expect.stringContaining(message.content));
+  });
+
   it('uses distinct immutable receipts when M2 arrives after atomic M1 reply', async () => {
     const m1 = {
       id: 'msg-anchor-m1',

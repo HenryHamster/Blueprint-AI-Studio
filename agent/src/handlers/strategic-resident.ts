@@ -941,6 +941,20 @@ export async function handleStrategicResident(
     return result;
   }
 
+  /**
+   * Persistent stream-json accepts one content item per user frame. Fold text-only
+   * blocks while preserving the existing multimodal path for images.
+   */
+  function collapseTextBlocksForResidentInput(blocks: ContentBlock[]): string | null {
+    if (blocks.length === 0) return null;
+    const textParts: string[] = [];
+    for (const block of blocks) {
+      if (block.type !== 'text') return null;
+      textParts.push(block.text);
+    }
+    return textParts.join('');
+  }
+
   const runTurn = async (content: string | ContentBlock[], operator: boolean, pickupLagMs?: number | null): Promise<ResidentTurnResult> => {
     let turnContent = content;
     if (pendingRestartCheckpoint !== null) {
@@ -967,8 +981,15 @@ export async function handleStrategicResident(
     }
     // Autonomous turns get a deeper per-turn stall budget so a long read/verify
     // step isn't killed mid-thought; operator turns keep the responsive default.
+    let residentInput: string | Array<Record<string, unknown>>;
+    if (Array.isArray(full)) {
+      const materialized = await materializeContentBlocks(full);
+      residentInput = collapseTextBlocksForResidentInput(materialized) ?? toRecordBlocks(materialized);
+    } else {
+      residentInput = full;
+    }
     const r = await session.sendTurn(
-      Array.isArray(full) ? toRecordBlocks(await materializeContentBlocks(full)) : full,
+      residentInput,
       operator ? undefined : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs });
     streamer.flush();
     streamer.done();
