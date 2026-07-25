@@ -205,6 +205,26 @@ describe('startResidentClaudeSession', () => {
     expect(session.failureCategory?.()).toBe('rate_limited');
     session.close();
   });
+  it('suppresses an assistant-text weekly-limit banner and fails the turn', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+    const events: Array<{ kind: string; text?: string }> = [];
+    session.onEvent((event) => events.push(event));
+
+    const banner = "You've hit your weekly limit · resets Jul 26, 9pm (UTC)";
+    const turn = session.sendTurn('hello');
+    ctl.pushLine({ type: 'assistant', message: { content: [{ type: 'text', text: banner }] } });
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: true,
+      failureCategory: 'rate_limited',
+      resultText: '',
+    });
+    expect(events).not.toContainEqual({ kind: 'text', text: banner });
+    expect(session.failureCategory?.()).toBe('rate_limited');
+    session.close();
+  });
   it('classifies an unterminated raw stdout weekly-limit banner before any turn', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
