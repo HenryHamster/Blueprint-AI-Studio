@@ -2756,6 +2756,60 @@ class TestRunnerEndpoints:
         assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
 
     @pytest.mark.asyncio
+    async def test_next_task_excludes_rate_limited_accounts_from_pool_selection(
+        self, client: AsyncClient, db_session
+    ):
+        """Local dispatch must route around accounts a prior attempt blacklisted."""
+        from app.max_plan_pool import LLMSelectionResult
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        task_instance = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={
+                "runner_target_id": str(runner.id),
+                "blacklisted_accounts": ["acct-rate-limited"],
+                "provision_failed_accounts": ["acct-provision-failed"],
+            },
+        )
+        db_session.add(task_instance)
+        await db_session.commit()
+
+        selection = LLMSelectionResult(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-4-8",
+            quality_tier="opus",
+            account={
+                "id": "acct-available",
+                "oauth_token": "sk-ant-test-token",
+                "runtime_secret": "sk-ant-test-token",
+                "claude_config_json": None,
+                "provider_metadata": {},
+            },
+            settings={},
+        )
+        select_mock = AsyncMock(return_value=selection)
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch("app.max_plan_pool.select_llm_runtime_for_task", new=select_mock):
+            response = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 200
+        assert set(select_mock.await_args.kwargs["blacklist"] or []) == {
+            "acct-rate-limited",
+            "acct-provision-failed",
+        }
+
+    @pytest.mark.asyncio
     async def test_next_task_returns_null_credentials_when_no_pool_account(
         self, client: AsyncClient, db_session
     ):
