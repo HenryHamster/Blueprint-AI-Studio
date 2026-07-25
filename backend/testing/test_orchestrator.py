@@ -6310,6 +6310,101 @@ class TestBatchedDepRowsSurviveCommit:
             f"verify callback read wrong project_id: {accessed_project_ids}"
         )
 
+    @pytest.mark.asyncio
+    async def test_detached_create_dep_verify_does_not_read_plan_output(
+        self, db_session
+    ):
+        """A detached create dep must take cached merge credit without loading
+        the dep-batch projection's intentionally omitted plan_output column.
+
+        _verify_pr_merged first checks the childless-plan recovery guard. That
+        guard used to read plan_output before checking task type, raising
+        DetachedInstanceError for every create dependency and aborting the
+        orchestrator cycle before runner reservation.
+        """
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+
+        from app.rollup_pr_verification import _verify_pr_merged
+
+        project = make_project(name="Detached Create Merge Credit", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "create dep"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            plan_output={"large": "intentionally omitted"},
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        db_session.expunge(dep)
+        detached_dep = (
+            await db_session.execute(
+                select(Task)
+                .where(Task.id == dep.id)
+                .options(
+                    _load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        Task.payloads,
+                        Task.project_id,
+                        Task.parent_task_id,
+                        raiseload=True,
+                    )
+                )
+            )
+        ).scalar_one()
+        db_session.expunge(detached_dep)
+        assert "plan_output" not in detached_dep.__dict__
+        assert await _verify_pr_merged(detached_dep, db_session) is True
+
+    @pytest.mark.asyncio
+    async def test_project_dispatch_projection_loads_integration_branch(
+        self, db_session
+    ):
+        """Capability-proof HEAD resolution may read the projected branch."""
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+
+        from app.branch_resolution import get_project_integration_branch
+        from app.orchestrator import PROJECT_RESOURCE_DISPATCH_COLUMNS
+
+        project = make_project(
+            name="Projected Capability Branch",
+            user_id="u1",
+            integration_branch="release/capability-proof",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        project_id = project.id
+        db_session.expunge(project)
+        projected = (
+            await db_session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .options(
+                    _load_only(
+                        *PROJECT_RESOURCE_DISPATCH_COLUMNS,
+                        raiseload=True,
+                    )
+                )
+            )
+        ).scalar_one()
+
+        assert (
+            get_project_integration_branch(projected)
+            == "release/capability-proof"
+        )
+
     def test_dep_batch_projection_excludes_heavy_columns(self):
         """The dep-batch load_only must exclude plan_output/status_log/depends_on
         and retain status/context/payloads needed by _check_candidate_task_deps."""
