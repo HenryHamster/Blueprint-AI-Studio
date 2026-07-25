@@ -442,8 +442,17 @@ def _uses_legacy_branch_resolver_shape(project) -> bool:
     # InvalidRequestError. Static inspection sees instance/class attributes
     # without invoking descriptors, while preserving the legacy-stub contract.
     missing = object()
+
+    def _has_shape_attr(attr: str) -> bool:
+        if inspect.getattr_static(project, attr, missing) is not missing:
+            return True
+        # Preserve support for dynamic proxy/test shapes that expose fields via
+        # __getattr__. Real SQLAlchemy descriptors were found statically above,
+        # so this fallback cannot trigger their raiseload behavior.
+        return hasattr(project, attr)
+
     return not any(
-        inspect.getattr_static(project, attr, missing) is not missing
+        _has_shape_attr(attr)
         for attr in ("promotion_target", "is_self_repo", "github_repo")
     )
 

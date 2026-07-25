@@ -92,9 +92,25 @@ class _RaiseloadProjectShape:
         raise AssertionError("shape detection invoked unloaded github_repo")
 
 
+class _DynamicProjectShape:
+    """Project-like proxy that supplies modern fields through __getattr__."""
+
+    integration_branch = "develop"
+
+    def __getattr__(self, name):
+        if name == "promotion_target":
+            return "main"
+        raise AttributeError(name)
+
+
 def test_integration_branch_shape_detection_does_not_invoke_descriptors():
     """Static shape detection must tolerate raiseloaded Project columns."""
     assert get_project_integration_branch(_RaiseloadProjectShape()) == "develop"
+
+
+def test_integration_branch_shape_detection_preserves_dynamic_proxies():
+    """Dynamic project proxies retain the non-legacy resolver contract."""
+    assert get_project_integration_branch(_DynamicProjectShape()) == "develop"
 
 
 class TestBlueprintNamespaceByRepoIdentity:
