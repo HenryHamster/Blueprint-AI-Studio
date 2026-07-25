@@ -2247,9 +2247,8 @@ async def test_spawn_followup_opt_in_for_operator_authored_task(db_session, monk
 
 
 @pytest.mark.asyncio
-async def test_spawn_followup_spawns_for_engine_authored_task(db_session, monkeypatch):
-    """Engine-authored tasks (created_by='ORCHESTRATOR') spawn the reason-and-ship
-    follow-on by default (no explicit spawn_followup needed)."""
+async def test_spawn_followup_is_suppressed_without_opt_in_for_engine_task(db_session, monkeypatch):
+    """Engine-authored tasks also require explicit spawn_followup=True."""
     from app.reaper_sweeps import sweep_deliver_task_wakes
 
     fake_child = Task(
@@ -2276,9 +2275,8 @@ async def test_spawn_followup_spawns_for_engine_authored_task(db_session, monkey
 
     db_session.expire_all()
     await db_session.refresh(task)
-    # Engine-authored: follow-on spawned by default → EVALUATING.
-    assert task.status == TaskStatus.EVALUATING
-    spawn_mock.assert_called_once()
+    assert task.status == TaskStatus.COMPLETED
+    spawn_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

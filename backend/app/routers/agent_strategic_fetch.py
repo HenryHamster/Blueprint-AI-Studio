@@ -17,16 +17,17 @@ the route paths stay byte-identical and the agent-side fetch script needs
 no change.
 """
 
-import logging
+import asyncio
 import uuid
+import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
-from app.database import get_session
+from app.database import AsyncSessionLocal, get_session
 from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
 from app.knowledge_query import (
     build_compute_sweep_groups,
@@ -40,6 +41,7 @@ from app.qualification_state_resolver import apply_verdict_substitution
 from app.release_scoring import blocker_execution_site as _blocker_execution_site
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.source_ref_validation import (
     ground_design_doc_value,
     resolve_branch_verification_context,
@@ -51,6 +53,80 @@ logger = logging.getLogger(__name__)
 
 _RESEARCH_HISTORY_KEEP_ON_FETCH = 20
 _RECENT_CLOSED_VERSIONS_KEEP = 5
+
+
+# Agent-requested image builds intentionally detach from a resident HTTP turn.
+# The periodic image-refresh sweep resumes any unmet build after a restart; this
+# registry only coalesces duplicate requests while this process is alive.
+_agent_compute_image_build_tasks: dict[uuid.UUID, asyncio.Task] = {}
+
+
+async def _run_agent_requested_compute_image_build(project_id: uuid.UUID) -> None:
+    """Run the existing refresh pipeline in an independent background session."""
+    from app.compute_backends import refresh_project_compute_image
+    from app.routers.admin_project_tools import (
+        _compute_image_build_semaphore,
+        _discover_manifest_tools,
+    )
+
+    async def fresh_manifest(project_arg: Project) -> dict[str, Any]:
+        return await _discover_manifest_tools(project_arg, force_refresh=True)
+
+    try:
+        async with AsyncSessionLocal() as build_session:
+            project = await build_session.get(Project, project_id)
+            if project is None:
+                logger.warning(
+                    "[COMPUTE-IMAGE] agent-requested build skipped: project=%s missing",
+                    project_id,
+                )
+                return
+            result = await refresh_project_compute_image(
+                build_session,
+                project,
+                allow_build=True,
+                build_semaphore=_compute_image_build_semaphore,
+                progress_cb=lambda: None,
+                _manifest_fn=fresh_manifest,
+            )
+            logger.info(
+                "[COMPUTE-IMAGE] agent-requested build finished: project=%s status=%s",
+                project_id,
+                result.get("status"),
+            )
+    except asyncio.CancelledError:
+        logger.warning(
+            "[COMPUTE-IMAGE] agent-requested build cancelled during shutdown: project=%s",
+            project_id,
+        )
+        raise
+    except Exception:  # noqa: BLE001 - periodic refresh will retry later
+        logger.exception(
+            "[COMPUTE-IMAGE] agent-requested build failed: project=%s", project_id
+        )
+
+
+def _request_agent_compute_image_build(project_id: uuid.UUID) -> str:
+    """Start or reuse a detached build; never make a resident await it."""
+    existing = _agent_compute_image_build_tasks.get(project_id)
+    if existing is not None and not existing.done():
+        return "already_running"
+
+    build_task = asyncio.create_task(_run_agent_requested_compute_image_build(project_id))
+    _agent_compute_image_build_tasks[project_id] = build_task
+
+    def _clear_completed(task: asyncio.Task) -> None:
+        if _agent_compute_image_build_tasks.get(project_id) is task:
+            _agent_compute_image_build_tasks.pop(project_id, None)
+
+    build_task.add_done_callback(_clear_completed)
+    return "started"
+
+
+def _agent_compute_image_build_in_progress(project_id: uuid.UUID) -> bool:
+    """Whether this process currently owns a detached build for *project_id*."""
+    task = _agent_compute_image_build_tasks.get(project_id)
+    return task is not None and not task.done()
 
 
 def _iso(dt: Any) -> str | None:
@@ -270,6 +346,92 @@ async def _resolve_agent_project(
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+@router.get("/projects/{project_id}/compute-environment")
+@limiter.limit("30/minute")
+async def agent_fetch_compute_environment(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Resolve a project's optional image environment without gating bare compute."""
+    project = await _resolve_agent_project(project_id, token, session)
+    from app.compute_image_environment import resolve_project_compute_image_environment
+
+    environment = await resolve_project_compute_image_environment(session, project)
+    environment["build_status"] = (
+        "in_progress"
+        if _agent_compute_image_build_in_progress(project.id)
+        else "not_running"
+    )
+    return {"status": "success", "data": environment}
+
+
+@router.post("/projects/{project_id}/compute-image/build")
+@limiter.limit("5/minute")
+async def agent_build_project_compute_image(
+    request: Request,
+    project_id: uuid.UUID,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Build a declared project image for a live Strategic agent.
+
+    This deliberately reuses the existing project-image refresh/build pipeline,
+    including its shared concurrency guard and digest-record persistence.  It is
+    not an arbitrary Docker capability: only a project-scoped Strategic task may
+    invoke it, and a missing ``compute.image.build`` remains a clear 422.
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+    task = await session.get(Task, uuid.UUID(str(token["sub"])))
+    task_type = (task.first_payload or {}).get("type") if task else None
+    if task_type not in STRATEGIC_TASK_TYPES:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Strategic agents may request a project compute-image build",
+        )
+
+    from app.compute_image_environment import (
+        ComputeImageEnvironmentState,
+        resolve_project_compute_image_environment,
+    )
+    from app.routers.admin_project_tools import _discover_manifest_tools
+
+    async def fresh_manifest(project_arg: Project) -> dict[str, Any]:
+        return await _discover_manifest_tools(project_arg, force_refresh=True)
+
+    environment = await resolve_project_compute_image_environment(
+        session, project, manifest_fn=fresh_manifest
+    )
+    if environment.get("state") == ComputeImageEnvironmentState.READY:
+        return {
+            "status": "success",
+            "build": {"status": "already_ready"},
+            "environment": environment,
+        }
+    if (
+        environment.get("state") != ComputeImageEnvironmentState.DECLARED_NEEDS_BUILD
+        or environment.get("action") != "build"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "compute-image build requires a declared compute.image.build recipe: "
+                f"{environment.get('state')}"
+            ),
+        )
+    launch_status = _request_agent_compute_image_build(project.id)
+    environment["build_status"] = "in_progress"
+    response.status_code = 202
+    return {
+        "status": "accepted",
+        "build": {"status": launch_status},
+        "environment": environment,
+        "next_step": "Re-run ./compute-image status later; do not wait or poll in this turn.",
+    }
 
 
 @router.get("/projects/{project_id}/directions")

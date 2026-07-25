@@ -2411,9 +2411,9 @@ class ComputeExperimentTaskPayload(BaseModel):
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
-    # When False, suppresses the reason-and-ship follow-on at completion.
-    # Operator-authored tasks (created_by="USER") default to suppressed; pass
-    # spawn_followup=True to opt in. Engine-authored tasks default to spawning.
+    # Explicit opt-in for one reason-and-ship/diagnose follow-on at completion.
+    # Absent/False preserves the terminal result and knowledge record without
+    # creating an implicit task chain.
     spawn_followup: bool | None = None
 
     @model_validator(mode="after")

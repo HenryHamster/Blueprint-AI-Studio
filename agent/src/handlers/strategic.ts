@@ -1248,6 +1248,32 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       one deadline-sized run; keep the artifact dir small (~25 MiB
 #                       upload cap); prefer a repo harness/experiment entrypoint
 #                       when one exists over inlining a bespoke pipeline.
+# Durable outputs (models, checkpoints, trained weights, generated datasets,
+# or any result the request says to retain): author the compute_experiment with
+# require_durable_artifact: true AND have its ordinary command copy the selected
+# outputs into '$BLUEPRINT_ARTIFACT_DIR' before exiting. Put a small manifest.json
+# there naming the retained files, their purpose, and the load/reproduction
+# command. Training-like work should normally do this; write checkpoints directly
+# there or copy the final selected checkpoint there. The platform already collects
+# this directory, and require_durable_artifact makes a missing/empty delivery a
+# loud failed result. Do not invent a second training or upload path; keep only
+# the useful, bounded files (artifact upload cap is about 25 MiB).
+# Project compute-image environment (only when a workload actually needs a
+# container-only runtime such as CUDA/framework libraries): run
+# './compute-image status' before authoring the launch. It returns one of four
+# actionable states:
+#   - ready: a digest-pinned project image is available; OMIT container_image so
+#     the platform selects it automatically.
+#   - missing_but_dockerfile_candidate: spawn a one-time create/refactor task to
+#     add the returned 'manifest_template' to '.blueprint/tools.json'; do not
+#     improvise a Docker build in a compute command.
+#   - declared_needs_build: the recipe is already in the repo; run
+#     './compute-image build' ONCE. It returns accepted/reused promptly; do NOT
+#     wait or foreground-poll it. Re-check status in a later resident turn
+#     before launching, and do not retry it in a loop.
+#   - no_candidate: no credible repository Dockerfile was found. Bare compute is
+#     still valid; do NOT block a normal command or manufacture an image solely
+#     to satisfy this resolver.
 # web_research and design are HIGH-ROI and chronically under-used: one durable
 # knowledge document de-risks every later task in the area and compounds across
 # cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:

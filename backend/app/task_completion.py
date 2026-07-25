@@ -2943,6 +2943,17 @@ _COMPUTE_INTENTIONAL_KILL_OUTCOMES: frozenset[str] = frozenset(
 )
 
 
+def _compute_followup_is_opted_in(task: Task) -> bool:
+    """Whether this experiment explicitly requests a disposition child.
+
+    Computing a result is complete work in its own right. Keep its durable
+    result and knowledge record, but never turn every terminal measurement into
+    an implicit write/retry loop. ``spawn_followup=True`` is the sole opt-in for
+    both reason-and-ship and diagnose-and-fix children.
+    """
+    return (task.first_payload or {}).get("spawn_followup") is True
+
+
 def _is_unmeasured_declared_metric(task: Task, criterion: dict | None) -> bool:
     """True when ``task`` declared a kind=metric criterion that produced NO value.
 
@@ -4404,7 +4415,8 @@ async def _handle_compute_experiment_completion(
             "[COMPUTE] Task %s FAILED at pre-flight smoke (no full VM provisioned)",
             task.id,
         )
-        await _spawn_act_on_verdict_followon(session, task, {}, logs, failure_mode=True)
+        if _compute_followup_is_opted_in(task):
+            await _spawn_act_on_verdict_followon(session, task, {}, logs, failure_mode=True)
         await _finalize_compute_experiment(
             session, task, TaskStatus.FAILED, logs, criterion, owns_commit=owns_commit
         )
@@ -4526,19 +4538,17 @@ async def _handle_compute_experiment_completion(
             task.id,
             verdict.reason,
         )
-        # Crash-visibility fix: the gate failed before any compute_result was
-        # extracted, so the experiment's traceback is otherwise stranded in a
-        # GCS bundle. No intentional kill reaches this branch (kills carry an
-        # outcome + cost and pass the gate), so always spawn a tracked
-        # diagnose-and-fix follow-on. The experiment itself stays FAILED.
-        if sweep_id:
-            await _maybe_spawn_sweep_aggregate_followon(
-                session, task, sweep_id, {}, logs, failure_mode=True
-            )
-        else:
-            await _spawn_act_on_verdict_followon(
-                session, task, {}, logs, failure_mode=True
-            )
+        # A retained diagnostic is sufficient by default. When the author
+        # explicitly asks for disposition, forward the traceback to one child.
+        if _compute_followup_is_opted_in(task):
+            if sweep_id:
+                await _maybe_spawn_sweep_aggregate_followon(
+                    session, task, sweep_id, {}, logs, failure_mode=True
+                )
+            else:
+                await _spawn_act_on_verdict_followon(
+                    session, task, {}, logs, failure_mode=True
+                )
         await _finalize_compute_experiment(
             session,
             task,
@@ -4601,7 +4611,10 @@ async def _handle_compute_experiment_completion(
             # compute_result + any durable artifact pointer) UNLESS the outcome
             # is an intentional kill — those are honest terminal states, not a
             # defect to investigate. Experiment stays FAILED.
-            if outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
+            if (
+                outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES
+                and _compute_followup_is_opted_in(task)
+            ):
                 if sweep_id:
                     await _maybe_spawn_sweep_aggregate_followon(
                         session, task, sweep_id, compute_result, logs, failure_mode=True
@@ -4652,20 +4665,17 @@ async def _handle_compute_experiment_completion(
                 task.id,
                 miss_reason,
             )
-            # Crash-visibility fix: a SUCCESS/FAILURE outcome whose declared metric
-            # never materialized is the classic "ran but crashed before emitting
-            # the number" case. Intentional kills are already excluded by the
-            # guard above, so spawn a tracked diagnose-and-fix follow-on
-            # (forwarding the partial result + artifact pointer). Experiment stays
-            # FAILED.
-            if sweep_id:
-                await _maybe_spawn_sweep_aggregate_followon(
-                    session, task, sweep_id, compute_result, logs, failure_mode=True
-                )
-            else:
-                await _spawn_act_on_verdict_followon(
-                    session, task, compute_result, logs, failure_mode=True
-                )
+            # The failed criterion and partial result are durable. A follow-on
+            # is exceptional and must be explicitly requested by the author.
+            if _compute_followup_is_opted_in(task):
+                if sweep_id:
+                    await _maybe_spawn_sweep_aggregate_followon(
+                        session, task, sweep_id, compute_result, logs, failure_mode=True
+                    )
+                else:
+                    await _spawn_act_on_verdict_followon(
+                        session, task, compute_result, logs, failure_mode=True
+                    )
             await _finalize_compute_experiment(
                 session,
                 task,
@@ -4684,32 +4694,11 @@ async def _handle_compute_experiment_completion(
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
 
-    # Always-dispose (axis B): EVERY measured, non-prerequisite compute
-    # experiment now spawns ONE write-capable reason-and-ship follow-on over its
-    # faithful result; the parent advances to EVALUATING to await it (mirroring
-    # the security_audit completion→spawn-create pattern). The authoring-time
-    # ``act_on_verdict`` opt-in is retired — disposition is decided here, not at
-    # spawn. The spawn is concurrency-bounded
-    # (``max_concurrent_act_on_verdict_followons``): when the cap is reached no
-    # child spawns and the experiment completes clean, so the dispose is
-    # best-effort, never a hard blocker. Faithful capture (axis A) always runs.
-    #
-    # Intentional kills (budget/deadline/cancel) are EXCLUDED: they are honest,
-    # intended terminal outcomes whose experiment never produced a result to
-    # reason over, so there is nothing to dispose — exactly as the failure
-    # branches above exclude them. They complete clean with full capture.
-    #
-    # spawn_followup gate: operator-authored tasks (created_by="USER") suppress
-    # the follow-on by default (opt-in via spawn_followup=True in the payload).
-    # Engine-authored tasks (ORCHESTRATOR / STRATEGIC_AGENT) spawn by default
-    # unless spawn_followup=False is explicitly set. This prevents validation
-    # smokes from burning agent budget on throwaway metrics.
-    _payload_spawn_followup = (task.first_payload or {}).get("spawn_followup")
-    _should_spawn_followup = (
-        _payload_spawn_followup is True
-        if task.created_by == "USER"
-        else _payload_spawn_followup is not False
-    )
+    # Faithful result capture (axis A) is always durable. A write-capable
+    # reason-and-ship disposition (axis B) is optional and starts ONLY when the
+    # author set spawn_followup=True. This keeps a direct measurement terminal
+    # instead of silently turning it into a task chain or retry loop.
+    _should_spawn_followup = _compute_followup_is_opted_in(task)
     final_status = TaskStatus.COMPLETED
     result_outcome = (plan_output.get("compute_result") or {}).get("outcome")
     if (

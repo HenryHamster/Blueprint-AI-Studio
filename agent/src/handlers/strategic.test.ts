@@ -2176,6 +2176,25 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
     // declared_metric documents what the command emits
     expect(executorPrompt).toContain('declared_metric');
   });
+
+  it('instructs output-preserving experiments to use the durable artifact contract', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-durable-output-contract',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toContain('require_durable_artifact: true');
+    expect(executorPrompt).toContain('$BLUEPRINT_ARTIFACT_DIR');
+    expect(executorPrompt).toContain('manifest.json');
+  });
 });
 
 describe('handleStrategic create-direction recovery prompt', () => {

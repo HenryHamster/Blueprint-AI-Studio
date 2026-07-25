@@ -53,6 +53,16 @@ describe('writeStrategicHelpers', () => {
     expect(fs.existsSync(`${testWorkspace}/strategic`)).toBe(true);
     expect(fs.existsSync(`${testWorkspace}/fetch`)).toBe(true);
     expect(fs.existsSync(`${testWorkspace}/design-doc`)).toBe(true);
+    expect(fs.existsSync(`${testWorkspace}/compute-image`)).toBe(true);
+  });
+
+  it('keeps compute-image build requests short and non-polling', () => {
+    writeStrategicHelpers('task', 'project', testWorkspace);
+    const script = fs.readFileSync(`${testWorkspace}/compute-image`, 'utf-8');
+
+    expect(script).toContain('curl -sS --max-time 30 --connect-timeout 10');
+    expect(script).not.toContain('--max-time 5500');
+    expect(script).toContain('Do not poll or retry from this resident turn.');
   });
 
   it('writes scripts with executable permissions', () => {
@@ -432,7 +442,7 @@ describe('writeStrategicHelpers', () => {
 
     it('generated strategic + fetch scripts pass `bash -n`', () => {
       writeStrategicHelpers('t', 'p', testWorkspace);
-      for (const name of ['strategic', 'fetch']) {
+      for (const name of ['strategic', 'fetch', 'compute-image']) {
         const p = `${testWorkspace}/${name}`;
         // Throws on a syntax error (non-zero exit) — the assertion is that it does not.
         expect(() => execFileSync('bash', ['-n', p], { stdio: 'pipe' })).not.toThrow();
