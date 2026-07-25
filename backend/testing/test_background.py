@@ -369,13 +369,21 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
+    # 30 min stale, not 10: "research" is in _THINKING_HEAVY_TASK_TYPES, so
+    # _heartbeat_stale_cutoff floors its heartbeat-stale window at
+    # _THINKING_HEAVY_PROGRESS_STALE_SECONDS (1500s / 25 min) — a research agent
+    # legitimately goes silent for 20+ min during a deep reasoning pass
+    # (b2410541 incident). A 10-minute-stale coordinator is therefore correctly
+    # NOT an orphan and is never reaped, which made this test assert on a task
+    # the reaper never touched. Stall past the 25-minute floor so the reap this
+    # test is actually about (parent-with-children → EVALUATING) really happens.
     coordinator = Task(
         project_id=project.id,
         payloads=[{"type": "research"}],
         vm_instance_id="coordinator-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(coordinator)
     await reaper_db.commit()
