@@ -6098,6 +6098,7 @@ def _compute_poll_loop(
     """
     url = f"{orchestrator_url}/api/runner/next-compute-job"
     poll_interval = base_poll_interval
+    last_low_disk_reclaim_at = float("-inf")
 
     while not _shutdown_event.is_set():
         try:
@@ -6124,12 +6125,39 @@ def _compute_poll_loop(
             # filesystem is nearly full. A baked container-image job must PULL a
             # multi-GB image before it can start; claiming it on a nearly-full
             # box means the pull dies "no space left on device" and the claim is
-            # wasted. Mirrors the agent poll loop's guard; disabled by default (0).
-            if _disk_below_min(_workspace_root(), _min_free_disk_bytes()):
+            # wasted. Before giving up, reclaim stale images once per minute:
+            # otherwise low disk can prevent every claim and leave cleanup with no
+            # path to run. The fit floor remains mandatory after the reclaim pass.
+            workspace_root = _workspace_root()
+            min_free_disk_bytes = _min_free_disk_bytes()
+            if _disk_below_min(workspace_root, min_free_disk_bytes):
+                now_monotonic = time.monotonic()
+                if now_monotonic - last_low_disk_reclaim_at >= 60.0:
+                    last_low_disk_reclaim_at = now_monotonic
+                    try:
+                        prune_result = _prune_docker_images(
+                            workspace_root, min_free_disk_bytes
+                        )
+                        prune_detail = (
+                            prune_result.get("reason")
+                            or prune_result.get("output")
+                            or "completed"
+                        )
+                        print(
+                            "[compute] low-disk pre-claim image hygiene "
+                            f"({prune_detail})",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[compute] low-disk pre-claim image hygiene failed: {exc}",
+                            flush=True,
+                        )
+            if _disk_below_min(workspace_root, min_free_disk_bytes):
                 _release_capacity(capacity)
                 print(
-                    f"[compute] low disk on {_workspace_root()} "
-                    f"(< {_min_free_disk_bytes()} bytes free) — skipping compute claim.",
+                    f"[compute] low disk on {workspace_root} "
+                    f"(< {min_free_disk_bytes} bytes free) — skipping compute claim.",
                     flush=True,
                 )
                 time.sleep(poll_interval)

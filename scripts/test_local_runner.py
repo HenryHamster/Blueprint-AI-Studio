@@ -1139,6 +1139,7 @@ class TestHostLoadThrottle(unittest.TestCase):
              patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
              patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
              patch.object(local_runner, "_disk_below_min", return_value=True), \
+             patch.object(local_runner, "_prune_docker_images", return_value={"reason": "removed_stale"}) as prune_images, \
              patch.object(local_runner, "_post", side_effect=fake_post):
             t = threading.Thread(
                 target=local_runner._compute_poll_loop,
@@ -1151,6 +1152,34 @@ class TestHostLoadThrottle(unittest.TestCase):
             local_runner._shutdown_event.set()
             t.join(timeout=2)
         self.assertEqual(calls, [], "must not poll for compute work while disk is low")
+        self.assertEqual(prune_images.call_count, 1)
+
+    def test_low_disk_reclaims_before_compute_claim(self):
+        """A successful reclaim rechecks capacity before the next job poll."""
+        disk_states = iter((True, False))
+
+        def fake_disk_below(*_args):
+            return next(disk_states, False)
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=None), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
+             patch.object(local_runner, "_disk_below_min", side_effect=fake_disk_below), \
+             patch.object(local_runner, "_prune_docker_images", return_value={"reason": "removed_stale"}) as prune_images, \
+             patch.object(local_runner, "_post", side_effect=lambda *_args, **_kwargs: (204, None, None)) as post:
+            t = threading.Thread(
+                target=local_runner._compute_poll_loop,
+                args=("http://test", "tok", active_jobs, lock, 1),
+                kwargs={"base_poll_interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.15)
+            local_runner._shutdown_event.set()
+            t.join(timeout=2)
+        self.assertEqual(prune_images.call_count, 1)
+        self.assertGreaterEqual(post.call_count, 1)
 
     def test_disk_ok_allows_compute_claim(self):
         """Compute poll proceeds when workspace free disk is above the guard."""
