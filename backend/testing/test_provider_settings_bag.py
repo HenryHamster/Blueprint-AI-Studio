@@ -590,6 +590,39 @@ def test_resolve_task_provider_settings_validates_bag():
         resolve_task_provider_settings(task, runtime_config, "anthropic")
 
 
+def test_resolve_task_provider_settings_uses_declared_model_fallback():
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "provider_settings_defaults": {
+            "anthropic": {"model": "claude-fable-5", "effort": "max"},
+        },
+    }
+
+    assert resolve_task_provider_settings(
+        _make_task("strategic_review"), runtime_config, "anthropic"
+    ) == {"model": "claude-opus-4-8", "effort": "max"}
+
+
+def test_resolve_task_provider_settings_fallback_keeps_other_errors_fail_closed():
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "provider_settings_defaults": {
+            "anthropic": {
+                "model": "claude-fable-5",
+                "effort": "max",
+                "bogus": 1,
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="unknown key"):
+        resolve_task_provider_settings(
+            _make_task("strategic_review"), runtime_config, "anthropic"
+        )
+
+
 def test_resolve_task_provider_settings_empty_when_nothing_configured():
     from app.max_plan_pool import resolve_task_provider_settings
 

@@ -62,6 +62,7 @@ _CODEX_REPAIR = (
 # agent tasks run in the prod image (non-root, prod-parity) with ZERO operator setup.
 # Overridable with --agent-image or the BLUEPRINT_AGENT_IMAGE env var.
 DEFAULT_AGENT_IMAGE_TAG = "blueprint-agent:local"
+_AGENT_SOURCE_LABEL = "com.blueprint.agent.source-revision"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOCAL_RUNNER = os.path.join(_SCRIPT_DIR, "local_runner.py")
@@ -422,7 +423,61 @@ def _image_present(tag: str, *, _run=subprocess.run) -> bool:
     return getattr(result, "returncode", 1) == 0
 
 
-def _build_image(tag: str, agent_dir: str, *, _run=subprocess.run) -> bool:
+def _agent_source_revision(
+    *, repo_root: str = _REPO_ROOT, _run=subprocess.run
+) -> str | None:
+    """Return the committed agent tree id used to invalidate local images."""
+    try:
+        result = _run(
+            ["git", "rev-parse", "HEAD:agent"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=repo_root,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = (getattr(result, "stdout", "") or "").strip()
+    if getattr(result, "returncode", 1) != 0 or not re.fullmatch(
+        r"[0-9a-fA-F]{40,64}", revision
+    ):
+        return None
+    return revision.lower()
+
+
+def _image_source_revision(
+    tag: str, *, _run=subprocess.run
+) -> str | None:
+    """Read the source-tree provenance label from an existing agent image."""
+    try:
+        result = _run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                f'{{{{ index .Config.Labels "{_AGENT_SOURCE_LABEL}" }}}}',
+                tag,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = (getattr(result, "stdout", "") or "").strip()
+    if getattr(result, "returncode", 1) != 0 or revision in {"", "<no value>"}:
+        return None
+    return revision.lower()
+
+
+def _build_image(
+    tag: str,
+    agent_dir: str,
+    *,
+    source_revision: str | None = None,
+    _run=subprocess.run,
+) -> bool:
     """Build ``<tag>`` from *agent_dir* (agent/Dockerfile). Streams build output.
 
     Returns True on a zero exit. Output is NOT captured so the operator sees build
@@ -434,7 +489,11 @@ def _build_image(tag: str, agent_dir: str, *, _run=subprocess.run) -> bool:
         flush=True,
     )
     try:
-        result = _run(["docker", "build", "-t", tag, agent_dir])
+        argv = ["docker", "build", "-t", tag]
+        if source_revision:
+            argv.extend(["--label", f"{_AGENT_SOURCE_LABEL}={source_revision}"])
+        argv.append(agent_dir)
+        result = _run(argv)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"[blueprint-runner] docker build error: {exc}", file=sys.stderr, flush=True)
         return False
@@ -471,6 +530,7 @@ def ensure_agent_image(
     build: bool = True,
     pull_ref: str | None = None,
     agent_dir: str = _AGENT_DIR,
+    source_revision: str | None = None,
     probe_only: bool = False,
     _run=subprocess.run,
 ) -> AgentImageResult:
@@ -497,10 +557,25 @@ def ensure_agent_image(
         )
 
     present = _image_present(tag, _run=_run)
+    image_revision = (
+        _image_source_revision(tag, _run=_run)
+        if present and source_revision and not pull_ref
+        else None
+    )
+    source_mismatch = bool(
+        present and source_revision and image_revision != source_revision.lower()
+    )
 
     if probe_only:
-        if present:
+        if present and not source_mismatch:
             return AgentImageResult(tag, True, f"image {tag} present -> docker-agent path ON.")
+        if source_mismatch:
+            return AgentImageResult(
+                None,
+                False,
+                f"image {tag} source revision is stale -> `blueprint-runner start` "
+                "will rebuild it.",
+            )
         if pull_ref:
             return AgentImageResult(
                 None,
@@ -539,16 +614,17 @@ def ensure_agent_image(
             tag, True, f"pulled {pull_ref} (tagged {tag}) -> docker-agent path ON."
         )
 
-    if present:
+    if present and not source_mismatch:
         return AgentImageResult(
             tag, True, f"image {tag} already present -> docker-agent path ON."
         )
 
     if not build:
+        state = "stale" if source_mismatch else "absent"
         return AgentImageResult(
             None,
             False,
-            f"image {tag} absent and --no-build-image set -> docker-agent path OFF. "
+            f"image {tag} {state} and --no-build-image set -> docker-agent path OFF. "
             "Agent tasks run under host bwrap (or are declined).",
         )
 
@@ -559,7 +635,7 @@ def ensure_agent_image(
             f"agent build context {agent_dir!r} not found -> docker-agent path OFF.",
         )
 
-    if not _build_image(tag, agent_dir, _run=_run):
+    if not _build_image(tag, agent_dir, source_revision=source_revision, _run=_run):
         return AgentImageResult(
             None,
             False,
@@ -1579,6 +1655,7 @@ def main(argv: list[str] | None = None) -> int:
             docker_usable=_docker_usable(),
             build=getattr(args, "build_image", True),
             pull_ref=getattr(args, "pull", None),
+            source_revision=_agent_source_revision(),
             probe_only=(args.command == "check"),
         )
     else:
