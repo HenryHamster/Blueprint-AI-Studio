@@ -7,6 +7,7 @@ import {
   recordResidentTurnLatency, getResidentTurnLatencyTelemetry,
   recordOperatorDecisionCapture, getOperatorDecisionCaptureTelemetry,
 } from '../index.js';
+import { HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT } from '../constants.js';
 import { restoreOperatorDecisionCaptureTelemetry } from '../telemetry.js';
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
@@ -1368,7 +1369,16 @@ export async function handleStrategicResident(
       body.operator_decision_summary = opDecisionSummary;
     }
     try {
-      const resp = await apiPost(`/api/agent/projects/${projectId}/strategic-session/heartbeat`, body) as SessionHeartbeatResponse;
+      // This await gates the only session-liveness loop. Never inherit the
+      // generic API retry chain here: a transient backend stall must settle
+      // promptly so the next liveness tick can retry before the server treats
+      // a live resident as stale and supersedes it.
+      const resp = await apiPost(
+        `/api/agent/projects/${projectId}/strategic-session/heartbeat`,
+        body,
+        HEARTBEAT_API_MAX_RETRIES,
+        HEARTBEAT_API_TIMEOUT,
+      ) as SessionHeartbeatResponse;
       // Fold the lease state so the loop's autonomous gate tracks the backend.
       authorityHeld = nextAuthorityHeld(authorityHeld, resp);
       // Track the work-state revision (when the backend ships it) so state-gated

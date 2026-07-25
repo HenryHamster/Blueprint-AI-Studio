@@ -114,6 +114,7 @@ import {
   ATTACHMENT_FETCH_TIMEOUT_MS,
   MAX_IMAGES_PER_TURN,
 } from './strategic-resident-lib.js';
+import { HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT } from '../constants.js';
 
 // The coalescing drain emits at most one frame per this window (see
 // STREAM_FLUSH_MS in strategic-resident.ts); mirrored here for the timing math.
@@ -328,6 +329,11 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       'session-started',
       'autonomous-turn',
     ]);
+    const heartbeat = mockApiPost.mock.calls.find(([url]) =>
+      url.includes('/strategic-session/heartbeat'),
+    );
+    expect(heartbeat?.[2]).toBe(HEARTBEAT_API_MAX_RETRIES);
+    expect(heartbeat?.[3]).toBe(HEARTBEAT_API_TIMEOUT);
   });
 
   it('unlinks a pre-existing reply-key symlink and exclusively creates a file without touching its target', () => {
