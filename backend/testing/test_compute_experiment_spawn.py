@@ -575,6 +575,12 @@ def _base_contract(**extra):
     }
 
 
+def test_validate_contract_rejects_literal_escaped_newline_in_python_c():
+    contract = _base_contract(command=r'python3 -c "\nimport json"')
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "literal \\n" in reason
+
 class TestValidateContractSmokeAdvisory:
     """Author smoke_sample failures are ADVISORY, not blocking — v20 design decision.
 
