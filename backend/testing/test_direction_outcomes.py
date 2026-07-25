@@ -3095,8 +3095,17 @@ async def test_read_cochange_prefers_telemetry_only_value(db_session: AsyncSessi
 
 
 @pytest.mark.asyncio
-async def test_read_cochange_falls_back_to_design_doc(db_session: AsyncSession):
-    """With no telemetry row, cochange readers fall back to design_doc (rollback safe)."""
+async def test_read_cochange_ignores_design_doc_when_no_telemetry_row(
+    db_session: AsyncSession,
+):
+    """With no telemetry row, cochange readers return empty — design_doc is NOT read.
+
+    ``cochange_state`` in ``project_telemetry`` is the sole store. The legacy
+    ``design_doc['cochange_index']`` fallback leg was removed in #16376 when the
+    design-doc God-column readers were repointed at the KV table, so a stale
+    design_doc must not resurrect a shadow copy of the index. This asserts the
+    absence of that fallback rather than its presence.
+    """
     from app.direction_outcomes import (
         read_cochange_applied_prs,
         read_cochange_index,
@@ -3109,8 +3118,8 @@ async def test_read_cochange_falls_back_to_design_doc(db_session: AsyncSession):
     }
     await db_session.flush()
 
-    assert await read_cochange_index(db_session, project) == {"a.py": {"b.py": 1.0}}
-    assert await read_cochange_applied_prs(db_session, project) == ["pr-1"]
+    assert await read_cochange_index(db_session, project) == {}
+    assert await read_cochange_applied_prs(db_session, project) == []
 
 
 def test_apply_cochange_idempotent_same_pr_not_double_counted():
