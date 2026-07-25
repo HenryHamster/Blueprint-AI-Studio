@@ -34,6 +34,12 @@ Examples:
     python scripts/blueprint.py fleet accounts --disable evan --yes
     python scripts/blueprint.py promote-recover qualify --yes
     python scripts/blueprint.py logs errors --minutes 30
+
+See also:
+    scripts/blueprint_runner.py — the separate CLI for local runner management
+    (start, check, install, uninstall, update, status).  All runner lifecycle
+    operations are in blueprint_runner.py; blueprint.py has no runner
+    subcommands.
 """
 import argparse
 import json

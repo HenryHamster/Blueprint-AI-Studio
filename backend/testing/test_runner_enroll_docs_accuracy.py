@@ -433,3 +433,85 @@ class TestFleetCommandScopeIsCloudVMPool:
                 f"cmd_fleet calls '{bad}', which is an enrollment operation. "
                 "Enrollment must remain in the admin-UI REST API, not the CLI."
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: blueprint.py module docstring accurately describes runner management
+# ---------------------------------------------------------------------------
+
+class TestBlueprintPyDocstringExcludesRunnerMgmt:
+    """scripts/blueprint.py must explicitly delegate runner management to blueprint_runner.py.
+
+    The design-doc agent derives the sys-operator-tooling description from the
+    module docstring.  If that docstring claims (or implies) blueprint.py provides
+    runner management, the design doc drifts from reality — all six runner
+    subcommands (start, check, install, uninstall, update, status) live in the
+    separate blueprint_runner.py CLI.
+    """
+
+    RUNNER_SUBCOMMANDS = ("start", "check", "install", "uninstall", "update", "status")
+
+    def test_docstring_names_blueprint_runner_for_runner_ops(
+        self, blueprint_source: str
+    ):
+        """Module docstring names blueprint_runner.py as the runner management CLI."""
+        module_docstring = _extract_module_docstring(blueprint_source)
+        assert module_docstring is not None, (
+            "scripts/blueprint.py has no module-level docstring. "
+            "Add one that describes its subcommand groups and delegates runner "
+            "management to blueprint_runner.py."
+        )
+        assert "blueprint_runner" in module_docstring, (
+            "scripts/blueprint.py module docstring does not mention 'blueprint_runner'. "
+            "The docstring must attribute runner management (start, check, install, "
+            "uninstall, update, status) to scripts/blueprint_runner.py so that "
+            "design-doc agents produce accurate sys-operator-tooling descriptions."
+        )
+
+    def test_docstring_does_not_claim_runner_subcommands(
+        self, blueprint_source: str
+    ):
+        """Module docstring 'Subcommand groups' section lists no runner-only subcommands.
+
+        The runner-only subcommands are those that exist exclusively in
+        blueprint_runner.py (install, uninstall, update, start-as-runner-daemon).
+        'status' and 'check' are not tested here because blueprint.py also has
+        legitimate subcommands with those names.
+        """
+        module_docstring = _extract_module_docstring(blueprint_source)
+        if module_docstring is None:
+            pytest.skip("No module docstring — covered by test_docstring_names_blueprint_runner_for_runner_ops")
+
+        # Extract the Subcommand groups section (if present).
+        match = re.search(
+            r"Subcommand groups:(.*?)(?:\n\S|\Z)",
+            module_docstring,
+            re.DOTALL,
+        )
+        if match is None:
+            # No explicit subcommand section — no false claims possible.
+            return
+        section = match.group(1)
+
+        # Runner-exclusive subcommands that must NOT appear as a listed group in
+        # blueprint.py (install/uninstall/update are unambiguously runner-only).
+        runner_only_pattern = re.compile(
+            r"^\s+(?:install|uninstall|update)\b",
+            re.MULTILINE,
+        )
+        bad_match = runner_only_pattern.search(section)
+        assert bad_match is None, (
+            f"scripts/blueprint.py docstring 'Subcommand groups' section lists "
+            f"a runner-only subcommand: {bad_match.group().strip()!r}. "
+            "Runner management (install, uninstall, update) belongs entirely in "
+            "scripts/blueprint_runner.py."
+        )
+
+
+def _extract_module_docstring(source: str) -> str | None:
+    """Return the module-level docstring from Python source, or None."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    return ast.get_docstring(tree)
