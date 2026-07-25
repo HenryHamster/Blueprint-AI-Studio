@@ -68,6 +68,12 @@ _GENERATED_COMMAND_RE = re.compile(
     r"^echo\s+(?P<blob>[A-Za-z0-9+/=]+)\s*\|\s*base64\s+-d\s*\|\s*bash$"
 )
 
+# ``python -c "\\n..."`` hands Python a literal backslash-n rather than a
+# source newline, so it always fails before the experiment can start.
+_PYTHON_C_LITERAL_ESCAPED_NEWLINE_RE = re.compile(
+    r"\bpython(?:3(?:\.\d+)?)?\s+-c\s+[\"']\\n"
+)
+
 # Within the decoded wrapper the aggregator is itself a base64 blob of a static
 # file (compute_arm_aggregator.py), thousands of characters long.  Expanding it
 # would bury the per-arm commands, which are the part an operator actually reads.
@@ -265,6 +271,12 @@ def _validate_compute_launch_contract(
             seen_names.add(arm_name)
             if not (isinstance(arm_cmd, str) and arm_cmd.strip()):
                 return False, f"arms[{i}].command (arm '{arm_name}') is missing or empty"
+            if _PYTHON_C_LITERAL_ESCAPED_NEWLINE_RE.search(arm_cmd):
+                return (
+                    False,
+                    f"arms[{i}].command starts python -c with a literal \\n; "
+                    "use a real script file or a base64-decoded script instead",
+                )
         declared_metric = contract.get("declared_metric")
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric is required and must be a non-empty string when arms are specified"
@@ -324,6 +336,14 @@ def _validate_compute_launch_contract(
             contract["command"] = f"echo {encoded} | base64 -d | bash"
     elif not (isinstance(command, str) and command.strip()):
         return False, "missing or empty command"
+
+    command = contract.get("command")
+    if isinstance(command, str) and _PYTHON_C_LITERAL_ESCAPED_NEWLINE_RE.search(command):
+        return (
+            False,
+            "command starts python -c with a literal \\n; "
+            "use a real script file or a base64-decoded script instead",
+        )
 
     declared_metric = contract.get("declared_metric")
     if declared_metric is not None:
