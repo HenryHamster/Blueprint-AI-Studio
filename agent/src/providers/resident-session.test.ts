@@ -67,6 +67,9 @@ import { startResidentClaudeSession } from './resident-session.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import { recordLlmTokens, recordNumTurns } from '../index.js';
 import { encodeUserTurnBlocks } from './resident-stream.js';
+import {
+  probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
+} from './runners.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -146,6 +149,21 @@ describe('startResidentClaudeSession', () => {
     expect(registerChildPid).toHaveBeenCalledWith(4242);
     session.close();
   });
+  it('applies the Claude optional-flag compatibility gate before resident spawn', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(new Set(['--effort']));
+    vi.mocked(stripUnsupportedClaudeOptionalArgs).mockImplementationOnce((args) => args.filter((arg) => arg !== '--include-partial-messages'));
+
+    const session = startResidentClaudeSession({});
+    const [, args] = vi.mocked(spawn).mock.calls[0] as unknown as [string, string[]];
+
+    expect(probeClaudeCapabilities).toHaveBeenCalledWith('claude', expect.any(Object));
+    expect(stripUnsupportedClaudeOptionalArgs).toHaveBeenCalledWith(expect.any(Array), expect.any(Set));
+    expect(args).not.toContain('--include-partial-messages');
+    expect(args).toContain('--input-format');
+    session.close();
+  });
   it('classifies provider rate limits from bounded stderr evidence', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
@@ -155,6 +173,18 @@ describe('startResidentClaudeSession', () => {
 
     expect(session.failureCategory?.()).toBe('rate_limited');
     session.close();
+  });
+
+  it('retains an exit diagnostic when the resident dies before any turn', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    ctl.pushStderr('Error: unknown option --include-partial-messages');
+    ctl.triggerClose(2);
+
+    expect(session.exitDiagnostic?.()).toContain('exit_code=2');
+    expect(session.exitDiagnostic?.()).toContain('unknown option --include-partial-messages');
   });
 
   it('propagates a top-level rate-limit error as a failed turn immediately', async () => {

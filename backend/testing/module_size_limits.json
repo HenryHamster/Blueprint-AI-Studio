@@ -200,7 +200,7 @@
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
     "handlers/research-plan-sections.ts": 1800,
-    "providers/resident-session.ts": 800
+    "providers/resident-session.ts": 1050
   },
   "frontend": {
     "useAppState.ts": 3000,

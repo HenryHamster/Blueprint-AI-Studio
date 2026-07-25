@@ -2067,13 +2067,14 @@ export async function handleStrategicResident(
     session.exitCode(),
     terminalProviderFailure.value ?? session.failureCategory?.() ?? null,
   );
+  const exitDiagnostic = status === 'FAILED' ? session.exitDiagnostic?.() : null;
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status,
       artifact_type: status === 'FAILED' ? 'ERROR_LOG' : 'RESEARCH_FINDINGS',
       ...(failureCategory ? { failure_category: failureCategory } : {}),
-      logs: `Resident strategic session ${sessionId} ended (${stopReason}).`,
+      logs: `Resident strategic session ${sessionId} ended (${stopReason}).${exitDiagnostic ? ` ${exitDiagnostic}` : ''}`,
     });
   } catch (e) {
     sendLog(ws, `[ERROR] Failed to post resident terminal status: ${String(e)}\n`);
