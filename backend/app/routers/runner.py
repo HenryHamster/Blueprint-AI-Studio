@@ -130,6 +130,9 @@ _MAX_IMAGE_CACHE_PROJECTS = 64
 # 1 PiB per bucket — far beyond any real image cache, so an absurd runner-reported
 # integer can never poison the telemetry while every plausible value passes.
 _MAX_IMAGE_CACHE_BYTES = 1 << 50
+_MAX_CONTAINER_IMAGE_STORE_PATH_CHARS = 512
+_MAX_CONTAINER_IMAGE_RECLAIM_REASON_CHARS = 500
+_CONTAINER_IMAGE_STORE_RUNTIMES = frozenset({"docker", "podman"})
 _PROJECT_VERIFICATION_VERSION = 1
 _MAX_PROJECT_VERIFICATION_REASON_CHARS = 500
 _PROJECT_VERIFICATION_BACKENDS = frozenset({"bwrap", "declined"})
@@ -177,6 +180,51 @@ def _sanitize_image_cache_by_project(raw: Any) -> dict | None:
         "by_project": by_project,
         "unattributed_bytes": _clamp_bytes(raw.get("unattributed_bytes")),
         "unattributed_image_count": _clamp_count(raw.get("unattributed_image_count")),
+    }
+
+
+def _sanitize_container_image_reclaim(raw: Any) -> dict | None:
+    """Bound the last runner-side image-store reclaim result for diagnostics."""
+    if not isinstance(raw, dict):
+        return None
+
+    def _bytes(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return max(0, min(_MAX_IMAGE_CACHE_BYTES, int(value)))
+        except (TypeError, ValueError):
+            return None
+
+    def _count(value: Any) -> int | None:
+        return _bytes(value)
+
+    runtime = raw.get("runtime")
+    runtime = runtime if runtime in _CONTAINER_IMAGE_STORE_RUNTIMES else None
+    store_root = raw.get("store_root")
+    store_root = (
+        store_root.strip()[:_MAX_CONTAINER_IMAGE_STORE_PATH_CHARS]
+        if isinstance(store_root, str) and store_root.strip()
+        else None
+    )
+    attempted_at = raw.get("attempted_at")
+    attempted_at = attempted_at.strip()[:64] if isinstance(attempted_at, str) else None
+    reason = raw.get("reason")
+    reason = (
+        reason.strip()[:_MAX_CONTAINER_IMAGE_RECLAIM_REASON_CHARS]
+        if isinstance(reason, str) and reason.strip()
+        else None
+    )
+    return {
+        "attempted_at": attempted_at,
+        "runtime": runtime,
+        "store_root": store_root,
+        "free_bytes_before": _bytes(raw.get("free_bytes_before")),
+        "free_bytes_after": _bytes(raw.get("free_bytes_after")),
+        "removed": _count(raw.get("removed")),
+        "kept": _count(raw.get("kept")),
+        "in_use_skipped": _count(raw.get("in_use_skipped")),
+        "reason": reason,
     }
 
 
@@ -604,7 +652,15 @@ class HeartbeatRequest(BaseModel):
     # console can tell a healthy runner from one heartbeating while every job fails.
     last_successful_job_at: str | None = None
     consecutive_job_failures: int | None = None
+    # ``disk_free_bytes`` is the legacy workspace measurement. Container-image
+    # pulls also report the Docker/Podman data-root separately so admission can
+    # gate on the real limiting filesystem.
     disk_free_bytes: int | None = None
+    workspace_free_bytes: int | None = None
+    container_image_store_runtime: str | None = None
+    container_image_store_path: str | None = None
+    container_image_store_free_bytes: int | None = None
+    container_image_reclaim: dict | None = None
     cpu_load_avg: float | None = None
     memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
@@ -1613,6 +1669,47 @@ async def heartbeat(
         runner.consecutive_job_failures = max(0, int(payload.consecutive_job_failures))
     if payload.disk_free_bytes is not None:
         caps["disk_free_bytes"] = max(0, int(payload.disk_free_bytes))
+    if payload.workspace_free_bytes is not None:
+        caps["workspace_free_bytes"] = max(0, int(payload.workspace_free_bytes))
+
+    # New runners explicitly send these as ``null`` when Docker/Podman info is
+    # unavailable or their active isolation backend changes. That is different
+    # from an older runner omitting the field: discard only an explicit-null
+    # value, otherwise a transient probe failure would leave a stale low Docker
+    # root in capabilities and hold future image jobs indefinitely.
+    reported_fields = getattr(payload, "model_fields_set", None)
+    if reported_fields is None:  # Pydantic v1 compatibility.
+        reported_fields = getattr(payload, "__fields_set__", set())
+    if not isinstance(reported_fields, (set, frozenset)):
+        reported_fields = set()
+    image_store_fields = (
+        "container_image_store_runtime",
+        "container_image_store_path",
+        "container_image_store_free_bytes",
+        "container_image_reclaim",
+    )
+    for field_name in image_store_fields:
+        if field_name in reported_fields and getattr(payload, field_name) is None:
+            caps.pop(field_name, None)
+
+    if payload.container_image_store_free_bytes is not None:
+        caps["container_image_store_free_bytes"] = max(
+            0, int(payload.container_image_store_free_bytes)
+        )
+    if payload.container_image_store_runtime in _CONTAINER_IMAGE_STORE_RUNTIMES:
+        caps["container_image_store_runtime"] = payload.container_image_store_runtime
+    if (
+        isinstance(payload.container_image_store_path, str)
+        and payload.container_image_store_path.strip()
+    ):
+        caps["container_image_store_path"] = (
+            payload.container_image_store_path.strip()[:_MAX_CONTAINER_IMAGE_STORE_PATH_CHARS]
+        )
+    sanitized_reclaim = _sanitize_container_image_reclaim(
+        payload.container_image_reclaim
+    )
+    if sanitized_reclaim is not None:
+        caps["container_image_reclaim"] = sanitized_reclaim
     sanitized_image_cache = _sanitize_image_cache_by_project(payload.image_cache_by_project)
     if sanitized_image_cache is not None:
         caps["image_cache_by_project"] = sanitized_image_cache
@@ -1974,30 +2071,35 @@ async def next_compute_job(
         return response
 
     # Claim-time disk-fit re-check for container-image jobs. Server-side dispatch
-    # gates on the heartbeat disk_free_bytes at PIN time, but the runner's free
-    # disk can fall between pin and this poll. A baked image is multi-GB and must
-    # be pulled before the job starts; claiming it on a runner that can no longer
-    # fit it wastes the claim (the pull dies "no space left on device"). Re-check
-    # the freshest heartbeat here and, if the runner is now below the fit floor,
-    # LEAVE the job STARTING (do not transition to RUNNING) and return 204 so it
-    # re-dispatches to a runner (or cloud backend) that can fit it. Runners that
-    # do not report disk_free_bytes are not gated (backward compatible).
+    # gates on the heartbeat workspace/image-store capacities at PIN time, but
+    # either filesystem can fall between pin and this poll. A baked image is
+    # multi-GB and must be pulled before the job starts; claiming it on a runner
+    # that can no longer fit it wastes the claim. Leave the job STARTING when a
+    # known capacity is below the floor. Older runners without this telemetry
+    # remain backward-compatible eligible.
     if (job.polling_metadata or {}).get("container_image"):
         from app.orchestrator_runner_dispatch import (
             _container_image_min_free_disk_bytes,
         )
-        from app.runner_eligibility import _runner_has_free_disk
+        from app.runner_eligibility import (
+            _runner_container_image_storage,
+            _runner_has_free_disk,
+        )
 
         disk_floor = _container_image_min_free_disk_bytes()
         if not _runner_has_free_disk(runner, disk_floor):
-            reported = (runner.capabilities or {}).get("disk_free_bytes")
+            storage = _runner_container_image_storage(runner)
             logger.warning(
                 "[RUNNERS] Not dispatching container-image compute job %s to runner "
-                "%s: reports only %s free disk bytes, below the %s-byte fit floor; "
-                "leaving STARTING for re-dispatch",
+                "%s: workspace_free_bytes=%s, image_store_free_bytes=%s, "
+                "runtime=%s, path=%s; below the %s-byte fit floor; leaving STARTING "
+                "for re-dispatch",
                 job.id,
                 runner.id,
-                reported,
+                storage["workspace_free_bytes"],
+                storage["image_store_free_bytes"],
+                storage["image_store_runtime"],
+                storage["image_store_path"],
                 disk_floor,
             )
             response.status_code = status.HTTP_204_NO_CONTENT

@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Mapping
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as _pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,6 +62,9 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         # Completion-debt-ledger system description seeded by completion_debt.py.
         # God-column cutover COMPLETE: the seeder now persists SOLELY to this
         # row; the design_doc write leg is cut. Retained here for budget
+        # Durable latest request/terminal outcome for Strategic-triggered baked
+        # compute-image builds; keyed by the exact dependency hash when known.
+        "compute_image_build_state",
         # exemption / regrowth guarding during the transition (migration 0695
         # backfills and strips the stale design_doc key).
         "systems/completion-debt-ledger",
@@ -107,6 +110,8 @@ _LANE_BASELINE_VERSIONS_MAX = 20
 
 __all__ = [
     "get_project_telemetry",
+    "claim_project_telemetry_lease",
+    "compare_and_set_project_telemetry_request",
     "insert_efficiency_snapshot",
     "read_all_lane_baselines",
     "read_recent_efficiency_snapshots",
@@ -199,6 +204,92 @@ async def set_project_telemetry(
         )
     )
     await session.execute(stmt)
+
+
+async def claim_project_telemetry_lease(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    key: str,
+    value: Dict[str, Any],
+    *,
+    lease_expires_before: str,
+) -> bool:
+    """Atomically claim a telemetry-backed lease.
+
+    The row is inserted when absent. On conflict it is replaced only when the
+    existing state is terminal, stale for the caller's dependency/recipe
+    identity, has no legacy lease, or its ISO-8601 UTC lease has expired.
+    ``RETURNING`` makes a loser distinguishable without a racy follow-up read.
+    Callers commit the enclosing transaction.
+    """
+    now: datetime = _utcnow()
+    status = ProjectTelemetry.value.op("->>")("status")
+    lease_expires_at = ProjectTelemetry.value.op("->>")("lease_expires_at")
+    existing_dep_hash = ProjectTelemetry.value.op("->>")("dep_hash")
+    existing_recipe_identity = ProjectTelemetry.value.op("->>")(
+        "recipe_identity"
+    )
+    claim_conditions = [
+        status != "requested",
+        lease_expires_at.is_(None),
+        lease_expires_at < lease_expires_before,
+    ]
+    dep_hash = value.get("dep_hash")
+    if isinstance(dep_hash, str) and dep_hash:
+        claim_conditions.append(existing_dep_hash.is_(None))
+        claim_conditions.append(existing_dep_hash != dep_hash)
+    recipe_identity = value.get("recipe_identity")
+    if isinstance(recipe_identity, str) and recipe_identity:
+        claim_conditions.append(existing_recipe_identity.is_(None))
+        claim_conditions.append(existing_recipe_identity != recipe_identity)
+    stmt = (
+        pg_insert(ProjectTelemetry)
+        .values(
+            id=uuid.uuid4(),
+            project_id=project_id,
+            key=key,
+            value=value,
+            updated_at=now,
+        )
+        .on_conflict_do_update(
+            index_elements=[ProjectTelemetry.project_id, ProjectTelemetry.key],
+            set_={"value": value, "updated_at": now},
+            where=or_(*claim_conditions),
+        )
+        .returning(ProjectTelemetry.id)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
+async def compare_and_set_project_telemetry_request(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    key: str,
+    expected_request_id: str,
+    value: Dict[str, Any],
+) -> bool:
+    """Replace an active request only when *expected_request_id* still owns it.
+
+    This is the terminal-write half of a durable lease: a late worker cannot
+    overwrite a newer claim even if it read the old row beforehand. Callers
+    commit the enclosing transaction.
+    """
+    request_id = ProjectTelemetry.value.op("->>")("request_id")
+    status = ProjectTelemetry.value.op("->>")("status")
+    stmt = (
+        update(ProjectTelemetry)
+        .where(
+            ProjectTelemetry.project_id == project_id,
+            ProjectTelemetry.key == key,
+            request_id == expected_request_id,
+            status == "requested",
+        )
+        .values(value=value, updated_at=_utcnow())
+        .returning(ProjectTelemetry.id)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
 
 
 async def upsert_telemetry(

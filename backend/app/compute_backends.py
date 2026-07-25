@@ -4998,6 +4998,40 @@ async def resolve_digest_pinned_default_image(
     return manifest_name
 
 
+async def resolve_project_compute_image_dependency_identity(
+    session: Any,
+    project: "Project",
+    *,
+    manifest_fn=None,
+) -> dict[str, Any]:
+    """Read the current compute-image input identity without building or writing.
+
+    This reuses the refresh driver's canonical dependency-hash calculation with
+    builds disabled. The no-op record callback is deliberate: a status reader
+    must never mutate ``ProjectComputeImage`` merely to decide whether a prior
+    build attempt applies to the current manifest inputs.
+    """
+
+    async def _discard_record(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    result = await refresh_project_compute_image(
+        session,
+        project,
+        allow_build=False,
+        _manifest_fn=manifest_fn,
+        _record_fn=_discard_record,
+    )
+    dep_hash = result.get("dep_hash")
+    if isinstance(dep_hash, str) and dep_hash:
+        return {"dep_hash": dep_hash, "status": result.get("status")}
+    return {
+        "dep_hash": None,
+        "status": result.get("status") or "error",
+        "reason": result.get("reason") or result.get("error"),
+    }
+
+
 async def resolve_project_default_container_image(
     session: Any,
     project: Any,

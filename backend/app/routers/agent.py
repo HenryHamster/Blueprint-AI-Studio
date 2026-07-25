@@ -63,7 +63,10 @@ from app.task_capabilities import (
     agent_capability_slice,
 )
 import app.shared_state as _shared_state
-from app.compute_experiment_contract import resolve_compute_spend_approval
+from app.compute_experiment_contract import (
+    resolve_compute_spend_approval,
+    resolve_compute_spend_direction,
+)
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
 from app.artifact_prerequisites import (
     ARTIFACT_PREREQUISITES_KEY,
@@ -5635,9 +5638,14 @@ async def spawn_subtask(
                 spend_cap = float(payload.get("spend_cap_usd") or 0)
                 if spend_cap <= 0:
                     raise ValueError("spend_cap_usd must be positive")
+                direction = await resolve_compute_spend_direction(
+                    session,
+                    project_id=parent_task.project_id,
+                    context=sanitized_context,
+                )
                 task_requires_approval, _ = resolve_compute_spend_approval(
                     runtime_config=_shared_state.runtime_config,
-                    direction=None,
+                    direction=direction,
                     spend_cap_usd=spend_cap,
                 )
             except (TypeError, ValueError):

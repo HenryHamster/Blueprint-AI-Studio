@@ -1888,7 +1888,7 @@ describe('recloneResidentWorkspace', () => {
 // during a slow turn rather than silence for the full duration. The ack is
 // suppressed entirely for fast turns (timer is cleared before it fires).
 
-describe('handleStrategicResident — early operator-turn acknowledgment', () => {
+describe('handleStrategicResident — operator-turn responsiveness', () => {
   beforeEach(() => {
     mockApiGet.mockReset();
     mockApiPost.mockReset();
@@ -1903,7 +1903,7 @@ describe('handleStrategicResident — early operator-turn acknowledgment', () =>
     vi.useRealTimers();
   });
 
-  it('posts an early acknowledgment when the operator turn exceeds the configured threshold', async () => {
+  it('does not post a canned acknowledgement while a slow operator turn is in flight', async () => {
     vi.useFakeTimers();
 
     const OPERATOR_MSG = {
@@ -1953,8 +1953,8 @@ describe('handleStrategicResident — early operator-turn acknowledgment', () =>
     await vi.advanceTimersByTimeAsync(3000);
 
     // The early ack must have been posted
-    expect(strategicPosts.length).toBeGreaterThanOrEqual(1);
-    expect(JSON.stringify(strategicPosts[0])).toContain('On it');
+    expect(strategicPosts).toHaveLength(0);
+    expect(session.sendTurn).toHaveBeenCalledWith(expect.anything(), { hardTimeoutMs: 120_000 });
 
     // Resolve the slow turn; handler should proceed to the heartbeat and stop
     resolveTurn(turnResult({ sentOperatorMessage: true, resultText: 'operator reply' }));

@@ -79,7 +79,10 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
-from app.compute_experiment_contract import resolve_compute_spend_approval
+from app.compute_experiment_contract import (
+    resolve_compute_spend_approval,
+    resolve_compute_spend_direction,
+)
 from app.runtime_config_state import runtime_config as _global_runtime_config
 from app.schemas import redact_command_log_text
 from app import storage
@@ -521,21 +524,11 @@ async def _assert_compute_spend_not_gated(
     task_type = str((task.first_payload or {}).get("type") or "")
     if task_type != "compute_experiment":
         return
-    project = await session.get(Project, task.project_id)
     # Use the global runtime_config which already includes deployment-state settings.
     runtime_config: dict = dict(_global_runtime_config)
-    direction: dict | None = None
-    if project is not None:
-        direction_id = str((task.context or {}).get("direction_id") or "")
-        if direction_id:
-            direction = next(
-                (
-                    d
-                    for d in (getattr(project, "directions", None) or [])
-                    if d.get("id") == direction_id
-                ),
-                None,
-            )
+    direction = await resolve_compute_spend_direction(
+        session, project_id=task.project_id, context=task.context
+    )
     requires_approval, threshold = resolve_compute_spend_approval(
         runtime_config=runtime_config,
         direction=direction,

@@ -240,6 +240,51 @@ export function buildLocalRunnerSection(status: unknown): string {
       );
     }
   }
+  // Project-scoped runner ids make the existing compute_experiment
+  // runner_target contract usable without exposing the global fleet. This is
+  // advisory telemetry: eligibility is rechecked by dispatch when the job is
+  // claimed, so a host can change state after this prompt was built.
+  const runners: unknown[] = Array.isArray(s.runners) ? s.runners : [];
+  if (runners.length > 0) {
+    const formatBytes = (value: unknown): string | null => (
+      typeof value === 'number' && value >= 0
+        ? `${(value / (1024 ** 3)).toFixed(1)} GiB`
+        : null
+    );
+    lines.push('- Project runner inventory (use the exact UUID only when a host preference is useful):');
+    for (const entry of runners.slice(0, 8)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const r = entry as Record<string, unknown>;
+      const runnerId = typeof r.runner_id === 'string' ? r.runner_id : '';
+      if (!runnerId) continue;
+      const hostname = typeof r.hostname === 'string' && r.hostname ? r.hostname : `runner-${runnerId.slice(0, 8)}`;
+      const persistedStatus = typeof r.status === 'string' ? r.status : 'unknown';
+      // A row can remain status=active after its heartbeat has expired. Never
+      // present that stale persisted state as evidence that the host is usable.
+      const state = r.live === true ? 'LIVE' : `STALE/OFFLINE (persisted status: ${persistedStatus})`;
+      const heartbeat = typeof r.last_heartbeat_at === 'string' ? `; last heartbeat ${r.last_heartbeat_at}` : '';
+      const gpuCount = typeof r.gpu_count === 'number' ? r.gpu_count : 0;
+      const container = r.container_ok === true
+        ? (r.gpu_in_container_ok === true ? 'containers+GPU OK' : 'containers OK, GPU passthrough unverified')
+        : 'no container runtime';
+      const active = typeof r.active_compute_jobs === 'number' ? r.active_compute_jobs : 0;
+      const max = typeof r.max_concurrent_compute === 'number' ? r.max_concurrent_compute : null;
+      const workspace = formatBytes(r.workspace_free_bytes) ?? formatBytes(r.disk_free_bytes);
+      const imageStore = formatBytes(r.container_image_store_free_bytes);
+      const storage = [
+        workspace ? `workspace/disk ${workspace}` : null,
+        imageStore ? `image store ${imageStore}` : null,
+      ].filter((part): part is string => part !== null).join(', ');
+      lines.push(
+        `  - ${hostname} [${runnerId}]: ${state}${heartbeat}; ${gpuCount} GPU(s); ${container}; `
+        + `compute ${active}${max !== null ? `/${max}` : ''}`
+        + (storage ? `; ${storage}` : ''),
+      );
+    }
+    lines.push(
+      '  To prefer one listed host, add `"runner_target": {"runner_id": "<UUID>", "strict": false}` to a compute_experiment spawn. Soft is the default: dispatch falls back when that host is busy/offline. Use `strict: true` ONLY when the experiment genuinely cannot run on another allowed runner; it intentionally waits for that exact host.',
+    );
+  }
   // Per-device hardware detail (backend-bounded per-runner AND in total under
   // the experiment-authoring shared budget) so the strategist can reason about
   // VRAM fit, device counts, and container capability when sizing experiments.
@@ -1248,6 +1293,36 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       one deadline-sized run; keep the artifact dir small (~25 MiB
 #                       upload cap); prefer a repo harness/experiment entrypoint
 #                       when one exists over inlining a bespoke pipeline.
+# Durable outputs (models, checkpoints, trained weights, generated datasets,
+# or any result the request says to retain): author the compute_experiment with
+# require_durable_artifact: true AND have its ordinary command copy the selected
+# outputs into '$BLUEPRINT_ARTIFACT_DIR' before exiting. Put a small manifest.json
+# there naming the retained files, their purpose, and the load/reproduction
+# command. Training-like work should normally do this; write checkpoints directly
+# there or copy the final selected checkpoint there. The platform already collects
+# this directory, and require_durable_artifact makes a missing/empty delivery a
+# loud failed result. Do not invent a second training or upload path; keep only
+# the useful, bounded files (artifact upload cap is about 25 MiB).
+# Project compute-image environment (only when a workload actually needs a
+# container-only runtime such as CUDA/framework libraries): run
+# './compute-image status' before authoring the launch. It returns one of four
+# actionable states:
+#   - ready: a digest-pinned project image is available; OMIT container_image so
+#     the platform selects it automatically.
+#   - missing_but_dockerfile_candidate: spawn a one-time create/refactor task to
+#     add the returned 'manifest_template' to '.blueprint/tools.json'; do not
+#     improvise a Docker build in a compute command.
+#   - declared_needs_build: the recipe is already in the repo; run
+#     './compute-image build' ONCE. It returns accepted/reused promptly; do NOT
+#     wait or foreground-poll it. Re-check status in a later resident turn
+#     before launching. 'build_status: requested' means the request was saved,
+#     not that a worker is definitely still alive. A 'last_build_outcome' is
+#     shown only when it belongs to the current recipe inputs; resolve its
+#     deferred/error cause before one later request if needed, never retry in a
+#     loop.
+#   - no_candidate: no credible repository Dockerfile was found. Bare compute is
+#     still valid; do NOT block a normal command or manufacture an image solely
+#     to satisfy this resolver.
 # web_research and design are HIGH-ROI and chronically under-used: one durable
 # knowledge document de-risks every later task in the area and compounds across
 # cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:

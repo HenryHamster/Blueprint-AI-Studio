@@ -266,7 +266,8 @@
         "exhausted-attempts fallback with no exchange text produces [exchange text unavailable] in the note",
         "id-less overflow sentinel: repeated escape-hatch trips through the handler loop produce at most one decisions-register entry (sentinelKey dedup guard)",
         "throws rather than re-cloning when no read token can be minted",
-        "posts an early acknowledgment when the operator turn exceeds the configured threshold",
+        "does not post a canned acknowledgement while a slow operator turn is in flight",
+        "sends the first text-only operator turn as one stream-json content item",
         "does not post an early ack when the turn completes before the threshold elapses",
         "completes normally when the early ack post fails",
         "does not persist or mark an operator message handled after a provider error",
@@ -349,7 +350,7 @@
       "test_ids": [
         "uses contract defaults when the payload omits the knobs",
         "reads the payload knobs (seconds → ms)",
-        "disables early ack when threshold is set to 0 or negative, and clamps to 1s floor",
+        "keeps canned acknowledgements disabled regardless of stale payload settings",
         "clamps to safe minimums",
         "never polls slower than the idle heartbeat tick",
         "minTickMs is never below the idle tick",

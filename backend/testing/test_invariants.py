@@ -13408,7 +13408,7 @@ class TestProblemModelWritePathInvariants:
         # lifecycle.py: sanitize_problem_model_raw caller
         ("lifecycle.py", 369): "sanitize_problem_model_raw(dict(project.problem_model))",
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1062): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", 1064): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
         ("direction_lifecycle.py", 812): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)

@@ -1013,6 +1013,36 @@ class TestAgentWorkspace(unittest.TestCase):
                 local_runner._cleanup_agent_workspace("never-made")  # no raise
 
 
+class TestContainerImageStore(unittest.TestCase):
+    def test_docker_store_reports_its_own_filesystem_capacity(self):
+        result = MagicMock(returncode=0, stdout="/var/lib/docker\n")
+        # Unit tests execute on Windows while production Docker runners are
+        # commonly Linux; model Docker's Linux data-root explicitly.
+        with patch.object(local_runner.os.path, "isabs", return_value=True), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=22_000) as free:
+            store = local_runner._container_image_store(
+                _docker_caps(), _run=lambda *args, **kwargs: result
+            )
+
+        self.assertEqual(
+            store,
+            {
+                "runtime": iso.BACKEND_DOCKER,
+                "root": "/var/lib/docker",
+                "free_bytes": 22_000,
+            },
+        )
+        free.assert_called_once_with("/var/lib/docker")
+
+    def test_container_store_rejects_nonlocal_runtime_path(self):
+        result = MagicMock(returncode=0, stdout="relative/docker-root\n")
+        self.assertIsNone(
+            local_runner._container_image_store(
+                _docker_caps(), _run=lambda *args, **kwargs: result
+            )
+        )
+
+
 class TestLowDiskGuard(unittest.TestCase):
     def test_min_free_disk_bytes_parses_env(self):
         with patch.dict(os.environ, {"BLUEPRINT_RUNNER_MIN_DISK_BYTES": "2048"}):
@@ -1025,6 +1055,25 @@ class TestLowDiskGuard(unittest.TestCase):
         with patch.dict(os.environ, {"BLUEPRINT_RUNNER_MIN_DISK_BYTES": "notanint"}):
             self.assertEqual(local_runner._min_free_disk_bytes(), 0)
 
+    def test_container_image_reclaim_floor_defaults_to_10_gib(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BLUEPRINT_RUNNER_MIN_DISK_BYTES", None)
+            os.environ.pop("BLUEPRINT_RUNNER_CONTAINER_IMAGE_MIN_DISK_BYTES", None)
+            self.assertEqual(
+                local_runner._container_image_reclaim_min_free_bytes(),
+                10_737_418_240,
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "BLUEPRINT_RUNNER_MIN_DISK_BYTES": "12",
+                "BLUEPRINT_RUNNER_CONTAINER_IMAGE_MIN_DISK_BYTES": "2048",
+            },
+        ):
+            self.assertEqual(
+                local_runner._container_image_reclaim_min_free_bytes(),
+                10_737_418_240,
+            )
     def test_guard_disabled_when_threshold_zero(self):
         # Even with a tiny reported free space, threshold 0 never guards.
         with patch.object(local_runner, "_disk_free_bytes", return_value=1):
@@ -1180,6 +1229,71 @@ class TestHostLoadThrottle(unittest.TestCase):
             t.join(timeout=2)
         self.assertEqual(prune_images.call_count, 1)
         self.assertGreaterEqual(post.call_count, 1)
+
+    def test_low_docker_store_reclaims_without_blocking_workspace_safe_poll(self):
+        """A low Docker root triggers cleanup, but imageless work still polls.
+
+        The server will keep container-image jobs queued until the next heartbeat
+        reports the reclaimed root. This runner-side loop must nevertheless run
+        cleanup even though no image job is currently claimable.
+        """
+        calls = []
+        telemetry = local_runner._TelemetryState()
+
+        def fake_post(*_args, **_kwargs):
+            calls.append("poll")
+            local_runner._shutdown_event.set()
+            return (204, None, None)
+
+        store = {
+            "runtime": iso.BACKEND_DOCKER,
+            "root": "/var/lib/docker",
+            "free_bytes": 500,
+        }
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=None), \
+             patch.object(local_runner, "_workspace_root", return_value="/work"), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000), \
+             patch.object(
+                 local_runner,
+                 "_container_image_reclaim_min_free_bytes",
+                 return_value=1_000,
+             ), \
+             patch.object(local_runner, "_container_image_store", return_value=store), \
+             patch.object(
+                 local_runner,
+                 "_disk_below_min",
+                 side_effect=lambda root, _floor: root == "/var/lib/docker",
+             ), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=2_000), \
+             patch.object(
+                 local_runner,
+                 "_prune_docker_images",
+                 return_value={
+                     "reason": "removed_stale",
+                     "pruned": True,
+                     "removed": 2,
+                     "kept": 1,
+                     "in_use_skipped": 0,
+                 },
+             ) as prune_images, \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            local_runner._compute_poll_loop(
+                "http://test",
+                "tok",
+                active_jobs,
+                lock,
+                1,
+                base_poll_interval=0.001,
+                capabilities=_docker_caps(),
+                telemetry=telemetry,
+            )
+
+        self.assertEqual(calls, ["poll"])
+        prune_images.assert_called_once_with("/var/lib/docker", 1_000)
+        self.assertEqual(
+            telemetry.container_image_reclaim_snapshot()["free_bytes_after"], 2_000
+        )
 
     def test_disk_ok_allows_compute_claim(self):
         """Compute poll proceeds when workspace free disk is above the guard."""
