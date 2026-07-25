@@ -8,6 +8,8 @@ or that there is no credible Dockerfile candidate to act on.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -65,6 +67,18 @@ def _suggested_image_name(project: "Project") -> str:
     if not slug:
         slug = f"project-{str(getattr(project, 'id', 'image'))[:8]}"
     return f"{resolve_compute_image_registry_repo()}/{slug}:latest"
+
+
+def _build_recipe_identity(compute_image: dict[str, Any]) -> str:
+    """Return a stable opaque fingerprint of the complete declared build config."""
+    payload = {
+        "name": compute_image.get("name"),
+        "build": compute_image.get("build"),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 async def _list_project_paths(project: "Project") -> list[str] | None:
@@ -148,6 +162,7 @@ async def resolve_project_compute_image_environment(
                 "action": "build",
                 "manifest_image": compute_image["name"],
                 "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
+                "build_recipe_identity": _build_recipe_identity(compute_image),
                 "next_step": "Run ./compute-image build, then re-check status before launching.",
                 **({"reason": resolution_error} if resolution_error else {}),
             }

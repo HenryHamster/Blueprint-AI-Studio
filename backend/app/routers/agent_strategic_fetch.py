@@ -74,8 +74,10 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _compute_image_recipe_identity(environment: dict[str, Any]) -> str:
-    """Fingerprint the declared recipe without treating it as a build hash."""
+def _compute_image_recipe_identity(
+    environment: dict[str, Any], manifest: dict[str, Any] | None = None
+) -> str:
+    """Fingerprint build inputs when a full dependency hash is unavailable."""
     payload = {
         key: environment.get(key)
         for key in (
@@ -86,7 +88,21 @@ def _compute_image_recipe_identity(environment: dict[str, Any]) -> str:
             "candidate_dockerfile",
         )
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    resolver_identity = environment.get("build_recipe_identity")
+    if isinstance(resolver_identity, str) and resolver_identity:
+        payload["build_recipe_identity"] = resolver_identity
+    else:
+        compute = manifest.get("compute") if isinstance(manifest, dict) else None
+        image = compute.get("image") if isinstance(compute, dict) else None
+        if isinstance(image, dict):
+            # Hash the complete declared build configuration. It covers recipe
+            # changes such as dependency files, parent images, and build args even
+            # when a transient manifest/dependency probe prevented a dep_hash.
+            payload["manifest_image"] = image.get("name")
+            payload["manifest_build"] = image.get("build")
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -324,15 +340,31 @@ async def _request_agent_compute_image_build(
     manifest_fn=None,
 ) -> str:
     """Claim a durable lease, then start one detached worker if we own it."""
-    existing = _agent_compute_image_build_tasks.get(project.id)
-    if existing is not None and not existing.done():
-        return "already_requested"
-
     from app.compute_backends import resolve_project_compute_image_dependency_identity
+
+    manifest: dict[str, Any] | None = None
+    if manifest_fn is not None:
+        try:
+            candidate = await manifest_fn(project)
+            if isinstance(candidate, dict):
+                manifest = candidate
+        except Exception:  # noqa: BLE001 - identity resolver records the failure
+            logger.warning(
+                "[COMPUTE-IMAGE] unable to read build manifest for lease: project=%s",
+                project.id,
+                exc_info=True,
+            )
+
+    async def cached_manifest(project_arg: Project) -> dict[str, Any]:
+        if manifest is not None:
+            return manifest
+        if manifest_fn is not None:
+            return await manifest_fn(project_arg)
+        return {}
 
     try:
         identity = await resolve_project_compute_image_dependency_identity(
-            session, project, manifest_fn=manifest_fn
+            session, project, manifest_fn=cached_manifest
         )
     except Exception:  # noqa: BLE001 - failure becomes an actionable terminal result
         logger.warning(
@@ -347,7 +379,7 @@ async def _request_agent_compute_image_build(
         project.id,
         request_id,
         dep_hash=identity.get("dep_hash"),
-        recipe_identity=_compute_image_recipe_identity(environment),
+        recipe_identity=_compute_image_recipe_identity(environment, manifest),
         identity_reason=identity.get("reason"),
     )
     if not claimed:
