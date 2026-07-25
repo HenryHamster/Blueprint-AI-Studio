@@ -51,7 +51,7 @@ RUN apt-get update \
 # compatibility and its platform-native optional package are dispatch-critical;
 # an unpinned rebuild or npm configured with omit=optional can leave a PATH shim
 # that crashes before inference.
-ARG CLAUDE_CODE_VERSION=2.1.197
+ARG CLAUDE_CODE_VERSION=2.1.219
 ARG CODEX_VERSION=0.144.1
 ARG GEMINI_VERSION=latest
 # The version smoke enters Codex's JS-shim -> native-package startup path

@@ -62,26 +62,33 @@ def _make_fake_gcp_harness():
 
 def test_build_duration_raises_on_missing_protobuf(monkeypatch):
     """_build_duration must raise ImportError when google.protobuf is absent."""
-    # Remove google.protobuf from sys.modules so the lazy import fails
-    saved = {}
+    # Hide google.protobuf so the lazy import inside _build_duration fails.
+    #
+    # monkeypatch must own EVERY sys.modules mutation here. A manual
+    # pop/restore mixed with monkeypatch.setitem leaves the interpreter in a
+    # broken state: the manual `finally` restore runs first, then monkeypatch
+    # undo deletes "google.protobuf" because the key was already absent when
+    # setitem recorded it. That strands live submodules (google.protobuf.message,
+    # .json_format, ...) in sys.modules while their parent package is gone, so
+    # the next `import google.protobuf` builds a *fresh* package object whose
+    # submodule attributes are never re-bound -- and every later google.cloud
+    # import in the session dies on
+    # `AttributeError: module 'google.protobuf' has no attribute 'message'`.
+    # monkeypatch undoes in LIFO order, so delitem-then-setitem on the same key
+    # unwinds correctly.
     for key in list(sys.modules):
         if key == "google.protobuf" or key.startswith("google.protobuf."):
-            saved[key] = sys.modules.pop(key)
+            monkeypatch.delitem(sys.modules, key)
 
     # Also stub google so the import path resolves up to the point of the sub-import
     google_stub = types.ModuleType("google")
     monkeypatch.setitem(sys.modules, "google", google_stub)
     monkeypatch.setitem(sys.modules, "google.protobuf", None)  # type: ignore[arg-type]
 
-    try:
-        from app.compute_cloud_run import _build_duration
+    from app.compute_cloud_run import _build_duration
 
-        with pytest.raises(ImportError, match=r"google\.protobuf"):
-            _build_duration(300)
-    finally:
-        # Restore saved modules
-        for key, mod in saved.items():
-            sys.modules[key] = mod
+    with pytest.raises(ImportError, match=r"google\.protobuf"):
+        _build_duration(300)
 
 
 def test_no_plaintext_credentials_in_env_overrides(monkeypatch):

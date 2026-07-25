@@ -5690,6 +5690,27 @@ async def test_medium_scope_without_expansion_ratio_history_stays_medium(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+async def _seed_cochange_index(db_session, project, cochange_index: dict) -> None:
+    """Seed the co-change affinity index where the decomposition path reads it.
+
+    ``research_completion`` resolves the index through
+    ``direction_outcomes.read_cochange_index``, which reads the
+    ``project_telemetry`` ``cochange_state`` row only — the legacy
+    ``design_doc['cochange_index']`` fallback leg was removed in #16376.
+    Seeding design_doc leaves the index empty at the read site, which silently
+    turns every decomposition assertion into a no-op.
+    """
+    from app.project_telemetry import upsert_telemetry
+
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        "cochange_state",
+        {"index": cochange_index, "applied_prs": []},
+    )
+    await db_session.flush()
+
+
 @pytest.mark.asyncio
 async def test_medium_with_independent_clusters_decomposes_to_smalls(
     db_session, mocker, monkeypatch
@@ -5714,11 +5735,11 @@ async def test_medium_with_independent_clusters_decomposes_to_smalls(
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
-        design_doc={"cochange_index": cochange_index},
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_cochange_index(db_session, project, cochange_index)
 
     task = await _make_research_task(project, direction, db_session)
     finding = _make_finding(
@@ -5766,11 +5787,11 @@ async def test_medium_with_single_cluster_stays_medium(db_session, mocker, monke
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
-        design_doc={"cochange_index": cochange_index},
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_cochange_index(db_session, project, cochange_index)
 
     task = await _make_research_task(project, direction, db_session)
     finding = _make_finding(
@@ -5811,11 +5832,13 @@ async def test_medium_skips_decomposition_when_cochange_is_sparse(
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
-        design_doc={"cochange_index": {"unrelated.py": {"other.py": 2.0}}},
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_cochange_index(
+        db_session, project, {"unrelated.py": {"other.py": 2.0}}
+    )
 
     task = await _make_research_task(project, direction, db_session)
     finding = _make_finding("New area no history", direction["id"], scope="medium")

@@ -17,6 +17,34 @@ from app.auth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _undo_auth_module_reload():
+    """Undo the ``importlib.reload(app.auth)`` calls this module performs.
+
+    Tests here reload ``app.auth`` to re-evaluate its module-level env reads
+    (``ADMIN_JWT_SECRET`` and friends) under a monkeypatched environment. The
+    reload re-executes the module *in place*, which leaks two ways once the
+    test finishes:
+
+    1. Every top-level name is rebound to a **new** object. Routes registered
+       on ``app.main.app`` still hold the originals, so identity comparisons
+       against ``app.auth.require_admin`` / ``get_current_user`` /
+       ``get_metrics_reader`` stop matching -- ``test_invariants`` then reports
+       that admin-surface routes have no recognized auth dependency.
+    2. Env-derived module constants keep the *test's* values (the last reload
+       leaves ``_CRANKED_admin_jwt_secret`` holding a throwaway secret), so
+       later admin-authenticated requests in other files fail with 401.
+
+    Snapshotting and restoring ``__dict__`` reverses the reload completely.
+    """
+    from app import auth as auth_mod
+
+    original = dict(auth_mod.__dict__)
+    yield
+    auth_mod.__dict__.clear()
+    auth_mod.__dict__.update(original)
+
+
 def _creds(token="fake-firebase-token"):
     return HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
 
