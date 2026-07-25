@@ -899,8 +899,13 @@ export async function handleStrategicResident(
     });
   };
   const invalidateSessionEvents = (): void => { sessionEventEpoch += 1; };
+  // The operator response target is a UI/progress SLO, never a cancellation
+  // deadline. Use the deeper autonomous no-output budget for the subprocess
+  // watchdog, while the session provider keeps its independent 15-minute hard
+  // backstop for a genuinely non-terminating child.
+  const sessionStallTimeoutMs = Math.max(cfg.turnTimeoutMs, cfg.autonomousTurnTimeoutMs);
   let session: ResidentSession = startResidentClaudeSession({
-    model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+    model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
   });
   bindSessionEvents(session);
 
@@ -980,8 +985,9 @@ export async function handleStrategicResident(
     } else {
       streamer.working();
     }
-    // Autonomous turns get a deeper per-turn stall budget so a long read/verify
-    // step isn't killed mid-thought; operator turns keep the responsive default.
+    // All turns get the same no-output budget. The shorter operator response
+    // target below is progress-only, so a slow healthy reply cannot terminate
+    // the resident.
     let residentInput: string | Array<Record<string, unknown>>;
     if (Array.isArray(full)) {
       const materialized = await materializeContentBlocks(full);
@@ -989,23 +995,27 @@ export async function handleStrategicResident(
     } else {
       residentInput = full;
     }
-    const turnOptions = operator
-      ? { hardTimeoutMs: cfg.turnTimeoutMs }
-      : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs };
-    const r = await session.sendTurn(residentInput, turnOptions);
-    streamer.flush();
-    streamer.done();
-    recordResidentTurnLatency({
-      kind: operator ? 'operator' : 'autonomous',
-      turnMs: r.turnMs,
-      ttftMs: r.ttftMs,
-      interrupted: r.interrupted,
-      toolCallCount: r.toolCallCount,
-      toolCallDurationMs: r.totalToolCallDurationMs,
-      meanInterTokenMs: r.meanInterTokenMs,
-      pickupLagMs: pickupLagMs ?? null,
-    });
-    return r;
+    const slowResponseTimer = operator
+      ? setTimeout(() => streamer.status('still working on your response'), cfg.turnTimeoutMs)
+      : null;
+    try {
+      const r = await session.sendTurn(residentInput, { stallTimeoutMs: sessionStallTimeoutMs });
+      streamer.flush();
+      streamer.done();
+      recordResidentTurnLatency({
+        kind: operator ? 'operator' : 'autonomous',
+        turnMs: r.turnMs,
+        ttftMs: r.ttftMs,
+        interrupted: r.interrupted,
+        toolCallCount: r.toolCallCount,
+        toolCallDurationMs: r.totalToolCallDurationMs,
+        meanInterTokenMs: r.meanInterTokenMs,
+        pickupLagMs: pickupLagMs ?? null,
+      });
+      return r;
+    } finally {
+      if (slowResponseTimer) clearTimeout(slowResponseTimer);
+    }
   };
 
   // Evaluate a completed turn for a wedged/stalled session. Returns true when the
@@ -1079,7 +1089,7 @@ export async function handleStrategicResident(
     session.close();
     try {
       const newSession = startResidentClaudeSession({
-        model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+        model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
       });
       bindSessionEvents(newSession);
       session = newSession;
@@ -1147,7 +1157,7 @@ export async function handleStrategicResident(
     compactionCount += 1;
 
     const newSession = startResidentClaudeSession({
-      model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+      model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
     });
     // Wire the same event listeners so the streamer keeps receiving deltas.
     bindSessionEvents(newSession);
@@ -1723,7 +1733,7 @@ export async function handleStrategicResident(
           invalidateSessionEvents();
           session.close();
           const recoverySession = startResidentClaudeSession({
-            model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+            model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
           });
           bindSessionEvents(recoverySession);
           session = recoverySession;

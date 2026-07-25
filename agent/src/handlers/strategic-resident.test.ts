@@ -1958,7 +1958,7 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
 
     // The early ack must have been posted
     expect(strategicPosts).toHaveLength(0);
-    expect(session.sendTurn).toHaveBeenCalledWith(expect.anything(), { hardTimeoutMs: 120_000 });
+    expect(session.sendTurn).toHaveBeenCalledWith(expect.anything(), { stallTimeoutMs: 300_000 });
 
     // Resolve the slow turn; handler should proceed to the heartbeat and stop
     resolveTurn(turnResult({ sentOperatorMessage: true, resultText: 'operator reply' }));

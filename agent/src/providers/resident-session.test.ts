@@ -449,16 +449,14 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
-  it('interrupt writes a control_request and marks the turn interrupted', async () => {
+  it('interrupt uses SIGINT without writing an unsupported control frame', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
     const session = startResidentClaudeSession({});
     const turn = session.sendTurn('long task');
     session.interrupt();
-    const controlWrite = ctl.stdinWrites.find((w) => w.includes('control_request'));
-    expect(controlWrite).toBeTruthy();
-    const parsed = JSON.parse((controlWrite as string).trim()) as { request?: unknown };
-    expect(parsed.request).toEqual({ subtype: 'interrupt' });
+    expect(ctl.stdinWrites.some((w) => w.includes('control_request'))).toBe(false);
+    expect(process.kill).toHaveBeenCalledWith(4242, 'SIGINT');
     ctl.pushLine({ type: 'result', result: 'stopped' });
     const r = await turn;
     expect(r.interrupted).toBe(true);
