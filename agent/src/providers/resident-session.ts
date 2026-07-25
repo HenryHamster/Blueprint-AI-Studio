@@ -258,6 +258,15 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (matchesAuthFailure(text, runner.provider)) return 'dead_auth';
     return null;
   };
+  // Claude's OAuth weekly-limit banner is sometimes emitted as an ordinary
+  // assistant text frame before the CLI exits. Keep this deliberately narrow:
+  // a model discussing rate limits must not be mistaken for an operational
+  // failure, but the provider's exact "You've hit your weekly limit" wording
+  // must never become a Strategic reply.
+  const isOAuthQuotaBanner = (text: string): boolean => (
+    matchesRateLimit(text, runner.provider, runner.authMode)
+    && /\byou(?:'|’)ve hit your (?:weekly|usage) limit\b|\byou have hit your (?:weekly|usage) limit\b/i.test(text)
+  );
   const clearFailureEvidence = (): void => {
     failureTextTail = '';
     terminalFailureCategory = null;
@@ -394,6 +403,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   };
 
   const handleEvent = (ev: ResidentStreamEvent): void => {
+    const textQuotaBanner = ev.kind === 'text'
+      && typeof ev.text === 'string'
+      && isOAuthQuotaBanner(ev.text);
     if (
       staleResultsPending === 0
       && !ev.nested
@@ -404,6 +416,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       // exhausted account.
       && (ev.kind === 'error'
         || ev.kind === 'other'
+        || textQuotaBanner
         || (ev.kind === 'result' && ev.isError && ev.isTurnResult)) && ev.text
     ) {
       appendFailureText(ev.text);
@@ -415,6 +428,13 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       }
     }
     if (ev.sessionId && !sessionId) sessionId = ev.sessionId;
+    if (textQuotaBanner) {
+      // The banner is a provider failure, not conversation content. Settling
+      // immediately lets the resident handler publish `rate_limited` and
+      // release/blacklist the account without waiting for the CLI to exit.
+      if (activeTurn) settleTurn('', false);
+      return;
+    }
     // Superseded-turn suppression. When a turn was force-settled (stall path)
     // while the child stayed alive, that abandoned turn still owes exactly one
     // top-level `result` (staleResultsPending) — and, because the child emits

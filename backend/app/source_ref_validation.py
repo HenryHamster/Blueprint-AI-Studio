@@ -1047,6 +1047,16 @@ async def resolve_branch_verification_context(
     branch-only dict is returned so callers fall back to local git HEAD.
     """
     from app.branch_resolution import get_project_integration_branch
+    from sqlalchemy import inspect as sa_inspect
+
+    # This resolver is called from request and worker sessions whose identity
+    # maps may already contain a deliberately narrow Project projection. A
+    # later session.get() returns that same partial instance without querying,
+    # so refresh the one branch column this function owns before synchronous
+    # branch resolution touches a raiseload descriptor.
+    state = sa_inspect(project, raiseerr=False)
+    if state is not None and "integration_branch" in state.unloaded:
+        await session.refresh(project, attribute_names=["integration_branch"])
 
     ctx: Dict[str, str] = {
         "branch": get_project_integration_branch(project),
