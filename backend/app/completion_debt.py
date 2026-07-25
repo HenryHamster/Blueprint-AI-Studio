@@ -830,6 +830,47 @@ def _apply_resolution(entry, reason: str | None) -> None:
         entry.resolution_reason = str(reason)[:_MAX_TITLE_LEN]
 
 
+def resolve_completion_debt(
+    session: Any,
+    dedupe_key: str,
+    *,
+    reason: str | None = None,
+) -> bool:
+    """Best-effort resolve of an OPEN debt entry (SYNC session).
+
+    Returns ``True`` iff an open row was found and flipped to resolved. Never
+    raises. A missing or already-resolved entry is a no-op. A sync session
+    handed an ``AsyncSession`` cleanly no-ops (returns ``False``).
+    """
+    if not dedupe_key or session is None:
+        return False
+    if _is_async_session(session):
+        return False
+    try:
+        from app.models import CompletionDebtEntry
+
+        entry = session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == dedupe_key,
+                CompletionDebtEntry.status == STATUS_OPEN,
+            )
+        ).scalar_one_or_none()
+        if entry is None:
+            return False
+        with session.begin_nested():
+            _apply_resolution(entry, reason)
+            session.add(entry)
+            session.flush()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to resolve debt (key=%s)",
+            dedupe_key,
+            exc_info=True,
+        )
+        return False
+
+
 async def aresolve_completion_debt(
     session: Any,
     dedupe_key: str,
@@ -1125,6 +1166,7 @@ def _build_completion_debt_design_doc_section() -> dict:
         "reconciliation_surfaces": [
             "knob graduation via admin settings endpoint resolves dormant-knob debt",
             "decided capability verdicts resolve capability-trial debt",
+            "a verified real-test run via record_no_ci_gate_runtime auto-resolves no_ci_gate debt",
             "a passing normal qualification gate resolves hotfix-deploy backfill debt",
             "adding a discoverable covering test file resolves capability earn obligation debt",
         ],

@@ -328,6 +328,7 @@ def record_no_ci_gate_runtime(
             pass
         if db_session is not None:
             db_session.add(project)
+            _pid = getattr(project, "id", None)
             # Completion-debt ledger: a fall-open to an UNVERIFIED merge is a
             # standing obligation (the no-CI gate owes an enforce decision).
             # Best-effort and deduped per project so repeated fall-opens keep a
@@ -340,7 +341,6 @@ def record_no_ci_gate_runtime(
                         KIND_NO_CI_GATE,
                     )
 
-                    _pid = getattr(project, "id", None)
                     record_completion_debt(
                         db_session,
                         dedupe_key=f"no_ci_gate:{_pid}",
@@ -349,6 +349,20 @@ def record_no_ci_gate_runtime(
                         project_id=_pid,
                         source="ci_resolution",
                         detail={"last_unverified_reason": str(unverified_reason)},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            elif executed_real_tests:
+                # A verified real-test run discharges any open no_ci_gate debt
+                # for this project — the gate's recovery proves the obligation
+                # was met. Best-effort: never raises, skips missing/resolved rows.
+                try:
+                    from app.completion_debt import resolve_completion_debt
+
+                    resolve_completion_debt(
+                        db_session,
+                        f"no_ci_gate:{_pid}",
+                        reason="verified_recovery",
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -411,6 +425,7 @@ async def arecord_no_ci_gate_runtime(
             pass
         if db_session is not None:
             db_session.add(project)
+            _pid = getattr(project, "id", None)
             if unverified_reason:
                 try:
                     from app.completion_debt import (
@@ -418,7 +433,6 @@ async def arecord_no_ci_gate_runtime(
                         KIND_NO_CI_GATE,
                     )
 
-                    _pid = getattr(project, "id", None)
                     await arecord_completion_debt(
                         db_session,
                         dedupe_key=f"no_ci_gate:{_pid}",
@@ -427,6 +441,20 @@ async def arecord_no_ci_gate_runtime(
                         project_id=_pid,
                         source="ci_resolution",
                         detail={"last_unverified_reason": str(unverified_reason)},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            elif executed_real_tests:
+                # A verified real-test run discharges any open no_ci_gate debt
+                # for this project — the gate's recovery proves the obligation
+                # was met. Best-effort: never raises, skips missing/resolved rows.
+                try:
+                    from app.completion_debt import aresolve_completion_debt
+
+                    await aresolve_completion_debt(
+                        db_session,
+                        f"no_ci_gate:{_pid}",
+                        reason="verified_recovery",
                     )
                 except Exception:  # noqa: BLE001
                     pass
