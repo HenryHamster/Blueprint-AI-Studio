@@ -202,7 +202,8 @@
         "test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_start_works",
         "test_start_adopts_task_and_liveness_heartbeat_preserves_lease",
         "test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears",
-        "test_reload_ensure_replaces_worker_stale_past_ui_threshold",
+        "test_reload_ensure_keeps_worker_during_transient_heartbeat_gap",
+        "test_reload_ensure_replaces_worker_stale_past_recovery_threshold",
         "test_stop_ends_task_releases_continuation_and_hands_off_messages",
         "test_stop_handoff_is_atomic_with_session_end",
         "test_unattended_cap_persists_message_handoff",
@@ -282,7 +283,8 @@
         "does not restart or mask a queued-message child close classified as %s",
         "re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
         "retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects",
-        "splits an aggregate required-image overflow into bounded same-timestamp model turns"
+        "splits an aggregate required-image overflow into bounded same-timestamp model turns",
+        "sends the first text-only operator turn as one stream-json content item"
       ]
     },
     {

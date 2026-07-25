@@ -506,14 +506,55 @@ async def test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears(
 
 
 @pytest.mark.asyncio
-async def test_reload_ensure_replaces_worker_stale_past_ui_threshold(db_session):
+async def test_reload_ensure_keeps_worker_during_transient_heartbeat_gap(db_session):
     project = await _make_project(db_session)
     old_task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
-    stale_at = _utcnow() - timedelta(seconds=91)
+    # A resident heartbeat can be delayed by a bounded API retry cycle. This
+    # was the production false-positive: the generic task heartbeat was still
+    # fresh, but the 90-second resident-only cutoff cancelled the live worker.
+    delayed_at = _utcnow() - timedelta(seconds=91)
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.IN_PROGRESS
+    old_task.last_heartbeat = _utcnow()
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob["worker_heartbeat_at"] = delayed_at.isoformat()
+    blob["updated_at"] = delayed_at.isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    reused = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert reused["session_id"] == started["session_id"]
+    assert reused["worker_generation"] == started["worker_generation"]
+    assert reused["task_id"] == started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_reload_ensure_replaces_worker_stale_past_recovery_threshold(db_session):
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
 
     old_task = await db_session.get(Task, old_task.id)
     old_task.status = TaskStatus.IN_PROGRESS

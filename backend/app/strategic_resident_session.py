@@ -128,7 +128,14 @@ _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 14400  # 4h
 # A task row can remain IN_PROGRESS long after its resident subprocess or runner
 # disappeared. Workday's synchronous ensure path must not trust that row
 # forever: a worker is healthy only while its task heartbeat is recent.
-_RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS = 90
+#
+# The resident heartbeat uses the bounded two-attempt / 10-second API policy.
+# apiRequest has separate header and body deadlines, so a transient failing
+# cycle can legitimately consume a little over 40 seconds before the loop can
+# make its next attempt. Keep enough room for three full cycles plus scheduling
+# slack; otherwise a healthy resident is cancelled while its generic task
+# heartbeat and runner both remain live.
+_RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS = 180
 
 # A provisional spawn-claim (an active session blob whose ``task_id`` is still
 # None because the spawn is in flight) blocks a concurrent start from spawning a
