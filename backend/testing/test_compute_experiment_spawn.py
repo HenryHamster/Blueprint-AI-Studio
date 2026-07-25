@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
+from sqlalchemy.orm import defer
 
 from app import compute_jobs
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
@@ -111,6 +112,47 @@ def test_author_contract_tolerates_non_dict_nested():
     }
     contract = _author_compute_launch_contract(finding)
     assert contract["command"] == "run"
+
+
+@pytest.mark.asyncio
+async def test_spend_direction_lookup_is_optional_and_raiseload_safe(db_session):
+    """A direction override is used when present, never required for compute."""
+    from sqlalchemy.exc import InvalidRequestError
+
+    from app.compute_experiment_contract import resolve_compute_spend_direction
+
+    project = Project(
+        name="Spend direction lookup",
+        user_id="test-user",
+        directions=[
+            {"id": "gpu-benchmark", "compute_experiment_spend_threshold_usd": 7.5}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    # Simulate the partial Project instances used by agent/dispatcher queries.
+    # Traversing ``project.directions`` would raise, but the resolver selects the
+    # JSON column directly and thus remains usable on the ordinary launch path.
+    db_session.expire(project, ["directions"])
+    partial = (
+        await db_session.execute(
+            select(Project)
+            .where(Project.id == project.id)
+            .options(defer(Project.directions, raiseload=True))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    with pytest.raises(InvalidRequestError):
+        _ = partial.directions
+
+    direction = await resolve_compute_spend_direction(
+        db_session, project_id=project.id, context={"direction_id": "gpu-benchmark"}
+    )
+    assert direction == {"id": "gpu-benchmark", "compute_experiment_spend_threshold_usd": 7.5}
+    assert await resolve_compute_spend_direction(
+        db_session, project_id=project.id, context={}
+    ) is None
 
 
 def test_author_contract_collects_input_artifact_job_id():
@@ -827,7 +869,13 @@ def _quiet_compute_io(mocker):
     )
 
 
-async def _make_compute_task(db_session, payload: dict) -> Task:
+async def _make_compute_task(
+    db_session, payload: dict, *, spawn_followup: bool | None = True
+) -> Task:
+    payload = dict(payload)
+    if spawn_followup is not None:
+        payload.setdefault("spawn_followup", spawn_followup)
+
     project = Project(name="ActOnVerdict", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
@@ -839,9 +887,7 @@ async def _make_compute_task(db_session, payload: dict) -> Task:
         status=TaskStatus.IN_PROGRESS,  # agent reported terminal; handler decides
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        # Engine-authored: the spawn_followup gate (#14223) suppresses
-        # follow-ons for created_by="USER" tasks, which is not what these
-        # autonomous-spawn tests exercise.
+        # Tests using this helper explicitly set spawn_followup=True by default.
         created_by="ORCHESTRATOR",
     )
     db_session.add(task)
@@ -967,13 +1013,10 @@ async def test_act_on_verdict_spawns_write_capable_followon(
 
 
 @pytest.mark.asyncio
-async def test_success_always_spawns_followon_without_opt_in(
+async def test_success_without_followup_opt_in_preserves_terminal_result(
     db_session, _quiet_compute_io
 ):
-    """Always-dispose (opt-in retired): a successful experiment with NO
-    act_on_verdict flag now ALWAYS spawns exactly one disposition follow-on, and
-    the parent advances to EVALUATING to await it. Faithful capture (axis A) is
-    still recorded on plan_output."""
+    """A direct success stays terminal unless its payload opts into follow-up."""
     task = await _make_compute_task(
         db_session,
         {
@@ -982,14 +1025,14 @@ async def test_success_always_spawns_followon_without_opt_in(
             "experiment": "mcts-rollout-depth",
             "hypothesis": "deeper rollouts beat the shallow baseline",
         },
+        spawn_followup=None,
     )
 
     await _handle_compute_experiment_completion(task, _result_with_arms(), db_session)
 
     await db_session.refresh(task)
-    # Parent advances to EVALUATING to await the always-spawned follow-on.
-    assert task.status == TaskStatus.EVALUATING
-    # Axis A capture still happens.
+    assert task.status == TaskStatus.COMPLETED
+    # Faithful capture still happens.
     assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
     assert task.plan_output["compute_result"]["final_cost_usd"] == pytest.approx(0.42)
 
@@ -998,13 +1041,7 @@ async def test_success_always_spawns_followon_without_opt_in(
         .scalars()
         .all()
     )
-    assert len(children) == 1
-    child = children[0]
-    assert child.first_payload["type"] == "create"
-    assert child.created_by == "ORCHESTRATOR"
-    assert child.status == TaskStatus.QUEUED
-    # Success framing: reason-and-ship, not diagnose-and-fix.
-    assert child.title.startswith("act-on-verdict:")
+    assert children == []
 
 
 @pytest.mark.asyncio
@@ -1513,12 +1550,10 @@ async def test_concurrent_cap_suppresses_excess_spawn(db_session, _quiet_compute
                     "type": "compute_experiment",
                     "base_branch": "main",
                     "experiment": experiment,
+                        "spawn_followup": True,
                 }
             ],
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-            # Engine-authored: the spawn_followup gate (#14223) suppresses
-            # follow-ons for created_by="USER" tasks; this test exercises the
-            # CONCURRENCY cap, so the spawn must not be USER-suppressed.
             created_by="ORCHESTRATOR",
         )
         db_session.add(t)
@@ -1604,12 +1639,10 @@ async def _make_sweep_arm(
                 "experiment": experiment,
                 "hypothesis": f"hypothesis for {experiment}",
                 "sweep_id": sweep_id,
+                "spawn_followup": True,
             }
         ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        # Engine-authored: the spawn_followup gate (#14223) suppresses
-        # follow-ons for created_by="USER" tasks; sweep tests exercise the
-        # sweep-deferral/aggregate mechanics, not USER suppression.
         created_by="ORCHESTRATOR",
     )
     db_session.add(task)

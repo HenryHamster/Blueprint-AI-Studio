@@ -585,6 +585,48 @@ def resolve_compute_spend_threshold(
         return 0.0
 
 
+async def resolve_compute_spend_direction(
+    session: "AsyncSession",
+    *,
+    project_id: Any,
+    context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the optional direction selected for a compute spend decision.
+
+    The lookup deliberately selects ``Project.directions`` as a scalar instead
+    of traversing a possibly partial ``Project`` instance. Compute launches
+    are reached from both agent and dispatcher sessions, some of which use
+    ``raiseload=True`` while assembling a task. A direction is advisory to
+    threshold selection, so an absent, stale, or malformed id must simply use
+    the global threshold rather than creating another launch path or failing
+    an otherwise valid bare compute job.
+    """
+    raw_direction_id = context.get("direction_id") if isinstance(context, dict) else None
+    direction_id = str(raw_direction_id or "").strip()
+    if not direction_id or project_id is None:
+        return None
+
+    from sqlmodel import select
+
+    from app.models import Project
+
+    result = await session.execute(
+        select(Project.directions).where(Project.id == project_id)
+    )
+    directions = result.scalar_one_or_none()
+    if not isinstance(directions, list):
+        return None
+    return next(
+        (
+            candidate
+            for candidate in directions
+            if isinstance(candidate, dict)
+            and str(candidate.get("id") or "") == direction_id
+        ),
+        None,
+    )
+
+
 def resolve_compute_spend_approval(
     *,
     runtime_config: dict[str, Any],
