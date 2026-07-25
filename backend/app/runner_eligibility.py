@@ -324,37 +324,68 @@ def _runner_has_free_vram(
     return any(mib >= required_mib for mib in free_mib_list)
 
 
+def _known_free_bytes(value: object) -> int | None:
+    """Return trusted non-negative capacity telemetry, else ``None``.
+
+    ``None`` deliberately means unknown rather than zero. Older runners do not
+    advertise the separate workspace/image-store fields, and dispatch must not
+    strand their work solely because of that protocol-version gap.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _runner_container_image_storage(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> dict[str, int | str | None]:
+    """Normalized storage telemetry relevant to a container-image pull.
+
+    ``disk_free_bytes`` remains the legacy workspace measurement. New runners
+    also send ``workspace_free_bytes`` and the filesystem that backs Docker or
+    Podman's image store. Both known capacities must clear the hard floor: a
+    pull needs the image store, while checkout/artifact work still needs the
+    workspace. Unknown values intentionally preserve legacy eligibility.
+    """
+    caps = runner.capabilities or {}
+    workspace = _known_free_bytes(caps.get("workspace_free_bytes"))
+    if workspace is None:
+        workspace = _known_free_bytes(caps.get("disk_free_bytes"))
+    image_store = _known_free_bytes(caps.get("container_image_store_free_bytes"))
+    runtime = caps.get("container_image_store_runtime")
+    path = caps.get("container_image_store_path")
+    return {
+        "workspace_free_bytes": workspace,
+        "image_store_free_bytes": image_store,
+        "image_store_runtime": runtime if isinstance(runtime, str) else None,
+        "image_store_path": path if isinstance(path, str) else None,
+    }
+
+
 def _runner_has_free_disk(
     runner: LocalRunner | RunnerDispatchSnapshot,
     required_bytes: int,
 ) -> bool:
-    """Whether this runner has at least ``required_bytes`` of free disk.
+    """Whether a container-image job fits every known required filesystem.
 
-    A container-image compute job must PULL a multi-GB image onto the runner
-    before it can start. Sent to a nearly-full box the pull dies part-way
-    ("no space left on device") and the claim is wasted — the job should have
-    held for a runner (or cloud backend) that can fit it.
-
-    Reads the heartbeat-reported ``disk_free_bytes`` (the free bytes on the
-    runner's image/workspace filesystem, the same field the low-disk health
-    sweep consults). As with :func:`_runner_has_free_vram`, absence of
-    telemetry is NOT a disqualification: a runner that never reports
-    ``disk_free_bytes`` (older runner) is treated as eligible — we gate
-    dispatch only on real contradicting data, never on missing data, so a
-    legitimately-configured runner is never demoted (backward compatible). A
-    malformed value is likewise ignored. A non-positive floor is no floor.
+    A container image is written to its runtime data-root, which can differ
+    from the runner workspace. Gate on the *limiting known* capacity while
+    retaining absence/malformed-telemetry compatibility for older runners.
+    This predicate is only used for container-image jobs; bwrap/imageless jobs
+    continue to use their workspace guard on the runner itself.
     """
     if required_bytes <= 0:
         return True
-    caps = runner.capabilities or {}
-    disk_free = caps.get("disk_free_bytes")
-    if disk_free is None:
-        return True
-    try:
-        return int(disk_free) >= required_bytes
-    except (TypeError, ValueError):
-        # Malformed telemetry — do not gate on data we cannot trust.
-        return True
+    storage = _runner_container_image_storage(runner)
+    known = (
+        storage["workspace_free_bytes"],
+        storage["image_store_free_bytes"],
+    )
+    return all(value is None or value >= required_bytes for value in known)
 
 
 def _runner_meets_min_compute_capability(

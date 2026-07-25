@@ -156,6 +156,21 @@ async def test_heartbeat_persists_snapshot_row(db_session):
         agent_available=True,
         gpu_utilization_pct=73,
         disk_free_bytes=5_000_000_000,
+        workspace_free_bytes=5_000_000_000,
+        container_image_store_runtime="docker",
+        container_image_store_path="/var/lib/docker",
+        container_image_store_free_bytes=4_000_000_000,
+        container_image_reclaim={
+            "attempted_at": "2026-07-24T12:00:00Z",
+            "runtime": "docker",
+            "store_root": "/var/lib/docker",
+            "free_bytes_before": 1_000_000,
+            "free_bytes_after": 4_000_000_000,
+            "removed": 3,
+            "kept": 1,
+            "in_use_skipped": 2,
+            "reason": "removed stale images",
+        },
         memory_free_bytes=2_000_000_000,
         cpu_load_avg=1.25,
         version="v1",
@@ -185,6 +200,21 @@ async def test_heartbeat_persists_snapshot_row(db_session):
     await db_session.refresh(runner)
     assert runner.capabilities["gpu_utilization_pct"] == 73
     assert runner.capabilities["active_task_ids"] == ["t1", "t2"]
+    assert runner.capabilities["workspace_free_bytes"] == 5_000_000_000
+    assert runner.capabilities["container_image_store_runtime"] == "docker"
+    assert runner.capabilities["container_image_store_path"] == "/var/lib/docker"
+    assert runner.capabilities["container_image_store_free_bytes"] == 4_000_000_000
+    assert runner.capabilities["container_image_reclaim"] == {
+        "attempted_at": "2026-07-24T12:00:00Z",
+        "runtime": "docker",
+        "store_root": "/var/lib/docker",
+        "free_bytes_before": 1_000_000,
+        "free_bytes_after": 4_000_000_000,
+        "removed": 3,
+        "kept": 1,
+        "in_use_skipped": 2,
+        "reason": "removed stale images",
+    }
 
 
 @pytest.mark.asyncio
