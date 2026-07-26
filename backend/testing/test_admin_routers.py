@@ -8869,46 +8869,45 @@ class TestBugReportCitationGate:
 
 
 class TestStrategistSpawnableRegistry:
-    """Guard: the strategist spawn allowlist is DERIVED from the per-type
-    ``strategist_spawnable`` capability flag, not a hardcoded literal. A future
-    type becomes strategist-spawnable by declaring the flag alone — no handler
-    edit — and implementation / PR-producing write types stay excluded."""
+    """Guard the registry-derived unified ``spawn_task`` policy."""
 
-    def test_allowlist_equals_expected_knowledge_types(self):
+    def test_allowlist_includes_knowledge_and_normal_task_types(self):
         from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
 
-        expected = frozenset({"research", "plan", "web_research", "design", "compute_experiment"})
+        expected = frozenset(
+            {
+                "create",
+                "plan",
+                "research",
+                "qa",
+                "refactor",
+                "compute_experiment",
+                "web_research",
+                "design",
+            }
+        )
         assert expected == STRATEGIST_SPAWNABLE_TASK_TYPES
 
-    def test_allowlist_is_derived_from_capability_flag(self):
+    def test_allowlists_are_derived_from_dispatch_policy(self):
         from app.task_capabilities import (
+            STRATEGIST_CONTEXTUAL_TASK_TYPES,
             STRATEGIST_SPAWNABLE_TASK_TYPES,
             TASK_CAPABILITY_BY_VALUE,
         )
 
-        # Every member declares the flag...
-        for t in STRATEGIST_SPAWNABLE_TASK_TYPES:
-            assert TASK_CAPABILITY_BY_VALUE[t].strategist_spawnable is True
-        # ...and the set is exactly the flagged capabilities (derivation, not a
-        # parallel literal that could drift).
-        derived = frozenset(
+        direct = frozenset(
             value
             for value, cap in TASK_CAPABILITY_BY_VALUE.items()
-            if cap.strategist_spawnable
+            if cap.strategist_dispatch == "direct"
         )
-        assert derived == STRATEGIST_SPAWNABLE_TASK_TYPES
-
-    def test_no_write_type_is_strategist_spawnable(self):
-        from app.task_capabilities import (
-            STRATEGIST_SPAWNABLE_TASK_TYPES,
-            WRITE_TASK_TYPES,
+        contextual = frozenset(
+            value
+            for value, cap in TASK_CAPABILITY_BY_VALUE.items()
+            if cap.strategist_dispatch == "requires_context"
         )
-
-        # Implementation / PR-producing types must not be directly spawnable —
-        # they flow through direction → research → plan → create.
-        assert STRATEGIST_SPAWNABLE_TASK_TYPES.isdisjoint(WRITE_TASK_TYPES)
-        for impl in ("create", "fix", "refactor", "migrate", "qa"):
-            assert impl not in STRATEGIST_SPAWNABLE_TASK_TYPES
+        assert direct == STRATEGIST_SPAWNABLE_TASK_TYPES
+        assert contextual == STRATEGIST_CONTEXTUAL_TASK_TYPES
+        assert STRATEGIST_CONTEXTUAL_TASK_TYPES == frozenset({"fix"})
 
     @pytest.mark.asyncio
     async def test_strategist_spawn_compute_experiment_persists_launch_contract(
@@ -14102,7 +14101,8 @@ class TestStrategistDisposeCompletionDebt:
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["op"] == "spawn_fix"
+        assert body["op"] == "spawn_task"
+        assert body["deprecated_alias"] == "spawn_fix"
         assert body["linked_debt_id"] == str(entry.id)
         await db_session.refresh(entry)
         linked = (entry.detail or {}).get("linked_tasks") or []
