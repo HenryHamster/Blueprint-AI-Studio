@@ -22,25 +22,11 @@ import { cliOps } from './strategic-ops-registry.js';
 // + `;;`); ops absent here render the uniform default arm.
 const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
   create_message: `  create-message)
-    # Resident operator turns install one ambient stable key before the model
-    # runs. Use it for this alternate message-send helper too, so a successful
-    # ./strategic create-message and the handler backstop coalesce exactly once.
+    # Operator replies are a native Workday MCP action. Do not make a generic
+    # strategic message look like a reply while an operator turn is active.
     if [ -e "$RESIDENT_REPLY_RECEIPT_PATH" ] || [ -L "$RESIDENT_REPLY_RECEIPT_PATH" ]; then
-      NODE_BIN="\${NODE_BINARY:-node}"
-      RECEIPT=$(_read_regular_bounded "$RESIDENT_REPLY_RECEIPT_PATH" 16384) || {
-        echo "[ERROR] create-message: ambient Resident reply receipt is not a safe regular file" >&2
-        exit 1
-      }
-      DATA=$("$NODE_BIN" -e 'const d=JSON.parse(process.argv[1]); const r=JSON.parse(process.argv[2]); if(!r || typeof r.idempotency_key!=="string" || !r.idempotency_key || !Array.isArray(r.covered_message_ids) || r.covered_message_ids.length===0 || r.covered_message_ids.some(x=>typeof x!=="string" || !x)) process.exit(2); d.idempotency_key=r.idempotency_key; d.covered_message_ids=r.covered_message_ids; process.stdout.write(JSON.stringify(d))' "$DATA" "$RECEIPT") || {
-        echo "[ERROR] create-message: could not merge ambient Resident reply receipt" >&2
-        exit 1
-      }
-      "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const d=JSON.parse(process.argv[2]); const t=p+".tmp."+process.pid; try { fs.writeFileSync(t,JSON.stringify(d),{encoding:"utf8",flag:"wx",mode:0o600}); fs.linkSync(t,p); } finally { try { fs.unlinkSync(t); } catch {} }' "$RESIDENT_STAGED_REPLY_PATH" "$DATA" || {
-        echo "[ERROR] create-message: failed to stage Resident reply" >&2
-        exit 1
-      }
-      printf '{"status":"staged","op":"create_message"}\n'
-      exit 0
+      echo "[ERROR] create-message: this is not the Workday operator reply tool; call reply_to_operator instead" >&2
+      exit 2
     elif [ -e "$RESIDENT_REPLY_KEY_PATH" ] || [ -L "$RESIDENT_REPLY_KEY_PATH" ]; then
       echo "[ERROR] create-message: ambient Resident reply key exists without its receipt" >&2
       exit 1

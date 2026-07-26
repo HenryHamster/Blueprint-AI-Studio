@@ -69,6 +69,13 @@ vi.mock('../providers/runners.js', () => ({
 vi.mock('../providers/resident-session.js', () => ({
   startResidentClaudeSession: vi.fn(),
 }));
+vi.mock('../providers/resident-reply-tool.js', () => ({
+  RESIDENT_REPLY_TOOL_NAME: 'mcp__workday__reply_to_operator',
+  provisionResidentReplyTool: vi.fn(() => ({
+    configPath: '/tmp/workday-reply-mcp.json',
+    toolName: 'mcp__workday__reply_to_operator',
+  })),
+}));
 vi.mock('./strategic-sections.js', () => ({
   buildDirSummaryText: vi.fn(() => ''),
   // Render each open message so the compaction checkpoint's "Open operator
@@ -233,6 +240,7 @@ function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult 
     appliedStrategicOp: false,
     sawToolUse: true,
     sentOperatorMessage: true, // skip the persistReply backstop
+    operatorReply: null,
     processGone: false,
     ttftMs: 1,
     turnMs: 1,
@@ -253,7 +261,33 @@ function makeSession(
 ) {
   let cb: ((ev: ResidentSessionEvent) => void) | null = null;
   return {
-    sendTurn: vi.fn(sendTurn),
+    // A confirmed native reply tool result has already written a receipt-bound
+    // staging file before Claude returns its top-level result. Model that
+    // protocol here; tests that need a missing tool explicitly return false.
+    sendTurn: vi.fn(async (text: string | Array<Record<string, unknown>>) => {
+      const result = await sendTurn(text);
+      const operatorReply = result.operatorReply ?? (result.sentOperatorMessage ? {
+        type: 'NOTE', content: result.resultText || 'native reply',
+      } : null);
+      const protocolResult = { ...result, operatorReply };
+      if (protocolResult.sentOperatorMessage && operatorReply !== null) {
+        const workspace = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+        const receiptPath = path.join(workspace, '.resident-reply-receipt.json');
+        const stagedPath = path.join(workspace, '.resident-reply-staged-message.json');
+        try {
+          const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8')) as {
+            idempotency_key: string; covered_message_ids: string[];
+          };
+          fs.writeFileSync(stagedPath, JSON.stringify({
+            type: operatorReply.type, content: operatorReply.content, ...receipt,
+          }), { mode: 0o600 });
+        } catch {
+          // A test may intentionally make receipt installation fail. The handler
+          // must then keep the operator message open rather than invent a reply.
+        }
+      }
+      return protocolResult;
+    }),
     interrupt: vi.fn(),
     onEvent: vi.fn((fn: (ev: ResidentSessionEvent) => void) => { cb = fn; }),
     touch: vi.fn(),
@@ -1989,7 +2023,10 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
 
     const ackPosts: Array<Record<string, unknown>> = [];
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
-      if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
+      if (
+        url.includes('/api/agent/strategic') && body?.op === 'create_message'
+        && String((body.data as Record<string, unknown> | undefined)?.idempotency_key ?? '').includes('resident-ack-')
+      ) {
         ackPosts.push(body);
       }
       if (url.includes('heartbeat')) return Promise.resolve({ authority_held: true, stop_requested: true });
@@ -2432,7 +2469,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         if (Array.isArray(input)) modelTurns.push(input);
         return Promise.resolve(turnResult({
           resultText: 'Reviewed the exact revisions.',
-          sentOperatorMessage: false,
+          sentOperatorMessage: true,
         }));
       },
       () => open.length > 0,
@@ -2581,7 +2618,8 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     const installedKeys: string[] = [];
     const installedReceipts: Array<{ idempotency_key: string; covered_message_ids: string[] }> = [];
     const heartbeatBodies: Array<Record<string, unknown>> = [];
-    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data) => {
+    const realWriteFileSync = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
       const written = typeof data === 'string'
         ? data
         : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString();
@@ -2591,6 +2629,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       if (String(file).endsWith('.resident-reply-receipt.json')) {
         installedReceipts.push(JSON.parse(written));
       }
+      return realWriteFileSync(file, data, options);
     });
 
     const runAttempt = async (
@@ -2693,7 +2732,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     const session = makeSession(
       () => Promise.resolve(turnResult({
         resultText: 'Handled this bounded operator batch.',
-        sentOperatorMessage: false,
+        sentOperatorMessage: true,
       })),
       () => true,
     );
@@ -2809,7 +2848,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(session.sendTurn).not.toHaveBeenCalled();
     expect(session.close).toHaveBeenCalled();
   });
-  it('leaves inbound messages open when the reply backstop POST fails', async () => {
+  it('leaves inbound messages open when native reply persistence fails', async () => {
     const operatorMessage = {
       id: 'msg-backstop-failure',
       content: 'Do not lose this reply',
@@ -2836,9 +2875,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     });
     const session = makeSession(
       () => Promise.resolve(turnResult({
-        resultText: 'A complete answer that needs the backstop',
-        accumulatedTurnText: 'A complete answer that needs the backstop',
-        sentOperatorMessage: false,
+        resultText: 'A complete answer staged by the native reply tool',
+        accumulatedTurnText: 'A complete answer staged by the native reply tool',
+        sentOperatorMessage: true,
       })),
       () => true,
     );
@@ -2857,6 +2896,47 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
     expect(posts.filter((post) => post.op === 'create_message')).toHaveLength(1);
     expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
+    expect(session.close).toHaveBeenCalled();
+  });
+  it('does not promote an inline final when reply_to_operator was never called', async () => {
+    const operatorMessage = {
+      id: 'msg-inline-only',
+      content: 'Please answer in Workday.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    const posts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+      if (body) posts.push(body);
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'This inline final must not be delivered.',
+        accumulatedTurnText: 'This inline final must not be delivered.',
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-inline-only',
+      { project_name: 'P', open_messages: [], strategic_session_operator_ack_threshold_seconds: 0 },
+      { project_metadata: { project_id: 'proj-inline-only' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(posts.some(post => post.op === 'create_message')).toBe(false);
     expect(session.close).toHaveBeenCalled();
   });
   it('folds the checkpoint into the first operator turn after bounded wedged preemption', async () => {

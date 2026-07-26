@@ -34,7 +34,7 @@ export type ResidentEventKind = 'text' | 'tool' | 'tool_result' | 'result' | 'er
  * (strategic_events.py). `command` = a Bash command, `file` = an edit/write,
  * `read` = a file read, `subagent` = a spawned Task/Agent, `tool_result` = a
  * tool's outcome, `tool` = any other tool. These NEVER persist — only the
- * assistant's `./messages send` reply reaches the durable transcript.
+ * native Workday `reply_to_operator` action reaches the durable transcript.
  */
 export type ResidentActivityKind = 'command' | 'file' | 'read' | 'subagent' | 'tool_result' | 'tool';
 
@@ -141,11 +141,13 @@ export interface ResidentStreamEvent {
   text?: string;
   /** tool name for 'tool' */
   toolName?: string;
+  /** raw tool arguments for a 'tool' event, retained for contract-bound tools */
+  input?: unknown;
   /** bash command string for a Bash 'tool' event (used to detect applied strategic ops) */
   command?: string;
   /** the CLI-assigned tool_use id — set on a 'tool' event (block.id) and on the
    *  matching 'tool_result' event (block.tool_use_id) so the session can
-   *  correlate a `./messages send` invocation with its execution outcome. */
+   *  correlate a native Workday reply invocation with its execution outcome. */
   toolUseId?: string;
   /** for a 'tool_result' event: the tool reported an error (non-zero exit for Bash). */
   isError?: boolean;
@@ -315,7 +317,7 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
           }
           const activity = describeToolUse(toolName, input);
           events.push({
-            kind: 'tool', toolName, command, toolUseId, nested, sessionId,
+            kind: 'tool', toolName, input, command, toolUseId, nested, sessionId,
             activityKind: activity?.kind, activityText: activity?.text,
           });
         }
@@ -344,9 +346,9 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
 
   if (type === 'user') {
     // A `user` line carries the tool_result blocks for the tools the model just
-    // ran. Surface each tool_result so the session can correlate a `./messages
-    // send` invocation with its execution outcome (is_error ⇒ the curl failed);
-    // a `user` line with no tool_result is bare protocol noise (→ system).
+    // ran. Surface each tool_result so the session can correlate a native
+    // Workday reply invocation with its execution outcome (is_error ⇒ the tool
+    // rejected it); a `user` line with no tool_result is bare protocol noise.
     const message = obj.message as Record<string, unknown> | undefined;
     const content = message?.content;
     if (Array.isArray(content)) {
