@@ -642,6 +642,21 @@ def _resident_worker_task_is_healthy(
             # The Task column is authoritative. The blob is an operator-facing
             # projection that may transiently lag its post-commit mirror.
             return True
+        # A retry deadline is not a claim guarantee: the retry scheduler and
+        # runner still need a little time to turn an elapsed durable hold into
+        # an IN_PROGRESS worker.  Keep the exact persisted retry generation
+        # healthy for the same bounded window used for worker heartbeats.  This
+        # covers the handoff just after ``retry_after_until`` without trusting a
+        # retry marker forever if the scheduler or runner has actually died.
+        blob_retry_until = _parse_iso_naive(blob.get("worker_retry_until"))
+        if (
+            blob.get("worker_state") == "retry_wait"
+            and blob_retry_until is not None
+            and blob_retry_until <= now
+            and (now - blob_retry_until).total_seconds()
+            <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+        ):
+            return True
     if task.status in {TaskStatus.QUEUED, TaskStatus.PROVISIONING}:
         # A resident failure can requeue the exact task between worker attempts.
         # Its original session start is no longer a useful health signal once the
