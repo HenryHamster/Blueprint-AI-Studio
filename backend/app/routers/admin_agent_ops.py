@@ -42,6 +42,10 @@ from app.strategic_events import (
     STRATEGIC_KIND_RUNNING_UPDATE,
     emit_strategic_updated,
 )
+from app.strategic_op_contracts import (
+    normalize_problem_model_envelope,
+    normalize_update_direction,
+)
 from app.direction_lifecycle import (
     _reset_outcome_detection_state,
     apply_churn_retirement_keep,
@@ -163,6 +167,8 @@ RESIDENT_REPLY_COVERED_MESSAGE_MAX = 20
 # the backend handler produces a CI failure rather than a silent no-op.
 STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "set_problem_model",
+    "patch_problem_model",
+    "replace_problem_model",
     "set_running_update",
     "set_memory",
     "set_session_summary",
@@ -1194,6 +1200,34 @@ async def strategic_operation(
             status_code=400, detail="Data payload too large (max 100KB)"
         )
 
+    # Normalize the few historically surprising envelopes before their domain
+    # handlers run.  Keeping this at the API boundary makes field errors
+    # consistent for CLI, direct API, and future non-shell clients.
+    if payload.op == "update_direction":
+        data = normalize_update_direction(data)
+
+    problem_model_dry_run = False
+    if payload.op in {
+        "set_problem_model",
+        "patch_problem_model",
+        "replace_problem_model",
+    }:
+        current_pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+        current_revision_raw = current_pm.get("revision", 0)
+        current_revision = (
+            current_revision_raw
+            if isinstance(current_revision_raw, int) and not isinstance(current_revision_raw, bool)
+            else 0
+        )
+        data, problem_model_dry_run, compatibility_warning = normalize_problem_model_envelope(
+            payload.op,
+            data,
+            current_revision=current_revision,
+            current_model=current_pm,
+        )
+        if compatibility_warning:
+            warnings.append(compatibility_warning)
+
     def _resp(body: dict) -> dict:
         if warnings:
             body["warnings"] = list(warnings)
@@ -1729,7 +1763,20 @@ async def strategic_operation(
 
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")
-        changes = data.get("changes", {})
+        # `data` has already been normalized by normalize_update_direction:
+        # canonical callers pass fields directly, while the legacy nested
+        # `changes` wrapper was flattened at the boundary.
+        changes = {
+            key: value
+            for key, value in data.items()
+            if key not in {
+                "direction_id",
+                "rationale",
+                "dedup_reasoning",
+                "successor_id",
+                "superseded_by_id",
+            }
+        }
         raw_dedup_reasoning = data.get("dedup_reasoning")
         if not dir_id or not changes:
             raise HTTPException(
@@ -4171,8 +4218,16 @@ async def strategic_operation(
             }
         )
 
-    elif payload.op == "set_problem_model":
-        # Full-model replacement. Validated and merged via apply_agent_update:
+    elif (
+        payload.op == "set_problem_model"
+        or payload.op == "patch_problem_model"
+        or payload.op == "replace_problem_model"
+    ):
+        # All problem-model writes funnel through the established safe merge.
+        # Envelope validation above distinguishes the normal patch form, the
+        # guarded recovery/bootstrapping replace form, and the legacy alias.
+        # apply_agent_update still owns collection integrity, revision history,
+        # and operator-wins reconciliation.
         # bumps revision, stamps last_updated, auto-archives closed/abandoned
         # gaps, preserves existing archived_gaps + revision_log, appends a
         # revision_log entry with the structured diff.
@@ -4277,6 +4332,19 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model: {ve}"
             ) from None
+        if problem_model_dry_run:
+            # The exact same validator/merge path as a write, but with no
+            # project/task/context mutation or alert side effect.  This gives
+            # callers an actionable preflight before a guarded replacement.
+            return _resp(
+                {
+                    "status": "preview",
+                    "op": payload.op,
+                    "current_revision": current_revision,
+                    "next_revision": new_pm_raw.get("revision"),
+                    "diff": pm_diff,
+                }
+            )
         # Reject with HTTP 400 when the live core alone exceeds the byte budget.
         # Fire the alert and commit it before raising so it persists despite the 400.
         if pm_diff.get("live_core_exceeds_budget"):
@@ -4448,7 +4516,7 @@ async def strategic_operation(
         return _resp(
             {
                 "status": "ok",
-                "op": "set_problem_model",
+                "op": payload.op,
                 "revision": new_pm_raw.get("revision"),
                 "diff": pm_diff,
                 "version_phase_decision_received": version_phase_decision is not None,

@@ -601,7 +601,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
   "data": { }
 }
 ```
@@ -617,7 +617,14 @@ truncated). Notable behaviors:
   100, ahead of normal autonomous work).
 - `reject_direction` tombstones a `proposed` direction and cancels any QUEUED
   tasks tied to it.
-- `set_problem_model` lifts out transient `version_phase_decision` /
+- `patch_problem_model` is the normal safe write. It requires
+  `{base_revision, patch}` and preserves omitted fields. It accepts optional
+  `transient_actions` and `dry_run`; stale revisions return HTTP 409.
+- `replace_problem_model` is reserved for bootstrap/recovery and requires
+  `{base_revision, model, confirm_replace: true}`. Use `dry_run: true` to
+  preview its diff first.
+- `set_problem_model` remains a compatibility alias and now uses safe patch
+  semantics. It lifts out transient `version_phase_decision` /
   `qualify_request` siblings before validating the durable problem model.
 - `record_finding_resolution` writes a per-finding re-qualification resolution
   ledger row for the current open release version. Required `data` fields:

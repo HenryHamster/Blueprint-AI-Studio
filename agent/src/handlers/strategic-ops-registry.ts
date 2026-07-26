@@ -40,6 +40,67 @@ export interface StrategicOpEntry {
    *  (internal-only / auto-invoked). Null for surfaced ops. Marks exclusion
    *  explicitly rather than by omission. */
   internalReason: string | null;
+  /**
+   * A compact, machine-readable input contract used by the generated helper's
+   * offline `help` and `schema` commands.  Runtime validation remains owned by
+   * the backend; this is deliberately a discoverability surface, not a second
+   * validator.
+   */
+  input?: StrategicOpInputContract;
+}
+
+export interface StrategicOpInputContract {
+  /** JSON is the normal transport. `markdown` accepts a raw --file/--stdin. */
+  kind: 'json' | 'markdown';
+  /** Required top-level fields for the canonical JSON form. */
+  required?: readonly string[];
+  /** Accepted top-level fields when the operation has a narrow envelope. */
+  fields?: readonly string[];
+  /** A valid, deliberately small example used by `strategic schema <op>`. */
+  example?: Record<string, unknown>;
+  /** Compatibility detail worth surfacing before an agent learns it by 400. */
+  notes?: readonly string[];
+}
+
+const jsonInput = (): StrategicOpInputContract => ({ kind: 'json' });
+const markdownInput = (): StrategicOpInputContract => ({
+  kind: 'markdown',
+  fields: ['markdown'],
+  example: { markdown: '# Current status\n...' },
+  notes: ['Use --file for markdown. --stdin accepts raw markdown. --json accepts {"markdown":"..."}.'],
+});
+
+const INPUTS = {
+  set_problem_model: {
+    kind: 'json' as const,
+    notes: ['Legacy alias for patch-problem-model. Omitted fields are preserved; use replace-problem-model only for bootstrap/recovery.'],
+  },
+  patch_problem_model: {
+    kind: 'json' as const,
+    required: ['base_revision', 'patch'],
+    fields: ['base_revision', 'patch', 'transient_actions', 'dry_run'],
+    example: { base_revision: 4, patch: { current_focus: 'Validate the local runner' } },
+    notes: ['Patch preserves omitted fields. Set dry_run=true to inspect the diff without writing.'],
+  },
+  replace_problem_model: {
+    kind: 'json' as const,
+    required: ['base_revision', 'model', 'confirm_replace'],
+    fields: ['base_revision', 'model', 'confirm_replace', 'dry_run'],
+    example: { base_revision: 4, model: { current_focus: 'Bootstrap model' }, confirm_replace: true },
+    notes: ['Reserved for bootstrap/recovery. confirm_replace must be true.'],
+  },
+  update_direction: {
+    kind: 'json' as const,
+    required: ['direction_id'],
+    fields: ['direction_id', 'text', 'priority', 'status', 'gap_id', 'success_evidence', 'retirement_condition', 'rationale', 'criterion_keys', 'recommended_mode', 'system_id', 'conflicts_with'],
+    example: { direction_id: 'd-123', priority: 'high', gap_id: 'g-4' },
+    notes: ['Pass fields directly. The legacy {direction_id, changes:{...}} wrapper remains temporarily supported.'],
+  },
+  set_running_update: markdownInput(),
+} satisfies Record<string, StrategicOpInputContract>;
+
+function inputFor(op: string): StrategicOpInputContract {
+  return INPUTS[op as keyof typeof INPUTS] ?? jsonInput();
 }
 
 /**
@@ -50,9 +111,13 @@ export interface StrategicOpEntry {
  */
 export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'set_problem_model', alias: 'set-problem-model', cli: true, prompt: true, internalReason: null,
-    description: "Replace/refresh the project's problem model (gaps, systems, priorities)." },
+    description: "Compatibility alias for patching the project's problem model.", input: inputFor('set_problem_model') },
+  { op: 'patch_problem_model', alias: 'patch-problem-model', cli: true, prompt: true, internalReason: null,
+    description: "Patch the project's problem model without clobbering omitted fields.", input: inputFor('patch_problem_model') },
+  { op: 'replace_problem_model', alias: 'replace-problem-model', cli: true, prompt: true, internalReason: null,
+    description: 'Guardedly replace a problem model for bootstrap or recovery.', input: inputFor('replace_problem_model') },
   { op: 'set_running_update', alias: 'set-running-update', cli: true, prompt: true, internalReason: null,
-    description: 'Update the operator-facing running-update snapshot (markdown file input).' },
+    description: 'Update the operator-facing running-update snapshot.', input: inputFor('set_running_update') },
   { op: 'reflect', alias: 'reflect', cli: true, prompt: true, internalReason: null,
     description: 'Record a strategic self-reflection note for the cycle.' },
   { op: 'pending_confirm', alias: 'pending-confirm', cli: true, prompt: true, internalReason: null,
@@ -64,7 +129,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'create_direction', alias: 'create-direction', cli: true, prompt: true, internalReason: null,
     description: 'Open a new strategic direction (optionally staged for the next version).' },
   { op: 'update_direction', alias: 'update-direction', cli: true, prompt: true, internalReason: null,
-    description: "Update an existing direction's fields, status, or gap linkage." },
+    description: "Update an existing direction's fields, status, or gap linkage.", input: inputFor('update_direction') },
   { op: 'retire_direction', alias: 'retire-direction', cli: true, prompt: true, internalReason: null,
     description: 'Retire a direction (expired/superseded); gated by the challenge.' },
   { op: 'stage_direction', alias: 'stage-direction', cli: true, prompt: true, internalReason: null,
@@ -135,6 +200,12 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
 /** Registry entries surfaced on the `./strategic` CLI, in canonical order. */
 export function cliOps(): StrategicOpEntry[] {
   return STRATEGIC_OPS_REGISTRY.filter(e => e.cli);
+}
+
+/** Return the discoverability contract for a surfaced operation. */
+export function cliOpInput(opOrAlias: string): StrategicOpInputContract | undefined {
+  const entry = cliOps().find(entry => entry.op === opOrAlias || entry.alias === opOrAlias);
+  return entry?.input ?? (entry ? jsonInput() : undefined);
 }
 
 /** Registry entries advertised in the strategist bootstrap prompt, in order. */

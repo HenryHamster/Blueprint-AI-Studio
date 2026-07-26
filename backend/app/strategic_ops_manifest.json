@@ -2,7 +2,23 @@
     {
         "op": "set_problem_model",
         "alias": "set-problem-model",
-        "description": "Replace/refresh the project's problem model (gaps, systems, priorities).",
+        "description": "Compatibility alias for patching the project's problem model.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "patch_problem_model",
+        "alias": "patch-problem-model",
+        "description": "Patch the project's problem model without clobbering omitted fields.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "replace_problem_model",
+        "alias": "replace-problem-model",
+        "description": "Guardedly replace a problem model for bootstrap or recovery.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
@@ -10,7 +26,7 @@
     {
         "op": "set_running_update",
         "alias": "set-running-update",
-        "description": "Update the operator-facing running-update snapshot (markdown file input).",
+        "description": "Update the operator-facing running-update snapshot.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
