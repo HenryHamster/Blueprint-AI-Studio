@@ -95,6 +95,26 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('reject-direction');
   });
 
+  it('uses the resident runtime reply paths instead of workspace-local authority files', () => {
+    const runtimeDir = path.join(os.tmpdir(), 'resident-reply-authority');
+    const replyKeyPath = path.join(runtimeDir, '.resident-reply-idempotency-key');
+    const replyReceiptPath = path.join(runtimeDir, '.resident-reply-receipt.json');
+    const stagedReplyPath = path.join(runtimeDir, '.resident-reply-staged-message.json');
+    writeStrategicHelpers('task-runtime', 'project-runtime', testWorkspace, {
+      replyKeyPath,
+      replyReceiptPath,
+      stagedReplyPath,
+    });
+
+    const content = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+    expect(content).toContain(replyKeyPath.replace(/\\/g, '/'));
+    expect(content).toContain(replyReceiptPath.replace(/\\/g, '/'));
+    expect(content).toContain(stagedReplyPath.replace(/\\/g, '/'));
+    expect(content).not.toContain(
+      path.join(testWorkspace, '.resident-reply-receipt.json').replace(/\\/g, '/'),
+    );
+  });
+
   it('rejects strategic create-message while a Resident operator receipt is active', () => {
     writeStrategicHelpers('task-ambient-key', 'project-ambient-key', testWorkspace);
     fs.writeFileSync(

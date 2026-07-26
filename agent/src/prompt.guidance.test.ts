@@ -1259,6 +1259,19 @@ describe('writeMessagesHelper', () => {
     expect(script).toContain('this is not the Workday operator reply tool; call reply_to_operator instead');
   });
 
+  it('embeds external resident reply authority paths when provided', () => {
+    writeMessagesHelper('task-resident', '/tmp/resident-workspace', {
+      residentReplyOnly: true,
+      replyKeyPath: '/tmp/resident-runtime/reply-key',
+      replyReceiptPath: '/tmp/resident-runtime/reply-receipt.json',
+      stagedReplyPath: '/tmp/resident-runtime/staged-reply.json',
+    });
+    const script = capturedScripts['/tmp/resident-workspace/messages'];
+    expect(script).toContain('REPLY_KEY_PATH="/tmp/resident-runtime/reply-key"');
+    expect(script).toContain('REPLY_RECEIPT_PATH="/tmp/resident-runtime/reply-receipt.json"');
+    expect(script).toContain('STAGED_REPLY_PATH="/tmp/resident-runtime/staged-reply.json"');
+  });
+
   it('reads the live token, captures stdin, retries on 401, and fails loud (live write-token fix)', async () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];

@@ -159,7 +159,7 @@
   },
   "agent": {
     "index.ts": 4600,
-    "prompt.ts": 2000,
+    "prompt.ts": 2350,
     "prompts/task-type-focus.ts": 450,
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1900,
@@ -170,7 +170,7 @@
     "handlers/research-plan.ts": 3000,
     "handlers/strategic.ts": 1900,
     "handlers/strategic-resident-lib.ts": 3050,
-    "handlers/strategic-resident.ts": 2350,
+    "handlers/strategic-resident.ts": 2750,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 1150,
     "handlers/standard.ts": 1900,

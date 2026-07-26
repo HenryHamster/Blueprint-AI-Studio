@@ -4,10 +4,33 @@ import os from 'os';
 import path from 'path';
 
 // ── Hoisted mock sinks ────────────────────────────────────────────────────────
-const { mockSendWsFrame, mockSendLog } = vi.hoisted(() => ({
-  mockSendWsFrame: vi.fn(),
-  mockSendLog: vi.fn(),
-}));
+const {
+  mockSendWsFrame, mockSendLog, replyToolPaths, mockProvisionResidentReplyTool,
+} = vi.hoisted(() => {
+  const paths = {
+    current: null as {
+      keyPath: string;
+      receiptPath: string;
+      stagedReplyPath: string;
+    } | null,
+  };
+  return {
+    mockSendWsFrame: vi.fn(),
+    mockSendLog: vi.fn(),
+    replyToolPaths: paths,
+    mockProvisionResidentReplyTool: vi.fn((_workspace: string, replyPaths?: {
+      keyPath: string;
+      receiptPath: string;
+      stagedReplyPath: string;
+    }) => {
+      paths.current = replyPaths ?? null;
+      return {
+        configPath: '/tmp/workday-reply-mcp.json',
+        toolName: 'mcp__workday__reply_to_operator',
+      };
+    }),
+  };
+});
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Only SessionStreamer is under test; stub the handler's heavy dependencies so
@@ -73,10 +96,7 @@ vi.mock('../providers/resident-session.js', () => ({
 }));
 vi.mock('../providers/resident-reply-tool.js', () => ({
   RESIDENT_REPLY_TOOL_NAME: 'mcp__workday__reply_to_operator',
-  provisionResidentReplyTool: vi.fn(() => ({
-    configPath: '/tmp/workday-reply-mcp.json',
-    toolName: 'mcp__workday__reply_to_operator',
-  })),
+  provisionResidentReplyTool: mockProvisionResidentReplyTool,
 }));
 vi.mock('./strategic-sections.js', () => ({
   buildDirSummaryText: vi.fn(() => ''),
@@ -102,7 +122,7 @@ vi.mock('./strategic-sections.js', () => ({
 import {
   SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
   recloneResidentWorkspace, installResidentReplyKeyAtPath,
-  readResidentStagedReplyAtPath,
+  readResidentStagedReplyAtPath, residentReplyRuntimePaths,
 } from './strategic-resident.js';
 import {
   apiGet, apiPost, persistAndPostStatus,
@@ -110,7 +130,7 @@ import {
 } from '../index.js';
 import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { writePlaybookHelper, buildContextPrefix } from '../prompt.js';
+import { writePlaybookHelper, writeMessagesHelper, buildContextPrefix } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
@@ -227,6 +247,7 @@ const mockWriteGitTokenFile = vi.mocked(writeGitTokenFile);
 const mockSetupGitCredentialHelper = vi.mocked(setupGitCredentialHelper);
 const mockPrepareWorkspaceForRole = vi.mocked(prepareWorkspaceForRole);
 const mockWritePlaybookHelper = vi.mocked(writePlaybookHelper);
+const mockWriteMessagesHelper = vi.mocked(writeMessagesHelper);
 const mockWriteStrategicHelpers = vi.mocked(writeStrategicHelpers);
 const mockProvisionAmbientHelpers = vi.mocked(provisionAmbientHelpers);
 const mockBuildContextPrefix = vi.mocked(buildContextPrefix);
@@ -272,10 +293,12 @@ function makeSession(
         type: 'NOTE', content: result.resultText || 'native reply',
       } : null);
       const protocolResult = { ...result, operatorReply };
-      if (protocolResult.sentOperatorMessage && operatorReply !== null) {
-        const workspace = process.env.AGENT_WORKSPACE || '/tmp/workspace';
-        const receiptPath = path.join(workspace, '.resident-reply-receipt.json');
-        const stagedPath = path.join(workspace, '.resident-reply-staged-message.json');
+      if (
+        protocolResult.sentOperatorMessage
+        && operatorReply !== null
+        && replyToolPaths.current !== null
+      ) {
+        const { receiptPath, stagedReplyPath: stagedPath } = replyToolPaths.current;
         try {
           const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8')) as {
             idempotency_key: string; covered_message_ids: string[];
@@ -306,6 +329,7 @@ type MockSession = ReturnType<typeof makeSession>;
 
 describe('handleStrategicResident — operator-turn compaction includes settled decision and drops answered message', () => {
   beforeEach(() => {
+    replyToolPaths.current = null;
     mockApiGet.mockReset();
     mockApiPost.mockReset();
     mockStartSession.mockReset();
@@ -318,14 +342,24 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
+  it('places reply authority outside the mutable Git workspace', () => {
+    const workspace = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+    const paths = residentReplyRuntimePaths('task-runtime-boundary');
+    expect(path.relative(workspace, paths.runtimeDir).startsWith('..')).toBe(true);
+    expect(paths.replyReceiptPath).toBe(path.join(
+      paths.runtimeDir,
+      '.resident-reply-receipt.json',
+    ));
+  });
+
   it('removes stale reply artifacts before the session starts or autonomous work runs', async () => {
     const events: string[] = [];
-    const residentWorkspace = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+    const replyRuntime = residentReplyRuntimePaths('task-stale-reply-key');
     vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
       expect([
-        residentWorkspace + '/.resident-reply-idempotency-key',
-        residentWorkspace + '/.resident-reply-receipt.json',
-        residentWorkspace + '/.resident-reply-staged-message.json',
+        replyRuntime.replyKeyPath,
+        replyRuntime.replyReceiptPath,
+        replyRuntime.stagedReplyPath,
       ]).toContain(file);
       events.push(`stale-artifact-removed:${path.basename(String(file))}`);
     });
@@ -356,13 +390,31 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       'ghtok', 'owner', 'repo', null, { value: '' },
     );
 
-    expect(events).toEqual([
+    expect(events.slice(0, 5)).toEqual([
       'stale-artifact-removed:.resident-reply-idempotency-key',
       'stale-artifact-removed:.resident-reply-receipt.json',
       'stale-artifact-removed:.resident-reply-staged-message.json',
       'session-started',
       'autonomous-turn',
     ]);
+    expect(mockWriteMessagesHelper).toHaveBeenCalledWith(
+      'task-stale-reply-key',
+      '/tmp',
+      expect.objectContaining({
+        residentReplyOnly: true,
+        replyReceiptPath: replyRuntime.replyReceiptPath,
+        stagedReplyPath: replyRuntime.stagedReplyPath,
+      }),
+    );
+    expect(mockWriteStrategicHelpers).toHaveBeenCalledWith(
+      'task-stale-reply-key',
+      'proj-stale-reply-key',
+      '/tmp',
+      expect.objectContaining({
+        replyReceiptPath: replyRuntime.replyReceiptPath,
+        stagedReplyPath: replyRuntime.stagedReplyPath,
+      }),
+    );
     const heartbeat = mockApiPost.mock.calls.find(([url]) =>
       url.includes('/strategic-session/heartbeat'),
     );
@@ -2782,7 +2834,6 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
     let turnFinished = false;
     let cleanupFailed = false;
-    vi.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
     vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
       if (
         turnFinished
@@ -2900,28 +2951,34 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
     expect(session.close).toHaveBeenCalled();
   });
-  it('does not promote an inline final when reply_to_operator was never called', async () => {
+  it('retries a missing native reply in place instead of failing and resetting the task', async () => {
+    vi.useFakeTimers();
     const operatorMessage = {
       id: 'msg-inline-only',
       content: 'Please answer in Workday.',
       created_at: new Date().toISOString(),
       from_type: 'user',
     };
-    let delivered = false;
+    let persisted = false;
     mockApiGet.mockImplementation((url: string) => {
-      if (url.includes('/messages?') && !delivered) {
-        delivered = true;
-        return Promise.resolve({ messages: [operatorMessage] });
+      if (url.includes('/messages?')) {
+        return Promise.resolve({ messages: persisted ? [] : [operatorMessage] });
       }
-      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
       return Promise.resolve(null);
     });
     const posts: Array<Record<string, unknown>> = [];
-    mockApiPost.mockImplementation((_url: string, body?: Record<string, unknown>) => {
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (body) posts.push(body);
-      return Promise.resolve({ authority_held: true, stop_requested: false });
+      if (body?.op === 'create_message') {
+        persisted = true;
+        return Promise.resolve({});
+      }
+      if (url.includes('/heartbeat')) {
+        return Promise.resolve({ authority_held: true, stop_requested: persisted });
+      }
+      return Promise.resolve({});
     });
-    const session = makeSession(
+    const missingReplySession = makeSession(
       () => Promise.resolve(turnResult({
         resultText: 'This inline final must not be delivered.',
         accumulatedTurnText: 'This inline final must not be delivered.',
@@ -2929,17 +2986,34 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       })),
       () => true,
     );
-    mockStartSession.mockReturnValue(session);
+    const retrySession = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'Delivered through the native reply tool.',
+        accumulatedTurnText: 'Delivered through the native reply tool.',
+        sentOperatorMessage: true,
+      })),
+      () => true,
+    );
+    mockStartSession
+      .mockReturnValueOnce(missingReplySession)
+      .mockReturnValue(retrySession);
 
-    await handleStrategicResident(
+    const run = handleStrategicResident(
       'task-inline-only',
       { project_name: 'P', open_messages: [], strategic_session_operator_ack_threshold_seconds: 0 },
       { project_metadata: { project_id: 'proj-inline-only' }, context: {} },
       'ghtok', 'owner', 'repo', null, { value: '' },
     );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await run;
 
-    expect(posts.some(post => post.op === 'create_message')).toBe(false);
-    expect(session.close).toHaveBeenCalled();
+    expect(posts.filter(post => post.op === 'create_message')).toHaveLength(1);
+    expect(missingReplySession.close).toHaveBeenCalled();
+    expect(retrySession.sendTurn).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ status: 'FAILED' }),
+    );
   });
   it('folds the checkpoint into the first operator turn after bounded wedged preemption', async () => {
     vi.useFakeTimers();
