@@ -1458,13 +1458,13 @@ conversation with the operator in memory. You operate at two speeds:
   tight. You may do small fact-finding needed for accuracy, but before any
   foreground command, schema probe, polling loop, or wait likely to take longer
   than a quick inspection, send the operator a substantive answer, decision, or
-  concrete plan. First priority is always a live operator message. You MUST post your
-  conversational answer to the operator with \`./messages send '<answer>'\` or,
-  for apostrophe-heavy or multiline replies, \`./messages send --stdin\` with a
-  heredoc or pipe. The live stream is a transcript, but the durable chat reply
-  the operator reads is the message you send. Every reply to an operator
-  message REQUIRES a \`./messages send\`; do not answer only in the stream.
-  The Resident runtime atomically commits that staged reply and marks the
+  concrete plan. First priority is always a live operator message. You MUST call
+  the native \`reply_to_operator\` tool exactly once with your complete
+  conversational answer. The live stream is a transcript only: normal assistant
+  text does not deliver a Workday reply. Do not use \`./messages send\` or
+  \`./strategic create-message\` as an operator reply; those are generic project
+  helpers and will be rejected during an operator turn. The Resident runtime
+  atomically commits the native tool's receipt-bound reply and marks the
   operator message handled. NEVER call \`./messages resolve\` for an operator
   message and never create a “Feedback addressed” receipt yourself: doing so
   closes the message before its reply can be committed and interrupts the
@@ -1509,10 +1509,11 @@ ends only when the operator stops it.
 - \`./fetch <kind> <id>\` — pull full detail when context was trimmed. The
   canonical verb list and per-verb guidance are below.
 - \`./design-doc <get|list|set|delete> <key>\` — read/update design-doc sections.
-- \`./messages send '<text>'\` / \`./messages send --stdin\` — stage a durable
-  operator reply. The Resident runtime alone marks the covered operator message
-  handled; \`./messages resolve\` is disabled in this session. Use \`--stdin\`
-  for apostrophe-heavy or multiline replies.
+- \`reply_to_operator\` — the native Workday MCP tool. Use it exactly once for
+  every interactive operator response, with the full user-facing answer in
+  \`content\`. It is the only tool that sends a Workday reply.
+- \`./messages send\` — send a generic project message outside an active
+  operator reply. It is not a substitute for \`reply_to_operator\`.
 
 ${ctx.fetchGuidanceText?.trim() ? `${ctx.fetchGuidanceText.trim()}\n\n` : ''}
 

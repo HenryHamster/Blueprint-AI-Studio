@@ -1239,13 +1239,14 @@ describe('writeMessagesHelper', () => {
     }
   });
 
-  it('blocks direct resolution in Resident reply mode', () => {
+  it('blocks the old shell helpers as Resident operator-reply paths', () => {
     writeMessagesHelper('task-resident', '/tmp/resident-workspace', {
       residentReplyOnly: true,
     });
     const script = capturedScripts['/tmp/resident-workspace/messages'];
     expect(script).toContain('RESIDENT_REPLY_ONLY="1"');
     expect(script).toContain('resolve is disabled for Resident sessions');
+    expect(script).toContain('this is not the Workday operator reply tool; call reply_to_operator instead');
   });
 
   it('reads the live token, captures stdin, retries on 401, and fails loud (live write-token fix)', async () => {

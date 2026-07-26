@@ -904,6 +904,10 @@ if [ "$OP" = "send" ]; then
   IDEM_KEY=""
   COVERED_IDS=""
   if [ -e "$REPLY_RECEIPT_PATH" ] || [ -L "$REPLY_RECEIPT_PATH" ]; then
+    if [ "$RESIDENT_REPLY_ONLY" = "1" ]; then
+      echo "[ERROR] send: this is not the Workday operator reply tool; call reply_to_operator instead" >&2
+      exit 2
+    fi
     RECEIPT=$(_read_regular_bounded "$REPLY_RECEIPT_PATH" 16384) || {
       echo "[ERROR] send: ambient Resident reply receipt is not a safe regular file" >&2; exit 1
     }

@@ -95,7 +95,7 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('reject-direction');
   });
 
-  it('stages the canonical Resident receipt from a subdirectory strategic call', () => {
+  it('rejects strategic create-message while a Resident operator receipt is active', () => {
     writeStrategicHelpers('task-ambient-key', 'project-ambient-key', testWorkspace);
     fs.writeFileSync(
       path.join(testWorkspace, '.resident-reply-receipt.json'),
@@ -121,7 +121,7 @@ describe('writeStrategicHelpers', () => {
       ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
       : process.env.PATH ?? '';
 
-    const stdout = execFileSync(
+    expect(() => execFileSync(
       bashExecutable,
       [
         bashPath(path.join(testWorkspace, 'strategic')),
@@ -139,23 +139,14 @@ describe('writeStrategicHelpers', () => {
           NODE_BINARY: bashPath(process.execPath),
           PATH: executionPath,
         },
+        stdio: 'pipe',
       },
-    );
-
-    expect(JSON.parse(stdout.trim())).toEqual({ status: 'staged', op: 'create_message' });
-    const staged = JSON.parse(fs.readFileSync(
-      path.join(testWorkspace, '.resident-reply-staged-message.json'), 'utf8',
-    )) as Record<string, unknown>;
-    expect(staged).toMatchObject({
-      type: 'NOTE',
-      content: 'operator reply',
-      idempotency_key: 'resident-reply-stable-anchor',
-      covered_message_ids: ['message-m1'],
-    });
+    )).toThrow();
+    expect(fs.existsSync(path.join(testWorkspace, '.resident-reply-staged-message.json'))).toBe(false);
   });
 
-  it('stages the canonical Resident receipt from a subdirectory messages send', () => {
-    writeMessagesHelper('task-ambient-messages', testWorkspace);
+  it('rejects messages send while a Resident operator receipt is active', () => {
+    writeMessagesHelper('task-ambient-messages', testWorkspace, { residentReplyOnly: true });
     fs.writeFileSync(
       path.join(testWorkspace, '.resident-reply-receipt.json'),
       JSON.stringify({
@@ -180,35 +171,9 @@ describe('writeStrategicHelpers', () => {
       ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
       : process.env.PATH ?? '';
 
-    const stdout = execFileSync(
-      bashExecutable,
-      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'operator reply'],
-      {
-        cwd: nestedDir,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
-          AGENT_API_TOKEN: 'test-token',
-          BASH_ENV: bashPath(bashEnv),
-          NODE_BINARY: bashPath(process.execPath),
-          PATH: executionPath,
-        },
-      },
-    );
-    expect(JSON.parse(stdout.trim())).toEqual({ status: 'staged', op: 'create_message' });
-    const staged = JSON.parse(fs.readFileSync(
-      path.join(testWorkspace, '.resident-reply-staged-message.json'), 'utf8',
-    )) as Record<string, unknown>;
-    expect(staged).toMatchObject({
-      type: 'NOTE',
-      content: 'operator reply',
-      idempotency_key: 'resident-messages-stable-anchor',
-      covered_message_ids: ['message-m2'],
-    });
     expect(() => execFileSync(
       bashExecutable,
-      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'second reply must not win'],
+      [bashPath(path.join(testWorkspace, 'messages')), 'send', 'operator reply'],
       {
         cwd: nestedDir,
         encoding: 'utf8',
@@ -223,9 +188,7 @@ describe('writeStrategicHelpers', () => {
         stdio: 'pipe',
       },
     )).toThrow();
-    expect(JSON.parse(fs.readFileSync(
-      path.join(testWorkspace, '.resident-reply-staged-message.json'), 'utf8',
-    ))).toMatchObject({ content: 'operator reply' });
+    expect(fs.existsSync(path.join(testWorkspace, '.resident-reply-staged-message.json'))).toBe(false);
   }, 15_000);
 
   it('fails closed on symlinked or oversized ambient receipt/key files before either helper posts', () => {

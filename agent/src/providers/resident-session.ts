@@ -7,8 +7,9 @@ import { writeAgentTokenFile } from '../token-file.js';
 import { PROCESS_KILL_GRACE_MS } from '../constants.js';
 import {
   parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks,
-  isStrategicMutation, isMessageSend, type ResidentStreamEvent,
+  isStrategicMutation, type ResidentStreamEvent,
 } from './resident-stream.js';
+import { RESIDENT_REPLY_TOOL_NAME } from './resident-reply-tool.js';
 import {
   getProviderRunner, matchesAuthFailure, matchesRateLimit,
   probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
@@ -47,6 +48,22 @@ const RESIDENT_TURN_FORCE_SETTLE_MS = 20_000;       // stall+interrupt → force
 // instead of spinning silently. Default is a generous backstop — legitimate
 // operator-reply and bounded autonomous turns finish well within it.
 const DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS = 15 * 60_000;
+const OPERATOR_REPLY_TYPES = new Set(['NOTE', 'QUESTION', 'FEEDBACK', 'BUG_REPORT', 'BLOCKER']);
+
+/** The exact reply arguments observed on the native MCP tool_use event. */
+export interface ResidentOperatorReply {
+  type: string;
+  content: string;
+}
+
+function parseOperatorReplyInput(input: unknown): ResidentOperatorReply | null {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
+  const raw = input as Record<string, unknown>;
+  const content = typeof raw.content === 'string' ? raw.content.trim() : '';
+  const type = raw.message_type === undefined ? 'NOTE' : raw.message_type;
+  if (!content || typeof type !== 'string' || !OPERATOR_REPLY_TYPES.has(type)) return null;
+  return { content, type };
+}
 
 export interface ResidentTurnResult {
   /** authoritative final assistant text for this turn (from the `result` event) */
@@ -64,11 +81,13 @@ export interface ResidentTurnResult {
   appliedStrategicOp: boolean;
   /** any tool_use ran during the turn */
   sawToolUse: boolean;
-  /** the agent posted a durable operator reply via `./messages send` during the
-   *  turn AND that send was CONFIRMED to succeed (its tool_result carried no
-   *  error). A send whose result never arrived, or came back is_error, leaves
-   *  this false so the handler's persistReply backstop still runs. */
+  /** the agent invoked the native Workday reply MCP tool during the turn AND
+   *  its tool_result confirmed success. Plain assistant text and shell helpers
+   *  are deliberately not replies. */
   sentOperatorMessage: boolean;
+  /** Exact accepted native-tool payload, retained outside the model-writable
+   *  staging file so it cannot be altered after tool success. */
+  operatorReply: ResidentOperatorReply | null;
   /** the underlying process exited (or was closed) before/while this turn ran */
   processGone: boolean;
   /** wall-clock ms from sendTurn() call to the first streamed text token; null when
@@ -156,6 +175,8 @@ export interface ResidentSessionOptions {
   idleCeilingMs?: number;
   /** called once when the child process exits */
   onExit?: (code: number | null) => void;
+  /** Required native MCP reply tool for this Resident session. */
+  replyTool?: { mcpConfigPath: string; toolName?: string };
 }
 
 interface ActiveTurn {
@@ -166,11 +187,9 @@ interface ActiveTurn {
   sawToolUse: boolean;
   appliedStrategicOp: boolean;
   sentOperatorMessage: boolean;
-  /** tool_use ids of `./messages send` invocations still awaiting a tool_result.
-   *  sentOperatorMessage flips true only when one of these resolves WITHOUT an
-   *  error — so a failed send (bad curl) never suppresses the persistReply
-   *  backstop and the operator's durable reply is never silently lost. */
-  pendingMessageSendIds: Set<string>;
+  operatorReply: ResidentOperatorReply | null;
+  /** Native reply inputs, keyed by their tool-use id until tool_result arrives. */
+  pendingOperatorReplies: Map<string, ResidentOperatorReply>;
   interrupted: boolean;
   timedOut: boolean;
   hardTimedOut: boolean;
@@ -243,6 +262,20 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   const capabilities = probeClaudeCapabilities(base.command, base.env);
   const compatibleBaseArgs = stripUnsupportedClaudeOptionalArgs(base.args, capabilities);
   const args = [...compatibleBaseArgs, '--input-format', 'stream-json'];
+  if (opts.replyTool) {
+    if (capabilities && (
+      !capabilities.has('--mcp-config')
+      || !capabilities.has('--strict-mcp-config')
+      || !capabilities.has('--allowedTools')
+    )) {
+      throw new Error('resident native reply tool requires Claude --mcp-config, --strict-mcp-config, and --allowedTools support');
+    }
+    args.push(
+      '--mcp-config', opts.replyTool.mcpConfigPath,
+      '--strict-mcp-config',
+      '--allowedTools', opts.replyTool.toolName ?? RESIDENT_REPLY_TOOL_NAME,
+    );
+  }
 
   // Guarantee the live token file exists with the CURRENT token before the
   // long-lived subprocess (and its bash helpers) start reading it. Refreshes
@@ -360,6 +393,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       appliedStrategicOp: t.appliedStrategicOp,
       sawToolUse: t.sawToolUse,
       sentOperatorMessage: t.sentOperatorMessage,
+      operatorReply: t.operatorReply,
       processGone,
       ttftMs,
       turnMs,
@@ -461,7 +495,8 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     // abandoned turn, NOT to the new `activeTurn` the loop has since started.
     // Drop those intermediates so a superseded turn's tail can neither stream as
     // the new turn's output nor fold into its result state (appliedStrategicOp /
-    // sentOperatorMessage / accumulated text / pending message-send ids). The
+    // sentOperatorMessage / accepted native reply / accumulated text / pending
+    // reply-tool ids). The
     // owed top-level `result` itself is still handled below — it records its
     // token usage and decrements the counter (see the 'result' case). The
     // current turn's own output cannot arrive while this counter is >0 (it comes
@@ -528,25 +563,28 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           // sentinel key so the tool_result handler can still compute duration.
           t.toolCallStartTimes.set(ev.toolUseId ?? `__no_id_${t.toolCallCount}`, Date.now());
           if (isStrategicMutation(ev.command)) t.appliedStrategicOp = true;
-          // A `./messages send` is only a CONFIRMED durable reply once its
-          // tool_result comes back without an error — track the pending id and
-          // let the 'tool_result' case flip sentOperatorMessage on success. When
-          // the CLI gave the block no id (should never happen) we cannot confirm,
-          // so we leave the flag false and let the handler's persistReply backstop
-          // run rather than optimistically assume a send that may have failed.
-          if (isMessageSend(ev.command) && ev.toolUseId) t.pendingMessageSendIds.add(ev.toolUseId);
+          // Only the explicit MCP reply tool carries the delivery contract.
+          // Bash `./messages send`, `./strategic create-message`, and normal
+          // assistant text are not accepted as an operator reply.
+          if (ev.toolName === (opts.replyTool?.toolName ?? RESIDENT_REPLY_TOOL_NAME) && ev.toolUseId) {
+            const reply = parseOperatorReplyInput(ev.input);
+            if (reply) t.pendingOperatorReplies.set(ev.toolUseId, reply);
+          }
         }
         break;
       }
       case 'tool_result': {
-        // Confirm a `./messages send` succeeded: a matching tool_result with no
-        // error means the durable operator reply was actually posted. A failed
-        // send (is_error) resolves the pending id WITHOUT setting the flag, so the
-        // handler still runs its persistReply backstop.
+        // A staged native reply counts only after its matching MCP tool_result
+        // confirms success. This guards against a tool call that failed to write
+        // the receipt-bound staging file.
         const t = activeTurn;
-        if (t && ev.toolUseId && t.pendingMessageSendIds.has(ev.toolUseId)) {
-          t.pendingMessageSendIds.delete(ev.toolUseId);
-          if (!ev.isError) t.sentOperatorMessage = true;
+        if (t && ev.toolUseId) {
+          const reply = t.pendingOperatorReplies.get(ev.toolUseId);
+          t.pendingOperatorReplies.delete(ev.toolUseId);
+          if (!ev.isError && reply) {
+            t.sentOperatorMessage = true;
+            t.operatorReply = reply;
+          }
         }
         // Per-tool-call latency: compute wall-clock duration from the tool_use
         // event to this tool_result and add it to the running total. When the
@@ -724,7 +762,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (!alive || closed) {
       return Promise.resolve({
         resultText: '', accumulatedTurnText: '', interrupted: false, timedOut: false, hardTimedOut: false,
-        appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
+        appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false, operatorReply: null,
         processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
         totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
         providerFailed: false, failureCategory: terminalFailureCategory,
@@ -751,8 +789,8 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     return new Promise<ResidentTurnResult>((resolve) => {
       const turn: ActiveTurn = {
         resolve, resultText: '', accumulated: '', streamedText: false,
-        sawToolUse: false, appliedStrategicOp: false, sentOperatorMessage: false,
-        pendingMessageSendIds: new Set<string>(),
+        sawToolUse: false, appliedStrategicOp: false, sentOperatorMessage: false, operatorReply: null,
+        pendingOperatorReplies: new Map<string, ResidentOperatorReply>(),
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
         stallTimeoutMs, hardTimeoutMs: turnHardTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
@@ -774,7 +812,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         emit({ kind: 'error', text: `failed to write turn: ${String(e)}` });
         resolve({
           resultText: '', accumulatedTurnText: '', interrupted: false, timedOut: false, hardTimedOut: false,
-          appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
+          appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false, operatorReply: null,
           processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
           totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
           providerFailed: false, failureCategory: terminalFailureCategory,

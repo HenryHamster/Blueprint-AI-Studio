@@ -24,6 +24,9 @@ import {
   type ResidentSession, type ResidentSessionEvent, type ResidentTurnResult,
 } from '../providers/resident-session.js';
 import {
+  provisionResidentReplyTool, RESIDENT_REPLY_TOOL_NAME,
+} from '../providers/resident-reply-tool.js';
+import {
   buildDirSummaryText,
   buildOpenMessagesText,
   formatRecentHandledConversation,
@@ -89,7 +92,7 @@ export interface ResidentStagedReply {
   context?: Record<string, unknown>;
 }
 
-/** Read and authenticate the helper's staged intent against this immutable turn receipt. */
+/** Read and authenticate the native reply tool's staged intent against this immutable turn receipt. */
 export function readResidentStagedReplyAtPath(
   stagedReplyPath: string,
   receipt: ResidentReplyReceipt,
@@ -873,7 +876,8 @@ export async function handleStrategicResident(
   const handleSessionEvent = (ev: ResidentSessionEvent): void => {
     if (ev.kind === 'text' && ev.text) {
       // Assistant reply text — the only content that reaches the durable
-      // transcript (once the agent `./messages send`s it). Streams as `message`.
+      // transcript is the native reply_to_operator payload. This text is only
+      // a live transcript stream, surfaced as `message`.
       streamer.delta(ev.text);
     } else if (ev.kind === 'tool' || ev.kind === 'activity') {
       // A tool call / tool result — a LIVE, ephemeral activity one-liner. Prefer
@@ -904,8 +908,16 @@ export async function handleStrategicResident(
   // watchdog, while the session provider keeps its independent 15-minute hard
   // backstop for a genuinely non-terminating child.
   const sessionStallTimeoutMs = Math.max(cfg.turnTimeoutMs, cfg.autonomousTurnTimeoutMs);
-  let session: ResidentSession = startResidentClaudeSession({
+  let residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
+    receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+    stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+  });
+  const residentSessionOptions = () => ({
     model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
+    replyTool: { mcpConfigPath: residentReplyTool.configPath, toolName: RESIDENT_REPLY_TOOL_NAME },
+  });
+  let session: ResidentSession = startResidentClaudeSession({
+    ...residentSessionOptions(),
   });
   bindSessionEvents(session);
 
@@ -1089,7 +1101,7 @@ export async function handleStrategicResident(
     session.close();
     try {
       const newSession = startResidentClaudeSession({
-        model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
+        ...residentSessionOptions(),
       });
       bindSessionEvents(newSession);
       session = newSession;
@@ -1157,7 +1169,7 @@ export async function handleStrategicResident(
     compactionCount += 1;
 
     const newSession = startResidentClaudeSession({
-      model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
+      ...residentSessionOptions(),
     });
     // Wire the same event listeners so the streamer keeps receiving deltas.
     bindSessionEvents(newSession);
@@ -1193,24 +1205,24 @@ export async function handleStrategicResident(
     return `resident-${kind}-${digest}`;
   };
   const persistReply = async (
-    r: ResidentTurnResult,
     anchorMessageId: string,
     coveredMessageIds: string[],
     stagedReply: ResidentStagedReply | null,
     residentTurnState: Record<string, unknown>,
   ): Promise<boolean> => {
-    const text = stagedReply?.content.trim() || r.resultText.trim();
+    if (!stagedReply) return false;
+    const text = stagedReply.content.trim();
     if (!text) return false;
     try {
       await apiPost('/api/agent/strategic', {
         task_id: taskId,
         op: 'create_message',
         data: {
-          type: stagedReply?.type ?? 'NOTE',
+          type: stagedReply.type,
           content: text,
           idempotency_key: residentMessageKey('reply', anchorMessageId),
           covered_message_ids: coveredMessageIds,
-          ...(stagedReply?.context === undefined ? {} : { context: stagedReply.context }),
+          ...(stagedReply.context === undefined ? {} : { context: stagedReply.context }),
           resident_turn_state: residentTurnState,
         },
       });
@@ -1673,6 +1685,23 @@ export async function handleStrategicResident(
       try { removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH); } catch { /* startup cleanup retries */ }
       return 'stop';
     }
+    const operatorReply = r.operatorReply;
+    if (!r.sentOperatorMessage || stagedReply === null || operatorReply === null) {
+      stopReason = 'operator_reply_tool_missing';
+      sendLog(ws, '[resident] no confirmed native reply_to_operator call; leaving operator message open for retry\n');
+      try { removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH); } catch { /* startup cleanup retries */ }
+      return 'stop';
+    }
+    // The MCP server's staging file proves receipt ownership, while the
+    // session keeps the accepted tool arguments outside model-writable storage.
+    // A later workspace write can therefore only make this turn fail closed;
+    // it can never change what gets persisted as the operator reply.
+    if (stagedReply.content !== operatorReply.content || stagedReply.type !== operatorReply.type) {
+      stopReason = 'operator_reply_staging_invalid';
+      sendLog(ws, '[resident] staged reply no longer matches accepted native tool arguments; leaving operator message open\n');
+      try { removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH); } catch { /* startup cleanup retries */ }
+      return 'stop';
+    }
     // Capture any operator-settled correction BEFORE the sole reply write. The
     // serialized state below then lands in the same backend transaction as the
     // reply and covered-message updates, closing the crash-before-heartbeat gap.
@@ -1680,7 +1709,7 @@ export async function handleStrategicResident(
       r,
       coveredMessageIds,
       msgs.map(message => message.content?.trim() ?? '').filter(Boolean).join('\n\n'),
-      stagedReply?.content,
+      operatorReply.content,
     );
     const residentTurnState: Record<string, unknown> = {
       exam_ledger: serializeLedger(
@@ -1698,7 +1727,11 @@ export async function handleStrategicResident(
     let replyPersisted = false;
     try {
       replyPersisted = await persistReply(
-        r, replyAnchorId, coveredMessageIds, stagedReply, residentTurnState,
+        replyAnchorId, coveredMessageIds, {
+          ...stagedReply,
+          type: operatorReply.type,
+          content: operatorReply.content,
+        }, residentTurnState,
       );
     } finally {
       try {
@@ -1765,6 +1798,10 @@ export async function handleStrategicResident(
           configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
           writeStrategicHelpers(taskId, projectId, WORKSPACE);
           provisionAmbientHelpers(taskId, WORKSPACE);
+          residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
+            receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+            stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+          });
           sendLog(ws, '[resident] workspace recovery — helper tools re-provisioned\n');
 
           // Restart the subprocess so its cwd points to the new directory inode.
@@ -1772,7 +1809,7 @@ export async function handleStrategicResident(
           invalidateSessionEvents();
           session.close();
           const recoverySession = startResidentClaudeSession({
-            model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
+            ...residentSessionOptions(),
           });
           bindSessionEvents(recoverySession);
           session = recoverySession;
