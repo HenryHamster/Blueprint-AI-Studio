@@ -18300,19 +18300,15 @@ async def _post_spawn_fix(
         app.dependency_overrides.pop(verify_agent_token, None)
 
 
-def test_one_time_spawnable_registry_set_is_implementation_types():
-    """STRATEGIST_ONE_TIME_SPAWNABLE_TYPES is exactly the PR-producing
-    implementation types, and is disjoint from the investigation/knowledge types
-    spawn_task accepts (no overlap between the two dispatch lanes)."""
+def test_spawn_fix_registry_export_is_only_a_compatibility_subset():
+    """The historical export remains, but its types now use spawn_task."""
     from app.task_capabilities import (
         STRATEGIST_ONE_TIME_SPAWNABLE_TYPES,
         STRATEGIST_SPAWNABLE_TASK_TYPES,
     )
 
     assert {"create", "refactor", "qa"} == STRATEGIST_ONE_TIME_SPAWNABLE_TYPES
-    # The two lanes are mutually exclusive: a one-time fix is direction-free and
-    # PR-producing; a spawn_task spawn is a read-only investigation.
-    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.isdisjoint(
+    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.issubset(
         STRATEGIST_SPAWNABLE_TASK_TYPES
     )
 
@@ -18333,7 +18329,8 @@ async def test_spawn_fix_creates_task_without_direction_id(db_session):
         spawn_type="create",
     )
     assert body["status"] == "ok"
-    assert body["op"] == "spawn_fix"
+    assert body["op"] == "spawn_task"
+    assert body["deprecated_alias"] == "spawn_fix"
     assert body["type"] == "create"
     assert body["deduplicated"] is False
     assert body["priority"] == 100
@@ -18345,11 +18342,9 @@ async def test_spawn_fix_creates_task_without_direction_id(db_session):
     assert spawned.created_by == "STRATEGIC_AGENT"
     assert spawned.first_payload.get("type") == "create"
 
-    # Direction-free provenance: spawned_by marks the one-time-fix lane and the
-    # one_time_fix flag is set; NO direction_id key exists in context.
+    # The compatibility alias creates the same normal direction-free task.
     ctx = spawned.context or {}
-    assert ctx.get("spawned_by") == "strategic_direct_fix"
-    assert ctx.get("one_time_fix") is True
+    assert ctx.get("spawned_by") == "strategic_direct"
     assert ctx.get("parent_strategic_task_id") == review_id
     assert "direction_id" not in ctx
 
@@ -18358,12 +18353,8 @@ async def test_spawn_fix_creates_task_without_direction_id(db_session):
 
 
 @pytest.mark.asyncio
-async def test_spawn_fix_rejects_direction_only_investigation_type(db_session):
-    """A research task is a strategist_spawnable investigation type, NOT a
-    one-time implementation type, so spawn_fix must reject it with a 400 listing
-    the registry-derived allowed types."""
-    from app.task_capabilities import STRATEGIST_ONE_TIME_SPAWNABLE_TYPES
-
+async def test_spawn_fix_alias_routes_research_through_spawn_task(db_session):
+    """The compatibility alias uses the unified task-type policy."""
     _project, review_id = await _make_strategic_review_task(db_session)
 
     body = await _post_spawn_fix(
@@ -18372,12 +18363,10 @@ async def test_spawn_fix_rejects_direction_only_investigation_type(db_session):
         title="Investigate something",
         prompt="research the codebase",
         spawn_type="research",
-        expect_status=400,
     )
-    detail = body["error"]["message"]
-    assert "must be one of" in detail
-    assert "research" in detail  # echoes the rejected type
-    assert str(sorted(STRATEGIST_ONE_TIME_SPAWNABLE_TYPES)) in detail
+    assert body["status"] == "ok"
+    assert body["op"] == "spawn_task"
+    assert body["deprecated_alias"] == "spawn_fix"
 
 
 @pytest.mark.asyncio
@@ -18399,7 +18388,8 @@ async def test_spawn_fix_fix_type_without_pr_context_fails_cleanly(db_session):
         expect_status=400,
     )
     detail = body["error"]["message"]
-    assert "must be one of" in detail
+    assert "pr_number" in detail
+    assert "branch" in detail
 
     # No task was created by the failed validation.
     count = (
@@ -18456,10 +18446,8 @@ async def test_spawn_fix_idempotent_on_retry_duplicate(db_session):
 
 
 @pytest.mark.asyncio
-async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
-    """One strategic review may spawn at most the per-review cap of one-time
-    fixes; the next is refused with 429 status='skipped' and an observable budget
-    flag stamped on the review."""
+async def test_spawn_fix_alias_has_no_per_review_quota(db_session, mocker):
+    """The deprecated alias is not a separately capped dispatch lane."""
     from sqlalchemy import func as _f
 
     mocker.patch.dict(
@@ -18477,16 +18465,14 @@ async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
         assert body["status"] == "ok"
         assert body["deduplicated"] is False
 
-    refused = await _post_spawn_fix(
+    third = await _post_spawn_fix(
         db_session,
         review_id,
         title="Fix gamma",
         prompt="do gamma",
-        expect_status=429,
     )
-    assert refused["status"] == "skipped"
-    assert refused["op"] == "spawn_fix"
-    assert refused["scope"] == "per_review"
+    assert third["status"] == "ok"
+    assert third["deprecated_alias"] == "spawn_fix"
 
     # Only the two budgeted tasks exist; the third was not created.
     count = (
@@ -18496,15 +18482,7 @@ async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
             .where(Task.created_by == "STRATEGIC_AGENT")
         )
     ).scalar()
-    assert count == 2
-
-    # The refusal is observable: the review carries the exhaustion flag.
-    review = (
-        await db_session.execute(select(Task).where(Task.id == review_id))
-    ).scalar_one()
-    flag = (review.context or {}).get("_strategic_spawn_budget_exhausted")
-    assert flag is not None
-    assert flag["scope"] == "per_review"
+    assert count == 3
 
 
 # ── CI compliance in strategic review payload ─────────────────────────────────

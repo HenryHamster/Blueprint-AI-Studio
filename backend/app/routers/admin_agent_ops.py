@@ -122,9 +122,11 @@ from app.strategic_constants import (
 )
 from app.task_capabilities import (
     STRATEGIC_TASK_TYPES,
+    STRATEGIST_CONTEXTUAL_TASK_TYPES,
     STRATEGIST_ONE_TIME_SPAWNABLE_TYPES,
     STRATEGIST_SPAWNABLE_TASK_TYPES,
 )
+from app.strategic_spawn_requests import submit_strategic_spawn
 from app.auth import require_admin
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
@@ -3458,20 +3460,21 @@ async def strategic_operation(
             }
         )
 
-    elif payload.op == "spawn_task":
-        # Allow strategic review to directly spawn a research, plan, web_research,
-        # or design task for targeted investigation, jumping the normal autonomous
-        # research queue. The allowed set is DERIVED FROM THE TASK-TYPE REGISTRY
-        # (STRATEGIST_SPAWNABLE_TASK_TYPES) rather than a hardcoded literal, so a
-        # newly registered investigation/knowledge type becomes spawnable by
-        # declaring strategist_spawnable=True alone. Restricted to investigation /
-        # knowledge / plan types — implementation must go through the normal
-        # direction → research → plan → create flow.
+    elif payload.op in {"spawn_task", "spawn_fix"}:
+        # One capability-driven task dispatch contract. spawn_fix is accepted for
+        # one compatibility release but routes through this exact path.
+        legacy_spawn_fix = payload.op == "spawn_fix"
         spawn_type = data.get("type")
-        if spawn_type not in STRATEGIST_SPAWNABLE_TASK_TYPES:
+        allowed_spawn_types = (
+            STRATEGIST_SPAWNABLE_TASK_TYPES | STRATEGIST_CONTEXTUAL_TASK_TYPES
+        )
+        if spawn_type not in allowed_spawn_types:
             raise HTTPException(
                 status_code=400,
-                detail=f"spawn_task type must be one of {sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)}; got '{spawn_type}'",
+                detail=(
+                    "spawn_task type must be one of "
+                    f"{sorted(allowed_spawn_types)}; got '{spawn_type}'"
+                ),
             )
         raw_prompt = str(data.get("prompt", "")).strip()
         # compute_experiment is described by its launch contract (command +
@@ -3522,6 +3525,15 @@ async def strategic_operation(
             "title": title,
             "base_branch": _get_project_integration_branch(project),
         }
+        if spawn_type in STRATEGIST_CONTEXTUAL_TASK_TYPES:
+            for context_field in (
+                "pr_number",
+                "branch",
+                "original_task_id",
+                "original_prompt",
+            ):
+                if data.get(context_field) is not None:
+                    spawn_payload[context_field] = data[context_field]
         if direction_id:
             spawn_payload["direction_id"] = direction_id
 
@@ -3589,9 +3601,17 @@ async def strategic_operation(
             spawn_payload["model"] = type_model
         if type_effort:
             spawn_payload["effort"] = type_effort
-        spawn_payload = _validate_internal_payload(
-            spawn_payload, f"strategic_spawn_task:{spawn_type}"
-        )
+        try:
+            spawn_payload = _validate_internal_payload(
+                spawn_payload, f"strategic_spawn_task:{spawn_type}"
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"spawn_task cannot build a valid '{spawn_type}' payload: {exc}"
+                ),
+            ) from exc
 
         # Idempotency guard against retry-duplicated spawns.
         #
@@ -3635,7 +3655,10 @@ async def strategic_operation(
         dedup_overlap_threshold = _runtime_config.get(
             "strategist_spawn_dedup_overlap_threshold", 4
         )
-        for candidate in (await session.execute(dupe_stmt)).scalars().all():
+        # Exact retry identity is now owned by StrategicSpawnRequest below. Keep
+        # the legacy query temporarily for rollout observability, but do not let
+        # fuzzy title overlap erase a distinct accepted request.
+        for candidate in ():
             exact = candidate.title == title
             semantic = (
                 not exact
@@ -3706,12 +3729,10 @@ async def strategic_operation(
             )
         ).scalar() or 0
 
-        ok, scope, reason = spawn_budget_status(
-            per_review_count,
-            window_count,
-            per_review_cap=per_review_cap,
-            window_cap=window_cap,
-        )
+        # The historical per-review quota no longer admits or rejects work.
+        # StrategicSpawnRequest applies the project-wide abuse circuit breaker
+        # after durably recording the exact request.
+        ok, scope, reason = True, None, None
         if not ok:
             ctx = task.context or {}
             task.context = {
@@ -3823,36 +3844,63 @@ async def strategic_operation(
                 ),
             )
 
-        new_task = Task(
-            project_id=project.id,
-            title=title,
-            description=prompt[:500],
-            payloads=[spawn_payload],
-            context=new_task_ctx,
-            status=TaskStatus.QUEUED,
-            priority=100,  # ahead of default (50) — course-correction runs first
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            created_by="STRATEGIC_AGENT",
-            criterion_ids=_task_criterion_ids,
-            **(
-                {"requires_approval": spawn_requires_approval}
-                if spawn_requires_approval is not None
-                else {}
-            ),
-        )
-        session.add(new_task)
-        await session.flush()
-
-        ctx = task.context or {}
-        task.context = {
-            **ctx,
-            "_strategic_tasks_spawned": ctx.get("_strategic_tasks_spawned", 0) + 1,
+        normalized_specification = {
+            "task": {
+                "title": title,
+                "description": prompt[:500],
+                "payloads": [spawn_payload],
+                "context": new_task_ctx,
+                "priority": 100,
+                "criterion_ids": _task_criterion_ids,
+                "requires_approval": spawn_requires_approval,
+                "watch": data.get("watch", True) is not False,
+                "watch_purpose": str(data.get("watch_purpose") or "")[:1000],
+            }
         }
-        flag_modified(task, "context")
-        session.add(task)
-        await session.commit()
+        try:
+            submission = await submit_strategic_spawn(
+                session,
+                project_id=project.id,
+                parent_task_id=task.id,
+                task_type=spawn_type,
+                specification=normalized_specification,
+                idempotency_key=data.get("idempotency_key"),
+                direction_id=str(direction_id) if direction_id else None,
+                burst_cap=int(
+                    _runtime_config.get("strategist_spawn_window_cap", 100)
+                ),
+                burst_window_minutes=int(
+                    _runtime_config.get("strategist_spawn_window_minutes", 60)
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        new_task = submission.task
+        if new_task is None:
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "deferred",
+                        "op": "spawn_task",
+                        "request_id": str(submission.request.id),
+                        "type": spawn_type,
+                        "reason": submission.request.admission_reason,
+                        "not_before": (
+                            submission.request.not_before.isoformat()
+                            if submission.request.not_before
+                            else None
+                        ),
+                        **(
+                            {"deprecated_alias": "spawn_fix"}
+                            if legacy_spawn_fix
+                            else {}
+                        ),
+                    }
+                ),
+                status_code=202,
+            )
         logger.info(
-            f"[STRATEGIC API] Spawned {spawn_type} task {new_task.id} "
+            f"[STRATEGIC API] Accepted {spawn_type} task {new_task.id} "
             f"(priority=100) from strategic review {task.id} for project {project.id}"
         )
         linked_debt_id = await _maybe_link_task_to_debt(
@@ -3862,9 +3910,16 @@ async def strategic_operation(
             {
                 "status": "ok",
                 "op": "spawn_task",
+                "request_id": str(submission.request.id),
                 "task_id": str(new_task.id),
                 "type": spawn_type,
                 "priority": 100,
+                "deduplicated": submission.replayed,
+                **(
+                    {"deprecated_alias": "spawn_fix"}
+                    if legacy_spawn_fix
+                    else {}
+                ),
                 **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
             }
         )

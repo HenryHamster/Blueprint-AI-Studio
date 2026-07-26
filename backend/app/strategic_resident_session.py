@@ -3616,11 +3616,20 @@ async def renew_resident_session_lease(
     # boundary. The existing task-tree work_state_rev remains the wake signal;
     # these bounded receipts preserve WHICH completion Strategic was awaiting.
     try:
+        from app.strategic_spawn_requests import drain_deferred_spawn_requests
         from app.strategic_watches import (
             resolve_project_task_watches,
             serialize_watch,
         )
 
+        await drain_deferred_spawn_requests(
+            session,
+            project_id=project.id,
+            burst_cap=int(runtime_config.get("strategist_spawn_window_cap", 100)),
+            burst_window_minutes=int(
+                runtime_config.get("strategist_spawn_window_minutes", 60)
+            ),
+        )
         _visible_watches = await resolve_project_task_watches(
             session,
             project_id=project.id,
