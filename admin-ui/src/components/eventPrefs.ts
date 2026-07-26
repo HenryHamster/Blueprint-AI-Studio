@@ -73,7 +73,7 @@ export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
   'release_stabilize_stalled', 'release_ci_unresolved_stall', 'release_auto_merge_stalled',
   'promotion_readiness_reached', 'strategic_steering_deferred', 'strategic_steering_acted',
-  'direction_staged_activated', 'capability_trial_stalled', 'capability_verdict_decided',
+  'direction_staged_activated',
   'capability_trial_ambiguous_lift_escalation',
   'question_answer', 'criterion_retracted', 'criterion_superseded',
   'capability_proof_gate_graduated_observe', 'capability_proof_gate_graduated_enforce',
@@ -85,7 +85,7 @@ export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
   'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
   'release_stabilize_stalled', 'release_ci_unresolved_stall', 'release_auto_merge_stalled',
-  'promotion_readiness_reached', 'capability_trial_stalled',
+  'promotion_readiness_reached',
   ...ESCALATION_EVENT_TYPES,
 ]);
 

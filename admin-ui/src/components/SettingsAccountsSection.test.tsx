@@ -107,7 +107,7 @@ describe('SettingsAccountsSection', () => {
             maxPlanAccounts={accounts}
             onRefreshAccounts={() => {
               refreshCount.current += 1;
-              if (refreshCount.current === 2) {
+              if (refreshCount.current === 1) {
                 setAccounts([
                   makeAccount({
                     usage_snapshot: {

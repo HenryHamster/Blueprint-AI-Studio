@@ -145,7 +145,7 @@ interface SettingsAccountsSectionProps {
   onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
-  onRefreshAccounts: () => void | Promise<void>;
+  onRefreshAccounts?: () => void | Promise<void>;
   onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
   providers: Record<string, ProviderCatalogEntry>;
@@ -1154,8 +1154,10 @@ export function SettingsAccountsSection({
   // The roster response owns the persisted usage snapshots. Refresh it while
   // this section is mounted so a background probe becoming known is reflected
   // without requiring the operator to leave and reopen Settings.
-  usePoller(() => onRefreshAccounts(), {
+  usePoller(() => onRefreshAccounts?.(), {
     intervalMs: DEFAULT_POLL_MS,
+    enabled: typeof onRefreshAccounts === 'function',
+    leading: false,
     deps: [],
   });
 
