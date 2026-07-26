@@ -136,12 +136,40 @@ def _execution_document_fields(job: ComputeJob, task: Task | None) -> tuple[str,
     )
 
 
+def _refresh_execution_document(
+    document: KnowledgeDocument,
+    *,
+    title: str,
+    summary: str,
+    body: str,
+    report: dict[str, Any],
+    citations: list[str],
+) -> KnowledgeDocument:
+    """Refresh mutable execution evidence without replacing legacy analysis."""
+    verdict = dict(document.forward_quality_verdict or {})
+    service_owned = verdict.get("analysis_mode") == "execution_observation"
+    verdict["execution"] = report
+    document.forward_quality_verdict = verdict
+    document.tags = list(
+        dict.fromkeys([*(document.tags or []), "compute_execution", str(report["job_status"]).lower()])
+    )
+    document.source_citations = list(
+        dict.fromkeys([*(document.source_citations or []), *citations])
+    )
+    if service_owned:
+        document.title = title
+        document.summary = summary
+        document.body = body
+    return document
+
+
 async def ensure_compute_execution_document(session, job_id: uuid.UUID) -> KnowledgeDocument | None:
     """Idempotently record one terminal execution document for ``job_id``.
 
     This intentionally does not alter task state or task-completion evidence.
     The unique ``source_compute_job_id`` is the concurrency-safe identity; a
-    second terminal path simply returns the first document.
+    second terminal path refreshes the same document with any evidence that
+    arrived after the terminal transition (notably runner stdout/stderr).
     """
     job = await session.get(ComputeJob, job_id)
     if job is None or _job_status_value(job) not in _TERMINAL_STATUSES:
@@ -151,10 +179,21 @@ async def ensure_compute_execution_document(session, job_id: uuid.UUID) -> Knowl
             select(KnowledgeDocument).where(KnowledgeDocument.source_compute_job_id == job.id)
         )
     ).scalars().first()
-    if existing is not None:
-        return existing
     task = await session.get(Task, job.task_id) if job.task_id else None
     title, summary, body, report, citations = _execution_document_fields(job, task)
+    if existing is not None:
+        _refresh_execution_document(
+            existing,
+            title=title,
+            summary=summary,
+            body=body,
+            report=report,
+            citations=citations,
+        )
+        session.add(existing)
+        await session.commit()
+        await session.refresh(existing)
+        return existing
     # Adopt the historical task-owned compute document when present.  This is a
     # one-time identity repair for rows written before source_compute_job_id
     # existed; it avoids showing two documents for one execution while keeping
@@ -173,10 +212,14 @@ async def ensure_compute_execution_document(session, job_id: uuid.UUID) -> Knowl
         ).scalars().first()
     if legacy is not None:
         legacy.source_compute_job_id = job.id
-        verdict = dict(legacy.forward_quality_verdict or {})
-        verdict["execution"] = report
-        legacy.forward_quality_verdict = verdict
-        legacy.tags = list(dict.fromkeys([*(legacy.tags or []), "compute_execution"]))
+        _refresh_execution_document(
+            legacy,
+            title=title,
+            summary=summary,
+            body=body,
+            report=report,
+            citations=citations,
+        )
         session.add(legacy)
         try:
             await session.commit()

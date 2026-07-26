@@ -130,6 +130,33 @@ _MAX_IMAGE_CACHE_PROJECTS = 64
 # 1 PiB per bucket — far beyond any real image cache, so an absurd runner-reported
 # integer can never poison the telemetry while every plausible value passes.
 _MAX_IMAGE_CACHE_BYTES = 1 << 50
+
+
+def _observed_runner_hardware(runner: LocalRunner) -> dict[str, Any]:
+    """Return a bounded snapshot of the hardware that actually ran a job."""
+    caps = dict(runner.capabilities or {})
+    hardware: dict[str, Any] = {
+        "has_gpu": caps.get("has_gpu") is True,
+    }
+    for key in ("gpu_count", "memory_free_bytes"):
+        value = caps.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            hardware[key] = value
+    for key in (
+        "gpu_names",
+        "gpu_compute_capabilities",
+        "gpu_memory_total_mib",
+        "gpu_memory_free_mib",
+    ):
+        value = caps.get(key)
+        if isinstance(value, list):
+            hardware[key] = value[:_MAX_GPU_LIST_ENTRIES]
+    cli_inventory = caps.get("cli_inventory")
+    if isinstance(cli_inventory, dict):
+        hardware["cli_inventory"] = dict(
+            list(cli_inventory.items())[:_MAX_CLI_INVENTORY_ENTRIES]
+        )
+    return hardware
 _MAX_CONTAINER_IMAGE_STORE_PATH_CHARS = 512
 _MAX_CONTAINER_IMAGE_RECLAIM_REASON_CHARS = 500
 _CONTAINER_IMAGE_STORE_RUNTIMES = frozenset({"docker", "podman"})
@@ -2316,6 +2343,17 @@ async def report_compute_job(
         job.ran_on_runner_id = runner.id
 
     meta = dict(job.polling_metadata or {})
+    runtime_provenance = dict(job.runtime_provenance or {})
+    runtime_provenance.update(
+        {
+            "backend": job.backend,
+            "runner_id": str(runner.id),
+            "runner_hostname": runner.hostname,
+            "runner_version": runner.version,
+            "observed_hardware": _observed_runner_hardware(runner),
+        }
+    )
+    job.runtime_provenance = runtime_provenance
     cancel_requested = bool(job.status in _COMPUTE_JOB_TERMINAL_STATUSES)
 
     # Store a terminal runner log under the common key immediately, before the
@@ -2483,6 +2521,12 @@ async def report_compute_job(
         job.updated_at = now
         session.add(job)
         await session.commit()
+        # The terminal transition may already have created the job-owned
+        # observation. Refresh it so a late final stdout/stderr report is not
+        # hidden behind a permanently stale document.
+        from app.compute_execution_documents import ensure_compute_execution_document
+
+        await ensure_compute_execution_document(session, job.id)
 
     return {"ok": True, "cancel_requested": cancel_requested}
 

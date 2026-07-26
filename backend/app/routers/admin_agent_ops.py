@@ -107,6 +107,7 @@ from app.strategic_completion import (
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
     find_gap_respawn_match,
 )
+from app.resource_envelope import resolve_project_require_local_runner
 from app.strategic_resident_session import (
     read_resident_session as _read_resident_session,
     resident_session_is_active as _resident_session_is_active,
@@ -3623,7 +3624,7 @@ async def strategic_operation(
                 _author_compute_launch_contract,
                 _validate_compute_launch_contract,
                 build_compute_contract_preview,
-                resolve_compute_spend_approval,
+                resolve_compute_spend_decision,
             )
 
             contract = _author_compute_launch_contract(data)
@@ -3644,12 +3645,16 @@ async def strategic_operation(
                 ),
                 None,
             )
-            needs_approval, _threshold = resolve_compute_spend_approval(
+            require_local_runner = resolve_project_require_local_runner(project)
+            spend_decision = resolve_compute_spend_decision(
                 runtime_config=_runtime_config,
                 direction=direction_ctx,
                 spend_cap_usd=spend_cap,
+                require_local_runner=require_local_runner,
+                task_context=dict(task.context or {}),
+                launch_contract=contract,
             )
-            spawn_requires_approval = needs_approval
+            spawn_requires_approval = spend_decision.requires_monetary_approval
             # Merge contract fields into the payload so the handler gets them.
             spawn_payload.update(contract)
             if data.get("preview_only") is True:
@@ -3663,9 +3668,7 @@ async def strategic_operation(
                             contract,
                             runtime_config=_runtime_config,
                             direction=direction_ctx,
-                            require_local_runner=bool(
-                                (task.context or {}).get("require_local_runner")
-                            ),
+                            require_local_runner=require_local_runner,
                             task_context=dict(task.context or {}),
                         ),
                     }
@@ -5766,7 +5769,10 @@ async def strategic_operation(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            request.admission_reason = f"cancelled_by_strategic: {reason}"
+            request.policy_snapshot = {
+                **dict(request.policy_snapshot or {}),
+                "cancel_reason": reason,
+            }
             session.add(request)
             await session.commit()
             return _resp(

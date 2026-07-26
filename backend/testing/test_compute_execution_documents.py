@@ -2,8 +2,13 @@
 
 import uuid
 
-from app.compute_execution_documents import _execution_document_fields
-from app.models import ComputeJob, ComputeJobOutcome, ComputeJobStatus
+from app.compute_execution_documents import (
+    _execution_document_fields,
+    _refresh_execution_document,
+)
+from app.models import ComputeJob, ComputeJobOutcome, ComputeJobStatus, KnowledgeDocument
+from app.routers.runner import _observed_runner_hardware
+from app.models import LocalRunner
 from app.schemas import serialize_compute_job_response_safe
 
 
@@ -64,3 +69,62 @@ def test_safe_compute_response_exposes_typed_terminal_log_not_manifest_secrets()
     assert "env" not in contract
     assert "container_registry_auth" not in contract
     assert data["runtime_provenance"]["runner_hostname"] == "gpu-box"
+
+
+def test_observed_runner_hardware_uses_heartbeat_inventory():
+    runner = LocalRunner(
+        project_id=uuid.uuid4(),
+        token_hash="0" * 64,
+        hostname="gpu-box",
+        capabilities={
+            "has_gpu": True,
+            "gpu_count": 2,
+            "gpu_names": ["NVIDIA L4", "NVIDIA L4"],
+            "gpu_memory_total_mib": [23034, 23034],
+            "active_task_ids": ["not-hardware"],
+        },
+    )
+
+    hardware = _observed_runner_hardware(runner)
+
+    assert hardware == {
+        "has_gpu": True,
+        "gpu_count": 2,
+        "gpu_names": ["NVIDIA L4", "NVIDIA L4"],
+        "gpu_memory_total_mib": [23034, 23034],
+    }
+
+
+def test_refresh_execution_document_replaces_stale_service_owned_log():
+    job = _terminal_job()
+    job.polling_metadata["command_log"] = {
+        "text": "late final output",
+        "truncated": False,
+        "source": "runner",
+    }
+    title, summary, body, report, citations = _execution_document_fields(job, None)
+    document = KnowledgeDocument(
+        project_id=job.project_id,
+        source_compute_job_id=job.id,
+        title="stale",
+        summary="stale",
+        body="stale",
+        tags=["compute_execution"],
+        source_citations=[],
+        forward_quality_verdict={
+            "analysis_mode": "execution_observation",
+            "execution": {"terminal_log": None},
+        },
+    )
+
+    _refresh_execution_document(
+        document,
+        title=title,
+        summary=summary,
+        body=body,
+        report=report,
+        citations=citations,
+    )
+
+    assert "late final output" in document.body
+    assert document.forward_quality_verdict["execution"]["terminal_log"]["source"] == "runner"

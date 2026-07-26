@@ -46,6 +46,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.resource_envelope import resolve_project_require_local_runner
 from app.schemas import serialize_compute_job_response_safe
 from app.shared_state import runtime_config
 from app.strategic_runtime_work import (
@@ -539,7 +540,10 @@ async def preview_project_compute_contract(
         contract,
         runtime_config=runtime_config,
         direction=direction,
-        require_local_runner=body.require_local_runner,
+        require_local_runner=(
+            resolve_project_require_local_runner(project)
+            or body.require_local_runner
+        ),
     )
 
 

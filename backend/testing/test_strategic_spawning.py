@@ -28,6 +28,7 @@ from app.models import (
     ArtifactType,
     LocalRunner,
     Project,
+    StrategicSpawnRequest,
     Task,
     TaskStatus,
     MessageType,
@@ -18300,6 +18301,38 @@ async def _post_spawn_fix(
         app.dependency_overrides.pop(verify_agent_token, None)
 
 
+async def _post_strategic_operation(db_session, task_id, *, op, data, expect_status=200):
+    from httpx import ASGITransport, AsyncClient
+
+    from app.database import get_session
+    from app.main import app
+    from app.routers.agent import verify_agent_token
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            response = await ac.post(
+                "/api/agent/strategic",
+                json={"op": op, "task_id": task_id, "data": data},
+            )
+        assert response.status_code == expect_status, response.text
+        return response.json()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
 def test_spawn_fix_registry_export_is_only_a_compatibility_subset():
     """The historical export remains, but its types now use spawn_task."""
     from app.task_capabilities import (
@@ -18311,6 +18344,67 @@ def test_spawn_fix_registry_export_is_only_a_compatibility_subset():
     assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.issubset(
         STRATEGIST_SPAWNABLE_TASK_TYPES
     )
+
+
+@pytest.mark.asyncio
+async def test_strategic_compute_preview_respects_project_local_runner_policy(db_session):
+    project, review_id = await _make_strategic_review_task(db_session)
+    project.build_config = {
+        "resource_envelope": {"require_local_runner": True}
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    body = await _post_strategic_operation(
+        db_session,
+        review_id,
+        op="spawn_task",
+        data={
+            "type": "compute_experiment",
+            "title": "Run local benchmark",
+            "prompt": "Run the benchmark on the required local runner.",
+            "command": "python benchmark.py",
+            "spend_cap_usd": 50,
+            "deadline_seconds": 600,
+            "preview_only": True,
+        },
+    )
+
+    decision = body["preview"]["monetary_decision"]
+    assert decision["execution_mode"] == "local_only"
+    assert decision["billable_estimate_usd"] == 0.0
+    assert decision["requires_monetary_approval"] is False
+    assert decision["reason_code"] == "project_requires_local_runner"
+
+
+@pytest.mark.asyncio
+async def test_cancel_deferred_spawn_keeps_long_reason_out_of_bounded_column(db_session):
+    project, review_id = await _make_strategic_review_task(db_session)
+    request = StrategicSpawnRequest(
+        project_id=project.id,
+        parent_task_id=uuid.UUID(review_id),
+        idempotency_key="cancel-long-reason",
+        task_type="create",
+        specification={},
+        specification_hash="0" * 64,
+        state="deferred",
+        admission_reason="burst_cap_reached",
+    )
+    db_session.add(request)
+    await db_session.commit()
+
+    reason = "x" * 500
+    body = await _post_strategic_operation(
+        db_session,
+        review_id,
+        op="cancel_task",
+        data={"request_id": str(request.id), "reason": reason},
+    )
+
+    assert body["request_state"] == "cancelled"
+    await db_session.refresh(request)
+    assert request.admission_reason == "cancelled_by_strategic"
+    assert request.policy_snapshot["cancel_reason"] == reason
 
 
 @pytest.mark.asyncio
