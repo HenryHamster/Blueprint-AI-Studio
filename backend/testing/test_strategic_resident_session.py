@@ -583,6 +583,89 @@ async def test_reload_ensure_keeps_fresh_retry_heartbeat_past_startup_window(
 
 
 @pytest.mark.asyncio
+async def test_reload_ensure_keeps_retry_wait_during_post_deadline_claim_grace(
+    db_session,
+):
+    """An elapsed retry deadline still needs bounded scheduler/runner handoff time."""
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    retry_until = _utcnow() - timedelta(seconds=15)
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.PROVISIONING
+    old_task.retry_after_until = retry_until
+    old_task.last_heartbeat = None
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob["worker_state"] = "retry_wait"
+    blob["worker_retry_until"] = retry_until.isoformat()
+    blob["worker_retry_reason"] = "Rate limited; waiting for account recovery"
+    blob.pop("worker_heartbeat_at", None)
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    reused = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert reused["session_id"] == started["session_id"]
+    assert reused["worker_generation"] == started["worker_generation"]
+    assert reused["task_id"] == started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.PROVISIONING
+
+
+@pytest.mark.asyncio
+async def test_reload_ensure_replaces_retry_wait_after_claim_grace_expires(db_session):
+    """The elapsed retry bridge remains bounded when no worker claims it."""
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    retry_until = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.PROVISIONING
+    old_task.retry_after_until = retry_until
+    old_task.last_heartbeat = None
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob["worker_state"] = "retry_wait"
+    blob["worker_retry_until"] = retry_until.isoformat()
+    blob.pop("worker_heartbeat_at", None)
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    replaced = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert replaced["session_id"] == started["session_id"]
+    assert replaced["worker_generation"] == started["worker_generation"] + 1
+    assert replaced["task_id"] != started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale(db_session):
     """The retry bridge stays bounded and still reclaims a genuinely dead task."""
     project = await _make_project(db_session)
