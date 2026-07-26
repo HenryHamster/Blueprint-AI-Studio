@@ -16,7 +16,7 @@ from typing import Any, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
@@ -112,6 +112,15 @@ from app.strategic_resident_session import (
     read_resident_session as _read_resident_session,
     resident_session_is_active as _resident_session_is_active,
 )
+from app.strategic_watches import (
+    AcknowledgeWatchInput,
+    CancelWatchInput,
+    WatchTaskInput,
+    acknowledge_watch,
+    cancel_watch,
+    register_task_watch,
+    serialize_watch,
+)
 from app.workbench_state import (
     strategic_local_continuation_status_from_vision,
 )
@@ -188,6 +197,9 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "spawn_task",
     "spawn_fix",
     "cancel_task",
+    "watch_task",
+    "ack_watch",
+    "cancel_watch",
     "dispose_completion_debt",
     "set_retirement_critiques",
     "set_evidence_progress",
@@ -5985,6 +5997,107 @@ async def strategic_operation(
 
         await session.commit()
         return _resp({"status": "ok", "op": "set_session_summary"})
+
+    elif payload.op == "watch_task":
+        try:
+            watch_input = WatchTaskInput.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"watch_task: invalid data: {exc}",
+            ) from None
+        try:
+            watch, created = await register_task_watch(
+                session,
+                project_id=project.id,
+                created_by_task_id=task.id,
+                target_task_id=watch_input.target_task_id,
+                purpose=watch_input.purpose.strip(),
+                strategic_session_id=str(
+                    (task.context or {}).get("strategic_session_id") or ""
+                )
+                or None,
+                deadline_at=watch_input.deadline_at,
+            )
+        except ValueError as exc:
+            status_code = (
+                400 if "cannot watch itself" in str(exc) else 404
+            )
+            raise HTTPException(status_code=status_code, detail=str(exc)) from None
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "watch_task",
+                "created": created,
+                "watch": serialize_watch(watch),
+            }
+        )
+
+    elif payload.op == "ack_watch":
+        try:
+            ack_input = AcknowledgeWatchInput.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ack_watch: invalid data: {exc}",
+            ) from None
+        try:
+            watch = await acknowledge_watch(
+                session,
+                project_id=project.id,
+                watch_id=ack_input.watch_id,
+                disposition=ack_input.disposition,
+                note=ack_input.note.strip(),
+            )
+        except ValueError as exc:
+            status_code = 404 if "not found in project" in str(exc) else 409
+            raise HTTPException(status_code=status_code, detail=str(exc)) from None
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "ack_watch",
+                "watch": serialize_watch(watch),
+            }
+        )
+
+    elif payload.op == "cancel_watch":
+        try:
+            cancel_input = CancelWatchInput.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cancel_watch: invalid data: {exc}",
+            ) from None
+        try:
+            watch = await cancel_watch(
+                session,
+                project_id=project.id,
+                watch_id=cancel_input.watch_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "cancel_watch",
+                "watch": serialize_watch(watch),
+            }
+        )
 
     elif payload.op == "cancel_task":
         if not isinstance(data, dict):

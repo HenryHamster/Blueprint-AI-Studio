@@ -601,7 +601,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
   "data": { }
 }
 ```
@@ -615,6 +615,15 @@ truncated). Notable behaviors:
   (`max_active_directions`, default 5) is reached.
 - `spawn_task` may only spawn `research` or `plan` tasks (queued at priority
   100, ahead of normal autonomous work).
+- `watch_task` registers a durable, one-shot terminal-state notification for a
+  task in the same project. Its strict `data` object requires `target_task_id`
+  (UUID), and optionally accepts `purpose` (up to 1000 characters) and
+  `deadline_at` (ISO-8601 datetime). Repeating the same owner/target pair
+  replays the existing watch.
+- `ack_watch` requires `watch_id` plus `disposition` (`reported`, `acted`,
+  `no_action`, or `superseded`), with an optional `note`; only a fired or
+  expired watch can be acknowledged. `cancel_watch` requires only `watch_id`.
+  Both operations are same-project and idempotent.
 - `reject_direction` tombstones a `proposed` direction and cancels any QUEUED
   tasks tied to it.
 - `patch_problem_model` is the normal safe write. It requires

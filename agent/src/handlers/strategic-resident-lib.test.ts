@@ -1458,6 +1458,8 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     expect(p).toContain('genuinely independent');
     expect(p).toContain('dispatch BOTH now');
     expect(p).toContain('staging one behind the other');
+    expect(p).toContain('./strategic watch-task');
+    expect(p).toContain('Do not spend turns polling it');
   });
 
   it('puts fired task watches ahead of normal examination until acknowledged', () => {

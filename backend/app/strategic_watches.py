@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from app.models import (
@@ -33,6 +34,34 @@ WATCH_ACK_DISPOSITIONS = frozenset(
     {"reported", "acted", "no_action", "superseded"}
 )
 WATCH_RECEIPT_LIMIT = 20
+
+
+class WatchTaskInput(BaseModel):
+    """Strict public input for the ``watch_task`` Strategic operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_task_id: uuid.UUID
+    purpose: str = Field(default="", max_length=1000)
+    deadline_at: datetime | None = None
+
+
+class AcknowledgeWatchInput(BaseModel):
+    """Strict public input for the ``ack_watch`` Strategic operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    watch_id: uuid.UUID
+    disposition: Literal["reported", "acted", "no_action", "superseded"]
+    note: str = Field(default="", max_length=1000)
+
+
+class CancelWatchInput(BaseModel):
+    """Strict public input for the ``cancel_watch`` Strategic operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    watch_id: uuid.UUID
 
 
 def _status_value(value: TaskStatus | str | None) -> str | None:
@@ -125,6 +154,8 @@ async def register_task_watch(
     target = await session.get(Task, target_task_id)
     if target is None or target.project_id != project_id:
         raise ValueError("target task not found in project")
+    if target.id == created_by_task_id:
+        raise ValueError("a strategic task cannot watch itself")
 
     existing = (
         await session.execute(

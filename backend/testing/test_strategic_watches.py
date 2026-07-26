@@ -8,8 +8,10 @@ from datetime import timedelta
 import pytest
 
 from app.models import Project, Task, TaskStatus
+from app.auth import create_agent_token
 from app.strategic_watches import (
     WATCH_ACKNOWLEDGED,
+    WATCH_CANCELLED,
     WATCH_EXPIRED,
     WATCH_FIRED,
     WATCH_PENDING,
@@ -170,3 +172,168 @@ async def test_watch_rejects_cross_project_target(db_session):
             created_by_task_id=owner.id,
             target_task_id=target.id,
         )
+
+
+def _strategic_headers(task: Task) -> dict[str, str]:
+    token = create_agent_token(
+        str(task.id),
+        "watch-ops-test-vm",
+        task_type="strategic_review",
+    )
+    return {"x-agent-token": token}
+
+
+@pytest.mark.asyncio
+async def test_watch_operations_create_replay_fire_and_acknowledge(
+    client,
+    db_session,
+):
+    project, owner, target = await _project_and_tasks(db_session)
+    headers = _strategic_headers(owner)
+    request = {
+        "task_id": str(owner.id),
+        "op": "watch_task",
+        "data": {
+            "target_task_id": str(target.id),
+            "purpose": "report the exact research result",
+        },
+    }
+
+    response = await client.post("/api/agent/strategic", json=request, headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] is True
+    assert body["watch"]["target_task_id"] == str(target.id)
+    assert body["watch"]["state"] == WATCH_PENDING
+    watch_id = body["watch"]["id"]
+
+    replay = await client.post("/api/agent/strategic", json=request, headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["created"] is False
+    assert replay.json()["watch"]["id"] == watch_id
+
+    target.status = TaskStatus.COMPLETED
+    target.latest_status_message = "research artifact ready"
+    db_session.add(target)
+    await db_session.commit()
+    visible = await resolve_project_task_watches(
+        db_session,
+        project_id=project.id,
+    )
+    await db_session.commit()
+    assert [str(item.id) for item in visible] == [watch_id]
+
+    acknowledged = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(owner.id),
+            "op": "ack_watch",
+            "data": {
+                "watch_id": watch_id,
+                "disposition": "reported",
+                "note": "included in the operator update",
+            },
+        },
+        headers=headers,
+    )
+    assert acknowledged.status_code == 200, acknowledged.text
+    assert acknowledged.json()["watch"]["state"] == WATCH_ACKNOWLEDGED
+    assert acknowledged.json()["watch"]["acknowledgement_disposition"] == "reported"
+
+
+@pytest.mark.asyncio
+async def test_watch_operations_enforce_strict_shape_project_and_state(
+    client,
+    db_session,
+):
+    project, owner, target = await _project_and_tasks(db_session)
+    headers = _strategic_headers(owner)
+
+    extra = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(owner.id),
+            "op": "watch_task",
+            "data": {
+                "target_task_id": str(target.id),
+                "purpose": "wait",
+                "poll_interval": 5,
+            },
+        },
+        headers=headers,
+    )
+    assert extra.status_code == 400, extra.text
+    assert "extra_forbidden" in extra.text
+
+    self_watch = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(owner.id),
+            "op": "watch_task",
+            "data": {"target_task_id": str(owner.id)},
+        },
+        headers=headers,
+    )
+    assert self_watch.status_code == 400, self_watch.text
+
+    other = Project(name="Other watch API project", user_id="test-user")
+    db_session.add(other)
+    await db_session.flush()
+    foreign_target = Task(
+        project_id=other.id,
+        title="Foreign target",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(foreign_target)
+    await db_session.commit()
+    foreign = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(owner.id),
+            "op": "watch_task",
+            "data": {"target_task_id": str(foreign_target.id)},
+        },
+        headers=headers,
+    )
+    assert foreign.status_code == 404, foreign.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_watch_operation_is_idempotent(client, db_session):
+    _project, owner, target = await _project_and_tasks(db_session)
+    headers = _strategic_headers(owner)
+    created = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(owner.id),
+            "op": "watch_task",
+            "data": {
+                "target_task_id": str(target.id),
+                "purpose": "no longer needed after superseding run",
+            },
+        },
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    watch_id = created.json()["watch"]["id"]
+    request = {
+        "task_id": str(owner.id),
+        "op": "cancel_watch",
+        "data": {"watch_id": watch_id},
+    }
+
+    cancelled = await client.post(
+        "/api/agent/strategic",
+        json=request,
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["watch"]["state"] == WATCH_CANCELLED
+    replay = await client.post(
+        "/api/agent/strategic",
+        json=request,
+        headers=headers,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["watch"]["state"] == WATCH_CANCELLED
