@@ -558,8 +558,10 @@ class ComputeJobResponse(BaseModel):
     # Immutable launch intent and execution-side placement facts.  These are
     # deliberately separate from polling_metadata so task intent cannot be
     # mistaken for what the worker actually ran.
-    execution_manifest: Dict[str, Any] = Field(default_factory=dict)
-    runtime_provenance: Dict[str, Any] = Field(default_factory=dict)
+    # Rows created before the operability migration legitimately carry NULL.
+    # Preserve that wire shape; callers already normalize absent provenance.
+    execution_manifest: Dict[str, Any] | None = None
+    runtime_provenance: Dict[str, Any] | None = None
     # Cross-job checkpoint resume, promoted from polling_metadata so the operator
     # can see (without digging into the launch bag) that a run resumed and from
     # where. ``input_artifact_job_id`` is the declared+validated resume source;
