@@ -53,7 +53,7 @@ from app.compute_backends import (
     _MAX_VIEWABLE_FILE_COUNT,
     _MAX_VIEWABLE_VIDEO_BYTES,
 )
-from app.compute_jobs import append_progress_sample
+from app.compute_jobs import append_progress_sample, normalize_terminal_command_log
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.runner_config import config_generation, live_safe_config
 from app.runner_pull_skip import (
@@ -2318,6 +2318,36 @@ async def report_compute_job(
     meta = dict(job.polling_metadata or {})
     cancel_requested = bool(job.status in _COMPUTE_JOB_TERMINAL_STATUSES)
 
+    # Store a terminal runner log under the common key immediately, before the
+    # monitor observes the terminal status.  A cancellation can otherwise win
+    # that poll race and strand the only useful stdout/stderr under a runner-only
+    # key (or discard a final report altogether).  Keep the legacy key too so
+    # older readers remain compatible.
+    terminal_runner_log: dict[str, Any] | None = None
+    if payload.command_log is not None and payload.exec_status != "running":
+        if isinstance(payload.command_log, dict):
+            log_text = payload.command_log.get("text", "")
+            log_truncated = payload.command_log.get("truncated") is True
+        elif isinstance(payload.command_log, str):
+            log_text = payload.command_log
+            log_truncated = False
+        else:
+            log_text = ""
+            log_truncated = False
+        if not isinstance(log_text, str):
+            log_text = ""
+        encoded_log = log_text.encode("utf-8")
+        if len(encoded_log) > _MAX_RUNNER_COMMAND_LOG_BYTES:
+            log_text = encoded_log[:_MAX_RUNNER_COMMAND_LOG_BYTES].decode("utf-8", "replace")
+            log_truncated = True
+        terminal_runner_log = {
+            "source": "runner",
+            "text": log_text,
+            "truncated": log_truncated,
+        }
+        meta["runner_command_log"] = terminal_runner_log
+        meta = normalize_terminal_command_log(meta)
+
     if job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
         valid_statuses = {"running", "succeeded", "failed"}
         if payload.exec_status in valid_statuses:
@@ -2347,17 +2377,12 @@ async def report_compute_job(
                         "truncated": live_truncated,
                     }
         elif payload.command_log is not None:
-            if isinstance(payload.command_log, dict):
-                log_text = payload.command_log.get("text", "")
-                if not isinstance(log_text, str):
-                    log_text = ""
-                if len(log_text.encode("utf-8")) > _MAX_RUNNER_COMMAND_LOG_BYTES:
-                    log_text = log_text.encode("utf-8")[:_MAX_RUNNER_COMMAND_LOG_BYTES].decode("utf-8", "replace")
-                    meta["runner_command_log"] = {"text": log_text, "truncated": True}
-                else:
-                    meta["runner_command_log"] = {"text": log_text, "truncated": False}
-            elif isinstance(payload.command_log, str):
-                meta["runner_command_log"] = {"text": payload.command_log, "truncated": False}
+            # Already normalized before entering the non-terminal branch.  The
+            # condition stays for readability: terminal reports never replace a
+            # running live tail with an unbounded payload.
+            if terminal_runner_log is not None:
+                meta["runner_command_log"] = terminal_runner_log
+                meta = normalize_terminal_command_log(meta)
         if payload.progress is not None:
             merged_progress, new_progress_records = _merge_progress_report(
                 meta.get("progress"), payload.progress, now
@@ -2447,6 +2472,14 @@ async def report_compute_job(
                 meta["artifact_delivery"] = delivery
         job.polling_metadata = meta
         job.last_heartbeat_at = now
+        job.updated_at = now
+        session.add(job)
+        await session.commit()
+    elif terminal_runner_log is not None:
+        # A late report from the runner is evidence, even when an operator
+        # cancellation has already finalized the ComputeJob.  Persist it rather
+        # than making a cancelled task hide the completed workload's stdout.
+        job.polling_metadata = meta
         job.updated_at = now
         session.add(job)
         await session.commit()

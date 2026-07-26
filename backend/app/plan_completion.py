@@ -24,8 +24,9 @@ from app.compute_experiment_contract import (
     _author_compute_launch_contract,
     _stamp_container_image_pin_status,
     _validate_compute_launch_contract,
-    resolve_compute_spend_approval,
+    resolve_compute_spend_decision,
 )
+from app.resource_envelope import resolve_project_require_local_runner
 from app.depends_on_provenance import remember_structural_depends_on
 from app.finding_deduplication import normalize_prerequisite, resolve_prerequisite_task
 from app.models import Project, Task, TaskHistory, TaskStatus
@@ -1090,11 +1091,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 if parent_direction_id
                 else None
             )
-            child_requires_approval, _ = resolve_compute_spend_approval(
+            _compute_spend_decision = resolve_compute_spend_decision(
                 runtime_config=_runtime_config,
                 direction=_ce_direction,
                 spend_cap_usd=float(compute_contract["spend_cap_usd"]),
+                require_local_runner=resolve_project_require_local_runner(project),
+                launch_contract=compute_contract,
             )
+            child_requires_approval = _compute_spend_decision.requires_monetary_approval
         else:
             child_requires_approval = False
         child = Task(

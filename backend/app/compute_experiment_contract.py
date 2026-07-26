@@ -7,9 +7,11 @@ same compute_experiment payload shape without importing each other.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -633,6 +635,190 @@ def resolve_compute_spend_approval(
     direction: dict[str, Any] | None,
     spend_cap_usd: float,
 ) -> tuple[bool, float]:
-    """Return ``(requires_approval, threshold)`` for a proposed compute spend."""
+    """Compatibility wrapper around :func:`resolve_compute_spend_decision`.
+
+    New launch paths should retain the full decision rather than discarding the
+    execution-mode and reason information.  Keeping this small wrapper avoids
+    changing unrelated callers while the authoring surfaces move over.
+    """
+    decision = resolve_compute_spend_decision(
+        runtime_config=runtime_config,
+        direction=direction,
+        spend_cap_usd=spend_cap_usd,
+    )
+    return decision.requires_monetary_approval, decision.threshold_usd
+
+
+@dataclass(frozen=True)
+class ComputeSpendDecision:
+    """The billable-risk decision for one normalized compute launch.
+
+    ``spend_cap_usd`` remains a useful runtime safety cap even for a local job,
+    but it is not a prediction of money Blueprint will spend.  The decision
+    keeps that distinction explicit so all authoring surfaces, final job
+    creation, and previews use identical approval semantics.
+    """
+
+    execution_mode: str
+    billable_estimate_usd: float
+    requires_monetary_approval: bool
+    threshold_usd: float
+    reason_code: str
+    declared_spend_cap_usd: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "execution_mode": self.execution_mode,
+            "billable_estimate_usd": self.billable_estimate_usd,
+            "requires_monetary_approval": self.requires_monetary_approval,
+            "threshold_usd": self.threshold_usd,
+            "reason_code": self.reason_code,
+            "declared_spend_cap_usd": self.declared_spend_cap_usd,
+        }
+
+
+def resolve_compute_spend_decision(
+    *,
+    runtime_config: dict[str, Any],
+    direction: dict[str, Any] | None,
+    spend_cap_usd: float,
+    require_local_runner: bool = False,
+    task_context: dict[str, Any] | None = None,
+    launch_contract: dict[str, Any] | None = None,
+) -> ComputeSpendDecision:
+    """Classify a compute launch before applying monetary approval policy.
+
+    Only an existing *guaranteed* local contract can be billed as zero:
+
+    * project ``require_local_runner``;
+    * an operator hard pin (``forced_runner_target_id``); or
+    * a validated strict ``runner_target`` in the launch contract.
+
+    A soft preferred runner is deliberately cloud-capable and therefore stays
+    approval-gated.  In particular, a transient ``runner_target_id`` written
+    after a runner claims a task is not treated as an authoring guarantee: doing
+    so could let a cloud-capable task bypass approval merely because its local
+    preference happened to win one dispatch race.
+    """
+    declared_cap = float(spend_cap_usd)
     threshold = resolve_compute_spend_threshold(runtime_config, direction)
-    return float(spend_cap_usd) > threshold, threshold
+    context = task_context if isinstance(task_context, dict) else {}
+    contract = launch_contract if isinstance(launch_contract, dict) else {}
+    runner_target = contract.get("runner_target")
+    strict_target = isinstance(runner_target, dict) and runner_target.get("strict") is True
+    forced_target = bool(str(context.get("forced_runner_target_id") or "").strip())
+
+    if require_local_runner:
+        reason_code = "project_requires_local_runner"
+    elif forced_target:
+        reason_code = "forced_runner_target"
+    elif strict_target:
+        reason_code = "strict_runner_target"
+    else:
+        return ComputeSpendDecision(
+            execution_mode="cloud_possible",
+            billable_estimate_usd=declared_cap,
+            requires_monetary_approval=declared_cap > threshold,
+            threshold_usd=threshold,
+            reason_code="cloud_fallback_possible",
+            declared_spend_cap_usd=declared_cap,
+        )
+
+    return ComputeSpendDecision(
+        execution_mode="local_only",
+        billable_estimate_usd=0.0,
+        requires_monetary_approval=False,
+        threshold_usd=threshold,
+        reason_code=reason_code,
+        declared_spend_cap_usd=declared_cap,
+    )
+
+
+def build_compute_contract_preview(
+    contract: dict[str, Any],
+    *,
+    runtime_config: dict[str, Any],
+    direction: dict[str, Any] | None = None,
+    require_local_runner: bool = False,
+    task_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a side-effect-free receipt using the production contract normalizer.
+
+    This is deliberately a service, not a second validator.  Authoring APIs and
+    the Strategic helper can expose it before dispatch, while job creation keeps
+    applying the same ``_validate_compute_launch_contract`` normalizer as its
+    binding guard.  The preview is migration-free: eventual execution manifests
+    can persist this exact result once the integration migration lands.
+    """
+    normalized = dict(contract) if isinstance(contract, dict) else {}
+    ok, reason = _validate_compute_launch_contract(normalized, require_smoke=False)
+    if not ok:
+        return {
+            "ok": False,
+            "normalized_contract": None,
+            "failure": {
+                "phase": "validation",
+                "classification": "contract_invalid",
+                "code": "compute_contract_invalid",
+                "retryable": False,
+                "hint": reason,
+            },
+        }
+
+    try:
+        declared_cap = float(normalized["spend_cap_usd"])
+    except (KeyError, TypeError, ValueError):  # guarded above; defensive for callers
+        return {
+            "ok": False,
+            "normalized_contract": None,
+            "failure": {
+                "phase": "validation",
+                "classification": "contract_invalid",
+                "code": "compute_spend_cap_invalid",
+                "retryable": False,
+                "hint": "spend_cap_usd must be a positive number",
+            },
+        }
+    decision = resolve_compute_spend_decision(
+        runtime_config=runtime_config,
+        direction=direction,
+        spend_cap_usd=declared_cap,
+        require_local_runner=require_local_runner,
+        task_context=task_context,
+        launch_contract=normalized,
+    )
+    command = normalized.get("command")
+    raw_command = command if isinstance(command, str) else ""
+    readable_command = decode_generated_command(raw_command) or raw_command
+    source_digest = hashlib.sha256(raw_command.encode("utf-8")).hexdigest()
+    criterion = normalized.get("success_criterion")
+    result_expectations = {
+        "declared_metric": normalized.get("declared_metric"),
+        "success_criterion": criterion if isinstance(criterion, dict) else None,
+        "artifact_required": normalized.get("require_durable_artifact") is True,
+        "input_artifact_job_id": normalized.get("input_artifact_job_id"),
+    }
+    requirements = {
+        "machine_type": normalized.get("machine_type"),
+        "accelerator": normalized.get("accelerator"),
+        "runner_target": normalized.get("runner_target"),
+        "container_image": normalized.get("container_image"),
+        "vram_gb": normalized.get("vram_gb"),
+        "min_compute_capability": normalized.get("min_compute_capability"),
+    }
+    return {
+        "ok": True,
+        "contract_version": 1,
+        "normalized_contract": normalized,
+        "authored_command": readable_command,
+        "effective_launcher": raw_command,
+        "source_digest": source_digest,
+        "result_expectations": result_expectations,
+        "capability_requirements": requirements,
+        "monetary_decision": decision.as_dict(),
+        "preflight": {
+            "status": "not_supported",
+            "reason_code": "preview_does_not_allocate_execution_environment",
+        },
+        "failure": None,
+    }

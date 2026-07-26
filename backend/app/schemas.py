@@ -515,6 +515,14 @@ class HeartbeatRequest(BaseModel):
     diagnostics_after_edit_arm: bool | None = None
 
 
+class ComputeTerminalLog(BaseModel):
+    """Canonical redacted terminal output for a compute job."""
+
+    source: Literal["backend", "runner", "legacy"]
+    text: str
+    truncated: bool = False
+
+
 class ComputeJobResponse(BaseModel):
     """Agent-facing serialization for persisted compute jobs."""
 
@@ -545,6 +553,7 @@ class ComputeJobResponse(BaseModel):
     result_reference: str | None = None
     artifact_id: uuid.UUID | None = None
     polling_metadata: Dict[str, Any] = Field(default_factory=dict)
+    terminal_log: ComputeTerminalLog | None = None
     compute_rpc_diagnostic: Dict[str, Any] | None = None
     # Cross-job checkpoint resume, promoted from polling_metadata so the operator
     # can see (without digging into the launch bag) that a run resumed and from
@@ -573,6 +582,19 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
         provenance = metadata.get("resume_provenance")
         if isinstance(provenance, dict) and provenance:
             data["resume_provenance"] = provenance
+        command_log = metadata.get("command_log")
+        source = "backend"
+        if not isinstance(command_log, dict):
+            command_log = metadata.get("runner_command_log")
+            source = "runner"
+        if isinstance(command_log, dict) and isinstance(command_log.get("text"), str):
+            if command_log.get("source") == "runner":
+                source = "runner"
+            data["terminal_log"] = {
+                "source": source,
+                "text": command_log["text"],
+                "truncated": command_log.get("truncated") is True,
+            }
     # Promote watchdog protection-status fields so the agent surface always has them.
     # Lazy import avoids the circular dependency (compute_jobs imports schemas).
     from app.compute_jobs import derive_watchdog_protection_status  # noqa: PLC0415
@@ -734,6 +756,11 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
             live_output = dict(live_output)
             live_output["text"] = redact_command_log_text(live_output["text"])
             metadata["live_output"] = live_output
+    terminal_log = data.get("terminal_log")
+    if isinstance(terminal_log, dict) and isinstance(terminal_log.get("text"), str):
+        terminal_log = dict(terminal_log)
+        terminal_log["text"] = redact_command_log_text(terminal_log["text"])
+        data["terminal_log"] = terminal_log
     # Recursively redact all string values in result_metrics so credentials in
     # any experiment output field cannot leak through unrecognized paths.
     if isinstance(metadata, dict):

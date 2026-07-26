@@ -80,7 +80,8 @@ from app.models import (
     TaskStatus,
 )
 from app.compute_experiment_contract import (
-    resolve_compute_spend_approval,
+    ComputeSpendDecision,
+    resolve_compute_spend_decision,
     resolve_compute_spend_direction,
 )
 from app.runtime_config_state import runtime_config as _global_runtime_config
@@ -513,6 +514,7 @@ async def _assert_compute_spend_not_gated(
     session,
     task: Task,
     spend_cap_usd: float,
+    decision: ComputeSpendDecision | None = None,
 ) -> None:
     """Terminal chokepoint: reject compute_experiment job creation when spend
     approval is required but has not been operator-cleared.
@@ -526,15 +528,22 @@ async def _assert_compute_spend_not_gated(
         return
     # Use the global runtime_config which already includes deployment-state settings.
     runtime_config: dict = dict(_global_runtime_config)
-    direction = await resolve_compute_spend_direction(
-        session, project_id=task.project_id, context=task.context
-    )
-    requires_approval, threshold = resolve_compute_spend_approval(
-        runtime_config=runtime_config,
-        direction=direction,
-        spend_cap_usd=spend_cap_usd,
-    )
-    if not requires_approval:
+    if decision is None:
+        direction = await resolve_compute_spend_direction(
+            session, project_id=task.project_id, context=task.context
+        )
+        project = await session.get(Project, task.project_id)
+        decision = resolve_compute_spend_decision(
+            runtime_config=runtime_config,
+            direction=direction,
+            spend_cap_usd=spend_cap_usd,
+            require_local_runner=(
+                resolve_project_require_local_runner(project) if project else False
+            ),
+            task_context=task.context,
+            launch_contract=task.first_payload,
+        )
+    if not decision.requires_monetary_approval:
         return
     if task.spend_approval_cleared_at is not None:
         return
@@ -542,11 +551,13 @@ async def _assert_compute_spend_not_gated(
         "error": "spend_cap_requires_approval",
         "message": (
             f"compute_experiment spend_cap_usd={spend_cap_usd:.2f} exceeds "
-            f"project threshold of {threshold:.2f} USD — "
+            f"project threshold of {decision.threshold_usd:.2f} USD — "
             "operator approval is required before this job can launch"
         ),
         "spend_cap_usd": spend_cap_usd,
-        "threshold_usd": threshold,
+        "billable_estimate_usd": decision.billable_estimate_usd,
+        "threshold_usd": decision.threshold_usd,
+        "reason_code": decision.reason_code,
     })
 
 
@@ -689,7 +700,24 @@ async def create_compute_job(
                 "backend": normalized_backend,
             }
         )
-    await _assert_compute_spend_not_gated(session, locked_task, capped_spend)
+    spend_direction = await resolve_compute_spend_direction(
+        session, project_id=locked_task.project_id, context=locked_task.context
+    )
+    spend_decision = resolve_compute_spend_decision(
+        runtime_config=dict(_global_runtime_config),
+        direction=spend_direction,
+        spend_cap_usd=capped_spend,
+        require_local_runner=(
+            resolve_project_require_local_runner(_policy_project)
+            if _policy_project is not None
+            else False
+        ),
+        task_context=locked_task.context,
+        launch_contract=locked_task.first_payload,
+    )
+    await _assert_compute_spend_not_gated(
+        session, locked_task, capped_spend, decision=spend_decision
+    )
     live_proof_requirement = _resolve_live_proof_requirement(
         locked_task,
         explicit_values=(live_proof_marker, live_proof),
@@ -763,7 +791,7 @@ async def create_compute_job(
     await _check_project_spend_ceiling(
         session,
         project_id=locked_task.project_id,
-        requested_cap_usd=capped_spend,
+        requested_cap_usd=spend_decision.billable_estimate_usd,
     )
     # GPU jobs add a provisioning allowance to the wall-clock deadline so a
     # Deep Learning VM cold-start cannot exhaust the declared runtime budget
@@ -814,6 +842,7 @@ async def create_compute_job(
         "launch_request_fingerprint": launch_request_fingerprint,
         "status_message": _LAUNCH_PLACEHOLDER_STATUS_MESSAGE,
         "park_deadline_seconds": park_deadline_seconds,
+        "monetary_decision": spend_decision.as_dict(),
     }
     if isinstance(declared_metric, str) and declared_metric.strip():
         # Persisted so the no-progress watchdog knows which reported metric to
@@ -3929,6 +3958,28 @@ def _set_meta(
     job.polling_metadata = meta
 
 
+def normalize_terminal_command_log(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Return metadata with one canonical terminal ``command_log`` entry.
+
+    Runner-subprocess reports historically persisted terminal output under
+    ``runner_command_log`` while every other backend and every consumer used
+    ``command_log``.  Normalizing at write/finalization time avoids a race where
+    cancellation wins before the regular poller has copied the runner field.
+    The legacy key is intentionally retained for old readers and diagnostics.
+    """
+    meta = dict(metadata or {})
+    canonical = meta.get("command_log")
+    if not isinstance(canonical, dict) or not isinstance(canonical.get("text"), str):
+        runner_log = meta.get("runner_command_log")
+        if isinstance(runner_log, dict) and isinstance(runner_log.get("text"), str):
+            canonical = dict(runner_log)
+        else:
+            canonical = None
+    if canonical is not None:
+        meta["command_log"] = canonical
+    return meta
+
+
 # polling_metadata key under which the poller records that the no-progress
 # watchdog is inert because the job reports progress under name(s) other than its
 # declared metric. Surfaced to the operator via serialize_compute_job_response so
@@ -4194,7 +4245,7 @@ def _finalize_terminal_job(
         auth = dict(meta["container_registry_auth"])
         auth.pop("password", None)
         meta["container_registry_auth"] = auth
-        job.polling_metadata = meta
+    job.polling_metadata = normalize_terminal_command_log(meta)
 
 
 def _record_terminal_reason_history(session, job: ComputeJob) -> None:
