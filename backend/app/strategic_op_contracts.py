@@ -26,6 +26,7 @@ UPDATE_DIRECTION_FIELDS = frozenset(
         "success_evidence",
         "retirement_condition",
         "rationale",
+        "terminal_reason",
         "dedup_reasoning",
         "criterion_keys",
         "recommended_mode",
@@ -41,7 +42,13 @@ UPDATE_DIRECTION_FIELDS = frozenset(
 # envelope has always allowed them beside ``changes``; retain that compatibility
 # without treating them as a second direct-field update form.
 UPDATE_DIRECTION_METADATA_FIELDS = frozenset(
-    {"rationale", "dedup_reasoning", "successor_id", "superseded_by_id"}
+    {
+        "rationale",
+        "terminal_reason",
+        "dedup_reasoning",
+        "successor_id",
+        "superseded_by_id",
+    }
 )
 
 PROBLEM_MODEL_PATCH_FIELDS = frozenset(

@@ -7279,6 +7279,7 @@ async def test_strategic_completion_fallback_superseded_update_persists_supersed
                     "op": "update",
                     "direction_id": "d-old",
                     "rationale": "superseded by newer approach",
+                    "terminal_reason": "superseded",
                     "changes": {
                         "status": "superseded",
                         "superseded_by": {
@@ -7354,6 +7355,7 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
                     "direction_id": "d-legacy",
                     "successor_id": "d-successor",
                     "rationale": "replaced",
+                    "terminal_reason": "superseded",
                     "dedup_reasoning": {
                         "closest_directions": ["d-legacy"],
                         "distinction": "This is a status reviver, not a new direction",
@@ -7429,9 +7431,10 @@ async def test_fallback_update_to_superseded_records_retired_memory(
             "vision": {"purpose": "test", "revision": 2},
             "direction_operations": [
                 {
-                    "op": "update",
-                    "direction_id": "d-sup",
-                    "rationale": "replaced by newer approach",
+                        "op": "update",
+                        "direction_id": "d-sup",
+                        "rationale": "replaced by newer approach",
+                        "terminal_reason": "superseded",
                     "changes": {
                         "status": "superseded",
                         "superseded_by": {
@@ -7501,10 +7504,11 @@ async def test_fallback_update_to_expired_records_retired_memory(db_session, moc
             "vision": {"purpose": "test", "revision": 2},
             "direction_operations": [
                 {
-                    "op": "update",
-                    "direction_id": "d-exp",
-                    "rationale": "no longer relevant after refactor",
-                    "changes": {"status": "expired"},
+                        "op": "update",
+                        "direction_id": "d-exp",
+                        "rationale": "no longer relevant after refactor",
+                        "terminal_reason": "invalidated",
+                        "changes": {"status": "expired"},
                 },
             ],
         }
@@ -7638,9 +7642,10 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
             "task_id": str(task.id),
             "op": "update_direction",
             "data": {
-                "direction_id": "d-http-old",
-                "rationale": "superseded by new direction",
-                "changes": {
+                    "direction_id": "d-http-old",
+                    "rationale": "superseded by new direction",
+                    "terminal_reason": "superseded",
+                    "changes": {
                     "status": "superseded",
                     "superseded_by": {
                         "direction_id": "d-http-new",
@@ -7959,9 +7964,10 @@ async def test_strategic_http_update_direction_superseded_stamps_completed_at_an
             "task_id": str(task.id),
             "op": "update_direction",
             "data": {
-                "direction_id": "d-http-sup-window",
-                "rationale": "superseded via HTTP path",
-                "changes": {
+                    "direction_id": "d-http-sup-window",
+                    "rationale": "superseded via HTTP path",
+                    "terminal_reason": "superseded",
+                    "changes": {
                     "status": "superseded",
                     "superseded_by": {
                         "direction_id": "d-http-successor",

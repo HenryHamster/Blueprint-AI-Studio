@@ -33,6 +33,7 @@ session seam both depend on.
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -3414,6 +3415,7 @@ async def renew_resident_session_lease(
     last_compaction_at: str | None = None,
     decisions_reg: str | None = None,
     activity: dict[str, Any] | None = None,
+    repo_head: str | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -3458,6 +3460,12 @@ async def renew_resident_session_lease(
     Returns the lease view the agent loop steers on:
     ``{authority_held, leased_until, stop_requested, status}``.
     """
+    normalized_repo_head = (
+        repo_head.lower()
+        if isinstance(repo_head, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", repo_head)
+        else None
+    )
     blob = read_resident_session(project.vision)
     if blob is None:
         raise HTTPException(status_code=404, detail="No resident session for project")
@@ -3754,6 +3762,8 @@ async def renew_resident_session_lease(
         # high-water mark rather than re-delivering already-answered messages.
         if message_cursor:
             updated["_message_cursor"] = message_cursor
+        if normalized_repo_head is not None:
+            updated["_resident_repo_head"] = normalized_repo_head
         # Persist the rolling per-kind turn-latency summary for operator-visible
         # observability. Bounded to a simple dict; ignored when absent/None.
         if isinstance(turn_latency_summary, dict):
@@ -3893,7 +3903,10 @@ async def renew_resident_session_lease(
     # restart can read them back on startup (the agent reads task.context at pull
     # time; project.vision is not visible to the agent).
     _need_ctx_update = (
-        exam_ledger_str is not None or bool(message_cursor) or decisions_reg is not None
+        exam_ledger_str is not None
+        or bool(message_cursor)
+        or decisions_reg is not None
+        or normalized_repo_head is not None
     )
     if _need_ctx_update:
         try:
@@ -3913,6 +3926,8 @@ async def renew_resident_session_lease(
                     ctx["message_cursor"] = message_cursor
                 if decisions_reg is not None:
                     ctx["_decisions_reg"] = decisions_reg
+                if normalized_repo_head is not None:
+                    ctx["_resident_repo_head"] = normalized_repo_head
 
             # Re-read Task.context FRESH under FOR UPDATE (populate_existing)
             # before the read-modify-write so a concurrent strategic-API
@@ -4191,6 +4206,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     last_compaction_at: str | None = None
     decisions_reg: str | None = None
     activity: dict[str, Any] | None = None
+    repo_head: str | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -4228,4 +4244,5 @@ async def resident_session_heartbeat(
         last_compaction_at=payload.last_compaction_at,
         decisions_reg=payload.decisions_reg,
         activity=payload.activity,
+        repo_head=payload.repo_head,
     )

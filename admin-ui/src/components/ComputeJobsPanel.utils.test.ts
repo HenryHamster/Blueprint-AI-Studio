@@ -5,6 +5,8 @@ import {
   computeJobEvidenceGroup,
   computeJobEvidenceTierRank,
   computeJobViewableArtifacts,
+  computeJobTerminalLabel,
+  fmtBytes,
 } from './ComputeJobsPanel.utils';
 import type { ComputeJob } from '../api';
 
@@ -32,6 +34,22 @@ const job = (over: Partial<TierJob>): TierJob =>
   }) as TierJob;
 
 const A_RESULT = { armA: { value: 1.5, met: true, cost_usd: null } };
+
+describe('computeJobTerminalLabel', () => {
+  it('prefers canonical experiment status over legacy SUCCESS outcome', () => {
+    expect(computeJobTerminalLabel(job({
+      outcome: 'SUCCESS',
+      experiment_status: 'CRITERION_NOT_MET',
+    }))).toBe('Criterion not met');
+  });
+});
+
+describe('fmtBytes', () => {
+  it('formats artifact manifest sizes compactly', () => {
+    expect(fmtBytes(512)).toBe('512 B');
+    expect(fmtBytes(1536)).toBe('2 KB');
+  });
+});
 
 describe('computeJobEvidenceTier', () => {
   it('local run WITH a result is machine-verified (covered)', () => {

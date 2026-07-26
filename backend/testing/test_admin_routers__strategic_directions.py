@@ -336,6 +336,7 @@ async def test_retire_direction_records_retired_memory(
             "data": {
                 "direction_id": "d-retire-mem",
                 "rationale": "lane is complete, evidence shipped",
+                "terminal_reason": "explicit_abandonment",
             },
         },
         headers={"x-agent-token": token},
@@ -470,7 +471,11 @@ async def test_retire_direction_challenge_gate_removed_proceeds(
         json={
             "task_id": str(task.id),
             "op": "retire_direction",
-            "data": {"direction_id": "d-defer-mem", "rationale": "kill it"},
+            "data": {
+                "direction_id": "d-defer-mem",
+                "rationale": "kill it",
+                "terminal_reason": "explicit_abandonment",
+            },
         },
         headers={"x-agent-token": token},
     )
@@ -517,6 +522,7 @@ async def test_update_direction_expired_records_retired_memory(
             "data": {
                 "direction_id": "d-upd-exp",
                 "rationale": "superseded by refactor lane",
+                "terminal_reason": "superseded",
                 "changes": {"status": "expired"},
             },
         },
@@ -557,6 +563,7 @@ async def test_update_direction_superseded_records_retired_memory(
             "data": {
                 "direction_id": "d-upd-sup",
                 "rationale": "replaced",
+                "terminal_reason": "superseded",
                 "changes": {
                     "status": "superseded",
                     "superseded_by": {
@@ -575,6 +582,49 @@ async def test_update_direction_superseded_records_retired_memory(
     assert entry is not None, f"update->superseded must record memory; got {mem}"
     assert entry["reason"] == "strategic_superseded"
     assert entry.get("outcome") == "superseded by d-successor"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_zero_attempt_terminal_requires_typed_reason(
+    client: AsyncClient, db_session, mocker
+):
+    """The generic update path cannot bypass the zero-attempt terminal guard."""
+    from app.auth import create_agent_token
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    project, task = await _make_strategic_retire_task(
+        db_session,
+        name="UpdateTerminalGuard",
+        vm="vm-upd-guard",
+        direction_id="d-upd-guard",
+    )
+    token = create_agent_token(
+        str(task.id), "vm-upd-guard", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-upd-guard",
+                "rationale": "stop without a typed reason",
+                "changes": {"status": "expired"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert (
+        resp.json()["error"]["message"]["error"]
+        == "zero_attempt_direction_requires_typed_terminal_reason"
+    )
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d["id"] == "d-upd-guard")
+    assert target["status"] == "active"
 
 
 @pytest.mark.asyncio

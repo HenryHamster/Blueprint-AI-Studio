@@ -68,6 +68,7 @@ export interface DirectionProgress {
   lifetime_generalized_successes?: number | null;
   lifetime_generalized_health_rate?: number | null;
   verified_prs_merged?: number | null;
+  reachable_prs_merged?: number | null;
   acceptance_declaration_coverage?: number | null;
   lifetime_acceptance_declaration_coverage?: number | null;
 }
@@ -615,6 +616,7 @@ export function DirectionPortfolioSection({
               const provenMerged = Math.max(0, Math.trunc(d.proven_prs_merged ?? 0));
               const consumedMerged = Math.max(0, Math.trunc(d.consumed_prs_merged ?? 0));
               const verifiedMerged = typeof d.verified_prs_merged === 'number' ? Math.max(0, Math.trunc(d.verified_prs_merged)) : null;
+              const reachableMerged = typeof d.reachable_prs_merged === 'number' ? Math.max(0, Math.trunc(d.reachable_prs_merged)) : null;
               const declCoverage = typeof d.acceptance_declaration_coverage === 'number' ? d.acceptance_declaration_coverage : null;
               const showProofSplit = provenMerged > 0 || consumedMerged > 0;
               const outcomeRows = summarizeOutcomeKinds(d.outcome_kind_breakdown);
@@ -637,7 +639,10 @@ export function DirectionPortfolioSection({
                     {cvr != null && <span className={cvrColor}>{cvr}% conversion</span>}
                     {acc != null && <span className={accColor} title="PRs merged / (merged + rejected)">{acc}% acc</span>}
                     {fas != null && <span className={fasColor} title={`First-attempt success rate${d.first_attempt_sample_size != null ? ` (n=${d.first_attempt_sample_size})` : ''}`}>{fas}% 1st</span>}
-                    <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}{d.prs_rejected != null && d.prs_rejected > 0 && <span className="text-red-400" title={`${d.prs_rejected} PR${d.prs_rejected !== 1 ? 's' : ''} rejected`}> · {d.prs_rejected} rej</span>}</span>
+                    <span title={reachableMerged == null ? 'Recorded merge badges; ancestry was not checked' : `${d.prs_merged} recorded merge badge${d.prs_merged !== 1 ? 's' : ''}`}>
+                      {reachableMerged == null ? `${d.prs_merged} recorded` : `${reachableMerged} landed`}
+                      {d.prs_rejected != null && d.prs_rejected > 0 && <span className="text-red-400" title={`${d.prs_rejected} PR${d.prs_rejected !== 1 ? 's' : ''} rejected`}> · {d.prs_rejected} rej</span>}
+                    </span>
                     {showProofSplit && <span className="text-emerald-300" title="Machine-proven merged PRs">{provenMerged} proven</span>}
                     {consumedMerged > 0 && <span className="text-sky-300" title="Downstream-artifact proof-by-consumption subset of proven merges">{consumedMerged} consumed</span>}
                     {verifiedMerged != null && verifiedMerged > 0 && <span className="text-teal-300" title="Verification-aware subset of merged PRs driving the conversion rate">{verifiedMerged} verified</span>}

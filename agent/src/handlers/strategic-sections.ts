@@ -1120,8 +1120,8 @@ export function buildDirSummaryText(
   }
   const body = directionsSummary.map((d, i) => {
     const parts = [`${fmtScalar(d.total_cycles, '0')} cycles`];
-    if (d.prs_merged) {
-      const prs_merged = Number(d.prs_merged);
+    if (d.prs_merged || d.reachable_prs_merged) {
+      const prs_merged = Number(d.prs_merged ?? 0);
       const verified = d.verified_prs_merged !== undefined && d.verified_prs_merged !== null
         ? Number(d.verified_prs_merged)
         : 0;
@@ -1132,7 +1132,12 @@ export function buildDirSummaryText(
         ? Number(d.reachable_prs_merged)
         : null;
 
-      let mergedText = `${prs_merged} merged`;
+      // An ancestry check is the only proof that a merge actually landed on the
+      // integration branch. Keep raw task/PR badges visible for diagnostics,
+      // but never present them as the primary shipped-work count.
+      let mergedText = reachable !== null
+        ? `${reachable} landed`
+        : `${prs_merged} recorded merge badge${prs_merged === 1 ? '' : 's'} (ancestry unknown)`;
       const annotations: string[] = [];
 
       // Add verified annotation if present and less than prs_merged
@@ -1148,7 +1153,9 @@ export function buildDirSummaryText(
       // (a different axis); the agent does not consume that field for this text.
       if (reachable !== null) {
         const badgeOnly = Math.max(0, prs_merged - reachable);
-        annotations.push(`${reachable} reachable, ${badgeOnly} badge-only`);
+        if (badgeOnly > 0) {
+          annotations.push(`${prs_merged} recorded merge badges; ${badgeOnly} ancestry-unconfirmed`);
+        }
       }
 
       if (annotations.length > 0) {

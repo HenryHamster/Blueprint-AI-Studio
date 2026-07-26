@@ -19,6 +19,7 @@ from app.direction_outcomes import (
     compute_direction_autonomy_state,
     declared_merged_count,
     proven_merged_count,
+    reachable_merged_count,
     verified_merged_count,
 )
 from app.models import Project, Task, TaskStatus, get_task_cost_by_provider_model
@@ -407,6 +408,8 @@ async def compute_direction_progress(
         # degraded-unverified) — drives conversion_rate so a merge that never
         # actually verified does not inflate the operator-read rate.
         verified_prs_merged = 0
+        reachable_prs_merged = 0
+        reachable_prs_recorded = False
         # Proven merge count + declaration-coverage numerator/denominator —
         # STRICTER than verified_prs_merged: proven counts machine-checked
         # named-test proof OR recorded downstream-artifact consumption; declared
@@ -476,6 +479,10 @@ async def compute_direction_progress(
             if entry_ts >= window_start:
                 prs_merged += entry.get("prs_merged") or 0
                 verified_prs_merged += verified_merged_count(entry)
+                reachable_count = reachable_merged_count(entry)
+                if reachable_count is not None:
+                    reachable_prs_merged += reachable_count
+                    reachable_prs_recorded = True
                 proven_prs_merged += proven_merged_count(entry)
                 consumed_prs_merged += entry.get("acceptance_consumed_merged", 0) or 0
                 declared_prs_merged += declared_merged_count(entry)
@@ -1151,6 +1158,11 @@ async def compute_direction_progress(
                     "tasks_created": tasks_created_in_window,
                     "prs_merged": prs_merged,
                     "verified_prs_merged": verified_prs_merged,
+                    **(
+                        {"reachable_prs_merged": reachable_prs_merged}
+                        if reachable_prs_recorded
+                        else {}
+                    ),
                     # Proven count + declaration coverage: machine-checked subset
                     # of verified merges (proven <= verified) and how much merged
                     # code committed to forward evidence. Lifetime counterparts

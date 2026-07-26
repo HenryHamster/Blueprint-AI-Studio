@@ -5479,6 +5479,36 @@ async def _handle_strategic_completion(
                     continue
                 for d in directions:
                     if d.get("id") == dir_id:
+                        requested_status = changes.get("status")
+                        terminal_reason_fb = op_entry.get(
+                            "terminal_reason"
+                        ) or changes.get("terminal_reason")
+                        if requested_status in {"expired", "superseded"} and d.get(
+                            "status"
+                        ) not in {"expired", "superseded"}:
+                            from app.direction_terminal_guard import (
+                                validate_direction_terminal_transition,
+                            )
+
+                            rationale_fb = op_entry.get("rationale") or changes.get(
+                                "rationale"
+                            )
+                            terminal_ok, terminal_error = (
+                                validate_direction_terminal_transition(
+                                    d,
+                                    rationale=rationale_fb,
+                                    terminal_reason=terminal_reason_fb,
+                                )
+                            )
+                            if not terminal_ok:
+                                logger.warning(
+                                    "[STRATEGIC] Task %s: skipped terminal "
+                                    "update_direction for %s: %s",
+                                    task.id,
+                                    dir_id,
+                                    terminal_error,
+                                )
+                                continue
                         # Snapshot contract fields before mutation to detect real changes.
                         _pre_text = d.get("text")
                         _pre_paths = list(d.get("paths") or [])
@@ -5569,6 +5599,13 @@ async def _handle_strategic_completion(
                                     )
                             else:
                                 d["status"] = changes["status"]
+                                if requested_status in {
+                                    "expired",
+                                    "superseded",
+                                } and terminal_reason_fb:
+                                    d["terminal_reason"] = (
+                                        str(terminal_reason_fb).strip().lower()
+                                    )
                                 superseded_by = None
                                 if changes["status"] == "superseded":
                                     d["completed_at"] = _utcnow().isoformat()
@@ -5776,6 +5813,7 @@ async def _handle_strategic_completion(
                 dir_id = op_entry.get("direction_id")
                 if not dir_id:
                     continue
+                rationale = str(op_entry.get("rationale") or "").strip()
                 blocked, why = challenge_rejects_portfolio_op(
                     fallback_challenge_record,
                     op,
@@ -5789,6 +5827,11 @@ async def _handle_strategic_completion(
                         why or "challenge rejected this retire_direction",
                     )
                     continue
+                from app.direction_terminal_guard import (
+                    validate_direction_terminal_transition,
+                )
+
+                terminal_reason = op_entry.get("terminal_reason")
                 # Direction retirement is the strategist's judgment call. The
                 # acceptance contract is enforced only at qualify (the ledger
                 # gate in compute_composite), so retiring a direction while a
@@ -5796,8 +5839,25 @@ async def _handle_strategic_completion(
                 # there is no pre-qualification coverage precondition here.
                 for d in directions:
                     if d.get("id") == dir_id:
+                        terminal_ok, terminal_error = (
+                            validate_direction_terminal_transition(
+                                d,
+                                rationale=rationale,
+                                terminal_reason=terminal_reason,
+                            )
+                        )
+                        if not terminal_ok:
+                            logger.warning(
+                                "[STRATEGIC] Task %s: skipped retire_direction for %s: %s",
+                                task.id,
+                                dir_id,
+                                terminal_error,
+                            )
+                            break
                         d["status"] = "retired"
                         d["retired_at"] = _utcnow().isoformat()
+                        if terminal_reason:
+                            d["terminal_reason"] = str(terminal_reason).strip().lower()
                         _pending_retire_memory.append(
                             {
                                 "snapshot": dict(d),
@@ -6512,6 +6572,8 @@ async def _handle_strategic_completion(
                     _msg_ctx.pop("reply_to", None)
             except (TypeError, ValueError):
                 _msg_ctx.pop("reply_to", None)
+        if _reply_to_id is not None:
+            _msg_ctx["message_role"] = "operator_reply"
 
         reserved_sequence = next(reserved_message_sequences, None)
         new_msg = await build_project_message(
