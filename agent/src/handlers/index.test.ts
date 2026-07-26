@@ -38,6 +38,7 @@ vi.mock('../workspacePrep.js', () => ({
 // which branch was taken without running the real session loop.
 vi.mock('./strategic-resident.js', () => ({
   handleStrategicResident: vi.fn().mockResolvedValue(undefined),
+  residentReplyRuntimePaths: vi.fn(),
 }));
 
 vi.mock('./audits.js', () => ({

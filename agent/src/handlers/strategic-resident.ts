@@ -1,5 +1,7 @@
 import fs from 'fs';
 import { createHash } from 'crypto';
+import os from 'os';
+import path from 'path';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
@@ -69,16 +71,34 @@ const STREAM_FLUSH_MS = 100;
 // session is considered wedged and stopped as FAILED rather than spun forever.
 const MAX_CONSECUTIVE_STALLS = 3;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
-// Resolve the workspace root from env here rather than from the imported
-// WORKSPACE binding: these are MODULE-LEVEL const initializers, so referencing
-// the ../index.js WORKSPACE export at import time hits a circular-import TDZ
-// ("Cannot access 'WORKSPACE' before initialization") when this module is
-// evaluated before index.ts finishes initializing its export. The value is
-// identical to WORKSPACE (index.ts: process.env.AGENT_WORKSPACE || '/tmp/workspace').
-const RESIDENT_WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
-const RESIDENT_REPLY_KEY_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-idempotency-key`;
-const RESIDENT_REPLY_RECEIPT_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-receipt.json`;
-const RESIDENT_STAGED_REPLY_PATH = `${RESIDENT_WORKSPACE}/.resident-reply-staged-message.json`;
+
+export interface ResidentReplyRuntimePaths {
+  runtimeDir: string;
+  replyKeyPath: string;
+  replyReceiptPath: string;
+  stagedReplyPath: string;
+}
+
+/**
+ * Keep the native reply capability outside the mutable Git checkout.
+ *
+ * Strategic residents routinely fetch, reset, or re-clone WORKSPACE while the
+ * persistent Claude/MCP subprocess stays alive. Workspace-local receipts can
+ * therefore disappear in the middle of an operator turn, making the required
+ * reply tool fail with ENOENT and causing a task-level reset. A per-process,
+ * task-scoped runtime directory survives those repository operations while
+ * remaining isolated from other resident generations.
+ */
+export function residentReplyRuntimePaths(taskId: string): ResidentReplyRuntimePaths {
+  const taskSlug = createHash('sha256').update(taskId).digest('hex').slice(0, 20);
+  const runtimeDir = path.join(os.tmpdir(), 'blueprint-resident-reply', `${taskSlug}-${process.pid}`);
+  return {
+    runtimeDir,
+    replyKeyPath: path.join(runtimeDir, '.resident-reply-idempotency-key'),
+    replyReceiptPath: path.join(runtimeDir, '.resident-reply-receipt.json'),
+    stagedReplyPath: path.join(runtimeDir, '.resident-reply-staged-message.json'),
+  };
+}
 
 export interface ResidentReplyReceipt {
   idempotency_key: string;
@@ -516,6 +536,14 @@ export async function handleStrategicResident(
   model?: string, effort?: string,
 ): Promise<void> {
   const baseBranch = resolveBaseBranch(payload, task);
+  const replyRuntime = residentReplyRuntimePaths(taskId);
+  const {
+    replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+    replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+    stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+  } = replyRuntime;
+  fs.mkdirSync(replyRuntime.runtimeDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(replyRuntime.runtimeDir, 0o700);
   statusRef.value = 'Starting resident strategic session...';
   sendLog(ws, 'Resident strategic session starting...\n');
 
@@ -556,14 +584,23 @@ export async function handleStrategicResident(
   }
 
   writePlaybookHelper(taskId);
-  writeMessagesHelper(taskId, WORKSPACE, { residentReplyOnly: true });
+  writeMessagesHelper(taskId, WORKSPACE, {
+    residentReplyOnly: true,
+    replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+    replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+    stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+  });
   writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   const disallowedTools = configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
   const contextPrefix = buildContextPrefix(task);
 
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
   const projectId = strVal(projectMetadata?.project_id);
-  writeStrategicHelpers(taskId, projectId, WORKSPACE);
+  writeStrategicHelpers(taskId, projectId, WORKSPACE, {
+    replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+    replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+    stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+  });
   provisionAmbientHelpers(taskId, WORKSPACE);
 
   const ctx = task.context && typeof task.context === 'object'
@@ -720,6 +757,7 @@ export async function handleStrategicResident(
     messages: ResidentInboundMessage[];
   } | null = null;
   let artifactRetryFailures = 0;
+  let operatorReplyProtocolFailures = 0;
 
   // ── Evidence-gated autonomous tick: examination ledger + rotating focus ──────
   // Code-owned cross-tick memory the model cannot be trusted to keep. The catalog
@@ -1368,6 +1406,41 @@ export async function handleStrategicResident(
     pendingOperatorAdmission = null;
   };
 
+  const retryOperatorReplyInPlace = async (
+    reason: string,
+    detail: string,
+  ): Promise<'stop' | 'continue'> => {
+    rollbackPendingOperatorAdmission();
+    operatorReplyProtocolFailures += 1;
+    try {
+      removeResidentReplyArtifactsAtPaths(
+        RESIDENT_REPLY_KEY_PATH,
+        RESIDENT_REPLY_RECEIPT_PATH,
+      );
+      removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+    } catch (e) {
+      sendLog(ws, `[resident] reply retry cleanup incomplete: ${String(e)}\n`);
+    }
+    const retryMs = Math.min(
+      30_000,
+      Math.max(cfg.messagePollMs, 1_500)
+        * (2 ** Math.min(operatorReplyProtocolFailures - 1, 4)),
+    );
+    setResidentActivity(
+      'waiting',
+      'Reply channel unavailable; retrying the operator turn in place',
+      new Date(Date.now() + retryMs).toISOString(),
+    );
+    sendLog(
+      ws,
+      `[resident] ${detail}; keeping task alive and retrying operator turn `
+        + `(failure ${operatorReplyProtocolFailures}, backoff ${retryMs}ms)\n`,
+    );
+    if (!restartSessionFromCheckpoint(reason)) return 'stop';
+    await sleep(retryMs);
+    return 'continue';
+  };
+
   // progress=true renews the authority lease (applied op / operator interaction);
   // progress=false is bare liveness (keeps the session fresh for the reaper only).
   // handledIds: message ids consumed by the resident turn — marked handled on the
@@ -1728,27 +1801,27 @@ export async function handleStrategicResident(
     try {
       stagedReply = readResidentStagedReplyAtPath(RESIDENT_STAGED_REPLY_PATH, replyReceipt);
     } catch (e) {
-      stopReason = 'operator_reply_staging_invalid';
-      sendLog(ws, `[resident] staged reply validation failed; leaving operator message open: ${String(e)}\n`);
-      try { removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH); } catch { /* startup cleanup retries */ }
-      return 'stop';
+      return retryOperatorReplyInPlace(
+        'operator reply staging validation failure',
+        `staged reply validation failed: ${String(e)}`,
+      );
     }
     const operatorReply = r.operatorReply;
     if (!r.sentOperatorMessage || stagedReply === null || operatorReply === null) {
-      stopReason = 'operator_reply_tool_missing';
-      sendLog(ws, '[resident] no confirmed native reply_to_operator call; leaving operator message open for retry\n');
-      try { removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH); } catch { /* startup cleanup retries */ }
-      return 'stop';
+      return retryOperatorReplyInPlace(
+        'operator reply tool missing',
+        'no confirmed native reply_to_operator call',
+      );
     }
     // The MCP server's staging file proves receipt ownership, while the
     // session keeps the accepted tool arguments outside model-writable storage.
     // A later workspace write can therefore only make this turn fail closed;
     // it can never change what gets persisted as the operator reply.
     if (stagedReply.content !== operatorReply.content || stagedReply.type !== operatorReply.type) {
-      stopReason = 'operator_reply_staging_invalid';
-      sendLog(ws, '[resident] staged reply no longer matches accepted native tool arguments; leaving operator message open\n');
-      try { removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH); } catch { /* startup cleanup retries */ }
-      return 'stop';
+      return retryOperatorReplyInPlace(
+        'operator reply staging mismatch',
+        'staged reply no longer matches accepted native tool arguments',
+      );
     }
     // Capture any operator-settled correction BEFORE the sole reply write. The
     // serialized state below then lands in the same backend transaction as the
@@ -1793,6 +1866,7 @@ export async function handleStrategicResident(
       stopReason = 'operator_reply_not_persisted';
       return 'stop';
     }
+    operatorReplyProtocolFailures = 0;
     pendingOperatorAdmission = null;
     // The create_message transaction already marked exactly this receipt's
     // covered IDs handled and persisted the restart-critical turn metadata.
@@ -1846,10 +1920,19 @@ export async function handleStrategicResident(
           // Re-provision all generated helper tools into the recreated checkout.
           // They were written into the deleted directory inode and are gone.
           writePlaybookHelper(taskId);
-          writeMessagesHelper(taskId, WORKSPACE, { residentReplyOnly: true });
+          writeMessagesHelper(taskId, WORKSPACE, {
+            residentReplyOnly: true,
+            replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+            replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+            stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+          });
           writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
           configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
-          writeStrategicHelpers(taskId, projectId, WORKSPACE);
+          writeStrategicHelpers(taskId, projectId, WORKSPACE, {
+            replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+            replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+            stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+          });
           provisionAmbientHelpers(taskId, WORKSPACE);
           residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
             receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
@@ -2248,6 +2331,16 @@ export async function handleStrategicResident(
     streamer.flush();
     invalidateSessionEvents();
     session.close();
+    try {
+      removeResidentReplyArtifactsAtPaths(
+        RESIDENT_REPLY_KEY_PATH,
+        RESIDENT_REPLY_RECEIPT_PATH,
+      );
+      removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+      fs.rmdirSync(replyRuntime.runtimeDir);
+    } catch (e) {
+      sendLog(ws, `[resident] reply runtime cleanup incomplete (non-fatal): ${String(e)}\n`);
+    }
   }
 
   // ── Terminal status ─────────────────────────────────────────────────────────

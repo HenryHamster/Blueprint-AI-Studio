@@ -78,16 +78,27 @@ function renderStrategicSchemaCase(): string {
   }).join('\n');
 }
 
-function generateStrategicScript(taskIdRaw: string, helperDir: string): string {
+function generateStrategicScript(
+  taskIdRaw: string,
+  helperDir: string,
+  replyPaths: {
+    replyKeyPath?: string;
+    replyReceiptPath?: string;
+    stagedReplyPath?: string;
+  } = {},
+): string {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const replyKeyPath = shellEscapeDoubleQuoted(
-    path.resolve(helperDir, '.resident-reply-idempotency-key').replace(/\\/g, '/'),
+    (replyPaths.replyKeyPath
+      ?? path.resolve(helperDir, '.resident-reply-idempotency-key')).replace(/\\/g, '/'),
   );
   const replyReceiptPath = shellEscapeDoubleQuoted(
-    path.resolve(helperDir, '.resident-reply-receipt.json').replace(/\\/g, '/'),
+    (replyPaths.replyReceiptPath
+      ?? path.resolve(helperDir, '.resident-reply-receipt.json')).replace(/\\/g, '/'),
   );
   const stagedReplyPath = shellEscapeDoubleQuoted(
-    path.resolve(helperDir, '.resident-reply-staged-message.json').replace(/\\/g, '/'),
+    (replyPaths.stagedReplyPath
+      ?? path.resolve(helperDir, '.resident-reply-staged-message.json')).replace(/\\/g, '/'),
   );
   const caseBody = renderStrategicCaseBody();
   const helpText = renderStrategicHelp();
@@ -1083,8 +1094,17 @@ export function buildStrategicChallengeExecutorSection(record: StrategicChalleng
   ].join('\n');
 }
 
-export function writeStrategicHelpers(taskId: string, projectId: string, workspace: string): void {
-  const strategicScript = generateStrategicScript(taskId, workspace);
+export function writeStrategicHelpers(
+  taskId: string,
+  projectId: string,
+  workspace: string,
+  replyPaths: {
+    replyKeyPath?: string;
+    replyReceiptPath?: string;
+    stagedReplyPath?: string;
+  } = {},
+): void {
+  const strategicScript = generateStrategicScript(taskId, workspace, replyPaths);
   fs.writeFileSync(`${workspace}/strategic`, strategicScript, { mode: 0o755 });
 
   // Strategic agents get the FULL verb set so their ./fetch is byte-identical

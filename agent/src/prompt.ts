@@ -861,18 +861,26 @@ exit $rc
 export function writeMessagesHelper(
   taskIdRaw: string,
   workspace: string = WORKSPACE,
-  options: { residentReplyOnly?: boolean } = {},
+  options: {
+    residentReplyOnly?: boolean;
+    replyKeyPath?: string;
+    replyReceiptPath?: string;
+    stagedReplyPath?: string;
+  } = {},
 ): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const residentReplyOnly = options.residentReplyOnly === true;
   const replyKeyPath = shellEscapeDoubleQuoted(
-    path.resolve(workspace, '.resident-reply-idempotency-key').replace(/\\/g, '/'),
+    (options.replyKeyPath
+      ?? path.resolve(workspace, '.resident-reply-idempotency-key')).replace(/\\/g, '/'),
   );
   const replyReceiptPath = shellEscapeDoubleQuoted(
-    path.resolve(workspace, '.resident-reply-receipt.json').replace(/\\/g, '/'),
+    (options.replyReceiptPath
+      ?? path.resolve(workspace, '.resident-reply-receipt.json')).replace(/\\/g, '/'),
   );
   const stagedReplyPath = shellEscapeDoubleQuoted(
-    path.resolve(workspace, '.resident-reply-staged-message.json').replace(/\\/g, '/'),
+    (options.stagedReplyPath
+      ?? path.resolve(workspace, '.resident-reply-staged-message.json')).replace(/\\/g, '/'),
   );
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
