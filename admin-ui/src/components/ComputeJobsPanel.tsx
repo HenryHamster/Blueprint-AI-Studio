@@ -26,6 +26,7 @@ import {
   computeJobEvidenceGroup,
   computeJobEvidenceTierRank,
   computeJobImagePinStatus,
+  fmtBytes,
   fmtUsd,
   fmtCountdown,
   fmtDuration,
@@ -875,6 +876,13 @@ function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
     setupStep: lp.setup_step ?? '',
     noProgressTimeoutSeconds: lp.no_progress_timeout_seconds != null ? String(lp.no_progress_timeout_seconds) : '',
     inputArtifactJobId: lp.input_artifact_job_id ?? '',
+  };
+}
+
+function buildArtifactInputForm(job: ComputeJob): ComputeExperimentForm {
+  return {
+    ...buildCloneForm(job),
+    inputArtifactJobId: job.id,
   };
 }
 
@@ -2041,6 +2049,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                           Clone to form
                         </button>
                       )}
+                      {onCloneExperiment && job.can_use_as_input && (
+                        <button
+                          onClick={() => onCloneExperiment(buildArtifactInputForm(job))}
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors"
+                          title="Launch another experiment with this artifact bundle rehydrated as input"
+                          data-testid="use-artifact-as-input"
+                        >
+                          Use as input
+                        </button>
+                      )}
                       {rerunState?.jobId === job.id ? (
                         <div className="flex flex-col gap-2 rounded border border-sky-500/30 bg-sky-500/10 p-2 text-ui-sm" data-testid="rerun-inline-panel">
                           {rerunState.result ? (
@@ -2317,7 +2335,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         reference={job.result_reference}
                         className="inline-flex items-center gap-1 font-semibold text-emerald-300 hover:text-emerald-200 hover:underline break-words min-w-0 text-left disabled:opacity-70"
                       >
-                        <span className="break-words">COMPUTE_RESULT artifact</span>
+                        <span className="break-words">Download artifact bundle</span>
                         <ExternalLink className="w-3 h-3 shrink-0" />
                       </ResolvedReferenceLink>
                     ) : (
@@ -2339,6 +2357,25 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <span className="break-all">{job.result_reference}</span>
                     <ExternalLink className="w-3 h-3 shrink-0" />
                   </ResolvedReferenceLink>
+                </div>
+              )}
+              {job.artifact?.manifest && (
+                <div className="mt-1 text-ui-sm text-neutral-400 font-mono" data-testid="compute-artifact-manifest">
+                  {job.artifact.manifest.file_count ?? 'Unknown'} files
+                  {job.artifact.manifest.total_size_bytes != null
+                    ? ` · ${fmtBytes(job.artifact.manifest.total_size_bytes)}`
+                    : ''}
+                  {job.artifact.manifest.paths && job.artifact.manifest.paths.length > 0
+                    ? ` · ${job.artifact.manifest.paths.join(', ')}${job.artifact.manifest.paths_truncated ? ', …' : ''}`
+                    : ''}
+                </div>
+              )}
+              {job.task_status === 'CANCELLED' && job.execution_status === 'SUCCEEDED' && (
+                <div className="mt-1 text-ui-sm text-amber-300" data-testid="compute-parent-job-reconciliation">
+                  Parent task cancelled; compute execution succeeded
+                  {job.criterion_status === 'MET' ? '; criterion met' : ''}
+                  {job.criterion_status === 'NOT_MET' ? '; criterion not met' : ''}
+                  {job.criterion_status === 'UNMEASURED' ? '; criterion unmeasured' : ''}
                 </div>
               )}
               <ComputeArtifactGallery testIdPrefix="compute" projectId={projectId} job={job} />

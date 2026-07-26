@@ -5262,6 +5262,7 @@ async def test_gap_reconciled_on_retire_fallback_path(db_session, mocker):
                     "op": "retire",
                     "direction_id": "d-xxx",
                     "rationale": "Done — metering gap closed",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -6551,7 +6552,11 @@ async def test_retirement_always_proceeds_without_challenge_gate(client, db_sess
             json={
                 "task_id": str(task.id),
                 "op": "retire_direction",
-                "data": {"direction_id": direction_id, "rationale": rationale},
+                "data": {
+                    "direction_id": direction_id,
+                    "rationale": rationale,
+                    "terminal_reason": "invalidated",
+                },
             },
             headers={"x-agent-token": token},
         )
@@ -6717,7 +6722,11 @@ async def test_retire_direction_rejected_portfolio_operation_blocks(client, db_s
         task,
         "vm-po-retire",
         "retire_direction",
-        {"direction_id": "d-retire", "rationale": "redundant"},
+        {
+            "direction_id": "d-retire",
+            "rationale": "redundant",
+            "terminal_reason": "invalidated",
+        },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -7279,6 +7288,7 @@ async def test_strategic_completion_fallback_superseded_update_persists_supersed
                     "op": "update",
                     "direction_id": "d-old",
                     "rationale": "superseded by newer approach",
+                    "terminal_reason": "superseded",
                     "changes": {
                         "status": "superseded",
                         "superseded_by": {
@@ -7354,6 +7364,7 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
                     "direction_id": "d-legacy",
                     "successor_id": "d-successor",
                     "rationale": "replaced",
+                    "terminal_reason": "superseded",
                     "dedup_reasoning": {
                         "closest_directions": ["d-legacy"],
                         "distinction": "This is a status reviver, not a new direction",
@@ -7429,9 +7440,10 @@ async def test_fallback_update_to_superseded_records_retired_memory(
             "vision": {"purpose": "test", "revision": 2},
             "direction_operations": [
                 {
-                    "op": "update",
-                    "direction_id": "d-sup",
-                    "rationale": "replaced by newer approach",
+                        "op": "update",
+                        "direction_id": "d-sup",
+                        "rationale": "replaced by newer approach",
+                        "terminal_reason": "superseded",
                     "changes": {
                         "status": "superseded",
                         "superseded_by": {
@@ -7501,10 +7513,11 @@ async def test_fallback_update_to_expired_records_retired_memory(db_session, moc
             "vision": {"purpose": "test", "revision": 2},
             "direction_operations": [
                 {
-                    "op": "update",
-                    "direction_id": "d-exp",
-                    "rationale": "no longer relevant after refactor",
-                    "changes": {"status": "expired"},
+                        "op": "update",
+                        "direction_id": "d-exp",
+                        "rationale": "no longer relevant after refactor",
+                        "terminal_reason": "invalidated",
+                        "changes": {"status": "expired"},
                 },
             ],
         }
@@ -7638,9 +7651,10 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
             "task_id": str(task.id),
             "op": "update_direction",
             "data": {
-                "direction_id": "d-http-old",
-                "rationale": "superseded by new direction",
-                "changes": {
+                    "direction_id": "d-http-old",
+                    "rationale": "superseded by new direction",
+                    "terminal_reason": "superseded",
+                    "changes": {
                     "status": "superseded",
                     "superseded_by": {
                         "direction_id": "d-http-new",
@@ -7959,9 +7973,10 @@ async def test_strategic_http_update_direction_superseded_stamps_completed_at_an
             "task_id": str(task.id),
             "op": "update_direction",
             "data": {
-                "direction_id": "d-http-sup-window",
-                "rationale": "superseded via HTTP path",
-                "changes": {
+                    "direction_id": "d-http-sup-window",
+                    "rationale": "superseded via HTTP path",
+                    "terminal_reason": "superseded",
+                    "changes": {
                     "status": "superseded",
                     "superseded_by": {
                         "direction_id": "d-http-successor",
@@ -13178,6 +13193,7 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
             "op": "retire",
             "direction_id": direction_id,
             "rationale": "CI speed goal met",
+            "terminal_reason": "invalidated",
         }
     ]
     logs = json.dumps(
@@ -13989,6 +14005,7 @@ async def test_retire_op_sets_retired_status_and_appears_in_summary(db_session, 
                     "op": "retire",
                     "direction_id": direction_id,
                     "rationale": "CI speed goal fully met",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -18621,6 +18638,7 @@ async def test_batch_retire_reconciles_gap_active_moves_and_records_deferral(
                     "op": "retire",
                     "direction_id": "d-ret",
                     "rationale": "no longer worthwhile",
+                    "terminal_reason": "invalidated",
                 },
             ],
         }
@@ -19516,6 +19534,7 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
                     "op": "retire_direction",
                     "direction_id": "d-retire",
                     "rationale": "done",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -19593,6 +19612,7 @@ async def test_retire_direction_note_not_duplicated_on_reprocess(db_session, moc
                     "op": "retire_direction",
                     "direction_id": "d-dedup",
                     "rationale": rationale,
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -19724,6 +19744,7 @@ async def test_retire_direction_succeeds_when_criterion_is_covered(
                     "op": "retire_direction",
                     "direction_id": direction_id,
                     "rationale": "Direction completed",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }

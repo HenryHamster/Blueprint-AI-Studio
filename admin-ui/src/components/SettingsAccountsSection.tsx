@@ -2,6 +2,7 @@ import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react
 import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle, Loader2, Pencil, Plus, RefreshCw, Sliders, Trash2, X } from 'lucide-react';
 import { parseTimestamp, timeAgo } from '../utils/time';
 import type { AccountMutationResult, AccountMutationReturn, AccountUpdatePayload, AuthMode, MaxPlanAccount, ProviderCatalogEntry, ProviderName } from '../types/settings';
+import { DEFAULT_POLL_MS, usePoller } from '../hooks/usePoller';
 
 const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'zai', 'deepseek', 'openai', 'gemini'];
 
@@ -144,6 +145,7 @@ interface SettingsAccountsSectionProps {
   onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
+  onRefreshAccounts?: () => void | Promise<void>;
   onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
   providers: Record<string, ProviderCatalogEntry>;
@@ -1116,6 +1118,7 @@ export function SettingsAccountsSection({
   onRemoveAccount,
   onResetRateLimits,
   onRefreshAccountModels,
+  onRefreshAccounts,
   onUpdateAccount,
   onUpdateAccountCaps,
   providers,
@@ -1146,6 +1149,16 @@ export function SettingsAccountsSection({
     daily_task_cap: '',
     max_concurrent_tasks: '',
     auto_disable_after_rate_limits: '',
+  });
+
+  // The roster response owns the persisted usage snapshots. Refresh it while
+  // this section is mounted so a background probe becoming known is reflected
+  // without requiring the operator to leave and reopen Settings.
+  usePoller(() => onRefreshAccounts?.(), {
+    intervalMs: DEFAULT_POLL_MS,
+    enabled: typeof onRefreshAccounts === 'function',
+    leading: false,
+    deps: [],
   });
 
   useEffect(() => {

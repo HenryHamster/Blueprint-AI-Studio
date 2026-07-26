@@ -2831,6 +2831,9 @@ _USAGE_SNAPSHOT_TTL_SECONDS = 300
 # TTL above: probes run every 300 s, so the selection gate considers a snapshot
 # fresh for the same window to avoid treating the gap as "unknown" on every call.
 _USAGE_METER_REFRESH_INTERVAL_SECONDS = 300
+# Spread cadence-triggered probes so a pool refresh does not hit every provider
+# account in the same millisecond and manufacture avoidable 429s.
+_USAGE_METER_PROBE_STAGGER_SECONDS = 0.5
 # A snapshot older than this renders as "stale" on the admin meter — three
 # missed meter refreshes. The 60s selection TTL is intentionally NOT used for
 # display: with a 300s refresh cadence it would flag virtually every render.
@@ -3121,7 +3124,15 @@ async def _persist_rate_limit_usage_to_db(
                 )
 
 
-def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:
+async def _delayed_usage_refresh(acct_id: str, delay_seconds: float) -> None:
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+    await _refresh_usage_snapshot(acct_id)
+
+
+def _schedule_usage_refresh(
+    acct: Dict[str, Any], *, delay_seconds: float = 0.0
+) -> None:
     """Fire-and-forget a background usage refresh for an account.
 
     MUST be called under the pool lock (reads/sets the in-flight flag). Network
@@ -3135,7 +3146,7 @@ def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:
     except RuntimeError:
         return
     acct["usage_probe_inflight"] = True
-    task = loop.create_task(_refresh_usage_snapshot(acct["id"]))
+    task = loop.create_task(_delayed_usage_refresh(acct["id"], delay_seconds))
     _usage_probe_tasks.add(task)
     task.add_done_callback(_usage_probe_tasks.discard)
 
@@ -3250,24 +3261,26 @@ def _restore_usage_state(
 def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
     """True iff this account can produce a usage snapshot worth probing.
 
-    Anthropic OAuth accounts probe the /api/oauth/usage endpoint. Anthropic
-    API-key accounts probe via a minimal messages.create call to capture rate-
-    limit headers. Eligibility is based on configured credential capability,
-    not whether a Secret Manager secret happened to be hydrated during the
-    last pool rebuild; rehydration happens immediately before probing.
+    Anthropic accounts and OpenAI Codex OAuth accounts have machine-readable
+    usage sources. Eligibility is based on configured credential capability,
+    not whether a Secret Manager secret happened to be hydrated during the last
+    pool rebuild; rehydration happens immediately before probing.
     """
     provider = _normalize_provider_name(acct.get("provider"))
     auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
-    if provider != LLMProviderName.ANTHROPIC.value:
-        return False
     if not bool(acct.get("enabled", True)):
         return False
+    has_secret = bool(
+        acct.get("secret_blob_ref")
+        or acct.get("oauth_token")
+        or acct.get("runtime_secret")
+    )
+    if provider == LLMProviderName.OPENAI.value:
+        return auth_mode == LLMAuthMode.OAUTH.value and has_secret
+    if provider != LLMProviderName.ANTHROPIC.value:
+        return False
     if auth_mode == LLMAuthMode.OAUTH.value:
-        return bool(
-            acct.get("secret_blob_ref")
-            or acct.get("oauth_token")
-            or acct.get("runtime_secret")
-        )
+        return has_secret
     if auth_mode == LLMAuthMode.API_KEY.value:
         return bool(acct.get("secret_blob_ref") or acct.get("runtime_secret"))
     return False
@@ -3326,7 +3339,10 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
                 continue
             if acct.get("usage_probe_failure_kind") == "unsupported":
                 continue
-            _schedule_usage_refresh(acct)
+            _schedule_usage_refresh(
+                acct,
+                delay_seconds=scheduled * _USAGE_METER_PROBE_STAGGER_SECONDS,
+            )
             scheduled += 1
     if scheduled:
         logger.info("[POOL] usage meter: scheduled %d usage probe(s)", scheduled)

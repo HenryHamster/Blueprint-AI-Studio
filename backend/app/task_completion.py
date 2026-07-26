@@ -71,7 +71,7 @@ from app.task_evaluators import (
     EvaluationVerdict,
     _extract_compute_measurement,
     describe_emitted_compute_metric_keys,
-    evaluate_compute_success_criterion,
+    evaluate_compute_success_criteria,
     evaluate_terminal_output,
     record_failed_gate,
 )
@@ -2954,8 +2954,10 @@ def _compute_followup_is_opted_in(task: Task) -> bool:
     return (task.first_payload or {}).get("spawn_followup") is True
 
 
-def _is_unmeasured_declared_metric(task: Task, criterion: dict | None) -> bool:
-    """True when ``task`` declared a kind=metric criterion that produced NO value.
+def _unmeasured_declared_metric_names(
+    task: Task, criteria_verdict: dict | None
+) -> list[str]:
+    """Return declared metric criteria that produced no usable observation.
 
     The loud unmeasured-criterion failure applies ONLY to ``kind="metric"``
     criteria that came back unmeasurable (no numeric value in the terminal
@@ -2967,18 +2969,31 @@ def _is_unmeasured_declared_metric(task: Task, criterion: dict | None) -> bool:
         threshold — that is faithfully recorded negative evidence, not a failure;
       * the no-criterion case — presence-based behavior is preserved.
     """
-    if not isinstance(criterion, dict):
-        return False
-    # measurable is False ONLY when the metric was absent/non-numeric in the
-    # result. A measured-but-missed criterion has measurable True and is evidence.
-    if criterion.get("measurable") is not False:
-        return False
+    if not isinstance(criteria_verdict, dict):
+        return []
     payload = task.first_payload or {}
-    raw = payload.get("success_criterion") if isinstance(payload, dict) else None
-    if not isinstance(raw, dict):
-        return False
-    kind = str(raw.get("kind") or "metric")
-    return kind == "metric"
+    if not isinstance(payload, dict):
+        return []
+    raw_many = payload.get("success_criteria")
+    declared = (
+        raw_many
+        if isinstance(raw_many, list)
+        else [payload.get("success_criterion")]
+    )
+    verdicts = criteria_verdict.get("criteria")
+    verdicts = verdicts if isinstance(verdicts, list) else []
+    missing: list[str] = []
+    for raw, verdict in zip(declared, verdicts):
+        if not isinstance(raw, dict) or not isinstance(verdict, dict):
+            continue
+        if str(raw.get("kind") or "metric") != "metric":
+            continue
+        if verdict.get("observation_status") not in {"UNMEASURED", "INVALID"}:
+            continue
+        metric = verdict.get("metric")
+        if isinstance(metric, str) and metric:
+            missing.append(metric)
+    return missing
 
 
 # Context key stamped on a spawned reason-and-ship follow-on identifying its
@@ -4382,12 +4397,18 @@ async def _handle_compute_experiment_completion(
     _echo_sha, _expected_sha = await _load_release_echo_for_criterion(
         session, task, logs
     )
-    criterion = evaluate_compute_success_criterion(
+    criteria_verdict = evaluate_compute_success_criteria(
         task, logs, echo_sha=_echo_sha, expected_sha=_expected_sha
     )
-    if criterion is not None:
+    criterion = None
+    if criteria_verdict is not None:
+        criteria = criteria_verdict.get("criteria")
+        if isinstance(criteria, list) and criteria:
+            criterion = criteria[0]
         crit_context = dict(task.context or {})
-        crit_context["compute_success_criterion"] = criterion
+        if criterion is not None:
+            crit_context["compute_success_criterion"] = criterion
+        crit_context["compute_success_criteria"] = criteria_verdict
         task.context = crit_context
         flag_modified(task, "context")
 
@@ -4460,6 +4481,8 @@ async def _handle_compute_experiment_completion(
         compute_result: dict[str, Any] = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        if criteria_verdict is not None:
+            compute_result["criteria_verdict"] = criteria_verdict
         # Non-success terminals carry WHY (the job's terminal_reason) so
         # plan_output.compute_result — the durable record downstream prompts
         # read — surfaces the reason, not just the outcome state.
@@ -4570,6 +4593,8 @@ async def _handle_compute_experiment_completion(
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        if criteria_verdict is not None:
+            compute_result["criteria_verdict"] = criteria_verdict
         # Mirror the prerequisite path: non-success terminals carry WHY so the
         # follow-on spawn and the sweep aggregate prompt (which read
         # plan_output.compute_result) surface the reason, not just the state.
@@ -4639,19 +4664,17 @@ async def _handle_compute_experiment_completion(
         # kind=artifact_produced (gated on durable_file_count) and intentional
         # budget/deadline/cancel kills (those stay exactly as today). A
         # measured-but-missed criterion is evidence, not this failure.
-        if (
-            _is_unmeasured_declared_metric(task, criterion)
-            and outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES
-        ):
+        unmeasured_metrics = _unmeasured_declared_metric_names(task, criteria_verdict)
+        if unmeasured_metrics and outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
             from app.failure_classification import (
                 COMPUTE_UNMEASURED_CRITERION,
                 persist_failure_category,
             )
 
-            metric_name = (criterion or {}).get("metric")
             emitted_diag = describe_emitted_compute_metric_keys(logs)
             miss_reason = (
-                f"compute_unmeasured_criterion: declared metric {metric_name!r} "
+                f"compute_unmeasured_criterion: declared metric(s) "
+                f"{unmeasured_metrics!r} "
                 f"produced no numeric value (outcome={outcome}); the experiment "
                 f"ran but the declared hypothesis was never measured — {emitted_diag}"
             )

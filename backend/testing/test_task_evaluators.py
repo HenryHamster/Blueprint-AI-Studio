@@ -24,6 +24,8 @@ from app.task_evaluators import (
     MetricStrategy,
     NoneStrategy,
     _declared_success_criterion,
+    _declared_success_criteria,
+    evaluate_compute_success_criteria,
     evaluate_terminal_output,
     record_failed_gate,
     resolve_evaluation_strategy,
@@ -399,6 +401,95 @@ def test_declared_success_criterion_artifact_produced_custom_min_count():
         ]
     )
     assert _declared_success_criterion(task) == ("durable_file_count", ">=", 3.0)
+
+
+def test_multiple_compute_criteria_are_and_evaluated_with_typed_observations():
+    task = Task(
+        payloads=[{
+            "type": "compute_experiment",
+            "success_criteria": [
+                {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+                {"metric": "latency_ms", "operator": "<=", "threshold": 100},
+            ],
+        }]
+    )
+    assert _declared_success_criteria(task) == [
+        ("accuracy", ">=", 0.9),
+        ("latency_ms", "<=", 100.0),
+    ]
+    verdict = evaluate_compute_success_criteria(
+        task, json.dumps({"accuracy": 0.95, "latency_ms": 120})
+    )
+    assert verdict is not None
+    assert verdict["operator"] == "AND"
+    assert verdict["met"] is False
+    assert [item["observation_status"] for item in verdict["criteria"]] == [
+        "MEASURED",
+        "MEASURED",
+    ]
+
+
+def test_compute_criterion_reports_missing_and_invalid_metric_reasons():
+    task = _criterion_task("accuracy", ">=", 0.9)
+    absent = evaluate_compute_success_criteria(task, json.dumps({"loss": 1.0}))
+    assert absent["criteria"][0]["observation_status"] == "UNMEASURED"
+    assert absent["criteria"][0]["reason_code"] == "METRIC_KEY_ABSENT"
+
+    invalid = evaluate_compute_success_criteria(
+        task, json.dumps({"accuracy": "not-a-number"})
+    )
+    assert invalid["criteria"][0]["observation_status"] == "INVALID"
+    assert invalid["criteria"][0]["reason_code"] == "METRIC_NOT_NUMERIC"
+
+    ambiguous = evaluate_compute_success_criteria(
+        task, json.dumps({"accuracy": 0.95, " Accuracy ": 0.7})
+    )
+    assert ambiguous["criteria"][0]["observation_status"] == "INVALID"
+    assert ambiguous["criteria"][0]["reason_code"] == "AMBIGUOUS_METRIC_KEY"
+
+
+def test_metric_strategy_does_not_report_multi_criteria_met_when_later_one_fails():
+    task = Task(
+        payloads=[{
+            "type": "compute_experiment",
+            "success_criteria": [
+                {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+                {"metric": "latency_ms", "operator": "<=", "threshold": 100},
+            ],
+        }]
+    )
+    artifact = json.dumps({
+        "outcome": "SUCCESS",
+        "final_cost_usd": 0.4,
+        "accuracy": 0.95,
+        "latency_ms": 120,
+    })
+    verdict = MetricStrategy().evaluate(task, artifact)
+    assert verdict.passed is True
+    assert "1/2 met" in verdict.reason
+    assert "failed: latency_ms" in verdict.reason
+    assert "all 2 declared success criteria met" not in verdict.reason
+
+
+def test_artifact_delivery_reports_all_multi_criteria_when_they_pass():
+    task = Task(
+        payloads=[{
+            "type": "compute_experiment",
+            "success_criteria": [
+                {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+                {"metric": "latency_ms", "operator": "<=", "threshold": 100},
+            ],
+        }]
+    )
+    artifact = json.dumps({
+        "outcome": "SUCCESS",
+        "final_cost_usd": 0.4,
+        "accuracy": 0.95,
+        "latency_ms": 80,
+    })
+    verdict = ArtifactDeliveryStrategy().evaluate(task, artifact)
+    assert verdict.passed is True
+    assert "all 2 declared success criteria met" in verdict.reason
 
 
 def test_compute_criterion_met_passes_with_reason():

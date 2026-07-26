@@ -198,7 +198,7 @@ export default function App() {
       return (stored as SortBy) ?? 'newest';
     } catch { return 'newest'; }
   });
-  const { setFailureClassFilter, setRequiresApproval, setStatusFilter, setStuckFilter, setStuckMinSeconds } = s;
+  const { setFailureClassFilter, setRequiresApproval, setStatusFilter } = s;
   useEffect(() => {
     const onFailureClassFilter = (e: Event) => {
       const failureClass = (e as CustomEvent<string>).detail;
@@ -212,17 +212,11 @@ export default function App() {
       setStatusFilter([...ACTIVE_TASK_STATUS_FILTER]);
     }
     if (s.requiresApproval) setRequiresApproval(false);
-    if (s.stuckFilter) setStuckFilter(false);
-    if (s.stuckMinSeconds !== 0) setStuckMinSeconds(0);
   }, [
     s.requiresApproval,
     s.statusFilter,
-    s.stuckFilter,
-    s.stuckMinSeconds,
     setRequiresApproval,
     setStatusFilter,
-    setStuckFilter,
-    setStuckMinSeconds,
   ]);
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
@@ -599,11 +593,12 @@ export default function App() {
       // Prefer the first-class BLOCKED status; fall back to the legacy
       // QUEUED+depends_on inference for older payloads predating the status.
       const blockedMatch = !s.blockedFilter || t.status === 'BLOCKED' || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
+      const stuckMatch = !s.stuckFilter || stuckTaskIds.has(t.id);
       const failureClassMatch = s.failureClassFilter.length === 0 || (t.status === 'FAILED' && t.failure_class != null && s.failureClassFilter.includes(t.failure_class));
-      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && failureClassMatch;
+      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && stuckMatch && failureClassMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.failureClassFilter, filterTaskTypeIds]);
+  }, [s.tasks, s.taskTypeFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.stuckFilter, s.failureClassFilter, filterTaskTypeIds, stuckTaskIds]);
 
   const {
     addToast: addTaskLookupToast,
@@ -1044,6 +1039,8 @@ export default function App() {
           onDateRangeChange={s.setDateRange}
           blockedFilter={s.blockedFilter}
           onBlockedFilterChange={s.setBlockedFilter}
+          stuckFilter={s.stuckFilter}
+          onStuckFilterChange={s.setStuckFilter}
           directionFilter={s.directionFilter}
           onDirectionFilterChange={s.setDirectionFilter}
           directions={directions}

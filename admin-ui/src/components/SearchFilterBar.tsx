@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/set-state-in-effect */
-import { Search, ChevronDown, Check, GitFork } from 'lucide-react';
+import { Search, ChevronDown, Check, GitFork, Timer } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
 import type { DateRange } from '../hooks/useSearchFilters';
@@ -17,6 +17,8 @@ interface SearchFilterBarProps {
   onDateRangeChange: (range: DateRange) => void;
   blockedFilter: boolean;
   onBlockedFilterChange: (v: boolean) => void;
+  stuckFilter?: boolean;
+  onStuckFilterChange?: (v: boolean) => void;
   directionFilter?: string;
   onDirectionFilterChange?: (v: string) => void;
   directions?: { id: string; text: string }[];
@@ -179,7 +181,7 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
 const DATE_RANGE_SELECT_OPTIONS: { label: string; value: string }[] = DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }));
 const FAILURE_CLASS_OPTIONS = Object.entries(FAILURE_CLASS_CONFIG).map(([value, config]) => ({ value, label: config.label }));
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, directionFilter = '', onDirectionFilterChange, directions, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, stuckFilter = false, onStuckFilterChange, directionFilter = '', onDirectionFilterChange, directions, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const { filterOptions: typeOptions } = useTaskCapabilities();
   useEffect(() => {
@@ -199,6 +201,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
     onFailureClassFilterChange != null && failureClassFilter.length > 0,
     dateRange !== 'all',
     blockedFilter,
+    stuckFilter,
     directionFilter !== '',
   ].filter(Boolean).length;
 
@@ -210,6 +213,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
     onFailureClassFilterChange?.([]);
     onDateRangeChange('all');
     onBlockedFilterChange(false);
+    onStuckFilterChange?.(false);
     onDirectionFilterChange?.('');
   }
 
@@ -261,6 +265,20 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         <GitFork className="w-3 h-3" />
         <span>Blocked</span>
       </button>
+
+      {onStuckFilterChange && (
+        <button
+          onClick={() => onStuckFilterChange(!stuckFilter)}
+          className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
+            stuckFilter
+              ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+              : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+          }`}
+        >
+          <Timer className="w-3 h-3" />
+          <span>Stuck</span>
+        </button>
+      )}
 
       {onDirectionFilterChange && (
         <SingleSelectDropdown

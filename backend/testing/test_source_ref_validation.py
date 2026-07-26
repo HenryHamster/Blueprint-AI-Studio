@@ -946,6 +946,27 @@ async def test_validate_source_refs_end_before_start_invalid(mocker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_scope", ["harness", "runtime"])
+async def test_validate_source_refs_non_project_scope_skips_project_head(
+    mocker, source_scope
+):
+    """Execution-environment paths are not judged against project HEAD."""
+    repo = mocker.patch("app.source_ref_validation._file_content_in_repo_branch")
+    local = mocker.patch("app.source_ref_validation._file_exists_at_head")
+    source = {
+        "type": "file",
+        "ref": "/workspace/agent/.resident-reply-receipt.json",
+        "source_scope": source_scope,
+    }
+
+    assert await validate_source_refs(
+        [source], token="t", owner="o", repo="r", branch="b"
+    ) == [source]
+    repo.assert_not_called()
+    local.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_validate_source_refs_passthrough_non_file(mocker):
     """PR/message sources pass through with no existence lookup at all."""
     repo = mocker.patch("app.source_ref_validation._file_content_in_repo_branch")
@@ -1431,3 +1452,18 @@ def test_classify_reproduction_no_citations_is_indeterminate():
         )
         == CITATION_STATE_INDETERMINATE
     )
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_marks_unknown_scope_indeterminate(monkeypatch):
+    async def should_not_validate(*args, **kwargs):
+        raise AssertionError("unknown source scopes must not use project HEAD")
+
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_at_head", should_not_validate
+    )
+    [source] = await validate_source_refs(
+        [{"type": "file", "ref": "/future/runtime/path.py", "source_scope": "worker"}]
+    )
+    assert source["validation_status"] == "indeterminate"
+    assert source["validation_reason"] == "unknown_source_scope"

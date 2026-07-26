@@ -77,8 +77,12 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "release_auto_merge_stalled": OPERATOR_FYI,
     "strategic_steering_deferred": OPERATOR_FYI,
     "strategic_steering_acted": OPERATOR_FYI,
-    "capability_trial_stalled": OPERATOR_FYI,
-    "capability_verdict_decided": OPERATOR_FYI,
+    # Trial progress/verdicts are platform control-loop bookkeeping, not
+    # project-strategy context. Keep them out of both the operator transcript
+    # and the strategist payload; only an ambiguous-lift escalation belongs in
+    # the project conversation.
+    "capability_trial_stalled": PIPELINE_LOG,
+    "capability_verdict_decided": PIPELINE_LOG,
     "capability_trial_ambiguous_lift_escalation": OPERATOR_FYI,
     "question_answer": OPERATOR_FYI,
     # feedback_reply: user replied to a feedback/notification — informational,

@@ -491,6 +491,21 @@ def test_compute_experiment_payload_accepts_success_criterion():
     assert result["success_criterion"]["threshold"] == 0.9
 
 
+def test_compute_experiment_payload_accepts_and_only_success_criteria():
+    result = _valid({
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "success_criteria": [
+            {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+            {"metric": "latency_ms", "operator": "<=", "threshold": 100},
+        ],
+    })
+    assert [item["metric"] for item in result["success_criteria"]] == [
+        "accuracy",
+        "latency_ms",
+    ]
+
+
 def test_compute_experiment_metric_criterion_requires_metric_operator_threshold():
     # kind defaults to "metric"; the metric/operator/threshold trio stays required
     # so a metric criterion missing any of them fails closed at validation.

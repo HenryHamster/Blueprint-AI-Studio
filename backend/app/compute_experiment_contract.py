@@ -153,6 +153,9 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
     success = _pick("success_criterion")
     if success is not None:
         contract["success_criterion"] = success
+    success_many = _pick("success_criteria")
+    if success_many is not None:
+        contract["success_criteria"] = success_many
     for opt_key in (
         "machine_type",
         "experiment",
@@ -357,6 +360,52 @@ def _validate_compute_launch_contract(
                 f"declared_metric {declared_metric!r} contains invalid characters — "
                 "metric keys must match ^[A-Za-z0-9_./-]+$",
             )
+    raw_criteria = contract.get("success_criteria")
+    if raw_criteria is not None:
+        if not isinstance(raw_criteria, list) or not raw_criteria:
+            return False, "success_criteria must be a non-empty array"
+        for index, item in enumerate(raw_criteria):
+            if not isinstance(item, dict):
+                return False, f"success_criteria[{index}] must be an object"
+            kind = str(item.get("kind") or "metric")
+            if kind == "artifact_produced":
+                continue
+            metric_name = item.get("metric")
+            if not (
+                isinstance(metric_name, str)
+                and metric_name.strip()
+                and METRIC_KEY_RE.fullmatch(metric_name)
+            ):
+                return False, (
+                    f"success_criteria[{index}].metric must be a non-empty metric key"
+                )
+            if item.get("operator") not in {">=", "<=", ">", "<", "==", "!="}:
+                return False, f"success_criteria[{index}].operator is invalid"
+            threshold = item.get("threshold")
+            if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+                return False, f"success_criteria[{index}].threshold must be numeric"
+        if declared_metric is not None:
+            criterion_metric_names = {
+                str(item.get("metric")).strip()
+                for item in raw_criteria
+                if isinstance(item, dict)
+                and str(item.get("kind") or "metric") == "metric"
+            }
+            if declared_metric not in criterion_metric_names:
+                return False, (
+                    "declared_metric must name one of the success_criteria metrics"
+                )
+    elif declared_metric is not None:
+        singular = contract.get("success_criterion")
+        if (
+            isinstance(singular, dict)
+            and str(singular.get("kind") or "metric") == "metric"
+            and singular.get("metric") != declared_metric
+        ):
+            return False, (
+                "declared_metric must match success_criterion.metric "
+                f"({declared_metric!r} != {singular.get('metric')!r})"
+            )
     try:
         spend = float(contract.get("spend_cap_usd"))
     except (TypeError, ValueError):
@@ -507,7 +556,9 @@ def _validate_compute_launch_contract(
                 "platform-preflight-smoke will gate at launch",
                 error_excerpt,
             )
-        elif contract.get("success_criterion") and not smoke.get("metric_captured"):
+        elif (
+            contract.get("success_criterion") or contract.get("success_criteria")
+        ) and not smoke.get("metric_captured"):
             logger.warning(
                 "compute_experiment author smoke_sample did not capture declared metric — "
                 "platform-preflight-smoke will gate at launch"
@@ -792,9 +843,11 @@ def build_compute_contract_preview(
     readable_command = decode_generated_command(raw_command) or raw_command
     source_digest = hashlib.sha256(raw_command.encode("utf-8")).hexdigest()
     criterion = normalized.get("success_criterion")
+    criteria = normalized.get("success_criteria")
     result_expectations = {
         "declared_metric": normalized.get("declared_metric"),
         "success_criterion": criterion if isinstance(criterion, dict) else None,
+        "success_criteria": criteria if isinstance(criteria, list) else None,
         "artifact_required": normalized.get("require_durable_artifact") is True,
         "input_artifact_job_id": normalized.get("input_artifact_job_id"),
     }

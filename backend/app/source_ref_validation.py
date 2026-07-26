@@ -1242,7 +1242,7 @@ async def validate_source_refs(
 ) -> list:
     """Validate all file-type source refs in a sources list.
 
-    For each source with type='file':
+    For each source with type='file' and source_scope='project' (the default):
     - Validates that the file exists on the project's integration branch
     - Validates that line numbers (if present) are within bounds
     - Marks unambiguously-invalid sources with valid: false
@@ -1261,6 +1261,14 @@ async def validate_source_refs(
     only an unambiguous absence on the integration branch (or a genuinely
     out-of-range line) flags a ref. This keeps prod findings (where the backend
     has no checkout) from having every valid citation marked broken.
+
+    ``source_scope`` may be ``project``, ``harness``, or ``runtime``. Harness
+    and runtime paths belong to the execution environment rather than the
+    project's integration branch, so they pass through without a project-HEAD
+    lookup. This prevents valid references such as ``/workspace/agent/...`` or
+    runner helper paths from being falsely marked stale. Unknown scopes also
+    skip project-HEAD validation, but are explicitly marked indeterminate so a
+    new producer scope can never be silently mistaken for project evidence.
 
     For sources with type='pr' or type='message': no validation needed.
 
@@ -1288,6 +1296,20 @@ async def validate_source_refs(
         # Unknown (non-file) source types pass through untouched
         if source_type != "file":
             validated.append(source)
+            continue
+
+        source_scope = str(
+            source.get("source_scope", source.get("repository_scope", "project"))
+            or "project"
+        ).strip().lower()
+        if source_scope in {"harness", "runtime"}:
+            validated.append(source)
+            continue
+        if source_scope != "project":
+            indeterminate = dict(source)
+            indeterminate["validation_status"] = "indeterminate"
+            indeterminate["validation_reason"] = "unknown_source_scope"
+            validated.append(indeterminate)
             continue
 
         ref = source.get("ref")

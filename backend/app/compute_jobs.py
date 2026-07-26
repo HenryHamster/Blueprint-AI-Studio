@@ -4594,6 +4594,7 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
                 "backend": reference.backend,
                 "artifact_uri": reference.uri,
                 "file_count": reference.file_count,
+                "total_size_bytes": reference.total_size_bytes,
                 "outcome": (job.outcome.value if job.outcome is not None else None),
                 "final_cost_usd": job.final_cost_usd,
             }

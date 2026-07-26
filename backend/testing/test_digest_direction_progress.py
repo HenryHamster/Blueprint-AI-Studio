@@ -335,6 +335,7 @@ async def test_digest_direction_progress_verified_prs_merged(
                         "timestamp": recent_ts,
                         "prs_merged": 3,
                         "verified_prs_merged": 2,
+                        "reachable_prs_merged": 1,
                     },
                 ],
             }
@@ -363,6 +364,7 @@ async def test_digest_direction_progress_verified_prs_merged(
     dp = data["direction_progress"][0]
     assert dp["prs_merged"] == 3  # raw count still includes the degraded merge
     assert dp["verified_prs_merged"] == 2  # verified count excludes it
+    assert dp["reachable_prs_merged"] == 1  # ancestry-confirmed landing truth
 
 
 @pytest.mark.asyncio
