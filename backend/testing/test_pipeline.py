@@ -772,6 +772,20 @@ class TestSpawnLimits:
 class TestTaskResultDedup:
     """Fix 2.7: record_task_result deduplicates by task_id."""
 
+    def setup_method(self):
+        from collections import deque
+
+        import app.shared_state as ss
+        from app.routers.agent_status import (
+            _recorded_task_entries,
+            _recorded_task_ids,
+        )
+
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        ss.deploy_monitoring["task_result_metadata"] = {}
+        _recorded_task_ids.clear()
+        _recorded_task_entries.clear()
+
     def test_duplicate_result_ignored(self):
         from app.routers.agent_status import record_task_result, _recorded_task_ids
         from app.shared_state import deploy_monitoring
