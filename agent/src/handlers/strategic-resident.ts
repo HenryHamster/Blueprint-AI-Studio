@@ -552,7 +552,7 @@ export async function handleStrategicResident(
   }
 
   writePlaybookHelper(taskId);
-  writeMessagesHelper(taskId);
+  writeMessagesHelper(taskId, WORKSPACE, { residentReplyOnly: true });
   writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   const disallowedTools = configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
   const contextPrefix = buildContextPrefix(task);
@@ -1721,7 +1721,7 @@ export async function handleStrategicResident(
           // Re-provision all generated helper tools into the recreated checkout.
           // They were written into the deleted directory inode and are gone.
           writePlaybookHelper(taskId);
-          writeMessagesHelper(taskId);
+          writeMessagesHelper(taskId, WORKSPACE, { residentReplyOnly: true });
           writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
           configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
           writeStrategicHelpers(taskId, projectId, WORKSPACE);
