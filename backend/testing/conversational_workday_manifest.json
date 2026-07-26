@@ -197,6 +197,8 @@
       "reason": "Covers the core conversational Workday session lifecycle — start/adopt, liveness heartbeat/lease, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
       "test_ids": [
         "test_session_state_helpers_remain_table_free",
+        "test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining",
+        "test_session_snapshot_warns_near_idle_end_and_freezes_when_ended",
         "test_hydration_ensure_cannot_resurrect_after_committed_mode_leave",
         "test_continuous_hydration_ensure_succeeds",
         "test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_start_works",
@@ -204,6 +206,8 @@
         "test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears",
         "test_reload_ensure_keeps_worker_during_transient_heartbeat_gap",
         "test_reload_ensure_keeps_fresh_retry_heartbeat_past_startup_window",
+        "test_reload_ensure_keeps_retry_wait_during_post_deadline_claim_grace",
+        "test_reload_ensure_replaces_retry_wait_after_claim_grace_expires",
         "test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale",
         "test_reload_ensure_replaces_worker_stale_past_recovery_threshold",
         "test_stop_ends_task_releases_continuation_and_hands_off_messages",
@@ -270,6 +274,7 @@
         "id-less overflow sentinel: repeated escape-hatch trips through the handler loop produce at most one decisions-register entry (sentinelKey dedup guard)",
         "throws rather than re-cloning when no read token can be minted",
         "does not post a canned acknowledgement while a slow operator turn is in flight",
+        "renews the Resident heartbeat while a slow operator reply is in flight",
         "sends the first text-only operator turn as one stream-json content item",
         "does not post an early ack when the turn completes before the threshold elapses",
         "completes normally when the early ack post fails",
@@ -279,14 +284,14 @@
         "drains 201 same-timestamp operator messages as atomic one-page batches without suppressing deferred rows",
         "stops before any further model work when reply receipt cleanup fails after a turn",
         "fails closed before the model when an operator batch has no stable message id",
-        "leaves inbound messages open when the reply backstop POST fails",
+        "leaves inbound messages open when native reply persistence fails",
+        "does not promote an inline final when reply_to_operator was never called",
         "folds the checkpoint into the first operator turn after bounded wedged preemption",
         "restarts after prompt SIGINT process exit and answers the queued operator message",
         "does not restart or mask a queued-message child close classified as %s",
         "re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
         "retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects",
-        "splits an aggregate required-image overflow into bounded same-timestamp model turns",
-        "sends the first text-only operator turn as one stream-json content item"
+        "splits an aggregate required-image overflow into bounded same-timestamp model turns"
       ]
     },
     {
@@ -381,6 +386,7 @@
         "extracts inline base64 image attachments from context",
         "returns a single message verbatim",
         "batches multiple messages with headers",
+        "combines a full 20-message pending burst into one ordered operator turn",
         "skips empty messages",
         "preserves image blocks through combine",
         "preserves image blocks through combine batch path (2+ messages)",
@@ -399,7 +405,7 @@
         "text attachment URL fetch failure degrades to a notice without throwing",
         "text attachment content is truncated when it exceeds MAX_TEXT_ATTACHMENT_BYTES",
         "includes the role framing, tools, and grounding sections",
-        "bootstrap_prompt_uses_quote_safe_message_delivery",
+        "bootstrap_prompt_uses_native_workday_reply_tool",
         "bootstrap_prompt_states_dispatched_work_runs_concurrently",
         "includes canonical fetch guidance when provided",
         "renders an empty-problem-model note when none is present",
@@ -499,6 +505,7 @@
         "fires when the floor tick has elapsed",
         "degrades to floor-tick pacing when work_state_rev is absent (older backend)",
         "runs the first-ever tick (Infinity since last) via the floor",
+        "puts fired task watches ahead of normal examination until acknowledged",
         "shouldRunAutonomousTurn does not fire on the loop\\",
         "SUSPENDS on authority_held:false without a stop",
         "RESUMES on authority_held:true after a lapse",
@@ -616,7 +623,8 @@
       "test_ids": [
         "executing state advances the elapsed timer each second",
         "dead state renders no ticking timer and stays constant as time advances",
-        "idle state renders waiting copy and no ticking timer"
+        "idle state renders waiting copy and no ticking timer",
+        "durable waiting state renders one compact activity and idle line"
       ]
     },
     {
