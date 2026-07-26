@@ -1,8 +1,8 @@
 # Pipeline Operability Repair — Unified Implementation Plan
 
-**Date:** 2026-07-25  
-**Status:** implementation-ready  
-**Delivery:** one integration branch and one pull request targeting `automain`  
+**Date:** 2026-07-25
+**Status:** implementation-ready
+**Delivery:** one integration branch and one pull request targeting `automain`
 **Intent:** repair the concrete operability failures observed during the long-running
 Strategic/MARL session without redesigning the whole pipeline.
 
