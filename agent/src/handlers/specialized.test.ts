@@ -229,7 +229,11 @@ import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix } from '../prompt.js';
+import {
+  PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE, DEFAULT_TOOL_GUIDANCE,
+  PLAYBOOK_GUIDANCE, BUILD_WITH_INTENT_GUIDANCE, BUILD_ORDER_GUIDANCE,
+  buildContextPrefix,
+} from '../prompt.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -1330,6 +1334,18 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(prompt).toContain('## Acceptance Evidence');
     expect(prompt).toContain('release-deploy-artifact-registry');
     expect(prompt).toContain('real, non-empty diff');
+  });
+
+  it('includes the shared build-discipline guidance in migration prompts', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add user_role column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain(BUILD_WITH_INTENT_GUIDANCE);
+    expect(prompt).toContain(BUILD_ORDER_GUIDANCE);
   });
 
   it('forwards a custom base_branch and disables tests-on-main accordingly', async () => {

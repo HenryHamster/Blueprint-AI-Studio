@@ -61,6 +61,8 @@ import {
   SIZE_GUARDRAIL_GUIDANCE,
   PRIOR_ATTEMPT_DIVERGENCE,
   BEYOND_SCOPE_REPORTING,
+  BUILD_WITH_INTENT_GUIDANCE,
+  BUILD_ORDER_GUIDANCE,
   READ_ONLY_BASH_WRITE_NOTE,
   SELF_REVIEW_PROMPT_VERSION,
   SHARED_LIFECYCLE_REMAINDER,
@@ -936,6 +938,14 @@ describe('codeChangeGuidanceVariant + fingerprint divergence', () => {
     const legacy = computePromptFingerprint('fix');
     const explicit = computePromptFingerprint('fix', undefined, {});
     expect(explicit).toBe(legacy);
+  });
+
+  it('fingerprints failure guidance only when the caller actually emits it', () => {
+    const withoutFailureGuidance = computePromptFingerprint('perf');
+    const withFailureGuidance = computePromptFingerprint('perf', undefined, {
+      emittedFailureGuidance: BUILD_WITH_INTENT_GUIDANCE + BUILD_ORDER_GUIDANCE,
+    });
+    expect(withFailureGuidance).not.toBe(withoutFailureGuidance);
   });
 });
 

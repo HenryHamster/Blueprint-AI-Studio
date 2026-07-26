@@ -38,6 +38,7 @@ import {
   buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
   PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
+  BUILD_WITH_INTENT_GUIDANCE, BUILD_ORDER_GUIDANCE,
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
@@ -313,7 +314,8 @@ CRITICAL RULES:
   });
   const migrateCodeChangeHelper = buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo });
   const migrateGuidanceFooter = PLAYBOOK_GUIDANCE + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE
-    + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING;
+    + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
+    + BUILD_WITH_INTENT_GUIDANCE + BUILD_ORDER_GUIDANCE;
   const migrateFetchBlock = `
 
 ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
@@ -338,6 +340,7 @@ ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   setPromptSizeTelemetry(migrateTelemetry.prompt_size_bytes, migrateTelemetry.prompt_section_count, migrateTelemetry.prompt_section_sizes);
   const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: migrateBuildConfig, owner, repo }),
+    emittedFailureGuidance: migrateGuidanceFooter,
   });
   setCurrentPromptFingerprint(migrateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: migrateFingerprint });
