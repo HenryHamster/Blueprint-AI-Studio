@@ -74,7 +74,12 @@ describe('pending Whiteboard ArtifactRef operation', () => {
     expect(request).toHaveBeenCalledTimes(2);
     expect(request.mock.calls[1]).toEqual(request.mock.calls[0]);
     expect(request.mock.calls[0][3]).toBe(pending.rendered_image);
-    expect(wait).toHaveBeenCalledWith(5000);
+    expect(wait).toHaveBeenCalledTimes(1);
+    // The retry deadline is absolute, so the next loop subtracts the small
+    // amount of wall time spent persisting the pending operation.
+    const [waitMs] = wait.mock.calls[0];
+    expect(waitMs).toBeGreaterThanOrEqual(4990);
+    expect(waitMs).toBeLessThanOrEqual(5000);
   });
 
   test('recovers a lost ready response by replaying the same identity', async () => {
