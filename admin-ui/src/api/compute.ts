@@ -37,6 +37,8 @@ export interface ComputeExperimentLaunchRequest {
   hypothesis?: string;
   metric?: string;
   success_criterion?: ComputeSuccessCriterion;
+  /** Additive AND-only criteria form. Singular success_criterion remains supported. */
+  success_criteria?: ComputeSuccessCriterion[];
   require_live_release?: boolean;
   require_durable_artifact?: boolean;
   provisioning_model?: string;
@@ -718,6 +720,19 @@ export interface ComputeJobLiveOutput {
   truncated: boolean;
 }
 
+export interface ComputeCriterionVerdict {
+  metric: string;
+  operator: string;
+  threshold: number;
+  value: number | null;
+  met: boolean;
+  measurable: boolean;
+  observation_status?: 'MEASURED' | 'UNMEASURED' | 'INVALID';
+  reason_code?: 'NO_RESULT_METRICS' | 'METRIC_KEY_ABSENT' | 'METRIC_NOT_NUMERIC' | 'AMBIGUOUS_METRIC_KEY' | null;
+  binding_status?: string | null;
+  per_arm?: Record<string, number | null>;
+}
+
 /** One directly viewable output file (plot/render/video) from a compute job's
  *  artifacts, surfaced as the first-class `viewable_artifacts` field on the
  *  job response (normalized server-side from the job's `viewable_files`
@@ -765,6 +780,13 @@ export interface ComputeJob {
     storage_uri: string | null;
     logical_key?: string | null;
     created_at?: string | null;
+    manifest?: {
+      file_count?: number | null;
+      total_size_bytes?: number | null;
+      paths?: string[];
+      paths_truncated?: boolean;
+    } | null;
+    download_available?: boolean;
   } | null;
   accelerator_type: string | null;
   accelerator_count: number | null;
@@ -803,20 +825,25 @@ export interface ComputeJob {
   task_type: string | null;
   /** Workflow state is intentionally distinct from the compute job outcome. */
   task_status?: string | null;
+  /** Compute execution truth, independent of parent task workflow state. */
+  execution_status?: 'QUEUED' | 'STARTING' | 'RUNNING' | 'POLLING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT' | 'UNKNOWN';
+  /** Evaluation truth for the declared measurement contract. */
+  criterion_status?: 'NOT_DECLARED' | 'MET' | 'NOT_MET' | 'UNMEASURED' | 'INVALID';
+  /** Primary operator-facing interpretation derived by the backend. */
+  experiment_status?: string;
   // Declared success criterion from the task payload (metric/operator/threshold).
   success_criterion?: ComputeSuccessCriterion | null;
+  success_criteria?: ComputeSuccessCriterion[] | null;
   // Evaluated verdict from task.plan_output.compute_result.criterion — present
   // only on terminal jobs whose task recorded a criterion evaluation.
-  criterion_verdict?: {
-    metric: string;
-    operator: string;
-    threshold: number;
-    value: number | null;
+  criterion_verdict?: ComputeCriterionVerdict | null;
+  criteria_verdict?: {
+    operator: 'AND';
     met: boolean;
     measurable: boolean;
-    binding_status?: string | null;
-    per_arm?: Record<string, number | null>;
+    criteria: ComputeCriterionVerdict[];
   } | null;
+  can_use_as_input?: boolean;
   // Durable KnowledgeDocument auto-persisted on task completion for all
   // measured terminal jobs. Surfaced from task.plan_output.knowledge_document.id.
   knowledge_document_id?: string | null;

@@ -395,7 +395,7 @@ describe('DashboardHome', () => {
     );
 
     const section = (await screen.findByText('Task Status')).closest('section') as HTMLElement;
-    const activeCard = within(section).getByText('Active').closest('div') as HTMLElement;
+    const activeCard = (await within(section).findByText('Active')).closest('div') as HTMLElement;
     expect(within(activeCard).getByText('12')).toBeInTheDocument();
     // Not the page-slice value of 1.
     expect(within(activeCard).queryByText('1')).not.toBeInTheDocument();
@@ -430,7 +430,7 @@ describe('DashboardHome', () => {
     );
 
     const section = (await screen.findByText('Task Status')).closest('section') as HTMLElement;
-    const activeCard = within(section).getByText('Active').closest('div') as HTMLElement;
+    const activeCard = (await within(section).findByText('Active')).closest('div') as HTMLElement;
     // Project-scoped (3), not fleet (12).
     expect(within(activeCard).getByText('3')).toBeInTheDocument();
     const queuedCard = within(section).getByText('Queued').closest('div') as HTMLElement;

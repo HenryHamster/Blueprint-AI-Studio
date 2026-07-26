@@ -94,8 +94,6 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "release_auto_merge_stalled",  # post_version_auto_merge_stall_message
         "strategic_steering_deferred",  # post_strategic_steering_deferred_message
         "strategic_steering_acted",  # post_strategic_steering_acted_message
-        "capability_trial_stalled",  # raise_stalled_trial_notice
-        "capability_verdict_decided",  # raise_capability_verdict_notice
         "capability_trial_ambiguous_lift_escalation",  # raise_ambiguous_lift_escalation_notice
         "criterion_retracted",  # post_criterion_retracted_message
         "criterion_superseded",  # post_criterion_superseded_message
@@ -1112,8 +1110,9 @@ async def post_operator_decision_capture_low_message(
         f"Operator-decision capture chronically low this session: "
         f"{captured}/{total} captured ({capture_rate}%) — {missed} operator "
         f"correction(s) may not have reached the durable decisions register. "
-        f"End operator turns with the OPERATOR-DECISION marker so settled "
-        f"corrections survive compaction and restart."
+        f"End a turn that settles or corrects direction with the literal line "
+        f"`OPERATOR-DECISION: <settled fact>` so it survives compaction and "
+        f"restart. Routine chat needs no decision marker."
     )
     return await post_event_message(
         session,
@@ -2642,6 +2641,7 @@ async def post_feedback_acknowledgment(
     context = stamp_message_audience(
         {
             "event_type": event_type,
+            "message_role": "operator_reply",
             "reply_to": str(original_msg_id),
             "resolution": resolution,
         },
@@ -2694,6 +2694,7 @@ async def post_question_answer(
     context = stamp_message_audience(
         {
             "event_type": "question_answer",
+            "message_role": "operator_reply",
             "reply_to": str(original_msg_id),
             "answer": answer,
         },

@@ -103,6 +103,19 @@ export function computeJobEvidenceTierRank(job: ComputeJob): number {
 /** Human-readable terminal reason for a finished job, distinguishing the three
  *  kill paths (operator / budget / deadline / no-progress) plus natural success/failure. */
 export function computeJobTerminalLabel(job: ComputeJob): string {
+  if (job.experiment_status) {
+    const labels: Record<string, string> = {
+      EXECUTED_NO_CRITERION: 'Executed',
+      CRITERION_MET: 'Criterion met',
+      CRITERION_NOT_MET: 'Criterion not met',
+      CRITERION_UNMEASURED: 'Criterion unmeasured',
+      CRITERION_INVALID: 'Criterion invalid',
+      EXECUTION_CANCELLED: 'Execution cancelled',
+      EXECUTION_TIMED_OUT: 'Execution timed out',
+      EXECUTION_FAILED: 'Execution failed',
+    };
+    if (labels[job.experiment_status]) return labels[job.experiment_status];
+  }
   const legacyRunnerNoProgress =
     job.outcome === 'FAILURE'
     && job.backend === 'runner-subprocess'

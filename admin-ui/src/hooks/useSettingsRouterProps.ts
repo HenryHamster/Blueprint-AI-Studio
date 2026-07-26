@@ -123,6 +123,7 @@ export function useSettingsRouterProps({
     onRemoveAccount: s.removeMaxPlanAccount,
     onResetRateLimits: s.resetAccountRateLimits,
     onRefreshAccountModels: s.refreshAccountModels,
+    onRefreshAccounts: s.fetchMaxPlanAccounts,
     onUpdateAccount: s.updateMaxPlanAccount,
     onUpdateAccountCaps: s.updateAccountCaps,
     showUserManagement: s.showUserManagement,

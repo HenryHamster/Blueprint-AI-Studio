@@ -713,7 +713,7 @@ class TestDarkMeterWarningForMissingSecret:
 
         monkeypatch.setattr(
             "app.max_plan_pool._schedule_usage_refresh",
-            lambda acct: None,
+            lambda acct, *, delay_seconds=0.0: None,
         )
 
         with caplog.at_level(logging.WARNING, logger="app.max_plan_pool"):
@@ -741,7 +741,7 @@ class TestDarkMeterWarningForMissingSecret:
 
         monkeypatch.setattr(
             "app.max_plan_pool._schedule_usage_refresh",
-            lambda acct: None,
+            lambda acct, *, delay_seconds=0.0: None,
         )
 
         with caplog.at_level(logging.WARNING, logger="app.max_plan_pool"):
@@ -768,7 +768,7 @@ class TestDarkMeterWarningForMissingSecret:
 
         monkeypatch.setattr(
             "app.max_plan_pool._schedule_usage_refresh",
-            lambda acct: None,
+            lambda acct, *, delay_seconds=0.0: None,
         )
 
         with caplog.at_level(logging.WARNING, logger="app.max_plan_pool"):
@@ -796,7 +796,7 @@ class TestDarkMeterWarningForMissingSecret:
         scheduled: list[str] = []
         monkeypatch.setattr(
             "app.max_plan_pool._schedule_usage_refresh",
-            lambda acct: scheduled.append(acct["id"]),
+            lambda acct, *, delay_seconds=0.0: scheduled.append(acct["id"]),
         )
 
         with caplog.at_level(logging.WARNING, logger="app.max_plan_pool"):

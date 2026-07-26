@@ -1748,6 +1748,7 @@ async def strategic_operation(
             if key not in {
                 "direction_id",
                 "rationale",
+                "terminal_reason",
                 "dedup_reasoning",
                 "successor_id",
                 "superseded_by_id",
@@ -1806,6 +1807,32 @@ async def strategic_operation(
                 _pre_rc = (d.get("context") or {}).get("retirement_condition")
                 _pre_gap_id = d.get("gap_id")
                 _pre_status = d.get("status")
+                requested_status = changes.get("status")
+                if requested_status in {"expired", "superseded"} and _pre_status not in {
+                    "expired",
+                    "superseded",
+                }:
+                    from app.direction_terminal_guard import (
+                        ZERO_ATTEMPT_TERMINAL_REASONS,
+                        validate_direction_terminal_transition,
+                    )
+
+                    terminal_ok, terminal_error = validate_direction_terminal_transition(
+                        d,
+                        rationale=rationale,
+                        terminal_reason=data.get("terminal_reason"),
+                    )
+                    if not terminal_ok:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error": terminal_error,
+                                "direction_id": str(dir_id),
+                                "allowed_zero_attempt_terminal_reasons": sorted(
+                                    ZERO_ATTEMPT_TERMINAL_REASONS
+                                ),
+                            },
+                        )
                 if "text" in changes:
                     d["text"] = _cap_str(
                         changes["text"],
@@ -1882,6 +1909,10 @@ async def strategic_operation(
                         "superseded",
                     ) and _pre_status not in ("expired", "superseded"):
                         _terminal_flip = changes["status"]
+                        if data.get("terminal_reason"):
+                            d["terminal_reason"] = (
+                                str(data["terminal_reason"]).strip().lower()
+                            )
                 if "recommended_mode" in changes:
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
@@ -2127,11 +2158,35 @@ async def strategic_operation(
                 break
         if matched_direction is None:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        from app.direction_terminal_guard import (
+            ZERO_ATTEMPT_TERMINAL_REASONS,
+            validate_direction_terminal_transition,
+        )
+
+        terminal_reason = data.get("terminal_reason")
+        terminal_ok, terminal_error = validate_direction_terminal_transition(
+            matched_direction,
+            rationale=rationale,
+            terminal_reason=terminal_reason,
+        )
+        if not terminal_ok:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": terminal_error,
+                    "direction_id": str(dir_id),
+                    "allowed_zero_attempt_terminal_reasons": sorted(
+                        ZERO_ATTEMPT_TERMINAL_REASONS
+                    ),
+                },
+            )
         _blk = await _challenge_gate("retire_direction", direction_id=str(dir_id))
         if _blk is not None:
             return _blk
 
         matched_direction["status"] = "expired"
+        if terminal_reason:
+            matched_direction["terminal_reason"] = str(terminal_reason).strip().lower()
         notes = matched_direction.get("notes", [])
         note_text = f"Retired by strategic review: {rationale}"
         if not any(n.get("text") == note_text for n in notes):
@@ -2991,6 +3046,7 @@ async def strategic_operation(
             )
         if covered_message_id_strings is not None:
             msg_ctx[covered_context_key] = covered_message_id_strings
+            msg_ctx["message_role"] = "operator_reply"
         raw_turn_state = data.get("resident_turn_state")
         resident_turn_state: dict[str, Any] | None = None
         resident_turn_state_sha256: str | None = None
@@ -3088,6 +3144,7 @@ async def strategic_operation(
             reply_target.handled_by_task_id = task.id
             reply_target.updated_at = _utcnow()
             session.add(reply_target)
+            msg_ctx["message_role"] = "operator_reply"
         # Rollback expires ORM instances even when expire_on_commit=False. Keep
         # identities as plain UUID/string values for replay paths.
         _task_id = task.id

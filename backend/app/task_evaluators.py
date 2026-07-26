@@ -416,18 +416,13 @@ class MetricStrategy:
             )
         outcome, cost = result
 
-        criterion = evaluate_compute_success_criterion(task, artifact_text)
+        criteria = evaluate_compute_success_criteria(task, artifact_text)
         reason = (
             f"compute experiment reached terminal outcome {outcome!r} "
             f"at measured cost ${cost}"
         )
-        if criterion is not None:
-            status = "met" if criterion["met"] else "recorded as evidence"
-            reason += (
-                f"; declared success criterion {status} "
-                f"({criterion['metric']} {criterion['operator']} "
-                f"{criterion['threshold']})"
-            )
+        if criteria is not None:
+            reason += f"; {_format_compute_criteria_summary(criteria, evidence=True)}"
         return EvaluationVerdict(True, reason, self.key)
 
 
@@ -462,23 +457,9 @@ class ArtifactDeliveryStrategy:
             f"compute experiment delivered terminal result {outcome!r} "
             f"at measured cost ${cost}"
         )
-        criterion = evaluate_compute_success_criterion(task, artifact_text)
-        if criterion is not None:
-            if criterion["met"]:
-                reason += (
-                    f"; success criterion met ({criterion['metric']} "
-                    f"{criterion['operator']} {criterion['threshold']})"
-                )
-            elif criterion["measurable"]:
-                reason += (
-                    f"; success criterion unmet ({_format_unmet_criterion(criterion)})"
-                )
-            else:
-                reason += (
-                    "; success criterion not reported "
-                    f"({criterion['metric']} {criterion['operator']} "
-                    f"{criterion['threshold']})"
-                )
+        criteria = evaluate_compute_success_criteria(task, artifact_text)
+        if criteria is not None:
+            reason += f"; {_format_compute_criteria_summary(criteria)}"
         return EvaluationVerdict(True, reason, self.key)
 
 
@@ -696,6 +677,48 @@ def _release_echo_numeric(binding_status: str, metric: str) -> float:
     return 1.0 if binding_status == "verified" else 0.0
 
 
+def _normalize_success_criterion(raw: object) -> tuple[str, str, float] | None:
+    """Normalize one persisted compute criterion into the evaluator tuple."""
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("kind") or "metric")
+    if kind == "artifact_produced":
+        try:
+            min_count = int(raw.get("min_file_count") or 1)
+        except (TypeError, ValueError):
+            min_count = 1
+        return ("durable_file_count", ">=", float(max(1, min_count)))
+    metric = raw.get("metric")
+    op = raw.get("operator")
+    threshold = _coerce_number(raw.get("threshold"))
+    if not isinstance(metric, str) or not metric.strip():
+        return None
+    if op not in _CRITERION_OPS or threshold is None:
+        return None
+    return metric.strip(), op, threshold
+
+
+def _declared_success_criteria(task: Task) -> list[tuple[str, str, float]]:
+    """Return all declared criteria in their deterministic evaluation order.
+
+    ``success_criteria`` is the additive AND-only form. The historical singular
+    field remains compatibility sugar and is used only when the array is absent.
+    Malformed entries are ignored defensively just as the singular reader did.
+    """
+    payload = task.first_payload or {}
+    if not isinstance(payload, dict):
+        return []
+    raw_many = payload.get("success_criteria")
+    if isinstance(raw_many, list):
+        return [
+            normalized
+            for raw in raw_many
+            if (normalized := _normalize_success_criterion(raw)) is not None
+        ]
+    normalized = _normalize_success_criterion(payload.get("success_criterion"))
+    return [normalized] if normalized is not None else []
+
+
 def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
     """Read a compute_experiment's declared success criterion from its payload.
 
@@ -714,29 +737,8 @@ def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
         ``durable_file_count`` is a backend-derived key always present in the
         COMPUTE_RESULT when a durable artifact exists (from ``_link_terminal_artifact``).
     """
-    payload = task.first_payload or {}
-    if not isinstance(payload, dict):
-        return None
-    raw = payload.get("success_criterion")
-    if not isinstance(raw, dict):
-        return None
-
-    kind = str(raw.get("kind") or "metric")
-    if kind == "artifact_produced":
-        try:
-            min_count = int(raw.get("min_file_count") or 1)
-        except (TypeError, ValueError):
-            min_count = 1
-        return ("durable_file_count", ">=", float(max(1, min_count)))
-
-    metric = raw.get("metric")
-    op = raw.get("operator")
-    threshold = _coerce_number(raw.get("threshold"))
-    if not isinstance(metric, str) or not metric.strip():
-        return None
-    if op not in _CRITERION_OPS or threshold is None:
-        return None
-    return metric.strip(), op, threshold
+    criteria = _declared_success_criteria(task)
+    return criteria[0] if criteria else None
 
 
 def _find_metric_case_insensitive(obj: dict, metric: str) -> object:
@@ -820,13 +822,13 @@ def _find_metric_in_arms(
     return best[1], best[0]
 
 
-def evaluate_compute_success_criterion(
-    task: Task,
+def _evaluate_normalized_compute_criterion(
+    criterion: tuple[str, str, float],
     artifact_text: str | None,
     *,
     echo_sha: str | None = None,
     expected_sha: str | None = None,
-) -> dict | None:
+) -> dict:
     """Evaluate a compute_experiment's declared success criterion against its result.
 
     Returns a small operator-readable dict
@@ -847,19 +849,19 @@ def evaluate_compute_success_criterion(
     absent/unmeasurable) as long as the caller passes the echo data, even when the
     experiment command emitted no COMPUTE_RESULT before timing out.
     """
-    criterion = _declared_success_criterion(task)
-    if criterion is None:
-        return None
     metric, op, threshold = criterion
     binding_status: str | None = None
     best_arm: str | None = None
     per_arm_values: dict | None = None
+    parsed_obj: dict | None = None
+    matching_key_count = 0
     if metric in _RELEASE_ECHO_METRICS:
         binding_status = derive_release_binding_status(echo_sha, expected_sha)
         value: float | None = _release_echo_numeric(binding_status, metric)
         raw_value: object = value
     else:
-        obj = _parse_artifact_json(artifact_text) or {}
+        parsed_obj = _parse_artifact_json(artifact_text)
+        obj = parsed_obj or {}
         arms_raw = obj.get("arms")
         if isinstance(arms_raw, (dict, list)):
             # Multi-arm result — aggregate using best-arm semantics.
@@ -901,9 +903,17 @@ def evaluate_compute_success_criterion(
             else:
                 raw_value = None
         else:
-            raw_value = obj.get(metric)
-            if raw_value is None:
-                raw_value = _find_metric_case_insensitive(obj, metric)
+            normalized_metric = metric.strip().lower()
+            matching_keys = [
+                key
+                for key in obj
+                if isinstance(key, str) and key.strip().lower() == normalized_metric
+            ]
+            matching_key_count = len(matching_keys)
+            if len(matching_keys) == 1:
+                raw_value = obj[matching_keys[0]]
+            else:
+                raw_value = None
         value = _coerce_number(raw_value)
     # Shared fail-closed core: a metric absent/non-numeric in the result is never
     # "met" (and ``criterion_met`` enforces that identically for the code gate).
@@ -915,7 +925,20 @@ def evaluate_compute_success_criterion(
         "value": value,
         "met": met,
         "measurable": value is not None,
+        "observation_status": "MEASURED" if value is not None else "UNMEASURED",
+        "reason_code": None,
     }
+    if value is None:
+        if metric not in _RELEASE_ECHO_METRICS and parsed_obj is None:
+            result["reason_code"] = "NO_RESULT_METRICS"
+        elif matching_key_count > 1:
+            result["observation_status"] = "INVALID"
+            result["reason_code"] = "AMBIGUOUS_METRIC_KEY"
+        elif raw_value is not None:
+            result["observation_status"] = "INVALID"
+            result["reason_code"] = "METRIC_NOT_NUMERIC"
+        else:
+            result["reason_code"] = "METRIC_KEY_ABSENT"
     if best_arm is not None:
         result["best_arm"] = best_arm
     if binding_status is not None:
@@ -923,6 +946,55 @@ def evaluate_compute_success_criterion(
     if per_arm_values is not None:
         result["per_arm"] = per_arm_values
     return result
+
+
+def evaluate_compute_success_criteria(
+    task: Task,
+    artifact_text: str | None,
+    *,
+    echo_sha: str | None = None,
+    expected_sha: str | None = None,
+) -> dict | None:
+    """Evaluate every declared criterion with simple all-required semantics."""
+    criteria = _declared_success_criteria(task)
+    if not criteria:
+        return None
+    verdicts = [
+        _evaluate_normalized_compute_criterion(
+            criterion,
+            artifact_text,
+            echo_sha=echo_sha,
+            expected_sha=expected_sha,
+        )
+        for criterion in criteria
+    ]
+    return {
+        "operator": "AND",
+        "met": all(verdict["met"] for verdict in verdicts),
+        "measurable": all(
+            verdict["observation_status"] == "MEASURED" for verdict in verdicts
+        ),
+        "criteria": verdicts,
+    }
+
+
+def evaluate_compute_success_criterion(
+    task: Task,
+    artifact_text: str | None,
+    *,
+    echo_sha: str | None = None,
+    expected_sha: str | None = None,
+) -> dict | None:
+    """Backward-compatible evaluator for the first declared criterion."""
+    criterion = _declared_success_criterion(task)
+    if criterion is None:
+        return None
+    return _evaluate_normalized_compute_criterion(
+        criterion,
+        artifact_text,
+        echo_sha=echo_sha,
+        expected_sha=expected_sha,
+    )
 
 
 def _format_unmet_criterion(criterion: dict) -> str:
@@ -944,6 +1016,50 @@ def _format_unmet_criterion(criterion: dict) -> str:
     return (
         f"declared success criterion not met: {metric}={value} "
         f"(required {op} {threshold})"
+    )
+
+
+def _format_compute_criteria_summary(
+    aggregate: dict, *, evidence: bool = False
+) -> str:
+    """Truthful compact reasoning for singular and AND-only criterion sets."""
+    criteria = aggregate.get("criteria")
+    if not isinstance(criteria, list) or not criteria:
+        return "declared success criteria unavailable"
+    if len(criteria) == 1:
+        criterion = criteria[0]
+        if criterion["met"]:
+            return (
+                "declared success criterion met "
+                f"({criterion['metric']} {criterion['operator']} "
+                f"{criterion['threshold']})"
+            )
+        if evidence:
+            return (
+                "declared success criterion recorded as evidence "
+                f"({criterion['metric']} {criterion['operator']} "
+                f"{criterion['threshold']})"
+            )
+        if criterion["measurable"]:
+            return f"success criterion unmet ({_format_unmet_criterion(criterion)})"
+        return (
+            "success criterion not reported "
+            f"({criterion['metric']} {criterion['operator']} "
+            f"{criterion['threshold']})"
+        )
+
+    met_count = sum(1 for criterion in criteria if criterion.get("met") is True)
+    if aggregate.get("met") is True:
+        return f"all {len(criteria)} declared success criteria met"
+    failed = [
+        str(criterion.get("metric") or "unknown")
+        for criterion in criteria
+        if criterion.get("met") is not True
+    ]
+    suffix = "recorded as evidence" if evidence else "not met"
+    return (
+        f"declared success criteria {suffix} "
+        f"({met_count}/{len(criteria)} met; failed: {', '.join(failed)})"
     )
 
 

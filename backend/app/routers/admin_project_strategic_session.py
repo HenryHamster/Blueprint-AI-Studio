@@ -1185,10 +1185,20 @@ _SESSION_OUTPUT_LIMIT = 8
 
 
 def _session_conversation_predicate():
-    # Keep Strategic's own replies visible in the conversation even if a stale
-    # audience stamp classifies them as strategist-internal. The CONVERSATION
-    # surface is the user-facing transcript; system-internal rows remain hidden.
+    # A Strategic sender is not, by itself, proof that a row belongs in the
+    # operator transcript: internal bookkeeping is also strategist-authored.
+    # New replies carry an explicit immutable role. The reply FK and resident
+    # covered-message receipt retain only provable legacy replies.
     _non_operator = [STRATEGIST_INTERNAL, PIPELINE_LOG]
+    _proven_operator_reply = and_(
+        ProjectMessage.from_type == "strategic",
+        or_(
+            ProjectMessage.context["message_role"].as_string() == "operator_reply",
+            ProjectMessage.context["event_type"].as_string() == "strategic_message",
+            ProjectMessage.reply_to_message_id.isnot(None),
+            ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
+        ),
+    )
     return and_(
         ProjectMessage.surface == MessageSurface.CONVERSATION,
         or_(
@@ -1196,7 +1206,7 @@ def _session_conversation_predicate():
             ProjectMessage.context["event_type"].as_string() != _CHECK_IN_EVENT_TYPE,
         ),
         or_(
-            ProjectMessage.from_type == "strategic",
+            _proven_operator_reply,
             ProjectMessage.context["audience"].as_string().is_(None),
             ~ProjectMessage.context["audience"].as_string().in_(_non_operator),
         ),

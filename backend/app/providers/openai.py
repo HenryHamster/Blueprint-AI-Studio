@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 _OPENAI_LIST_MODELS_URL = "https://api.openai.com/v1/models"
 _MODEL_LISTING_TIMEOUT_SECONDS = 5.0
+_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+_USAGE_PROBE_TIMEOUT_SECONDS = 5.0
 
 # Agent roles can run for up to four hours.  Keep one additional hour for VM
 # startup, provider validation and final-status persistence.  When a Codex OAuth
@@ -34,6 +36,51 @@ _MODEL_LISTING_TIMEOUT_SECONDS = 5.0
 CODEX_OAUTH_MIN_CONCURRENT_TTL_SECONDS = 5 * 60 * 60
 
 _API_KEY_RE = re.compile(r"sk-[A-Za-z0-9_\-]+")
+
+
+def _codex_reset_at_iso(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _normalize_codex_usage(data: Any, probed_at: str) -> UsageSnapshot:
+    """Normalize Codex's machine-readable subscription rate-limit snapshot."""
+
+    if not isinstance(data, Mapping):
+        return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+    rate_limit = data.get("rate_limit")
+    if not isinstance(rate_limit, Mapping):
+        return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+
+    windows: dict[str, float] = {}
+    resets: dict[str, str | None] = {}
+    for source, target in (
+        ("primary_window", "five_hour"),
+        ("secondary_window", "seven_day"),
+    ):
+        cell = rate_limit.get(source)
+        if not isinstance(cell, Mapping):
+            continue
+        used = cell.get("used_percent")
+        if isinstance(used, bool) or not isinstance(used, (int, float)):
+            continue
+        windows[target] = float(used)
+        resets[target] = _codex_reset_at_iso(cell.get("reset_at"))
+
+    # The primary window is the minimum useful contract. Secondary may be
+    # absent for plans that do not expose a weekly limit.
+    if "five_hour" not in windows:
+        return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+    return UsageSnapshot(
+        known=True,
+        window_utilizations=windows,
+        resets_at=resets,
+        probed_at=probed_at,
+    )
 
 
 def codex_oauth_credential_hash(secret: str) -> str:
@@ -511,23 +558,68 @@ class OpenAIProvider(LLMProvider):
         auth_mode: LLMAuthMode,
         provider_metadata: Mapping[str, Any] | None = None,
     ) -> UsageSnapshot:
-        """No clean usage-headroom source for OpenAI/Codex → always unknown.
+        """Probe Codex subscription usage for OAuth accounts; never raises."""
 
-        Neither the API-key billing surface nor the ChatGPT-plan (Codex OAuth)
-        access token exposes a reliable, documented per-window utilization
-        endpoint. Rather than scrape a flaky surface, we resolve to unknown so
-        selection behaves exactly as today for OpenAI accounts. Revisit if a
-        first-class usage endpoint appears.
-        """
-        # The deployed Codex runtime has no stable machine-readable
-        # subscription-usage contract.  Keep that limitation explicit for the
-        # operator rather than making the UI look like a transient probe
-        # outage, and do not scrape CLI/TUI text or API-key billing data.
         from app.time_utils import _utcnow
 
-        return UsageSnapshot.unknown(
-            _utcnow().isoformat(), failure_kind="unsupported"
-        )
+        probed_at = _utcnow().isoformat()
+        if auth_mode != LLMAuthMode.OAUTH:
+            # API keys use the platform billing surface, not ChatGPT plan
+            # windows. Keep that separate rather than presenting fake parity.
+            return UsageSnapshot.unknown(probed_at, failure_kind="unsupported")
+        if not secret:
+            return UsageSnapshot.unknown(probed_at, failure_kind="missing_secret")
+        try:
+            parsed = parse_json_secret(secret)
+            tokens = parsed.get("tokens")
+            if not isinstance(tokens, Mapping):
+                raise ValueError("missing tokens object")
+            access_token = tokens.get("access_token")
+            account_id = tokens.get("account_id")
+            if not isinstance(access_token, str) or not access_token:
+                raise ValueError("missing access token")
+            if not isinstance(account_id, str) or not account_id:
+                raise ValueError("missing account id")
+        except (TypeError, ValueError):
+            return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+
+        try:
+            import httpx
+        except ImportError:
+            return UsageSnapshot.unknown(probed_at, failure_kind="unsupported")
+        try:
+            async with httpx.AsyncClient(
+                timeout=_USAGE_PROBE_TIMEOUT_SECONDS
+            ) as client:
+                response = await client.get(
+                    _CODEX_USAGE_URL,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "ChatGPT-Account-ID": account_id,
+                    },
+                )
+                if response.status_code in (401, 403):
+                    return UsageSnapshot.unknown(
+                        probed_at, failure_kind="authentication"
+                    )
+                if response.status_code == 429:
+                    return UsageSnapshot.unknown(
+                        probed_at, failure_kind="rate_limited"
+                    )
+                if response.status_code >= 400:
+                    return UsageSnapshot.unknown(probed_at, failure_kind="endpoint")
+                try:
+                    data = response.json()
+                except ValueError:
+                    return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+        except httpx.TimeoutException:
+            return UsageSnapshot.unknown(probed_at, failure_kind="timeout")
+        except httpx.RequestError:
+            return UsageSnapshot.unknown(probed_at, failure_kind="transport")
+        except Exception as exc:  # noqa: BLE001 - unknown is the probe contract
+            logger.info("[OPENAI] Codex usage probe failed: %s", exc)
+            return UsageSnapshot.unknown(probed_at, failure_kind="endpoint")
+        return _normalize_codex_usage(data, probed_at)
 
     async def list_available_models(
         self,

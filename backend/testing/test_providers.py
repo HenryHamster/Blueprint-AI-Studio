@@ -811,11 +811,17 @@ class TestGeminiLegacyAliases:
 
 
 class _FakeResponse:
-    def __init__(self, json_data=None, raise_status=False, raise_json=False):
+    def __init__(
+        self, json_data=None, raise_status=False, raise_json=False, status_code=None
+    ):
         self._json = json_data
         self._raise_status = raise_status
         self._raise_json = raise_json
-        self.status_code = 401 if raise_status else 200
+        self.status_code = (
+            status_code
+            if status_code is not None
+            else (401 if raise_status else 200)
+        )
 
     def raise_for_status(self):
         if self._raise_status:
@@ -1053,6 +1059,19 @@ class TestAnthropicProbeUsage:
         assert snap.known is False
 
     @pytest.mark.asyncio
+    async def test_rate_limit_is_classified(self, monkeypatch):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        _patch_httpx(
+            monkeypatch,
+            _FakeAsyncClient(response=_FakeResponse(status_code=429)),
+        )
+        snap = await provider.probe_usage(
+            "sk-ant-oat01-secret", LLMAuthMode.OAUTH, {}
+        )
+        assert snap.known is False
+        assert snap.probe_failure_kind == "rate_limited"
+
+    @pytest.mark.asyncio
     async def test_garbage_json_resolves_to_unknown(self, monkeypatch):
         provider = get_provider(LLMProviderName.ANTHROPIC)
         _patch_httpx(
@@ -1092,13 +1111,91 @@ class TestAnthropicProbeUsage:
         assert snap.known is False
 
 
-class TestOtherProvidersProbeUnknown:
+class TestOpenAIProbeUsage:
+    @staticmethod
+    def _oauth_secret() -> str:
+        return json.dumps(
+            {
+                "tokens": {
+                    "access_token": "codex-access-token",
+                    "account_id": "account-123",
+                }
+            }
+        )
+
     @pytest.mark.asyncio
-    async def test_openai_probe_is_unknown(self):
+    async def test_oauth_probe_returns_known_snapshot(self, monkeypatch):
+        provider = get_provider(LLMProviderName.OPENAI)
+        response = _FakeResponse(
+            json_data={
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 45,
+                        "reset_at": 1785617248,
+                    },
+                    "secondary_window": {
+                        "used_percent": 12.5,
+                        "reset_at": 1786000000,
+                    },
+                }
+            }
+        )
+        _patch_httpx(monkeypatch, _FakeAsyncClient(response=response))
+        snap = await provider.probe_usage(
+            self._oauth_secret(), LLMAuthMode.OAUTH, {}
+        )
+        assert snap.known is True
+        assert snap.window_utilizations == {
+            "five_hour": 45.0,
+            "seven_day": 12.5,
+        }
+        assert snap.resets_at["five_hour"].endswith("+00:00")
+        assert _FakeAsyncClient.last_url.endswith("/backend-api/wham/usage")
+        assert _FakeAsyncClient.last_headers == {
+            "Authorization": "Bearer codex-access-token",
+            "ChatGPT-Account-ID": "account-123",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "failure_kind"),
+        [
+            (401, "authentication"),
+            (403, "authentication"),
+            (429, "rate_limited"),
+            (500, "endpoint"),
+        ],
+    )
+    async def test_status_failures_are_classified(
+        self, monkeypatch, status_code, failure_kind
+    ):
+        provider = get_provider(LLMProviderName.OPENAI)
+        _patch_httpx(
+            monkeypatch,
+            _FakeAsyncClient(response=_FakeResponse(status_code=status_code)),
+        )
+        snap = await provider.probe_usage(
+            self._oauth_secret(), LLMAuthMode.OAUTH, {}
+        )
+        assert snap.known is False
+        assert snap.probe_failure_kind == failure_kind
+
+    @pytest.mark.asyncio
+    async def test_malformed_oauth_secret_is_schema_failure(self):
+        provider = get_provider(LLMProviderName.OPENAI)
+        snap = await provider.probe_usage("{}", LLMAuthMode.OAUTH, {})
+        assert snap.known is False
+        assert snap.probe_failure_kind == "schema"
+
+    @pytest.mark.asyncio
+    async def test_api_key_remains_unsupported(self):
         provider = get_provider(LLMProviderName.OPENAI)
         snap = await provider.probe_usage("sk-proj-x", LLMAuthMode.API_KEY, {})
         assert snap.known is False
+        assert snap.probe_failure_kind == "unsupported"
 
+
+class TestOtherProvidersProbeUnknown:
     @pytest.mark.asyncio
     async def test_gemini_probe_is_unknown(self):
         provider = get_provider(LLMProviderName.GEMINI)

@@ -1118,7 +1118,7 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('[high]');
     expect(result).toContain('improve perf');
     expect(result).toContain('5 cycles');
-    expect(result).toContain('3 merged');
+    expect(result).toContain('3 recorded merge badges (ancestry unknown)');
     expect(result).toContain('1 failed');
     expect(result).not.toContain('proven');
     expect(result).not.toContain('consumed downstream');
@@ -1135,7 +1135,7 @@ describe('buildDirSummaryText', () => {
       proven_prs_merged: 2,
       consumed_prs_merged: 1,
     }]);
-    expect(result).toContain('5 merged');
+    expect(result).toContain('5 recorded merge badges (ancestry unknown)');
     expect(result).toContain('2 proven (1 consumed downstream)');
   });
 
@@ -1149,12 +1149,12 @@ describe('buildDirSummaryText', () => {
       prs_merged: 4,
       verified_prs_merged: 4,
     }]);
-    expect(result).toContain('4 merged');
+    expect(result).toContain('4 recorded merge badges (ancestry unknown)');
     expect(result).not.toContain('badge-only');
     expect(result).not.toContain('verified,');
   });
 
-  it('falls back to plain merged when verified_prs_merged is absent (legacy payload)', () => {
+  it('labels raw badges and unknown ancestry for a legacy payload', () => {
     const result = buildDirSummaryText([{
       id: 'd-legacy',
       text: 'legacy no verified field',
@@ -1163,7 +1163,7 @@ describe('buildDirSummaryText', () => {
       total_cycles: 1,
       prs_merged: 7,
     }]);
-    expect(result).toContain('7 merged');
+    expect(result).toContain('7 recorded merge badges (ancestry unknown)');
     expect(result).not.toContain('badge-only');
     expect(result).not.toContain('verified,');
   });
@@ -1179,7 +1179,7 @@ describe('buildDirSummaryText', () => {
       proven_prs_merged: 0,
       consumed_prs_merged: 0,
     }]);
-    expect(result).toContain('2 merged');
+    expect(result).toContain('2 recorded merge badges (ancestry unknown)');
     expect(result).not.toContain('0 proven');
     expect(result).not.toContain('consumed downstream');
   });
@@ -1194,7 +1194,7 @@ describe('buildDirSummaryText', () => {
       prs_merged: 5,
       verified_prs_merged: 3,
     }]);
-    expect(result).toContain('5 merged (3 verified)');
+    expect(result).toContain('5 recorded merge badges (ancestry unknown) (3 verified)');
   });
 
   it('omits verified annotation when verified equals merged', () => {
@@ -1207,8 +1207,7 @@ describe('buildDirSummaryText', () => {
       prs_merged: 4,
       verified_prs_merged: 4,
     }]);
-    expect(result).toContain('4 merged');
-    expect(result).not.toContain('4 merged (');
+    expect(result).toContain('4 recorded merge badges (ancestry unknown)');
   });
 
   it('omits verified annotation when field is absent', () => {
@@ -1220,8 +1219,7 @@ describe('buildDirSummaryText', () => {
       total_cycles: 1,
       prs_merged: 3,
     }]);
-    expect(result).toContain('3 merged');
-    expect(result).not.toContain('3 merged (');
+    expect(result).toContain('3 recorded merge badges (ancestry unknown)');
   });
 
   it('renders reachable-vs-badge split when reachable_prs_merged is present', () => {
@@ -1234,7 +1232,7 @@ describe('buildDirSummaryText', () => {
       prs_merged: 5,
       reachable_prs_merged: 3,
     }]);
-    expect(result).toContain('5 merged (3 reachable, 2 badge-only)');
+    expect(result).toContain('3 landed (5 recorded merge badges; 2 ancestry-unconfirmed)');
   });
 
   it('omits reachable split when field is absent (legacy-unknown)', () => {
@@ -1246,8 +1244,7 @@ describe('buildDirSummaryText', () => {
       total_cycles: 2,
       prs_merged: 2,
     }]);
-    expect(result).toContain('2 merged');
-    expect(result).not.toContain('2 merged (');
+    expect(result).toContain('2 recorded merge badges (ancestry unknown)');
   });
 
   it('renders explicit known-zero reachability distinctly from legacy-unknown', () => {
@@ -1263,7 +1260,7 @@ describe('buildDirSummaryText', () => {
       prs_merged: 3,
       reachable_prs_merged: 0,
     }]);
-    expect(result).toContain('3 merged (0 reachable, 3 badge-only)');
+    expect(result).toContain('0 landed (3 recorded merge badges; 3 ancestry-unconfirmed)');
   });
 
   it('combines verified and reachable annotations with semicolon separator', () => {
@@ -1277,7 +1274,7 @@ describe('buildDirSummaryText', () => {
       verified_prs_merged: 4,
       reachable_prs_merged: 5,
     }]);
-    expect(result).toContain('6 merged (4 verified; 5 reachable, 1 badge-only)');
+    expect(result).toContain('5 landed (4 verified; 6 recorded merge badges; 1 ancestry-unconfirmed)');
   });
 
   it('shows SATURATED flag when applicable', () => {

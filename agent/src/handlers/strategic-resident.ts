@@ -59,6 +59,11 @@ import {
   type StrategicWatchReceipt, type ResidentActivityUpdate,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
+import {
+  formatResidentRepoSnapshot,
+  syncResidentRepository,
+  type ResidentRepoSnapshot,
+} from './resident-repo-freshness.js';
 
 const _RESIDENT_STRATEGIC_TASK_TYPE = 'strategic_review' as const;
 
@@ -758,6 +763,10 @@ export async function handleStrategicResident(
   } | null = null;
   let artifactRetryFailures = 0;
   let operatorReplyProtocolFailures = 0;
+  let lastDeliveredRepoHead = typeof ctx._resident_repo_head === 'string'
+    ? ctx._resident_repo_head
+    : null;
+  let repoRefreshRetryAt = 0;
 
   // ── Evidence-gated autonomous tick: examination ledger + rotating focus ──────
   // Code-owned cross-tick memory the model cannot be trusted to keep. The catalog
@@ -1037,8 +1046,18 @@ export async function handleStrategicResident(
     return textParts.join('');
   }
 
-  const runTurn = async (content: string | ContentBlock[], operator: boolean, pickupLagMs?: number | null): Promise<ResidentTurnResult> => {
-    let turnContent = content;
+  const runTurn = async (
+    content: string | ContentBlock[],
+    operator: boolean,
+    pickupLagMs?: number | null,
+    repoSnapshot?: ResidentRepoSnapshot,
+  ): Promise<ResidentTurnResult> => {
+    const repoPrefix = repoSnapshot
+      ? `${formatResidentRepoSnapshot(repoSnapshot)}\n\n---\n\n`
+      : '';
+    let turnContent: string | ContentBlock[] = typeof content === 'string'
+      ? `${repoPrefix}${content}`
+      : [{ type: 'text', text: repoPrefix }, ...content];
     if (pendingRestartCheckpoint !== null) {
       const checkpointPrefix = `${pendingRestartCheckpoint}\n\n---\n\n`;
       turnContent = typeof content === 'string'
@@ -1466,6 +1485,7 @@ export async function handleStrategicResident(
     const body: Record<string, unknown> = {
       session_id: sessionId, task_id: taskId, progress, note,
       worker_generation: workerGeneration,
+      repo_head: lastDeliveredRepoHead,
       // Send the current cursor so the backend persists it; a restart will
       // restore it from task.context.message_cursor instead of falling back to
       // the 2-minute window that re-delivers already-answered messages.
@@ -1762,7 +1782,20 @@ export async function handleStrategicResident(
       return 'stop';
     }
     try {
-      const turnPromise = runTurn(operatorBlocks, true, pickupLagMs);
+      const repoSnapshot = syncResidentRepository(
+        WORKSPACE,
+        baseBranch,
+        lastDeliveredRepoHead,
+      );
+      if (repoSnapshot.status === 'CURRENT') {
+        lastDeliveredRepoHead = repoSnapshot.head;
+      } else {
+        sendLog(
+          ws,
+          `[resident] repository freshness UNKNOWN for operator turn: ${repoSnapshot.reason}\n`,
+        );
+      }
+      const turnPromise = runTurn(operatorBlocks, true, pickupLagMs, repoSnapshot);
       const watch = await watchOperatorTurn(turnPromise);
       if (watch === 'stop') {
         session.interrupt();
@@ -2068,7 +2101,6 @@ export async function handleStrategicResident(
       // (never-examined first, then LRU), recent records so the turn goes
       // somewhere new/deeper, open FOUND leads to restate, and a corrective flag
       // set after an unevidenced idle claim.
-      examTick += 1;
       operatorTurnJustCompleted = false;
       const focus = nextFocus(surfaceCatalog, examRecords, FOCUS_LIST_SIZE);
       const recentRecords = examRecords.slice(-6);
@@ -2076,6 +2108,39 @@ export async function handleStrategicResident(
       const corrective = correctiveNextTick;
       // Only a recovered decision or NO-DECISION may clear this snapshot.
       const reviewForTurn = operatorDecisionReview;
+      if (Date.now() < repoRefreshRetryAt) {
+        setResidentActivity(
+          'waiting',
+          'Repository refresh unavailable; autonomous work paused',
+          new Date(repoRefreshRetryAt).toISOString(),
+        );
+        await sleep(cfg.messagePollMs);
+        continue;
+      }
+      const repoSnapshot = syncResidentRepository(
+        WORKSPACE,
+        baseBranch,
+        lastDeliveredRepoHead,
+      );
+      if (repoSnapshot.status !== 'CURRENT') {
+        repoRefreshRetryAt = Date.now() + 30_000;
+        setResidentActivity(
+          'waiting',
+          'Repository freshness unknown; autonomous work paused',
+          new Date(repoRefreshRetryAt).toISOString(),
+        );
+        streamer.status('repository refresh unavailable — autonomous work paused');
+        sendLog(
+          ws,
+          `[resident] repository freshness UNKNOWN; skipping autonomous turn: ${repoSnapshot.reason}\n`,
+        );
+        if (livenessHeartbeatDue()) await livenessHeartbeat();
+        await sleep(cfg.messagePollMs);
+        continue;
+      }
+      repoRefreshRetryAt = 0;
+      lastDeliveredRepoHead = repoSnapshot.head;
+      examTick += 1;
       lastAutonomousTurnAt = Date.now();
       setResidentActivity('working', 'Reviewing project state');
       const turnPromise = runTurn(
@@ -2090,6 +2155,8 @@ export async function handleStrategicResident(
           firedStrategicWatches,
         ),
         false,
+        null,
+        repoSnapshot,
       );
       const watch = await watchTurn(turnPromise);
       let r: ResidentTurnResult;

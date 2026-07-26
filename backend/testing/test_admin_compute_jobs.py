@@ -264,6 +264,13 @@ async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
         "storage_uri": "gs://bucket/jobs/job-1/result.parquet",
         "logical_key": "compute-result-job-1",
         "created_at": artifact.created_at.isoformat(),
+        "download_available": True,
+        "manifest": {
+            "file_count": None,
+            "total_size_bytes": None,
+            "paths": [],
+            "paths_truncated": False,
+        },
     }
 
 

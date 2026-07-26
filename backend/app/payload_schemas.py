@@ -1064,6 +1064,10 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # negative evidence; a declared metric with NO numeric value fails loud
     # (compute_unmeasured_criterion). When absent, presence-based behavior holds.
     success_criterion: ComputeSuccessCriterion | None = None
+    # Additive multi-criterion form. Criteria are deliberately AND-only: every
+    # declared measurement must be met for the experiment goal to be met. The
+    # singular field remains supported as compatibility sugar.
+    success_criteria: list[ComputeSuccessCriterion] | None = None
     # Optional strict-delivery gate. When True, completion FAILS unless the job
     # links a COMPUTE_RESULT artifact whose storage URI is durable-class (gs://,
     # s3://, az://, file:). Absent/False preserves existing fail-soft behavior.

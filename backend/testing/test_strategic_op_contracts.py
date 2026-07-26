@@ -20,11 +20,13 @@ def test_update_direction_normalizes_legacy_changes_wrapper():
         {
             "direction_id": "d-1",
             "rationale": "new evidence",
+            "terminal_reason": "superseded",
             "changes": {"priority": "high"},
         }
     ) == {
         "direction_id": "d-1",
         "rationale": "new evidence",
+        "terminal_reason": "superseded",
         "priority": "high",
     }
 

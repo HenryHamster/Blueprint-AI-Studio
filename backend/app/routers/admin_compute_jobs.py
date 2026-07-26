@@ -36,6 +36,7 @@ from app.compute_jobs_aggregation import (
     aggregate_compute_jobs_summary,
     aggregate_criterion_summary,
 )
+from app.compute_outcome_status import derive_compute_outcome_status
 from app.database import get_session
 from app.models import (
     Artifact,
@@ -54,7 +55,9 @@ from app.strategic_runtime_work import (
 )
 from app.task_evaluators import (
     _declared_success_criterion,
+    _declared_success_criteria,
     evaluate_compute_success_criterion,
+    evaluate_compute_success_criteria,
 )
 from app.storage import artifact_expires_at
 
@@ -129,7 +132,7 @@ def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
     """
     # artifact_type is persisted as a plain String column, so it reads back as a
     # str; tolerate either the Enum member or the raw value.
-    return {
+    descriptor = {
         "id": str(artifact.id),
         "artifact_type": getattr(
             artifact.artifact_type, "value", artifact.artifact_type
@@ -138,6 +141,30 @@ def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
         "logical_key": artifact.logical_key,
         "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
     }
+    try:
+        metadata = json.loads(artifact.logs or "{}")
+    except (TypeError, ValueError):
+        metadata = {}
+    if isinstance(metadata, dict):
+        file_count = metadata.get("file_count")
+        total_size_bytes = metadata.get("total_size_bytes")
+        descriptor["manifest"] = {
+            "file_count": file_count
+            if isinstance(file_count, int) and not isinstance(file_count, bool)
+            else None,
+            "total_size_bytes": total_size_bytes
+            if isinstance(total_size_bytes, int)
+            and not isinstance(total_size_bytes, bool)
+            else None,
+            "paths": [
+                item["filename"]
+                for item in metadata.get("viewable_files", [])
+                if isinstance(item, dict) and isinstance(item.get("filename"), str)
+            ][:25],
+            "paths_truncated": bool(metadata.get("viewable_files_dropped")),
+        }
+    descriptor["download_available"] = bool(artifact.storage_uri)
+    return descriptor
 
 
 def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
@@ -194,8 +221,10 @@ async def _build_compute_job_payload(
     an optional descriptor for the job's linked durable Artifact, and the
     declared success criterion + its computed verdict when present."""
     task_ids = {job.task_id for job in jobs if job.task_id is not None}
-    # Maps task_id -> (title, task_type, success_criterion, criterion_verdict, task)
-    task_meta: Dict[uuid.UUID, tuple[str | None, str | None, Any, Any, Any]] = {}
+    # Maps task_id -> title/type/singular criterion/all criteria/verdict/task.
+    task_meta: Dict[
+        uuid.UUID, tuple[str | None, str | None, Any, Any, Any, Any]
+    ] = {}
     if task_ids:
         rows = (
             (
@@ -211,6 +240,7 @@ async def _build_compute_job_payload(
         for task in rows:
             task_type = str(task.first_payload.get("type") or "") or None
             normalized = _declared_success_criterion(task)
+            normalized_many = _declared_success_criteria(task)
             success_criterion = (
                 {
                     "metric": normalized[0],
@@ -229,6 +259,14 @@ async def _build_compute_job_payload(
                 task.title,
                 task_type,
                 success_criterion,
+                [
+                    {
+                        "metric": item[0],
+                        "operator": item[1],
+                        "threshold": item[2],
+                    }
+                    for item in normalized_many
+                ],
                 verdict,
                 task,
             )
@@ -283,7 +321,7 @@ async def _build_compute_job_payload(
         # not the job row; batch its hostname in the same query so the forced
         # target is resolvable even when the job is held (no claimed pin yet).
         _tmeta = task_meta.get(job.task_id)
-        _forced_raw = (_tmeta[4].context or {}).get("forced_runner_target_id") if _tmeta and _tmeta[4] is not None else None
+        _forced_raw = (_tmeta[5].context or {}).get("forced_runner_target_id") if _tmeta and _tmeta[5] is not None else None
         if _forced_raw:
             try:
                 runner_target_ids.add(uuid.UUID(str(_forced_raw)))
@@ -310,9 +348,17 @@ async def _build_compute_job_payload(
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response_safe(job)
-        title, task_type, success_criterion, criterion_verdict, task_obj = (
-            task_meta.get(job.task_id, (None, None, None, None, None))
+        (
+            title,
+            task_type,
+            success_criterion,
+            success_criteria,
+            criterion_verdict,
+            task_obj,
+        ) = (
+            task_meta.get(job.task_id, (None, None, None, [], None, None))
         )
+        criteria_verdict: dict | None = None
         # For terminal jobs whose task hasn't been finalized yet (plan_output
         # does not carry compute_result.criterion), compute the verdict directly
         # from the job row so the panel shows real results immediately.
@@ -326,6 +372,25 @@ async def _build_compute_job_payload(
             criterion_verdict = evaluate_compute_success_criterion(
                 task_obj, artifact_text
             )
+            criteria_verdict = evaluate_compute_success_criteria(
+                task_obj, artifact_text
+            )
+        elif (
+            success_criteria
+            and job.status in _COMPUTE_JOB_TERMINAL_STATUSES
+            and task_obj is not None
+        ):
+            artifact_text = await build_compute_result_logs_async(job)
+            criteria_verdict = evaluate_compute_success_criteria(
+                task_obj, artifact_text
+            )
+        if criteria_verdict is None and criterion_verdict is not None:
+            criteria_verdict = {
+                "operator": "AND",
+                "met": criterion_verdict.get("met") is True,
+                "measurable": criterion_verdict.get("measurable") is True,
+                "criteria": [criterion_verdict],
+            }
         # Prefer the durable execution observation.  The task mirror is only a
         # convenience projection and may be absent or refer to a later analysis.
         knowledge_document_id: str | None = execution_doc_ids.get(job.id)
@@ -395,7 +460,10 @@ async def _build_compute_job_payload(
             else None
         )
         data["success_criterion"] = success_criterion
+        data["success_criteria"] = success_criteria
         data["criterion_verdict"] = criterion_verdict
+        data["criteria_verdict"] = criteria_verdict
+        data.update(derive_compute_outcome_status(job.status, criteria_verdict))
         data["knowledge_document_id"] = knowledge_document_id
         data["per_arm_verdicts"] = per_arm_verdicts
         # Serve the canonical evidence tier (machine-verified / attested /
@@ -417,6 +485,7 @@ async def _build_compute_job_payload(
         data["artifact"] = (
             _artifact_descriptor(linked_artifact) if linked_artifact else None
         )
+        data["can_use_as_input"] = bool(linked_artifact and linked_artifact.storage_uri)
         # Runner identity and wait-state fields.
         pm = job.polling_metadata or {}
         # Additive per-file viewable-artifact manifest (empty when the job
