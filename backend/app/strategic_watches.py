@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.models import (
     KnowledgeDocument,
@@ -29,11 +29,11 @@ WATCH_ACKNOWLEDGED = "acknowledged"
 WATCH_CANCELLED = "cancelled"
 WATCH_EXPIRED = "expired"
 
-WATCH_ACTIVE_STATES = (WATCH_PENDING, WATCH_FIRED, WATCH_EXPIRED)
 WATCH_ACK_DISPOSITIONS = frozenset(
     {"reported", "acted", "no_action", "superseded"}
 )
 WATCH_RECEIPT_LIMIT = 20
+WATCH_RESOLUTION_LIMIT = 100
 
 
 class WatchTaskInput(BaseModel):
@@ -205,51 +205,81 @@ async def resolve_project_task_watches(
     """
 
     now = now or _utcnow()
-    rows = (
+    # Resolve newly terminal/deadline-expired watches independently of receipt
+    # pagination. Otherwise the oldest unacknowledged fired receipts can occupy
+    # the entire bounded query forever and starve later pending transitions.
+    pending_rows = (
         (
             await session.execute(
                 select(StrategicWatch, Task)
                 .join(Task, Task.id == StrategicWatch.target_task_id)
                 .where(
                     StrategicWatch.project_id == project_id,
-                    StrategicWatch.state.in_(WATCH_ACTIVE_STATES),
+                    StrategicWatch.state == WATCH_PENDING,
+                    or_(
+                        StrategicWatch.deadline_at <= now,
+                        Task.status.in_(
+                            (
+                                TaskStatus.COMPLETED,
+                                TaskStatus.FAILED,
+                                TaskStatus.CANCELLED,
+                            )
+                        ),
+                    ),
                 )
                 .order_by(StrategicWatch.created_at.asc())
-                .limit(max(1, min(int(limit), WATCH_RECEIPT_LIMIT)))
+                .limit(WATCH_RESOLUTION_LIMIT)
             )
         )
         .all()
     )
-    visible: list[StrategicWatch] = []
-    for watch, target in rows:
-        if watch.state == WATCH_PENDING:
-            if watch.deadline_at is not None and watch.deadline_at <= now:
-                watch.state = WATCH_EXPIRED
-                watch.fired_at = now
-                watch.receipt = {
-                    "watch_id": str(watch.id),
-                    "target_kind": "task",
-                    "target_task_id": str(target.id),
-                    "title": str(target.title or "Untitled Task")[:500],
-                    "task_status": _status_value(target.status),
-                    "purpose": str(watch.purpose or "")[:1000],
-                    "reason": "watch_deadline_elapsed",
-                    "fired_at": now.isoformat(),
-                }
-                session.add(watch)
-            elif _is_terminal(target.status):
-                watch.state = WATCH_FIRED
-                watch.terminal_status = _status_value(target.status)
-                watch.fired_at = now
-                watch.receipt = await _build_task_receipt(
-                    session,
-                    watch=watch,
-                    target=target,
+    for watch, target in pending_rows:
+        if watch.deadline_at is not None and watch.deadline_at <= now:
+            watch.state = WATCH_EXPIRED
+            watch.fired_at = now
+            watch.receipt = {
+                "watch_id": str(watch.id),
+                "target_kind": "task",
+                "target_task_id": str(target.id),
+                "title": str(target.title or "Untitled Task")[:500],
+                "task_status": _status_value(target.status),
+                "purpose": str(watch.purpose or "")[:1000],
+                "reason": "watch_deadline_elapsed",
+                "fired_at": now.isoformat(),
+            }
+        else:
+            watch.state = WATCH_FIRED
+            watch.terminal_status = _status_value(target.status)
+            watch.fired_at = now
+            watch.receipt = await _build_task_receipt(
+                session,
+                watch=watch,
+                target=target,
+            )
+        session.add(watch)
+    if pending_rows:
+        await session.flush()
+
+    # Pagination applies only to already-resolved receipts shown to Strategic.
+    # Pending transitions above therefore keep making progress even when the
+    # visible receipt backlog is larger than the heartbeat payload cap.
+    return list(
+        (
+            (
+                await session.execute(
+                    select(StrategicWatch)
+                    .where(
+                        StrategicWatch.project_id == project_id,
+                        StrategicWatch.state.in_((WATCH_FIRED, WATCH_EXPIRED)),
+                    )
+                    .order_by(StrategicWatch.created_at.asc())
+                    .limit(max(1, min(int(limit), WATCH_RECEIPT_LIMIT)))
                 )
-                session.add(watch)
-        if watch.state in {WATCH_FIRED, WATCH_EXPIRED}:
-            visible.append(watch)
-    return visible
+            )
+            .scalars()
+            .all()
+        )
+    )
 
 
 async def acknowledge_watch(

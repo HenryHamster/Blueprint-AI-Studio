@@ -8,10 +8,18 @@ from datetime import timedelta
 import pytest
 from sqlmodel import select
 
-from app.models import Project, StrategicSpawnRequest, StrategicWatch, Task, TaskStatus
+from app.models import (
+    CompletionDebtEntry,
+    Project,
+    StrategicSpawnRequest,
+    StrategicWatch,
+    Task,
+    TaskStatus,
+)
 from app.strategic_spawn_requests import (
     cancel_deferred_spawn_request,
     drain_deferred_spawn_requests,
+    drain_due_strategic_spawn_requests,
     submit_strategic_spawn,
 )
 from app.time_utils import _utcnow
@@ -215,3 +223,74 @@ async def test_cancelled_deferred_request_never_drains(db_session):
     await db_session.refresh(deferred.request)
     assert deferred.request.state == "cancelled"
     assert deferred.request.task_id is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_sweep_drains_without_heartbeat_and_links_debt_once(
+    db_session,
+):
+    project, owner = await _owner(db_session)
+    debt = CompletionDebtEntry(
+        project_id=project.id,
+        kind="capability_trial",
+        dedupe_key=f"strategic-spawn:{uuid.uuid4()}",
+        title="Follow through on accepted Strategic work",
+        detail={},
+    )
+    db_session.add(debt)
+    await db_session.commit()
+
+    first = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=_spec("Occupy the abuse window", watch=False),
+        idempotency_key="occupy-window",
+        direction_id=None,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    deferred_spec = _spec("Deferred linked work", watch=False)
+    deferred_spec["debt_id"] = str(debt.id)
+    deferred = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=deferred_spec,
+        idempotency_key="deferred-linked",
+        direction_id=None,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    assert deferred.request.state == "deferred"
+
+    first.request.dispatched_at = _utcnow() - timedelta(minutes=61)
+    deferred.request.not_before = _utcnow() - timedelta(seconds=1)
+    db_session.add(first.request)
+    db_session.add(deferred.request)
+    await db_session.commit()
+
+    drained = await drain_due_strategic_spawn_requests(
+        db_session,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    await db_session.commit()
+    assert [row.id for row in drained] == [deferred.request.id]
+
+    # A later orchestrator tick is a no-op and the idempotent debt ledger keeps
+    # exactly one forward pointer for the task created by the deferred request.
+    assert (
+        await drain_due_strategic_spawn_requests(
+            db_session,
+            burst_cap=1,
+            burst_window_minutes=60,
+        )
+    ) == []
+    await db_session.commit()
+    await db_session.refresh(deferred.request)
+    await db_session.refresh(debt)
+    linked = (debt.detail or {}).get("linked_tasks") or []
+    assert [row["task_id"] for row in linked] == [str(deferred.request.task_id)]

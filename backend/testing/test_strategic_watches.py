@@ -151,6 +151,55 @@ async def test_pending_watch_expires_visibly(db_session):
 
 
 @pytest.mark.asyncio
+async def test_fired_receipt_backlog_does_not_starve_later_pending_transition(
+    db_session,
+):
+    project, owner, target = await _project_and_tasks(db_session)
+    old_watch_ids = []
+    for index in range(21):
+        completed = Task(
+            project_id=project.id,
+            title=f"Old completed task {index}",
+            created_by="STRATEGIC_AGENT",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+        )
+        db_session.add(completed)
+        await db_session.flush()
+        old_watch, _ = await register_task_watch(
+            db_session,
+            project_id=project.id,
+            created_by_task_id=owner.id,
+            target_task_id=completed.id,
+            purpose="unacknowledged old receipt",
+        )
+        old_watch_ids.append(old_watch.id)
+    later_watch, _ = await register_task_watch(
+        db_session,
+        project_id=project.id,
+        created_by_task_id=owner.id,
+        target_task_id=target.id,
+        purpose="must resolve behind the receipt backlog",
+    )
+    await db_session.commit()
+
+    target.status = TaskStatus.COMPLETED
+    db_session.add(target)
+    await db_session.commit()
+
+    visible = await resolve_project_task_watches(
+        db_session,
+        project_id=project.id,
+    )
+    await db_session.commit()
+    await db_session.refresh(later_watch)
+
+    assert [watch.id for watch in visible] == old_watch_ids[:20]
+    assert later_watch.state == WATCH_FIRED
+    assert later_watch.terminal_status == TaskStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
 async def test_watch_rejects_cross_project_target(db_session):
     project, owner, _ = await _project_and_tasks(db_session)
     other = Project(name="Other watch project", user_id="test-user")

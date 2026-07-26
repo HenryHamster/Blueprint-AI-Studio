@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
@@ -19,12 +20,16 @@ from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import StrategicSpawnRequest, Task, TaskStatus, _utcnow
+from app.models import Project, StrategicSpawnRequest, Task, TaskStatus, _utcnow
 from app.strategic_watches import register_task_watch
+from app.task_locking import project_lock
 
 DEFAULT_BURST_CAP = 100
 DEFAULT_BURST_WINDOW_MINUTES = 60
 MAX_DRAIN_PER_PASS = 10
+MAX_PROJECTS_PER_SWEEP = 20
+
+logger = logging.getLogger("blueprint")
 
 
 def stable_specification_hash(specification: dict[str, Any]) -> str:
@@ -47,6 +52,7 @@ class SpawnSubmission:
     request: StrategicSpawnRequest
     task: Task | None
     replayed: bool
+    linked_debt_id: str | None = None
 
 
 def _task_from_specification(
@@ -86,11 +92,15 @@ async def _dispatch_request(
     session,
     *,
     request: StrategicSpawnRequest,
-) -> Task:
+) -> tuple[Task, str | None]:
     if request.task_id is not None:
         existing = await session.get(Task, request.task_id)
         if existing is not None:
-            return existing
+            return existing, await _link_request_debt(
+                session,
+                request=request,
+                task=existing,
+            )
 
     task = _task_from_specification(
         project_id=request.project_id,
@@ -129,7 +139,44 @@ async def _dispatch_request(
             parent.context = context
             flag_modified(parent, "context")
             session.add(parent)
-    return task
+    return task, await _link_request_debt(
+        session,
+        request=request,
+        task=task,
+    )
+
+
+async def _link_request_debt(
+    session,
+    *,
+    request: StrategicSpawnRequest,
+    task: Task,
+) -> str | None:
+    """Best-effort, idempotently link the eventual task to requested debt."""
+
+    debt_id = (request.specification or {}).get("debt_id")
+    if not debt_id:
+        return None
+    from app.completion_debt import link_task_to_debt
+
+    try:
+        await link_task_to_debt(
+            session,
+            debt_id,
+            project_id=request.project_id,
+            task_id=task.id,
+            note="spawned by strategist",
+        )
+        return str(debt_id)
+    except Exception:  # noqa: BLE001 - linkage must never lose accepted work
+        logger.warning(
+            "[STRATEGIC SPAWN] debt linkage failed (request=%s debt=%s task=%s)",
+            request.id,
+            debt_id,
+            task.id,
+            exc_info=True,
+        )
+        return None
 
 
 async def _recent_dispatch_count(
@@ -213,7 +260,18 @@ async def submit_strategic_spawn(
             if existing.task_id is not None
             else None
         )
-        return SpawnSubmission(existing, existing_task, True)
+        linked_debt_id = (
+            await _link_request_debt(
+                session,
+                request=existing,
+                task=existing_task,
+            )
+            if existing_task is not None
+            else None
+        )
+        if linked_debt_id is not None:
+            await session.commit()
+        return SpawnSubmission(existing, existing_task, True, linked_debt_id)
 
     now = _utcnow()
     cap = max(1, int(burst_cap))
@@ -255,9 +313,9 @@ async def submit_strategic_spawn(
         await session.commit()
         return SpawnSubmission(request, None, False)
 
-    child = await _dispatch_request(session, request=request)
+    child, linked_debt_id = await _dispatch_request(session, request=request)
     await session.commit()
-    return SpawnSubmission(request, child, False)
+    return SpawnSubmission(request, child, False, linked_debt_id)
 
 
 async def drain_deferred_spawn_requests(
@@ -303,6 +361,57 @@ async def drain_deferred_spawn_requests(
     for request in rows:
         await _dispatch_request(session, request=request)
     return rows
+
+
+async def drain_due_strategic_spawn_requests(
+    session,
+    *,
+    burst_cap: int = DEFAULT_BURST_CAP,
+    burst_window_minutes: int = DEFAULT_BURST_WINDOW_MINUTES,
+    max_projects: int = MAX_PROJECTS_PER_SWEEP,
+) -> list[StrategicSpawnRequest]:
+    """Autonomously drain due project queues under their mutation locks.
+
+    This is the bounded orchestrator sweep entrypoint. It discovers due
+    projects independently of Resident heartbeats, then reuses the same
+    project-locked FIFO drainer as the heartbeat fast path. The caller commits.
+    """
+
+    now = _utcnow()
+    project_ids = (
+        (
+            await session.execute(
+                select(StrategicSpawnRequest.project_id)
+                .where(
+                    StrategicSpawnRequest.state == "deferred",
+                    StrategicSpawnRequest.not_before <= now,
+                )
+                .distinct()
+                .limit(max(1, min(int(max_projects), MAX_PROJECTS_PER_SWEEP)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    drained: list[StrategicSpawnRequest] = []
+    for project_id in project_ids:
+        async with project_lock(
+            session,
+            project_id,
+            skip_locked=True,
+            load_columns=[Project.id],
+        ) as locked_project:
+            if locked_project is None:
+                continue
+            drained.extend(
+                await drain_deferred_spawn_requests(
+                    session,
+                    project_id=project_id,
+                    burst_cap=burst_cap,
+                    burst_window_minutes=burst_window_minutes,
+                )
+            )
+    return drained
 
 
 async def cancel_deferred_spawn_request(

@@ -1004,44 +1004,6 @@ async def agent_annotate(
     return response
 
 
-async def _maybe_link_task_to_debt(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    debt_id: Any,
-    task_id: uuid.UUID,
-) -> str | None:
-    """Best-effort link a freshly-spawned task to an open completion-debt row.
-
-    Returns the debt id (str) on success, ``None`` when no debt_id was supplied
-    or linkage failed. Linkage is a convenience forward-pointer and must NEVER
-    fail the spawn that already committed, so all errors (unknown/closed debt,
-    ledger write failure) are swallowed after rolling back the linkage attempt.
-    """
-    if not debt_id:
-        return None
-    from app.completion_debt import link_task_to_debt as _link_task_to_debt
-
-    try:
-        await _link_task_to_debt(
-            session,
-            debt_id,
-            project_id=project_id,
-            task_id=task_id,
-            note="spawned by strategist",
-        )
-        await session.commit()
-        return str(debt_id)
-    except Exception:  # noqa: BLE001 — best-effort; spawn already committed
-        await session.rollback()
-        logger.warning(
-            "[STRATEGIC API] link_task_to_debt failed (debt_id=%s task=%s) — non-fatal",
-            debt_id,
-            task_id,
-            exc_info=True,
-        )
-        return None
-
-
 async def _enforce_resident_mutation_fence(
     session: AsyncSession,
     project: Project,
@@ -3773,6 +3735,7 @@ async def strategic_operation(
             )
 
         normalized_specification = {
+            "debt_id": str(data.get("debt_id")) if data.get("debt_id") else None,
             "task": {
                 "title": title,
                 "description": prompt[:500],
@@ -3831,9 +3794,6 @@ async def strategic_operation(
             f"[STRATEGIC API] Accepted {spawn_type} task {new_task.id} "
             f"(priority=100) from strategic review {task.id} for project {project.id}"
         )
-        linked_debt_id = await _maybe_link_task_to_debt(
-            session, project.id, data.get("debt_id"), new_task.id
-        )
         return _resp(
             {
                 "status": "ok",
@@ -3848,7 +3808,11 @@ async def strategic_operation(
                     if legacy_spawn_fix
                     else {}
                 ),
-                **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
+                **(
+                    {"linked_debt_id": submission.linked_debt_id}
+                    if submission.linked_debt_id
+                    else {}
+                ),
             }
         )
 
