@@ -601,7 +601,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
   "data": { }
 }
 ```
@@ -613,8 +613,17 @@ truncated). Notable behaviors:
 - `create_direction` requires `text`, `success_evidence`, and
   `retirement_condition`; returns `409` if the active-direction cap
   (`max_active_directions`, default 5) is reached.
-- `spawn_task` may only spawn `research` or `plan` tasks (queued at priority
-  100, ahead of normal autonomous work).
+- `spawn_task` durably dispatches `research`, `web_research`, `design`, `plan`,
+  `compute_experiment`, `create`, `refactor`, or `qa` directly. `fix` is also
+  accepted when `pr_number` and `branch` are supplied. Direction association is
+  optional. The request is idempotent, automatically watches the child unless
+  `watch: false`, and returns HTTP 202 with a durable deferred receipt only when
+  the project-wide abuse circuit breaker is reached. `spawn_fix` remains an
+  unadvertised compatibility alias for one release.
+- `cancel_task` requires a reason plus exactly one of `target_task_id` or
+  `request_id`. A task can be cancelled only in its early lifecycle; a durable
+  spawn request can be cancelled only while deferred, which prevents later
+  auto-drain from creating the task.
 - `watch_task` registers a durable, one-shot terminal-state notification for a
   task in the same project. Its strict `data` object requires `target_task_id`
   (UUID), and optionally accepts `purpose` (up to 1000 characters) and

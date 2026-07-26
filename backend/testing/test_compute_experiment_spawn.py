@@ -1683,11 +1683,10 @@ async def test_concurrent_cap_suppresses_excess_spawn(db_session, _quiet_compute
             runtime_config.pop("max_concurrent_act_on_verdict_followons", None)
 
 
-def test_strategist_allowlist_excludes_create_unchanged():
-    """The act_on_verdict spawn does NOT widen the strategist allowlist: the
-    strategist still cannot spawn create (the ORCHESTRATOR does the spawn)."""
-    assert "create" not in STRATEGIST_SPAWNABLE_TASK_TYPES
-    assert "refactor" not in STRATEGIST_SPAWNABLE_TASK_TYPES
+def test_strategist_allowlist_includes_ordinary_implementation_tasks():
+    """Strategic dispatch uses the unified spawn_task path for normal work."""
+    assert {"create", "refactor", "qa"} <= STRATEGIST_SPAWNABLE_TASK_TYPES
+    # A fix still requires existing PR/branch context.
     assert "fix" not in STRATEGIST_SPAWNABLE_TASK_TYPES
 
 

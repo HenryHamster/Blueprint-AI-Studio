@@ -282,17 +282,15 @@ describe('writeStrategicHelpers', () => {
     expect(fs.existsSync(marker)).toBe(false);
   }, 20_000);
 
-  it('routes the spawn-fix op to the spawn_fix backend operation', () => {
+  it('advertises only unified spawn-task while backend retains the alias', () => {
     const taskId = 'test-task-123';
     const projectId = 'test-project-456';
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
-    // The one-time-fix dispatch arm exists and maps the CLI verb to the API op.
-    expect(content).toContain('spawn-fix)');
-    expect(content).toContain('_call "spawn_fix"');
-    // It is advertised in the usage string alongside spawn-task.
-    expect(content).toContain('spawn-fix');
+    expect(content).toContain('spawn-task)');
+    expect(content).toContain('_call "spawn_task"');
+    expect(content).not.toContain('spawn-fix)');
   });
 
   it('routes acceptance-criteria authoring to the set_acceptance_criteria backend operation', () => {

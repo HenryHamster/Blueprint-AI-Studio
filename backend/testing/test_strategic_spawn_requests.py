@@ -10,6 +10,7 @@ from sqlmodel import select
 
 from app.models import Project, StrategicSpawnRequest, StrategicWatch, Task, TaskStatus
 from app.strategic_spawn_requests import (
+    cancel_deferred_spawn_request,
     drain_deferred_spawn_requests,
     submit_strategic_spawn,
 )
@@ -165,3 +166,52 @@ async def test_abuse_burst_defers_then_drains_fifo(db_session):
     await db_session.refresh(second.request)
     assert second.request.state == "dispatched"
     assert second.request.task_id is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_deferred_request_never_drains(db_session):
+    project, owner = await _owner(db_session)
+    first = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=_spec("First", watch=False),
+        idempotency_key="first",
+        direction_id=None,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    deferred = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=_spec("Cancelled", watch=False),
+        idempotency_key="cancelled",
+        direction_id=None,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    assert deferred.request.state == "deferred"
+
+    await cancel_deferred_spawn_request(
+        db_session,
+        project_id=project.id,
+        request_id=deferred.request.id,
+    )
+    first.request.dispatched_at = _utcnow() - timedelta(minutes=61)
+    db_session.add(first.request)
+    await db_session.commit()
+
+    drained = await drain_deferred_spawn_requests(
+        db_session,
+        project_id=project.id,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    await db_session.commit()
+    assert drained == []
+    await db_session.refresh(deferred.request)
+    assert deferred.request.state == "cancelled"
+    assert deferred.request.task_id is None

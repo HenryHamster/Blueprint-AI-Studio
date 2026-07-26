@@ -26,7 +26,11 @@ from app.compute_jobs import (
     kill_compute_job,
     list_compute_jobs,
 )
-from app.compute_experiment_contract import decode_generated_command
+from app.compute_experiment_contract import (
+    _author_compute_launch_contract,
+    build_compute_contract_preview,
+    decode_generated_command,
+)
 from app.compute_jobs_aggregation import (
     aggregate_all_compute_jobs_summary,
     aggregate_compute_jobs_summary,
@@ -43,6 +47,7 @@ from app.models import (
     TaskStatus,
 )
 from app.schemas import serialize_compute_job_response_safe
+from app.shared_state import runtime_config
 from app.strategic_runtime_work import (
     task_awaiting_local_runner_since,
 )
@@ -97,6 +102,15 @@ class _AskComputeJobRequest(BaseModel):
             if question and answer:
                 turns.append({"question": question, "answer": answer})
         return turns[-_ASK_HISTORY_MAX_TURNS:]
+
+
+class _ComputeContractPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contract: dict[str, Any]
+    direction_id: str | None = None
+    require_local_runner: bool = False
+
 
 router = APIRouter(
     prefix="/api/admin",
@@ -496,6 +510,37 @@ async def _build_compute_job_payload(
         data["forced_runner"] = forced_runner_descriptor
         payload.append(data)
     return payload
+
+
+@router.post("/projects/{project_id}/compute-jobs/preview")
+async def preview_project_compute_contract(
+    project_id: uuid.UUID,
+    body: _ComputeContractPreviewRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Validate and explain the normalized compute launch without dispatching."""
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    direction = next(
+        (
+            item
+            for item in (project.directions or [])
+            if item.get("id") == body.direction_id
+        ),
+        None,
+    )
+    if body.direction_id and direction is None:
+        raise HTTPException(status_code=400, detail="Unknown direction_id")
+    contract = _author_compute_launch_contract(body.contract)
+    return build_compute_contract_preview(
+        contract,
+        runtime_config=runtime_config,
+        direction=direction,
+        require_local_runner=body.require_local_runner,
+    )
 
 
 @router.get("/projects/{project_id}/compute-jobs")

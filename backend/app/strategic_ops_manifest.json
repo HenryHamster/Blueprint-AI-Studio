@@ -138,23 +138,23 @@
     {
         "op": "spawn_task",
         "alias": "spawn-task",
-        "description": "Spawn an implementation/research/plan task for a direction.",
+        "description": "Durably dispatch an implementation, research, plan, design, or compute task.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
     },
     {
         "op": "spawn_fix",
-        "alias": "spawn-fix",
-        "description": "Spawn a one-time fix task.",
-        "cli": true,
-        "prompt": true,
-        "internal_reason": null
+        "alias": null,
+        "description": "Deprecated compatibility alias for spawn-task.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Deprecated compatibility alias; use spawn-task."
     },
     {
         "op": "cancel_task",
         "alias": "cancel-task",
-        "description": "Cancel a previously spawned QUEUED/PROVISIONING task with a required reason.",
+        "description": "Cancel a spawned QUEUED/PROVISIONING task or deferred spawn request.",
         "cli": true,
         "prompt": true,
         "internal_reason": null

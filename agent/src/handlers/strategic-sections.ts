@@ -1453,7 +1453,7 @@ export function buildCompletionDebtSection(debt: unknown): string {
       lines.push(`    Linked task(s): ${taskSummaries}${disposeNudge}`);
     }
   }
-  lines.push('\n_Dispose an obligation once its work lands: `./strategic dispose-completion-debt \'{"debt_id":"<id>","disposition":"resolved","evidence":"<what proved it done>"}\'` (use `"dismissed"` with a reason if it no longer applies). When spawning follow-up work, pass `"debt_id":"<id>"` in the spawn-task/spawn-fix DATA to link the task to its obligation._');
+  lines.push('\n_Dispose an obligation once its work lands: `./strategic dispose-completion-debt \'{"debt_id":"<id>","disposition":"resolved","evidence":"<what proved it done>"}\'` (use `"dismissed"` with a reason if it no longer applies). When spawning follow-up work, pass `"debt_id":"<id>"` in the spawn-task DATA to link the task to its obligation._');
   lines.push('_Address open completion debt before adding new obligations in the same area._');
   return lines.join('\n');
 }

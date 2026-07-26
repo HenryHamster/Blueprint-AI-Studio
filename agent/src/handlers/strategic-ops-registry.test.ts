@@ -53,7 +53,6 @@ describe('strategic ops registry — internal consistency', () => {
         expect(e.alias).toBe(e.op.replace(/_/g, '-'));
         expect(e.internalReason).toBeNull();
       } else {
-        // Excluded EXPLICITLY: no alias, and a stated reason (not by omission).
         expect(e.alias, `${e.op} is internal-only but carries an alias`).toBeNull();
         expect(e.internalReason, `${e.op} must state why it is excluded`).toBeTruthy();
       }
