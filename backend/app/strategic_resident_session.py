@@ -52,6 +52,7 @@ from app.models import (
     Project,
     ProjectMessage,
     StrategicCycle,
+    StrategicWatch,
     Task,
     TaskStatus,
     _utcnow,
@@ -118,12 +119,12 @@ RESIDENT_SESSION_REASON_RUNNER_OFFLINE = "runner_offline"
 # interaction before the heartbeat stops renewing the lease (so the legacy
 # cadence reclaims authority) even though the session process is still alive.
 # Operator interaction (a new operator message) re-arms it. Referenced by name;
-# ``runtime_config`` supplies the registered default (14400s / 4h — see
+# ``runtime_config`` supplies the registered default (7200s / 2h — see
 # ``runtime_config_state.py``); this local fallback only applies if the key is
 # ever absent from the registry, so it is pinned to that same 4h value to keep
 # the effective cap self-documenting rather than silently disagreeing with it.
 STRATEGIC_SESSION_MAX_UNATTENDED_SETTING = "strategic_session_max_unattended_seconds"
-_DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 14400  # 4h
+_DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 7200  # 2h
 
 # A task row can remain IN_PROGRESS long after its resident subprocess or runner
 # disappeared. Workday's synchronous ensure path must not trust that row
@@ -901,7 +902,8 @@ async def _compute_resident_work_state(
       created tasks' and their descendant tasks' latest status transitions
       (``Task.updated_at`` advances on every transition via ``onupdate``),
       operator-authored ``ProjectMessage`` arrivals, and ``StrategicCycle``
-      mutation stamps. The agent compares this against the rev it recorded at
+      mutation stamps, plus pending/fired ``StrategicWatch`` changes. The agent
+      compares this against the rev it recorded at
       its last autonomous turn to decide whether the world moved. ``None`` when
       the project has no such activity yet, in which case an older agent
       degrades to floor-tick pacing.
@@ -982,13 +984,23 @@ async def _compute_resident_work_state(
             )
         )
     ).scalar_one_or_none()
+    watch_max = (
+        await session.execute(
+            select(func.max(StrategicWatch.updated_at)).where(
+                StrategicWatch.project_id == project_id,
+                StrategicWatch.state.in_(("pending", "fired", "expired")),
+            )
+        )
+    ).scalar_one_or_none()
     # SQLite returns the raw aggregate as text, while asyncpg returns a
     # tz-aware datetime. The ORM aggregates below use NaiveUTCDateTime.
     if isinstance(task_max, str):
         task_max = datetime.fromisoformat(task_max.replace("Z", "+00:00"))
     if task_max is not None and task_max.tzinfo is not None:
         task_max = task_max.astimezone(timezone.utc).replace(tzinfo=None)
-    stamps = [dt for dt in (task_max, msg_max, cycle_max) if dt is not None]
+    stamps = [
+        dt for dt in (task_max, msg_max, cycle_max, watch_max) if dt is not None
+    ]
     work_state_rev = max(stamps).isoformat() if stamps else None
 
     new_operator_messages = (
@@ -3258,6 +3270,7 @@ async def renew_resident_session_lease(
     work_state_rev, work_state_summary = await _compute_resident_work_state(
         session, project.id, resident_session_id=session_id
     )
+    fired_watch_receipts: list[dict[str, Any]] = []
     # Conversation availability is independent from mutation authority. A
     # resident may answer while a batch strategic cycle is active, but it must
     # stay chat-only until that cycle releases the project's strategic lane.
@@ -3335,6 +3348,7 @@ async def renew_resident_session_lease(
             "status": status,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -3593,10 +3607,37 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
         }
+    # Resolve exact task watches while this heartbeat owns the project mutation
+    # boundary. The existing task-tree work_state_rev remains the wake signal;
+    # these bounded receipts preserve WHICH completion Strategic was awaiting.
+    try:
+        from app.strategic_watches import (
+            resolve_project_task_watches,
+            serialize_watch,
+        )
+
+        _visible_watches = await resolve_project_task_watches(
+            session,
+            project_id=project.id,
+            now=now,
+        )
+        fired_watch_receipts = [serialize_watch(row) for row in _visible_watches]
+        work_state_summary = {
+            **work_state_summary,
+            "fired_watches": len(fired_watch_receipts),
+        }
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] strategic watch resolution failed for session %s — ignored",
+            session_id,
+            exc_info=True,
+        )
+
     # Mirror the exam ledger and message cursor into task.context so a runner
     # restart can read them back on startup (the agent reads task.context at pull
     # time; project.vision is not visible to the agent).
@@ -3782,6 +3823,7 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -3812,6 +3854,7 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -3826,6 +3869,7 @@ async def renew_resident_session_lease(
         "status": refreshed.get("status") or STATUS_ACTIVE,
         "work_state_rev": work_state_rev,
         "work_state_summary": work_state_summary,
+        "fired_watches": fired_watch_receipts,
         "exam_ledger": exam_ledger_str,
         "active_direction_ids": active_direction_ids,
         "direction_grounding": direction_grounding,

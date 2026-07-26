@@ -1459,6 +1459,39 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     expect(p).toContain('dispatch BOTH now');
     expect(p).toContain('staging one behind the other');
   });
+
+  it('puts fired task watches ahead of normal examination until acknowledged', () => {
+    const p = buildAutonomousPrompt(
+      [],
+      [],
+      [],
+      false,
+      3,
+      '',
+      false,
+      [{
+        id: 'watch-1',
+        target_kind: 'task',
+        target_task_id: 'task-1',
+        purpose: 'report the measurement',
+        state: 'fired',
+        terminal_status: 'COMPLETED',
+        receipt: {
+          title: 'Compute the final metric',
+          knowledge_document_ids: ['doc-1'],
+        },
+      }],
+    );
+    expect(p).toContain('FIRED TASK WATCHES');
+    expect(p).toContain('watch=watch-1');
+    expect(p).toContain('task=task-1');
+    expect(p).toContain('report the measurement');
+    expect(p).toContain('documents=doc-1');
+    expect(p).toContain('ack-watch');
+    expect(p.indexOf('FIRED TASK WATCHES')).toBeLessThan(
+      p.indexOf('No operator message is pending'),
+    );
+  });
 });
 
 describe('decisionsRegisterText decisions register', () => {

@@ -482,7 +482,7 @@ class TestNotificationConfigSettings:
         strategic_local_hold_timeout_seconds (900),
         strategic_session_idle_tick_seconds (5),
         strategic_session_turn_timeout_seconds (120),
-        strategic_session_max_unattended_seconds (14400).
+        strategic_session_max_unattended_seconds (7200).
 
         Note: the legacy ``strategic_session_enabled`` feature flag was retired
         from the settings contract; only the cadence/safety knobs remain."""
@@ -493,7 +493,7 @@ class TestNotificationConfigSettings:
         assert data["strategic_local_hold_timeout_seconds"] == 900
         assert data["strategic_session_idle_tick_seconds"] == 5
         assert data["strategic_session_turn_timeout_seconds"] == 120
-        assert data["strategic_session_max_unattended_seconds"] == 14400
+        assert data["strategic_session_max_unattended_seconds"] == 7200
 
         # Integer knobs round-trip and clamp to their documented ranges.
         resp = await client.patch(
@@ -1958,7 +1958,7 @@ class TestEvergreenFillSettingsPersist:
         _shared_state.runtime_config["strategic_local_hold_timeout_seconds"] = 900
         _shared_state.runtime_config["strategic_session_idle_tick_seconds"] = 5
         _shared_state.runtime_config["strategic_session_turn_timeout_seconds"] = 120
-        _shared_state.runtime_config["strategic_session_max_unattended_seconds"] = 14400
+        _shared_state.runtime_config["strategic_session_max_unattended_seconds"] = 7200
 
         await sync_runtime_config_from_state(row)
 

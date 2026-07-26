@@ -57,6 +57,24 @@ export interface MessagesPollResponse {
   server_time?: string;
 }
 
+export interface StrategicWatchReceipt {
+  id: string;
+  target_kind?: 'task';
+  target_task_id?: string;
+  purpose?: string;
+  state?: 'fired' | 'expired' | string;
+  terminal_status?: string | null;
+  receipt?: {
+    title?: string;
+    task_type?: string;
+    terminal_status?: string;
+    latest_status_message?: string;
+    knowledge_document_ids?: string[];
+    reason?: string;
+    [key: string]: unknown;
+  };
+}
+
 export interface SessionHeartbeatResponse {
   authority_held?: boolean;
   leased_until?: string;
@@ -71,6 +89,10 @@ export interface SessionHeartbeatResponse {
   /** Optional compact counts feeding the tick context (in-flight tasks, terminal
    *  transitions since last look, new operator messages). Advisory only. */
   work_state_summary?: Record<string, unknown>;
+  /** Exact task-completion agenda receipts. Unlike work_state_rev (which only
+   *  says the world moved), these remain present until Strategic acknowledges
+   *  the result through ack-watch. */
+  fired_watches?: StrategicWatchReceipt[];
   /** Serialized exam-ledger echoed from the heartbeat note, or null. Agents
    *  ignore this field; it is only used for roundtrip integrity checks. */
   exam_ledger?: string | null;
@@ -2395,6 +2417,7 @@ export function buildAutonomousPrompt(
   maxOpsPerTurn = 3,
   decisionsRegisterText = '',
   operatorDecisionReview: PendingOperatorDecisionReview | boolean = false,
+  firedWatches: StrategicWatchReceipt[] = [],
 ): string {
   const lines: string[] = [];
 
@@ -2435,6 +2458,29 @@ export function buildAutonomousPrompt(
         : '',
       '',
     );
+  }
+
+  if (firedWatches.length > 0) {
+    lines.push(
+      'FIRED TASK WATCHES (handle before normal rotating examination):',
+      'These are durable tasks you explicitly waited on. Inspect the result and',
+      'documents, report or act as appropriate, then acknowledge each receipt with',
+      '`./strategic ack-watch --json \'{"watch_id":"<id>","disposition":"reported|acted|no_action|superseded","note":"<brief reason>"}\'`.',
+    );
+    for (const watch of firedWatches.slice(0, 20)) {
+      const receipt = watch.receipt ?? {};
+      const title = typeof receipt.title === 'string' ? receipt.title : 'task';
+      const status = watch.terminal_status
+        ?? (typeof receipt.terminal_status === 'string' ? receipt.terminal_status : watch.state ?? 'ready');
+      const purpose = typeof watch.purpose === 'string' && watch.purpose
+        ? `; purpose=${watch.purpose}`
+        : '';
+      const documents = Array.isArray(receipt.knowledge_document_ids) && receipt.knowledge_document_ids.length > 0
+        ? `; documents=${receipt.knowledge_document_ids.join(',')}`
+        : '';
+      lines.push(`- watch=${watch.id}; task=${watch.target_task_id ?? 'unknown'}; ${title}; status=${status}${purpose}${documents}`.slice(0, 1200));
+    }
+    lines.push('');
   }
 
   lines.push(

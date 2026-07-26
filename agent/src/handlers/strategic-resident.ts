@@ -54,6 +54,7 @@ import {
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
   type PendingOperatorDecisionReview,
   type CheckpointGrounding, type CheckpointStateResponse,
+  type StrategicWatchReceipt,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -862,6 +863,9 @@ export async function handleStrategicResident(
   // Latest work_state_rev observed on a heartbeat (undefined until the backend
   // that populates it lands — absence degrades to floor-tick pacing).
   let currentWorkStateRev: string | null = null;
+  // Exact task-completion receipts returned by the heartbeat. They remain in
+  // autonomous prompts until the backend observes an explicit ack-watch.
+  let firedStrategicWatches: StrategicWatchReceipt[] = [];
   // Pacing for the "watching" ephemeral status line emitted while gated-idle so
   // deliberate quiet looks different from a dark/crashed session.
   let lastWatchingEmitAt = 0;
@@ -1406,6 +1410,14 @@ export async function handleStrategicResident(
       // Track the work-state revision (when the backend ships it) so state-gated
       // pacing can fire on a real world change; absence leaves it null (floor tick).
       if (typeof resp.work_state_rev === 'string') currentWorkStateRev = resp.work_state_rev;
+      if (Array.isArray(resp.fired_watches)) {
+        firedStrategicWatches = resp.fired_watches.filter(
+          (watch): watch is StrategicWatchReceipt =>
+            watch !== null
+            && typeof watch === 'object'
+            && typeof watch.id === 'string',
+        );
+      }
       // Refresh the surface catalog from the backend's live direction list so
       // newly created or retired directions enter/leave the rotation mid-session.
       if (Array.isArray(resp.active_direction_ids)) {
@@ -1935,6 +1947,7 @@ export async function handleStrategicResident(
           cfg.maxOpsPerTurn,
           decisionsRegisterText(decisionsReg),
           reviewForTurn ?? false,
+          firedStrategicWatches,
         ),
         false,
       );
