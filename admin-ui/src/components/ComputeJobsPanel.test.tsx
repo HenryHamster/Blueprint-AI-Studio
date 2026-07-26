@@ -983,7 +983,7 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(openSpy).toHaveBeenCalled();
   });
 
-  test('surfaces COMPUTE_RESULT artifact with a resolvable reference link', async () => {
+  test('surfaces an artifact bundle with a resolvable reference link', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
@@ -995,7 +995,7 @@ describe('ComputeJobsPanel render + kill', () => {
     ]));
     const { findByText, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     // Primary artifact affordance is an openable link.
-    const artifactLink = await findByText('COMPUTE_RESULT artifact');
+    const artifactLink = await findByText('Download artifact bundle');
     expect(artifactLink.closest('a')).toHaveAttribute(
       'href',
       'https://storage.example.com/jobs/job-1/result.json',
