@@ -164,6 +164,31 @@ describe('startResidentClaudeSession', () => {
     expect(args).toContain('--input-format');
     session.close();
   });
+  it('launches the receipt-bound Workday reply tool through MCP when configured', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({
+      replyTool: { mcpConfigPath: '/tmp/workday-reply-mcp.json' },
+    });
+    const [, args] = vi.mocked(spawn).mock.calls[0] as unknown as [string, string[]];
+    expect(args).toEqual(expect.arrayContaining([
+      '--mcp-config', '/tmp/workday-reply-mcp.json',
+      '--strict-mcp-config',
+      '--allowedTools', 'mcp__workday__reply_to_operator',
+    ]));
+    session.close();
+  });
+
+  it('refuses a known Claude CLI that cannot isolate the reply MCP config', () => {
+    vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(
+      new Set(['--mcp-config', '--allowedTools']),
+    );
+
+    expect(() => startResidentClaudeSession({
+      replyTool: { mcpConfigPath: '/tmp/workday-reply-mcp.json' },
+    })).toThrow(/--strict-mcp-config/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
   it('classifies provider rate limits from bounded stderr evidence', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
@@ -541,56 +566,57 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
-  it('flags sentOperatorMessage only after ./messages send SUCCEEDS (tool_result, no error)', async () => {
+  it('flags sentOperatorMessage only after the native reply MCP tool succeeds', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
-    const session = startResidentClaudeSession({});
+    const session = startResidentClaudeSession({ replyTool: { mcpConfigPath: '/tmp/workday-mcp.json' } });
     const turn = session.sendTurn('reply to operator');
     ctl.pushLine({
       type: 'assistant',
-      message: { content: [{ type: 'tool_use', id: 'toolu_send', name: 'Bash', input: { command: "./messages send 'here you go'" } }] },
+      message: { content: [{ type: 'tool_use', id: 'toolu_reply', name: 'mcp__workday__reply_to_operator', input: { content: 'here you go' } }] },
     });
-    // The send's tool_result comes back without an error → confirmed delivery.
+    // The MCP tool result comes back without an error → confirmed staging.
     ctl.pushLine({
       type: 'user',
-      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_send', content: 'ok', is_error: false }] },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_reply', content: 'accepted', is_error: false }] },
     });
     ctl.pushLine({ type: 'result', result: 'done' });
     const r = await turn;
     expect(r.sentOperatorMessage).toBe(true);
+    expect(r.operatorReply).toEqual({ type: 'NOTE', content: 'here you go' });
     session.close();
   });
 
-  it('does NOT flag sentOperatorMessage when ./messages send FAILS (tool_result is_error)', async () => {
+  it('does NOT treat a successful ./messages send as a Workday operator reply', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
-    const session = startResidentClaudeSession({});
+    const session = startResidentClaudeSession({ replyTool: { mcpConfigPath: '/tmp/workday-mcp.json' } });
     const turn = session.sendTurn('reply to operator');
     ctl.pushLine({
       type: 'assistant',
-      message: { content: [{ type: 'tool_use', id: 'toolu_bad', name: 'Bash', input: { command: "./messages send 'lost reply'" } }] },
+      message: { content: [{ type: 'tool_use', id: 'toolu_bad', name: 'Bash', input: { command: "./messages send 'not a reply'" } }] },
     });
-    // The curl failed → is_error: the flag must stay false so persistReply runs.
     ctl.pushLine({
       type: 'user',
-      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bad', content: 'curl: (7) failed', is_error: true }] },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bad', content: 'ok', is_error: false }] },
     });
     ctl.pushLine({ type: 'result', result: 'tried' });
     const r = await turn;
     expect(r.sentOperatorMessage).toBe(false);
+    expect(r.operatorReply).toBeNull();
     session.close();
   });
 
-  it('does NOT flag sentOperatorMessage when the send has no confirming tool_result', async () => {
+  it('does NOT flag sentOperatorMessage when native reply has no confirming tool_result', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
-    const session = startResidentClaudeSession({});
+    const session = startResidentClaudeSession({ replyTool: { mcpConfigPath: '/tmp/workday-mcp.json' } });
     const turn = session.sendTurn('reply to operator');
     ctl.pushLine({
       type: 'assistant',
-      message: { content: [{ type: 'tool_use', id: 'toolu_x', name: 'Bash', input: { command: "./messages send 'unconfirmed'" } }] },
+      message: { content: [{ type: 'tool_use', id: 'toolu_x', name: 'mcp__workday__reply_to_operator', input: { content: 'unconfirmed' } }] },
     });
-    // Turn ends before any tool_result — unconfirmed, so persistReply backstops.
+    // Turn ends before any tool_result — unconfirmed, so the handler rejects it.
     ctl.pushLine({ type: 'result', result: 'done' });
     const r = await turn;
     expect(r.sentOperatorMessage).toBe(false);
@@ -743,7 +769,7 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
-  it('does not mis-attribute a force-settled turn’s late ./messages send to the NEXT turn', async () => {
+  it('does not mis-attribute a force-settled turn’s late native reply to the NEXT turn', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
     const session = startResidentClaudeSession({ turnTimeoutMs: 20_000, hardTurnTimeoutMs: 10 * 60_000 });
@@ -754,11 +780,11 @@ describe('startResidentClaudeSession', () => {
     expect(rA.timedOut).toBe(true);
 
     const turnB = session.sendTurn('B');
-    // A's late confirmed ./messages send (tool_use + successful tool_result) must
+    // A's late confirmed native reply (tool_use + successful tool_result) must
     // NOT flip B.sentOperatorMessage — it was A's reply, not B's.
     ctl.pushLine({
       type: 'assistant',
-      message: { content: [{ type: 'tool_use', id: 'toolu_A', name: 'Bash', input: { command: "./messages send 'A reply'" } }] },
+      message: { content: [{ type: 'tool_use', id: 'toolu_A', name: 'mcp__workday__reply_to_operator', input: { content: 'A reply' } }] },
     });
     ctl.pushLine({
       type: 'user',

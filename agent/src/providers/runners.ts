@@ -76,6 +76,8 @@ const CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS: Readonly<Record<string, number>> = {
   '--tools': 1,
   '--disable-slash-commands': 0,
   '--strict-mcp-config': 0,
+  '--mcp-config': 1,
+  '--allowedTools': 1,
   '--no-session-persistence': 0,
 };
 const claudeCapabilityCache = new Map<string, ReadonlySet<string> | null>();

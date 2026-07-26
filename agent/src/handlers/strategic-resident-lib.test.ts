@@ -1109,14 +1109,14 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('never heartbeat or timer chatter');
   });
 
-  it('bootstrap_prompt_uses_quote_safe_message_delivery', () => {
+  it('bootstrap_prompt_uses_native_workday_reply_tool', () => {
     const p = buildBootstrapPrompt(base);
-    expect(p).toContain("./messages send '<answer>'");
-    expect(p).toContain('./messages send --stdin');
-    expect(p).toContain('apostrophe-heavy or multiline replies');
-    expect(p).toContain('heredoc or pipe');
+    expect(p).toContain('native `reply_to_operator` tool exactly once');
+    expect(p).toMatch(/normal assistant\s+text does not deliver a Workday reply/);
+    expect(p).toMatch(/Do not use `\.\/messages send` or\s+`\.\/strategic create-message` as an operator reply/);
+    expect(p).toMatch(/full user-facing answer in\s+`content`/);
     expect(p).toContain('NEVER call `./messages resolve` for an operator');
-    expect(p).toContain('atomically commits that staged reply');
+    expect(p).toContain("atomically commits the native tool's receipt-bound reply");
   });
 
   it('bootstrap_prompt_states_dispatched_work_runs_concurrently', () => {
