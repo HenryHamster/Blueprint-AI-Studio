@@ -203,6 +203,8 @@
         "test_start_adopts_task_and_liveness_heartbeat_preserves_lease",
         "test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears",
         "test_reload_ensure_keeps_worker_during_transient_heartbeat_gap",
+        "test_reload_ensure_keeps_fresh_retry_heartbeat_past_startup_window",
+        "test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale",
         "test_reload_ensure_replaces_worker_stale_past_recovery_threshold",
         "test_stop_ends_task_releases_continuation_and_hands_off_messages",
         "test_stop_handoff_is_atomic_with_session_end",
