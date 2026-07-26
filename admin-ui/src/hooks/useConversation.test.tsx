@@ -436,6 +436,35 @@ describe('conversation pagination', () => {
 describe('initial window and newest-message pinning', () => {
   afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
+  test('fetchInitial loads the first bounded transcript page without waiting for a poll epoch', async () => {
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { has_more: false, next_before_sequence: null, items: [message(50)] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+
+    renderHook(() => useConversation({
+      enabled: true,
+      fetchInitial: true,
+      projectId: 'project-1',
+      actorUserId: 'actor-1',
+      includeMessageId: null,
+      getMessages: () => messages,
+      setMessages,
+      onLoadingChange: vi.fn(),
+      onError: vi.fn(),
+    }));
+
+    await waitFor(() => expect(fetchStrategicConversation).toHaveBeenCalledTimes(1));
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
+      includeMessageId: null,
+      limit: CONVERSATION_INITIAL_WINDOW,
+    });
+    expect(messages.map(item => item.sequence)).toEqual([50]);
+  });
+
   test('initial fetch uses CONVERSATION_INITIAL_WINDOW as the limit', async () => {
     let messages: ProjectMessage[] = [];
     fetchStrategicConversation.mockResolvedValue({
@@ -466,9 +495,8 @@ describe('initial window and newest-message pinning', () => {
     expect(fetchStrategicConversation.mock.calls[0][1]).not.toHaveProperty('search');
   });
 
-  test('CONVERSATION_INITIAL_WINDOW is between 15 and 25 messages', () => {
-    expect(CONVERSATION_INITIAL_WINDOW).toBeGreaterThanOrEqual(15);
-    expect(CONVERSATION_INITIAL_WINDOW).toBeLessThanOrEqual(25);
+  test('CONVERSATION_INITIAL_WINDOW keeps a useful bounded mobile transcript', () => {
+    expect(CONVERSATION_INITIAL_WINDOW).toBe(50);
   });
 
   test('hasMore is true when server has older messages beyond the initial window', async () => {

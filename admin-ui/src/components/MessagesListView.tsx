@@ -926,6 +926,8 @@ function ConversationVirtualList({
   const listRef = useListRef(null);
   const rowHeight = useDynamicRowHeight({ defaultRowHeight: 96 });
   const renderedRangeRef = useRef({ startIndex: -1, stopIndex: -1 });
+  const userHasScrolledRef = useRef(false);
+  const autoLoadingOlderRef = useRef(false);
   const pendingNavigationRef = useRef<{
     index: number;
     attempts: number;
@@ -979,20 +981,40 @@ function ConversationVirtualList({
     },
   }), [conversationListRef, listRef, rows]);
 
+  const handleLoadOlder = useCallback(() => {
+    const element = listRef.current?.element;
+    if (element && onLoadOlderConversationMessages) {
+      void preserveScrollAnchorAfterPrepend(element, onLoadOlderConversationMessages);
+    }
+  }, [listRef, onLoadOlderConversationMessages]);
+
   const handleConversationRowsRendered = useCallback((visible: { startIndex: number; stopIndex: number }) => {
     renderedRangeRef.current = visible;
     const pending = pendingNavigationRef.current;
-    if (!pending) return;
-    if (pending.index >= visible.startIndex && pending.index <= visible.stopIndex) {
+    if (pending && pending.index >= visible.startIndex && pending.index <= visible.stopIndex) {
       pendingNavigationRef.current = null;
       window.clearTimeout(pending.timeout);
       pending.resolve(true);
-      return;
+    } else if (pending) {
+      if (pending.attempts < 12) {
+        pending.attempts += 1;
+        listRef.current?.scrollToRow({ index: pending.index, align: 'center', behavior: 'instant' });
+      }
     }
-    if (pending.attempts >= 12) return;
-    pending.attempts += 1;
-    listRef.current?.scrollToRow({ index: pending.index, align: 'center', behavior: 'instant' });
-  }, [listRef]);
+    // Match native chat behavior on touch/wheel scrolling: reaching the top
+    // retrieves the next bounded history page. The explicit top button stays
+    // available for keyboard and as a fallback if scrolling is interrupted.
+    if (
+      userHasScrolledRef.current
+      && visible.startIndex === 0
+      && rows[0]?.kind === 'load_older'
+      && !loadingOlderConversationMessages
+      && !autoLoadingOlderRef.current
+    ) {
+      autoLoadingOlderRef.current = true;
+      handleLoadOlder();
+    }
+  }, [handleLoadOlder, listRef, loadingOlderConversationMessages, rows]);
 
   useEffect(() => () => {
     if (!pendingNavigationRef.current) return;
@@ -1006,12 +1028,23 @@ function ConversationVirtualList({
     return () => { scrollRef.current = null; };
   });
 
-  const handleLoadOlder = useCallback(() => {
+  useEffect(() => {
     const element = listRef.current?.element;
-    if (element && onLoadOlderConversationMessages) {
-      void preserveScrollAnchorAfterPrepend(element, onLoadOlderConversationMessages);
-    }
-  }, [listRef, onLoadOlderConversationMessages]);
+    if (!element) return;
+    const markUserScroll = () => { userHasScrolledRef.current = true; };
+    element.addEventListener('touchstart', markUserScroll, { passive: true });
+    element.addEventListener('wheel', markUserScroll, { passive: true });
+    element.addEventListener('keydown', markUserScroll);
+    return () => {
+      element.removeEventListener('touchstart', markUserScroll);
+      element.removeEventListener('wheel', markUserScroll);
+      element.removeEventListener('keydown', markUserScroll);
+    };
+  }, [listRef]);
+
+  useEffect(() => {
+    if (!loadingOlderConversationMessages) autoLoadingOlderRef.current = false;
+  }, [loadingOlderConversationMessages, hasOlderConversationMessages]);
 
   const rowProps: ConversationRowData = useMemo(() => ({
     rows,

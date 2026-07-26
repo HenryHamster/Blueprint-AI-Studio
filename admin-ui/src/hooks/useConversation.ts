@@ -7,8 +7,8 @@ import type { ProjectMessage } from '../types/messages';
 import { parseTimestamp } from '../utils/time';
 import { messageHasClientIdentity } from '../utils/conversationMessageIdentity';
 
-/** Mobile-first initial window: load only the most recent N messages on open. */
-export const CONVERSATION_INITIAL_WINDOW = 20;
+/** Mobile-first initial window: enough recent context without fetching an entire transcript. */
+export const CONVERSATION_INITIAL_WINDOW = 50;
 
 export function compareConversationMessages(a: ProjectMessage, b: ProjectMessage): number {
   if (a.sequence != null || b.sequence != null) {
@@ -71,6 +71,12 @@ export function conversationMessagesEqual(a: ProjectMessage, b: ProjectMessage):
 
 interface UseConversationOptions {
   enabled: boolean;
+  /**
+   * Fetch the initial transcript directly instead of waiting for a strategic
+   * read-model poll. This keeps chat usable when the read model is already
+   * hydrated but has not emitted its first poll epoch yet.
+   */
+  fetchInitial?: boolean;
   projectId: string | null;
   actorUserId: string | null;
   includeMessageId: string | null;
@@ -96,6 +102,7 @@ interface UseConversationOptions {
 
 export function useConversation({
   enabled,
+  fetchInitial = false,
   projectId,
   actorUserId,
   includeMessageId,
@@ -124,6 +131,7 @@ export function useConversation({
   const refreshAbortRef = useRef<AbortController | null>(null);
   const olderAbortRef = useRef<AbortController | null>(null);
   const ackedRealtimeMessageIdsRef = useRef<Set<string>>(new Set());
+  const initialFetchScopeRef = useRef<string | null>(null);
 
   useEffect(() => {
     activeScopeRef.current = `${actorUserId ?? ''}:${projectId ?? ''}:${normalizedSearch}`;
@@ -241,6 +249,20 @@ export function useConversation({
   useEffect(() => {
     gapContinuationRef.current = () => { void refresh(true); };
   }, [refresh]);
+
+  // The Strategic read model is intentionally allowed to refresh this hook,
+  // but it cannot be the only source of the first transcript page: a hydrated
+  // model may not emit a new epoch after the chat surface mounts. Fetch one
+  // bounded page for every project/target scope, then let normal poll/realtime
+  // updates continue to fill the tail.
+  useEffect(() => {
+    if (!fetchInitial || !enabled || !projectId || !actorUserId) return;
+    const scope = `${actorUserId}:${projectId}:${includeMessageId ?? ''}`;
+    if (initialFetchScopeRef.current === scope) return;
+    initialFetchScopeRef.current = scope;
+    onLoadingChange(true);
+    void refresh(false);
+  }, [actorUserId, enabled, fetchInitial, includeMessageId, onLoadingChange, projectId, refresh]);
 
   const loadOlder = useCallback(async () => {
     if (!enabled || !projectId || !actorUserId || normalizedSearch || loadingOlder || !hasMore || nextBeforeSequence == null) return;

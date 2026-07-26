@@ -440,19 +440,34 @@ describe('MessagesPanel chrome modes', () => {
     expect(onOpenCommandPalette).toHaveBeenCalledTimes(1);
   });
 
-  test('starter prompts render on empty conversation and prefill the composer', async () => {
+  test('empty conversation does not render suggested-message chips', async () => {
     const el = await renderPanel({ filterChrome: 'minimal' });
     const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
     if (!textarea) throw new Error('expected minimal composer textarea');
 
     expect(el.textContent).toContain('Workday can research, plan, and spawn budgeted compute experiments from chat.');
-    const starter = Array.from(el.querySelectorAll('button')).find(button => button.textContent === 'What should I research next?');
-    if (!starter) throw new Error('starter prompt button not found');
+    expect(textarea.value).toBe('');
+    expect(el.textContent).not.toContain('What should I research next?');
+    expect(el.textContent).not.toContain('Plan a budgeted compute experiment for this idea.');
+  });
 
-    await act(async () => { starter.click(); });
+  test('minimal chat fetches its initial transcript when the Strategic read model is already hydrated', async () => {
+    const history = Array.from({ length: 3 }, (_, index) => makeMsg({
+      id: `history-${index + 1}`,
+      sequence: index + 1,
+      content: `History message ${index + 1}`,
+      surface: 'conversation',
+    }));
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState(),
+    }, history);
 
-    expect(textarea.value).toBe('What should I research next?');
-    expect(el.textContent).toContain('What should I research next?');
+    await waitFor(() => expect(el.textContent).toContain('History message 3'));
+    const conversationRequests = vi.mocked(apiFetch).mock.calls
+      .map(call => String(call[0]))
+      .filter(url => url.includes('/strategic-conversation'));
+    expect(conversationRequests.some(url => url.includes('limit=50'))).toBe(true);
   });
 
   test('opens a durable tool handoff as an exact conversation draft', async () => {
