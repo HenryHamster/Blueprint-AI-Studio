@@ -54,7 +54,7 @@ import {
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
   type PendingOperatorDecisionReview,
   type CheckpointGrounding, type CheckpointStateResponse,
-  type StrategicWatchReceipt,
+  type StrategicWatchReceipt, type ResidentActivityUpdate,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -874,6 +874,26 @@ export async function handleStrategicResident(
   // (which would still see no .git if the recovery clone hasn't fully landed yet).
   // Reset to false when .git is observed, arming the guard for the next event.
   let workspaceVanishHandled = false;
+  let residentActivity: ResidentActivityUpdate = {
+    phase: 'waiting',
+    phase_started_at: new Date().toISOString(),
+    last_action: 'Waiting for operator input or project movement',
+    next_review_at: null,
+  };
+  const setResidentActivity = (
+    phase: ResidentActivityUpdate['phase'],
+    lastAction: string,
+    nextReviewAt: string | null = null,
+  ): void => {
+    residentActivity = {
+      phase,
+      phase_started_at: residentActivity.phase === phase
+        ? residentActivity.phase_started_at
+        : new Date().toISOString(),
+      last_action: lastAction.slice(0, 240),
+      next_review_at: nextReviewAt,
+    };
+  };
 
   // ── Session + streaming wiring ──────────────────────────────────────────────
   const streamer = new SessionStreamer(ws, sessionId, taskId);
@@ -887,8 +907,10 @@ export async function handleStrategicResident(
       // A tool call / tool result — a LIVE, ephemeral activity one-liner. Prefer
       // the parser's compact `{kind,text}`; fall back to a bare tool label.
       if (ev.activity) {
+        setResidentActivity('working', ev.activity.text);
         streamer.activity(ev.activity.kind as StreamFrameKind, ev.activity.text);
       } else if (ev.kind === 'tool') {
+        setResidentActivity('working', ev.text || ev.toolName || 'Running tool');
         streamer.tool(ev.toolName, ev.text);
       }
     } else if (ev.kind === 'error' && ev.text) {
@@ -1382,6 +1404,7 @@ export async function handleStrategicResident(
       // Persist the decisions register so a full restart (VM recycle, process
       // crash) can restore settled decisions from task.context._decisions_reg.
       decisions_reg: decisionsReg.length > 0 ? serializeDecisionsReg(decisionsReg) : null,
+      activity: residentActivity,
     };
     if (handledIds && handledIds.length > 0) {
       body.handled_message_ids = handledIds;
@@ -1576,6 +1599,10 @@ export async function handleStrategicResident(
     msgs: ResidentInboundMessage[],
   ): Promise<'stop' | 'continue'> => {
     const pickupLagMs = computePickupLagMs(msgs);
+    setResidentActivity(
+      'working',
+      `Responding to ${msgs.length} operator message${msgs.length === 1 ? '' : 's'}`,
+    );
     const coveredMessageIds = msgs
       .map(message => typeof message.id === 'string' ? message.id.trim() : '')
       .filter(Boolean);
@@ -1592,6 +1619,15 @@ export async function handleStrategicResident(
     } catch (error) {
       if (!isRetryableArtifactAttachmentError(error)) throw error;
       rollbackPendingOperatorAdmission();
+      setResidentActivity(
+        'waiting',
+        'Waiting to retry a temporarily unavailable Whiteboard revision',
+        new Date(Date.now() + Math.min(
+          30_000,
+          Math.max(cfg.messagePollMs, 1_500)
+            * (2 ** Math.min(artifactRetryFailures, 4)),
+        )).toISOString(),
+      );
       streamer.status('required Whiteboard revision temporarily unavailable — retrying');
       sendLog(ws, `[resident] ${error.message}; restored operator message admission for retry\n`);
       const retryMs = Math.min(
@@ -1762,6 +1798,11 @@ export async function handleStrategicResident(
     // covered IDs handled and persisted the restart-critical turn metadata.
     // The heartbeat only renews authority and reports ancillary session state;
     // it must never expand the covered set after a crash/retry.
+    setResidentActivity(
+      'waiting',
+      'Operator reply delivered; checking project state',
+      new Date(Date.now() + cfg.messagePollMs).toISOString(),
+    );
     const hb = await heartbeat(true);
     if (hb === null) {
       stopReason = 'operator_post_reply_heartbeat_failed';
@@ -1875,6 +1916,13 @@ export async function handleStrategicResident(
       // message re-engages) so the NEXT iteration reopens the autonomous path.
       // We never self-prompt or mutate strategic state on a lapsed lease.
       if (!autonomousActive(cfg.autonomousEnabled, authorityHeld)) {
+        setResidentActivity(
+          'waiting',
+          authorityHeld
+            ? 'Waiting in chat-only mode'
+            : 'Waiting for operator interaction to re-arm autonomy',
+          new Date(Date.now() + cfg.messagePollMs).toISOString(),
+        );
         // Poll operator messages at the fast cadence (the fast path at the top of
         // the loop does the actual pickup); heartbeat only when the paced liveness
         // interval is due so passive mode doesn't hammer the backend.
@@ -1901,6 +1949,14 @@ export async function handleStrategicResident(
           ? Number.POSITIVE_INFINITY : Date.now() - lastAutonomousTurnAt,
         floorTickMs: cfg.minTickMs,
       })) {
+        const nextReviewAt = lastAutonomousTurnAt === 0
+          ? new Date().toISOString()
+          : new Date(lastAutonomousTurnAt + cfg.minTickMs).toISOString();
+        setResidentActivity(
+          'waiting',
+          'Watching for task, project, or operator movement',
+          nextReviewAt,
+        );
         if (livenessHeartbeatDue()) {
           const hb = await livenessHeartbeat();
           if (hb?.stop_requested) break;
@@ -1938,6 +1994,7 @@ export async function handleStrategicResident(
       // Only a recovered decision or NO-DECISION may clear this snapshot.
       const reviewForTurn = operatorDecisionReview;
       lastAutonomousTurnAt = Date.now();
+      setResidentActivity('working', 'Reviewing project state');
       const turnPromise = runTurn(
         buildAutonomousPrompt(
           focus,
@@ -2128,6 +2185,13 @@ export async function handleStrategicResident(
       // state transition: tick verdict, exam ledger, decisions register, review,
       // agenda, corrective state, and capture telemetry are all classified first.
       // Compaction remains later so the operator-first ordering is unchanged.
+      setResidentActivity(
+        'waiting',
+        r.appliedStrategicOp
+          ? 'Strategic progress recorded; watching for movement'
+          : 'Review complete; watching for movement',
+        new Date(lastAutonomousTurnAt + cfg.minTickMs).toISOString(),
+      );
       const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
       // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
       // writes are already folded into the rev we compare against next iteration.

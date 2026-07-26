@@ -336,6 +336,57 @@ describe('computeResidentActivityState', () => {
     const state = computeResidentActivityState(transcript, [], session({ updated_at: freshAt }), NOW);
     expect(state?.phase).toBe('executing');
   });
+
+  it('prefers the durable activity contract and carries idle/message/watch detail', () => {
+    const state = computeResidentActivityState(
+      [],
+      [],
+      session({
+        activity: {
+          phase: 'waiting',
+          phase_started_at: '2026-06-01T11:59:00Z',
+          last_action: 'Watching task completions',
+          pending_operator_messages: 2,
+          idle_remaining_seconds: 3540,
+          pending_watches: 1,
+          fired_watches: 2,
+        },
+      }),
+      NOW,
+    );
+    expect(state).toMatchObject({
+      phase: 'idle',
+      durablePhase: 'waiting',
+      label: 'Waiting',
+      detail: 'Watching task completions',
+      idleRemainingSeconds: 3540,
+      pendingOperatorMessages: 2,
+      pendingWatches: 1,
+      firedWatches: 2,
+    });
+  });
+
+  it('renders the durable pre-stop warning as non-ticking stopping state', () => {
+    const state = computeResidentActivityState(
+      [],
+      [],
+      session({
+        activity: {
+          phase: 'stopping',
+          last_action: 'Idle limit approaching',
+          idle_remaining_seconds: 240,
+        },
+      }),
+      NOW,
+    );
+    expect(state).toMatchObject({
+      phase: 'idle',
+      durablePhase: 'stopping',
+      label: 'Stopping soon',
+      idleRemainingSeconds: 240,
+    });
+    expect(state?.startMs).toBeUndefined();
+  });
 });
 
 describe('countStrategicReplies', () => {

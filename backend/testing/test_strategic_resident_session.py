@@ -7,7 +7,7 @@ handoff, and reaper contracts directly.
 """
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from inspect import unwrap
 import uuid
 from unittest.mock import AsyncMock
@@ -135,6 +135,84 @@ def test_session_state_helpers_remain_table_free():
     )
     assert snapshot is not None
     assert snapshot["session_id"] == "ss-restored"
+
+
+def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(
+    monkeypatch,
+):
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 7200)
+    now = datetime.fromisoformat("2026-07-25T12:00:00")
+    snapshot = resident_session_snapshot(
+        {
+            RESIDENT_SESSION_KEY: {
+                "session_id": "ss-activity",
+                "status": "active",
+                "stop_requested": False,
+                "started_at": "2026-07-25T10:00:00",
+                "updated_at": "2026-07-25T11:59:30",
+                "last_operator_interaction_at": "2026-07-25T11:00:00",
+                "activity": {
+                    "phase": "working",
+                    "phase_started_at": "2026-07-25T11:59:00",
+                    "last_action": "x" * 500,
+                    "pending_operator_messages": 3,
+                    "next_review_at": "2026-07-25T12:05:00",
+                    "pending_watches": 2,
+                    "fired_watches": 1,
+                },
+            }
+        },
+        now=now,
+    )
+
+    assert snapshot is not None
+    assert snapshot["activity"] == {
+        "phase": "working",
+        "phase_started_at": "2026-07-25T11:59:00",
+        "last_action": "x" * 240,
+        "pending_operator_messages": 3,
+        "next_review_at": "2026-07-25T12:05:00",
+        "idle_remaining_seconds": 3600,
+        "pending_watches": 2,
+        "fired_watches": 1,
+    }
+
+
+def test_session_snapshot_warns_near_idle_end_and_freezes_when_ended(monkeypatch):
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 600)
+    vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "ss-idle-warning",
+            "status": "active",
+            "stop_requested": False,
+            "started_at": "2026-07-25T11:50:00",
+            "updated_at": "2026-07-25T11:58:00",
+            "last_operator_interaction_at": "2026-07-25T11:50:00",
+            "activity": {"phase": "waiting", "last_action": "Watching tasks"},
+        }
+    }
+    warning = resident_session_snapshot(
+        vision,
+        now=datetime.fromisoformat("2026-07-25T11:56:00"),
+    )
+    assert warning is not None
+    assert warning["activity"]["phase"] == "stopping"
+    assert warning["activity"]["idle_remaining_seconds"] == 240
+
+    vision[RESIDENT_SESSION_KEY].update(
+        {
+            "status": "ended",
+            "stop_requested": True,
+            "ended_at": "2026-07-25T12:00:00",
+        }
+    )
+    ended = resident_session_snapshot(
+        vision,
+        now=datetime.fromisoformat("2026-07-25T13:00:00"),
+    )
+    assert ended is not None
+    assert ended["activity"]["phase"] == "ended"
+    assert ended["activity"]["idle_remaining_seconds"] == 0
 
 
 @pytest.mark.asyncio

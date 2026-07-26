@@ -75,6 +75,13 @@ export interface StrategicWatchReceipt {
   };
 }
 
+export interface ResidentActivityUpdate {
+  phase: 'working' | 'waiting';
+  phase_started_at: string;
+  last_action: string;
+  next_review_at?: string | null;
+}
+
 export interface SessionHeartbeatResponse {
   authority_held?: boolean;
   leased_until?: string;
