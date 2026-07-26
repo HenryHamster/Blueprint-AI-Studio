@@ -780,8 +780,13 @@ exit $rc
   excludeAgentHelpers();
 }
 
-export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
+export function writeMessagesHelper(
+  taskIdRaw: string,
+  workspace: string = WORKSPACE,
+  options: { residentReplyOnly?: boolean } = {},
+): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
+  const residentReplyOnly = options.residentReplyOnly === true;
   const replyKeyPath = shellEscapeDoubleQuoted(
     path.resolve(workspace, '.resident-reply-idempotency-key').replace(/\\/g, '/'),
   );
@@ -810,6 +815,7 @@ ${agentTokenShellFn()}
 ${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
+RESIDENT_REPLY_ONLY="${residentReplyOnly ? '1' : '0'}"
 REPLY_KEY_PATH="${replyKeyPath}"
 REPLY_RECEIPT_PATH="${replyReceiptPath}"
 STAGED_REPLY_PATH="${stagedReplyPath}"
@@ -864,6 +870,10 @@ if [ "$OP" = "send" ]; then
   }
   printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
 elif [ "$OP" = "resolve" ]; then
+  if [ "$RESIDENT_REPLY_ONLY" = "1" ]; then
+    echo "[ERROR] resolve is disabled for Resident sessions; use ./messages send so the runtime can commit the reply and mark the operator message handled atomically" >&2
+    exit 2
+  fi
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
   PAYLOAD=$(printf '{"task_id":%s,"op":"resolve_message","data":{"message_id":%s,"resolution":%s}}' \\

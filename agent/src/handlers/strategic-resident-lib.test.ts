@@ -1115,6 +1115,8 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('./messages send --stdin');
     expect(p).toContain('apostrophe-heavy or multiline replies');
     expect(p).toContain('heredoc or pipe');
+    expect(p).toContain('NEVER call `./messages resolve` for an operator');
+    expect(p).toContain('atomically commits that staged reply');
   });
 
   it('bootstrap_prompt_states_dispatched_work_runs_concurrently', () => {

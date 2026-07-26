@@ -1144,6 +1144,47 @@ async def test_resident_reply_receipt_is_atomic_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_resident_direct_message_resolution_is_rejected(
+    client: AsyncClient, db_session
+):
+    """Residents cannot create a receipt that races their atomic reply."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    inbound = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Please reply without closing this first.",
+        resident_session_id="resident-receipt-session",
+    )
+    db_session.add(inbound)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {"message_id": str(inbound.id), "resolution": "Addressed"},
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "create_message" in response.text
+    await db_session.refresh(inbound)
+    assert inbound.status == "open"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "vision_update",
     [
