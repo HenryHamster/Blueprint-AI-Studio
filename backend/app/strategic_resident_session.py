@@ -643,6 +643,22 @@ def _resident_worker_task_is_healthy(
             # projection that may transiently lag its post-commit mirror.
             return True
     if task.status in {TaskStatus.QUEUED, TaskStatus.PROVISIONING}:
+        # A resident failure can requeue the exact task between worker attempts.
+        # Its original session start is no longer a useful health signal once the
+        # session has been alive for five minutes: the runner may have just sent
+        # a task heartbeat while preparing the next attempt.  Treat that fresh
+        # task heartbeat as a bounded retry/startup bridge, then reclaim only
+        # after it actually goes stale.  Otherwise a recoverable provider or
+        # reply-persistence error turns into a false "stale heartbeat" session
+        # supersession at the five-minute start-claim boundary.
+        heartbeat = task.last_heartbeat
+        if heartbeat is not None:
+            if heartbeat.tzinfo is not None:
+                heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
+            if (
+                now - heartbeat
+            ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
+                return True
         started = _parse_iso_naive(blob.get("started_at"))
         return bool(
             started

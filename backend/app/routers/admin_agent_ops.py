@@ -3295,6 +3295,20 @@ async def strategic_operation(
         )
 
     elif payload.op == "resolve_message":
+        if resident_ctx.get("_resident_session") is True:
+            # A Resident answer must be committed through create_message with
+            # covered_message_ids. Direct resolution creates only an
+            # auto-generated receipt, then makes the eventual transactional
+            # reply reject the now-non-open operator message. Keep this
+            # invariant server-enforced so an outdated runner or prompt cannot
+            # silently interrupt the conversation.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Resident sessions must stage replies with create_message; "
+                    "direct resolve_message is disabled"
+                ),
+            )
         msg_id = data.get("message_id")
         if not msg_id:
             raise HTTPException(status_code=400, detail="message_id required")

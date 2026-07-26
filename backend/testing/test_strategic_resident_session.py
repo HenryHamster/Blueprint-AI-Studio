@@ -545,6 +545,82 @@ async def test_reload_ensure_keeps_worker_during_transient_heartbeat_gap(db_sess
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retry_status", [TaskStatus.QUEUED, TaskStatus.PROVISIONING])
+async def test_reload_ensure_keeps_fresh_retry_heartbeat_past_startup_window(
+    db_session, retry_status
+):
+    """A retrying resident must outlive its original five-minute start claim."""
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = retry_status
+    old_task.last_heartbeat = _utcnow()
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob.pop("worker_heartbeat_at", None)
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    reused = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert reused["session_id"] == started["session_id"]
+    assert reused["worker_generation"] == started["worker_generation"]
+    assert reused["task_id"] == started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == retry_status
+
+
+@pytest.mark.asyncio
+async def test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale(db_session):
+    """The retry bridge stays bounded and still reclaims a genuinely dead task."""
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.QUEUED
+    old_task.last_heartbeat = stale_at
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob.pop("worker_heartbeat_at", None)
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    replaced = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert replaced["session_id"] == started["session_id"]
+    assert replaced["worker_generation"] == started["worker_generation"] + 1
+    assert replaced["task_id"] != started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_reload_ensure_replaces_worker_stale_past_recovery_threshold(db_session):
     project = await _make_project(db_session)
     old_task = await _make_task(db_session, project)

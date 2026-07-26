@@ -1228,6 +1228,15 @@ describe('writeMessagesHelper', () => {
     }
   });
 
+  it('blocks direct resolution in Resident reply mode', () => {
+    writeMessagesHelper('task-resident', '/tmp/resident-workspace', {
+      residentReplyOnly: true,
+    });
+    const script = capturedScripts['/tmp/resident-workspace/messages'];
+    expect(script).toContain('RESIDENT_REPLY_ONLY="1"');
+    expect(script).toContain('resolve is disabled for Resident sessions');
+  });
+
   it('reads the live token, captures stdin, retries on 401, and fails loud (live write-token fix)', async () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];
