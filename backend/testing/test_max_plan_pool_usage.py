@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.providers.base import UsageSnapshot
+from app.providers.anthropic import _normalize_anthropic_usage
 from app.max_plan_pool import (
     _account_by_id,
     _persist_rate_limit_usage_to_db,
@@ -23,6 +24,7 @@ from app.max_plan_pool import (
     get_usage_headroom_armable_since,
     reconcile_usage_headroom_arming,
     refresh_usage_meter_snapshots,
+    usage_snapshot_summary_with_fallback,
 )
 from app.time_utils import _utcnow
 
@@ -155,6 +157,33 @@ class TestUsageSnapshotFromDict:
         assert restored.window_utilizations == {"five_hour": 42.0, "seven_day": 63.5}
         # probed_at falls back to updated_at for old blobs
         assert restored.probed_at == "2026-07-09T12:00:00"
+
+    def test_unknown_snapshot_round_trips_its_failure_class(self):
+        original = UsageSnapshot.unknown(
+            "2026-07-09T12:00:00", failure_kind="authentication"
+        )
+        restored = UsageSnapshot.from_dict(original.to_dict())
+        assert restored is not None
+        assert restored.known is False
+        assert restored.probe_failure_kind == "authentication"
+
+
+class TestAnthropicUsageNormalization:
+    def test_five_hour_window_is_sufficient(self):
+        snapshot = _normalize_anthropic_usage(
+            {"five_hour": {"utilization": 31.5, "resets_at": "2026-07-10T05:00:00Z"}},
+            "2026-07-09T12:00:00",
+        )
+        assert snapshot.known is True
+        assert snapshot.window_utilizations == {"five_hour": 31.5}
+        assert snapshot.resets_at["five_hour"] == "2026-07-10T05:00:00Z"
+
+    def test_invalid_five_hour_data_is_classified_as_schema_failure(self):
+        snapshot = _normalize_anthropic_usage(
+            {"five_hour": {"utilization": None}}, "2026-07-09T12:00:00"
+        )
+        assert snapshot.known is False
+        assert snapshot.probe_failure_kind == "schema"
 
 
 # ── probed_at preserved through persist/restore cycle ────────────────────────
@@ -378,6 +407,99 @@ class TestSnapshotFromPersistedUsageWithNewBlobs:
             "five_hour": {"utilization": 10.0},
         }
         assert _snapshot_from_persisted_usage(raw) is None
+
+
+class TestUsageAttemptDiagnostics:
+    def test_failed_attempt_is_visible_without_clobbering_last_good_reading(self):
+        now = _utcnow()
+        persisted = {
+            "source": "oauth_usage_probe",
+            "known": True,
+            "probed_at": (now - timedelta(minutes=20)).isoformat(),
+            "updated_at": (now - timedelta(minutes=20)).isoformat(),
+            "five_hour": {"utilization": 43.0},
+            "last_attempt_at": now.isoformat(),
+            "last_attempt_status": "timeout",
+        }
+        summary = usage_snapshot_summary_with_fallback(None, persisted, now)
+        assert summary["known"] is True
+        assert summary["five_hour_utilization"] == 43.0
+        assert summary["stale"] is True
+        assert summary["last_attempt_status"] == "timeout"
+        assert summary["last_attempt_failure_kind"] == "timeout"
+
+    def test_openai_account_is_explicitly_unsupported(self):
+        now = _utcnow()
+        summary = usage_snapshot_summary_with_fallback(
+            {
+                "provider": "openai",
+                "auth_mode": "oauth",
+                "enabled": True,
+            },
+            None,
+            now,
+        )
+        assert summary["known"] is False
+        assert summary["dark_reason"] == "unsupported"
+
+    @pytest.mark.asyncio
+    async def test_failed_attempt_persist_retains_existing_last_good_blob(self, monkeypatch):
+        existing = {
+            "source": "oauth_usage_probe",
+            "known": True,
+            "updated_at": "2026-07-09T11:00:00",
+            "five_hour": {"utilization": 21.0},
+        }
+
+        class FakeRow:
+            rate_limit_usage = existing
+            updated_at = None
+
+        row = FakeRow()
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, model, acct_id):
+                return row
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda value: value)
+
+        await _persist_rate_limit_usage_to_db(
+            "usage-acct",
+            UsageSnapshot.unknown(
+                "2026-07-09T12:00:00", failure_kind="timeout"
+            ),
+        )
+
+        assert row.rate_limit_usage["five_hour"]["utilization"] == 21.0
+        assert row.rate_limit_usage["updated_at"] == "2026-07-09T11:00:00"
+        assert row.rate_limit_usage["last_attempt_status"] == "timeout"
+
+    def test_secret_manager_reference_is_meter_eligible_before_hydration(self):
+        from app.max_plan_pool import _account_meter_eligible
+
+        assert _account_meter_eligible(
+            {
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "enabled": True,
+                "secret_blob_ref": "projects/example/secrets/anthropic/versions/latest",
+                "runtime_secret": None,
+                "oauth_token": None,
+            }
+        ) is True
 
 
 # ── persist-failure counter recovery ─────────────────────────────────────────

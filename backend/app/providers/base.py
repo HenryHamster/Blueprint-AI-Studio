@@ -94,10 +94,10 @@ class UsageSnapshot:
     """Normalized, provider-agnostic account usage-headroom snapshot.
 
     Produced by :meth:`LLMProvider.probe_usage`. ADVISORY ONLY — consumed by the
-    pool's proactive headroom gate/ranking, never by correctness paths. The two
-    load-bearing windows are ``five_hour`` and ``seven_day`` (utilization is a
-    percentage in roughly [0, 100]); providers MAY surface extra windows
-    (per-model sub-buckets etc.) additively.
+    pool's proactive headroom gate/ranking, never by correctness paths. The
+    five-hour window is sufficient for a known snapshot; seven-day and any
+    provider-specific windows are additive (utilization is a percentage in
+    roughly [0, 100]).
 
     - ``known=False`` is the sentinel "no clean usage source / probe failed".
       Selection MUST treat an unknown snapshot exactly as it behaves with no
@@ -119,13 +119,34 @@ class UsageSnapshot:
     raw_rate_limit_blob: dict | None = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # A stable, non-sensitive classification for an unsuccessful probe.  This
+    # deliberately lives on the snapshot rather than being inferred from log
+    # text, so the pool can persist and render a useful last-attempt state
+    # without ever exposing provider responses or credentials.
+    #
+    # Known values are provider-agnostic where possible: ``unsupported``,
+    # ``missing_secret``, ``secret_unavailable``, ``authentication``,
+    # ``timeout``, ``transport``, ``endpoint``, ``schema``, and
+    # ``provider_error``.  Unknown values remain safe additive data.
+    probe_failure_kind: str | None = field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
     @classmethod
-    def unknown(cls, probed_at: str | None = None) -> UsageSnapshot:
-        return cls(known=False, probed_at=probed_at)
+    def unknown(
+        cls,
+        probed_at: str | None = None,
+        *,
+        failure_kind: str | None = None,
+    ) -> UsageSnapshot:
+        return cls(
+            known=False,
+            probed_at=probed_at,
+            probe_failure_kind=failure_kind,
+        )
 
     def load_bearing_utilizations(self) -> tuple[float, ...]:
-        """The five_hour / seven_day utilizations that are present + numeric.
+        """The five-hour / seven-day utilizations that are present + numeric.
 
         Empty tuple when the snapshot is unknown or carries neither window —
         callers treat that as "unknown" for gate/ranking purposes.
@@ -154,6 +175,8 @@ class UsageSnapshot:
         }
         if self.probed_at is not None:
             d["probed_at"] = self.probed_at
+        if self.probe_failure_kind:
+            d["probe_failure_kind"] = self.probe_failure_kind
         if self.known:
             for window, util in self.window_utilizations.items():
                 entry: dict[str, Any] = {"utilization": float(util)}
@@ -176,9 +199,14 @@ class UsageSnapshot:
         known = raw.get("known", True)
         # Prefer explicit probed_at; fall back to updated_at for old blobs.
         probed_at: str | None = raw.get("probed_at") or raw.get("updated_at")
+        failure_kind = raw.get("probe_failure_kind")
+        if not isinstance(failure_kind, str) or not failure_kind:
+            failure_kind = None
         if not known:
-            return cls.unknown(probed_at)
-        _reserved = frozenset({"source", "known", "probed_at", "updated_at"})
+            return cls.unknown(probed_at, failure_kind=failure_kind)
+        _reserved = frozenset(
+            {"source", "known", "probed_at", "updated_at", "probe_failure_kind"}
+        )
         utils: dict[str, float] = {}
         resets: dict[str, str | None] = {}
         for key, entry in raw.items():
@@ -198,6 +226,7 @@ class UsageSnapshot:
             window_utilizations=utils,
             resets_at=resets,
             probed_at=probed_at,
+            probe_failure_kind=failure_kind,
         )
 
 

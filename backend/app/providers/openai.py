@@ -519,7 +519,15 @@ class OpenAIProvider(LLMProvider):
         selection behaves exactly as today for OpenAI accounts. Revisit if a
         first-class usage endpoint appears.
         """
-        return UsageSnapshot.unknown()
+        # The deployed Codex runtime has no stable machine-readable
+        # subscription-usage contract.  Keep that limitation explicit for the
+        # operator rather than making the UI look like a transient probe
+        # outage, and do not scrape CLI/TUI text or API-key billing data.
+        from app.time_utils import _utcnow
+
+        return UsageSnapshot.unknown(
+            _utcnow().isoformat(), failure_kind="unsupported"
+        )
 
     async def list_available_models(
         self,
