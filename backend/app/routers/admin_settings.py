@@ -795,7 +795,7 @@ async def get_settings(
             "strategic_session_autonomous_turn_timeout_seconds", 300
         ),
         "strategic_session_max_unattended_seconds": _runtime_config.get(
-            "strategic_session_max_unattended_seconds", 14400
+            "strategic_session_max_unattended_seconds", 7200
         ),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "promotion_enabled_by_project": {
@@ -3911,7 +3911,7 @@ async def _apply_settings(
                     ),
                     "strategic_session_max_unattended_seconds": int(
                         _runtime_config.get(
-                            "strategic_session_max_unattended_seconds", 14400
+                            "strategic_session_max_unattended_seconds", 7200
                         )
                     ),
                     "direction_gap_respawn_block_mode": str(

@@ -16,7 +16,7 @@ from typing import Any, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
@@ -42,6 +42,10 @@ from app.strategic_events import (
     STRATEGIC_KIND_RUNNING_UPDATE,
     emit_strategic_updated,
 )
+from app.strategic_op_contracts import (
+    normalize_problem_model_envelope,
+    normalize_update_direction,
+)
 from app.direction_lifecycle import (
     _reset_outcome_detection_state,
     apply_churn_retirement_keep,
@@ -57,6 +61,7 @@ from app.models import (
     Project,
     ProjectMessage,
     SourceKind,
+    StrategicSpawnRequest,
     Task,
     TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
@@ -101,12 +106,20 @@ from app.strategic_completion import (
     record_retired_direction_memory,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
     find_gap_respawn_match,
-    spawn_budget_status,
-    spawn_title_is_redundant,
 )
+from app.resource_envelope import resolve_project_require_local_runner
 from app.strategic_resident_session import (
     read_resident_session as _read_resident_session,
     resident_session_is_active as _resident_session_is_active,
+)
+from app.strategic_watches import (
+    AcknowledgeWatchInput,
+    CancelWatchInput,
+    WatchTaskInput,
+    acknowledge_watch,
+    cancel_watch,
+    register_task_watch,
+    serialize_watch,
 )
 from app.workbench_state import (
     strategic_local_continuation_status_from_vision,
@@ -122,8 +135,12 @@ from app.strategic_constants import (
 )
 from app.task_capabilities import (
     STRATEGIC_TASK_TYPES,
-    STRATEGIST_ONE_TIME_SPAWNABLE_TYPES,
+    STRATEGIST_CONTEXTUAL_TASK_TYPES,
     STRATEGIST_SPAWNABLE_TASK_TYPES,
+)
+from app.strategic_spawn_requests import (
+    cancel_deferred_spawn_request,
+    submit_strategic_spawn,
 )
 from app.auth import require_admin
 from app.task_locking import (
@@ -161,6 +178,8 @@ RESIDENT_REPLY_COVERED_MESSAGE_MAX = 20
 # the backend handler produces a CI failure rather than a silent no-op.
 STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "set_problem_model",
+    "patch_problem_model",
+    "replace_problem_model",
     "set_running_update",
     "set_memory",
     "set_session_summary",
@@ -180,6 +199,9 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "spawn_task",
     "spawn_fix",
     "cancel_task",
+    "watch_task",
+    "ack_watch",
+    "cancel_watch",
     "dispose_completion_debt",
     "set_retirement_critiques",
     "set_evidence_progress",
@@ -982,44 +1004,6 @@ async def agent_annotate(
     return response
 
 
-async def _maybe_link_task_to_debt(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    debt_id: Any,
-    task_id: uuid.UUID,
-) -> str | None:
-    """Best-effort link a freshly-spawned task to an open completion-debt row.
-
-    Returns the debt id (str) on success, ``None`` when no debt_id was supplied
-    or linkage failed. Linkage is a convenience forward-pointer and must NEVER
-    fail the spawn that already committed, so all errors (unknown/closed debt,
-    ledger write failure) are swallowed after rolling back the linkage attempt.
-    """
-    if not debt_id:
-        return None
-    from app.completion_debt import link_task_to_debt as _link_task_to_debt
-
-    try:
-        await _link_task_to_debt(
-            session,
-            debt_id,
-            project_id=project_id,
-            task_id=task_id,
-            note="spawned by strategist",
-        )
-        await session.commit()
-        return str(debt_id)
-    except Exception:  # noqa: BLE001 — best-effort; spawn already committed
-        await session.rollback()
-        logger.warning(
-            "[STRATEGIC API] link_task_to_debt failed (debt_id=%s task=%s) — non-fatal",
-            debt_id,
-            task_id,
-            exc_info=True,
-        )
-        return None
-
-
 async def _enforce_resident_mutation_fence(
     session: AsyncSession,
     project: Project,
@@ -1191,6 +1175,34 @@ async def strategic_operation(
         raise HTTPException(
             status_code=400, detail="Data payload too large (max 100KB)"
         )
+
+    # Normalize the few historically surprising envelopes before their domain
+    # handlers run.  Keeping this at the API boundary makes field errors
+    # consistent for CLI, direct API, and future non-shell clients.
+    if payload.op == "update_direction":
+        data = normalize_update_direction(data)
+
+    problem_model_dry_run = False
+    if payload.op in {
+        "set_problem_model",
+        "patch_problem_model",
+        "replace_problem_model",
+    }:
+        current_pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+        current_revision_raw = current_pm.get("revision", 0)
+        current_revision = (
+            current_revision_raw
+            if isinstance(current_revision_raw, int) and not isinstance(current_revision_raw, bool)
+            else 0
+        )
+        data, problem_model_dry_run, compatibility_warning = normalize_problem_model_envelope(
+            payload.op,
+            data,
+            current_revision=current_revision,
+            current_model=current_pm,
+        )
+        if compatibility_warning:
+            warnings.append(compatibility_warning)
 
     def _resp(body: dict) -> dict:
         if warnings:
@@ -1727,7 +1739,20 @@ async def strategic_operation(
 
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")
-        changes = data.get("changes", {})
+        # `data` has already been normalized by normalize_update_direction:
+        # canonical callers pass fields directly, while the legacy nested
+        # `changes` wrapper was flattened at the boundary.
+        changes = {
+            key: value
+            for key, value in data.items()
+            if key not in {
+                "direction_id",
+                "rationale",
+                "dedup_reasoning",
+                "successor_id",
+                "superseded_by_id",
+            }
+        }
         raw_dedup_reasoning = data.get("dedup_reasoning")
         if not dir_id or not changes:
             raise HTTPException(
@@ -3458,20 +3483,21 @@ async def strategic_operation(
             }
         )
 
-    elif payload.op == "spawn_task":
-        # Allow strategic review to directly spawn a research, plan, web_research,
-        # or design task for targeted investigation, jumping the normal autonomous
-        # research queue. The allowed set is DERIVED FROM THE TASK-TYPE REGISTRY
-        # (STRATEGIST_SPAWNABLE_TASK_TYPES) rather than a hardcoded literal, so a
-        # newly registered investigation/knowledge type becomes spawnable by
-        # declaring strategist_spawnable=True alone. Restricted to investigation /
-        # knowledge / plan types — implementation must go through the normal
-        # direction → research → plan → create flow.
+    elif payload.op == "spawn_task" or payload.op == "spawn_fix":
+        # One capability-driven task dispatch contract. spawn_fix is accepted for
+        # one compatibility release but routes through this exact path.
+        legacy_spawn_fix = payload.op == "spawn_fix"
         spawn_type = data.get("type")
-        if spawn_type not in STRATEGIST_SPAWNABLE_TASK_TYPES:
+        allowed_spawn_types = (
+            STRATEGIST_SPAWNABLE_TASK_TYPES | STRATEGIST_CONTEXTUAL_TASK_TYPES
+        )
+        if spawn_type not in allowed_spawn_types:
             raise HTTPException(
                 status_code=400,
-                detail=f"spawn_task type must be one of {sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)}; got '{spawn_type}'",
+                detail=(
+                    "spawn_task type must be one of "
+                    f"{sorted(allowed_spawn_types)}; got '{spawn_type}'"
+                ),
             )
         raw_prompt = str(data.get("prompt", "")).strip()
         # compute_experiment is described by its launch contract (command +
@@ -3522,6 +3548,15 @@ async def strategic_operation(
             "title": title,
             "base_branch": _get_project_integration_branch(project),
         }
+        if spawn_type in STRATEGIST_CONTEXTUAL_TASK_TYPES:
+            for context_field in (
+                "pr_number",
+                "branch",
+                "original_task_id",
+                "original_prompt",
+            ):
+                if data.get(context_field) is not None:
+                    spawn_payload[context_field] = data[context_field]
         if direction_id:
             spawn_payload["direction_id"] = direction_id
 
@@ -3550,7 +3585,8 @@ async def strategic_operation(
             from app.compute_experiment_contract import (
                 _author_compute_launch_contract,
                 _validate_compute_launch_contract,
-                resolve_compute_spend_approval,
+                build_compute_contract_preview,
+                resolve_compute_spend_decision,
             )
 
             contract = _author_compute_launch_contract(data)
@@ -3571,14 +3607,34 @@ async def strategic_operation(
                 ),
                 None,
             )
-            needs_approval, _threshold = resolve_compute_spend_approval(
+            require_local_runner = resolve_project_require_local_runner(project)
+            spend_decision = resolve_compute_spend_decision(
                 runtime_config=_runtime_config,
                 direction=direction_ctx,
                 spend_cap_usd=spend_cap,
+                require_local_runner=require_local_runner,
+                task_context=dict(task.context or {}),
+                launch_contract=contract,
             )
-            spawn_requires_approval = needs_approval
+            spawn_requires_approval = spend_decision.requires_monetary_approval
             # Merge contract fields into the payload so the handler gets them.
             spawn_payload.update(contract)
+            if data.get("preview_only") is True:
+                return _resp(
+                    {
+                        "status": "ok",
+                        "op": "spawn_task",
+                        "preview_only": True,
+                        "type": spawn_type,
+                        "preview": build_compute_contract_preview(
+                            contract,
+                            runtime_config=_runtime_config,
+                            direction=direction_ctx,
+                            require_local_runner=require_local_runner,
+                            task_context=dict(task.context or {}),
+                        ),
+                    }
+                )
 
         # Apply per-type model/effort defaults
         type_model = _runtime_config.get("task_type_models", {}).get(spawn_type) or None
@@ -3589,164 +3645,19 @@ async def strategic_operation(
             spawn_payload["model"] = type_model
         if type_effort:
             spawn_payload["effort"] = type_effort
-        spawn_payload = _validate_internal_payload(
-            spawn_payload, f"strategic_spawn_task:{spawn_type}"
-        )
-
-        # Idempotency guard against retry-duplicated spawns.
-        #
-        # ``spawn_task`` is a non-idempotent POST, and the strategic agent's
-        # shell helper (``_call`` in strategic-helpers.ts) retries on any
-        # non-2xx — including its own ``curl --max-time 30`` timeout. When this
-        # endpoint runs slow (e.g. event-loop saturation pushed one observed
-        # call to 93s), the agent abandons the in-flight request and retries;
-        # the abandoned request still commits server-side, so one logical spawn
-        # produces two identical tasks (incident 2026-06-02: 00a63ec1 / 65108ef3
-        # — same parent strategic review, byte-identical payload, 59s apart).
-        #
-        # The agent's retry is strictly sequential (timeout -> 5s sleep ->
-        # retry), so the duplicate requests are never concurrent; a plain
-        # read-then-skip closes the hole. Keying on the *source* strategic
-        # task means a same-(type, title) match is always a true duplicate (a
-        # single review run never legitimately re-spawns the identical task),
-        # so this only collapses accidental retries — it does not constrain the
-        # strategic agent's judgement across distinct reviews.
-        #
-        # The broadened guard also collapses semantically-redundant spawns: a
-        # near-duplicate knowledge request for the SAME review and type that
-        # differs only in wording (word overlap >= threshold) is treated as the
-        # same logical investigation, so a single review cannot spend its budget
-        # on rewordings of one question. Exact-title matches keep the original
-        # idempotency semantics; the title-similarity check is additive.
-        dedup_since = _utcnow() - timedelta(minutes=30)
-        dupe_stmt = (
-            select(Task)
-            .where(
-                Task.project_id == project.id,
-                Task.created_by == "STRATEGIC_AGENT",
-                Task.created_at >= dedup_since,
-                Task.context["spawned_by"].as_string() == "strategic_direct",
-                Task.context["parent_strategic_task_id"].as_string() == str(task.id),
-                Task.payloads[0]["type"].as_string() == spawn_type,
+        try:
+            spawn_payload = _validate_internal_payload(
+                spawn_payload, f"strategic_spawn_task:{spawn_type}"
             )
-            .order_by(Task.created_at.asc())
-            .limit(200)
-        )
-        dedup_overlap_threshold = _runtime_config.get(
-            "strategist_spawn_dedup_overlap_threshold", 4
-        )
-        for candidate in (await session.execute(dupe_stmt)).scalars().all():
-            exact = candidate.title == title
-            semantic = (
-                not exact
-                and spawn_title_is_redundant(
-                    title,
-                    [candidate.title or ""],
-                    threshold=dedup_overlap_threshold,
-                )
-                is not None
-            )
-            if exact or semantic:
-                logger.info(
-                    "[STRATEGIC API] spawn_task idempotency: returning existing "
-                    "%s for %s spawn from strategic review %s "
-                    "(type=%s, title=%r, existing=%r)",
-                    candidate.id,
-                    "duplicate" if exact else "semantic-duplicate",
-                    task.id,
-                    spawn_type,
-                    title,
-                    candidate.title,
-                )
-                return _resp(
-                    {
-                        "status": "ok",
-                        "op": "spawn_task",
-                        "task_id": str(candidate.id),
-                        "type": spawn_type,
-                        "priority": candidate.priority,
-                        "deduplicated": True,
-                    }
-                )
-
-        # Budget enforcement. The strategist's autonomous spawn path is otherwise
-        # unbounded: one review can queue any number of elevated-priority,
-        # real-cost tasks. Count this review's prior strategic_direct spawns and
-        # the project-wide spawns in the rolling window, then ask the pure policy
-        # helper whether one more fits. When exhausted, stamp an observable flag
-        # on the review, log, and refuse with 429 — never a silent swallow.
-        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
-        window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
-        window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
-
-        per_review_count = (
-            await session.execute(
-                select(_func.count())
-                .select_from(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.created_by == "STRATEGIC_AGENT",
-                    Task.context["spawned_by"].as_string() == "strategic_direct",
-                    Task.context["parent_strategic_task_id"].as_string()
-                    == str(task.id),
-                )
-            )
-        ).scalar() or 0
-        window_since = _utcnow() - timedelta(minutes=window_minutes)
-        window_count = (
-            await session.execute(
-                select(_func.count())
-                .select_from(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.created_by == "STRATEGIC_AGENT",
-                    Task.context["spawned_by"].as_string() == "strategic_direct",
-                    Task.created_at >= window_since,
-                )
-            )
-        ).scalar() or 0
-
-        ok, scope, reason = spawn_budget_status(
-            per_review_count,
-            window_count,
-            per_review_cap=per_review_cap,
-            window_cap=window_cap,
-        )
-        if not ok:
-            ctx = task.context or {}
-            task.context = {
-                **ctx,
-                "_strategic_spawn_budget_exhausted": {
-                    "scope": scope,
-                    "reason": reason,
-                    "at": _utcnow().isoformat(),
-                },
-            }
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-            logger.warning(
-                "[STRATEGIC API] spawn_task refused for strategic review %s: %s "
-                "(per_review=%s/%s, window=%s/%s)",
-                task.id,
-                reason,
-                per_review_count,
-                per_review_cap,
-                window_count,
-                window_cap,
-            )
-            return JSONResponse(
-                content=_resp(
-                    {
-                        "status": "skipped",
-                        "op": "spawn_task",
-                        "scope": scope,
-                        "reason": reason,
-                    }
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"spawn_task cannot build a valid '{spawn_type}' payload: {exc}"
                 ),
-                status_code=429,
-            )
+            ) from exc
 
+        # Exact idempotency and admission are handled by StrategicSpawnRequest.
         new_task_ctx: dict = {
             "spawned_by": "strategic_direct",
             "parent_strategic_task_id": str(task.id),
@@ -3823,301 +3734,98 @@ async def strategic_operation(
                 ),
             )
 
-        new_task = Task(
-            project_id=project.id,
-            title=title,
-            description=prompt[:500],
-            payloads=[spawn_payload],
-            context=new_task_ctx,
-            status=TaskStatus.QUEUED,
-            priority=100,  # ahead of default (50) — course-correction runs first
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            created_by="STRATEGIC_AGENT",
-            criterion_ids=_task_criterion_ids,
-            **(
-                {"requires_approval": spawn_requires_approval}
-                if spawn_requires_approval is not None
-                else {}
-            ),
-        )
-        session.add(new_task)
-        await session.flush()
-
-        ctx = task.context or {}
-        task.context = {
-            **ctx,
-            "_strategic_tasks_spawned": ctx.get("_strategic_tasks_spawned", 0) + 1,
+        normalized_specification = {
+            "debt_id": str(data.get("debt_id")) if data.get("debt_id") else None,
+            "task": {
+                "title": title,
+                "description": prompt[:500],
+                "payloads": [spawn_payload],
+                "context": new_task_ctx,
+                "priority": 100,
+                "criterion_ids": _task_criterion_ids,
+                "requires_approval": spawn_requires_approval,
+                "watch": data.get("watch", True) is not False,
+                "watch_purpose": str(data.get("watch_purpose") or "")[:1000],
+            }
         }
-        flag_modified(task, "context")
-        session.add(task)
-        await session.commit()
+        try:
+            submission = await submit_strategic_spawn(
+                session,
+                project_id=project.id,
+                parent_task_id=task.id,
+                task_type=spawn_type,
+                specification=normalized_specification,
+                idempotency_key=data.get("idempotency_key"),
+                direction_id=str(direction_id) if direction_id else None,
+                burst_cap=int(
+                    _runtime_config.get("strategist_spawn_window_cap", 100)
+                ),
+                burst_window_minutes=int(
+                    _runtime_config.get("strategist_spawn_window_minutes", 60)
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        new_task = submission.task
+        if new_task is None:
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "deferred",
+                        "op": "spawn_task",
+                        "request_id": str(submission.request.id),
+                        "type": spawn_type,
+                        "reason": submission.request.admission_reason,
+                        "not_before": (
+                            submission.request.not_before.isoformat()
+                            if submission.request.not_before
+                            else None
+                        ),
+                        **(
+                            {"deprecated_alias": "spawn_fix"}
+                            if legacy_spawn_fix
+                            else {}
+                        ),
+                    }
+                ),
+                status_code=202,
+            )
         logger.info(
-            f"[STRATEGIC API] Spawned {spawn_type} task {new_task.id} "
+            f"[STRATEGIC API] Accepted {spawn_type} task {new_task.id} "
             f"(priority=100) from strategic review {task.id} for project {project.id}"
-        )
-        linked_debt_id = await _maybe_link_task_to_debt(
-            session, project.id, data.get("debt_id"), new_task.id
         )
         return _resp(
             {
                 "status": "ok",
                 "op": "spawn_task",
+                "request_id": str(submission.request.id),
                 "task_id": str(new_task.id),
                 "type": spawn_type,
                 "priority": 100,
-                **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
+                "deduplicated": submission.replayed,
+                **(
+                    {"deprecated_alias": "spawn_fix"}
+                    if legacy_spawn_fix
+                    else {}
+                ),
+                **(
+                    {"linked_debt_id": submission.linked_debt_id}
+                    if submission.linked_debt_id
+                    else {}
+                ),
             }
         )
 
-    elif payload.op == "spawn_fix":
-        # Dispatch a ONE-TIME implementation task (bug fix, CI remediation,
-        # isolated cleanup) with NO strategic direction. Unlike spawn_task — which
-        # is restricted to read-only investigation/knowledge types that flow into
-        # a direction — spawn_fix accepts the PR-producing implementation types
-        # (STRATEGIST_ONE_TIME_SPAWNABLE_TYPES = create/refactor/qa, derived
-        # from the registry, not a hardcoded literal) and produces a task that
-        # carries NO direction_id, so it never lands in project.directions /
-        # staged_directions / any direction portfolio logic. It fires once and
-        # lands a PR; there is no evidence/retirement lifecycle.
-        spawn_type = data.get("type")
-        if spawn_type not in STRATEGIST_ONE_TIME_SPAWNABLE_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "spawn_fix type must be one of "
-                    f"{sorted(STRATEGIST_ONE_TIME_SPAWNABLE_TYPES)}; got '{spawn_type}'"
-                ),
-            )
-        raw_prompt = str(data.get("prompt", "")).strip()
-        if not raw_prompt:
-            raise HTTPException(status_code=400, detail="prompt is required")
-        raw_title = str(data.get("title", "")).strip()
-        if not raw_title:
-            raise HTTPException(status_code=400, detail="title is required")
-        # Cap to prevent runaway prompts consuming token budget
-        prompt = _cap_str(raw_prompt, 10_000, "prompt", warnings)
-        title = _cap_str(raw_title, 200, "title", warnings)
-
-        # Build payload with the same validator the spawners use, but with NO
-        # direction_id key — a one-time fix is intentionally direction-free.
-        spawn_payload: dict = {
-            "type": spawn_type,
-            "prompt": prompt,
-            "title": title,
-            "base_branch": _get_project_integration_branch(project),
-        }
-        # Apply per-type model/effort defaults
-        type_model = _runtime_config.get("task_type_models", {}).get(spawn_type) or None
-        type_effort = (
-            _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
-        )
-        if type_model:
-            spawn_payload["model"] = type_model
-        if type_effort:
-            spawn_payload["effort"] = type_effort
-        # A one-time fix is dispatched from a prompt alone — it has no
-        # pre-existing PR context. Some implementation types carry required
-        # payload fields that a prompt-only spawn cannot supply (notably ``fix``,
-        # whose FixPayload requires ``pr_number`` + ``branch`` — the same reason
-        # ``fix`` is excluded from the plan-decomposition allowlist). Surface that
-        # as a clean 400 rather than letting the validator's ValueError escape as
-        # an opaque 500.
-        try:
-            spawn_payload = _validate_internal_payload(
-                spawn_payload, f"strategic_spawn_fix:{spawn_type}"
-            )
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"spawn_fix cannot build a valid '{spawn_type}' payload from a "
-                    f"prompt alone (this type needs pre-existing context a one-time "
-                    f"fix does not supply): {exc}"
-                ),
-            ) from exc
-
-        # Idempotency guard against retry-duplicated spawns. Mirrors spawn_task's
-        # read-then-skip guard, but keys on the ``strategic_direct_fix`` provenance
-        # so one-time-fix dedup is independent of the knowledge-spawn window.
-        dedup_since = _utcnow() - timedelta(minutes=30)
-        dupe_stmt = (
-            select(Task)
-            .where(
-                Task.project_id == project.id,
-                Task.created_by == "STRATEGIC_AGENT",
-                Task.created_at >= dedup_since,
-                Task.context["spawned_by"].as_string() == "strategic_direct_fix",
-                Task.context["parent_strategic_task_id"].as_string() == str(task.id),
-                Task.payloads[0]["type"].as_string() == spawn_type,
-            )
-            .order_by(Task.created_at.asc())
-            .limit(200)
-        )
-        dedup_overlap_threshold = _runtime_config.get(
-            "strategist_spawn_dedup_overlap_threshold", 4
-        )
-        for candidate in (await session.execute(dupe_stmt)).scalars().all():
-            exact = candidate.title == title
-            semantic = (
-                not exact
-                and spawn_title_is_redundant(
-                    title,
-                    [candidate.title or ""],
-                    threshold=dedup_overlap_threshold,
-                )
-                is not None
-            )
-            if exact or semantic:
-                logger.info(
-                    "[STRATEGIC API] spawn_fix idempotency: returning existing "
-                    "%s for %s fix from strategic review %s "
-                    "(type=%s, title=%r, existing=%r)",
-                    candidate.id,
-                    "duplicate" if exact else "semantic-duplicate",
-                    task.id,
-                    spawn_type,
-                    title,
-                    candidate.title,
-                )
-                return _resp(
-                    {
-                        "status": "ok",
-                        "op": "spawn_fix",
-                        "task_id": str(candidate.id),
-                        "type": spawn_type,
-                        "deduplicated": True,
-                    }
-                )
-
-        # Budget enforcement — independent of the knowledge-spawn budget: count
-        # this review's prior strategic_direct_fix spawns and the project-wide
-        # fix spawns in the rolling window, then ask the same pure policy helper
-        # whether one more fits. When exhausted, stamp an observable flag, log,
-        # and refuse with 429 — never a silent swallow.
-        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
-        window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
-        window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
-
-        per_review_count = (
-            await session.execute(
-                select(_func.count())
-                .select_from(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.created_by == "STRATEGIC_AGENT",
-                    Task.context["spawned_by"].as_string() == "strategic_direct_fix",
-                    Task.context["parent_strategic_task_id"].as_string()
-                    == str(task.id),
-                )
-            )
-        ).scalar() or 0
-        window_since = _utcnow() - timedelta(minutes=window_minutes)
-        window_count = (
-            await session.execute(
-                select(_func.count())
-                .select_from(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.created_by == "STRATEGIC_AGENT",
-                    Task.context["spawned_by"].as_string() == "strategic_direct_fix",
-                    Task.created_at >= window_since,
-                )
-            )
-        ).scalar() or 0
-
-        ok, scope, reason = spawn_budget_status(
-            per_review_count,
-            window_count,
-            per_review_cap=per_review_cap,
-            window_cap=window_cap,
-        )
-        if not ok:
-            ctx = task.context or {}
-            task.context = {
-                **ctx,
-                "_strategic_spawn_budget_exhausted": {
-                    "scope": scope,
-                    "reason": reason,
-                    "at": _utcnow().isoformat(),
-                },
-            }
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-            logger.warning(
-                "[STRATEGIC API] spawn_fix refused for strategic review %s: %s "
-                "(per_review=%s/%s, window=%s/%s)",
-                task.id,
-                reason,
-                per_review_count,
-                per_review_cap,
-                window_count,
-                window_cap,
-            )
-            return JSONResponse(
-                content=_resp(
-                    {
-                        "status": "skipped",
-                        "op": "spawn_fix",
-                        "scope": scope,
-                        "reason": reason,
-                    }
-                ),
-                status_code=429,
-            )
-
-        # Direction-free by construction: the context carries no direction_id, so
-        # the spawned task can never surface in any direction portfolio logic.
-        new_task_ctx: dict = {
-            "spawned_by": "strategic_direct_fix",
-            "one_time_fix": True,
-            "parent_strategic_task_id": str(task.id),
-        }
-
-        new_task = Task(
-            project_id=project.id,
-            title=title,
-            description=prompt[:500],
-            payloads=[spawn_payload],
-            context=new_task_ctx,
-            status=TaskStatus.QUEUED,
-            priority=100,  # ahead of default (50) — course-correction runs first
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            created_by="STRATEGIC_AGENT",
-        )
-        session.add(new_task)
-        await session.flush()
-
-        ctx = task.context or {}
-        task.context = {
-            **ctx,
-            "_strategic_tasks_spawned": ctx.get("_strategic_tasks_spawned", 0) + 1,
-        }
-        flag_modified(task, "context")
-        session.add(task)
-        await session.commit()
-        logger.info(
-            f"[STRATEGIC API] Spawned one-time {spawn_type} fix task {new_task.id} "
-            f"(priority=100, no direction) from strategic review {task.id} "
-            f"for project {project.id}"
-        )
-        linked_debt_id = await _maybe_link_task_to_debt(
-            session, project.id, data.get("debt_id"), new_task.id
-        )
-        return _resp(
-            {
-                "status": "ok",
-                "op": "spawn_fix",
-                "task_id": str(new_task.id),
-                "type": spawn_type,
-                "priority": 100,
-                "deduplicated": False,
-                **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
-            }
-        )
-
-    elif payload.op == "set_problem_model":
-        # Full-model replacement. Validated and merged via apply_agent_update:
+    elif (
+        payload.op == "set_problem_model"
+        or payload.op == "patch_problem_model"
+        or payload.op == "replace_problem_model"
+    ):
+        # All problem-model writes funnel through the established safe merge.
+        # Envelope validation above distinguishes the normal patch form, the
+        # guarded recovery/bootstrapping replace form, and the legacy alias.
+        # apply_agent_update still owns collection integrity, revision history,
+        # and operator-wins reconciliation.
         # bumps revision, stamps last_updated, auto-archives closed/abandoned
         # gaps, preserves existing archived_gaps + revision_log, appends a
         # revision_log entry with the structured diff.
@@ -4222,6 +3930,19 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model: {ve}"
             ) from None
+        if problem_model_dry_run:
+            # The exact same validator/merge path as a write, but with no
+            # project/task/context mutation or alert side effect.  This gives
+            # callers an actionable preflight before a guarded replacement.
+            return _resp(
+                {
+                    "status": "preview",
+                    "op": payload.op,
+                    "current_revision": current_revision,
+                    "next_revision": new_pm_raw.get("revision"),
+                    "diff": pm_diff,
+                }
+            )
         # Reject with HTTP 400 when the live core alone exceeds the byte budget.
         # Fire the alert and commit it before raising so it persists despite the 400.
         if pm_diff.get("live_core_exceeds_budget"):
@@ -4393,7 +4114,7 @@ async def strategic_operation(
         return _resp(
             {
                 "status": "ok",
-                "op": "set_problem_model",
+                "op": payload.op,
                 "revision": new_pm_raw.get("revision"),
                 "diff": pm_diff,
                 "version_phase_decision_received": version_phase_decision is not None,
@@ -5863,6 +5584,107 @@ async def strategic_operation(
         await session.commit()
         return _resp({"status": "ok", "op": "set_session_summary"})
 
+    elif payload.op == "watch_task":
+        try:
+            watch_input = WatchTaskInput.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"watch_task: invalid data: {exc}",
+            ) from None
+        try:
+            watch, created = await register_task_watch(
+                session,
+                project_id=project.id,
+                created_by_task_id=task.id,
+                target_task_id=watch_input.target_task_id,
+                purpose=watch_input.purpose.strip(),
+                strategic_session_id=str(
+                    (task.context or {}).get("strategic_session_id") or ""
+                )
+                or None,
+                deadline_at=watch_input.deadline_at,
+            )
+        except ValueError as exc:
+            status_code = (
+                400 if "cannot watch itself" in str(exc) else 404
+            )
+            raise HTTPException(status_code=status_code, detail=str(exc)) from None
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "watch_task",
+                "created": created,
+                "watch": serialize_watch(watch),
+            }
+        )
+
+    elif payload.op == "ack_watch":
+        try:
+            ack_input = AcknowledgeWatchInput.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ack_watch: invalid data: {exc}",
+            ) from None
+        try:
+            watch = await acknowledge_watch(
+                session,
+                project_id=project.id,
+                watch_id=ack_input.watch_id,
+                disposition=ack_input.disposition,
+                note=ack_input.note.strip(),
+            )
+        except ValueError as exc:
+            status_code = 404 if "not found in project" in str(exc) else 409
+            raise HTTPException(status_code=status_code, detail=str(exc)) from None
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "ack_watch",
+                "watch": serialize_watch(watch),
+            }
+        )
+
+    elif payload.op == "cancel_watch":
+        try:
+            cancel_input = CancelWatchInput.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cancel_watch: invalid data: {exc}",
+            ) from None
+        try:
+            watch = await cancel_watch(
+                session,
+                project_id=project.id,
+                watch_id=cancel_input.watch_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "cancel_watch",
+                "watch": serialize_watch(watch),
+            }
+        )
+
     elif payload.op == "cancel_task":
         if not isinstance(data, dict):
             raise HTTPException(
@@ -5870,11 +5692,12 @@ async def strategic_operation(
                 detail="cancel_task data must be an object",
             )
         target_task_id = data.get("target_task_id")
+        spawn_request_id = data.get("request_id")
         reason = str(data.get("reason", "")).strip()
-        if not target_task_id:
+        if bool(target_task_id) == bool(spawn_request_id):
             raise HTTPException(
                 status_code=400,
-                detail="cancel_task requires 'target_task_id'",
+                detail="cancel_task requires exactly one of 'target_task_id' or 'request_id'",
             )
         if not reason:
             raise HTTPException(
@@ -5882,6 +5705,48 @@ async def strategic_operation(
                 detail="cancel_task requires a non-empty 'reason' string",
             )
         reason = _cap_str(reason, 500, "reason", warnings)
+
+        if spawn_request_id:
+            try:
+                request_uuid = uuid.UUID(str(spawn_request_id))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cancel_task request_id must be a UUID",
+                ) from exc
+            request = await session.get(StrategicSpawnRequest, request_uuid)
+            if request is None or request.project_id != project.id:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"cancel_task: spawn request {spawn_request_id} not found",
+                )
+            if request.parent_task_id != task.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="cancel_task: spawn request was not created by this strategic session",
+                )
+            try:
+                request = await cancel_deferred_spawn_request(
+                    session,
+                    project_id=project.id,
+                    request_id=request_uuid,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            request.policy_snapshot = {
+                **dict(request.policy_snapshot or {}),
+                "cancel_reason": reason,
+            }
+            session.add(request)
+            await session.commit()
+            return _resp(
+                {
+                    "status": "ok",
+                    "op": "cancel_task",
+                    "request_id": str(request.id),
+                    "request_state": request.state,
+                }
+            )
 
         target_task = await session.get(Task, target_task_id)
         if not target_task:

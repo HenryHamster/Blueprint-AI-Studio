@@ -515,6 +515,14 @@ class HeartbeatRequest(BaseModel):
     diagnostics_after_edit_arm: bool | None = None
 
 
+class ComputeTerminalLog(BaseModel):
+    """Canonical redacted terminal output for a compute job."""
+
+    source: Literal["backend", "runner", "legacy"]
+    text: str
+    truncated: bool = False
+
+
 class ComputeJobResponse(BaseModel):
     """Agent-facing serialization for persisted compute jobs."""
 
@@ -545,7 +553,15 @@ class ComputeJobResponse(BaseModel):
     result_reference: str | None = None
     artifact_id: uuid.UUID | None = None
     polling_metadata: Dict[str, Any] = Field(default_factory=dict)
+    terminal_log: ComputeTerminalLog | None = None
     compute_rpc_diagnostic: Dict[str, Any] | None = None
+    # Immutable launch intent and execution-side placement facts.  These are
+    # deliberately separate from polling_metadata so task intent cannot be
+    # mistaken for what the worker actually ran.
+    # Rows created before the operability migration legitimately carry NULL.
+    # Preserve that wire shape; callers already normalize absent provenance.
+    execution_manifest: Dict[str, Any] | None = None
+    runtime_provenance: Dict[str, Any] | None = None
     # Cross-job checkpoint resume, promoted from polling_metadata so the operator
     # can see (without digging into the launch bag) that a run resumed and from
     # where. ``input_artifact_job_id`` is the declared+validated resume source;
@@ -573,6 +589,19 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
         provenance = metadata.get("resume_provenance")
         if isinstance(provenance, dict) and provenance:
             data["resume_provenance"] = provenance
+        command_log = metadata.get("command_log")
+        source = "backend"
+        if not isinstance(command_log, dict):
+            command_log = metadata.get("runner_command_log")
+            source = "runner"
+        if isinstance(command_log, dict) and isinstance(command_log.get("text"), str):
+            if command_log.get("source") == "runner":
+                source = "runner"
+            data["terminal_log"] = {
+                "source": source,
+                "text": command_log["text"],
+                "truncated": command_log.get("truncated") is True,
+            }
     # Promote watchdog protection-status fields so the agent surface always has them.
     # Lazy import avoids the circular dependency (compute_jobs imports schemas).
     from app.compute_jobs import derive_watchdog_protection_status  # noqa: PLC0415
@@ -702,6 +731,25 @@ def _redact_dict_strings(obj: Any) -> Any:
     return obj
 
 
+def _operator_safe_execution_manifest(manifest: Any) -> Dict[str, Any]:
+    """Return readable execution intent without copying launch secrets.
+
+    The same structure is persisted with the job for durable provenance, so
+    this guard is intentionally defensive for legacy rows that may predate the
+    write-time scrub in ``create_compute_job``.
+    """
+    if not isinstance(manifest, dict):
+        return {}
+    safe = dict(manifest)
+    normalized = safe.get("normalized_contract")
+    if isinstance(normalized, dict):
+        safe_normalized = dict(normalized)
+        for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
+            safe_normalized.pop(key, None)
+        safe["normalized_contract"] = safe_normalized
+    return _redact_dict_strings(safe)
+
+
 def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     """Return a JSON-ready compute-job response with launch-spec fields redacted.
 
@@ -734,12 +782,24 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
             live_output = dict(live_output)
             live_output["text"] = redact_command_log_text(live_output["text"])
             metadata["live_output"] = live_output
+    terminal_log = data.get("terminal_log")
+    if isinstance(terminal_log, dict) and isinstance(terminal_log.get("text"), str):
+        terminal_log = dict(terminal_log)
+        terminal_log["text"] = redact_command_log_text(terminal_log["text"])
+        data["terminal_log"] = terminal_log
     # Recursively redact all string values in result_metrics so credentials in
     # any experiment output field cannot leak through unrecognized paths.
     if isinstance(metadata, dict):
         result_metrics = metadata.get("result_metrics")
         if isinstance(result_metrics, dict):
             metadata["result_metrics"] = _redact_dict_strings(result_metrics)
+
+    data["execution_manifest"] = _operator_safe_execution_manifest(
+        data.get("execution_manifest")
+    )
+    data["runtime_provenance"] = _redact_dict_strings(
+        data.get("runtime_provenance") or {}
+    )
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level

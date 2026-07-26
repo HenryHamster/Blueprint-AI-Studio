@@ -61,6 +61,8 @@ import {
   SIZE_GUARDRAIL_GUIDANCE,
   PRIOR_ATTEMPT_DIVERGENCE,
   BEYOND_SCOPE_REPORTING,
+  BUILD_WITH_INTENT_GUIDANCE,
+  BUILD_ORDER_GUIDANCE,
   READ_ONLY_BASH_WRITE_NOTE,
   SELF_REVIEW_PROMPT_VERSION,
   SHARED_LIFECYCLE_REMAINDER,
@@ -571,6 +573,17 @@ describe('assembleFailureGuidanceBlocks — structural invariants', () => {
     expect(padIdx).toBeLessThan(bsrIdx);
     expect(bsrIdx).toBeLessThan(ecIdx);
   });
+
+  it('appends the build-discipline blocks after EDGES (intent then order)', () => {
+    const blocks = assembleFailureGuidanceBlocks();
+    expect(blocks).toContain('Build With Intent: Decide Before You Draft'); // BUILD_WITH_INTENT_GUIDANCE
+    expect(blocks).toContain('Build Order: Design');                        // BUILD_ORDER_GUIDANCE
+    const ecIdx  = blocks.indexOf('Edges-Considered Field in Self-Review');
+    const bwiIdx = blocks.indexOf('Build With Intent: Decide Before You Draft');
+    const boIdx  = blocks.indexOf('Build Order: Design');
+    expect(ecIdx).toBeLessThan(bwiIdx);
+    expect(bwiIdx).toBeLessThan(boIdx);
+  });
 });
 
 // ── formatSelfReviewCalibrationSection ───────────────────────────────────────
@@ -925,6 +938,14 @@ describe('codeChangeGuidanceVariant + fingerprint divergence', () => {
     const legacy = computePromptFingerprint('fix');
     const explicit = computePromptFingerprint('fix', undefined, {});
     expect(explicit).toBe(legacy);
+  });
+
+  it('fingerprints failure guidance only when the caller actually emits it', () => {
+    const withoutFailureGuidance = computePromptFingerprint('perf');
+    const withFailureGuidance = computePromptFingerprint('perf', undefined, {
+      emittedFailureGuidance: BUILD_WITH_INTENT_GUIDANCE + BUILD_ORDER_GUIDANCE,
+    });
+    expect(withFailureGuidance).not.toBe(withoutFailureGuidance);
   });
 });
 

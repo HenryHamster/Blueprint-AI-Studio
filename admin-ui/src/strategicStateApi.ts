@@ -859,6 +859,16 @@ export interface StrategicResidentSessionSnapshot {
   last_operator_interaction_at?: string | null;
   compaction_count?: number | null;
   last_compaction_at?: string | null;
+  activity?: {
+    phase: 'working' | 'waiting' | 'retrying' | 'stopping' | 'ended' | string;
+    phase_started_at?: string | null;
+    last_action?: string | null;
+    pending_operator_messages?: number;
+    next_review_at?: string | null;
+    idle_remaining_seconds?: number | null;
+    pending_watches?: number;
+    fired_watches?: number;
+  } | null;
 }
 
 /** Cheap, operator-legible availability for the persistent Workday session. */

@@ -930,6 +930,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const finalPromptWithTree = finalPrompt + fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
+    emittedFailureGuidance: assembleFailureGuidanceBlocks(isRetry),
   });
 
   statusRef.value = `Running ${providerRunner.displayName}...`;

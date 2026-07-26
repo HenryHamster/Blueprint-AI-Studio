@@ -52,6 +52,7 @@ from app.models import (
     Project,
     ProjectMessage,
     StrategicCycle,
+    StrategicWatch,
     Task,
     TaskStatus,
     _utcnow,
@@ -118,12 +119,12 @@ RESIDENT_SESSION_REASON_RUNNER_OFFLINE = "runner_offline"
 # interaction before the heartbeat stops renewing the lease (so the legacy
 # cadence reclaims authority) even though the session process is still alive.
 # Operator interaction (a new operator message) re-arms it. Referenced by name;
-# ``runtime_config`` supplies the registered default (14400s / 4h — see
+# ``runtime_config`` supplies the registered default (7200s / 2h — see
 # ``runtime_config_state.py``); this local fallback only applies if the key is
 # ever absent from the registry, so it is pinned to that same 4h value to keep
 # the effective cap self-documenting rather than silently disagreeing with it.
 STRATEGIC_SESSION_MAX_UNATTENDED_SETTING = "strategic_session_max_unattended_seconds"
-_DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 14400  # 4h
+_DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 7200  # 2h
 
 # A task row can remain IN_PROGRESS long after its resident subprocess or runner
 # disappeared. Workday's synchronous ensure path must not trust that row
@@ -148,6 +149,15 @@ _RESIDENT_START_CLAIM_STALE_SECONDS = 300  # 5 min
 # interaction for the unattended cap (operator messages are stored as ``user``;
 # ``operator`` is included defensively).
 _OPERATOR_MESSAGE_FROM_TYPES = ("user", "operator")
+_RESIDENT_ACTIVITY_PHASES = {
+    "working",
+    "waiting",
+    "retrying",
+    "stopping",
+    "ended",
+}
+_RESIDENT_ACTIVITY_LAST_ACTION_MAX_CHARS = 240
+_RESIDENT_ACTIVITY_IDLE_WARNING_SECONDS = 300
 
 # created_by value stamped on tasks the strategist spawns (mirrors
 # ``agent_tasks._STRATEGIC_AGENT_CREATED_BY`` / admin_agent_ops). Used to scope
@@ -490,7 +500,148 @@ def resident_session_is_active(blob: dict[str, Any] | None) -> bool:
     )
 
 
-def resident_session_snapshot(vision: dict[str, Any] | None) -> dict[str, Any] | None:
+def _resident_activity_snapshot(
+    blob: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return the bounded, operator-facing resident activity projection.
+
+    The agent persists phase/action transitions in the session blob. Time
+    remaining is derived at read time from the same operator-interaction clock
+    used by the unattended backstop, so it keeps ticking without heartbeat
+    writes and freezes cleanly once the session ends.
+    """
+    current_now = now or _utcnow()
+    raw = blob.get("activity")
+    activity = dict(raw) if isinstance(raw, dict) else {}
+    phase = str(activity.get("phase") or "waiting").strip().lower()
+    if phase not in _RESIDENT_ACTIVITY_PHASES:
+        phase = "waiting"
+
+    status = str(blob.get("status") or "").strip().lower()
+    ended_at = _parse_iso_naive(blob.get("ended_at"))
+    if status == STATUS_ENDED or bool(blob.get("stop_requested")) or ended_at is not None:
+        phase = "ended"
+    elif blob.get("worker_state") == "retry_wait":
+        phase = "retrying"
+
+    last_operator = _parse_iso_naive(
+        blob.get("last_operator_interaction_at")
+    ) or _parse_iso_naive(blob.get("started_at"))
+    try:
+        max_unattended = max(
+            0,
+            int(
+                runtime_config.get(
+                    STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
+                    _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS,
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        max_unattended = _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS
+
+    clock_now = ended_at or current_now
+    idle_remaining: int | None = None
+    if last_operator is not None and max_unattended > 0:
+        idle_remaining = max(
+            0,
+            int(
+                max_unattended
+                - max(0.0, (clock_now - last_operator).total_seconds())
+            ),
+        )
+        if (
+            phase not in {"ended", "retrying"}
+            and idle_remaining <= min(
+                _RESIDENT_ACTIVITY_IDLE_WARNING_SECONDS,
+                max_unattended,
+            )
+        ):
+            phase = "stopping"
+
+    last_action = str(activity.get("last_action") or "").strip()
+    if not last_action:
+        last_action = {
+            "working": "Working",
+            "waiting": "Waiting for operator input or project movement",
+            "retrying": str(
+                blob.get("worker_retry_reason")
+                or "Provider temporarily unavailable"
+            ),
+            "stopping": "Idle limit approaching",
+            "ended": "Session ended",
+        }[phase]
+
+    def _count(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    result: dict[str, Any] = {
+        "phase": phase,
+        "phase_started_at": activity.get("phase_started_at")
+        or blob.get("updated_at")
+        or blob.get("started_at"),
+        "last_action": last_action[:_RESIDENT_ACTIVITY_LAST_ACTION_MAX_CHARS],
+        "pending_operator_messages": _count(
+            activity.get("pending_operator_messages")
+        ),
+        "next_review_at": activity.get("next_review_at"),
+        "idle_remaining_seconds": idle_remaining,
+        "pending_watches": _count(activity.get("pending_watches")),
+        "fired_watches": _count(activity.get("fired_watches")),
+    }
+    return result
+
+
+def _normalized_activity_update(
+    value: Any,
+    *,
+    current: dict[str, Any] | None,
+    now_iso: str,
+    pending_operator_messages: int,
+    pending_watches: int,
+    fired_watches: int,
+) -> dict[str, Any]:
+    """Validate and bound the agent-authored portion of the activity object."""
+    raw = value if isinstance(value, dict) else {}
+    previous = current if isinstance(current, dict) else {}
+    phase = str(raw.get("phase") or previous.get("phase") or "waiting").lower()
+    if phase not in {"working", "waiting"}:
+        phase = "waiting"
+    previous_phase = str(previous.get("phase") or "")
+    phase_started_at = (
+        previous.get("phase_started_at")
+        if previous_phase == phase
+        else now_iso
+    )
+    last_action = str(
+        raw.get("last_action")
+        or previous.get("last_action")
+        or ("Working" if phase == "working" else "Waiting for project movement")
+    ).strip()
+    next_review_at = raw.get("next_review_at")
+    if not isinstance(next_review_at, str) or _parse_iso_naive(next_review_at) is None:
+        next_review_at = None
+    return {
+        "phase": phase,
+        "phase_started_at": phase_started_at or now_iso,
+        "last_action": last_action[:_RESIDENT_ACTIVITY_LAST_ACTION_MAX_CHARS],
+        "pending_operator_messages": max(0, int(pending_operator_messages)),
+        "next_review_at": next_review_at,
+        "pending_watches": max(0, int(pending_watches)),
+        "fired_watches": max(0, int(fired_watches)),
+    }
+
+
+def resident_session_snapshot(
+    vision: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
     """Public, bounded projection of the session-state blob for API responses."""
     blob = read_resident_session(vision)
     if blob is None:
@@ -514,6 +665,7 @@ def resident_session_snapshot(vision: dict[str, Any] | None) -> dict[str, Any] |
         "last_compaction_at": blob.get("last_compaction_at"),
         "operator_decision_summary": blob.get("_operator_decision_summary"),
         "turn_latency_summary": blob.get("_turn_latency_summary"),
+        "activity": _resident_activity_snapshot(blob, now=now),
     }
 
 
@@ -759,6 +911,25 @@ async def sync_resident_worker_retry_wait(
                                 task.latest_status_message
                                 or "Resident worker waiting before retry"
                             )[:500]
+                            updated["activity"] = {
+                                "phase": "retrying",
+                                "phase_started_at": now.isoformat(),
+                                "last_action": str(
+                                    task.latest_status_message
+                                    or "Provider temporarily unavailable"
+                                )[:_RESIDENT_ACTIVITY_LAST_ACTION_MAX_CHARS],
+                                "pending_operator_messages": int(
+                                    (
+                                        (current or {}).get("activity")
+                                        if isinstance(
+                                            (current or {}).get("activity"), dict
+                                        )
+                                        else {}
+                                    ).get("pending_operator_messages")
+                                    or 0
+                                ),
+                                "next_review_at": retry_until.isoformat(),
+                            }
                         elif updated.get("worker_state") == "retry_wait":
                             updated["worker_state"] = "ready"
                             updated.pop("worker_retry_until", None)
@@ -825,6 +996,18 @@ async def clear_resident_worker_retry_wait(
                         updated.pop("worker_retry_until", None)
                         updated.pop("worker_retry_reason", None)
                         updated["updated_at"] = now_iso
+                        previous_activity = (
+                            updated.get("activity")
+                            if isinstance(updated.get("activity"), dict)
+                            else {}
+                        )
+                        updated["activity"] = {
+                            **previous_activity,
+                            "phase": "waiting",
+                            "phase_started_at": now_iso,
+                            "last_action": "Retry hold cleared; waiting for work",
+                            "next_review_at": None,
+                        }
 
                         def _clear_retry_wait(vision: dict[str, Any]) -> None:
                             vision[RESIDENT_SESSION_KEY] = updated
@@ -901,7 +1084,8 @@ async def _compute_resident_work_state(
       created tasks' and their descendant tasks' latest status transitions
       (``Task.updated_at`` advances on every transition via ``onupdate``),
       operator-authored ``ProjectMessage`` arrivals, and ``StrategicCycle``
-      mutation stamps. The agent compares this against the rev it recorded at
+      mutation stamps, plus pending/fired ``StrategicWatch`` changes. The agent
+      compares this against the rev it recorded at
       its last autonomous turn to decide whether the world moved. ``None`` when
       the project has no such activity yet, in which case an older agent
       degrades to floor-tick pacing.
@@ -982,13 +1166,33 @@ async def _compute_resident_work_state(
             )
         )
     ).scalar_one_or_none()
+    watch_max = (
+        await session.execute(
+            select(func.max(StrategicWatch.updated_at)).where(
+                StrategicWatch.project_id == project_id,
+                StrategicWatch.state.in_(("pending", "fired", "expired")),
+            )
+        )
+    ).scalar_one_or_none()
+    watch_counts = (
+        await session.execute(
+            select(
+                func.count().filter(StrategicWatch.state == "pending"),
+                func.count().filter(
+                    StrategicWatch.state.in_(("fired", "expired"))
+                ),
+            ).where(StrategicWatch.project_id == project_id)
+        )
+    ).one()
     # SQLite returns the raw aggregate as text, while asyncpg returns a
     # tz-aware datetime. The ORM aggregates below use NaiveUTCDateTime.
     if isinstance(task_max, str):
         task_max = datetime.fromisoformat(task_max.replace("Z", "+00:00"))
     if task_max is not None and task_max.tzinfo is not None:
         task_max = task_max.astimezone(timezone.utc).replace(tzinfo=None)
-    stamps = [dt for dt in (task_max, msg_max, cycle_max) if dt is not None]
+    stamps = [
+        dt for dt in (task_max, msg_max, cycle_max, watch_max) if dt is not None
+    ]
     work_state_rev = max(stamps).isoformat() if stamps else None
 
     new_operator_messages = (
@@ -1007,6 +1211,8 @@ async def _compute_resident_work_state(
         "in_flight": int(in_flight),
         "terminal_since": int(terminal_since),
         "new_operator_messages": int(new_operator_messages),
+        "pending_watches": int(watch_counts[0] or 0),
+        "fired_watches": int(watch_counts[1] or 0),
     }
 
 
@@ -2130,6 +2336,15 @@ async def start_resident_session(
                 "ended_at": None,
                 "last_progress_at": None,
                 "last_operator_interaction_at": now_iso,
+                "activity": {
+                    "phase": "waiting",
+                    "phase_started_at": now_iso,
+                    "last_action": "Resident session starting",
+                    "pending_operator_messages": 0,
+                    "next_review_at": None,
+                    "pending_watches": 0,
+                    "fired_watches": 0,
+                },
             }
             if carried_exam_ledger:
                 vision[RESIDENT_SESSION_KEY]["_exam_ledger"] = carried_exam_ledger
@@ -2697,6 +2912,17 @@ async def stop_resident_session(
         ended["stop_requested"] = True
         ended["ended_at"] = now_iso
         ended["updated_at"] = now_iso
+        ended["activity"] = {
+            **(
+                ended.get("activity")
+                if isinstance(ended.get("activity"), dict)
+                else {}
+            ),
+            "phase": "ended",
+            "phase_started_at": now_iso,
+            "last_action": "Session stopped by operator",
+            "next_review_at": None,
+        }
         vision[RESIDENT_SESSION_KEY] = ended
         ended_holder["blob"] = ended
 
@@ -3187,6 +3413,7 @@ async def renew_resident_session_lease(
     compaction_count: int | None = None,
     last_compaction_at: str | None = None,
     decisions_reg: str | None = None,
+    activity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -3258,6 +3485,7 @@ async def renew_resident_session_lease(
     work_state_rev, work_state_summary = await _compute_resident_work_state(
         session, project.id, resident_session_id=session_id
     )
+    fired_watch_receipts: list[dict[str, Any]] = []
     # Conversation availability is independent from mutation authority. A
     # resident may answer while a batch strategic cycle is active, but it must
     # stay chat-only until that cycle releases the project's strategic lane.
@@ -3335,6 +3563,7 @@ async def renew_resident_session_lease(
             "status": status,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -3392,6 +3621,17 @@ async def renew_resident_session_lease(
         ended["stop_requested"] = True
         ended["ended_at"] = now_iso
         ended["updated_at"] = now_iso
+        ended["activity"] = {
+            **(
+                ended.get("activity")
+                if isinstance(ended.get("activity"), dict)
+                else {}
+            ),
+            "phase": "ended",
+            "phase_started_at": now_iso,
+            "last_action": "Session ended after reaching the idle limit",
+            "next_review_at": None,
+        }
         vision[RESIDENT_SESSION_KEY] = ended
         vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
 
@@ -3573,6 +3813,22 @@ async def renew_resident_session_lease(
             updated["compaction_count"] = compaction_count
         if isinstance(last_compaction_at, str) and last_compaction_at:
             updated["last_compaction_at"] = last_compaction_at
+        updated["activity"] = _normalized_activity_update(
+            activity,
+            current=(
+                fresh.get("activity")
+                if isinstance(fresh.get("activity"), dict)
+                else None
+            ),
+            now_iso=now_iso,
+            pending_operator_messages=int(
+                work_state_summary.get("new_operator_messages") or 0
+            ),
+            pending_watches=int(
+                work_state_summary.get("pending_watches") or 0
+            ),
+            fired_watches=int(work_state_summary.get("fired_watches") or 0),
+        )
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
@@ -3593,10 +3849,46 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
         }
+    # Resolve exact task watches while this heartbeat owns the project mutation
+    # boundary. The existing task-tree work_state_rev remains the wake signal;
+    # these bounded receipts preserve WHICH completion Strategic was awaiting.
+    try:
+        from app.strategic_spawn_requests import drain_deferred_spawn_requests
+        from app.strategic_watches import (
+            resolve_project_task_watches,
+            serialize_watch,
+        )
+
+        await drain_deferred_spawn_requests(
+            session,
+            project_id=project.id,
+            burst_cap=int(runtime_config.get("strategist_spawn_window_cap", 100)),
+            burst_window_minutes=int(
+                runtime_config.get("strategist_spawn_window_minutes", 60)
+            ),
+        )
+        _visible_watches = await resolve_project_task_watches(
+            session,
+            project_id=project.id,
+            now=now,
+        )
+        fired_watch_receipts = [serialize_watch(row) for row in _visible_watches]
+        work_state_summary = {
+            **work_state_summary,
+            "fired_watches": len(fired_watch_receipts),
+        }
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] strategic watch resolution failed for session %s — ignored",
+            session_id,
+            exc_info=True,
+        )
+
     # Mirror the exam ledger and message cursor into task.context so a runner
     # restart can read them back on startup (the agent reads task.context at pull
     # time; project.vision is not visible to the agent).
@@ -3782,6 +4074,7 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -3812,6 +4105,7 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -3826,6 +4120,7 @@ async def renew_resident_session_lease(
         "status": refreshed.get("status") or STATUS_ACTIVE,
         "work_state_rev": work_state_rev,
         "work_state_summary": work_state_summary,
+        "fired_watches": fired_watch_receipts,
         "exam_ledger": exam_ledger_str,
         "active_direction_ids": active_direction_ids,
         "direction_grounding": direction_grounding,
@@ -3895,6 +4190,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     compaction_count: int | None = None
     last_compaction_at: str | None = None
     decisions_reg: str | None = None
+    activity: dict[str, Any] | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -3931,4 +4227,5 @@ async def resident_session_heartbeat(
         compaction_count=payload.compaction_count,
         last_compaction_at=payload.last_compaction_at,
         decisions_reg=payload.decisions_reg,
+        activity=payload.activity,
     )

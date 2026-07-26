@@ -1525,7 +1525,12 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     ['fetch_and_tools', `\n\n${fixFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
   ]);
   setPromptSizeTelemetry(fixTelemetry.prompt_size_bytes, fixTelemetry.prompt_section_count, fixTelemetry.prompt_section_sizes);
-  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget, codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: fixBuildConfig, owner, repo }) });
+  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, {
+    includeParallelFixGuidance: parallelFixInjected,
+    promotionTarget,
+    codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: fixBuildConfig, owner, repo }),
+    emittedFailureGuidance: assembleFailureGuidanceBlocks(),
+  });
   statusRef.value = 'Addressing review feedback...';
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before the fix session starts so fast fix/rebase tasks still

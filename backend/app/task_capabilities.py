@@ -221,26 +221,13 @@ class TaskCapability:
     # PR-producing implementation subtype, so it carries its own separate flag
     # rather than widening PLAN_SUBTASK_TYPES.
     plan_knowledge_prereq_eligible: bool = False
-    # Whether the autonomous strategist (strategic_review) may directly spawn this
-    # type via the spawn_task ops operation. SINGLE source of truth for the
-    # strategist spawn allowlist (routers/admin_agent_ops.py) — see
-    # STRATEGIST_SPAWNABLE_TASK_TYPES. Intentionally limited to investigation /
-    # knowledge / plan types (research, plan, web_research, design); it is NOT set
-    # on implementation / PR-producing types, which must flow through the normal
-    # direction → research → plan → create path rather than being spawned directly.
-    strategist_spawnable: bool = False
-    # Whether the autonomous strategist may directly dispatch this type as a
-    # ONE-TIME implementation task (no strategic direction) via the spawn_fix ops
-    # operation. SINGLE source of truth for the strategist one-time-fix allowlist
-    # (routers/admin_agent_ops.py) — see STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.
-    # Intentionally limited to the PR-producing implementation types that can fire
-    # once and land a fix without a direction lifecycle (create, refactor,
-    # qa). It is DELIBERATELY DISJOINT from strategist_spawnable (the
-    # investigation/knowledge types): a one-time fix produces a branch/PR and
-    # carries NO direction_id, whereas a strategist_spawnable spawn is a read-only
-    # investigation that may inform a direction — so the two carry separate flags
-    # rather than widening either set.
-    strategist_one_time_spawnable: bool = False
+    # Whether Strategic may dispatch this type through the unified spawn_task
+    # contract. ``direct`` needs only a valid task payload; ``requires_context``
+    # additionally requires the type's normal launch context (currently a PR or
+    # branch for ``fix``). Direction association is optional for either policy.
+    strategist_dispatch: Literal["disabled", "direct", "requires_context"] = (
+        "disabled"
+    )
     # Short presentation badge for compact operator surfaces (task cards, filter
     # chips). Defaults to ``label`` when unset via the published contract.
     badge: str | None = None
@@ -256,7 +243,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         delivers_product=True,
         reservable=True,
         plan_subtask_eligible=True,
-        strategist_one_time_spawnable=True,
+        strategist_dispatch="direct",
         description="Implement new functionality and open a PR.",
         run_shape="workflow",
         output_kind="pr",
@@ -284,7 +271,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         user_launchable=True,
         delivers_product=True,
-        strategist_one_time_spawnable=False,
+        strategist_dispatch="requires_context",
         description="Fix a PR from review feedback or CI failures.",
         run_shape="workflow",
         output_kind="pr",
@@ -299,7 +286,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="strategic",
         user_launchable=True,
         reservable=True,
-        strategist_spawnable=True,
+        strategist_dispatch="direct",
         description="Decompose work into subtasks.",
         run_shape="single_agent",
         output_kind="knowledge",
@@ -315,7 +302,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="strategic",
         user_launchable=True,
         reservable=True,
-        strategist_spawnable=True,
+        strategist_dispatch="direct",
         description="Analyze the codebase and produce findings.",
         run_shape="single_agent",
         output_kind="knowledge",
@@ -376,7 +363,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         periodic_eligible=True,
         plan_subtask_eligible=True,
-        strategist_one_time_spawnable=True,
+        strategist_dispatch="direct",
         description="Add or improve test coverage.",
         run_shape="workflow",
         output_kind="pr",
@@ -446,7 +433,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="build",
         user_launchable=True,
         plan_subtask_eligible=True,
-        strategist_one_time_spawnable=True,
+        strategist_dispatch="direct",
         description="Improve code structure without changing behavior.",
         run_shape="workflow",
         output_kind="pr",
@@ -629,7 +616,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_handler="compute_experiment",
         evaluation="artifact-delivery",
         run_shape="experiment_loop",
-        strategist_spawnable=True,
+        strategist_dispatch="direct",
     ),
     TaskCapability(
         TaskType.web_research,
@@ -637,7 +624,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         user_launchable=True,
-        strategist_spawnable=True,
+        strategist_dispatch="direct",
         plan_knowledge_prereq_eligible=True,
         description=(
             "Web-first research that produces a durable, queryable knowledge "
@@ -657,7 +644,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         user_launchable=True,
-        strategist_spawnable=True,
+        strategist_dispatch="direct",
         plan_knowledge_prereq_eligible=True,
         description=(
             "Codebase-internal design work: ground a design question in the "
@@ -916,37 +903,27 @@ PLAN_KNOWLEDGE_SUBTASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.plan_knowledge_prereq_eligible
 )
-# Canonical registry of task types the autonomous strategist (strategic_review)
-# may directly spawn via the spawn_task ops operation. SINGLE source of truth for
-# the strategist spawn allowlist (routers/admin_agent_ops.py) — the handler
-# derives its allowed set from this frozenset rather than a hardcoded literal, so
-# a newly registered investigation/knowledge type becomes strategist-spawnable by
-# declaring ``strategist_spawnable=True`` alone, with no handler edit. Deliberately
-# limited to investigation/knowledge/plan types (research, plan, web_research,
-# design, compute_experiment); implementation / PR-producing write types are excluded and must flow
-# through the normal direction → research → plan → create path.
+# Canonical registry of task types the autonomous strategist may dispatch through
+# spawn_task without extra launch context.
 STRATEGIST_SPAWNABLE_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES
-    if capability.strategist_spawnable
+    if capability.strategist_dispatch == "direct"
 )
-# Canonical registry of task types the autonomous strategist (strategic_review)
-# may directly dispatch as a ONE-TIME implementation task — no strategic
-# direction, no research→plan→create pipeline — via the spawn_fix ops operation.
-# SINGLE source of truth for the strategist one-time-fix allowlist
-# (routers/admin_agent_ops.py) — the handler derives its allowed set from this
-# frozenset rather than a hardcoded literal, so a newly registered
-# fire-once-and-land implementation type becomes spawn_fix-eligible by declaring
-# ``strategist_one_time_spawnable=True`` alone. Currently the PR-producing
-# implementation types {create, refactor, qa}. This set is DELIBERATELY
-# DISJOINT from STRATEGIST_SPAWNABLE_TASK_TYPES (the investigation/knowledge types
-# spawn_task accepts): a one-time fix carries NO direction_id and produces a
-# branch/PR, whereas a spawn_task spawn is a read-only investigation that may
-# inform a direction.
-STRATEGIST_ONE_TIME_SPAWNABLE_TYPES: frozenset[str] = frozenset(
+# Task types accepted by spawn_task only when their normal launch context is
+# present. Kept separate from the direct set so the router can emit a precise
+# validation error rather than silently constructing an unusable task.
+STRATEGIST_CONTEXTUAL_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES
-    if capability.strategist_one_time_spawnable
+    if capability.strategist_dispatch == "requires_context"
+)
+# Temporary compatibility export for callers that still import the historical
+# spawn_fix allowlist. spawn_fix itself is only an alias for unified spawn_task.
+STRATEGIST_ONE_TIME_SPAWNABLE_TYPES: frozenset[str] = frozenset(
+    task_type
+    for task_type in STRATEGIST_SPAWNABLE_TASK_TYPES
+    if TASK_CAPABILITY_BY_VALUE[task_type].agent_mode == "write"
 )
 # Map of task-type value -> declared completion-handler logical name, derived
 # from the registry. This REPLACES the hand-maintained if/elif completion

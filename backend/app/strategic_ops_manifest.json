@@ -2,7 +2,23 @@
     {
         "op": "set_problem_model",
         "alias": "set-problem-model",
-        "description": "Replace/refresh the project's problem model (gaps, systems, priorities).",
+        "description": "Compatibility alias for patching the project's problem model.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "patch_problem_model",
+        "alias": "patch-problem-model",
+        "description": "Patch the project's problem model without clobbering omitted fields.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "replace_problem_model",
+        "alias": "replace-problem-model",
+        "description": "Guardedly replace a problem model for bootstrap or recovery.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
@@ -10,7 +26,7 @@
     {
         "op": "set_running_update",
         "alias": "set-running-update",
-        "description": "Update the operator-facing running-update snapshot (markdown file input).",
+        "description": "Update the operator-facing running-update snapshot.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
@@ -122,23 +138,47 @@
     {
         "op": "spawn_task",
         "alias": "spawn-task",
-        "description": "Spawn an implementation/research/plan task for a direction.",
+        "description": "Durably dispatch an implementation, research, plan, design, or compute task.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
     },
     {
         "op": "spawn_fix",
-        "alias": "spawn-fix",
-        "description": "Spawn a one-time fix task.",
+        "alias": null,
+        "description": "Deprecated compatibility alias for spawn-task.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Deprecated compatibility alias; use spawn-task."
+    },
+    {
+        "op": "cancel_task",
+        "alias": "cancel-task",
+        "description": "Cancel a spawned QUEUED/PROVISIONING task or deferred spawn request.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
     },
     {
-        "op": "cancel_task",
-        "alias": "cancel-task",
-        "description": "Cancel a previously spawned QUEUED/PROVISIONING task with a required reason.",
+        "op": "watch_task",
+        "alias": "watch-task",
+        "description": "Register a durable one-shot notification for a same-project task reaching a terminal state.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "ack_watch",
+        "alias": "ack-watch",
+        "description": "Acknowledge a fired task watch after reporting, acting, or deciding no action is needed.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "cancel_watch",
+        "alias": "cancel-watch",
+        "description": "Cancel a task watch that is no longer relevant.",
         "cli": true,
         "prompt": true,
         "internal_reason": null

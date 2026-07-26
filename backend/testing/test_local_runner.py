@@ -8946,9 +8946,10 @@ class TestRegistryPasswordErasedOnTerminalFinalization:
 class TestReportCommandLogDropsArbitraryKeys:
     """Pin the allowlist behavior of the /compute-job/{id}/report endpoint.
 
-    The handler ONLY extracts ``text`` from ``command_log`` and writes a
-    fixed-shape ``{"text": ..., "truncated": ...}`` object — no injected keys
-    leak through, and result_metrics is bounded by _MAX_RUNNER_RESULT_METRICS_KEYS.
+    The handler extracts ``text`` from ``command_log`` and writes a bounded,
+    typed ``{"text": ..., "truncated": ..., "source": "runner"}`` object — no
+    injected keys leak through, and result_metrics is bounded by
+    _MAX_RUNNER_RESULT_METRICS_KEYS.
     """
 
     async def _make_running_job(self, db_session):
@@ -9002,13 +9003,15 @@ class TestReportCommandLogDropsArbitraryKeys:
         await db_session.refresh(job)
         meta = job.polling_metadata
 
-        # runner_command_log must contain ONLY text and truncated.
+        # runner_command_log must contain only the bounded typed-log fields.
         command_log_stored = meta.get("runner_command_log", {})
-        assert set(command_log_stored.keys()) == {"text", "truncated"}, (
-            f"runner_command_log must have exactly {{text, truncated}}, got {set(command_log_stored.keys())}"
+        assert set(command_log_stored.keys()) == {"text", "truncated", "source"}, (
+            "runner_command_log must have exactly "
+            f"{{text, truncated, source}}, got {set(command_log_stored.keys())}"
         )
         assert command_log_stored["text"] == "run ok"
         assert command_log_stored["truncated"] is False
+        assert command_log_stored["source"] == "runner"
 
         # Hostile keys must NOT appear as top-level polling_metadata keys.
         for hostile_key in ("injected", "container_registry_auth", "runner_exit_code"):
@@ -9047,9 +9050,11 @@ class TestReportCommandLogDropsArbitraryKeys:
         await db_session.refresh(job)
         stored = job.polling_metadata.get("runner_command_log", {})
         assert stored.get("truncated") is True, "truncated must be True for oversized text"
-        assert set(stored.keys()) == {"text", "truncated"}, (
-            f"runner_command_log must have exactly {{text, truncated}}, got {set(stored.keys())}"
+        assert set(stored.keys()) == {"text", "truncated", "source"}, (
+            "runner_command_log must have exactly "
+            f"{{text, truncated, source}}, got {set(stored.keys())}"
         )
+        assert stored["source"] == "runner"
         assert len(stored["text"].encode("utf-8")) <= _MAX_RUNNER_COMMAND_LOG_BYTES
 
     @pytest.mark.asyncio

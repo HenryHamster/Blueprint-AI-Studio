@@ -1568,7 +1568,7 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
   });
 });
 
-describe('spawn-fix allowlist sync', () => {
+describe('unified spawn-task guidance', () => {
   const base: ThinkerPromptParams = {
     contextPrefix: '',
     projectName: 'Test Project',
@@ -1605,12 +1605,11 @@ describe('spawn-fix allowlist sync', () => {
     efficiencySnapshotSection: '',
   };
 
-  it('advertises create/refactor/qa for spawn-fix — not fix — matching backend STRATEGIST_ONE_TIME_SPAWNABLE_TYPES', () => {
+  it('routes bounded implementation and contextual fix work through spawn-task', () => {
     const prompt = buildThinkerPrompt(base);
-    // spawn-fix section must list exactly the backend-allowed types (create, refactor, qa)
-    expect(prompt).toContain("types `create`/`refactor`/`qa`");
-    // 'fix' must not appear as an advertised spawn-fix type
-    expect(prompt).not.toMatch(/`spawn-fix`[^)]*types[^)]*`fix`/);
+    expect(prompt).toContain('dispatch `create`/`refactor`/`qa` directly');
+    expect(prompt).toContain('`fix` work also uses `spawn-task`');
+    expect(prompt).not.toContain('`spawn-fix`');
   });
 });
 

@@ -1176,6 +1176,8 @@ async def load_max_plan_pool():
                 e.get("usage_snapshot"),
                 e.get("usage_snapshot_at"),
                 e.get("usage_probe_failed_at"),
+                e.get("usage_probe_attempt_at"),
+                e.get("usage_probe_failure_kind"),
             )
             for aid, e in _account_by_id.items()
         }
@@ -2959,6 +2961,7 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
     if acct is None:
         return
     snapshot: UsageSnapshot
+    secret: str | None = None
     success = False
     try:
         provider_name = (
@@ -2968,15 +2971,24 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
         auth_mode_raw = (
             _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
         )
-        secret = acct.get("oauth_token") or acct.get("runtime_secret")
+        secret, secret_failure_kind = await _rehydrate_usage_probe_secret(acct)
         provider = get_provider(provider_name)
-        snapshot = await provider.probe_usage(
-            secret, LLMAuthMode(auth_mode_raw), acct.get("provider_metadata") or {}
-        )
+        if secret_failure_kind is not None:
+            snapshot = UsageSnapshot.unknown(
+                _utcnow().isoformat(), failure_kind=secret_failure_kind
+            )
+        else:
+            snapshot = await provider.probe_usage(
+                secret,
+                LLMAuthMode(auth_mode_raw),
+                acct.get("provider_metadata") or {},
+            )
         success = snapshot.known
     except Exception as exc:  # advisory; cache unknown on failure
         logger.debug("[POOL] usage probe errored for %s: %s", acct_id, exc)
-        snapshot = UsageSnapshot.unknown()
+        snapshot = UsageSnapshot.unknown(
+            _utcnow().isoformat(), failure_kind="provider_error"
+        )
     async with _max_plan_pool_lock:
         live = _account_by_id.get(acct_id)
         if live is not None:
@@ -2989,12 +3001,55 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
                 live.pop("usage_probe_failed_at", None)
             else:
                 live["usage_probe_failed_at"] = _utcnow()
+            live["usage_probe_attempt_at"] = _utcnow()
+            live["usage_probe_failure_kind"] = (
+                None if success else snapshot.probe_failure_kind or "provider_error"
+            )
+            if secret is not None:
+                live["runtime_secret"] = secret
+                if auth_mode_raw == LLMAuthMode.OAUTH.value:
+                    live["oauth_token"] = secret
+                live["runtime_ready"] = True
+                live["secret_fetch_failed"] = False
+            elif snapshot.probe_failure_kind == "secret_unavailable":
+                live["secret_fetch_failed"] = True
             live.pop("usage_probe_inflight", None)
-    # Persist to the DB row on success so the data survives restarts.
-    # Best-effort: a write failure is non-fatal — the in-memory copy is the
-    # primary source and the probe will retry with the next refresh cycle.
-    if success:
-        await _persist_rate_limit_usage_to_db(acct_id, snapshot)
+    # Persist every attempt.  A failed probe updates its classified attempt
+    # state while retaining an existing last-good snapshot and its freshness.
+    # Best-effort: a write failure is non-fatal and never affects admission.
+    await _persist_rate_limit_usage_to_db(acct_id, snapshot)
+
+
+async def _rehydrate_usage_probe_secret(
+    acct: Dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Return a probe credential immediately before network I/O.
+
+    Pool rebuilds intentionally avoid keeping Secret Manager material fresh
+    forever.  The usage meter must not mistake that memory-saving behavior for
+    an account capability failure, so it resolves a Secret Manager reference
+    here, outside the pool lock.  The return value is ``(secret, failure_kind)``
+    and never contains an exception message or secret material in diagnostics.
+    """
+    reference = acct.get("secret_blob_ref")
+    if isinstance(reference, str) and reference.startswith("projects/"):
+        try:
+            from app.secrets_manager import get_user_secret
+
+            secret = await get_user_secret(reference)
+        except Exception:  # advisory: show a stable operator-visible reason
+            logger.warning(
+                "[POOL] usage meter could not rehydrate Secret Manager credential for %s",
+                acct.get("id", "<unknown>"),
+            )
+            return None, "secret_unavailable"
+        if isinstance(secret, str) and secret:
+            return secret, None
+        return None, "secret_unavailable"
+    secret = acct.get("oauth_token") or acct.get("runtime_secret") or reference
+    if isinstance(secret, str) and secret:
+        return secret, None
+    return None, "missing_secret"
 
 
 async def _persist_rate_limit_usage_to_db(
@@ -3009,17 +3064,6 @@ async def _persist_rate_limit_usage_to_db(
     column).  On success, removes ONLY this account from the failing set so one
     account's recovery never clears another account's failure attribution.
     """
-    if not snapshot.known:
-        return
-    # When the probe carried a raw messages_api_header blob (API_KEY probe path),
-    # persist it directly so remaining_tokens and limit_tokens survive the round-
-    # trip. The blob's updated_at is overwritten with the actual write time.
-    raw = getattr(snapshot, "raw_rate_limit_blob", None)
-    if isinstance(raw, dict) and raw.get("source") == "messages_api_header":
-        usage_dict = dict(raw)
-    else:
-        usage_dict = snapshot.to_dict()
-    usage_dict["updated_at"] = _utcnow().isoformat()
     from app.models import MaxPlanAccount
 
     for attempt in range(2):
@@ -3029,6 +3073,34 @@ async def _persist_rate_limit_usage_to_db(
                     MaxPlanAccount, uuid.UUID(acct_id)
                 )
                 if row is not None:
+                    # Successful snapshots replace the last-good reading.  A
+                    # failed attempt only annotates the existing blob, keeping
+                    # both its historical reading and its original freshness.
+                    raw = getattr(snapshot, "raw_rate_limit_blob", None)
+                    if snapshot.known:
+                        if (
+                            isinstance(raw, dict)
+                            and raw.get("source") == "messages_api_header"
+                        ):
+                            usage_dict = dict(raw)
+                        else:
+                            usage_dict = snapshot.to_dict()
+                        usage_dict["updated_at"] = _utcnow().isoformat()
+                    else:
+                        existing = row.rate_limit_usage
+                        usage_dict = (
+                            dict(existing)
+                            if isinstance(existing, Mapping)
+                            else snapshot.to_dict()
+                        )
+                    usage_dict["last_attempt_at"] = (
+                        snapshot.probed_at or _utcnow().isoformat()
+                    )
+                    usage_dict["last_attempt_status"] = (
+                        "known"
+                        if snapshot.known
+                        else snapshot.probe_failure_kind or "provider_error"
+                    )
                     row.rate_limit_usage = usage_dict
                     row.updated_at = _utcnow()
                     persist_session.add(row)
@@ -3077,6 +3149,11 @@ def _maybe_schedule_usage_refresh(acct: Dict[str, Any], now: datetime) -> None:
     retried on every selection touch.
     """
     if _cached_usage_snapshot(acct, now) is not None:
+        return
+    # A provider can explicitly report that no stable machine-readable meter
+    # exists.  That is a durable product limitation, not a transient failure;
+    # do not keep spending background work rediscovering it.
+    if acct.get("usage_probe_failure_kind") == "unsupported":
         return
     failed_at = acct.get("usage_probe_failed_at")
     if (
@@ -3146,7 +3223,7 @@ def _restore_usage_state(
     """
     candidates: list[tuple[datetime, UsageSnapshot]] = []
     if prev_state is not None:
-        prev_snap, prev_at, prev_failed_at = prev_state
+        prev_snap, prev_at, prev_failed_at, *attempt_state = prev_state
         if (
             isinstance(prev_snap, UsageSnapshot)
             and prev_snap.known
@@ -3155,6 +3232,12 @@ def _restore_usage_state(
             candidates.append((prev_at, prev_snap))
         if prev_failed_at is not None:
             entry["usage_probe_failed_at"] = prev_failed_at
+        if len(attempt_state) >= 2:
+            attempt_at, failure_kind = attempt_state[:2]
+            if attempt_at is not None:
+                entry["usage_probe_attempt_at"] = attempt_at
+            if isinstance(failure_kind, str) and failure_kind:
+                entry["usage_probe_failure_kind"] = failure_kind
     parsed = _snapshot_from_persisted_usage(persisted_raw)
     if parsed is not None:
         candidates.append((parsed[1], parsed[0]))
@@ -3167,10 +3250,11 @@ def _restore_usage_state(
 def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
     """True iff this account can produce a usage snapshot worth probing.
 
-    Anthropic OAuth accounts probe the /api/oauth/usage endpoint.
-    Anthropic API-key accounts probe via a minimal messages.create call to
-    capture rate-limit headers.  Every other provider/auth combination
-    resolves to ``UsageSnapshot.unknown()`` so the meter loop skips them.
+    Anthropic OAuth accounts probe the /api/oauth/usage endpoint. Anthropic
+    API-key accounts probe via a minimal messages.create call to capture rate-
+    limit headers. Eligibility is based on configured credential capability,
+    not whether a Secret Manager secret happened to be hydrated during the
+    last pool rebuild; rehydration happens immediately before probing.
     """
     provider = _normalize_provider_name(acct.get("provider"))
     auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
@@ -3179,9 +3263,13 @@ def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
     if not bool(acct.get("enabled", True)):
         return False
     if auth_mode == LLMAuthMode.OAUTH.value:
-        return bool(acct.get("oauth_token") or acct.get("runtime_secret"))
+        return bool(
+            acct.get("secret_blob_ref")
+            or acct.get("oauth_token")
+            or acct.get("runtime_secret")
+        )
     if auth_mode == LLMAuthMode.API_KEY.value:
-        return bool(acct.get("runtime_secret"))
+        return bool(acct.get("secret_blob_ref") or acct.get("runtime_secret"))
     return False
 
 
@@ -3235,6 +3323,8 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
                 and (now - failed_at).total_seconds()
                 < _USAGE_METER_REFRESH_INTERVAL_SECONDS
             ):
+                continue
+            if acct.get("usage_probe_failure_kind") == "unsupported":
                 continue
             _schedule_usage_refresh(acct)
             scheduled += 1
@@ -3816,8 +3906,9 @@ def _usage_dark_reason(acct: Dict[str, Any]) -> str | None:
     """Classify WHY an account's usage meter is dark (known=False).
 
     Returns one of:
-    - ``"not_oauth"``: account uses API-key or other non-OAuth auth — the
-      provider's probe_usage returns unknown() for all non-OAuth modes.
+    - ``"unsupported"``: the provider has no stable machine-readable plan
+      usage contract (currently Codex/OpenAI); this is not retried as an
+      endpoint outage.
     - ``"no_secret"``: OAuth account but both oauth_token and runtime_secret
       are absent and Secret Manager was not attempted — probe cannot
       authenticate.
@@ -3825,12 +3916,18 @@ def _usage_dark_reason(acct: Dict[str, Any]) -> str | None:
       failed — credential is unreachable, meter cannot authenticate.
     - ``"never_probed"``: meter-eligible account that has never been probed
       (no snapshot and no probe-failure stamp).
-    - ``"endpoint_error"``: probe was attempted but the endpoint returned
-      unknown (HTTP error, schema drift, or transient failure).
+    - a stable probe failure class (``authentication``, ``timeout``,
+      ``transport``, ``endpoint``, ``schema``, ``provider_error``) when the
+      latest attempt supplied one.
     - ``None``: meter is known (should not be called on known snapshots).
     """
     auth_mode = _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
     provider = _normalize_provider_name(acct.get("provider"))
+    if provider == LLMProviderName.OPENAI.value:
+        return "unsupported"
+    failure_kind = acct.get("usage_probe_failure_kind")
+    if isinstance(failure_kind, str) and failure_kind:
+        return failure_kind
     # Anthropic API-key accounts with a runtime_secret are now meter-eligible
     # (they probe via messages.create headers).  All other non-OAuth modes are
     # ineligible and classified as not_oauth.
@@ -3838,7 +3935,7 @@ def _usage_dark_reason(acct: Dict[str, Any]) -> str | None:
         if (
             auth_mode == LLMAuthMode.API_KEY.value
             and provider == LLMProviderName.ANTHROPIC.value
-            and bool(acct.get("runtime_secret"))
+            and bool(acct.get("secret_blob_ref") or acct.get("runtime_secret"))
         ):
             pass  # fall through to the eligible path below
         else:
@@ -3856,6 +3953,87 @@ def _usage_dark_reason(acct: Dict[str, Any]) -> str | None:
         return "never_probed"
     # Probe was attempted (has a snapshot timestamp or failure stamp).
     return "endpoint_error"
+
+
+def _usage_attempt_from_persisted(
+    raw: Any,
+) -> tuple[str | None, str | None]:
+    """Read the non-sensitive last-attempt state from a persisted meter blob."""
+    if not isinstance(raw, Mapping):
+        return None, None
+    attempted_at = raw.get("last_attempt_at")
+    status = raw.get("last_attempt_status")
+    # Blobs written before explicit attempt state still carry an unknown probe
+    # as source=oauth_usage_probe, known=false, probed_at=... .
+    if not isinstance(attempted_at, str):
+        if raw.get("known") is False and isinstance(raw.get("probed_at"), str):
+            attempted_at = raw["probed_at"]
+    if not isinstance(status, str) or not status:
+        if raw.get("known") is False:
+            raw_kind = raw.get("probe_failure_kind")
+            status = (
+                raw_kind
+                if isinstance(raw_kind, str) and raw_kind
+                else "provider_error"
+            )
+        else:
+            status = None
+    return attempted_at, status
+
+
+def _usage_attempt_from_memory(
+    acct: Dict[str, Any] | None,
+) -> tuple[str | None, str | None]:
+    if acct is None:
+        return None, None
+    at = acct.get("usage_probe_attempt_at")
+    if isinstance(at, datetime):
+        attempted_at = at.isoformat()
+    elif isinstance(at, str):
+        attempted_at = at
+    else:
+        snap = acct.get("usage_snapshot")
+        attempted_at = snap.probed_at if isinstance(snap, UsageSnapshot) else None
+    kind = acct.get("usage_probe_failure_kind")
+    if isinstance(kind, str) and kind:
+        return attempted_at, kind
+    snap = acct.get("usage_snapshot")
+    if isinstance(snap, UsageSnapshot) and not snap.known:
+        return attempted_at, snap.probe_failure_kind or "provider_error"
+    if attempted_at:
+        return attempted_at, "known"
+    return None, None
+
+
+def _latest_usage_attempt(
+    acct: Dict[str, Any] | None, persisted_raw: Any
+) -> tuple[str | None, str | None]:
+    """Choose the latest safe probe-attempt receipt across memory and DB."""
+    candidates = [
+        _usage_attempt_from_memory(acct),
+        _usage_attempt_from_persisted(persisted_raw),
+    ]
+    candidates = [
+        item for item in candidates if item[0] is not None or item[1] is not None
+    ]
+    if not candidates:
+        return None, None
+    # ISO-8601 timestamps are lexicographically sortable for the format we
+    # write.  A malformed timestamp is still rendered but safely loses to a
+    # well-formed/current one instead of breaking the account response.
+    return max(candidates, key=lambda item: item[0] or "")
+
+
+def _with_usage_attempt(
+    summary: Dict[str, Any], attempted_at: str | None, status: str | None
+) -> Dict[str, Any]:
+    """Attach additive attempt diagnostics without changing last-good values."""
+    summary["last_attempt_at"] = attempted_at
+    summary["last_attempt_status"] = status
+    summary["last_attempt_failure_kind"] = (
+        status if status and status != "known" else None
+    )
+    return summary
 
 
 def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, Any]:
@@ -3879,7 +4057,7 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
     )
     if not isinstance(snap, UsageSnapshot) or not snap.known:
         probed_at = snap.probed_at if isinstance(snap, UsageSnapshot) else None
-        return {
+        return _with_usage_attempt({
             "known": False,
             "dark_reason": _usage_dark_reason(acct),
             "five_hour_utilization": None,
@@ -3887,8 +4065,8 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
             "resets_at": {},
             "probed_at": probed_at,
             "stale": stale,
-        }
-    return {
+        }, *_usage_attempt_from_memory(acct))
+    return _with_usage_attempt({
         "known": True,
         "dark_reason": None,
         "five_hour_utilization": snap.window_utilizations.get("five_hour"),
@@ -3896,15 +4074,20 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
         "resets_at": dict(snap.resets_at),
         "probed_at": snap.probed_at,
         "stale": stale,
-    }
+    }, *_usage_attempt_from_memory(acct))
 
 
 def _usage_summary_from_snapshot(
-    snap: UsageSnapshot, at: datetime, now: datetime
+    snap: UsageSnapshot,
+    at: datetime,
+    now: datetime,
+    *,
+    attempted_at: str | None = None,
+    attempt_status: str | None = None,
 ) -> Dict[str, Any]:
     """JSON-safe summary for a KNOWN snapshot with wall-clock stamp ``at``."""
     stale = (now - at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
-    return {
+    return _with_usage_attempt({
         "known": True,
         "dark_reason": None,
         "five_hour_utilization": snap.window_utilizations.get("five_hour"),
@@ -3912,7 +4095,7 @@ def _usage_summary_from_snapshot(
         "resets_at": dict(snap.resets_at),
         "probed_at": snap.probed_at,
         "stale": stale,
-    }
+    }, attempted_at, attempt_status)
 
 
 def usage_snapshot_summary_with_fallback(
@@ -3952,18 +4135,28 @@ def usage_snapshot_summary_with_fallback(
         # No known source anywhere — preserve the in-memory unknown summary
         # (carries probed_at/stale from a probe-unknown result) when present.
         if acct is not None:
-            return _usage_snapshot_summary(acct, now)
-        return {
+            summary = _usage_snapshot_summary(acct, now)
+            attempted_at, attempt_status = _latest_usage_attempt(acct, persisted_raw)
+            return _with_usage_attempt(summary, attempted_at, attempt_status)
+        attempted_at, attempt_status = _latest_usage_attempt(acct, persisted_raw)
+        return _with_usage_attempt({
             "known": False,
-            "dark_reason": None,
+            "dark_reason": "unsupported" if acct is None else _usage_dark_reason(acct),
             "five_hour_utilization": None,
             "seven_day_utilization": None,
             "resets_at": {},
             "probed_at": None,
             "stale": True,
-        }
+        }, attempted_at, attempt_status)
     best_at, best_snap = max(candidates, key=lambda c: c[0])
-    return _usage_summary_from_snapshot(best_snap, best_at, now)
+    attempted_at, attempt_status = _latest_usage_attempt(acct, persisted_raw)
+    return _usage_summary_from_snapshot(
+        best_snap,
+        best_at,
+        now,
+        attempted_at=attempted_at,
+        attempt_status=attempt_status,
+    )
 
 
 async def select_max_plan_account_balanced(

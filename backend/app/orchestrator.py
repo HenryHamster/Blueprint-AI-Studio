@@ -524,6 +524,7 @@ _last_usage_meter_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_anomaly_state_persist: datetime = _utcnow()
 _last_anomaly_sweep: datetime = _utcnow()
+_last_strategic_spawn_drain: datetime | None = None
 # C3: regression dispatch + EVALUATING-timeout recovery now run as dedicated
 # background tasks (lifecycle.py) on their own schedules. These two module
 # attributes are retained for back-compat (tests / metrics) but are no longer
@@ -1260,6 +1261,7 @@ async def orchestrator_worker():
 
     global _last_pool_refresh, _last_usage_meter_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
+    global _last_strategic_spawn_drain
     global \
         _last_orphan_check, \
         _last_post_commit_sweep, \
@@ -1393,6 +1395,39 @@ async def orchestrator_worker():
                 except Exception:
                     logger.exception("anomaly_maintenance_sweep failed")
                 _last_anomaly_sweep = _utcnow()
+
+            # Drain accepted Strategic spawn intent independently of a Resident
+            # heartbeat. The Resident path remains a low-latency fast path, while
+            # this leader-owned bounded sweep guarantees due requests progress
+            # even when the long-lived Strategic task is idle or has ended.
+            if _is_cadence_due(_last_strategic_spawn_drain, 15):
+                try:
+                    from app.strategic_spawn_requests import (
+                        drain_due_strategic_spawn_requests,
+                    )
+
+                    async with AsyncSessionLocal() as _spawn_drain_session:
+                        await drain_due_strategic_spawn_requests(
+                            _spawn_drain_session,
+                            burst_cap=int(
+                                _runtime_config.get(
+                                    "strategist_spawn_window_cap",
+                                    100,
+                                )
+                            ),
+                            burst_window_minutes=int(
+                                _runtime_config.get(
+                                    "strategist_spawn_window_minutes",
+                                    60,
+                                )
+                            ),
+                        )
+                        await _spawn_drain_session.commit()
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Strategic deferred-spawn drain failed"
+                    )
+                _last_strategic_spawn_drain = _utcnow()
 
             # First-cycle awaits are the most common silent-hang site: connection
             # pool exhaustion, row-level locks from a previously OOM'd instance,

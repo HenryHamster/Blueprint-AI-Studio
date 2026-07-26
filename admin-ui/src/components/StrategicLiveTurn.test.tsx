@@ -79,4 +79,28 @@ describe('StrategicResidentActivityWidget — timer truthfulness', () => {
     act(() => vi.advanceTimersByTime(10000));
     expect(text()).toBe(before);
   });
+
+  test('durable waiting state renders one compact activity and idle line', () => {
+    mount(
+      <StrategicResidentActivityWidget
+        state={{
+          phase: 'idle',
+          durablePhase: 'waiting',
+          label: 'Waiting',
+          detail: 'Watching task completions',
+          idleRemainingSeconds: 7140,
+          pendingOperatorMessages: 2,
+          pendingWatches: 1,
+          firedWatches: 1,
+        }}
+      />,
+    );
+    expect(host?.querySelector('[data-testid="strategic-resident-activity"]')?.getAttribute('data-phase'))
+      .toBe('waiting');
+    expect(text()).toContain('Watching task completions');
+    expect(text()).toContain('2 messages pending');
+    expect(text()).toContain('2 watches');
+    expect(text()).toContain('idle 1h 59m left');
+    expect(text()).not.toContain('running…');
+  });
 });

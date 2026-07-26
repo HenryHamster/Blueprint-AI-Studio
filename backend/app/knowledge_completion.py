@@ -2294,7 +2294,12 @@ def _ground_and_assemble_compute_analysis(
     }, ""
 
 
-_ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "deterministic": 0, "llm": 1}
+_ANALYSIS_STRENGTH: dict[str, int] = {
+    "execution_observation": -1,
+    "fallback": 0,
+    "deterministic": 0,
+    "llm": 1,
+}
 
 
 def _incoming_mode_is_upgrade(
@@ -2438,14 +2443,19 @@ async def _persist_compute_knowledge_document(
         "compute_acceptance_reason"
     ]
 
+    identity_filter = (
+        KnowledgeDocument.source_compute_job_id == compute_job_id
+        if compute_job_id is not None
+        else KnowledgeDocument.source_task_id == task.id
+    )
     existing = (
         (
             await session.execute(
                 select(KnowledgeDocument).where(
                     KnowledgeDocument.project_id == task.project_id,
-                    KnowledgeDocument.source_task_id == task.id,
                     KnowledgeDocument.source_kind
                     == SourceKind.COMPUTE_EXPERIMENT.value,
+                    identity_filter,
                 )
             )
         )
@@ -2456,6 +2466,7 @@ async def _persist_compute_knowledge_document(
         doc = KnowledgeDocument(
             project_id=task.project_id,
             source_task_id=task.id,
+            source_compute_job_id=compute_job_id,
             direction_id=direction_id,
             source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
             title=title,

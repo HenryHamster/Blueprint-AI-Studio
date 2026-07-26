@@ -4776,4 +4776,26 @@ describe('ComputeJobsPanel evidence-tier filter + sort', () => {
       expect(order).toEqual(['tierjob-alpha', 'tierjob-bravo', 'tierjob-charlie']);
     });
   });
+
+  test('uses the typed terminal log and keeps task workflow distinct from job execution', async () => {
+    const job = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      task_status: 'CANCELLED',
+      final_cost_usd: 0,
+      terminal_log: { source: 'runner', text: 'finished normally', truncated: false },
+      execution_manifest: { capability_requirements: { machine_type: 'g2-standard-4', accelerator: 'L4' } },
+      runtime_provenance: { backend: 'runner_subprocess', runner_hostname: 'gpu-box' },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const terminalLog = await findByTestId('compute-command-log');
+    expect(terminalLog.textContent).toContain('Terminal log (runner)');
+    expect(terminalLog.textContent).toContain('finished normally');
+    expect((await findByTestId('compute-task-job-state')).textContent).toContain('task workflow: CANCELLED');
+    const placement = await findByTestId('compute-requested-vs-executed');
+    expect(placement.textContent).toContain('requested: g2-standard-4 · L4');
+    expect(placement.textContent).toContain('executed: runner_subprocess · gpu-box');
+  });
 });

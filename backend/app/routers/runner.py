@@ -53,7 +53,7 @@ from app.compute_backends import (
     _MAX_VIEWABLE_FILE_COUNT,
     _MAX_VIEWABLE_VIDEO_BYTES,
 )
-from app.compute_jobs import append_progress_sample
+from app.compute_jobs import append_progress_sample, normalize_terminal_command_log
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.runner_config import config_generation, live_safe_config
 from app.runner_pull_skip import (
@@ -130,6 +130,33 @@ _MAX_IMAGE_CACHE_PROJECTS = 64
 # 1 PiB per bucket — far beyond any real image cache, so an absurd runner-reported
 # integer can never poison the telemetry while every plausible value passes.
 _MAX_IMAGE_CACHE_BYTES = 1 << 50
+
+
+def _observed_runner_hardware(runner: LocalRunner) -> dict[str, Any]:
+    """Return a bounded snapshot of the hardware that actually ran a job."""
+    caps = dict(runner.capabilities or {})
+    hardware: dict[str, Any] = {
+        "has_gpu": caps.get("has_gpu") is True,
+    }
+    for key in ("gpu_count", "memory_free_bytes"):
+        value = caps.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            hardware[key] = value
+    for key in (
+        "gpu_names",
+        "gpu_compute_capabilities",
+        "gpu_memory_total_mib",
+        "gpu_memory_free_mib",
+    ):
+        value = caps.get(key)
+        if isinstance(value, list):
+            hardware[key] = value[:_MAX_GPU_LIST_ENTRIES]
+    cli_inventory = caps.get("cli_inventory")
+    if isinstance(cli_inventory, dict):
+        hardware["cli_inventory"] = dict(
+            list(cli_inventory.items())[:_MAX_CLI_INVENTORY_ENTRIES]
+        )
+    return hardware
 _MAX_CONTAINER_IMAGE_STORE_PATH_CHARS = 512
 _MAX_CONTAINER_IMAGE_RECLAIM_REASON_CHARS = 500
 _CONTAINER_IMAGE_STORE_RUNTIMES = frozenset({"docker", "podman"})
@@ -2316,7 +2343,48 @@ async def report_compute_job(
         job.ran_on_runner_id = runner.id
 
     meta = dict(job.polling_metadata or {})
+    runtime_provenance = dict(job.runtime_provenance or {})
+    runtime_provenance.update(
+        {
+            "backend": job.backend,
+            "runner_id": str(runner.id),
+            "runner_hostname": runner.hostname,
+            "runner_version": runner.version,
+            "observed_hardware": _observed_runner_hardware(runner),
+        }
+    )
+    job.runtime_provenance = runtime_provenance
     cancel_requested = bool(job.status in _COMPUTE_JOB_TERMINAL_STATUSES)
+
+    # Store a terminal runner log under the common key immediately, before the
+    # monitor observes the terminal status.  A cancellation can otherwise win
+    # that poll race and strand the only useful stdout/stderr under a runner-only
+    # key (or discard a final report altogether).  Keep the legacy key too so
+    # older readers remain compatible.
+    terminal_runner_log: dict[str, Any] | None = None
+    if payload.command_log is not None and payload.exec_status != "running":
+        if isinstance(payload.command_log, dict):
+            log_text = payload.command_log.get("text", "")
+            log_truncated = payload.command_log.get("truncated") is True
+        elif isinstance(payload.command_log, str):
+            log_text = payload.command_log
+            log_truncated = False
+        else:
+            log_text = ""
+            log_truncated = False
+        if not isinstance(log_text, str):
+            log_text = ""
+        encoded_log = log_text.encode("utf-8")
+        if len(encoded_log) > _MAX_RUNNER_COMMAND_LOG_BYTES:
+            log_text = encoded_log[:_MAX_RUNNER_COMMAND_LOG_BYTES].decode("utf-8", "replace")
+            log_truncated = True
+        terminal_runner_log = {
+            "source": "runner",
+            "text": log_text,
+            "truncated": log_truncated,
+        }
+        meta["runner_command_log"] = terminal_runner_log
+        meta = normalize_terminal_command_log(meta)
 
     if job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
         valid_statuses = {"running", "succeeded", "failed"}
@@ -2347,17 +2415,12 @@ async def report_compute_job(
                         "truncated": live_truncated,
                     }
         elif payload.command_log is not None:
-            if isinstance(payload.command_log, dict):
-                log_text = payload.command_log.get("text", "")
-                if not isinstance(log_text, str):
-                    log_text = ""
-                if len(log_text.encode("utf-8")) > _MAX_RUNNER_COMMAND_LOG_BYTES:
-                    log_text = log_text.encode("utf-8")[:_MAX_RUNNER_COMMAND_LOG_BYTES].decode("utf-8", "replace")
-                    meta["runner_command_log"] = {"text": log_text, "truncated": True}
-                else:
-                    meta["runner_command_log"] = {"text": log_text, "truncated": False}
-            elif isinstance(payload.command_log, str):
-                meta["runner_command_log"] = {"text": payload.command_log, "truncated": False}
+            # Already normalized before entering the non-terminal branch.  The
+            # condition stays for readability: terminal reports never replace a
+            # running live tail with an unbounded payload.
+            if terminal_runner_log is not None:
+                meta["runner_command_log"] = terminal_runner_log
+                meta = normalize_terminal_command_log(meta)
         if payload.progress is not None:
             merged_progress, new_progress_records = _merge_progress_report(
                 meta.get("progress"), payload.progress, now
@@ -2450,6 +2513,27 @@ async def report_compute_job(
         job.updated_at = now
         session.add(job)
         await session.commit()
+    elif terminal_runner_log is not None:
+        # A late report from the runner is evidence, even when an operator
+        # cancellation has already finalized the ComputeJob.  Persist it rather
+        # than making a cancelled task hide the completed workload's stdout.
+        job.polling_metadata = meta
+        job.updated_at = now
+        session.add(job)
+        await session.commit()
+        # The terminal transition may already have created the job-owned
+        # observation. Refresh it so a late final stdout/stderr report is not
+        # hidden behind a permanently stale document.
+        from app.compute_execution_documents import ensure_compute_execution_document
+
+        try:
+            await ensure_compute_execution_document(session, job.id)
+        except Exception:
+            logger.warning(
+                "[RUNNERS] Late compute execution document refresh failed for job %s",
+                job.id,
+                exc_info=True,
+            )
 
     return {"ok": True, "cancel_requested": cancel_requested}
 

@@ -1640,6 +1640,26 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     ) : ''}
                   </div>
                   {(() => {
+                    const requested = job.execution_manifest?.capability_requirements;
+                    const actual = job.runtime_provenance;
+                    const actualBackend = typeof actual?.backend === 'string' ? actual.backend : null;
+                    const runner = typeof actual?.runner_hostname === 'string' ? actual.runner_hostname : null;
+                    if (!requested && !actual) return null;
+                    const requestedMachine = typeof requested?.machine_type === 'string' ? requested.machine_type : job.machine_type;
+                    const requestedAccelerator = typeof requested?.accelerator === 'string' ? requested.accelerator : job.accelerator_type;
+                    return (
+                      <div className="text-ui-sm text-neutral-500 font-mono mt-0.5" data-testid="compute-requested-vs-executed">
+                        requested: {requestedMachine ?? 'default'}{requestedAccelerator ? ` · ${requestedAccelerator}` : ''}
+                        {' · '}executed: {actualBackend ?? job.backend}{runner ? ` · ${runner}` : ''}
+                      </div>
+                    );
+                  })()}
+                  {job.task_status && job.task_status !== job.status && (
+                    <div className="text-ui-xs text-neutral-600 font-mono mt-0.5" data-testid="compute-task-job-state">
+                      task workflow: {job.task_status} · job execution: {job.status}
+                    </div>
+                  )}
+                  {(() => {
                     const runner = job.runner;
                     const runnerName = runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
                     if (runnerName) {
@@ -2662,7 +2682,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
               {(() => {
                 if (active) return null;
-                const cl = job.command_log ?? (job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null);
+                const cl = job.terminal_log ?? job.command_log ?? (job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null);
                 if (!cl || typeof cl.text !== 'string' || !cl.text.trim()) return null;
                 const lines = cl.text.split('\n');
                 const clipped = lines.length > 30;
@@ -2672,7 +2692,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 return (
                   <div className="mt-1.5" data-testid="compute-command-log">
                     <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
-                      <span>Command log</span>
+                      <span>{'source' in cl && cl.source ? `Terminal log (${cl.source})` : 'Command log'}</span>
                       {cl.truncated && (
                         <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
                           server-truncated

@@ -414,6 +414,24 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     expect(texts.some(t => t.includes('second'))).toBe(true);
   });
 
+  it('combines a full 20-message pending burst into one ordered operator turn', () => {
+    const messages = Array.from(
+      { length: OPERATOR_MESSAGE_BATCH_CAP },
+      (_, index) => ({ id: `message-${index + 1}`, content: `body-${index + 1}` }),
+    );
+    const out = combineOperatorMessages(messages);
+    const text = out
+      .filter((block: ContentBlock): block is { type: 'text'; text: string } => block.type === 'text')
+      .map(block => block.text)
+      .join('');
+    for (let index = 0; index < messages.length; index += 1) {
+      expect(text).toContain(
+        `[operator message ${index + 1}/${OPERATOR_MESSAGE_BATCH_CAP}]\nbody-${index + 1}`,
+      );
+    }
+    expect(text.indexOf('body-1')).toBeLessThan(text.indexOf('body-20'));
+  });
+
   it('skips empty messages', () => {
     expect(combineOperatorMessages([{ content: '' }, { content: '   ' }])).toHaveLength(0);
   });
@@ -1458,6 +1476,41 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     expect(p).toContain('genuinely independent');
     expect(p).toContain('dispatch BOTH now');
     expect(p).toContain('staging one behind the other');
+    expect(p).toContain('./strategic watch-task');
+    expect(p).toContain('Do not spend turns polling it');
+  });
+
+  it('puts fired task watches ahead of normal examination until acknowledged', () => {
+    const p = buildAutonomousPrompt(
+      [],
+      [],
+      [],
+      false,
+      3,
+      '',
+      false,
+      [{
+        id: 'watch-1',
+        target_kind: 'task',
+        target_task_id: 'task-1',
+        purpose: 'report the measurement',
+        state: 'fired',
+        terminal_status: 'COMPLETED',
+        receipt: {
+          title: 'Compute the final metric',
+          knowledge_document_ids: ['doc-1'],
+        },
+      }],
+    );
+    expect(p).toContain('FIRED TASK WATCHES');
+    expect(p).toContain('watch=watch-1');
+    expect(p).toContain('task=task-1');
+    expect(p).toContain('report the measurement');
+    expect(p).toContain('documents=doc-1');
+    expect(p).toContain('ack-watch');
+    expect(p.indexOf('FIRED TASK WATCHES')).toBeLessThan(
+      p.indexOf('No operator message is pending'),
+    );
   });
 });
 

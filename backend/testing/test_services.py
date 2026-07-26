@@ -992,6 +992,10 @@ async def test_persist_zone_health_handles_missing_deploy_state(mocker):
 @pytest_asyncio.fixture()
 async def gcp_db(mocker):
     """Isolated in-memory SQLite DB for gcp_cleanup_service tests."""
+    import app.vm_lifecycle as _vm_lifecycle
+
+    previous_vm_count = _vm_lifecycle._last_gcp_vm_count
+    previous_vm_check = _vm_lifecycle._last_gcp_vm_check
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -1009,12 +1013,18 @@ async def gcp_db(mocker):
     )
     mocker.patch("app.services.AsyncSessionLocal", _Session)
 
-    async with _Session() as session:
-        yield session
-
-    async with _engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.drop_all)
-    await _engine.dispose()
+    try:
+        async with _Session() as session:
+            yield session
+    finally:
+        # gcp_cleanup_service intentionally refreshes these process-wide
+        # counters.  Keep that contract observable within each test without
+        # leaking a mocked cleanup result into duration-reordered tests.
+        _vm_lifecycle._last_gcp_vm_count = previous_vm_count
+        _vm_lifecycle._last_gcp_vm_check = previous_vm_check
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.drop_all)
+        await _engine.dispose()
 
 
 async def _make_task_with_vm(session, project_id, status, vm_instance_id=None) -> Task:
@@ -1052,7 +1062,9 @@ async def test_gcp_cleanup_passes_active_vm_ids_to_cleanup(gcp_db, mocker):
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, None)
 
     mock_cleanup = AsyncMock(
-        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2)
+        return_value=MagicMock(
+            deleted=[], failed=[], total_gcp_vms=2, agent_vm_count=2
+        )
     )
     mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
 
@@ -1092,7 +1104,9 @@ async def test_gcp_cleanup_spares_live_warm_handoff_target_vm(gcp_db, mocker):
     await gcp_db.commit()
 
     mock_cleanup = AsyncMock(
-        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=1)
+        return_value=MagicMock(
+            deleted=[], failed=[], total_gcp_vms=1, agent_vm_count=1
+        )
     )
     mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
     mocker.patch(
@@ -1126,7 +1140,9 @@ async def test_gcp_cleanup_reclaims_expired_warm_handoff_target_vm(gcp_db, mocke
     await gcp_db.commit()
 
     mock_cleanup = AsyncMock(
-        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=1)
+        return_value=MagicMock(
+            deleted=[], failed=[], total_gcp_vms=1, agent_vm_count=1
+        )
     )
     mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
     mocker.patch(
@@ -1162,7 +1178,9 @@ async def test_gcp_cleanup_does_not_exempt_pool_vm_when_pool_disabled(gcp_db, mo
     try:
         _shared_state.runtime_config["warm_pool_enabled"] = False
         mock_cleanup = AsyncMock(
-            return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2)
+            return_value=MagicMock(
+                deleted=[], failed=[], total_gcp_vms=2, agent_vm_count=2
+            )
         )
         mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
         mocker.patch(
@@ -1335,7 +1353,9 @@ async def test_gcp_cleanup_does_not_reap_parked_task_vm(gcp_db, mocker):
     await gcp_db.commit()
 
     mock_cleanup = AsyncMock(
-        return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2)
+        return_value=MagicMock(
+            deleted=[], failed=[], total_gcp_vms=2, agent_vm_count=2
+        )
     )
     mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
     mocker.patch(

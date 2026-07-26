@@ -71,7 +71,7 @@ from app.task_capabilities import (
 )
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
-    resolve_compute_spend_approval,
+    resolve_compute_spend_decision,
     validate_compute_runner_target_enrollment,
 )
 from app.compute_jobs import clamp_spend_cap_usd, clamp_deadline_seconds
@@ -80,7 +80,10 @@ from app.vm_cost_rates import (
     resolve_compute_machine_type,
     validate_compute_request,
 )
-from app.resource_envelope import resolve_project_hardware_policy
+from app.resource_envelope import (
+    resolve_project_hardware_policy,
+    resolve_project_require_local_runner,
+)
 from app.runner_project_binding import runner_allowed_for_project
 from app.schemas import (
     TaskEvaluationSummary,
@@ -3573,10 +3576,17 @@ async def create_compute_experiment_task(
                 "is_duplicate": True,
             }
 
-    requires_approval, _ = resolve_compute_spend_approval(
+    spend_decision = resolve_compute_spend_decision(
         runtime_config=_runtime_config,
         direction=None,
         spend_cap_usd=float(launch_contract["spend_cap_usd"]),
+        require_local_runner=resolve_project_require_local_runner(project),
+        task_context=(
+            {"forced_runner_target_id": forced_runner_id}
+            if forced_runner_id
+            else {}
+        ),
+        launch_contract=launch_contract,
     )
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
@@ -3600,7 +3610,7 @@ async def create_compute_experiment_task(
         status=TaskStatus.QUEUED,
         created_by="USER",
         launched_by_user_id=current_user["user_id"],
-        requires_approval=requires_approval,
+        requires_approval=spend_decision.requires_monetary_approval,
         idempotency_key=scoped_idempotency_key,
         context=task_context,
     )
@@ -3663,6 +3673,7 @@ async def create_compute_experiment_task(
         "status": new_task.status,
         "vm_instance_id": new_task.vm_instance_id,
         "requires_approval": new_task.requires_approval,
+        "monetary_decision": spend_decision.as_dict(),
     }
 
 
@@ -3756,10 +3767,17 @@ async def rerun_compute_experiment(
             else None
         )
 
-    requires_approval, _ = resolve_compute_spend_approval(
+    spend_decision = resolve_compute_spend_decision(
         runtime_config=_runtime_config,
         direction=None,
         spend_cap_usd=float(new_payload_raw["spend_cap_usd"]),
+        require_local_runner=resolve_project_require_local_runner(project),
+        task_context=(
+            {"forced_runner_target_id": forced_runner_id}
+            if forced_runner_id
+            else {}
+        ),
+        launch_contract=new_payload_raw,
     )
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
@@ -3772,7 +3790,7 @@ async def rerun_compute_experiment(
         status=TaskStatus.QUEUED,
         created_by="USER",
         launched_by_user_id=current_user["user_id"],
-        requires_approval=requires_approval,
+        requires_approval=spend_decision.requires_monetary_approval,
         parent_task_id=source.id,
         context=(
             {"forced_runner_target_id": forced_runner_id} if forced_runner_id else {}

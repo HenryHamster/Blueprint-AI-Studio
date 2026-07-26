@@ -41,13 +41,13 @@ def _snapshot_from_rate_limit_data(
     path may not carry it on all response types).
     """
     if not isinstance(rate_limit_data, dict):
-        return UsageSnapshot.unknown(probed_at)
+        return UsageSnapshot.unknown(probed_at, failure_kind="schema")
     entry_5h = rate_limit_data.get("unified_5h")
     if not isinstance(entry_5h, dict):
-        return UsageSnapshot.unknown(probed_at)
+        return UsageSnapshot.unknown(probed_at, failure_kind="schema")
     util_5h = entry_5h.get("utilization")
     if isinstance(util_5h, bool) or not isinstance(util_5h, (int, float)):
-        return UsageSnapshot.unknown(probed_at)
+        return UsageSnapshot.unknown(probed_at, failure_kind="schema")
     resets: dict[str, str | None] = {}
     reset_5h = entry_5h.get("resets_at")
     if isinstance(reset_5h, str) and reset_5h:
@@ -85,21 +85,25 @@ def _normalize_anthropic_usage(data: Any, probed_at: str | None) -> UsageSnapsho
 
     Pure + total: tolerates unknown/extra fields (undocumented endpoint) and
     resolves to ``UsageSnapshot.unknown()`` on ANY structural drift or a
-    missing/null/non-numeric load-bearing field. The five_hour AND seven_day
-    utilization windows are both required; per-model windows (seven_day_sonnet
-    etc.) are carried additively when numeric but never load-bearing.
+    missing/null/non-numeric five-hour field. The five-hour utilization window
+    is sufficient; seven-day and per-model windows are additive when present
+    and numeric.
     """
     if not isinstance(data, Mapping):
-        return UsageSnapshot.unknown(probed_at)
+        return UsageSnapshot.unknown(probed_at, failure_kind="schema")
     windows: dict[str, float] = {}
     resets: dict[str, str | None] = {}
     for window in ("five_hour", "seven_day"):
         cell = data.get(window)
         if not isinstance(cell, Mapping):
-            return UsageSnapshot.unknown(probed_at)
+            if window == "five_hour":
+                return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+            continue
         util = _coerce_utilization(cell.get("utilization"))
         if util is None:
-            return UsageSnapshot.unknown(probed_at)
+            if window == "five_hour":
+                return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+            continue
         windows[window] = util
         reset_raw = cell.get("resets_at")
         resets[window] = reset_raw if isinstance(reset_raw, str) and reset_raw else None
@@ -303,20 +307,20 @@ class AnthropicProvider(LLMProvider):
         """
         self.ensure_supported_auth_mode(auth_mode)
         if not secret:
-            return UsageSnapshot.unknown()
+            return UsageSnapshot.unknown(failure_kind="missing_secret")
         from app.time_utils import _utcnow
 
         probed_at = _utcnow().isoformat()
         if auth_mode == LLMAuthMode.API_KEY:
             return await self._probe_usage_api_key(secret, probed_at)
         if auth_mode != LLMAuthMode.OAUTH:
-            return UsageSnapshot.unknown()
+            return UsageSnapshot.unknown(probed_at, failure_kind="unsupported")
         # Stamp probed_at already set above for API_KEY path; re-use here.
         try:
             import httpx
         except ImportError:
             logger.warning("[ANTHROPIC] httpx unavailable; skipping usage probe")
-            return UsageSnapshot.unknown(probed_at)
+            return UsageSnapshot.unknown(probed_at, failure_kind="unsupported")
         try:
             async with httpx.AsyncClient(
                 timeout=_USAGE_PROBE_TIMEOUT_SECONDS
@@ -328,13 +332,29 @@ class AnthropicProvider(LLMProvider):
                         "anthropic-beta": _USAGE_PROBE_BETA_HEADER,
                     },
                 )
-                resp.raise_for_status()
-                data = resp.json()
+                if resp.status_code in (401, 403):
+                    return UsageSnapshot.unknown(probed_at, failure_kind="authentication")
+                if resp.status_code >= 400:
+                    return UsageSnapshot.unknown(probed_at, failure_kind="endpoint")
+                try:
+                    data = resp.json()
+                except ValueError:
+                    return UsageSnapshot.unknown(probed_at, failure_kind="schema")
+        except httpx.TimeoutException as exc:
+            logger.info(
+                "[ANTHROPIC] usage probe failed: %s (returning unknown)", exc
+            )
+            return UsageSnapshot.unknown(probed_at, failure_kind="timeout")
+        except httpx.RequestError as exc:
+            logger.info(
+                "[ANTHROPIC] usage probe failed: %s (returning unknown)", exc
+            )
+            return UsageSnapshot.unknown(probed_at, failure_kind="transport")
         except Exception as exc:  # noqa: BLE001 — unknown is the contract
             logger.info(
                 "[ANTHROPIC] usage probe failed: %s (returning unknown)", exc
             )
-            return UsageSnapshot.unknown(probed_at)
+            return UsageSnapshot.unknown(probed_at, failure_kind="endpoint")
         return _normalize_anthropic_usage(data, probed_at)
 
     async def _probe_usage_api_key(
@@ -350,7 +370,7 @@ class AnthropicProvider(LLMProvider):
             from app.direct_llm_client import call_direct_llm
         except ImportError:
             logger.warning("[ANTHROPIC] direct_llm_client unavailable; skipping API-key usage probe")
-            return UsageSnapshot.unknown(probed_at)
+            return UsageSnapshot.unknown(probed_at, failure_kind="unsupported")
         try:
             _text, rate_limit_data = await call_direct_llm(
                 api_key,
@@ -362,7 +382,7 @@ class AnthropicProvider(LLMProvider):
             logger.info(
                 "[ANTHROPIC] API-key usage probe failed: %s (returning unknown)", exc
             )
-            return UsageSnapshot.unknown(probed_at)
+            return UsageSnapshot.unknown(probed_at, failure_kind="provider_error")
         return _snapshot_from_rate_limit_data(rate_limit_data, probed_at)
 
     def settings_schema(self) -> dict[str, Any]:

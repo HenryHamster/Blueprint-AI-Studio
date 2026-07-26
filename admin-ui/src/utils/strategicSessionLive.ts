@@ -234,6 +234,9 @@ export type ResidentActivityPhase = 'executing' | 'idle' | 'dead';
 
 export interface ResidentActivityState {
   phase: ResidentActivityPhase;
+  /** Durable backend lifecycle phase. `phase` remains the timer/presentation
+   * compatibility shape; this field carries the exact operator contract. */
+  durablePhase?: 'working' | 'waiting' | 'retrying' | 'stopping' | 'ended';
   /** The shell command / tool one-liner currently (or last) executing. */
   commandText?: string;
   /** Epoch ms the executing command started — drives the LIVE counter (executing only). */
@@ -242,6 +245,11 @@ export interface ResidentActivityState {
   endMs?: number;
   /** Short human-readable label for the state. */
   label: string;
+  detail?: string;
+  idleRemainingSeconds?: number | null;
+  pendingOperatorMessages?: number;
+  pendingWatches?: number;
+  firedWatches?: number;
 }
 
 /** Heartbeat older than this (relative to `nowMs`) means the resident session is
@@ -312,7 +320,11 @@ export function computeResidentActivityState(
     const frozen = !Number.isNaN(endedAtMs)
       ? endedAtMs
       : (!Number.isNaN(heartbeatMs) ? heartbeatMs : undefined);
-    return { phase: 'dead', endMs: frozen, label: 'Session ended' };
+    return {
+      phase: 'dead', durablePhase: 'ended', endMs: frozen, label: 'Session ended',
+      detail: residentSession.activity?.last_action ?? undefined,
+      idleRemainingSeconds: residentSession.activity?.idle_remaining_seconds,
+    };
   }
 
   // A provider-enforced retry hold is an intentional dormant state. The worker
@@ -321,12 +333,15 @@ export function computeResidentActivityState(
   if (retryWaiting) {
     return {
       phase: 'idle',
+      durablePhase: 'retrying',
       endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
       label: retryWaitLabel(
         residentSession.worker_retry_reason,
         residentSession.worker_retry_until,
         nowMs,
       ),
+      detail: residentSession.activity?.last_action ?? undefined,
+      idleRemainingSeconds: residentSession.activity?.idle_remaining_seconds,
     };
   }
 
@@ -336,8 +351,10 @@ export function computeResidentActivityState(
   if (residentSession.worker_state === 'starting') {
     return {
       phase: 'idle',
+      durablePhase: 'waiting',
       endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
       label: 'Reconnecting Workday…',
+      idleRemainingSeconds: residentSession.activity?.idle_remaining_seconds,
     };
   }
 
@@ -347,8 +364,48 @@ export function computeResidentActivityState(
   if (residentSession.worker_state === 'restart_failed' || stale) {
     return {
       phase: 'dead',
+      durablePhase: 'ended',
       endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
       label: 'Workday needs restart',
+      detail: residentSession.activity?.last_action ?? undefined,
+      idleRemainingSeconds: residentSession.activity?.idle_remaining_seconds,
+    };
+  }
+
+  const durable = residentSession.activity;
+  const durablePhase = durable?.phase;
+  if (
+    durable
+    && (
+      durablePhase === 'working'
+      || durablePhase === 'waiting'
+      || durablePhase === 'retrying'
+      || durablePhase === 'stopping'
+    )
+  ) {
+    const phaseStartedMs = durable.phase_started_at
+      ? parseTimestamp(durable.phase_started_at).getTime()
+      : NaN;
+    return {
+      phase: durablePhase === 'working' ? 'executing' : 'idle',
+      durablePhase,
+      startMs: durablePhase === 'working' && !Number.isNaN(phaseStartedMs)
+        ? phaseStartedMs
+        : undefined,
+      endMs: durablePhase === 'working' || Number.isNaN(heartbeatMs)
+        ? undefined
+        : heartbeatMs,
+      label: {
+        working: 'Working',
+        waiting: 'Waiting',
+        retrying: 'Retrying',
+        stopping: 'Stopping soon',
+      }[durablePhase],
+      detail: durable.last_action ?? undefined,
+      idleRemainingSeconds: durable.idle_remaining_seconds,
+      pendingOperatorMessages: durable.pending_operator_messages,
+      pendingWatches: durable.pending_watches,
+      firedWatches: durable.fired_watches,
     };
   }
 
@@ -361,11 +418,15 @@ export function computeResidentActivityState(
     && activity.latestLifecycle !== 'done';
 
   if (executing && last) {
-    return { phase: 'executing', commandText: last.text, startMs: last.ts, label: 'Working' };
+    return {
+      phase: 'executing', durablePhase: 'working', commandText: last.text,
+      startMs: last.ts, label: 'Working',
+    };
   }
 
   return {
     phase: 'idle',
+    durablePhase: 'waiting',
     endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
     label: 'Waiting for direction',
   };

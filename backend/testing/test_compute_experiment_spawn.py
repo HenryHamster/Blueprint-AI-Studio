@@ -114,6 +114,83 @@ def test_author_contract_tolerates_non_dict_nested():
     assert contract["command"] == "run"
 
 
+def test_compute_spend_decision_only_waives_guaranteed_local_execution():
+    from app.compute_experiment_contract import resolve_compute_spend_decision
+
+    common = {
+        "runtime_config": {"compute_experiment_spend_threshold_usd": 10.0},
+        "direction": None,
+        "spend_cap_usd": 15.0,
+    }
+    cloud = resolve_compute_spend_decision(**common)
+    assert cloud.execution_mode == "cloud_possible"
+    assert cloud.billable_estimate_usd == 15.0
+    assert cloud.requires_monetary_approval is True
+
+    soft = resolve_compute_spend_decision(
+        **common,
+        launch_contract={"runner_target": {"runner_id": str(uuid.uuid4()), "strict": False}},
+    )
+    assert soft.execution_mode == "cloud_possible"
+    assert soft.requires_monetary_approval is True
+
+    strict = resolve_compute_spend_decision(
+        **common,
+        launch_contract={"runner_target": {"runner_id": str(uuid.uuid4()), "strict": True}},
+    )
+    assert strict.execution_mode == "local_only"
+    assert strict.billable_estimate_usd == 0.0
+    assert strict.requires_monetary_approval is False
+
+    project_local = resolve_compute_spend_decision(
+        **common, require_local_runner=True
+    )
+    assert project_local.reason_code == "project_requires_local_runner"
+    assert project_local.requires_monetary_approval is False
+
+
+def test_compute_contract_preview_uses_normalizer_and_returns_stable_failure():
+    from app.compute_experiment_contract import build_compute_contract_preview
+
+    preview = build_compute_contract_preview(
+        {"command": "python benchmark.py", "spend_cap_usd": 15, "deadline_seconds": 300},
+        runtime_config={"compute_experiment_spend_threshold_usd": 10},
+    )
+    assert preview["ok"] is True
+    assert preview["normalized_contract"]["command"] == "python benchmark.py"
+    assert preview["monetary_decision"]["execution_mode"] == "cloud_possible"
+    assert preview["monetary_decision"]["requires_monetary_approval"] is True
+    assert preview["preflight"]["status"] == "not_supported"
+
+    invalid = build_compute_contract_preview(
+        {"command": "", "spend_cap_usd": 15, "deadline_seconds": 300},
+        runtime_config={},
+    )
+    assert invalid["ok"] is False
+    assert invalid["failure"] == {
+        "phase": "validation",
+        "classification": "contract_invalid",
+        "code": "compute_contract_invalid",
+        "retryable": False,
+        "hint": "missing or empty command",
+    }
+
+
+def test_terminal_log_normalization_promotes_runner_output_without_clobbering_canonical_log():
+    runner_only = compute_jobs.normalize_terminal_command_log(
+        {"runner_command_log": {"text": "runner stderr", "truncated": True}}
+    )
+    assert runner_only["command_log"] == runner_only["runner_command_log"]
+
+    canonical = compute_jobs.normalize_terminal_command_log(
+        {
+            "command_log": {"text": "backend stdout", "truncated": False},
+            "runner_command_log": {"text": "runner stderr", "truncated": True},
+        }
+    )
+    assert canonical["command_log"]["text"] == "backend stdout"
+
+
 @pytest.mark.asyncio
 async def test_spend_direction_lookup_is_optional_and_raiseload_safe(db_session):
     """A direction override is used when present, never required for compute."""
@@ -1606,11 +1683,10 @@ async def test_concurrent_cap_suppresses_excess_spawn(db_session, _quiet_compute
             runtime_config.pop("max_concurrent_act_on_verdict_followons", None)
 
 
-def test_strategist_allowlist_excludes_create_unchanged():
-    """The act_on_verdict spawn does NOT widen the strategist allowlist: the
-    strategist still cannot spawn create (the ORCHESTRATOR does the spawn)."""
-    assert "create" not in STRATEGIST_SPAWNABLE_TASK_TYPES
-    assert "refactor" not in STRATEGIST_SPAWNABLE_TASK_TYPES
+def test_strategist_allowlist_includes_ordinary_implementation_tasks():
+    """Strategic dispatch uses the unified spawn_task path for normal work."""
+    assert {"create", "refactor", "qa"} <= STRATEGIST_SPAWNABLE_TASK_TYPES
+    # A fix still requires existing PR/branch context.
     assert "fix" not in STRATEGIST_SPAWNABLE_TASK_TYPES
 
 

@@ -27,6 +27,8 @@ from app.task_capabilities import (
     RUN_SHAPE_BY_TASK_TYPE,
     STRATEGIC_PHASE_BY_TASK_TYPE,
     STRATEGIC_TASK_TYPES,
+    STRATEGIST_CONTEXTUAL_TASK_TYPES,
+    STRATEGIST_SPAWNABLE_TASK_TYPES,
     TASK_CAPABILITIES,
     TASK_CAPABILITY_BY_TYPE,
     USER_LAUNCHABLE_TASK_TYPES,
@@ -37,6 +39,20 @@ from app.task_capabilities import (
     strategic_phase_for,
     task_type_catalog,
 )
+
+
+def test_strategist_dispatch_policy_uses_one_spawn_task_contract():
+    assert {
+        "research",
+        "web_research",
+        "design",
+        "plan",
+        "compute_experiment",
+        "create",
+        "refactor",
+        "qa",
+    }.issubset(STRATEGIST_SPAWNABLE_TASK_TYPES)
+    assert STRATEGIST_CONTEXTUAL_TASK_TYPES == {"fix"}
 
 
 def test_task_capability_registry_covers_task_type_enum():

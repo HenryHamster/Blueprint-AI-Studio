@@ -1273,8 +1273,7 @@ def test_rewrite_expected_schema_revision_absent_returns_zero():
 def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
     """Migration 0707 must chain from 0702 and reference each KV-backed key.
 
-    Exercises the live 0707 migration file (production code) and confirms
-    EXPECTED_SCHEMA_REVISION in main.py has been bumped to match.
+    Exercises the live historical 0707 migration file (production code).
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     migration_path = versions_dir / "0707_backfill_remaining_design_doc_telemetry.py"
@@ -1298,10 +1297,18 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
             f"Backfill key {key!r} not referenced in 0707 migration body"
         )
 
-    # EXPECTED_SCHEMA_REVISION in main.py must be bumped to 0707.
+
+def test_operability_0708_is_the_expected_schema_head():
+    """The additive operability migration extends 0707 and is the app head."""
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    migration_path = versions_dir / "0708_pipeline_operability_foundation.py"
+    content = migration_path.read_text()
+    revision, down_revision = parse_revision_identifiers(content)
+    assert (revision, down_revision) == ("0708", "0707")
+
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0707", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0707', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0708", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0708', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )
