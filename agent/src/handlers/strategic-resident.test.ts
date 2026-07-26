@@ -1950,6 +1950,7 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
         project_name: 'P',
         open_messages: [],
         strategic_session_operator_ack_threshold_seconds: 2,
+        strategic_session_idle_tick_seconds: 10,
       },
       { project_metadata: { project_id: 'proj-ack' }, context: {} },
       'ghtok', 'owner', 'repo', null, { value: '' },
@@ -2069,6 +2070,7 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
         project_name: 'P',
         open_messages: [],
         strategic_session_operator_ack_threshold_seconds: 2,
+        strategic_session_idle_tick_seconds: 10,
       },
       { project_metadata: { project_id: 'proj-ack-fail' }, context: {} },
       'ghtok', 'owner', 'repo', null, { value: '' },
@@ -2084,6 +2086,65 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
 
     // The heartbeat (proof the turn completed) must have been reached
     expect(heartbeatCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('renews the Resident heartbeat while a slow operator reply is in flight', async () => {
+    vi.useFakeTimers();
+
+    const operatorMessage = {
+      id: 'msg-liveness',
+      content: 'Please take the time you need, but keep the session alive.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    let resolveTurn!: (r: ResidentTurnResult) => void;
+    const blockedTurnPromise = new Promise<ResidentTurnResult>((resolve) => {
+      resolveTurn = resolve;
+    });
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [operatorMessage] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatBodies.length > 1,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(() => blockedTurnPromise, () => true);
+    mockStartSession.mockReturnValue(session);
+    const handlerDone = handleStrategicResident(
+      'task-operator-liveness',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 1,
+      },
+      { project_metadata: { project_id: 'proj-operator-liveness' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(heartbeatBodies).toContainEqual(expect.objectContaining({ progress: false }));
+
+    resolveTurn(turnResult({ sentOperatorMessage: true, resultText: 'operator reply' }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await handlerDone;
   });
 });
 

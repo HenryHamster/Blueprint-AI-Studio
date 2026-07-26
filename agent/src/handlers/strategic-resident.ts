@@ -1457,6 +1457,29 @@ export async function handleStrategicResident(
     }
   };
 
+  // Operator turns are equally capable of outliving the reaper window.  The
+  // generic task heartbeat proves the runner is alive, but the session's
+  // worker heartbeat is the authority used by the resident reaper.  Keep that
+  // heartbeat moving while a slow provider reply is streamed; previously this
+  // watchdog existed only for autonomous turns, so a mid-conversation reply
+  // could be superseded despite the runner continuing to report progress.
+  const watchOperatorTurn = async (
+    turnPromise: Promise<ResidentTurnResult>,
+  ): Promise<'done' | 'stop'> => {
+    const doneSignal: Promise<'done'> = turnPromise.then(() => 'done' as const);
+    for (;;) {
+      const raced = await Promise.race([
+        doneSignal,
+        sleep(cfg.messagePollMs).then(() => 'tick' as const),
+      ]);
+      if (raced === 'done') return 'done';
+      if (livenessHeartbeatDue()) {
+        const hb = await livenessHeartbeat();
+        if (hb?.stop_requested || !authorityHeld) return 'stop';
+      }
+    }
+  };
+
   // ── Git READ-token background refresh ────────────────────────────────────────
   // Periodically calls /api/agent/git-read-token and updates the credential
   // helper's token file so `git fetch origin` keeps working beyond the 60-minute
@@ -1606,7 +1629,23 @@ export async function handleStrategicResident(
       return 'stop';
     }
     try {
-      r = await runTurn(operatorBlocks, true, pickupLagMs);
+      const turnPromise = runTurn(operatorBlocks, true, pickupLagMs);
+      const watch = await watchOperatorTurn(turnPromise);
+      if (watch === 'stop') {
+        session.interrupt();
+        const settledBeforeDeadline = await Promise.race([
+          turnPromise.then(() => true),
+          new Promise<boolean>((resolve) => setTimeout(() => { resolve(false); }, OPERATOR_PREEMPT_DEADLINE_MS)),
+        ]);
+        if (!settledBeforeDeadline) {
+          invalidateSessionEvents();
+          session.close();
+        }
+        await turnPromise;
+        stopReason = 'operator_turn_interrupted';
+        return 'stop';
+      }
+      r = await turnPromise;
     } finally {
       if (ackTimer !== null) clearTimeout(ackTimer);
       try {
