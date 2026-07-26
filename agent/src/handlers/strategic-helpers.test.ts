@@ -1362,6 +1362,33 @@ describe('buildStrategicChallengePrompt', () => {
     // Fail-closed instruction present.
     expect(prompt).toContain('When in doubt, REJECT');
   });
+
+  it('retains early grounding and late portfolio operations when bounding long analysis', () => {
+    const earlyGrounding = 'EARLY_GROUNDING_HEAD_7366725';
+    const latePortfolioMoves = [
+      'LATE_PORTFOLIO_OPERATIONS',
+      'RETIRE d-3e65f0d8',
+      'CREATE corpus-production direction',
+    ].join('\n');
+    const analysisText = `${earlyGrounding}\n${'x'.repeat(45_000)}\n${latePortfolioMoves}`;
+    const opts = {
+      analysisText,
+      dirSummaryText: '',
+      pastRetirementCritiquesSection: '',
+      portfolioCompositionText: '',
+    };
+
+    const prompt = buildStrategicChallengePrompt(opts);
+    const emptyAnalysisPrompt = buildStrategicChallengePrompt({
+      ...opts,
+      analysisText: '',
+    });
+
+    expect(prompt).toContain(earlyGrounding);
+    expect(prompt).toContain(latePortfolioMoves);
+    expect(prompt).toContain('middle of strategic analysis omitted to preserve prompt bound');
+    expect(prompt.length - emptyAnalysisPrompt.length).toBeLessThanOrEqual(40_000);
+  });
 });
 
 describe('buildStrategicChallengeExecutorSection (retirement gate)', () => {

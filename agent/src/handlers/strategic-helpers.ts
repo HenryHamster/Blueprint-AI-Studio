@@ -891,6 +891,25 @@ export function parseStrategicChallengeRecord(rawText: string): StrategicChallen
   return record;
 }
 
+const _CHALLENGE_ANALYSIS_MAX_CHARS = 40_000;
+const _CHALLENGE_ANALYSIS_HEAD_CHARS = 20_000;
+const _CHALLENGE_ANALYSIS_OMISSION_MARKER =
+  '\n\n[... middle of strategic analysis omitted to preserve prompt bound ...]\n\n';
+
+function boundStrategicChallengeAnalysis(rawAnalysis: string): string {
+  const analysis = rawAnalysis || '';
+  if (analysis.length <= _CHALLENGE_ANALYSIS_MAX_CHARS) return analysis;
+
+  const tailChars = _CHALLENGE_ANALYSIS_MAX_CHARS
+    - _CHALLENGE_ANALYSIS_HEAD_CHARS
+    - _CHALLENGE_ANALYSIS_OMISSION_MARKER.length;
+  return [
+    analysis.slice(0, _CHALLENGE_ANALYSIS_HEAD_CHARS),
+    _CHALLENGE_ANALYSIS_OMISSION_MARKER,
+    analysis.slice(-tailChars),
+  ].join('');
+}
+
 // Build the adversarial challenge prompt. The challenger reads the thinker's
 // analysis plus the directions/portfolio context the thinker saw, and emits
 // ONLY the strict verdict JSON.
@@ -902,7 +921,7 @@ export function buildStrategicChallengePrompt(opts: {
   stagedDirectionsText?: string;
   activeCapacityText?: string;
 }): string {
-  const analysis = (opts.analysisText || '').slice(0, 40_000);
+  const analysis = boundStrategicChallengeAnalysis(opts.analysisText);
   const ctxBlocks = [
     opts.dirSummaryText ? `## Existing directions (what the thinker saw)\n${opts.dirSummaryText}` : '',
     opts.portfolioCompositionText ? `## Portfolio composition\n${opts.portfolioCompositionText}` : '',
