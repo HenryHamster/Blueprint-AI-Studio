@@ -3825,10 +3825,12 @@ class TestRefreshUsageMeterSnapshots:
         return acct
 
     async def test_schedules_only_eligible_accounts(self, monkeypatch):
-        scheduled: list[str] = []
+        scheduled: list[tuple[str, float]] = []
         monkeypatch.setattr(
             "app.max_plan_pool._schedule_usage_refresh",
-            lambda acct: scheduled.append(acct["id"]),
+            lambda acct, *, delay_seconds=0.0: scheduled.append(
+                (acct["id"], delay_seconds)
+            ),
         )
         self._register(
             _acct(id="claude", provider="anthropic", auth_mode="oauth")
@@ -3854,15 +3856,19 @@ class TestRefreshUsageMeterSnapshots:
             )
         )
         count = await refresh_usage_meter_snapshots()
-        assert scheduled == ["claude"]
-        assert count == 1
+        assert [account_id for account_id, _ in scheduled] == [
+            "claude",
+            "codex",
+        ]
+        assert [delay for _, delay in scheduled] == [0.0, 0.5]
+        assert count == 2
 
     async def test_skips_fresh_snapshots_and_recent_failures(self, monkeypatch):
         now = _utcnow()
         scheduled: list[str] = []
         monkeypatch.setattr(
             "app.max_plan_pool._schedule_usage_refresh",
-            lambda acct: scheduled.append(acct["id"]),
+            lambda acct, *, delay_seconds=0.0: scheduled.append(acct["id"]),
         )
         fresh = self._register(
             _acct(id="fresh", provider="anthropic", auth_mode="oauth")

@@ -263,14 +263,14 @@
       "classification": "high_signal",
       "message_type": "NOTE",
       "source_fn": "raise_stalled_trial_notice",
-      "audience": "operator-fyi"
+      "audience": "pipeline-log"
     },
     {
       "name": "capability_verdict_decided",
       "classification": "high_signal",
       "message_type": "NOTE",
       "source_fn": "raise_capability_verdict_notice",
-      "audience": "operator-fyi"
+      "audience": "pipeline-log"
     },
     {
       "name": "capability_trial_ambiguous_lift_escalation",

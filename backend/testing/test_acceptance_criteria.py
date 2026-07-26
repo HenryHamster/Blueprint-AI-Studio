@@ -5348,6 +5348,7 @@ async def test_retire_direction_clears_criterion_keys(
             "data": {
                 "direction_id": dir_id,
                 "rationale": "work is done",
+                "terminal_reason": "invalidated",
             },
         },
     )

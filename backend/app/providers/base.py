@@ -126,7 +126,7 @@ class UsageSnapshot:
     #
     # Known values are provider-agnostic where possible: ``unsupported``,
     # ``missing_secret``, ``secret_unavailable``, ``authentication``,
-    # ``timeout``, ``transport``, ``endpoint``, ``schema``, and
+    # ``rate_limited``, ``timeout``, ``transport``, ``endpoint``, ``schema``, and
     # ``provider_error``.  Unknown values remain safe additive data.
     probe_failure_kind: str | None = field(
         default=None, compare=False, hash=False, repr=False

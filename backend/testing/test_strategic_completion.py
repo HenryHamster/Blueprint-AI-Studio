@@ -5262,6 +5262,7 @@ async def test_gap_reconciled_on_retire_fallback_path(db_session, mocker):
                     "op": "retire",
                     "direction_id": "d-xxx",
                     "rationale": "Done — metering gap closed",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -6551,7 +6552,11 @@ async def test_retirement_always_proceeds_without_challenge_gate(client, db_sess
             json={
                 "task_id": str(task.id),
                 "op": "retire_direction",
-                "data": {"direction_id": direction_id, "rationale": rationale},
+                "data": {
+                    "direction_id": direction_id,
+                    "rationale": rationale,
+                    "terminal_reason": "invalidated",
+                },
             },
             headers={"x-agent-token": token},
         )
@@ -6717,7 +6722,11 @@ async def test_retire_direction_rejected_portfolio_operation_blocks(client, db_s
         task,
         "vm-po-retire",
         "retire_direction",
-        {"direction_id": "d-retire", "rationale": "redundant"},
+        {
+            "direction_id": "d-retire",
+            "rationale": "redundant",
+            "terminal_reason": "invalidated",
+        },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -13184,6 +13193,7 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
             "op": "retire",
             "direction_id": direction_id,
             "rationale": "CI speed goal met",
+            "terminal_reason": "invalidated",
         }
     ]
     logs = json.dumps(
@@ -13995,6 +14005,7 @@ async def test_retire_op_sets_retired_status_and_appears_in_summary(db_session, 
                     "op": "retire",
                     "direction_id": direction_id,
                     "rationale": "CI speed goal fully met",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -18627,6 +18638,7 @@ async def test_batch_retire_reconciles_gap_active_moves_and_records_deferral(
                     "op": "retire",
                     "direction_id": "d-ret",
                     "rationale": "no longer worthwhile",
+                    "terminal_reason": "invalidated",
                 },
             ],
         }
@@ -19522,6 +19534,7 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
                     "op": "retire_direction",
                     "direction_id": "d-retire",
                     "rationale": "done",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -19599,6 +19612,7 @@ async def test_retire_direction_note_not_duplicated_on_reprocess(db_session, moc
                     "op": "retire_direction",
                     "direction_id": "d-dedup",
                     "rationale": rationale,
+                    "terminal_reason": "invalidated",
                 }
             ],
         }
@@ -19730,6 +19744,7 @@ async def test_retire_direction_succeeds_when_criterion_is_covered(
                     "op": "retire_direction",
                     "direction_id": direction_id,
                     "rationale": "Direction completed",
+                    "terminal_reason": "invalidated",
                 }
             ],
         }

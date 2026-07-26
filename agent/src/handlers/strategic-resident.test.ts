@@ -98,6 +98,20 @@ vi.mock('../providers/resident-reply-tool.js', () => ({
   RESIDENT_REPLY_TOOL_NAME: 'mcp__workday__reply_to_operator',
   provisionResidentReplyTool: mockProvisionResidentReplyTool,
 }));
+vi.mock('./resident-repo-freshness.js', () => ({
+  syncResidentRepository: vi.fn((_workspace: string, _baseBranch: string, previousHead?: string | null) => ({
+    status: 'CURRENT',
+    head: '0123456789abcdef0123456789abcdef01234567',
+    previousHead: previousHead ?? null,
+    commits: [],
+    changedFiles: [],
+    omittedCommits: 0,
+    omittedChangedFiles: 0,
+    deltaAvailable: previousHead !== null && previousHead !== undefined,
+    reason: null,
+  })),
+  formatResidentRepoSnapshot: vi.fn(() => '## Repository freshness\nStatus: CURRENT'),
+}));
 vi.mock('./strategic-sections.js', () => ({
   buildDirSummaryText: vi.fn(() => ''),
   // Render each open message so the compaction checkpoint's "Open operator

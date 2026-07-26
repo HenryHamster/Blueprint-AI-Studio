@@ -334,6 +334,8 @@ class AnthropicProvider(LLMProvider):
                 )
                 if resp.status_code in (401, 403):
                     return UsageSnapshot.unknown(probed_at, failure_kind="authentication")
+                if resp.status_code == 429:
+                    return UsageSnapshot.unknown(probed_at, failure_kind="rate_limited")
                 if resp.status_code >= 400:
                     return UsageSnapshot.unknown(probed_at, failure_kind="endpoint")
                 try:

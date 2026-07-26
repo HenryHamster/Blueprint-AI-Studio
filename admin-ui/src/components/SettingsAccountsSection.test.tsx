@@ -1,8 +1,9 @@
-import { useState, type ComponentProps } from 'react';
+import { useRef, useState, type ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SettingsAccountsSection } from './SettingsAccountsSection';
 import type { AccountMutationResult, MaxPlanAccount, ProviderCatalogEntry } from '../types/settings';
+import { DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 function makeAccount(overrides: Partial<MaxPlanAccount> = {}): MaxPlanAccount {
   return {
@@ -48,6 +49,7 @@ function Harness({
       onRemoveAccount={onRemoveAccount}
       onResetRateLimits={vi.fn()}
       onRefreshAccountModels={vi.fn()}
+      onRefreshAccounts={overrides.onRefreshAccounts ?? vi.fn()}
       onUpdateAccount={onUpdateAccount}
       onUpdateAccountCaps={onUpdateAccountCaps}
       providers={overrides.providers ?? {
@@ -79,6 +81,69 @@ function Harness({
 }
 
 describe('SettingsAccountsSection', () => {
+  it('refreshes an unknown usage snapshot while the accounts surface remains active', async () => {
+    vi.useFakeTimers();
+    try {
+      function RefreshingHarness() {
+        const [accounts, setAccounts] = useState([
+          makeAccount({
+            usage_snapshot: {
+              known: false,
+              five_hour_utilization: null,
+              seven_day_utilization: null,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+              dark_reason: 'endpoint',
+              last_attempt_at: '2026-07-26T21:42:15Z',
+              last_attempt_failure_kind: 'endpoint',
+            },
+          }),
+        ]);
+        const refreshCount = useRef(0);
+
+        return (
+          <Harness
+            maxPlanAccounts={accounts}
+            onRefreshAccounts={() => {
+              refreshCount.current += 1;
+              if (refreshCount.current === 2) {
+                setAccounts([
+                  makeAccount({
+                    usage_snapshot: {
+                      known: true,
+                      five_hour_utilization: 42,
+                      seven_day_utilization: 57,
+                      resets_at: {},
+                      probed_at: '2026-07-26T21:43:00Z',
+                      stale: false,
+                      dark_reason: null,
+                      last_attempt_at: '2026-07-26T21:43:00Z',
+                      last_attempt_failure_kind: null,
+                    },
+                  }),
+                ]);
+              }
+            }}
+          />
+        );
+      }
+
+      render(<RefreshingHarness />);
+      expect(screen.getByText(/usage endpoint/)).toBeInTheDocument();
+
+      await act(async () => {
+        vi.advanceTimersByTime(DEFAULT_POLL_MS);
+      });
+
+      expect(screen.getByText('42%')).toBeInTheDocument();
+      expect(screen.getByText('57%')).toBeInTheDocument();
+      expect(screen.queryByText(/usage endpoint/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('enables the add-account flow once required fields are filled', () => {
     const onAddAccount = vi.fn();
     render(<Harness onAddAccount={onAddAccount} />);

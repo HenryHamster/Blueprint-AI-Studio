@@ -4825,7 +4825,11 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
                 json={
                     "op": "retire_direction",
                     "task_id": task_id,
-                    "data": {"direction_id": "d-retire-me", "rationale": "obsolete"},
+                    "data": {
+                        "direction_id": "d-retire-me",
+                        "rationale": "obsolete",
+                        "terminal_reason": "invalidated",
+                    },
                 },
             )
             assert r3.status_code == 200, r3.text
@@ -4901,7 +4905,11 @@ async def _retire_one_direction(db_session, mocker, active_ids):
                 json={
                     "op": "retire_direction",
                     "task_id": task_id,
-                    "data": {"direction_id": active_ids[0], "rationale": "obsolete"},
+                    "data": {
+                        "direction_id": active_ids[0],
+                        "rationale": "obsolete",
+                        "terminal_reason": "invalidated",
+                    },
                 },
             )
         assert r.status_code == 200, r.text
@@ -5026,6 +5034,7 @@ async def test_retire_direction_spawns_and_persists_memo_task(db_session, mocker
                     "data": {
                         "direction_id": direction_id,
                         "rationale": "Gap is now closed, evidence confirms success.",
+                        "terminal_reason": "invalidated",
                     },
                 },
             )
@@ -5134,6 +5143,7 @@ async def test_retire_direction_reconciles_problem_model_gap(db_session, mocker)
                     "data": {
                         "direction_id": direction_id,
                         "rationale": "Gap is closed.",
+                        "terminal_reason": "invalidated",
                     },
                 },
             )

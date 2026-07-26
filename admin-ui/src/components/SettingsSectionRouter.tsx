@@ -197,6 +197,7 @@ export interface SettingsSectionRouterProps {
   onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
   onResetRateLimits: (id: string) => void;
   onRefreshAccountModels: (id: string) => void;
+  onRefreshAccounts: () => void | Promise<void>;
   onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (
     id: string,
@@ -456,6 +457,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
             onRemoveAccount={props.onRemoveAccount}
             onResetRateLimits={props.onResetRateLimits}
             onRefreshAccountModels={props.onRefreshAccountModels}
+            onRefreshAccounts={props.onRefreshAccounts}
             onUpdateAccount={props.onUpdateAccount}
             onUpdateAccountCaps={props.onUpdateAccountCaps}
             providers={props.providers}

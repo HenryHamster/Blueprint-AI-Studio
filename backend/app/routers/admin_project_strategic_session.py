@@ -1194,6 +1194,7 @@ def _session_conversation_predicate():
         ProjectMessage.from_type == "strategic",
         or_(
             ProjectMessage.context["message_role"].as_string() == "operator_reply",
+            ProjectMessage.context["event_type"].as_string() == "strategic_message",
             ProjectMessage.reply_to_message_id.isnot(None),
             ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
         ),
