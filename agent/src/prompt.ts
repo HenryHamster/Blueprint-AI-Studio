@@ -655,11 +655,19 @@ export function assembleFailureGuidanceBlocks(includeRetryGuidance = true): stri
 export function computePromptFingerprint(
   taskType: string,
   buildConfig?: BuildConfig,
-  options?: { includeParallelFixGuidance?: boolean; promotionTarget?: string; codeChangeGuidanceVariant?: string },
+  options?: {
+    includeParallelFixGuidance?: boolean;
+    promotionTarget?: string;
+    codeChangeGuidanceVariant?: string;
+    emittedFailureGuidance?: string;
+  },
 ): string {
   const hints = getTaskTypeHints(buildConfig, options?.promotionTarget);
   const taskHint = hints[taskType] ?? '';
-  const sections = [taskHint, DEFAULT_TOOL_GUIDANCE, assembleFailureGuidanceBlocks()];
+  const sections = [taskHint, DEFAULT_TOOL_GUIDANCE];
+  if (options?.emittedFailureGuidance) {
+    sections.push(options.emittedFailureGuidance);
+  }
   if (options?.includeParallelFixGuidance) sections.push(PARALLEL_FIX_GUIDANCE);
   // The code-change lifecycle/helper guidance now varies by project (self-repo
   // vs. build_config-driven vs. generic no-config). Fold the chosen variant into

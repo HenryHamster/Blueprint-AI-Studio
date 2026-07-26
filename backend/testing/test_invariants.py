@@ -13431,20 +13431,20 @@ class TestProblemModelWritePathInvariants:
         ("routers/admin_projects.py", 1284): "current_model pydantic model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 967): "pm parsed from ProblemModel, model_dump",
-        # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (6 sites)
-        ("routers/admin_agent_ops.py", 1659): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2006): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2436): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2549): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2804): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
+        ("routers/admin_agent_ops.py", 1671): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2031): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2461): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2574): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2829): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4224): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 3959): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4252): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 3987): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 4783): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4518): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 4865): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4600): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):
@@ -13456,7 +13456,9 @@ class TestProblemModelWritePathInvariants:
 
         for py_file in sorted(app_dir.rglob("*.py")):
             source = py_file.read_text(encoding="utf-8")
-            rel = py_file.relative_to(BACKEND_ROOT / "app")
+            # Keep allowlist keys stable across Linux CI and Windows developer
+            # machines.
+            rel = py_file.relative_to(BACKEND_ROOT / "app").as_posix()
             try:
                 tree = ast.parse(source, filename=str(py_file))
             except SyntaxError:
@@ -13468,7 +13470,7 @@ class TestProblemModelWritePathInvariants:
                 for tgt in node.targets:
                     if isinstance(tgt, ast.Attribute) and tgt.attr == "problem_model":
                         lineno = node.lineno
-                        key = (str(rel), lineno)
+                        key = (rel, lineno)
                         if isinstance(node.value, ast.Call) and isinstance(
                             node.value.func, ast.Attribute
                         ):

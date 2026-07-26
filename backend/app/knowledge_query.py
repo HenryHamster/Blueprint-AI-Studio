@@ -302,7 +302,7 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
 
     Field set is the documented contract shared by the admin and agent
     surfaces: id, title, summary, topic, tags, source_citations,
-    source_task_id, created_at, updated_at, forward_quality_verdict (plus
+    source_task_id, source_compute_job_id, created_at, updated_at, forward_quality_verdict (plus
     body only when ``include_body``).
     """
     acceptance = classify_knowledge_acceptance(
@@ -330,6 +330,9 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "tags": doc.tags or [],
         "source_citations": doc.source_citations or [],
         "source_task_id": str(doc.source_task_id) if doc.source_task_id else None,
+        "source_compute_job_id": (
+            str(doc.source_compute_job_id) if doc.source_compute_job_id else None
+        ),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
         "forward_quality_verdict": doc.forward_quality_verdict,

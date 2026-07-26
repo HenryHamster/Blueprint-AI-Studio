@@ -53,7 +53,6 @@ describe('strategic ops registry — internal consistency', () => {
         expect(e.alias).toBe(e.op.replace(/_/g, '-'));
         expect(e.internalReason).toBeNull();
       } else {
-        // Excluded EXPLICITLY: no alias, and a stated reason (not by omission).
         expect(e.alias, `${e.op} is internal-only but carries an alias`).toBeNull();
         expect(e.internalReason, `${e.op} must state why it is excluded`).toBeTruthy();
       }
@@ -79,8 +78,18 @@ describe('generated ./strategic CLI derives from the registry', () => {
   const script = renderStrategicScript();
 
   it('usage string lists exactly the CLI-flagged aliases in registry order', () => {
-    const expected = `Usage: strategic ${cliOps().map(e => e.alias).join('|')} <json-or-file>`;
-    expect(script).toContain(expected);
+    expect(script).toContain("Usage: strategic <operation> (--json '<object>' | --file <path> | --stdin)");
+    for (const entry of cliOps()) {
+      expect(script).toContain(`echo '${entry.alias}\t`);
+    }
+  });
+
+  it('provides offline help and a machine-readable schema for every CLI operation', () => {
+    expect(script).toContain('strategic help <operation>');
+    expect(script).toContain('strategic schema <operation>');
+    for (const entry of cliOps()) {
+      expect(script).toContain(`operation":"${entry.alias}`);
+    }
   });
 
   it('every CLI-flagged op has a case arm routing its alias to _call "<op>"', () => {

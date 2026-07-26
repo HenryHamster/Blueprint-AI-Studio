@@ -2465,6 +2465,20 @@ class ComputeJob(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Stable operator-facing execution contract. New jobs persist the readable
+    # authored source separately from any generated Base64/Bash transport so
+    # clients never need to reverse-engineer wrappers. Nullable for legacy jobs.
+    execution_manifest: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    # Placement and terminal execution facts observed after dispatch: actual
+    # backend/runner, hardware attestation, exit/cancellation classification,
+    # and canonical log availability. Kept separate from requested machine_type.
+    runtime_provenance: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
     # Authoritative record of the local runner that actually CLAIMED and ran this
     # job (stamped at /next-compute-job claim time). Detach-on-delete (SET NULL),
     # NOT cascade: a compute job is durable history that must outlive a deleted
@@ -3345,6 +3359,188 @@ class StrategicCycle(SQLModel, table=True):
             CYCLE_META_MEMOS_AVAILABLE: int(meta.get(CYCLE_META_MEMOS_AVAILABLE) or 0),
             CYCLE_META_MEMOS_CITED: int(meta.get(CYCLE_META_MEMOS_CITED) or 0),
         }
+
+
+class StrategicSpawnRequest(SQLModel, table=True):
+    """Durable, idempotent intent to dispatch one task from Strategic.
+
+    Persisting intent before admission means a transient capacity/abuse guard can
+    defer work without losing its specification or making the agent rediscover
+    the request by retrying. ``idempotency_key`` is scoped to the originating
+    Strategic task; the eventual child task link detaches on task deletion so
+    the request remains useful audit history.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    parent_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    idempotency_key: str = Field(
+        sa_column=Column(String(128), nullable=False),
+    )
+    task_type: str = Field(sa_column=Column(String(64), nullable=False))
+    specification: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    specification_hash: str = Field(
+        sa_column=Column(String(64), nullable=False),
+    )
+    direction_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    state: str = Field(
+        default="accepted",
+        sa_column=Column(String(32), nullable=False, server_default=text("'accepted'")),
+    )
+    admission_reason: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    policy_snapshot: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    not_before: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+    dispatched_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "parent_task_id",
+            "idempotency_key",
+            name="uq_strategicspawnrequest_parent_idempotency",
+        ),
+        Index(
+            "ix_strategicspawnrequest_state_notbefore_created",
+            "state",
+            "not_before",
+            "created_at",
+        ),
+        Index(
+            "ix_strategicspawnrequest_project_state",
+            "project_id",
+            "state",
+        ),
+    )
+
+
+class StrategicWatch(SQLModel, table=True):
+    """One-shot, durable Strategic agenda receipt for a task reaching terminal.
+
+    This is deliberately not ``TaskWakeRegistration``: a Resident watch must not
+    park or advance the long-lived Strategic task. The existing heartbeat detects
+    world-state movement; this row preserves which exact task mattered and keeps
+    the fired receipt visible until Strategic acknowledges it.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    created_by_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    strategic_session_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    target_task_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    purpose: str = Field(default="", sa_column=Column(String(1000), nullable=False))
+    state: str = Field(
+        default="pending",
+        sa_column=Column(String(32), nullable=False, server_default=text("'pending'")),
+    )
+    terminal_status: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
+    )
+    receipt: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    deadline_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    fired_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    acknowledged_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    acknowledgement_disposition: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
+    )
+    acknowledgement_note: str | None = Field(
+        default=None, sa_column=Column(String(1000), nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "created_by_task_id",
+            "target_task_id",
+            name="uq_strategicwatch_creator_target",
+        ),
+        Index("ix_strategicwatch_project_state", "project_id", "state"),
+        Index(
+            "ix_strategicwatch_state_deadline",
+            "state",
+            "deadline_at",
+        ),
+    )
 
 
 class OrchestratorErrorAck(SQLModel, table=True):
@@ -4430,6 +4626,18 @@ class KnowledgeDocument(SQLModel, table=True):
         sa_column=Column(
             ForeignKey("task.id", ondelete="SET NULL"),
             nullable=True,
+            index=True,
+        ),
+    )
+    # Exact compute execution that produced this report. Unique when present so
+    # terminal handlers and retries can idempotently ensure one document per job.
+    source_compute_job_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("computejob.id", ondelete="SET NULL"),
+            nullable=True,
+            unique=True,
             index=True,
         ),
     )

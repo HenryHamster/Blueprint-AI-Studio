@@ -772,6 +772,20 @@ class TestSpawnLimits:
 class TestTaskResultDedup:
     """Fix 2.7: record_task_result deduplicates by task_id."""
 
+    def setup_method(self):
+        from collections import deque
+
+        import app.shared_state as ss
+        from app.routers.agent_status import (
+            _recorded_task_entries,
+            _recorded_task_ids,
+        )
+
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        ss.deploy_monitoring["task_result_metadata"] = {}
+        _recorded_task_ids.clear()
+        _recorded_task_entries.clear()
+
     def test_duplicate_result_ignored(self):
         from app.routers.agent_status import record_task_result, _recorded_task_ids
         from app.shared_state import deploy_monitoring
@@ -4675,34 +4689,26 @@ async def test_spawn_task_allows_registry_knowledge_types(strategic_db, spawn_ty
 
 
 @pytest.mark.asyncio
-async def test_spawn_task_rejects_non_allowlisted_implementation_type(strategic_db):
-    """An implementation / PR-producing type (create) is not strategist_spawnable,
-    so the spawn_task op must reject it with a 400 listing the allowed types."""
-    from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
-
+async def test_spawn_task_allows_direct_implementation_type(strategic_db):
+    """Implementation-ready work uses the same spawn_task contract."""
     _project, review_id = await _make_strategic_review(strategic_db)
 
     body = await _post_spawn_task(
         strategic_db,
         review_id,
-        title="Should not be allowed",
+        title="Implement direct fix",
         prompt="implement a feature",
         spawn_type="create",
-        expect_status=400,
     )
-    # The app's HTTPException handler wraps the detail as {"error": {"message": ...}}.
-    detail = body["error"]["message"]
-    assert "must be one of" in detail
-    assert "create" in detail  # echoes the rejected type
-    # The allowed-types list in the message is the registry-derived sorted set.
-    assert str(sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)) in detail
+    assert body["status"] == "ok"
+    assert body["type"] == "create"
+    spawned = await strategic_db.get(Task, body["task_id"])
+    assert spawned.first_payload["type"] == "create"
 
 
 @pytest.mark.asyncio
-async def test_spawn_task_per_review_budget_enforced(strategic_db, mocker):
-    """One strategic review may spawn at most the per-review cap; the next spawn
-    is refused with 429 status='skipped' and an observable budget flag stamped
-    on the review (not a silent swallow)."""
+async def test_spawn_task_has_no_ordinary_per_review_quota(strategic_db, mocker):
+    """The compatibility per-review setting no longer rejects legitimate work."""
     from sqlalchemy import func as _f
     from sqlmodel import select
 
@@ -4721,17 +4727,14 @@ async def test_spawn_task_per_review_budget_enforced(strategic_db, mocker):
         assert body["status"] == "ok"
         assert not body.get("deduplicated")
 
-    refused = await _post_spawn_task(
+    third = await _post_spawn_task(
         strategic_db,
         review_id,
         title="Investigate gamma",
         prompt="do gamma",
-        expect_status=429,
     )
-    assert refused["status"] == "skipped"
-    assert refused["scope"] == "per_review"
+    assert third["status"] == "ok"
 
-    # Only the two budgeted tasks exist; the third was not created.
     count = (
         await strategic_db.execute(
             select(_f.count())
@@ -4739,22 +4742,12 @@ async def test_spawn_task_per_review_budget_enforced(strategic_db, mocker):
             .where(Task.created_by == "STRATEGIC_AGENT")
         )
     ).scalar()
-    assert count == 2
-
-    # The refusal is observable: the review carries the exhaustion flag.
-    review = (
-        await strategic_db.execute(select(Task).where(Task.id == review_id))
-    ).scalar_one()
-    flag = (review.context or {}).get("_strategic_spawn_budget_exhausted")
-    assert flag is not None
-    assert flag["scope"] == "per_review"
+    assert count == 3
 
 
 @pytest.mark.asyncio
-async def test_spawn_task_rolling_window_budget_enforced(strategic_db, mocker):
-    """The rolling-window cap bounds spawns across consecutive reviews: once the
-    project-wide window count is reached, a spawn from a fresh review is refused
-    with scope='window'."""
+async def test_spawn_task_abuse_burst_is_durably_deferred(strategic_db, mocker):
+    """An exceptional project burst yields a durable 202 receipt, not lost work."""
     from sqlalchemy import func as _f
     from sqlmodel import select
 
@@ -4785,15 +4778,16 @@ async def test_spawn_task_rolling_window_budget_enforced(strategic_db, mocker):
         assert body["status"] == "ok"
 
     # A spawn from review B (per-review count 0) is still refused by the window.
-    refused = await _post_spawn_task(
+    deferred = await _post_spawn_task(
         strategic_db,
         review_b,
         title="Investigate gamma",
         prompt="do gamma",
-        expect_status=429,
+        expect_status=202,
     )
-    assert refused["status"] == "skipped"
-    assert refused["scope"] == "window"
+    assert deferred["status"] == "deferred"
+    assert deferred["reason"] == "project_spawn_burst"
+    assert deferred["request_id"]
 
     count = (
         await strategic_db.execute(
@@ -4806,9 +4800,8 @@ async def test_spawn_task_rolling_window_budget_enforced(strategic_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_spawn_task_semantic_duplicate_title_deduped(strategic_db):
-    """A near-duplicate spawn (same review/type, overlapping topic, different
-    wording) collapses to the existing task rather than creating a second one."""
+async def test_spawn_task_similar_titles_remain_distinct_without_same_key(strategic_db):
+    """Fuzzy wording must not erase a separately accepted task specification."""
     from sqlalchemy import func as _f
     from sqlmodel import select
 
@@ -4823,16 +4816,14 @@ async def test_spawn_task_semantic_duplicate_title_deduped(strategic_db):
     assert first["status"] == "ok"
     assert not first.get("deduplicated")
 
-    # Differs only in wording — overlap {warm, pool, provisioning, ready, signal}
-    # = 5 >= threshold 4 → treated as the same logical investigation.
     second = await _post_spawn_task(
         strategic_db,
         review_id,
         title="Research warm pool provisioning ready signal timing",
         prompt="look into it differently",
     )
-    assert second.get("deduplicated") is True
-    assert second["task_id"] == first["task_id"]
+    assert second.get("deduplicated") is False
+    assert second["task_id"] != first["task_id"]
 
     count = (
         await strategic_db.execute(
@@ -4841,22 +4832,15 @@ async def test_spawn_task_semantic_duplicate_title_deduped(strategic_db):
             .where(Task.created_by == "STRATEGIC_AGENT")
         )
     ).scalar()
-    assert count == 1
+    assert count == 2
 
 
 @pytest.mark.asyncio
-async def test_spawn_task_dedup_scan_is_limited(strategic_db, mocker):
-    """The strategic dedup scan applies a hard row cap before materializing rows."""
+async def test_spawn_task_persists_durable_request(strategic_db):
+    """Every accepted spawn has an inspectable request record."""
+    from app.models import StrategicSpawnRequest
+
     _project, review_id = await _make_strategic_review(strategic_db)
-
-    captured_statements = []
-    original_execute = strategic_db.execute
-
-    async def _capture_execute(statement, *args, **kwargs):
-        captured_statements.append(statement)
-        return await original_execute(statement, *args, **kwargs)
-
-    mocker.patch.object(strategic_db, "execute", side_effect=_capture_execute)
 
     body = await _post_spawn_task(
         strategic_db,
@@ -4865,10 +4849,9 @@ async def test_spawn_task_dedup_scan_is_limited(strategic_db, mocker):
         prompt="confirm the dedup query stays bounded",
     )
     assert body["status"] == "ok"
-    assert any(
-        "LIMIT 200" in str(stmt.compile(compile_kwargs={"literal_binds": True}))
-        for stmt in captured_statements
-    )
+    request = await strategic_db.get(StrategicSpawnRequest, body["request_id"])
+    assert str(request.task_id) == body["task_id"]
+    assert request.state == "dispatched"
 
 
 # ── Direction Starvation Detection ───────────────────────────────────────────

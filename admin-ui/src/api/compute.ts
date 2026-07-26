@@ -706,6 +706,13 @@ export interface ComputeJobCommandLog {
   byte_count: number;
 }
 
+/** Redacted, bounded stdout/stderr captured when a job reaches a terminal state. */
+export interface ComputeTerminalLog {
+  source: 'backend' | 'runner' | string;
+  text: string;
+  truncated: boolean;
+}
+
 export interface ComputeJobLiveOutput {
   text: string;
   truncated: boolean;
@@ -773,16 +780,29 @@ export interface ComputeJob {
     provisioning_model?: string | null;
   } | null;
   polling_metadata?: Record<string, unknown>;
+  /** Immutable authored launch receipt, separate from execution observations. */
+  execution_manifest?: {
+    authored_command?: string | null;
+    effective_launcher?: string | null;
+    source_digest?: string | null;
+    capability_requirements?: Record<string, unknown> | null;
+    normalized_contract?: Record<string, unknown> | null;
+  } | null;
+  /** Placement and terminal facts reported by the execution side. */
+  runtime_provenance?: Record<string, unknown> | null;
   // First-class exit_code and command_log promoted from polling_metadata.
   // Null when not yet available or not applicable.
   exit_code?: number | null;
   command_log?: ComputeJobCommandLog | null;
+  terminal_log?: ComputeTerminalLog | null;
   // Bounded RPC failure diagnostic; null/absent when no backend RPC has failed
   // (or once it resolves). Older responses may carry it under polling_metadata.
   compute_rpc_diagnostic?: ComputeRpcDiagnostic | null;
   // Augmented by the admin list endpoint from the launching Task.
   task_title: string | null;
   task_type: string | null;
+  /** Workflow state is intentionally distinct from the compute job outcome. */
+  task_status?: string | null;
   // Declared success criterion from the task payload (metric/operator/threshold).
   success_criterion?: ComputeSuccessCriterion | null;
   // Evaluated verdict from task.plan_output.compute_result.criterion — present
@@ -1341,6 +1361,8 @@ export interface KnowledgeDocument {
   tags: string[];
   source_citations: KnowledgeCitation[];
   source_task_id: string | null;
+  /** Job identity for an execution observation; null for task-only documents. */
+  source_compute_job_id?: string | null;
   authoring_branch?: string | null;
   head_sha?: string | null;
   /** Which kind of task produced this document. `string` keeps it forward-compatible. */

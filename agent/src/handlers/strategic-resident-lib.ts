@@ -57,6 +57,31 @@ export interface MessagesPollResponse {
   server_time?: string;
 }
 
+export interface StrategicWatchReceipt {
+  id: string;
+  target_kind?: 'task';
+  target_task_id?: string;
+  purpose?: string;
+  state?: 'fired' | 'expired' | string;
+  terminal_status?: string | null;
+  receipt?: {
+    title?: string;
+    task_type?: string;
+    terminal_status?: string;
+    latest_status_message?: string;
+    knowledge_document_ids?: string[];
+    reason?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface ResidentActivityUpdate {
+  phase: 'working' | 'waiting';
+  phase_started_at: string;
+  last_action: string;
+  next_review_at?: string | null;
+}
+
 export interface SessionHeartbeatResponse {
   authority_held?: boolean;
   leased_until?: string;
@@ -71,6 +96,10 @@ export interface SessionHeartbeatResponse {
   /** Optional compact counts feeding the tick context (in-flight tasks, terminal
    *  transitions since last look, new operator messages). Advisory only. */
   work_state_summary?: Record<string, unknown>;
+  /** Exact task-completion agenda receipts. Unlike work_state_rev (which only
+   *  says the world moved), these remain present until Strategic acknowledges
+   *  the result through ack-watch. */
+  fired_watches?: StrategicWatchReceipt[];
   /** Serialized exam-ledger echoed from the heartbeat note, or null. Agents
    *  ignore this field; it is only used for roundtrip integrity checks. */
   exam_ledger?: string | null;
@@ -2395,6 +2424,7 @@ export function buildAutonomousPrompt(
   maxOpsPerTurn = 3,
   decisionsRegisterText = '',
   operatorDecisionReview: PendingOperatorDecisionReview | boolean = false,
+  firedWatches: StrategicWatchReceipt[] = [],
 ): string {
   const lines: string[] = [];
 
@@ -2437,6 +2467,29 @@ export function buildAutonomousPrompt(
     );
   }
 
+  if (firedWatches.length > 0) {
+    lines.push(
+      'FIRED TASK WATCHES (handle before normal rotating examination):',
+      'These are durable tasks you explicitly waited on. Inspect the result and',
+      'documents, report or act as appropriate, then acknowledge each receipt with',
+      '`./strategic ack-watch --json \'{"watch_id":"<id>","disposition":"reported|acted|no_action|superseded","note":"<brief reason>"}\'`.',
+    );
+    for (const watch of firedWatches.slice(0, 20)) {
+      const receipt = watch.receipt ?? {};
+      const title = typeof receipt.title === 'string' ? receipt.title : 'task';
+      const status = watch.terminal_status
+        ?? (typeof receipt.terminal_status === 'string' ? receipt.terminal_status : watch.state ?? 'ready');
+      const purpose = typeof watch.purpose === 'string' && watch.purpose
+        ? `; purpose=${watch.purpose}`
+        : '';
+      const documents = Array.isArray(receipt.knowledge_document_ids) && receipt.knowledge_document_ids.length > 0
+        ? `; documents=${receipt.knowledge_document_ids.join(',')}`
+        : '';
+      lines.push(`- watch=${watch.id}; task=${watch.target_task_id ?? 'unknown'}; ${title}; status=${status}${purpose}${documents}`.slice(0, 1200));
+    }
+    lines.push('');
+  }
+
   lines.push(
     'No operator message is pending. Complete ONE meaningful unit of progress this',
     `turn. A unit may chain investigate → decide → act → verify, and may batch up to`,
@@ -2448,6 +2501,10 @@ export function buildAutonomousPrompt(
     'create_direction, that work executes in the pipeline regardless of your cadence.',
     'When two pieces of work are genuinely independent (no shared files, no logical',
     'dependency), dispatch BOTH now rather than staging one behind the other.',
+    'When a specific result matters in a later turn, register it once with',
+    '`./strategic watch-task --json \'{"target_task_id":"<task-id>","purpose":"<what to do when it finishes>"}\'`.',
+    'Do not spend turns polling it: its terminal receipt will be placed ahead of normal',
+    'agenda work until you handle it and call `ack-watch`.',
     '',
     'Maintain a standing agenda in your session memory; act on the highest-leverage',
     'item actionable NOW. If more actionable items remain after this turn, end with a',

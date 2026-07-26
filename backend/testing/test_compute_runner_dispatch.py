@@ -1559,7 +1559,11 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
     assert meta.get("runner_exec_status") == "succeeded"
     assert meta.get("runner_exit_code") == 0
     assert meta.get("runner_result_metrics") == {"accuracy": 0.99, "loss": 0.01}
-    assert meta.get("runner_command_log") == {"text": "Training complete", "truncated": False}
+    assert meta.get("runner_command_log") == {
+        "text": "Training complete",
+        "truncated": False,
+        "source": "runner",
+    }
     assert meta.get("runner_finished_at") is not None
 
     # poll_status must now return SUCCEEDED so the monitor can finalize.
@@ -1604,7 +1608,7 @@ async def test_compute_job_report_command_log_extra_keys_filtered(
     client, db_session, monkeypatch
 ):
     """POST /api/runner/compute-job/{id}/report with command_log containing extra
-    keys stores only {text, truncated} in polling_metadata (key 14c62b47c166af12)."""
+    keys stores only {text, truncated, source} in polling_metadata."""
     from app import auth as auth_mod
     from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
     from app.models import LocalRunner
@@ -1667,7 +1671,7 @@ async def test_compute_job_report_command_log_extra_keys_filtered(
     await db_session.refresh(job)
     meta = job.polling_metadata or {}
     stored_log = meta.get("runner_command_log")
-    assert stored_log == {"text": "Done", "truncated": False}
+    assert stored_log == {"text": "Done", "truncated": False, "source": "runner"}
     # Extra keys must not be persisted
     assert "extra_key" not in stored_log
     assert "another_key" not in stored_log

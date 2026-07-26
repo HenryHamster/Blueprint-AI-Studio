@@ -43,9 +43,10 @@ from app.compute_experiment_contract import (
     _author_compute_launch_contract,
     _stamp_container_image_pin_status,
     _validate_compute_launch_contract,
-    resolve_compute_spend_approval,
+    resolve_compute_spend_decision,
     resolve_compute_spend_threshold,
 )
+from app.resource_envelope import resolve_project_require_local_runner
 from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
     _HISTORY_AGG_DEFAULTS,
     _DECOMP_AGG_DEFAULTS,
@@ -4396,12 +4397,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _cc_direction = (
                 _directions_by_id.get(str(_cc_dir_id)) if _cc_dir_id else None
             )
-            _compute_requires_approval, _compute_threshold = (
-                resolve_compute_spend_approval(
-                    runtime_config=_runtime_config,
-                    direction=_cc_direction,
-                    spend_cap_usd=float(_compute_contract["spend_cap_usd"]),
-                )
+            _compute_spend_decision = resolve_compute_spend_decision(
+                runtime_config=_runtime_config,
+                direction=_cc_direction,
+                spend_cap_usd=float(_compute_contract["spend_cap_usd"]),
+                require_local_runner=resolve_project_require_local_runner(
+                    _scope_cal_project
+                ),
+                launch_contract=_compute_contract,
+            )
+            _compute_requires_approval = (
+                _compute_spend_decision.requires_monetary_approval
             )
 
         # Apply failure-feedback mitigation: downscope when rejection patterns are high

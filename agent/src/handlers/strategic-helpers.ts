@@ -6,7 +6,7 @@ import { boundedRegularReadShellFn, excludeAgentHelpers, writeDesignDocHelper, s
 import { extractJsonObject } from '../json-extract.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
-import { cliOps } from './strategic-ops-registry.js';
+import { cliOpInput, cliOps } from './strategic-ops-registry.js';
 
 // Strategic shell-helper generators
 // Generates three independent bash scripts for strategic-mode task execution:
@@ -34,13 +34,6 @@ const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
     _call "create_message"
     ;;`,
   set_running_update: `  set-running-update)
-    # DATA is a path to the markdown file written by the Thinker. Wrap
-    # the file contents as {markdown: "..."} before the usual body build.
-    FILE="$DATA"
-    [ -f "$FILE" ] || { echo "[ERROR] set-running-update: file not found: $FILE" >&2; exit 1; }
-    # Portable JSON encoding via python3 (preferred) or node — no jq dependency.
-    # Read the file's raw text and wrap as {"markdown": "..."} for the API.
-    DATA=$(printf '{"markdown":%s}' "$(_json_str "$(cat "$FILE")")")
     _call "set_running_update"
     ;;`,
 };
@@ -50,14 +43,39 @@ const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
 // backend dispatch chain. Every CLI-flagged op becomes a `<alias>) _call "<op>"`
 // arm (or its SPECIAL_CLI_CASE_BODIES override); the usage string lists the same
 // aliases in the same order.
-function renderStrategicUsageAliases(): string {
-  return cliOps().map(e => e.alias).join('|');
-}
-
 function renderStrategicCaseBody(): string {
   return cliOps()
     .map(e => SPECIAL_CLI_CASE_BODIES[e.op] ?? `  ${e.alias}) _call "${e.op}" ;;`)
     .join('\n');
+}
+
+function renderStrategicHelp(): string {
+  return cliOps()
+    .map(entry => {
+      const line = `${entry.alias}\t${entry.description}`.replace(/'/g, "'\"'\"'");
+      return `  echo '${line}'`;
+    })
+    .join('\n');
+}
+
+function renderStrategicSchemaCase(): string {
+  return cliOps().map(entry => {
+    const input = cliOpInput(entry.op)!;
+    const schema = JSON.stringify({
+      operation: entry.alias,
+      backend_op: entry.op,
+      input: input.kind,
+      required: input.required ?? [],
+      fields: input.fields ?? [],
+      example: input.example ?? {},
+      notes: input.notes ?? [],
+    });
+    // JSON.stringify produces no single quotes for our checked-in contracts;
+    // shellEscape is still used so a future description/example cannot turn
+    // the generated help into executable shell.
+    const quoted = schema.replace(/'/g, "'\\\"'\\\"'");
+    return `  ${entry.alias}) printf '%s\\n' '${quoted}' ;;`;
+  }).join('\n');
 }
 
 function generateStrategicScript(taskIdRaw: string, helperDir: string): string {
@@ -71,14 +89,46 @@ function generateStrategicScript(taskIdRaw: string, helperDir: string): string {
   const stagedReplyPath = shellEscapeDoubleQuoted(
     path.resolve(helperDir, '.resident-reply-staged-message.json').replace(/\\/g, '/'),
   );
-  const usageAliases = renderStrategicUsageAliases();
   const caseBody = renderStrategicCaseBody();
+  const helpText = renderStrategicHelp();
+  const schemaCase = renderStrategicSchemaCase();
   return `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
 # The op vocabulary below is DERIVED from the canonical registry
 # (strategic-ops-registry.ts) — do not hand-edit the case/usage list.
-OP="\${1:?Usage: strategic ${usageAliases} <json-or-file>}"
+_usage() {
+  echo "Usage: strategic <operation> (--json '<object>' | --file <path> | --stdin)"
+  echo "       strategic help <operation>"
+  echo "       strategic schema <operation>"
+  echo ""
+  echo "Operations:"
+${helpText}
+}
+
+_schema() {
+  case "$1" in
+${schemaCase}
+    *) echo "Unknown operation for schema: $1" >&2; return 1 ;;
+  esac
+}
+
+if [ "$#" -eq 0 ] || [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
+  _usage
+  exit 0
+fi
+if [ "$1" = "help" ]; then
+  [ -n "\${2:-}" ] || { _usage; exit 1; }
+  _schema "$2"
+  exit $?
+fi
+if [ "$1" = "schema" ]; then
+  [ -n "\${2:-}" ] || { _usage; exit 1; }
+  _schema "$2"
+  exit $?
+fi
+
+OP="$1"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
@@ -88,9 +138,71 @@ TASK="${taskId}"
 RESIDENT_REPLY_KEY_PATH="${replyKeyPath}"
 RESIDENT_REPLY_RECEIPT_PATH="${replyReceiptPath}"
 RESIDENT_STAGED_REPLY_PATH="${stagedReplyPath}"
-DATA="$1"
 NODE_BIN="\${NODE_BINARY:-node}"
 ${boundedRegularReadShellFn()}
+
+_validate_json() {
+  "$NODE_BIN" -e 'JSON.parse(process.argv[1])' "$DATA" >/dev/null 2>&1 || {
+    echo "[ERROR] $OP requires valid JSON input; run 'strategic schema $OP' for the accepted shape" >&2
+    exit 2
+  }
+}
+
+_read_json_input() {
+  case "\${1:-}" in
+    --json)
+      [ "$#" -eq 2 ] || { echo "[ERROR] --json requires exactly one JSON argument" >&2; exit 2; }
+      DATA="$2"
+      ;;
+    --file)
+      [ "$#" -eq 2 ] || { echo "[ERROR] --file requires exactly one path" >&2; exit 2; }
+      [ -f "$2" ] || { echo "[ERROR] input file not found: $2" >&2; exit 2; }
+      DATA=$(cat "$2")
+      ;;
+    --stdin)
+      [ "$#" -eq 1 ] || { echo "[ERROR] --stdin accepts no trailing arguments" >&2; exit 2; }
+      DATA=$(cat)
+      ;;
+    *)
+      [ "$#" -eq 1 ] || { echo "[ERROR] use exactly one of --json, --file, or --stdin" >&2; exit 2; }
+      echo "[WARN] positional JSON is deprecated; use --json, --file, or --stdin" >&2
+      DATA="$1"
+      ;;
+  esac
+  _validate_json
+}
+
+_read_running_update_input() {
+  case "\${1:-}" in
+    --file)
+      [ "$#" -eq 2 ] || { echo "[ERROR] --file requires exactly one path" >&2; exit 2; }
+      [ -f "$2" ] || { echo "[ERROR] input file not found: $2" >&2; exit 2; }
+      DATA=$(printf '{"markdown":%s}' "$(_json_str "$(cat "$2")")")
+      ;;
+    --stdin)
+      [ "$#" -eq 1 ] || { echo "[ERROR] --stdin accepts no trailing arguments" >&2; exit 2; }
+      DATA=$(printf '{"markdown":%s}' "$(_json_str "$(cat)")")
+      ;;
+    --json)
+      [ "$#" -eq 2 ] || { echo "[ERROR] --json requires exactly one JSON argument" >&2; exit 2; }
+      DATA="$2"
+      _validate_json
+      ;;
+    *)
+      # Legacy form: positional markdown file path.
+      [ "$#" -eq 1 ] || { echo "[ERROR] use --file, --stdin, or --json" >&2; exit 2; }
+      [ -f "$1" ] || { echo "[ERROR] set-running-update: file not found: $1" >&2; exit 2; }
+      echo "[WARN] positional file input is deprecated; use --file" >&2
+      DATA=$(printf '{"markdown":%s}' "$(_json_str "$(cat "$1")")")
+      ;;
+  esac
+}
+
+if [ "$OP" = "set-running-update" ]; then
+  _read_running_update_input "$@"
+else
+  _read_json_input "$@"
+fi
 
 _call() {
   local attempt=0 saw_auth=0 max=3 delay http_code body dump response
@@ -779,6 +891,25 @@ export function parseStrategicChallengeRecord(rawText: string): StrategicChallen
   return record;
 }
 
+const _CHALLENGE_ANALYSIS_MAX_CHARS = 40_000;
+const _CHALLENGE_ANALYSIS_HEAD_CHARS = 20_000;
+const _CHALLENGE_ANALYSIS_OMISSION_MARKER =
+  '\n\n[... middle of strategic analysis omitted to preserve prompt bound ...]\n\n';
+
+function boundStrategicChallengeAnalysis(rawAnalysis: string): string {
+  const analysis = rawAnalysis || '';
+  if (analysis.length <= _CHALLENGE_ANALYSIS_MAX_CHARS) return analysis;
+
+  const tailChars = _CHALLENGE_ANALYSIS_MAX_CHARS
+    - _CHALLENGE_ANALYSIS_HEAD_CHARS
+    - _CHALLENGE_ANALYSIS_OMISSION_MARKER.length;
+  return [
+    analysis.slice(0, _CHALLENGE_ANALYSIS_HEAD_CHARS),
+    _CHALLENGE_ANALYSIS_OMISSION_MARKER,
+    analysis.slice(-tailChars),
+  ].join('');
+}
+
 // Build the adversarial challenge prompt. The challenger reads the thinker's
 // analysis plus the directions/portfolio context the thinker saw, and emits
 // ONLY the strict verdict JSON.
@@ -790,7 +921,7 @@ export function buildStrategicChallengePrompt(opts: {
   stagedDirectionsText?: string;
   activeCapacityText?: string;
 }): string {
-  const analysis = (opts.analysisText || '').slice(0, 40_000);
+  const analysis = boundStrategicChallengeAnalysis(opts.analysisText);
   const ctxBlocks = [
     opts.dirSummaryText ? `## Existing directions (what the thinker saw)\n${opts.dirSummaryText}` : '',
     opts.portfolioCompositionText ? `## Portfolio composition\n${opts.portfolioCompositionText}` : '',

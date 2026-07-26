@@ -12,16 +12,41 @@ Runs under --noconftest (no DB, no conftest fixtures).
 """
 import heapq
 import json
+import tomllib
 import warnings
 from pathlib import Path
 
 BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
+PYPROJECT_PATH = BACKEND_ROOT / "pyproject.toml"
 
 NUM_SHARDS = 8
 # Allow up to 50 % above average before we flag it.  A perfectly balanced split
 # has ratio 1.00; real LDF packing of this suite is typically 1.00–1.05.
 MAX_IMBALANCE_RATIO = 1.50
+
+
+def test_ci_uses_least_duration_splitting() -> None:
+    """Keep the real pytest-split algorithm aligned with the model below.
+
+    ``duration_based_chunks`` preserves collection-order boundaries and can
+    concentrate thousands of cheap tests in one shard when recorded durations
+    drift.  The least-duration algorithm uses the LDF allocation simulated by
+    this guard and distributes individual tests across the least-loaded shard.
+    """
+    with PYPROJECT_PATH.open("rb") as f:
+        config = tomllib.load(f)
+    addopts = config["tool"]["pytest"]["ini_options"]["addopts"].split()
+    configured_algorithms = [
+        addopts[index + 1]
+        for index, option in enumerate(addopts[:-1])
+        if option == "--splitting-algorithm"
+    ]
+    assert configured_algorithms == ["least_duration"], (
+        "pytest-split must use least_duration so CI matches this LDF balance "
+        "guard; its default duration_based_chunks algorithm previously put "
+        "nearly half the suite in one contiguous shard"
+    )
 
 
 def _load_durations() -> dict:

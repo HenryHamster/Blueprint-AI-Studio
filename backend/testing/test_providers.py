@@ -815,6 +815,7 @@ class _FakeResponse:
         self._json = json_data
         self._raise_status = raise_status
         self._raise_json = raise_json
+        self.status_code = 401 if raise_status else 200
 
     def raise_for_status(self):
         if self._raise_status:
@@ -891,11 +892,13 @@ class TestAnthropicUsageNormalization:
         # But extras are never load-bearing.
         assert set(snap.load_bearing_utilizations()) == {1.0, 2.0}
 
-    def test_missing_load_bearing_window_is_unknown(self):
+    def test_five_hour_only_is_known(self):
         from app.providers.anthropic import _normalize_anthropic_usage
 
         snap = _normalize_anthropic_usage({"five_hour": {"utilization": 10.0}}, "n")
-        assert snap.known is False
+        assert snap.known is True
+        assert snap.window_utilizations == {"five_hour": 10.0}
+        assert "seven_day" not in snap.window_utilizations
 
     def test_null_load_bearing_field_is_unknown(self):
         from app.providers.anthropic import _normalize_anthropic_usage

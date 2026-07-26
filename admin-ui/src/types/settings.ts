@@ -209,11 +209,15 @@ export interface AccountUsageSummary {
 
 export interface AccountUsageSnapshot {
   known: boolean;
+  dark_reason?: string | null;
   five_hour_utilization: number | null;
   seven_day_utilization: number | null;
   resets_at: Record<string, string | null>;
   probed_at: string | null;
   stale: boolean;
+  last_attempt_at?: string | null;
+  last_attempt_status?: string | null;
+  last_attempt_failure_kind?: string | null;
 }
 
 export type AccountStatus = 'ready' | 'degraded' | 'at_cap' | 'unavailable' | 'unconfigured' | 'disabled' | string;

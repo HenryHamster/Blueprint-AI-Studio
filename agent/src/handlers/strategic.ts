@@ -1357,6 +1357,9 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # arm writes to $BLUEPRINT_RESULT_FILE.
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<arm A outperforms arm B on the declared metric>", "arms": [{"name": "a", "command": "<command for arm a>"}, {"name": "b", "command": "<command for arm b>"}], "declared_metric": "<metric_key>", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "direction_id": "d-xxx"}'
 # Optional fields on any spawn-task call:
+#   idempotency_key — stable identity for safe retries. Reusing a key with a
+#     different specification is rejected.
+#   watch — defaults true; set false only for intentionally uninteresting work.
 #   criterion_ids — list of criterion keys (from acceptance criteria) to link this
 #     task's merge evidence to coverage. When direction_id is also set, these are
 #     MERGED with the direction's criterion_keys (both filtered to active keys).
@@ -1371,9 +1374,10 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Direction spawn with explicit extra criterion coverage (merged with direction's own keys):
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "direction_id": "d-xxx", "criterion_ids": ["c-key-extra"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py"}}'
 
-# One-time fix: spawn a PR-producing task with NO direction (create/refactor/qa).
-# Fires once and lands a PR; no direction lifecycle.
-./strategic spawn-fix '{"type": "create|refactor|qa", "title": "...", "prompt": "Full implementation prompt..."}'
+# Implementation-ready bounded work uses the same command and needs no direction.
+./strategic spawn-task '{"type": "create|refactor|qa", "title": "...", "prompt": "Full implementation prompt...", "idempotency_key": "stable-logical-request"}'
+# Fixing an existing PR additionally requires its normal launch context.
+./strategic spawn-task '{"type": "fix", "title": "...", "prompt": "...", "pr_number": 123, "branch": "task/existing-pr"}'
 
 # Dispose an open completion-debt ledger entry.
 # disposition: "resolved" (requires evidence) or "dismissed" (requires reason).

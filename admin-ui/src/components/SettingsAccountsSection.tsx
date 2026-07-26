@@ -365,7 +365,7 @@ function AccountRow({
             {tokenAge && <span className={`ml-2 ${isExpiring ? 'text-amber-400' : ''}`}>&middot; token {tokenAge}</span>}
             {account.provider_metadata?.project && typeof account.provider_metadata.project === 'string' && <span className="ml-2">&middot; {account.provider_metadata.project}</span>}
             {account.provider_metadata?.location && typeof account.provider_metadata.location === 'string' && <span className="ml-2">@ {account.provider_metadata.location}</span>}
-            {account.usage_snapshot?.known && (
+            {account.usage_snapshot?.known ? (
               <span
                 className={`ml-2 ${account.usage_snapshot.stale ? 'opacity-60' : ''}`}
                 title={`5h: ${account.usage_snapshot.five_hour_utilization ?? '?'}% · 7d: ${account.usage_snapshot.seven_day_utilization ?? '?'}% plan usage${account.usage_snapshot.probed_at ? ` · probed ${account.usage_snapshot.probed_at}` : ''}${account.usage_snapshot.stale ? ' · STALE' : ''}`}
@@ -379,8 +379,18 @@ function AccountRow({
                   {account.usage_snapshot.seven_day_utilization == null ? '?' : `${Math.round(account.usage_snapshot.seven_day_utilization)}%`}
                 </span>
                 {account.usage_snapshot.stale && <span className="text-neutral-500"> (stale)</span>}
+                {account.usage_snapshot.last_attempt_failure_kind && (
+                  <span className="text-amber-400"> (latest probe {account.usage_snapshot.last_attempt_failure_kind})</span>
+                )}
               </span>
-            )}
+            ) : account.usage_snapshot ? (
+              <span
+                className={`ml-2 ${account.usage_snapshot.dark_reason === 'unsupported' ? 'text-neutral-500' : 'text-amber-400'}`}
+                title={`Usage probe: ${account.usage_snapshot.last_attempt_failure_kind ?? account.usage_snapshot.dark_reason ?? 'unknown'}${account.usage_snapshot.last_attempt_at ? ` · last attempted ${account.usage_snapshot.last_attempt_at}` : ''}`}
+              >
+                &middot; usage {account.usage_snapshot.last_attempt_failure_kind ?? account.usage_snapshot.dark_reason ?? 'unknown'}
+              </span>
+            ) : null}
           </div>
           {accountSupportsAvailabilityCheck(account) && (
             <AccountAvailabilityLine

@@ -9989,6 +9989,47 @@ class TestComputeExperimentSpawn:
         # At/below threshold -> dispatched, not held.
         assert child.requires_approval is False
 
+    async def test_required_local_compute_uses_loaded_project_for_spend_policy(
+        self, db_session, mocker
+    ):
+        """Research completion must evaluate local placement on its loaded project.
+
+        This guards the completion-path variable mismatch that raised NameError
+        before any compute child could be created.
+        """
+        from sqlalchemy.orm.attributes import flag_modified
+        from test_autonomous_research import _patch_research_externals
+
+        project, direction, task = await _grader_project_and_task(
+            db_session, "d-cx-local-policy"
+        )
+        project.build_config = {
+            **(project.build_config or {}),
+            "resource_envelope": {"require_local_runner": True},
+        }
+        flag_modified(project, "build_config")
+        db_session.add(project)
+        await db_session.commit()
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=50.0, deadline_seconds=3600
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        assert (children[0].first_payload or {}).get("type") == "compute_experiment"
+        assert children[0].requires_approval is False
+
     async def test_above_threshold_spawns_held_for_approval(self, db_session, mocker):
         from test_autonomous_research import _patch_research_externals
 

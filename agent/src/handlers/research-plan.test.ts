@@ -3488,8 +3488,21 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     const script = helperCall ? helperCall[1] : '';
     expect(script).toContain('set-evidence-progress)');
     expect(script).toContain('_call "set_evidence_progress"');
-	    // Usage string advertises the ops (set-memory set-session-summary added for memory; consume/dismiss-knowledge for knowledge lifecycle).
-	    expect(script).toContain("set-evidence-progress|set-acceptance-criteria|record-finding-resolution|set-memory|set-session-summary|consume-knowledge|dismiss-knowledge|request-qualification <json-or-file>");
+    // Generated help advertises each canonical op independently. Do not pin
+    // adjacency: newly registered operations may legitimately appear between
+    // these lifecycle commands.
+    for (const op of [
+      'set-evidence-progress',
+      'set-acceptance-criteria',
+      'record-finding-resolution',
+      'set-memory',
+      'set-session-summary',
+      'consume-knowledge',
+      'dismiss-knowledge',
+      'request-qualification',
+    ]) {
+      expect(script).toContain(`echo '${op}\t`);
+    }
 
   });
 });

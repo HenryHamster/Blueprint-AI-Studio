@@ -6154,6 +6154,20 @@ def test_compute_terminal_diagnostics_surface_executing_backend_and_runner():
 # ── E2E local-backend smoke ──────────────────────────────────────────────────
 
 
+def test_deterministic_analysis_upgrades_execution_observation():
+    """Execution telemetry must not block the completed experiment verdict."""
+    from app.knowledge_completion import _incoming_mode_is_upgrade
+
+    document = KnowledgeDocument(
+        forward_quality_verdict={
+            "analysis_mode": "execution_observation",
+            "execution": {"job_status": "SUCCEEDED"},
+        }
+    )
+
+    assert _incoming_mode_is_upgrade(document, "deterministic") is True
+
+
 @pytest.mark.asyncio
 async def test_local_backend_e2e_smoke(db_session, monkeypatch, _quiet_compute_io):
     """End-to-end smoke: real LocalSubprocessComputeBackend drives create →

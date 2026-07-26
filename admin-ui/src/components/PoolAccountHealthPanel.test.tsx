@@ -204,7 +204,7 @@ describe('PoolAccountHealthPanel', () => {
     });
     render(<PoolAccountHealthPanel accounts={[account]} loading={false} />);
 
-    expect(screen.getByText('usage ?')).toBeInTheDocument();
+    expect(screen.getByText('usage unknown')).toBeInTheDocument();
     // Explicit unknown — no synthesized 5h/7d utilization badge.
     expect(screen.queryByText(/5h/)).not.toBeInTheDocument();
     expect(screen.queryByText(/7d/)).not.toBeInTheDocument();
@@ -215,7 +215,7 @@ describe('PoolAccountHealthPanel', () => {
     expect(() =>
       render(<PoolAccountHealthPanel accounts={[account]} loading={false} />),
     ).not.toThrow();
-    expect(screen.queryByText('usage ?')).not.toBeInTheDocument();
+    expect(screen.queryByText('usage unknown')).not.toBeInTheDocument();
     expect(screen.queryByTitle(/Usage headroom/)).not.toBeInTheDocument();
   });
 
@@ -238,6 +238,42 @@ describe('PoolAccountHealthPanel', () => {
     const detail = screen.getByTitle('Usage headroom detail');
     expect(detail).toHaveTextContent('resets');
     expect(detail).toHaveTextContent('probed');
+  });
+
+  it('renders unsupported usage distinctly from a transient probe failure', () => {
+    const account = makeAccount({
+      usage_snapshot: {
+        known: false,
+        dark_reason: 'unsupported',
+        five_hour_utilization: null,
+        seven_day_utilization: null,
+        resets_at: {},
+        probed_at: null,
+        stale: true,
+      },
+    });
+    render(<PoolAccountHealthPanel accounts={[account]} loading={false} />);
+
+    expect(screen.getByText('usage unsupported')).toBeInTheDocument();
+  });
+
+  it('keeps last-good usage visible when the latest probe failed', () => {
+    const account = makeAccount({
+      usage_snapshot: {
+        known: true,
+        five_hour_utilization: 42,
+        seven_day_utilization: null,
+        resets_at: {},
+        probed_at: '2026-06-06T12:00:00Z',
+        stale: true,
+        last_attempt_at: '2026-06-06T12:05:00Z',
+        last_attempt_failure_kind: 'timeout',
+      },
+    });
+    render(<PoolAccountHealthPanel accounts={[account]} loading={false} />);
+
+    expect(screen.getByText('5h 42%')).toBeInTheDocument();
+    expect(screen.getByText('probe timeout')).toBeInTheDocument();
   });
 
   it('applies reduced opacity for disabled and disqualified accounts', () => {

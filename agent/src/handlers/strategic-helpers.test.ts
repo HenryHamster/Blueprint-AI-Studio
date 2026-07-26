@@ -282,17 +282,15 @@ describe('writeStrategicHelpers', () => {
     expect(fs.existsSync(marker)).toBe(false);
   }, 20_000);
 
-  it('routes the spawn-fix op to the spawn_fix backend operation', () => {
+  it('advertises only unified spawn-task while backend retains the alias', () => {
     const taskId = 'test-task-123';
     const projectId = 'test-project-456';
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
-    // The one-time-fix dispatch arm exists and maps the CLI verb to the API op.
-    expect(content).toContain('spawn-fix)');
-    expect(content).toContain('_call "spawn_fix"');
-    // It is advertised in the usage string alongside spawn-task.
-    expect(content).toContain('spawn-fix');
+    expect(content).toContain('spawn-task)');
+    expect(content).toContain('_call "spawn_task"');
+    expect(content).not.toContain('spawn-fix)');
   });
 
   it('routes acceptance-criteria authoring to the set_acceptance_criteria backend operation', () => {
@@ -1363,6 +1361,33 @@ describe('buildStrategicChallengePrompt', () => {
     expect(prompt).toContain('EVERY direction the thinker proposes to retire');
     // Fail-closed instruction present.
     expect(prompt).toContain('When in doubt, REJECT');
+  });
+
+  it('retains early grounding and late portfolio operations when bounding long analysis', () => {
+    const earlyGrounding = 'EARLY_GROUNDING_HEAD_7366725';
+    const latePortfolioMoves = [
+      'LATE_PORTFOLIO_OPERATIONS',
+      'RETIRE d-3e65f0d8',
+      'CREATE corpus-production direction',
+    ].join('\n');
+    const analysisText = `${earlyGrounding}\n${'x'.repeat(45_000)}\n${latePortfolioMoves}`;
+    const opts = {
+      analysisText,
+      dirSummaryText: '',
+      pastRetirementCritiquesSection: '',
+      portfolioCompositionText: '',
+    };
+
+    const prompt = buildStrategicChallengePrompt(opts);
+    const emptyAnalysisPrompt = buildStrategicChallengePrompt({
+      ...opts,
+      analysisText: '',
+    });
+
+    expect(prompt).toContain(earlyGrounding);
+    expect(prompt).toContain(latePortfolioMoves);
+    expect(prompt).toContain('middle of strategic analysis omitted to preserve prompt bound');
+    expect(prompt.length - emptyAnalysisPrompt.length).toBeLessThanOrEqual(40_000);
   });
 });
 

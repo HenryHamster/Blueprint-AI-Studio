@@ -25,11 +25,16 @@ interface RateLimitedModel {
 // "five_hour" / "seven_day" mapping to ISO-8601 reset timestamps (or null).
 export interface UsageSnapshot {
   known: boolean;
+  dark_reason?: string | null;
   five_hour_utilization: number | null;
   seven_day_utilization: number | null;
   resets_at: Record<string, string | null>;
   probed_at: string | null;
   stale: boolean;
+  /** Additive diagnostic receipt. A failed attempt never removes last-good usage. */
+  last_attempt_at?: string | null;
+  last_attempt_status?: string | null;
+  last_attempt_failure_kind?: string | null;
 }
 
 export interface AccountHealthEntry {
@@ -101,6 +106,10 @@ function formatTimeOnly(iso: string | null): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
   return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
+function usageProbeLabel(snapshot: UsageSnapshot): string {
+  return snapshot.last_attempt_failure_kind ?? snapshot.dark_reason ?? 'unknown';
 }
 
 function maxUsage(snapshot: UsageSnapshot | undefined): number {
@@ -259,13 +268,21 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                             stale{acct.usage_snapshot.probed_at ? ` @${formatTimeOnly(acct.usage_snapshot.probed_at)}` : ''}
                           </span>
                         )}
+                        {acct.usage_snapshot.last_attempt_failure_kind && (
+                          <span
+                            className="text-amber-400"
+                            title={`Latest usage probe failed: ${acct.usage_snapshot.last_attempt_failure_kind}${acct.usage_snapshot.last_attempt_at ? ` at ${acct.usage_snapshot.last_attempt_at}` : ''}. Showing the last known reading.`}
+                          >
+                            probe {acct.usage_snapshot.last_attempt_failure_kind}
+                          </span>
+                        )}
                       </span>
                     ) : (
                       <span
-                        className="text-ui-sm font-mono text-neutral-500"
-                        title="No usage probe available for this provider/account"
+                        className={`text-ui-sm font-mono ${acct.usage_snapshot.dark_reason === 'unsupported' ? 'text-neutral-500' : 'text-amber-400'}`}
+                        title={`Usage probe: ${usageProbeLabel(acct.usage_snapshot)}${acct.usage_snapshot.last_attempt_at ? ` (last attempted ${acct.usage_snapshot.last_attempt_at})` : ''}`}
                       >
-                        usage ?
+                        usage {usageProbeLabel(acct.usage_snapshot)}
                       </span>
                     )
                   )}
@@ -346,8 +363,14 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                     </>
                   ) : (
                     <div className="text-neutral-500">
-                      usage headroom unknown — no probe available for this provider/account
-                      {acct.usage_snapshot.probed_at ? ` (last probed ${formatResetAt(acct.usage_snapshot.probed_at)})` : ''}
+                      usage headroom {acct.usage_snapshot.dark_reason === 'unsupported' ? 'unsupported' : 'unavailable'} — {usageProbeLabel(acct.usage_snapshot)}
+                      {acct.usage_snapshot.last_attempt_at ? ` (last attempted ${formatResetAt(acct.usage_snapshot.last_attempt_at)})` : acct.usage_snapshot.probed_at ? ` (last probed ${formatResetAt(acct.usage_snapshot.probed_at)})` : ''}
+                    </div>
+                  )}
+                  {acct.usage_snapshot.known && acct.usage_snapshot.last_attempt_failure_kind && (
+                    <div className="text-amber-400">
+                      latest probe {acct.usage_snapshot.last_attempt_failure_kind}
+                      {acct.usage_snapshot.last_attempt_at ? ` at ${formatResetAt(acct.usage_snapshot.last_attempt_at)}` : ''}; showing last known reading
                     </div>
                   )}
                 </div>

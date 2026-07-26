@@ -97,6 +97,24 @@ function InFlightCounter({ startMs, endMs }: { startMs?: number; endMs?: number 
   return <span className="shrink-0 text-neutral-500"> running… ({elapsed}s)</span>;
 }
 
+function activityMeta(state: ResidentActivityState): string | null {
+  const parts: string[] = [];
+  if (state.detail?.trim()) parts.push(state.detail.trim());
+  if (typeof state.pendingOperatorMessages === 'number' && state.pendingOperatorMessages > 0) {
+    parts.push(`${state.pendingOperatorMessages} message${state.pendingOperatorMessages === 1 ? '' : 's'} pending`);
+  }
+  const watchCount = (state.pendingWatches ?? 0) + (state.firedWatches ?? 0);
+  if (watchCount > 0) parts.push(`${watchCount} watch${watchCount === 1 ? '' : 'es'}`);
+  if (typeof state.idleRemainingSeconds === 'number') {
+    const minutes = Math.max(0, Math.ceil(state.idleRemainingSeconds / 60));
+    const idle = minutes >= 60
+      ? `${Math.floor(minutes / 60)}h${minutes % 60 ? ` ${minutes % 60}m` : ''}`
+      : `${minutes}m`;
+    parts.push(`idle ${idle} left`);
+  }
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
 /**
  * The LIVE, ephemeral activity strip: a compact scrolling feed of the commands /
  * tools the resident strategist is running for the current turn. Cleared the
@@ -166,15 +184,18 @@ export function StrategicResidentActivityWidget({ state, onOpenActivity }: { sta
     'group flex scroll-mt-24 justify-start rounded-md';
   const inner =
     'flex w-full min-w-0 max-w-[92%] flex-col items-start md:max-w-[76%]';
+  const meta = activityMeta(state);
+  const renderedPhase = state.durablePhase ?? state.phase;
 
   if (state.phase === 'executing') {
     return (
-      <div data-testid="strategic-resident-activity" data-phase="executing" className={base}>
+      <div data-testid="strategic-resident-activity" data-phase={renderedPhase} className={base}>
         <div className={inner}>
           <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-cyan-900/50 bg-neutral-950/60 px-2 py-1.5 text-ui-md text-neutral-300">
             <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-cyan-400" aria-hidden="true" />
             <span className="shrink-0 font-medium text-cyan-300">{state.label}</span>
-            <span className="min-w-0 flex-1" />
+            {meta && <span className="min-w-0 flex-1 truncate text-neutral-400">{meta}</span>}
+            {!meta && <span className="min-w-0 flex-1" />}
             <InFlightCounter startMs={state.startMs} />
             {onOpenActivity && (
               <button type="button" onClick={onOpenActivity} className="min-h-11 shrink-0 rounded px-2 text-neutral-400 hover:text-neutral-200">
@@ -189,11 +210,12 @@ export function StrategicResidentActivityWidget({ state, onOpenActivity }: { sta
 
   if (state.phase === 'idle') {
     return (
-      <div data-testid="strategic-resident-activity" data-phase="idle" className={base}>
+      <div data-testid="strategic-resident-activity" data-phase={renderedPhase} className={base}>
         <div className={inner}>
           <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-400">
             <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500/70" aria-hidden="true" />
-            <span className="min-w-0 truncate font-medium text-neutral-400">{state.label}</span>
+            <span className="shrink-0 font-medium text-neutral-400">{state.label}</span>
+            {meta && <span className="min-w-0 flex-1 truncate text-neutral-500">{meta}</span>}
             {onOpenActivity && (
               <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
                 Activity
@@ -207,11 +229,12 @@ export function StrategicResidentActivityWidget({ state, onOpenActivity }: { sta
 
   // dead / not-running: explicit ended presentation, no ticking timer.
   return (
-    <div data-testid="strategic-resident-activity" data-phase="dead" className={base}>
+    <div data-testid="strategic-resident-activity" data-phase={renderedPhase} className={base}>
       <div className={inner}>
         <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-500">
           <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500/70" aria-hidden="true" />
-          <span className="min-w-0 truncate font-medium text-neutral-500">{state.label}</span>
+          <span className="shrink-0 font-medium text-neutral-500">{state.label}</span>
+          {meta && <span className="min-w-0 flex-1 truncate text-neutral-600">{meta}</span>}
           {onOpenActivity && (
             <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
               Activity
