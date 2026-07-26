@@ -139,6 +139,10 @@ async def test_empty_string_tail_leaves_context_unmutated(vm_db, mocker):
 @pytest.mark.asyncio
 async def test_capture_exception_does_not_block_teardown(vm_db, mocker):
     """A capture that raises must not prevent the VM delete from running."""
+    # The process-global inventory cache is unrelated to this contract and is
+    # mutated by service tests. Pin it to a valid count so this test exercises
+    # only the forensics-failure path.
+    mocker.patch("app.vm_lifecycle._last_gcp_vm_count", 0)
     mocker.patch(
         "app.vm_lifecycle._capture_and_persist_teardown_forensics",
         side_effect=RuntimeError("serial RPC blew up"),

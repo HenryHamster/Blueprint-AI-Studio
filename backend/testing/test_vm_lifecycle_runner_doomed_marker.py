@@ -73,12 +73,17 @@ async def test_fire_and_forget_still_marks_real_agent_vm(mocker):
         "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
     )
     vm_id = "agent-vm-real-teardown"
+    existing_deletes = set(vm_lifecycle._background_vm_deletes)
 
     fire_and_forget_vm_delete(vm_id, reason="agent_completion")
 
     doomed, reason = is_orchestrator_initiated_delete(vm_id)
     assert doomed
     assert reason == "agent_completion"
-    # Wait for the background task set to drain so no task leaks across tests.
-    for task in list(vm_lifecycle._background_vm_deletes):
+    # Drain only the task created by this call. The process-global set can
+    # contain unrelated deletes scheduled by earlier suite tests, potentially
+    # on a different event loop.
+    new_deletes = set(vm_lifecycle._background_vm_deletes) - existing_deletes
+    assert len(new_deletes) == 1
+    for task in new_deletes:
         await task
