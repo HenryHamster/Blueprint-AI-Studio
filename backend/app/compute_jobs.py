@@ -81,6 +81,7 @@ from app.models import (
 )
 from app.compute_experiment_contract import (
     ComputeSpendDecision,
+    build_compute_contract_preview,
     resolve_compute_spend_decision,
     resolve_compute_spend_direction,
 )
@@ -902,6 +903,34 @@ async def create_compute_job(
         # the command runs. Recorded so the operator can see the run resumed and
         # from where, and so _build_launch_spec can forward it to the backend.
         polling_metadata["input_artifact_job_id"] = resolved_input_artifact_job_id
+    execution_manifest = build_compute_contract_preview(
+        {
+            **locked_task.first_payload,
+            "command": command,
+            "spend_cap_usd": capped_spend,
+            "deadline_seconds": capped_deadline,
+            "machine_type": resolved_machine_type,
+            "accelerator": persisted_accelerator,
+            "container_image": container_image,
+            "declared_metric": declared_metric,
+        },
+        runtime_config=dict(_global_runtime_config),
+        direction=spend_direction,
+        require_local_runner=(
+            resolve_project_require_local_runner(_policy_project)
+            if _policy_project is not None
+            else False
+        ),
+        task_context=locked_task.context,
+    )
+    # The manifest is durable operator provenance, not a second copy of the
+    # launch-secret bag.  Keep the readable contract while ensuring registry
+    # credentials and environment values remain only in the short-lived launch
+    # metadata used by the worker.
+    normalized_contract = execution_manifest.get("normalized_contract")
+    if isinstance(normalized_contract, dict):
+        normalized_contract.pop("env", None)
+        normalized_contract.pop("container_registry_auth", None)
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,
@@ -913,6 +942,14 @@ async def create_compute_job(
         spend_cap_usd=capped_spend,
         accrued_cost_usd=0.0,
         wall_clock_deadline=deadline_at,
+        execution_manifest=execution_manifest,
+        runtime_provenance={
+            "backend": normalized_backend,
+            "requested_machine_type": resolved_machine_type,
+            "requested_accelerator": persisted_accelerator,
+            "runner_hostname": runner_hostname,
+            "placement_state": "queued",
+        },
         polling_metadata={
             **polling_metadata,
             "provisioning_deadline_at": provisioning_deadline_at.isoformat(),
@@ -2050,6 +2087,16 @@ async def _lock_compute_job(session, job_id: uuid.UUID) -> ComputeJob | None:
     return result.scalars().first()
 
 
+async def _ensure_terminal_execution_document(session, job_id: uuid.UUID) -> None:
+    """Best-effort durable observation, independent of parent task lifecycle."""
+    try:
+        from app.compute_execution_documents import ensure_compute_execution_document
+
+        await ensure_compute_execution_document(session, job_id)
+    except Exception:  # noqa: BLE001 - evidence must not undo terminal state
+        logger.exception("[COMPUTE_JOB] execution document failed for job=%s", job_id)
+
+
 async def kill_compute_job(
     session,
     *,
@@ -2156,6 +2203,7 @@ async def _apply_operator_kill_result(
         )
     await session.commit()
     await session.refresh(live)
+    await _ensure_terminal_execution_document(session, live.id)
     return live
 
 
@@ -2259,6 +2307,7 @@ async def finalize_silent_compute_job(
             wake_source_ref=str(live.id),
         )
     await session.commit()
+    await _ensure_terminal_execution_document(session, live.id)
     return True
 
 
@@ -3675,6 +3724,8 @@ async def _apply_polled_compute_job_result(
                 _set_meta(live, live_output=dict(status.live_output))
             _apply_watchdog_metric_mismatch_marker(live, progress_metric_mismatch)
         await session.commit()
+        if terminal_status is not None and outcome is not None:
+            await _ensure_terminal_execution_document(session, live.id)
         return True
 
 
@@ -3734,6 +3785,7 @@ async def finalize_runner_subprocess_job_for_dead_runner(
                 wake_source_ref=str(live.id),
             )
         await session.commit()
+        await _ensure_terminal_execution_document(session, live.id)
         return True
 
 
@@ -3782,6 +3834,7 @@ async def _apply_task_terminal_cancellation(
                 wake_source_ref=str(live.id),
             )
         await session.commit()
+        await _ensure_terminal_execution_document(session, live.id)
         return True
 
 
@@ -4237,6 +4290,24 @@ def _finalize_terminal_job(
         # The immediate delete retries failed; the orphan sweep is the safety net.
         extra["terminate_failed"] = True
     _set_meta(job, status_message=terminal_reason, **extra)
+    provenance = dict(job.runtime_provenance or {})
+    provenance.update(
+        {
+            "backend": job.backend,
+            "placement_state": "terminal",
+            "job_status": status.value,
+            "job_outcome": outcome.value,
+            "terminal_reason": terminal_reason,
+            "exit_code": exit_code,
+            "completed_at": now.isoformat() if hasattr(now, "isoformat") else str(now),
+        }
+    )
+    if job.ran_on_runner_id is not None:
+        provenance["runner_id"] = str(job.ran_on_runner_id)
+    runner_hostname = (job.polling_metadata or {}).get("runner_hostname")
+    if isinstance(runner_hostname, str) and runner_hostname:
+        provenance["runner_hostname"] = runner_hostname
+    job.runtime_provenance = provenance
     # Erase the registry password the moment the job reaches a terminal state.
     # The runner only needed it once (at docker-login time); keeping it in the
     # DB row beyond that is an unnecessary plaintext secret at rest.

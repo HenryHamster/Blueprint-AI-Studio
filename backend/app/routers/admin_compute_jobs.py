@@ -37,6 +37,7 @@ from app.models import (
     Artifact,
     ComputeJob,
     ComputeJobStatus,
+    KnowledgeDocument,
     LocalRunner,
     Task,
     TaskStatus,
@@ -185,7 +186,7 @@ async def _build_compute_job_payload(
             (
                 await session.execute(
                     select(Task)
-                    .options(load_only(Task.id, Task.payloads, Task.title, Task.plan_output, Task.context, raiseload=True))
+                    .options(load_only(Task.id, Task.payloads, Task.title, Task.status, Task.plan_output, Task.context, raiseload=True))
                     .where(Task.id.in_(task_ids))
                 )
             )
@@ -216,6 +217,27 @@ async def _build_compute_job_payload(
                 verdict,
                 task,
             )
+
+    # Execution observations are job-owned, so they remain available when a
+    # parent task is cancelled or has not yet produced its plan-output mirror.
+    # Batch the lookup rather than coupling job truth to task lifecycle.
+    execution_doc_ids: Dict[uuid.UUID, str] = {}
+    job_ids = {job.id for job in jobs}
+    if job_ids:
+        document_rows = (
+            (
+                await session.execute(
+                    select(KnowledgeDocument.id, KnowledgeDocument.source_compute_job_id)
+                    .where(KnowledgeDocument.source_compute_job_id.in_(job_ids))
+                )
+            )
+            .all()
+        )
+        execution_doc_ids = {
+            source_job_id: str(document_id)
+            for document_id, source_job_id in document_rows
+            if source_job_id is not None
+        }
 
     # Batch-load linked artifacts to avoid an N+1 query across the listed jobs.
     artifact_ids = {job.artifact_id for job in jobs if job.artifact_id is not None}
@@ -289,17 +311,19 @@ async def _build_compute_job_payload(
             criterion_verdict = evaluate_compute_success_criterion(
                 task_obj, artifact_text
             )
-        # Derive knowledge_document_id from the task's plan_output.
-        knowledge_document_id: str | None = None
+        # Prefer the durable execution observation.  The task mirror is only a
+        # convenience projection and may be absent or refer to a later analysis.
+        knowledge_document_id: str | None = execution_doc_ids.get(job.id)
         per_arm_verdicts: dict | None = None
         if task_obj is not None:
             knowledge_doc = (task_obj.plan_output or {}).get("knowledge_document") or {}
             raw_kdoc_id = (
                 knowledge_doc.get("id") if isinstance(knowledge_doc, dict) else None
             )
-            knowledge_document_id = (
-                str(raw_kdoc_id) if raw_kdoc_id is not None else None
-            )
+            if knowledge_document_id is None:
+                knowledge_document_id = (
+                    str(raw_kdoc_id) if raw_kdoc_id is not None else None
+                )
             raw_pav = knowledge_doc.get("per_arm_verdicts") if isinstance(knowledge_doc, dict) else None
             per_arm_verdicts = raw_pav if isinstance(raw_pav, dict) else None
         experiment: str | None = None
@@ -350,6 +374,11 @@ async def _build_compute_job_payload(
             }
         data["task_title"] = title
         data["task_type"] = task_type
+        data["task_status"] = (
+            str(getattr(task_obj.status, "value", task_obj.status))
+            if task_obj is not None
+            else None
+        )
         data["success_criterion"] = success_criterion
         data["criterion_verdict"] = criterion_verdict
         data["knowledge_document_id"] = knowledge_document_id

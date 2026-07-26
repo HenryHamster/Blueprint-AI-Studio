@@ -555,6 +555,11 @@ class ComputeJobResponse(BaseModel):
     polling_metadata: Dict[str, Any] = Field(default_factory=dict)
     terminal_log: ComputeTerminalLog | None = None
     compute_rpc_diagnostic: Dict[str, Any] | None = None
+    # Immutable launch intent and execution-side placement facts.  These are
+    # deliberately separate from polling_metadata so task intent cannot be
+    # mistaken for what the worker actually ran.
+    execution_manifest: Dict[str, Any] = Field(default_factory=dict)
+    runtime_provenance: Dict[str, Any] = Field(default_factory=dict)
     # Cross-job checkpoint resume, promoted from polling_metadata so the operator
     # can see (without digging into the launch bag) that a run resumed and from
     # where. ``input_artifact_job_id`` is the declared+validated resume source;
@@ -724,6 +729,25 @@ def _redact_dict_strings(obj: Any) -> Any:
     return obj
 
 
+def _operator_safe_execution_manifest(manifest: Any) -> Dict[str, Any]:
+    """Return readable execution intent without copying launch secrets.
+
+    The same structure is persisted with the job for durable provenance, so
+    this guard is intentionally defensive for legacy rows that may predate the
+    write-time scrub in ``create_compute_job``.
+    """
+    if not isinstance(manifest, dict):
+        return {}
+    safe = dict(manifest)
+    normalized = safe.get("normalized_contract")
+    if isinstance(normalized, dict):
+        safe_normalized = dict(normalized)
+        for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
+            safe_normalized.pop(key, None)
+        safe["normalized_contract"] = safe_normalized
+    return _redact_dict_strings(safe)
+
+
 def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     """Return a JSON-ready compute-job response with launch-spec fields redacted.
 
@@ -767,6 +791,13 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
         result_metrics = metadata.get("result_metrics")
         if isinstance(result_metrics, dict):
             metadata["result_metrics"] = _redact_dict_strings(result_metrics)
+
+    data["execution_manifest"] = _operator_safe_execution_manifest(
+        data.get("execution_manifest")
+    )
+    data["runtime_provenance"] = _redact_dict_strings(
+        data.get("runtime_provenance") or {}
+    )
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level
