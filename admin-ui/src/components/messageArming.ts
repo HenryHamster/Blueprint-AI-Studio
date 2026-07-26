@@ -29,11 +29,6 @@ const ARMING_HINT: Record<ArmingOutcome, string> = {
 // marker and queued behind the active cycle, then picked up on the next cycle.
 const QUEUED_STEERING_HINT = 'Strategist is working — your steer queues for the next cycle.';
 export const WORKDAY_CAPABILITY_HINT = 'Workday can research, plan, and spawn budgeted compute experiments from chat.';
-export const WORKDAY_STARTER_PROMPTS = [
-  'What should I research next?',
-  'Plan a budgeted compute experiment for this idea.',
-  'Spawn a compute experiment for the highest-priority unknown.',
-];
 
 // Outcome → post-send toast copy.
 const ARMING_TOAST: Record<ArmingOutcome, string> = {

@@ -22,7 +22,7 @@ import { useMessagesPanelFilters } from './useMessagesPanelFilters';
 import { MessagesListView, type ConversationListImperativeApi } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
-import { armingToastCopy, parseArmingOutcome, conversationAcceptanceToastCopy, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
+import { armingToastCopy, parseArmingOutcome, conversationAcceptanceToastCopy, type ArmingOutcome, WORKDAY_CAPABILITY_HINT } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
@@ -1079,6 +1079,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     loadingOlder: loadingOlderConversation,
   } = useConversation({
     enabled: conversationMode,
+    fetchInitial: usesStrategicReadModel,
     projectId: selectedProjectId,
     actorUserId: currentActorUserId,
     includeMessageId: conversationIncludeMessageId,
@@ -1287,7 +1288,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     } satisfies ProjectMessage;
     return [...conversationMessages, optimisticMessage];
   }, [conversationMode, optimisticSend, conversationMessages, selectedProjectId]);
-  const starterPrompts = conversationMode && !loading && conversationMessages.length === 0 ? WORKDAY_STARTER_PROMPTS : null;
+  const showEmptyConversationHint = conversationMode && !loading && conversationMessages.length === 0;
   // Clear the working state once a FRESH strategist reply lands (compare reply
   // COUNT to the baseline captured at send time — robust to client/server clock
   // skew, unlike a timestamp compare).
@@ -2822,15 +2823,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }
 
-  const handlePickStarterPrompt = useCallback((value: string) => {
-    setNewContent(value);
-    const captured = captureCurrentDraftRefs();
-    setDraftSourceRefs(captured.sourceRefs);
-    setDraftArtifactRefs(captured.artifactRefs);
-    persistComposerEnvelope({ content: value, sourceRefs: captured.sourceRefs, artifactRefs: captured.artifactRefs });
-    focusComposerTextarea();
-  }, [captureCurrentDraftRefs, focusComposerTextarea, persistComposerEnvelope]);
-
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
       {/* Header */}
@@ -3321,9 +3313,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         onCancelReply={handleCancelReply}
         onAbandonPending={handleAbandonPendingSend}
         onSubmit={handleSubmit}
-        starterPrompts={starterPrompts ?? undefined}
-        capabilityHint={starterPrompts ? WORKDAY_CAPABILITY_HINT : undefined}
-        onPickStarterPrompt={handlePickStarterPrompt}
+        capabilityHint={showEmptyConversationHint ? WORKDAY_CAPABILITY_HINT : undefined}
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
