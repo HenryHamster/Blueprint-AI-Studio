@@ -284,7 +284,7 @@ timeout_method = "thread"  # works with asyncio
 # event-loop contamination — a pooled production-engine connection bound to a
 # prior test's loop (see testing/conftest.py _dispose_production_engine_per_test,
 # which fixes the root cause; this is defense-in-depth).
-addopts = "-m 'not integration' --reruns 2 --only-rerun 'attached to a different loop' --only-rerun 'Event loop is closed'"
+addopts = "-m 'not integration' --reruns 2 --only-rerun 'attached to a different loop' --only-rerun 'Event loop is closed' --splitting-algorithm least_duration"
 python_classes = ["Test", "*Test"]
 # Surface deprecation warnings from core runtime dependencies as errors so that
 # a dependency bump that introduces a deprecated-API call fails CI immediately
