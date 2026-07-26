@@ -224,6 +224,19 @@ async def test_cancelled_deferred_request_never_drains(db_session):
     assert deferred.request.state == "cancelled"
     assert deferred.request.task_id is None
 
+    with pytest.raises(ValueError, match=r"already terminal \(cancelled\)"):
+        await submit_strategic_spawn(
+            db_session,
+            project_id=project.id,
+            parent_task_id=owner.id,
+            task_type="create",
+            specification=_spec("Cancelled", watch=False),
+            idempotency_key="cancelled",
+            direction_id=None,
+            burst_cap=1,
+            burst_window_minutes=60,
+        )
+
 
 @pytest.mark.asyncio
 async def test_orchestrator_sweep_drains_without_heartbeat_and_links_debt_once(

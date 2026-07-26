@@ -255,6 +255,11 @@ async def submit_strategic_spawn(
             raise ValueError(
                 "idempotency_key was already used for a different spawn specification"
             )
+        if existing.state in {"cancelled", "rejected"}:
+            raise ValueError(
+                f"spawn request is already terminal ({existing.state}); "
+                "use a new idempotency key for new work"
+            )
         existing_task = (
             await session.get(Task, existing.task_id)
             if existing.task_id is not None

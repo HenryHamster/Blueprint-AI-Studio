@@ -2526,7 +2526,14 @@ async def report_compute_job(
         # hidden behind a permanently stale document.
         from app.compute_execution_documents import ensure_compute_execution_document
 
-        await ensure_compute_execution_document(session, job.id)
+        try:
+            await ensure_compute_execution_document(session, job.id)
+        except Exception:
+            logger.warning(
+                "[RUNNERS] Late compute execution document refresh failed for job %s",
+                job.id,
+                exc_info=True,
+            )
 
     return {"ok": True, "cancel_requested": cancel_requested}
 
