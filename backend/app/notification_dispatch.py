@@ -94,8 +94,6 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "release_auto_merge_stalled",  # post_version_auto_merge_stall_message
         "strategic_steering_deferred",  # post_strategic_steering_deferred_message
         "strategic_steering_acted",  # post_strategic_steering_acted_message
-        "capability_trial_stalled",  # raise_stalled_trial_notice
-        "capability_verdict_decided",  # raise_capability_verdict_notice
         "capability_trial_ambiguous_lift_escalation",  # raise_ambiguous_lift_escalation_notice
         "criterion_retracted",  # post_criterion_retracted_message
         "criterion_superseded",  # post_criterion_superseded_message

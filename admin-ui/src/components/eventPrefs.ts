@@ -90,6 +90,8 @@ export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
 ]);
 
 export const ROUTINE_EVENT_LABELS: Record<string, string> = {
+  capability_trial_stalled: 'stalled capability trials',
+  capability_verdict_decided: 'capability verdicts',
   pr_merged: 'PR merges',
   direction_milestone: 'milestones',
   cycle_summary: 'cycle summaries',
