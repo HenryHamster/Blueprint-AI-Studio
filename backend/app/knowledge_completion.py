@@ -2294,7 +2294,12 @@ def _ground_and_assemble_compute_analysis(
     }, ""
 
 
-_ANALYSIS_STRENGTH: dict[str, int] = {"fallback": 0, "deterministic": 0, "llm": 1}
+_ANALYSIS_STRENGTH: dict[str, int] = {
+    "execution_observation": -1,
+    "fallback": 0,
+    "deterministic": 0,
+    "llm": 1,
+}
 
 
 def _incoming_mode_is_upgrade(
