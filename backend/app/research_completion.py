@@ -4401,7 +4401,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 runtime_config=_runtime_config,
                 direction=_cc_direction,
                 spend_cap_usd=float(_compute_contract["spend_cap_usd"]),
-                require_local_runner=resolve_project_require_local_runner(project),
+                require_local_runner=resolve_project_require_local_runner(
+                    _scope_cal_project
+                ),
                 launch_contract=_compute_contract,
             )
             _compute_requires_approval = (
