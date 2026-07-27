@@ -248,6 +248,7 @@ def build_agent_secret_manifest(
         "VM_INSTANCE_ID": vm_instance_id,
         "ORCHESTRATOR_URL": ORCHESTRATOR_URL,
         "TASK_ID": str(task_id),
+        "PROJECT_ID": project_id,
         "PROVIDER": materials.provider_name,
         "AUTH_MODE": materials.auth_mode_value,
     }
@@ -267,6 +268,7 @@ def build_agent_secret_manifest(
         "metadata": {
             "vm_instance_id": vm_instance_id,
             "task_id": str(task_id),
+            "project_id": project_id,
             "task_type": task_type,
             "provider": materials.provider_name,
             "auth_mode": materials.auth_mode_value,

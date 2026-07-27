@@ -4076,13 +4076,56 @@ async def test_resolve_project_default_container_image_pins_manifest_tag(
         new_callable=AsyncMock,
         return_value={
             "compute": {
-                "image": {"name": "reg.example.com/org/repo/compute-proj:latest"}
+                "image": {
+                    "name": "reg.example.com/org/repo/compute-proj:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
             }
         },
     )
 
     resolved = await resolve_project_default_container_image(db_session, project)
     assert resolved == pinned_ref
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_default_container_image_preserves_external_image(
+    db_session, mocker
+):
+    """A stale local build record must never replace a declared vendor image."""
+    from app.compute_backends import resolve_project_default_container_image
+    from app.models import ProjectComputeImage
+
+    project = Project(name="ExternalDefaultImage", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    external_image = "ghcr.io/vendor/compute-proj:latest"
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/vendor",
+            dep_hash="stale-local-build",
+            tag="latest",
+            pinned_ref="ghcr.io/vendor/compute-proj@sha256:stale",
+            digest="sha256:stale",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {"image": {"name": external_image}}},
+    )
+
+    assert (
+        await resolve_project_default_container_image(db_session, project)
+        == external_image
+    )
 
 
 @pytest.mark.asyncio
@@ -4278,7 +4321,10 @@ async def test_resolve_project_baked_image_strict_returns_pinned_ref_on_success(
         new_callable=AsyncMock,
         return_value={
             "compute": {
-                "image": {"name": "reg.example.com/org/repo/strict-proj:latest"}
+                "image": {
+                    "name": "reg.example.com/org/repo/strict-proj:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
             }
         },
     )
@@ -4309,7 +4355,10 @@ async def test_resolve_project_baked_image_strict_errors_when_no_build_record(
         new_callable=AsyncMock,
         return_value={
             "compute": {
-                "image": {"name": "reg.example.com/org/repo/not-built-yet:latest"}
+                "image": {
+                    "name": "reg.example.com/org/repo/not-built-yet:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
             }
         },
     )
@@ -4320,6 +4369,30 @@ async def test_resolve_project_baked_image_strict_errors_when_no_build_record(
     assert "not-built-yet" in error or "baked compute image" in error, (
         f"error message should mention the image or the concept; got: {error!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_accepts_external_image_without_build(
+    db_session, mocker
+):
+    """A declared external runtime image does not require a Blueprint build row."""
+    from app.compute_backends import resolve_project_baked_image_strict
+
+    project = Project(name="StrictExternalRuntimeProject", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    external_image = "nvcr.io/nvidia/tensorflow:25.01-tf2-py3"
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {"image": {"name": external_image}}},
+    )
+
+    ref, error = await resolve_project_baked_image_strict(db_session, project)
+    assert ref == external_image
+    assert error is None
 
 
 @pytest.mark.asyncio
@@ -4338,7 +4411,14 @@ async def test_resolve_project_baked_image_strict_already_digest_pinned(
     mocker.patch(
         "app.routers.admin_project_tools._discover_manifest_tools",
         new_callable=AsyncMock,
-        return_value={"compute": {"image": {"name": already_pinned}}},
+        return_value={
+            "compute": {
+                "image": {
+                    "name": already_pinned,
+                    "build": {"dockerfile": "Dockerfile"},
+                }
+            }
+        },
     )
 
     ref, error = await resolve_project_baked_image_strict(db_session, project)

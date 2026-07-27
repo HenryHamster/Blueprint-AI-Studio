@@ -1307,15 +1307,16 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # the useful, bounded files (artifact upload cap is about 25 MiB).
 # Project compute-image environment (only when a workload actually needs a
 # container-only runtime such as CUDA/framework libraries): run
-# './compute-image status' before authoring the launch. It returns one of four
+# 'compute-image status' before authoring the launch. It returns one of four
 # actionable states:
-#   - ready: a digest-pinned project image is available; OMIT container_image so
-#     the platform selects it automatically.
+#   - ready: either a declared external runtime image or a digest-pinned
+#     Blueprint-built image is available; OMIT container_image so the platform
+#     selects the correct declared image automatically.
 #   - missing_but_dockerfile_candidate: spawn a one-time create/refactor task to
 #     add the returned 'manifest_template' to '.blueprint/tools.json'; do not
 #     improvise a Docker build in a compute command.
 #   - declared_needs_build: the recipe is already in the repo; run
-#     './compute-image build' ONCE. It returns accepted/reused promptly; do NOT
+#     'compute-image build' ONCE. It returns accepted/reused promptly; do NOT
 #     wait or foreground-poll it. Re-check status in a later resident turn
 #     before launching. 'build_status: requested' means the request was saved,
 #     not that a worker is definitely still alive. A 'last_build_outcome' is

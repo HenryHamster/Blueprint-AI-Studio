@@ -263,6 +263,14 @@ async def test_admin_playbook_size_limits(
     assert resp.status_code == 400
     assert "too large" in resp.json()["error"]["message"].lower()
 
+    # Limit is UTF-8 bytes, not Unicode code points.
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "too-big-unicode", "value": "é" * 1025},
+    )
+    assert resp.status_code == 400
+    assert "2050 bytes" in resp.json()["error"]["message"]
+
     # Invalid key: contains space and special char
     resp = await client.put(
         f"/api/admin/projects/{project.id}/playbook",

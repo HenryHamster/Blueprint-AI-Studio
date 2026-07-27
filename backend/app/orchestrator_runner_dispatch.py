@@ -1816,18 +1816,17 @@ async def _dispatch_compute_experiment_directly(
     container_image = payload.get("container_image") or (
         payload.get("compute_experiment") or {}
     ).get("container_image")
-    # ── USE-default (images-first): default the project's baked image ──────────
+    # ── USE-default (images-first): default the project's declared image ───────
     # A compute_experiment dispatched WITHOUT an explicit container_image — an
     # operator-created experiment, a planned compute_experiment prerequisite, or a
     # retry that never went through the plan/research completion authors — reaches
     # here image-less and would run unreproducibly on the host toolchain. Resolve
-    # the project's declared, digest-pinned baked image exactly as the completion
-    # path does (shared helper resolve_project_default_container_image). This runs
-    # BEFORE runner selection so the resolved digest flows through the
-    # container-runtime / GPU-in-container eligibility gate below. Fail-OPEN and
-    # additive: an explicit payload container_image is left untouched; a project
-    # with no manifest compute image / no build record / any error keeps today's
-    # image-less behavior (helper returns None).
+    # the project's declared image. External runtime images (no build recipe) are
+    # launched as declared; Blueprint-built images require a resolved,
+    # digest-pinned build record. This runs BEFORE runner selection so the image
+    # flows through the container-runtime / GPU-in-container eligibility gate
+    # below. An explicit payload container_image is left untouched; projects with
+    # no manifest compute image keep today's image-less behavior.
     resolved_default_container_image: str | None = None
     if not container_image:
         from app.compute_backends import resolve_project_baked_image_strict

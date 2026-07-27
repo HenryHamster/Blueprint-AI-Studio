@@ -5907,6 +5907,8 @@ async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) ->
     confirmed = {"v": 0}
 
     def _mutate(doc: Dict[str, Any]) -> None:
+        from app.playbook_storage import mutate_visible_playbook_entry
+
         for entry_id in entry_ids:
             full_key = (
                 entry_id if entry_id.startswith("playbook/") else f"playbook/{entry_id}"
@@ -5914,11 +5916,21 @@ async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) ->
             entry = doc.get(full_key)
             if not isinstance(entry, dict):
                 continue
-            entry = dict(entry)
-            entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
-            entry["last_confirmed_at"] = now_iso
-            doc[full_key] = entry
-            confirmed["v"] += 1
+
+            def _record_confirmation(visible_entry: dict) -> None:
+                visible_entry["confirmed_count"] = (
+                    visible_entry.get("confirmed_count", 0) + 1
+                )
+                visible_entry["last_confirmed_at"] = now_iso
+
+            updated = mutate_visible_playbook_entry(
+                entry,
+                viewer_task_id=str(task.id),
+                mutate=_record_confirmation,
+            )
+            if updated is not None:
+                doc[full_key] = updated
+                confirmed["v"] += 1
 
     # expire_on_commit=False means a Project already identity-mapped by the
     # surrounding completion flow carries a stale design_doc; expire it so the

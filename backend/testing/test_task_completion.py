@@ -3644,6 +3644,45 @@ class TestConfirmAppliedPlaybookEntries:
         assert project.design_doc["playbook/tip-b"]["confirmed_count"] == 0
 
     @pytest.mark.asyncio
+    async def test_peer_completion_credits_prior_entry_during_pending_update(
+        self, db_session
+    ):
+        from app.task_completion import confirm_applied_playbook_entries
+
+        writer_task_id = _uuid_mod.uuid4()
+        project = make_project(
+            design_doc={
+                "playbook/tip-a": {
+                    "content": "uncommitted replacement",
+                    "pending_source": str(writer_task_id),
+                    "confirmed_count": 0,
+                    "_pending_previous": {
+                        "content": "committed guidance",
+                        "confirmed_count": 2,
+                    },
+                }
+            }
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"playbook_applied_entry_ids": ["playbook/tip-a"]},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await confirm_applied_playbook_entries(task, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        entry = project.design_doc["playbook/tip-a"]
+        assert entry["confirmed_count"] == 0
+        assert entry["_pending_previous"]["confirmed_count"] == 3
+        assert "last_confirmed_at" in entry["_pending_previous"]
+
+    @pytest.mark.asyncio
     async def test_normalizes_missing_prefix(self, db_session):
         """Entry IDs without 'playbook/' prefix are auto-prefixed before lookup."""
         from app.task_completion import confirm_applied_playbook_entries

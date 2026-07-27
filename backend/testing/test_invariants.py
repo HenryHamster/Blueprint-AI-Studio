@@ -8,10 +8,13 @@ Run with: pytest testing/test_invariants.py -v --noconftest
 """
 
 import ast
+import io
 import os
 import re
 import subprocess
+import symtable
 import sys
+import tokenize
 from functools import cache
 from pathlib import Path
 
@@ -11578,7 +11581,10 @@ def test_get_branch_sha_live_guard_scanner_flags_injected_site():
 # String patch-target resolution invariant
 # ---------------------------------------------------------------------------
 
-def _iter_app_patch_target_sites(testing_dir: Path) -> list[tuple[str, int, str]]:
+@cache
+def _iter_app_patch_target_sites(
+    testing_dir: Path,
+) -> tuple[tuple[str, int, str], ...]:
     """Return [(filename, lineno, target), ...] for app.* string patch targets.
 
     Single source of truth for "where is an ``app.*`` symbol patched" — both the
@@ -11589,45 +11595,78 @@ def _iter_app_patch_target_sites(testing_dir: Path) -> list[tuple[str, int, str]
     name attributes that don't exist at module level.
     """
     sites: list[tuple[str, int, str]] = []
+    ignored_token_types = {
+        tokenize.ENCODING,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.NEWLINE,
+        tokenize.NL,
+        tokenize.COMMENT,
+    }
     for py_file in sorted(testing_dir.glob("*.py")):
         try:
             source = py_file.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=py_file.name)
-        except (SyntaxError, UnicodeDecodeError):
+            if "app." not in source:
+                continue
+            tokens = [
+                token
+                for token in tokenize.generate_tokens(io.StringIO(source).readline)
+                if token.type not in ignored_token_types
+            ]
+        except (SyntaxError, UnicodeDecodeError, tokenize.TokenError):
             continue
 
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+        for index, token in enumerate(tokens):
+            if token.type != tokenize.NAME or token.string not in ("patch", "setattr"):
                 continue
-            func = node.func
-            if isinstance(func, ast.Attribute) and func.attr in ("patch", "setattr"):
-                pass
-            elif isinstance(func, ast.Name) and func.id == "patch":
-                pass
-            else:
-                continue
-
-            # create=True patches intentionally reference non-existent attributes
-            if any(
-                kw.arg == "create"
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value is True
-                for kw in node.keywords
+            if token.string == "setattr" and (
+                index == 0 or tokens[index - 1].string != "."
             ):
                 continue
+            if index + 2 >= len(tokens) or tokens[index + 1].string != "(":
+                continue
+            arg_index = index + 2
+            target_parts: list[str] = []
+            while arg_index < len(tokens) and tokens[arg_index].type == tokenize.STRING:
+                try:
+                    part = ast.literal_eval(tokens[arg_index].string)
+                except (SyntaxError, ValueError):
+                    target_parts = []
+                    break
+                if not isinstance(part, str):
+                    target_parts = []
+                    break
+                target_parts.append(part)
+                arg_index += 1
+            if not target_parts:
+                continue
+            target = "".join(target_parts)
 
-            if not node.args:
+            depth = 0
+            create_true = False
+            for inner_index in range(index + 1, len(tokens)):
+                inner = tokens[inner_index]
+                if inner.string in ("(", "[", "{"):
+                    depth += 1
+                elif inner.string in (")", "]", "}"):
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif (
+                    depth == 1
+                    and inner.type == tokenize.NAME
+                    and inner.string == "create"
+                    and inner_index + 2 < len(tokens)
+                    and tokens[inner_index + 1].string == "="
+                    and tokens[inner_index + 2].string == "True"
+                ):
+                    create_true = True
+            if create_true:
                 continue
-            first_arg = node.args[0]
-            if not isinstance(first_arg, ast.Constant) or not isinstance(
-                first_arg.value, str
-            ):
-                continue
-            target = first_arg.value
             # Require at least app.<module>.<attr> (two dots minimum)
             if target.startswith("app.") and "." in target[4:]:
-                sites.append((py_file.name, node.lineno, target))
-    return sites
+                sites.append((py_file.name, token.start[0], target))
+    return tuple(sites)
 
 def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
     """Return {filename: {target, ...}} for app.* string patch targets in test files."""
@@ -11863,7 +11902,9 @@ def _app_symbol_kind(
                 return _app_symbol_kind(app_dir, source_mod, alias.name, _depth + 1)
     return "absent"  # caught by test_string_patch_targets_resolve, not here
 
-def _referenced_symbol_names(roots: "tuple[Path, ...]") -> set[str]:
+def _referenced_symbol_names(
+    roots: "tuple[Path, ...]", candidates: "set[str] | None" = None
+) -> set[str]:
     """The set of every symbol name REFERENCED anywhere under ``roots``.
 
     A reference means the in-process code under test still routes through the symbol, so
@@ -11898,27 +11939,112 @@ def _referenced_symbol_names(roots: "tuple[Path, ...]") -> set[str]:
     the name is referenced, just not there.
     """
     names: set[str] = set()
+
+    def collect_table_references(table: symtable.SymbolTable) -> None:
+        for identifier in table.get_identifiers():
+            if (candidates is None or identifier in candidates) and table.lookup(
+                identifier
+            ).is_referenced():
+                names.add(identifier)
+        for child in table.get_children():
+            collect_table_references(child)
+
     for root in roots:
         for py_file in sorted(root.rglob("*.py")):
-            tree = _parse_python_file(py_file)
-            if tree is None:
+            try:
+                source = py_file.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
                 continue
-            for node in ast.walk(tree):
-                # ast.walk visits a Call's `func` child, so `symbol(...)` and
-                # `mod.symbol(...)` are both captured by the Load branches below.
-                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                    names.add(node.id)
-                elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
-                    names.add(node.attr)
-                elif (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "getattr"
-                    and len(node.args) >= 2
-                    and isinstance(node.args[1], ast.Constant)
-                    and isinstance(node.args[1].value, str)
-                ):
-                    names.add(node.args[1].value)
+            try:
+                tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+                in_import = False
+                statement_start = True
+                paren_depth = 0
+                pending_getattr = False
+                getattr_calls: list[list[int]] = []
+                previous_significant: str | None = None
+                file_candidates: set[str] = set()
+                for token in tokens:
+                    if token.type == tokenize.NEWLINE:
+                        in_import = False
+                        statement_start = True
+                        previous_significant = None
+                        continue
+                    if token.type in (
+                        tokenize.NL,
+                        tokenize.INDENT,
+                        tokenize.DEDENT,
+                        tokenize.COMMENT,
+                        tokenize.ENCODING,
+                    ):
+                        continue
+                    if token.type == tokenize.OP:
+                        if token.string == "(":
+                            paren_depth += 1
+                            if pending_getattr:
+                                getattr_calls.append([paren_depth, 0])
+                        elif token.string == ",":
+                            if getattr_calls and getattr_calls[-1][0] == paren_depth:
+                                getattr_calls[-1][1] += 1
+                        elif token.string == ")":
+                            if getattr_calls and getattr_calls[-1][0] == paren_depth:
+                                getattr_calls.pop()
+                            paren_depth = max(0, paren_depth - 1)
+                        if token.string in (";", ":"):
+                            statement_start = True
+                        else:
+                            statement_start = False
+                        pending_getattr = False
+                        previous_significant = token.string
+                        continue
+                    if token.type == tokenize.STRING:
+                        if (
+                            getattr_calls
+                            and getattr_calls[-1] == [paren_depth, 1]
+                        ):
+                            try:
+                                dynamic_name = ast.literal_eval(token.string)
+                            except (SyntaxError, ValueError):
+                                dynamic_name = None
+                            if isinstance(dynamic_name, str) and (
+                                candidates is None or dynamic_name in candidates
+                            ):
+                                names.add(dynamic_name)
+                        statement_start = False
+                        pending_getattr = False
+                        previous_significant = token.string
+                        continue
+                    if token.type != tokenize.NAME:
+                        statement_start = False
+                        pending_getattr = False
+                        previous_significant = token.string
+                        continue
+                    name = token.string
+                    if candidates is None or name in candidates:
+                        file_candidates.add(name)
+                    if statement_start and name in ("from", "import"):
+                        in_import = True
+                    if in_import:
+                        statement_start = False
+                        previous_significant = name
+                        continue
+                    if previous_significant == "." and (
+                        candidates is None or name in candidates
+                    ):
+                        names.add(name)
+                    statement_start = False
+                    pending_getattr = name == "getattr"
+                    previous_significant = name
+            except (IndentationError, SyntaxError, tokenize.TokenError):
+                continue
+            if not file_candidates:
+                continue
+            try:
+                collect_table_references(
+                    symtable.symtable(source, str(py_file), "exec")
+                )
+            except SyntaxError:
+                continue
     return names
 
 def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
@@ -11984,13 +12110,18 @@ def _find_vacuous_mocks(
     for filename, lineno, target in _iter_app_patch_target_sites(testing_dir):
         sites_by_target.setdefault(target, []).append(f"{filename}:{lineno}")
 
-    referenced = _referenced_symbol_names(reference_roots)
+    function_sites: dict[str, list[str]] = {}
+    for target, sites in sites_by_target.items():
+        module_dotted, _, attr = target.rpartition(".")
+        if _app_symbol_kind(app_dir, module_dotted, attr) == "function":
+            function_sites[target] = sites
+
+    candidate_names = {target.rpartition(".")[2] for target in function_sites}
+    referenced = _referenced_symbol_names(reference_roots, candidate_names)
 
     findings: list[str] = []
-    for target, sites in sorted(sites_by_target.items()):
-        module_dotted, _, attr = target.rpartition(".")
-        if _app_symbol_kind(app_dir, module_dotted, attr) != "function":
-            continue  # classes/constants are read, never called — out of scope
+    for target, sites in sorted(function_sites.items()):
+        attr = target.rpartition(".")[2]
         if attr in referenced:
             continue  # production still routes through it — the mock is live
         if target in allowlist:
@@ -13432,19 +13563,19 @@ class TestProblemModelWritePathInvariants:
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 967): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1671): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2062): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2516): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2629): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2884): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 1688): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2079): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2533): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2646): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2901): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4016): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4033): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4044): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4061): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 4575): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4592): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 4657): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4674): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):

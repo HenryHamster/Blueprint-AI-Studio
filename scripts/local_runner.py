@@ -3662,6 +3662,11 @@ def _heartbeat_loop(
                         else:
                             stale = version_hint not in version
                         if stale:
+                            # Enter drain mode immediately. Both agent and
+                            # compute pollers stop NEW claims while existing
+                            # work finishes, guaranteeing a long-lived resident
+                            # cannot starve a runner rollout forever.
+                            _update_in_progress.set()
                             # Check if runner is completely idle before attempting
                             # auto-update (no active tasks and no compute jobs).
                             with lock:
@@ -3672,14 +3677,19 @@ def _heartbeat_loop(
                             else:
                                 has_compute = False
 
-                            if not has_tasks and not has_compute and deferred_auto_update_hint != version_hint:
+                            if deferred_auto_update_hint == version_hint:
+                                # A prior update proved this exact server hint is
+                                # behind/different from origin/main. Do not
+                                # re-arm drain mode forever on every heartbeat;
+                                # wait for the server hint to change.
+                                _update_in_progress.clear()
+                            elif not has_tasks and not has_compute:
                                 print(
                                     f"[runner] version mismatch ({version!r} vs "
                                     f"{version_hint!r}) and runner is idle — "
                                     "auto-updating...",
                                     flush=True,
                                 )
-                                _update_in_progress.set()
                                 try:
                                     result = br.do_update()
                                 except Exception:
@@ -3728,12 +3738,13 @@ def _heartbeat_loop(
                                 print(
                                     f"[runner] WARNING: runner version {version!r} "
                                     f"does not match orchestrator version hint "
-                                    f"{version_hint!r} — not auto-updating because "
-                                    "tasks are still executing.",
+                                    f"{version_hint!r} — draining new claims; "
+                                    "auto-update will start when current work finishes.",
                                     flush=True,
                                 )
                         else:
                             deferred_auto_update_hint = None
+                            _update_in_progress.clear()
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -5441,6 +5452,52 @@ def _parse_result_metrics(result_file: str) -> dict | None:
     return filtered or None
 
 
+def _resolve_compute_cwd(
+    clone_dir: str | None, requested_cwd: object
+) -> str | None:
+    """Resolve a job cwd inside its cloned repository.
+
+    Compute contracts express ``cwd`` relative to the repository root. Resolve
+    that path on the host before isolation planning so every backend can map the
+    same directory into its sandbox. Reject traversal and symlink escapes rather
+    than allowing a job-authored cwd to point elsewhere on the runner.
+    """
+    if clone_dir is None:
+        if requested_cwd:
+            raise ValueError(
+                "a compute cwd requires a successfully cloned repository"
+            )
+        return None
+
+    clone_mount = os.path.abspath(clone_dir)
+    clone_root = os.path.realpath(clone_dir)
+    raw_cwd = str(requested_cwd or ".").strip() or "."
+    candidate_requested = (
+        os.path.realpath(raw_cwd)
+        if os.path.isabs(raw_cwd)
+        else os.path.realpath(os.path.join(clone_root, raw_cwd))
+    )
+    try:
+        contained = (
+            os.path.commonpath((clone_root, candidate_requested)) == clone_root
+        )
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError(
+            f"{raw_cwd!r} escapes the cloned repository; cwd must stay within it"
+        )
+    if not os.path.isdir(candidate_requested):
+        raise ValueError(
+            f"{raw_cwd!r} does not name a directory in the cloned repository"
+        )
+    # Preserve the bind source's spelling (including a symlinked TMPDIR) while
+    # using the canonical path only for containment validation. Isolation maps
+    # cwd relative to the non-canonical bind source supplied to the runtime.
+    relative = os.path.relpath(candidate_requested, clone_root)
+    return os.path.normpath(os.path.join(clone_mount, relative))
+
+
 def _run_compute_job(
     job_body: dict,
     orchestrator_url: str,
@@ -5662,9 +5719,27 @@ def _run_compute_job(
                     resume_hydration=resume_hydration,
                 )
                 return
-            if not cwd:
-                cwd = clone_dir
             print(f"[compute] cloned {owner}/{repo}@{ref} for job {job_id}", flush=True)
+
+        try:
+            cwd = _resolve_compute_cwd(clone_dir, cwd)
+        except ValueError as exc:
+            print(
+                f"[compute] invalid working directory for job {job_id}: {exc}",
+                flush=True,
+            )
+            outcome = "failure"
+            _report_terminal(
+                exec_status="failed",
+                exit_code=1,
+                command_log={
+                    "text": f"[runner] invalid compute cwd: {exc}; "
+                    "command never started",
+                    "truncated": False,
+                },
+                resume_hydration=resume_hydration,
+            )
+            return
 
         # Registry auth for docker/podman backends only (trusted host `docker login`).
         backend_pre = iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
@@ -6247,6 +6322,10 @@ def _compute_poll_loop(
 
     while not _shutdown_event.is_set():
         try:
+            if _update_in_progress.is_set():
+                time.sleep(poll_interval)
+                continue
+
             with lock:
                 active_count = len(active_jobs)
 
@@ -7151,6 +7230,7 @@ def _spawn_agent_task(
     agent_started_at: dict,
     agent_teardown: dict,
     lock: threading.Lock,
+    project_id: str | None = None,
     llm_env: dict[str, str] | None = None,
     llm_files: list[dict[str, str]] | None = None,
     decline_reason_out: list[str] | None = None,
@@ -7262,6 +7342,10 @@ def _spawn_agent_task(
     }
     if effective_llm_env:
         injected_env.update(effective_llm_env)
+    # Task identity is authoritative and must not be overridden by provider
+    # credential material returned in credentials.env.
+    if project_id:
+        injected_env["PROJECT_ID"] = project_id
     plan = iso.plan_agent_execution(
         caps=caps,
         agent_binary=agent_binary,
@@ -7883,6 +7967,7 @@ def main() -> None:
             poll_interval = base_poll_interval
 
             task_id = body.get("task_id") or body.get("id", "unknown")
+            project_id = body.get("project_id")
             agent_token = body.get("agent_token", "")
             task_type = body.get("task_type", "unknown")
             vm_instance_id = body.get("vm_instance_id") or "runner:local"
@@ -7968,6 +8053,7 @@ def main() -> None:
                 agent_started_at=agent_started_at,
                 agent_teardown=agent_teardown,
                 lock=lock,
+                project_id=project_id,
                 llm_env=llm_env,
                 llm_files=llm_files,
                 decline_reason_out=decline_reason,
