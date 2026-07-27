@@ -5441,6 +5441,36 @@ def _parse_result_metrics(result_file: str) -> dict | None:
     return filtered or None
 
 
+def _resolve_cloned_repo_cwd(clone_dir: str, requested_cwd: object) -> str:
+    """Resolve a job cwd inside its cloned repository.
+
+    Compute contracts express ``cwd`` relative to the repository root. Resolve
+    that path on the host before isolation planning so every backend can map the
+    same directory into its sandbox. Reject traversal and symlink escapes rather
+    than allowing a job-authored cwd to point elsewhere on the runner.
+    """
+    clone_root = os.path.realpath(clone_dir)
+    raw_cwd = str(requested_cwd or ".").strip() or "."
+    candidate = (
+        os.path.realpath(raw_cwd)
+        if os.path.isabs(raw_cwd)
+        else os.path.realpath(os.path.join(clone_root, raw_cwd))
+    )
+    try:
+        contained = os.path.commonpath((clone_root, candidate)) == clone_root
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError(
+            f"{raw_cwd!r} escapes the cloned repository; cwd must stay within it"
+        )
+    if not os.path.isdir(candidate):
+        raise ValueError(
+            f"{raw_cwd!r} does not name a directory in the cloned repository"
+        )
+    return candidate
+
+
 def _run_compute_job(
     job_body: dict,
     orchestrator_url: str,
@@ -5662,8 +5692,25 @@ def _run_compute_job(
                     resume_hydration=resume_hydration,
                 )
                 return
-            if not cwd:
-                cwd = clone_dir
+            try:
+                cwd = _resolve_cloned_repo_cwd(clone_dir, cwd)
+            except ValueError as exc:
+                print(
+                    f"[compute] invalid working directory for job {job_id}: {exc}",
+                    flush=True,
+                )
+                outcome = "failure"
+                _report_terminal(
+                    exec_status="failed",
+                    exit_code=1,
+                    command_log={
+                        "text": f"[runner] invalid compute cwd: {exc}; "
+                        "command never started",
+                        "truncated": False,
+                    },
+                    resume_hydration=resume_hydration,
+                )
+                return
             print(f"[compute] cloned {owner}/{repo}@{ref} for job {job_id}", flush=True)
 
         # Registry auth for docker/podman backends only (trusted host `docker login`).

@@ -4216,6 +4216,38 @@ class TestDockerLogin(unittest.TestCase):
         self.assertEqual(popen_calls, [], "docker run must not be called on login failure")
 
 
+# ── Compute working-directory resolution ──────────────────────────────────────
+
+class TestComputeCwdResolution(unittest.TestCase):
+    def test_relative_cwd_resolves_from_clone_root(self):
+        clone_dir = os.path.join(os.getcwd(), "repo")
+        nested = os.path.join(clone_dir, "DEN")
+
+        with patch.object(local_runner.os.path, "isdir", return_value=True):
+            resolved = local_runner._resolve_cloned_repo_cwd(clone_dir, "DEN")
+
+        self.assertEqual(resolved, os.path.realpath(nested))
+
+    def test_empty_cwd_defaults_to_clone_root(self):
+        clone_dir = os.path.join(os.getcwd(), "repo")
+        with patch.object(local_runner.os.path, "isdir", return_value=True):
+            resolved = local_runner._resolve_cloned_repo_cwd(clone_dir, None)
+
+        self.assertEqual(resolved, os.path.realpath(clone_dir))
+
+    def test_cwd_cannot_escape_clone_root(self):
+        clone_dir = os.path.join(os.getcwd(), "repo")
+
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            local_runner._resolve_cloned_repo_cwd(clone_dir, "..")
+
+    def test_cwd_must_name_an_existing_directory(self):
+        clone_dir = os.path.join(os.getcwd(), "repo")
+        with patch.object(local_runner.os.path, "isdir", return_value=False):
+            with self.assertRaisesRegex(ValueError, "does not name a directory"):
+                local_runner._resolve_cloned_repo_cwd(clone_dir, "missing")
+
+
 # ── Registry-host derivation (FIX B4) ──────────────────────────────────────────
 
 class TestRegistryHostDerivation(unittest.TestCase):
