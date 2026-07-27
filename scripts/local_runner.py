@@ -5441,7 +5441,9 @@ def _parse_result_metrics(result_file: str) -> dict | None:
     return filtered or None
 
 
-def _resolve_cloned_repo_cwd(clone_dir: str, requested_cwd: object) -> str:
+def _resolve_compute_cwd(
+    clone_dir: str | None, requested_cwd: object
+) -> str | None:
     """Resolve a job cwd inside its cloned repository.
 
     Compute contracts express ``cwd`` relative to the repository root. Resolve
@@ -5449,26 +5451,40 @@ def _resolve_cloned_repo_cwd(clone_dir: str, requested_cwd: object) -> str:
     same directory into its sandbox. Reject traversal and symlink escapes rather
     than allowing a job-authored cwd to point elsewhere on the runner.
     """
+    if clone_dir is None:
+        if requested_cwd:
+            raise ValueError(
+                "a compute cwd requires a successfully cloned repository"
+            )
+        return None
+
+    clone_mount = os.path.abspath(clone_dir)
     clone_root = os.path.realpath(clone_dir)
     raw_cwd = str(requested_cwd or ".").strip() or "."
-    candidate = (
+    candidate_requested = (
         os.path.realpath(raw_cwd)
         if os.path.isabs(raw_cwd)
         else os.path.realpath(os.path.join(clone_root, raw_cwd))
     )
     try:
-        contained = os.path.commonpath((clone_root, candidate)) == clone_root
+        contained = (
+            os.path.commonpath((clone_root, candidate_requested)) == clone_root
+        )
     except ValueError:
         contained = False
     if not contained:
         raise ValueError(
             f"{raw_cwd!r} escapes the cloned repository; cwd must stay within it"
         )
-    if not os.path.isdir(candidate):
+    if not os.path.isdir(candidate_requested):
         raise ValueError(
             f"{raw_cwd!r} does not name a directory in the cloned repository"
         )
-    return candidate
+    # Preserve the bind source's spelling (including a symlinked TMPDIR) while
+    # using the canonical path only for containment validation. Isolation maps
+    # cwd relative to the non-canonical bind source supplied to the runtime.
+    relative = os.path.relpath(candidate_requested, clone_root)
+    return os.path.normpath(os.path.join(clone_mount, relative))
 
 
 def _run_compute_job(
@@ -5692,26 +5708,27 @@ def _run_compute_job(
                     resume_hydration=resume_hydration,
                 )
                 return
-            try:
-                cwd = _resolve_cloned_repo_cwd(clone_dir, cwd)
-            except ValueError as exc:
-                print(
-                    f"[compute] invalid working directory for job {job_id}: {exc}",
-                    flush=True,
-                )
-                outcome = "failure"
-                _report_terminal(
-                    exec_status="failed",
-                    exit_code=1,
-                    command_log={
-                        "text": f"[runner] invalid compute cwd: {exc}; "
-                        "command never started",
-                        "truncated": False,
-                    },
-                    resume_hydration=resume_hydration,
-                )
-                return
             print(f"[compute] cloned {owner}/{repo}@{ref} for job {job_id}", flush=True)
+
+        try:
+            cwd = _resolve_compute_cwd(clone_dir, cwd)
+        except ValueError as exc:
+            print(
+                f"[compute] invalid working directory for job {job_id}: {exc}",
+                flush=True,
+            )
+            outcome = "failure"
+            _report_terminal(
+                exec_status="failed",
+                exit_code=1,
+                command_log={
+                    "text": f"[runner] invalid compute cwd: {exc}; "
+                    "command never started",
+                    "truncated": False,
+                },
+                resume_hydration=resume_hydration,
+            )
+            return
 
         # Registry auth for docker/podman backends only (trusted host `docker login`).
         backend_pre = iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)

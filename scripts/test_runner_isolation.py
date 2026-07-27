@@ -1061,6 +1061,19 @@ class TestComputePlan(unittest.TestCase):
 
         self.assertEqual(plan.argv[plan.argv.index("-w") + 1], "/workspace/DEN")
 
+    def test_docker_clone_allows_directory_name_starting_with_dotdot(self):
+        plan = self._common(
+            caps=_caps(docker_usable=True),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            clone_dir_host="/tmp/bp_x/repo",
+            cwd_host="/tmp/bp_x/repo/..cache",
+        )
+
+        self.assertEqual(
+            plan.argv[plan.argv.index("-w") + 1],
+            "/workspace/..cache",
+        )
+
     def test_apptainer_clone_honors_nested_cwd(self):
         plan = self._common(
             caps=_caps(apptainer_path="/usr/bin/apptainer"),

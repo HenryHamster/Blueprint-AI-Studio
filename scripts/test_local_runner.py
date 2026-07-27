@@ -4224,14 +4224,14 @@ class TestComputeCwdResolution(unittest.TestCase):
         nested = os.path.join(clone_dir, "DEN")
 
         with patch.object(local_runner.os.path, "isdir", return_value=True):
-            resolved = local_runner._resolve_cloned_repo_cwd(clone_dir, "DEN")
+            resolved = local_runner._resolve_compute_cwd(clone_dir, "DEN")
 
         self.assertEqual(resolved, os.path.realpath(nested))
 
     def test_empty_cwd_defaults_to_clone_root(self):
         clone_dir = os.path.join(os.getcwd(), "repo")
         with patch.object(local_runner.os.path, "isdir", return_value=True):
-            resolved = local_runner._resolve_cloned_repo_cwd(clone_dir, None)
+            resolved = local_runner._resolve_compute_cwd(clone_dir, None)
 
         self.assertEqual(resolved, os.path.realpath(clone_dir))
 
@@ -4239,13 +4239,35 @@ class TestComputeCwdResolution(unittest.TestCase):
         clone_dir = os.path.join(os.getcwd(), "repo")
 
         with self.assertRaisesRegex(ValueError, "escapes"):
-            local_runner._resolve_cloned_repo_cwd(clone_dir, "..")
+            local_runner._resolve_compute_cwd(clone_dir, "..")
 
     def test_cwd_must_name_an_existing_directory(self):
         clone_dir = os.path.join(os.getcwd(), "repo")
         with patch.object(local_runner.os.path, "isdir", return_value=False):
             with self.assertRaisesRegex(ValueError, "does not name a directory"):
-                local_runner._resolve_cloned_repo_cwd(clone_dir, "missing")
+                local_runner._resolve_compute_cwd(clone_dir, "missing")
+
+    def test_symlinked_clone_root_keeps_mount_relative_path(self):
+        clone_dir = os.path.join(os.getcwd(), "scratch-link", "repo")
+        clone_real = os.path.join(os.getcwd(), "real-scratch", "repo")
+        cwd_real = os.path.join(clone_real, "DEN")
+        realpaths = {
+            clone_dir: clone_real,
+            os.path.join(clone_real, "DEN"): cwd_real,
+        }
+
+        with patch.object(
+            local_runner.os.path,
+            "realpath",
+            side_effect=lambda path: realpaths.get(path, path),
+        ), patch.object(local_runner.os.path, "isdir", return_value=True):
+            resolved = local_runner._resolve_compute_cwd(clone_dir, "DEN")
+
+        self.assertEqual(resolved, os.path.join(clone_dir, "DEN"))
+
+    def test_cwd_without_clone_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "requires a successfully cloned"):
+            local_runner._resolve_compute_cwd(None, "DEN")
 
 
 # ── Registry-host derivation (FIX B4) ──────────────────────────────────────────

@@ -1735,7 +1735,7 @@ def _rel_to_sandbox(host_path: str | None, workspace_host: str, mount: str) -> s
     if not host_path:
         return None
     rel = os.path.relpath(host_path, workspace_host)
-    if rel.startswith(".."):
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
         return host_path  # not under the workspace bind; leave as-is
     return mount if rel == "." else f"{mount}/{rel.replace(os.sep, '/')}"
 
