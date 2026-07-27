@@ -23,6 +23,7 @@ import {
   blockedChallengeRecord,
   renderStrategicFetchVerbHelpLines,
 } from './strategic-helpers.js';
+import { writeArtifactsHelper, COMPUTE_ARTIFACT_GUIDANCE } from './artifacts-helper.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 import { reconcileDesignDocIndex } from '../utils/design-doc-presence.js';
 import {
@@ -448,6 +449,7 @@ export async function handleStrategic(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const artifactsHelperAvailable = writeArtifactsHelper(WORKSPACE);
   const researchMode = strVal(payload.research_mode, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
 
@@ -1387,6 +1389,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # shipped this cycle" section in your prompt). Use only when you actually
 # need the detail — extra context hurts reasoning quality.
 ${renderStrategicFetchVerbHelpLines().join('\n')}
+${artifactsHelperAvailable ? COMPUTE_ARTIFACT_GUIDANCE : ''}
 
 # Operational Knowledge (playbook)
 # You always receive a complete index of playbook keys (playbook_keys_index) —

@@ -17,6 +17,7 @@ import {
   writePlaybookHelper, writeMessagesHelper, writeSkillHelpers,
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
+import { writeArtifactsHelper, COMPUTE_ARTIFACT_GUIDANCE } from './artifacts-helper.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import {
   writeGitTokenFile, setupGitCredentialHelper, GIT_TOKEN_REFRESH_MS,
@@ -595,6 +596,7 @@ export async function handleStrategicResident(
     replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
   });
+  const artifactsHelperAvailable = writeArtifactsHelper(WORKSPACE);
   writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   const disallowedTools = configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
   const contextPrefix = buildContextPrefix(task);
@@ -745,7 +747,8 @@ export async function handleStrategicResident(
     openMessagesText: buildOpenMessagesText(openMessages),
     recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
     sessionId,
-    fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
+    fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS)
+      + (artifactsHelperAvailable ? `\n${COMPUTE_ARTIFACT_GUIDANCE}` : ''),
     priorSessionContextText,
     skillsText,
     toolContentText,
@@ -1959,6 +1962,7 @@ export async function handleStrategicResident(
             replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
             stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
           });
+          writeArtifactsHelper(WORKSPACE);
           writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
           configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
           writeStrategicHelpers(taskId, projectId, WORKSPACE, {

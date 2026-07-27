@@ -945,13 +945,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedArtifactUrls.size} signed URL(s).\n`);
   }
 
+  const artifactFetchGuidance = artifactsHelperAvailable ? COMPUTE_ARTIFACT_GUIDANCE : '';
   const finalPromptWithTree = finalPrompt
     + fileTree
     + repoMap
     + analysisContext
     + prerequisiteKnowledgeSection
     + prerequisiteArtifactSection
-    + (artifactsHelperAvailable ? COMPUTE_ARTIFACT_GUIDANCE : '');
+    + artifactFetchGuidance;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
     emittedFailureGuidance: assembleFailureGuidanceBlocks(isRetry),
@@ -996,7 +997,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const taskNotices = acceptanceEvidenceNotice + provenanceNotice;
   const taskGuidance = taskTypeHint + firstTaskSection + taskTypeFocusBlock;
   const promptSuffixBlock = promptSuffix + prTitlePrefixNote;
-  const fetchToolBlock = `\n\n${stdFetchGuidance}${COMPUTE_ARTIFACT_GUIDANCE}${DEFAULT_TOOL_GUIDANCE}`;
+  const fetchToolBlock = `\n\n${stdFetchGuidance}${artifactFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   const promptedTelemetry = buildPromptSizeTelemetry(finalPromptWithTree, [
     ['claude_md', claudeMdPrefix],
     ['playbook', playbookSection],
