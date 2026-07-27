@@ -47,7 +47,7 @@ export function shouldRunBackendMergeGate(cfg: Pick<CodeChangeHelperConfig, 'own
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'compute-image', 'blocked', 'symbols', 'viewport-snapshot', 'viewport-live'];
+export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'compute-image', 'artifacts', 'blocked', 'symbols', 'viewport-snapshot', 'viewport-live'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;

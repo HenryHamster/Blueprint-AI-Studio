@@ -64,7 +64,8 @@ import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLO
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { writeGitTokenFile, ensureGitCredentialHelperScript } from '../git-credential.js';
 import { runCodeChangeTask } from './code-change.js';
-import { consumeAndCommitArtifacts } from './artifact-consume.js';
+import { consumeAndCommitArtifacts, hydrateComputeResultArtifacts } from './artifact-consume.js';
+import { writeArtifactsHelper, COMPUTE_ARTIFACT_GUIDANCE } from './artifacts-helper.js';
 import { isBlueprintSelfRepo } from '../prompts/code-change-helpers.js';
 import { writeDiagnosticsAfterEditHook } from '../prompts/diagnostics-after-edit-hook.js';
 import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from '../prompts/self-review.js';
@@ -540,6 +541,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const artifactsHelperAvailable = writeArtifactsHelper(WORKSPACE);
   writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   if (isBlueprintSelfRepo(owner, repo)) {
     writeViewportSnapshotHelper(taskId);
@@ -908,11 +910,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           logical_key: strVal(p.logical_key),
           artifact_type: strVal(p.artifact_type),
           source_task_id: strVal(p.source_task_id),
+          source_compute_job_id: strVal(p.source_compute_job_id),
           storage_uri: strVal(p.storage_uri),
         }))
         .filter((p) => p.artifact_id)
     : [];
   const signedArtifactUrls = new Map<string, string>();
+  const hydratedArtifactPaths = new Map<string, string>();
   if (artifactPointers.length > 0) {
     const urlResults = await Promise.all(
       artifactPointers.map(async (p) => {
@@ -923,11 +927,31 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     for (const { artifact_id, url } of urlResults) {
       if (url) signedArtifactUrls.set(artifact_id, url);
     }
-    prerequisiteArtifactSection = buildPrerequisiteArtifactSection(artifactPointers, signedArtifactUrls, taskId);
+    const hydrated = await hydrateComputeResultArtifacts({
+      pointers: artifactPointers,
+      repoRoot: WORKSPACE,
+      ws,
+      signedUrls: signedArtifactUrls,
+    });
+    for (const [artifactId, localPath] of hydrated.localPaths) {
+      hydratedArtifactPaths.set(artifactId, localPath);
+    }
+    prerequisiteArtifactSection = buildPrerequisiteArtifactSection(
+      artifactPointers,
+      signedArtifactUrls,
+      taskId,
+      hydratedArtifactPaths,
+    );
     sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedArtifactUrls.size} signed URL(s).\n`);
   }
 
-  const finalPromptWithTree = finalPrompt + fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection;
+  const finalPromptWithTree = finalPrompt
+    + fileTree
+    + repoMap
+    + analysisContext
+    + prerequisiteKnowledgeSection
+    + prerequisiteArtifactSection
+    + (artifactsHelperAvailable ? COMPUTE_ARTIFACT_GUIDANCE : '');
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
     emittedFailureGuidance: assembleFailureGuidanceBlocks(isRetry),
@@ -972,7 +996,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const taskNotices = acceptanceEvidenceNotice + provenanceNotice;
   const taskGuidance = taskTypeHint + firstTaskSection + taskTypeFocusBlock;
   const promptSuffixBlock = promptSuffix + prTitlePrefixNote;
-  const fetchToolBlock = `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const fetchToolBlock = `\n\n${stdFetchGuidance}${COMPUTE_ARTIFACT_GUIDANCE}${DEFAULT_TOOL_GUIDANCE}`;
   const promptedTelemetry = buildPromptSizeTelemetry(finalPromptWithTree, [
     ['claude_md', claudeMdPrefix],
     ['playbook', playbookSection],

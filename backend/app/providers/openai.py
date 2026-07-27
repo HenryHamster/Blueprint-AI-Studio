@@ -58,7 +58,7 @@ def _normalize_codex_usage(data: Any, probed_at: str) -> UsageSnapshot:
 
     windows: dict[str, float] = {}
     resets: dict[str, str | None] = {}
-    for source, target in (
+    for source, legacy_target in (
         ("primary_window", "five_hour"),
         ("secondary_window", "seven_day"),
     ):
@@ -68,12 +68,29 @@ def _normalize_codex_usage(data: Any, probed_at: str) -> UsageSnapshot:
         used = cell.get("used_percent")
         if isinstance(used, bool) or not isinstance(used, (int, float)):
             continue
+        # Codex names windows by precedence, not duration. Historically the
+        # primary window was five hours, but current plans can expose a weekly
+        # primary window with no five-hour window at all. Prefer the provider's
+        # explicit duration and retain the legacy mapping only for old payloads
+        # that omit it.
+        duration = cell.get("limit_window_seconds")
+        target = legacy_target
+        if not isinstance(duration, bool) and isinstance(duration, (int, float)):
+            if 4 * 60 * 60 <= float(duration) <= 6 * 60 * 60:
+                target = "five_hour"
+            elif 6 * 24 * 60 * 60 <= float(duration) <= 8 * 24 * 60 * 60:
+                target = "seven_day"
+            else:
+                # The shared summary/UI currently names only these two plan
+                # windows. Do not claim a novel duration is known until the
+                # contract can render it without inventing a label.
+                continue
         windows[target] = float(used)
         resets[target] = _codex_reset_at_iso(cell.get("reset_at"))
 
-    # The primary window is the minimum useful contract. Secondary may be
-    # absent for plans that do not expose a weekly limit.
-    if "five_hour" not in windows:
+    # At least one numeric window is the minimum useful contract. Codex plans
+    # no longer universally expose a five-hour window.
+    if not windows:
         return UsageSnapshot.unknown(probed_at, failure_kind="schema")
     return UsageSnapshot(
         known=True,

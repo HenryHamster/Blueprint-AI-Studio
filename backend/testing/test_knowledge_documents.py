@@ -1060,6 +1060,312 @@ async def test_design_completion_also_delivers(db_session, _quiet_broadcast):
     assert prereqs[0]["source_kind"] == "design"
 
 
+_CANONICAL_COMPUTE_RESULT_URI = object()
+
+
+async def _make_compute_delivery_fixture(
+    db_session,
+    *,
+    project_name: str,
+    storage_uri: str | None | object = _CANONICAL_COMPUTE_RESULT_URI,
+    create_artifact: bool = True,
+    create_job: bool = True,
+):
+    """Create one grounded compute document and a direct queued consumer."""
+    from app.models import Artifact, ArtifactType, ComputeJob, ComputeJobStatus
+
+    project, producer = await _make_compute_task(
+        db_session, project_name=project_name
+    )
+    dependent = await _make_queued_dependent(
+        db_session,
+        project_id=project.id,
+        depends_on=[str(producer.id)],
+    )
+
+    job = None
+    if create_job:
+        job = ComputeJob(
+            project_id=project.id,
+            task_id=producer.id,
+            backend="local",
+            status=ComputeJobStatus.SUCCEEDED,
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+
+    artifact = None
+    if create_artifact:
+        if storage_uri is _CANONICAL_COMPUTE_RESULT_URI:
+            storage_uri = (
+                "gs://blueprint-agent-artifacts/"
+                f"compute-jobs/{job.id if job is not None else uuid.uuid4()}/"
+                "artifacts/transfers/result.tar.gz"
+            )
+        artifact = Artifact(
+            task_id=producer.id,
+            artifact_type=ArtifactType.COMPUTE_RESULT,
+            storage_uri=storage_uri,
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+        await db_session.refresh(artifact)
+        if job is not None:
+            job.artifact_id = artifact.id
+            db_session.add(job)
+            await db_session.commit()
+            await db_session.refresh(job)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=producer.id,
+        source_compute_job_id=job.id if job is not None else None,
+        source_kind="compute_experiment",
+        title="Grounded compute result",
+        summary="The measured result and its durable result bundle.",
+        body="# Result\n\nMeasured on the compute runner.",
+        topic="compute-result",
+        source_citations=["gs://bucket/compute/jobs/result.tar.gz"],
+        forward_quality_verdict={
+            "analysis_mode": "llm",
+            "probes": {"grounding": {"grounded": 1}},
+        },
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+    return project, producer, dependent, doc, job, artifact
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_delivers_result_artifact_to_dependent(
+    db_session, mocker
+):
+    """A compute knowledge prerequisite authorizes its exact result bundle."""
+    from app.knowledge_completion import _deliver_knowledge_to_dependents
+
+    mocker.patch(
+        "app.reaper_sweeps.event_driven_unblock_on_knowledge",
+        new_callable=AsyncMock,
+    )
+    _project, producer, dependent, doc, job, artifact = (
+        await _make_compute_delivery_fixture(
+            db_session, project_name="CEartifact-delivery"
+        )
+    )
+
+    await _deliver_knowledge_to_dependents(
+        producer,
+        doc,
+        {"title": doc.title, "summary": doc.summary},
+        db_session,
+    )
+
+    await db_session.refresh(dependent)
+    artifact_prereqs = (dependent.context or {}).get("artifact_prerequisites")
+    assert isinstance(artifact_prereqs, list) and len(artifact_prereqs) == 1
+    assert artifact_prereqs[0] == {
+        "artifact_id": str(artifact.id),
+        "logical_key": None,
+        "artifact_type": "COMPUTE_RESULT",
+        "source_task_id": str(producer.id),
+        "source_compute_job_id": str(job.id),
+        "storage_uri": artifact.storage_uri,
+    }
+
+
+@pytest.mark.asyncio
+async def test_compute_artifact_delivery_is_deduped(db_session, mocker):
+    """Re-entrant knowledge delivery never duplicates either pointer."""
+    from app.knowledge_completion import _deliver_knowledge_to_dependents
+
+    mocker.patch(
+        "app.reaper_sweeps.event_driven_unblock_on_knowledge",
+        new_callable=AsyncMock,
+    )
+    _project, producer, dependent, doc, _job, _artifact = (
+        await _make_compute_delivery_fixture(
+            db_session, project_name="CEartifact-dedupe"
+        )
+    )
+    normalized = {"title": doc.title, "summary": doc.summary}
+
+    await _deliver_knowledge_to_dependents(
+        producer, doc, normalized, db_session
+    )
+    await _deliver_knowledge_to_dependents(
+        producer, doc, normalized, db_session
+    )
+
+    await db_session.refresh(dependent)
+    assert len(dependent.context["knowledge_prerequisites"]) == 1
+    assert len(dependent.context["artifact_prerequisites"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("create_job", "create_artifact", "storage_uri"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (True, True, None),
+    ],
+    ids=["missing-job", "missing-artifact", "missing-storage-uri"],
+)
+async def test_compute_knowledge_without_downloadable_result_delivers_only_knowledge(
+    db_session,
+    mocker,
+    create_job,
+    create_artifact,
+    storage_uri,
+):
+    """Incomplete legacy linkage does not authorize a nonexistent result bundle."""
+    from app.knowledge_completion import _deliver_knowledge_to_dependents
+
+    mocker.patch(
+        "app.reaper_sweeps.event_driven_unblock_on_knowledge",
+        new_callable=AsyncMock,
+    )
+    _project, producer, dependent, doc, _job, _artifact = (
+        await _make_compute_delivery_fixture(
+            db_session,
+            project_name=f"CEartifact-{create_job}-{create_artifact}",
+            storage_uri=storage_uri,
+            create_artifact=create_artifact,
+            create_job=create_job,
+        )
+    )
+
+    await _deliver_knowledge_to_dependents(
+        producer,
+        doc,
+        {"title": doc.title, "summary": doc.summary},
+        db_session,
+    )
+
+    await db_session.refresh(dependent)
+    assert len(dependent.context["knowledge_prerequisites"]) == 1
+    assert "artifact_prerequisites" not in dependent.context
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_rejects_cross_project_artifact_link(
+    db_session, mocker
+):
+    """A job cannot authorize an artifact owned by a task in another project."""
+    from app.knowledge_completion import _deliver_knowledge_to_dependents
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch(
+        "app.reaper_sweeps.event_driven_unblock_on_knowledge",
+        new_callable=AsyncMock,
+    )
+    project, producer, dependent, doc, job, _artifact = (
+        await _make_compute_delivery_fixture(
+            db_session,
+            project_name="CEartifact-project-a",
+            create_artifact=False,
+        )
+    )
+    other_project, other_task = await _make_compute_task(
+        db_session, project_name="CEartifact-project-b"
+    )
+    assert other_project.id != project.id
+    foreign_artifact = Artifact(
+        task_id=other_task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri="gs://bucket/foreign/result.tar.gz",
+    )
+    db_session.add(foreign_artifact)
+    await db_session.commit()
+    await db_session.refresh(foreign_artifact)
+    job.artifact_id = foreign_artifact.id
+    db_session.add(job)
+    await db_session.commit()
+
+    await _deliver_knowledge_to_dependents(
+        producer,
+        doc,
+        {"title": doc.title, "summary": doc.summary},
+        db_session,
+    )
+
+    await db_session.refresh(dependent)
+    assert len(dependent.context["knowledge_prerequisites"]) == 1
+    assert "artifact_prerequisites" not in dependent.context
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_rejects_mismatched_artifact_uri_job(
+    db_session, mocker
+):
+    """A document cannot deliver a bundle stored beneath another job prefix."""
+    from app.knowledge_completion import _deliver_knowledge_to_dependents
+
+    mocker.patch(
+        "app.reaper_sweeps.event_driven_unblock_on_knowledge",
+        new_callable=AsyncMock,
+    )
+    _project, producer, dependent, doc, _job, _artifact = (
+        await _make_compute_delivery_fixture(
+            db_session,
+            project_name="CEartifact-uri-job-mismatch",
+            storage_uri=(
+                "gs://blueprint-agent-artifacts/"
+                f"compute-jobs/{uuid.uuid4()}/artifacts/transfers/result.tar.gz"
+            ),
+        )
+    )
+
+    await _deliver_knowledge_to_dependents(
+        producer,
+        doc,
+        {"title": doc.title, "summary": doc.summary},
+        db_session,
+    )
+
+    await db_session.refresh(dependent)
+    assert len(dependent.context["knowledge_prerequisites"]) == 1
+    assert "artifact_prerequisites" not in dependent.context
+
+
+@pytest.mark.asyncio
+async def test_late_compute_knowledge_dependent_backfills_canonical_artifact(
+    db_session,
+):
+    """A child created after the compute document still gets its exact bundle."""
+    from app.artifact_prerequisites import backfill_artifact_prerequisites
+
+    project, producer, _early_dependent, _doc, job, artifact = (
+        await _make_compute_delivery_fixture(
+            db_session, project_name="CEartifact-late-child"
+        )
+    )
+    producer.status = TaskStatus.COMPLETED
+    db_session.add(producer)
+    await db_session.commit()
+
+    late_dependent = await _make_queued_dependent(
+        db_session,
+        project_id=project.id,
+        depends_on=[str(producer.id)],
+    )
+    assert "artifact_prerequisites" not in (late_dependent.context or {})
+
+    await backfill_artifact_prerequisites(late_dependent, db_session)
+    await db_session.commit()
+    await backfill_artifact_prerequisites(late_dependent, db_session)
+    await db_session.commit()
+    await db_session.refresh(late_dependent)
+
+    pointers = late_dependent.context["artifact_prerequisites"]
+    assert len(pointers) == 1
+    assert pointers[0]["artifact_id"] == str(artifact.id)
+    assert pointers[0]["source_compute_job_id"] == str(job.id)
+    assert pointers[0]["logical_key"] is None
+
+
 # ── design codebase-grounding probe (file citations resolve to real paths) ──
 #
 # A design document's value is that it is grounded in the ACTUAL code. The

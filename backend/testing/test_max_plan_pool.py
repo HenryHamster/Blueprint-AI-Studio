@@ -3860,7 +3860,7 @@ class TestRefreshUsageMeterSnapshots:
             "claude",
             "codex",
         ]
-        assert [delay for _, delay in scheduled] == [0.0, 0.5]
+        assert [delay for _, delay in scheduled] == [0.0, 30.0]
         assert count == 2
 
     async def test_skips_fresh_snapshots_and_recent_failures(self, monkeypatch):

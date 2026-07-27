@@ -25,11 +25,13 @@ import { fetchArtifactDownloadUrl, type PrerequisiteArtifactPointer } from './pr
 // remain prompt-only — committing them would pollute the diff. GIT_COMMIT is
 // the ArtifactType (backend models.py) that denotes delivered repo files.
 export const COMMITTABLE_ARTIFACT_TYPES = new Set<string>(['GIT_COMMIT']);
+export const HYDRATABLE_ARTIFACT_TYPES = new Set<string>(['COMPUTE_RESULT']);
 
 // Cap on the compressed bundle we will download. Bundles are small file sets;
 // anything larger is almost certainly wrong and we refuse it rather than risk
 // OOM on a 2-vCPU VM.
 export const MAX_BUNDLE_DOWNLOAD_BYTES = 100 * 1024 * 1024; // 100 MiB compressed
+export const BUNDLE_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 export interface ExtractLimits {
   /** Maximum number of files written from a single bundle. */
@@ -159,7 +161,13 @@ export function extractTarGzToDir(
   destDir: string,
   limits: ExtractLimits = DEFAULT_EXTRACT_LIMITS,
 ): ExtractResult {
-  const tarBuf = zlib.gunzipSync(gzBuf);
+  // Include bounded tar header/padding overhead while preventing a compressed
+  // zip bomb from being expanded without limit before per-entry checks run.
+  // tar writers commonly pad small archives to a 10 KiB record boundary.
+  // Account for that fixed envelope plus one overflow entry so we can report
+  // the max-files violation without making decompression unbounded.
+  const maxTarBytes = limits.maxTotalBytes + 10240 + ((limits.maxFiles + 1) * 1024);
+  const tarBuf = zlib.gunzipSync(gzBuf, { maxOutputLength: maxTarBytes });
   const entries = parseTar(tarBuf);
   const result: ExtractResult = { written: [], rejected: [], skipped: [] };
   const resolvedRoot = path.resolve(destDir);
@@ -196,17 +204,39 @@ export function extractTarGzToDir(
 export async function downloadBundle(
   url: string,
   maxBytes: number = MAX_BUNDLE_DOWNLOAD_BYTES,
+  timeoutMs: number = BUNDLE_DOWNLOAD_TIMEOUT_MS,
 ): Promise<Buffer | null> {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+  deadline.unref();
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) return null;
     const lengthHeader = res.headers.get('content-length');
     if (lengthHeader && Number(lengthHeader) > maxBytes) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length === 0 || buf.length > maxBytes) return null;
-    return buf;
+    if (!res.body) return null;
+    const reader = res.body.getReader();
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength === 0) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        try { await reader.cancel(); } catch { /* best-effort connection cleanup */ }
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+    if (totalBytes === 0) return null;
+    return Buffer.concat(chunks, totalBytes);
   } catch {
     return null;
+  } finally {
+    clearTimeout(deadline);
   }
 }
 
@@ -255,6 +285,142 @@ export interface ConsumeOutcome {
   committedArtifactIds: string[];
   commits: ArtifactCommit[];
   rejectedEntries: { artifact_id: string; entries: string[] }[];
+}
+
+export interface HydrateArtifactsOptions {
+  pointers: PrerequisiteArtifactPointer[];
+  /** Repo clone beside which the ignored runtime input directory is created. */
+  repoRoot?: string;
+  ws?: WebSocket | null;
+  signedUrls?: Map<string, string>;
+  limits?: ExtractLimits;
+  resolveUrl?: (artifactId: string) => Promise<string | null>;
+  download?: (url: string) => Promise<Buffer | null>;
+  /** Test injection; production writes the repository-local git exclude. */
+  ensureIgnored?: (repoRoot: string) => boolean;
+}
+
+export interface HydrateOutcome {
+  /** Artifact id -> repo-relative directory containing the extracted files. */
+  localPaths: Map<string, string>;
+  rejectedEntries: { artifact_id: string; entries: string[] }[];
+}
+
+function safePathComponent(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+$/, '_').slice(0, 160);
+}
+
+function hasSymlinkInExistingPath(root: string, relativePath: string): boolean {
+  let cursor = path.resolve(root);
+  for (const component of relativePath.split(/[\\/]+/).filter(Boolean)) {
+    cursor = path.join(cursor, component);
+    if (fs.existsSync(cursor) && fs.lstatSync(cursor).isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+export function computeArtifactInputPath(pointer: PrerequisiteArtifactPointer): string {
+  const uriMatch = (pointer.storage_uri || '').match(/(?:^|\/)compute-jobs\/([^/]+)/);
+  const sourceId = pointer.source_compute_job_id || uriMatch?.[1] || pointer.artifact_id;
+  return path.posix.join('.blueprint-inputs', 'compute-jobs', safePathComponent(sourceId || 'unknown'));
+}
+
+// Runtime inputs must never be swept into `git add -A`. Use the clone-local
+// exclude instead of editing the consumer repository's tracked .gitignore.
+export function ensureRuntimeInputsIgnored(repoRoot: string): boolean {
+  try {
+    const rawGitPath = git(['rev-parse', '--git-path', 'info/exclude'], repoRoot).trim();
+    if (!rawGitPath) return false;
+    const excludePath = path.isAbsolute(rawGitPath) ? rawGitPath : path.resolve(repoRoot, rawGitPath);
+    fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    const current = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf-8') : '';
+    if (!current.split(/\r?\n/).includes('/.blueprint-inputs/')) {
+      fs.appendFileSync(excludePath, `${current && !current.endsWith('\n') ? '\n' : ''}/.blueprint-inputs/\n`);
+    }
+    git(
+      ['check-ignore', '-q', '--no-index', '--', '.blueprint-inputs/.blueprint-ignore-probe'],
+      repoRoot,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Fetch and safely unpack COMPUTE_RESULT prerequisites into a predictable,
+// ignored workspace directory. Unlike GIT_COMMIT consumption, this never stages
+// or commits anything. Failures remain prompt-visible through the signed URL.
+export async function hydrateComputeResultArtifacts(opts: HydrateArtifactsOptions): Promise<HydrateOutcome> {
+  const repoRoot = opts.repoRoot ?? WORKSPACE;
+  const ws = opts.ws ?? null;
+  const limits = opts.limits ?? DEFAULT_EXTRACT_LIMITS;
+  const resolveUrl = opts.resolveUrl ?? fetchArtifactDownloadUrl;
+  const download = opts.download ?? downloadBundle;
+  const ensureIgnored = opts.ensureIgnored ?? ensureRuntimeInputsIgnored;
+  const outcome: HydrateOutcome = { localPaths: new Map(), rejectedEntries: [] };
+  const pointers = opts.pointers.filter(
+    (p) => (p.artifact_id || '').trim() && HYDRATABLE_ARTIFACT_TYPES.has((p.artifact_type || '').trim()),
+  );
+  if (pointers.length === 0) return outcome;
+
+  if (!ensureIgnored(repoRoot)) {
+    sendLog(ws, '[ArtifactHydrate] Could not install the local git exclude; refusing to create untracked compute inputs.\n');
+    return outcome;
+  }
+
+  for (const pointer of pointers) {
+    const id = pointer.artifact_id.trim();
+    const relativeDir = computeArtifactInputPath(pointer);
+    const destDir = path.resolve(repoRoot, relativeDir);
+    let tempDir: string | null = null;
+    try {
+      const url = opts.signedUrls?.get(id) || (await resolveUrl(id));
+      if (!url) {
+        sendLog(ws, `[ArtifactHydrate] No signed URL for compute artifact ${id} — leaving it prompt-only.\n`);
+        continue;
+      }
+      const buf = await download(url);
+      if (!buf) {
+        sendLog(ws, `[ArtifactHydrate] Could not download compute artifact ${id} — leaving it prompt-only.\n`);
+        continue;
+      }
+
+      // The destination is derived only from a sanitized id. Refuse a tracked
+      // symlink at any runtime-input path component before recursive cleanup,
+      // then replace the destination as a unit so retries cannot mix versions.
+      if (hasSymlinkInExistingPath(repoRoot, relativeDir)) {
+        sendLog(ws, `[ArtifactHydrate] Refusing compute artifact ${id}: runtime input path contains a symlink.\n`);
+        continue;
+      }
+      fs.mkdirSync(path.dirname(destDir), { recursive: true });
+      tempDir = fs.mkdtempSync(`${destDir}.tmp-`);
+      const contentsDir = path.join(tempDir, 'contents');
+      fs.mkdirSync(contentsDir, { recursive: true });
+      // Preserve the exact downloaded bytes for tarball-aware ingest and make
+      // a separate, safely extracted view available for ordinary file reads.
+      fs.writeFileSync(path.join(tempDir, 'bundle.tar.gz'), buf);
+      const extracted = extractTarGzToDir(buf, contentsDir, limits);
+      if (extracted.rejected.length > 0) {
+        outcome.rejectedEntries.push({ artifact_id: id, entries: extracted.rejected });
+        sendLog(ws, `[ArtifactHydrate] Rejected ${extracted.rejected.length} unsafe entr(ies) in compute artifact ${id}: ${extracted.rejected.slice(0, 5).join(', ')}\n`);
+      }
+      if (extracted.written.length === 0) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        tempDir = null;
+        sendLog(ws, `[ArtifactHydrate] Compute artifact ${id} contained no usable files.\n`);
+        continue;
+      }
+      fs.rmSync(destDir, { recursive: true, force: true });
+      fs.renameSync(tempDir, destDir);
+      tempDir = null;
+      outcome.localPaths.set(id, relativeDir);
+      sendLog(ws, `[ArtifactHydrate] Extracted ${extracted.written.length} compute artifact file(s) to ${relativeDir}/ (not staged).\n`);
+    } catch (e) {
+      if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+      sendLog(ws, `[ArtifactHydrate] Failed to hydrate compute artifact ${id} (non-fatal): ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
+  return outcome;
 }
 
 // Fetch → untar → extract → git-commit each committable delivered artifact into

@@ -130,7 +130,7 @@ describe('SettingsAccountsSection', () => {
       }
 
       render(<RefreshingHarness />);
-      expect(screen.getByText(/usage endpoint/)).toBeInTheDocument();
+      expect(screen.getByText(/usage unavailable \(probe endpoint\)/)).toBeInTheDocument();
 
       await act(async () => {
         vi.advanceTimersByTime(DEFAULT_POLL_MS);
@@ -138,10 +138,37 @@ describe('SettingsAccountsSection', () => {
 
       expect(screen.getByText('42%')).toBeInTheDocument();
       expect(screen.getByText('57%')).toBeInTheDocument();
-      expect(screen.queryByText(/usage endpoint/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/usage unavailable/)).not.toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('renders a weekly-only Codex window without inventing a five-hour period', () => {
+    render(
+      <Harness
+        maxPlanAccounts={[
+          makeAccount({
+            provider: 'openai',
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: null,
+              seven_day_utilization: 48,
+              resets_at: { seven_day: '2026-08-01T20:47:28Z' },
+              probed_at: '2026-07-27T01:46:49Z',
+              stale: false,
+              dark_reason: null,
+              last_attempt_at: '2026-07-27T01:46:49Z',
+              last_attempt_failure_kind: null,
+            },
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('48%')).toBeInTheDocument();
+    expect(screen.queryByText('5h')).not.toBeInTheDocument();
+    expect(screen.getByText(/7d/)).toBeInTheDocument();
   });
 
   it('enables the add-account flow once required fields are filled', () => {
