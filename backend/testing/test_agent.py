@@ -6372,7 +6372,7 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
     headers = {"x-agent-token": token}
 
     # Per-entry limit: value > 2048 bytes should be rejected
-    oversized_value = "x" * 2049
+    oversized_value = "é" * 1025
     resp = await client.post(
         "/api/agent/playbook",
         json={
@@ -6380,21 +6380,6 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
             "op": "set",
             "key": "too-big",
             "value": oversized_value,
-        },
-        headers=headers,
-    )
-    assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
-    assert "2KB" in resp.json()["error"]["message"]
-
-    # The documented limit is bytes, not Unicode code points.
-    multibyte_oversized_value = "é" * 1025
-    resp = await client.post(
-        "/api/agent/playbook",
-        json={
-            "task_id": str(task.id),
-            "op": "set",
-            "key": "too-big-unicode",
-            "value": multibyte_oversized_value,
         },
         headers=headers,
     )

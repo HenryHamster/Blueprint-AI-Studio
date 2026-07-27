@@ -22,6 +22,7 @@ vi.mock('../index.js', () => ({
 
 // runClaudeCode must never be invoked for maxFixAttempts:0 runs — stub anyway.
 vi.mock('../providers/runners.js', () => ({
+  syncAgentHelpersToPath: vi.fn(() => '/tmp/blueprint-agent-bin-test'),
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
   __resetClaudeCapabilityCacheForTesting: vi.fn(),
   probeClaudeCapabilities: vi.fn(() => null),

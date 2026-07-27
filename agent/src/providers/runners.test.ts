@@ -709,4 +709,28 @@ describe('syncAgentHelpersToPath', () => {
     );
     expect(env.PATH.startsWith(helperBin)).toBe(true);
   });
+
+  it('supports narrow fs facades only when no stale helper directory exists', () => {
+    const fsFacade = fs as unknown as {
+      rmSync?: typeof fs.rmSync;
+    };
+    const rmSync = fsFacade.rmSync;
+    fsFacade.rmSync = undefined;
+    try {
+      vi.mocked(fs.existsSync).mockReturnValueOnce(false);
+      const env = { PATH: '/usr/bin:/bin' };
+      const helperBin = syncAgentHelpersToPath('/tmp/ws', env);
+      expect(fs.mkdirSync).toHaveBeenCalledWith(
+        helperBin,
+        { recursive: true, mode: 0o700 },
+      );
+      expect(env.PATH.startsWith(helperBin)).toBe(true);
+
+      vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+      expect(() => syncAgentHelpersToPath('/tmp/ws', { PATH: '/usr/bin:/bin' }))
+        .toThrow(/Cannot safely reset agent helper PATH directory/);
+    } finally {
+      fsFacade.rmSync = rmSync;
+    }
+  });
 });

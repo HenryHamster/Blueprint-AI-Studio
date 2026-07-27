@@ -820,7 +820,17 @@ async def test_plan_compute_experiment_defaults_to_pinned_ref(
     mocker.patch(
         "app.routers.admin_project_tools._discover_manifest_tools",
         new_callable=AsyncMock,
-        return_value={"compute": {"image": {"name": _PLAN_MANIFEST_TAG}}},
+        return_value={
+            "compute": {
+                "image": {
+                    "name": _PLAN_MANIFEST_TAG,
+                    # A build recipe declares this as a Blueprint-managed image.
+                    # Buildless images are external/prebuilt and intentionally
+                    # preserve their declared ref instead of consulting build rows.
+                    "build": {"dockerfile": "Dockerfile"},
+                }
+            }
+        },
     )
 
     await _handle_plan_completion(task, _compute_prereq_plan_logs(), db_session)

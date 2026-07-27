@@ -1392,10 +1392,9 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
 `;
 
 export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`, commits
-  changes, pushes branch, creates PR. Writes /tmp/pr_url_<task_id> on success.
-  Pass \`--with-tests\` to run \`./check test\` instead. **Exit 4 = conflicts.**
-  Rebase onto origin/<base>, resolve via Edit or \`git checkout --theirs\`,
-  \`./check\`, then \`./pr open\` again. If unresolved after ~2 attempts, \`./blocked\`.
+  and pushes changes, opens the PR, and records its URL. \`--with-tests\` runs
+  \`./check test\`. **Exit 4 = conflicts:** rebase on origin/<base>, resolve,
+  re-check and reopen; after ~2 failed attempts, \`./blocked\`.
 - \`./done\` — marks COMPLETED with the PR URL. Requires \`./pr open\` first.
   - \`./done --already-done "<reason>"\` — Deliverable EXISTS on base branch.
     Reason MUST name concrete artifact (≥30 chars), e.g.
@@ -1411,9 +1410,7 @@ export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --bod
   run cheapest faithful checks, \`./pr open\`, \`./done\`; CI is authoritative.
   A real assertion/lint/build/test failure still blocks publication and must be fixed.
 - \`./blocked "<reason>"\` — Only when no code edit can fix it; routes to strategic.
-- \`compute-image status\` — read-only project runtime/image diagnosis for
-  compute-related tasks. It reports whether the manifest declares an external
-  runtime image or a Blueprint build recipe. \`build\` remains Strategic-only.
+- \`compute-image status\` — diagnose compute images; \`build\` is Strategic-only.
 
 Exit: edit -> ./check -> ./pr open -> ./done
 
@@ -1577,13 +1574,11 @@ export const CODE_CHANGE_HELPER_GUIDANCE =
 
 export const PLAYBOOK_GUIDANCE = `
 ## Operational Playbook — Active Collective Memory
-The playbook is shared, mutable knowledge across all agents — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge or overwrite an existing entry, and \`./playbook get\` to review. Each value has a 2048-byte (2KB) limit, checked locally before the request is sent. If an entry led you astray, overwrite it.
+Use \`./playbook get\` to review shared repo knowledge and \`./playbook set <key> <value>\` to add or replace it. Values are limited to 2048 UTF-8 bytes.
 
-An entry written by an active task is visible to that task immediately but becomes shared with other tasks only after the source task completes. If the source task fails or is cancelled, its pending entry is removed; this prevents unshipped conclusions from poisoning later work.
+Active-task writes are staged: the writer sees its update immediately; peers keep the prior committed entry (or none). Completion publishes it; failure/cancellation restores the prior entry or removes a new one.
 
-**When to save:** after fixing a build/test error, discovering non-obvious configuration, running successful commands, or finding undocumented patterns. Check \`./playbook get\` first to avoid duplicates.
-
-**Before completing your task:** reflect on repo-level knowledge you gained and save it — the next agent starts cold, and one good entry compounds across hundreds of tasks.
+Before completing, save concise reusable facts such as working commands, configuration, quirks, or undocumented patterns. Check existing entries first.
 
 \`\`\`bash
 ./playbook set "key-name" "Concise operational knowledge here."

@@ -42,6 +42,7 @@ vi.mock('./resident-stream.js', async (importOriginal) => {
 });
 
 vi.mock('./runners.js', () => ({
+  syncAgentHelpersToPath: vi.fn(() => '/tmp/blueprint-agent-bin-test'),
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
   __resetClaudeCapabilityCacheForTesting: vi.fn(),
   probeClaudeCapabilities: vi.fn(() => null),

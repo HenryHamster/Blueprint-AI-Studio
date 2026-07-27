@@ -1097,7 +1097,18 @@ export function syncAgentHelpersToPath(
 ): string {
   const taskKey = (process.env.TASK_ID || 'current').replace(/[^a-zA-Z0-9_-]/g, '_');
   const helperBin = path.join(os.tmpdir(), `blueprint-agent-bin-${taskKey}`);
-  fs.rmSync(helperBin, { recursive: true, force: true });
+  // Node always provides rmSync in the supported runtime. Some focused tests
+  // intentionally install a narrow fs facade because they exercise provider
+  // streaming rather than filesystem behavior. Allow that facade only when it
+  // proves there is no stale helper directory to clear; otherwise fail closed
+  // rather than leaving wrappers from an earlier task on PATH.
+  if (typeof fs.rmSync === 'function') {
+    fs.rmSync(helperBin, { recursive: true, force: true });
+  } else if (fs.existsSync(helperBin)) {
+    throw new Error(
+      `Cannot safely reset agent helper PATH directory without fs.rmSync: ${helperBin}`,
+    );
+  }
   fs.mkdirSync(helperBin, { recursive: true, mode: 0o700 });
   for (const name of AGENT_HELPER_NAMES) {
     const source = path.join(workspace, name);
