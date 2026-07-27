@@ -69,6 +69,49 @@ def test_get_project_id_refuses_ambiguous_unconfigured_fallback(
 
     assert "multiple projects" in capsys.readouterr().err.lower()
 
+
+def test_strategic_chat_sends_required_idempotency_key(monkeypatch):
+    """Interactive Strategic sends satisfy the durable message contract."""
+    requests = []
+    inputs = iter(["hello", "/quit"])
+
+    def fake_api(method, path, body=None):
+        requests.append((method, path, body))
+        if method == "GET":
+            return {"conversation": {"items": []}}
+        return {"id": "sent-message"}
+
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _op: None)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _project_id: "project-1")
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "input", lambda _prompt: next(inputs), raising=False)
+    monkeypatch.setattr(blueprint.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        blueprint.uuid,
+        "uuid4",
+        lambda: "00000000-0000-4000-8000-000000000001",
+    )
+
+    blueprint._strategic_chat(
+        argparse.Namespace(
+            project_id=None,
+            json_out=False,
+            interval=0.5,
+            timeout=0.5,
+            type="NOTE",
+        )
+    )
+
+    post = next(request for request in requests if request[0] == "POST")
+    assert post[1] == "/api/admin/projects/project-1/strategic-session/messages"
+    assert post[2] == {
+        "content": "hello",
+        "message_type": "NOTE",
+        "idempotency_key": (
+            "strategic-chat:00000000-0000-4000-8000-000000000001"
+        ),
+    }
+
 # ── root wrapper existence and invocation tests ───────────────────────────────
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
