@@ -49,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from blueprint_api import (
@@ -3536,7 +3537,11 @@ def _strategic_chat(args: argparse.Namespace) -> None:
             if content:
                 sent = api("POST",
                            f"/api/admin/projects/{pid}/strategic-session/messages",
-                           {"content": content, "message_type": msg_type})
+                           {
+                               "content": content,
+                               "message_type": msg_type,
+                               "idempotency_key": f"strategic-chat:{uuid.uuid4()}",
+                           })
                 sent_id = sent.get("id") if isinstance(sent, dict) else None
                 if sent_id:
                     seen.add(sent_id)
