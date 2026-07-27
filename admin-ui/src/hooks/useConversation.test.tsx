@@ -1,7 +1,11 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ProjectMessage } from '../types/messages';
-import { CONVERSATION_INITIAL_WINDOW, mergeConversationPages, useConversation } from './useConversation';
+import {
+  CONVERSATION_INITIAL_WINDOW,
+  mergeConversationPages,
+  useConversation,
+} from './useConversation';
 
 const { fetchStrategicConversation } = vi.hoisted(() => ({
   fetchStrategicConversation: vi.fn(),
@@ -465,7 +469,7 @@ describe('initial window and newest-message pinning', () => {
     expect(messages.map(item => item.sequence)).toEqual([50]);
   });
 
-  test('initial fetch uses CONVERSATION_INITIAL_WINDOW as the limit', async () => {
+  test('initial fetch uses the bounded conversation window', async () => {
     let messages: ProjectMessage[] = [];
     fetchStrategicConversation.mockResolvedValue({
       conversation: { has_more: false, next_before_sequence: null, items: [] },
@@ -495,8 +499,8 @@ describe('initial window and newest-message pinning', () => {
     expect(fetchStrategicConversation.mock.calls[0][1]).not.toHaveProperty('search');
   });
 
-  test('CONVERSATION_INITIAL_WINDOW keeps a useful bounded mobile transcript', () => {
-    expect(CONVERSATION_INITIAL_WINDOW).toBe(50);
+  test('CONVERSATION_INITIAL_WINDOW is uniformly bounded across layouts', () => {
+    expect(CONVERSATION_INITIAL_WINDOW).toBe(30);
   });
 
   test('hasMore is true when server has older messages beyond the initial window', async () => {
