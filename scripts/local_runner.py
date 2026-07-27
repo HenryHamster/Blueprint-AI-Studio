@@ -3662,6 +3662,11 @@ def _heartbeat_loop(
                         else:
                             stale = version_hint not in version
                         if stale:
+                            # Enter drain mode immediately. Both agent and
+                            # compute pollers stop NEW claims while existing
+                            # work finishes, guaranteeing a long-lived resident
+                            # cannot starve a runner rollout forever.
+                            _update_in_progress.set()
                             # Check if runner is completely idle before attempting
                             # auto-update (no active tasks and no compute jobs).
                             with lock:
@@ -3672,14 +3677,19 @@ def _heartbeat_loop(
                             else:
                                 has_compute = False
 
-                            if not has_tasks and not has_compute and deferred_auto_update_hint != version_hint:
+                            if deferred_auto_update_hint == version_hint:
+                                # A prior update proved this exact server hint is
+                                # behind/different from origin/main. Do not
+                                # re-arm drain mode forever on every heartbeat;
+                                # wait for the server hint to change.
+                                _update_in_progress.clear()
+                            elif not has_tasks and not has_compute:
                                 print(
                                     f"[runner] version mismatch ({version!r} vs "
                                     f"{version_hint!r}) and runner is idle — "
                                     "auto-updating...",
                                     flush=True,
                                 )
-                                _update_in_progress.set()
                                 try:
                                     result = br.do_update()
                                 except Exception:
@@ -3728,12 +3738,13 @@ def _heartbeat_loop(
                                 print(
                                     f"[runner] WARNING: runner version {version!r} "
                                     f"does not match orchestrator version hint "
-                                    f"{version_hint!r} — not auto-updating because "
-                                    "tasks are still executing.",
+                                    f"{version_hint!r} — draining new claims; "
+                                    "auto-update will start when current work finishes.",
                                     flush=True,
                                 )
                         else:
                             deferred_auto_update_hint = None
+                            _update_in_progress.clear()
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -6311,6 +6322,10 @@ def _compute_poll_loop(
 
     while not _shutdown_event.is_set():
         try:
+            if _update_in_progress.is_set():
+                time.sleep(poll_interval)
+                continue
+
             with lock:
                 active_count = len(active_jobs)
 
@@ -7215,6 +7230,7 @@ def _spawn_agent_task(
     agent_started_at: dict,
     agent_teardown: dict,
     lock: threading.Lock,
+    project_id: str | None = None,
     llm_env: dict[str, str] | None = None,
     llm_files: list[dict[str, str]] | None = None,
     decline_reason_out: list[str] | None = None,
@@ -7326,6 +7342,10 @@ def _spawn_agent_task(
     }
     if effective_llm_env:
         injected_env.update(effective_llm_env)
+    # Task identity is authoritative and must not be overridden by provider
+    # credential material returned in credentials.env.
+    if project_id:
+        injected_env["PROJECT_ID"] = project_id
     plan = iso.plan_agent_execution(
         caps=caps,
         agent_binary=agent_binary,
@@ -7947,6 +7967,7 @@ def main() -> None:
             poll_interval = base_poll_interval
 
             task_id = body.get("task_id") or body.get("id", "unknown")
+            project_id = body.get("project_id")
             agent_token = body.get("agent_token", "")
             task_type = body.get("task_type", "unknown")
             vm_instance_id = body.get("vm_instance_id") or "runner:local"
@@ -8032,6 +8053,7 @@ def main() -> None:
                 agent_started_at=agent_started_at,
                 agent_teardown=agent_teardown,
                 lock=lock,
+                project_id=project_id,
                 llm_env=llm_env,
                 llm_files=llm_files,
                 decline_reason_out=decline_reason,

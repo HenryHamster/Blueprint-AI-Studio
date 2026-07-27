@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+from collections.abc import Callable
 from datetime import datetime
 from datetime import timedelta
 
@@ -1333,9 +1334,14 @@ async def finalize_pending_playbook_entries(
         if succeeded:
             entry = dict(value)
             entry.pop("pending_source", None)
+            entry.pop("_pending_previous", None)
             doc[key] = entry
         else:
-            to_delete.append(key)
+            previous = value.get("_pending_previous")
+            if isinstance(previous, dict) and previous:
+                doc[key] = previous
+            else:
+                to_delete.append(key)
         changed += 1
 
     for key in to_delete:
@@ -1361,6 +1367,51 @@ async def finalize_pending_playbook_entries(
             succeeded,
         )
     return changed
+
+
+def visible_playbook_entry(
+    value: object,
+    *,
+    viewer_task_id: str | None = None,
+) -> dict | None:
+    """Return the entry a viewer may trust while an update is pending.
+
+    The source task sees its staged candidate. Other viewers keep seeing the
+    prior committed value, when one exists; a brand-new pending claim remains
+    hidden until its source task completes.
+    """
+    if not isinstance(value, dict):
+        return None
+    pending_source = value.get("pending_source")
+    if pending_source and pending_source != viewer_task_id:
+        previous = value.get("_pending_previous")
+        return previous if isinstance(previous, dict) and previous else None
+    visible = dict(value)
+    visible.pop("_pending_previous", None)
+    return visible
+
+
+def mutate_visible_playbook_entry(
+    value: object,
+    *,
+    viewer_task_id: str | None,
+    mutate: Callable[[dict], None],
+) -> dict | None:
+    """Apply observation counters to the same entry content the viewer saw."""
+    if not isinstance(value, dict):
+        return None
+    raw = dict(value)
+    pending_source = raw.get("pending_source")
+    if pending_source and pending_source != viewer_task_id:
+        previous = raw.get("_pending_previous")
+        if not isinstance(previous, dict) or not previous:
+            return None
+        previous = dict(previous)
+        mutate(previous)
+        raw["_pending_previous"] = previous
+        return raw
+    mutate(raw)
+    return raw
 
 
 def _archive_least_useful_entry(doc: dict) -> dict:

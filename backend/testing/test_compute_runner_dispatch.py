@@ -2794,7 +2794,12 @@ async def test_compute_experiment_defaults_container_image_to_project_image(
             return_value={
                 "tools": [],
                 "skills": [],
-                "compute": {"image": {"name": _PROJECT_IMAGE}},
+                "compute": {
+                    "image": {
+                        "name": _PROJECT_IMAGE,
+                        "build": {"dockerfile": "Dockerfile"},
+                    }
+                },
                 "error": None,
             }
         ),

@@ -60,6 +60,30 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     });
   });
 
+  it('provisions read-only compute-image status access in code-task workspaces', async () => {
+    const previousProjectId = process.env.PROJECT_ID;
+    process.env.PROJECT_ID = 'project-code-helper';
+    try {
+      const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+      writeCodeChangeHelpers({
+        taskId: 'test-task-compute-image',
+        workBranch: 'blueprint/test-task-compute-image',
+        baseBranch: 'main',
+        owner: 'example',
+        repo: 'project',
+        testsOnMainBranch: true,
+      });
+    } finally {
+      if (previousProjectId === undefined) delete process.env.PROJECT_ID;
+      else process.env.PROJECT_ID = previousProjectId;
+    }
+
+    const helper = capturedScripts['/tmp/workspace/compute-image'];
+    expect(helper).toContain('/compute-environment');
+    expect(helper).toContain("PROJECT='project-code-helper'");
+    expect(helper).toContain('The backend enforces the Strategic-only build authority');
+  });
+
   it('generates ./check with the admin-ui viewport gate and no jsdom test command', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers({

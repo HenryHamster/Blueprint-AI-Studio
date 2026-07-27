@@ -78,6 +78,7 @@ from app.payload_schemas import (
 from app.playbook_storage import (
     _PLAYBOOK_CAPACITY_BYTES,
     _playbook_size_bytes,
+    visible_playbook_entry,
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
 )
 from app.project_message_projection import (
@@ -647,10 +648,8 @@ async def update_playbook(
         for k, v in doc.items():
             if not k.startswith("playbook/"):
                 continue
-            if isinstance(v, dict):
-                pending_source = v.get("pending_source")
-                if pending_source and pending_source != my_id:
-                    continue
+            if visible_playbook_entry(v, viewer_task_id=my_id) is None:
+                continue
             keys.append(k[len("playbook/") :])
         return {"status": "ok", "op": op, "keys": keys}
 
@@ -663,10 +662,8 @@ async def update_playbook(
         if payload.key and payload.key.strip():
             full_key = f"playbook/{payload.key.strip()}"
             v = doc.get(full_key) if doc else None
-            if isinstance(v, dict):
-                pending_source = v.get("pending_source")
-                if pending_source and pending_source != my_id:
-                    return {"status": "ok", "op": op, "entries": {}}
+            v = visible_playbook_entry(v, viewer_task_id=my_id)
+            if v is not None:
                 return {
                     "status": "ok",
                     "op": op,
@@ -685,12 +682,9 @@ async def update_playbook(
         # No specific key — return all entries (existing behavior)
         entries = {}
         for k, v in doc.items():
-            if k.startswith("playbook/") and isinstance(v, dict):
-                # Hide pending entries written by OTHER non-completed tasks —
-                # only the source task can see its own un-finalised entries.
-                # Prevents a failed task's lies from poisoning peers' prompts.
-                pending_source = v.get("pending_source")
-                if pending_source and pending_source != my_id:
+            if k.startswith("playbook/"):
+                v = visible_playbook_entry(v, viewer_task_id=my_id)
+                if v is None:
                     continue
                 short_key = k[len("playbook/") :]
                 entries[short_key] = {
@@ -723,10 +717,11 @@ async def update_playbook(
     if op == "set":
         if payload.value is None:
             raise HTTPException(status_code=400, detail="value is required for set")
-        if len(payload.value) > 2048:
+        value_size = len(payload.value.encode("utf-8"))
+        if value_size > 2048:
             raise HTTPException(
                 status_code=400,
-                detail=f"Value too large ({len(payload.value)} bytes, max 2KB)",
+                detail=f"Value too large ({value_size} bytes, max 2KB)",
             )
         if payload.applicable_types is not None:
             invalid = [
@@ -739,6 +734,14 @@ async def update_playbook(
                 )
         playbook_key = f"playbook/{key}"
         existing = doc.get(playbook_key, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        existing_pending_source = existing.get("pending_source")
+        if existing_pending_source and existing_pending_source != str(task.id):
+            raise HTTPException(
+                status_code=409,
+                detail="Another active task has a pending update for this playbook key",
+            )
         entry: dict = {
             "content": payload.value,
             "source_task_id": str(task.id),
@@ -763,6 +766,20 @@ async def update_playbook(
         # when the task ultimately fails to land the code.
         if task.status != TaskStatus.COMPLETED:
             entry["pending_source"] = str(task.id)
+            # Updating a committed entry is staged, not destructive. If this
+            # task later fails, finalization restores the prior shared truth
+            # instead of deleting the key entirely. Repeated writes by the same
+            # task retain the original committed value.
+            prior_entry = (
+                existing.get("_pending_previous")
+                if existing_pending_source == str(task.id)
+                else existing
+            )
+            if isinstance(prior_entry, dict) and prior_entry:
+                entry["_pending_previous"] = prior_entry
+        # Capacity accounting replaces this key; do not count the old value and
+        # the staged replacement simultaneously.
+        doc.pop(playbook_key, None)
         # Evict least-useful entries until there is room for the new write.
         # Loop so a single large write or an already-over-cap state self-heals.
         entry_estimate = len(_json.dumps(entry).encode())

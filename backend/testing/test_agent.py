@@ -6386,6 +6386,21 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
     assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
     assert "2KB" in resp.json()["error"]["message"]
 
+    # The documented limit is bytes, not Unicode code points.
+    multibyte_oversized_value = "é" * 1025
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "too-big-unicode",
+            "value": multibyte_oversized_value,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
+    assert "2050 bytes" in resp.json()["error"]["message"]
+
     # Total playbook limit: at capacity, new writes succeed by evicting old entries
     # rather than hard-rejecting.  Each entry ~1500 chars value; with metadata
     # overhead each row is ~1620B, so ~18 fit under 30KB before eviction kicks in.

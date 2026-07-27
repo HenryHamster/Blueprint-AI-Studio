@@ -7,6 +7,7 @@ import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
 import { writeCheckHelper } from './check-helper.js';
 import { writeDoneHelper } from './done-helper.js';
 import { writePrHelper } from './pr-helper.js';
+import { writeComputeImageHelper } from '../compute-image-helper.js';
 
 // Re-exported so callers importing writeCheckHelper from this module keep working.
 export { writeCheckHelper } from './check-helper.js';
@@ -229,6 +230,10 @@ export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
   writeDoneHelper(cfg);
   writeFailHelper(cfg);
   writeBlockedHelper(cfg);
+  const projectId = process.env.PROJECT_ID?.trim();
+  if (projectId) {
+    writeComputeImageHelper(projectId, WORKSPACE);
+  }
   excludeAgentHelpers();
 }
 

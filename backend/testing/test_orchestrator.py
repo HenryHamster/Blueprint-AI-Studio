@@ -13993,10 +13993,9 @@ async def test_container_image_only_still_holds_with_generic_docker_reason(
 
 # ---------------------------------------------------------------------------
 # Images-first USE-default on the DISPATCH path: a compute_experiment dispatched
-# WITHOUT an explicit container_image defaults to the project's digest-pinned
-# baked image (ProjectComputeImage), exactly as the completion authoring path
-# does — so operator-created experiments, planned prerequisites, and retries run
-# reproducibly on the declared image instead of image-less on the host toolchain.
+# WITHOUT an explicit container_image defaults to the project's declared image.
+# Blueprint-built images use their digest-pinned ProjectComputeImage record;
+# external runtime images launch directly without an unrelated build record.
 # ---------------------------------------------------------------------------
 
 
@@ -14089,7 +14088,10 @@ async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
         new_callable=AsyncMock,
         return_value={
             "compute": {
-                "image": {"name": "reg.example.com/org/repo/compute-proj:latest"}
+                "image": {
+                    "name": "reg.example.com/org/repo/compute-proj:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
             }
         },
     )
@@ -14143,6 +14145,75 @@ async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
         "dispatch must forward the project's digest-pinned baked image when the "
         f"payload declares none; got {captured.get('container_image')!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_uses_declared_external_image_without_build_record(
+    db_session, mocker
+):
+    """A vendor/runtime image without a build recipe launches as declared."""
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="ExternalRuntimeProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    external_image = "nvcr.io/nvidia/tensorflow:25.01-tf2-py3"
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {"image": {"name": external_image}}},
+    )
+
+    captured: dict = {}
+
+    async def _fake_create(session, task, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=uuid.uuid4(), polling_metadata={})
+
+    mocker.patch(
+        "app.compute_jobs.create_compute_job", new=AsyncMock(side_effect=_fake_create)
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched"
+    assert captured.get("container_image") == external_image
 
 
 @pytest.mark.asyncio
@@ -14242,7 +14313,7 @@ async def test_dispatch_leaves_explicit_container_image_untouched(db_session, mo
 
 # ---------------------------------------------------------------------------
 # fail-CLOSED baked-image dispatch: a compute_experiment whose project declares
-# compute.image.name must be terminal-FAILED (not run image-less) when no
+# a Blueprint build recipe must be terminal-FAILED (not run image-less) when no
 # built, digest-pinned ProjectComputeImage row exists.
 # ---------------------------------------------------------------------------
 
@@ -14251,9 +14322,9 @@ async def test_dispatch_leaves_explicit_container_image_untouched(db_session, mo
 async def test_dispatch_fails_closed_when_baked_image_declared_but_no_build_record(
     db_session, mocker
 ):
-    """A project that declares compute.image.name but has no built
-    ProjectComputeImage row must NOT run image-less — dispatch terminal-FAILs
-    the task with an honest reason and class 'baked_image_unresolvable'.
+    """A project that declares a build recipe but has no built image row must
+    NOT run image-less — dispatch terminal-FAILs with an honest reason and
+    class ``baked_image_unresolvable``.
     """
     from sqlmodel import select as _select
     from app.models import ComputeJob
@@ -14269,14 +14340,18 @@ async def test_dispatch_fails_closed_when_baked_image_declared_but_no_build_reco
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Manifest declares an image name — but NO ProjectComputeImage row has been
-    # inserted, so the strict resolver cannot produce a digest-pinned reference.
+    # Manifest declares a Blueprint build recipe — but NO ProjectComputeImage
+    # row has been inserted, so the strict resolver cannot produce a
+    # digest-pinned reference.
     mocker.patch(
         "app.routers.admin_project_tools._discover_manifest_tools",
         new_callable=AsyncMock,
         return_value={
             "compute": {
-                "image": {"name": "reg.example.com/org/repo/not-built-yet:latest"}
+                "image": {
+                    "name": "reg.example.com/org/repo/not-built-yet:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
             }
         },
     )

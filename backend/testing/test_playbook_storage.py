@@ -267,6 +267,63 @@ def test_is_auto_playbook_suppressed_respects_recent_tombstone():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_visible_playbook_entry_keeps_prior_truth_during_staged_update():
+    from app.playbook_storage import visible_playbook_entry
+
+    prior = {"content": "Committed truth", "source_task_id": "old-task"}
+    staged = {
+        "content": "Pending replacement",
+        "source_task_id": "new-task",
+        "pending_source": "new-task",
+        "_pending_previous": prior,
+    }
+
+    assert visible_playbook_entry(staged, viewer_task_id="new-task") == {
+        "content": "Pending replacement",
+        "source_task_id": "new-task",
+        "pending_source": "new-task",
+    }
+    assert visible_playbook_entry(staged, viewer_task_id="peer-task") == prior
+    assert visible_playbook_entry(
+        {
+            "content": "Brand-new pending claim",
+            "pending_source": "new-task",
+        },
+        viewer_task_id="peer-task",
+    ) is None
+
+
+def test_mutate_visible_playbook_entry_credits_prior_entry_for_peer():
+    from app.playbook_storage import mutate_visible_playbook_entry
+
+    staged = {
+        "content": "Pending replacement",
+        "pending_source": "writer-task",
+        "_pending_previous": {
+            "content": "Committed truth",
+            "reference_count": 1,
+            "confirmed_count": 2,
+        },
+    }
+
+    def credit(entry):
+        entry["reference_count"] = entry.get("reference_count", 0) + 1
+        entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
+
+    updated = mutate_visible_playbook_entry(
+        staged,
+        viewer_task_id="peer-task",
+        mutate=credit,
+    )
+
+    assert updated is not None
+    assert updated["content"] == "Pending replacement"
+    assert "reference_count" not in updated
+    assert updated["_pending_previous"]["content"] == "Committed truth"
+    assert updated["_pending_previous"]["reference_count"] == 2
+    assert updated["_pending_previous"]["confirmed_count"] == 3
+
+
 @pytest.mark.asyncio
 async def test_finalize_pending_playbook_entries_drops_on_failure(db_session):
     """A FAILED task's pending entries are removed so peers never see the lie."""
@@ -345,6 +402,47 @@ async def test_finalize_pending_playbook_entries_promotes_on_success(db_session)
         "Successful task's pending flag must be cleared"
     )
     assert entry["content"] == "Real finding from completed task"
+
+
+@pytest.mark.asyncio
+async def test_finalize_failed_pending_update_restores_prior_entry(db_session):
+    """A failed staged update must not erase the last committed shared truth."""
+    from app.playbook_learning import finalize_pending_playbook_entries
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    prior = {
+        "content": "Last committed fact",
+        "source_task_id": str(uuid.uuid4()),
+        "updated_at": _utcnow().isoformat(),
+        "confirmed_count": 2,
+    }
+    project.design_doc = {
+        "playbook/staged-update": {
+            "content": "Unshipped replacement",
+            "source_task_id": str(task.id),
+            "pending_source": str(task.id),
+            "_pending_previous": prior,
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 2,
+        },
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    n = await finalize_pending_playbook_entries(task, db_session, succeeded=False)
+    await db_session.flush()
+
+    assert n == 1
+    assert project.design_doc["playbook/staged-update"] == prior
 
 
 def test_grounding_sweep_restores_falsely_downgraded_entry(tmp_path):

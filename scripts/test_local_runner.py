@@ -1100,9 +1100,11 @@ class TestHostLoadThrottle(unittest.TestCase):
 
     def setUp(self):
         local_runner._shutdown_event.clear()
+        local_runner._update_in_progress.clear()
 
     def tearDown(self):
         local_runner._shutdown_event.clear()
+        local_runner._update_in_progress.clear()
 
     def _make_compute_deps(self):
         active_jobs: set = set()
@@ -5297,9 +5299,11 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
 
     def setUp(self):
         local_runner._shutdown_event.clear()
+        local_runner._update_in_progress.clear()
 
     def tearDown(self):
         local_runner._shutdown_event.clear()
+        local_runner._update_in_progress.clear()
 
     def test_version_hint_mismatch_logs_warning(self):
         """When version_hint differs and tasks are executing, a warning is printed."""
@@ -5343,7 +5347,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             warning_lines,
             "Expected a version mismatch warning in output",
         )
-        self.assertIn("not auto-updating", str(warning_lines))
+        self.assertIn("draining new claims", str(warning_lines))
+        self.assertTrue(local_runner._update_in_progress.is_set())
 
     def test_version_hint_match_silent(self):
         """When version_hint matches runner version, no warning is printed."""
@@ -5468,7 +5473,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             warning_lines,
             "Expected a version mismatch warning when SHA comparison fails",
         )
-        self.assertIn("not auto-updating", str(warning_lines))
+        self.assertIn("draining new claims", str(warning_lines))
+        self.assertTrue(local_runner._update_in_progress.is_set())
 
     def test_version_hint_mismatch_triggers_auto_update_when_idle(self):
         """When version_hint differs and runner is idle, auto-update is triggered."""
@@ -5526,9 +5532,12 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
     def test_noop_auto_update_keeps_healthy_runner_alive(self):
         """A no-op update must not restart-loop against a lagging server SHA."""
         output_lines = []
+        post_count = {"value": 0}
 
         def fake_post(url, token, body, **kwargs):
-            local_runner._shutdown_event.set()
+            post_count["value"] += 1
+            if post_count["value"] >= 2:
+                local_runner._shutdown_event.set()
             return 200, {
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
@@ -5552,6 +5561,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner, "_container_image_store", return_value=None), \
                  patch.object(local_runner.br, "do_update", return_value=0) as update_mock, \
                  patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
+                 patch.object(local_runner.time, "sleep", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", {}, threading.Lock(),
@@ -5562,6 +5572,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
 
         update_mock.assert_called_once()
         reexec_mock.assert_not_called()
+        self.assertFalse(local_runner._update_in_progress.is_set())
         self.assertIn(
             "continuing without restart",
             " ".join(output_lines).lower(),
@@ -5610,7 +5621,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             warning_lines,
             "Expected a warning when compute jobs are active and version differs",
         )
-        self.assertIn("not auto-updating", str(warning_lines))
+        self.assertIn("draining new claims", str(warning_lines))
+        self.assertTrue(local_runner._update_in_progress.is_set())
 
     def test_no_version_hint_no_warning(self):
         """When the response lacks version_hint, the runner never warns."""
@@ -5809,7 +5821,7 @@ class TestDockerAgentBackend(unittest.TestCase):
     # ---- plan + spawn + container tracking -----------------------------------
 
     def _spawn(self, *, backend, container_name, agent_image, agent_binary, caps,
-               task_type="research", llm_env=None):
+               task_type="research", llm_env=None, project_id="project-123"):
         active_tasks: dict = {}
         agent_started_at: dict = {}
         agent_teardown: dict = {}
@@ -5846,6 +5858,7 @@ class TestDockerAgentBackend(unittest.TestCase):
                 agent_started_at=agent_started_at,
                 agent_teardown=agent_teardown,
                 lock=threading.Lock(),
+                project_id=project_id,
                 llm_env=llm_env,
             )
         return {
@@ -5902,6 +5915,23 @@ class TestDockerAgentBackend(unittest.TestCase):
         )
         self.assertEqual(pkw["injected_env"]["PROVIDER"], "openai")
 
+    def test_task_project_id_overrides_provider_credential_env(self):
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=_bwrap_caps(),
+            project_id="authoritative-project",
+            llm_env={"PROJECT_ID": "credential-env-project"},
+        )
+
+        _, pkw = r["plan"].call_args
+        self.assertEqual(
+            pkw["injected_env"]["PROJECT_ID"],
+            "authoritative-project",
+        )
+
     def test_real_iso_interface_docker_plan_and_container_name(self):
         """Integration guard against interface drift: drive _spawn_agent_task with the
         REAL iso.decide_agent_backend + iso.plan_agent_execution (both pure) — only
@@ -5943,6 +5973,7 @@ class TestDockerAgentBackend(unittest.TestCase):
         # No image → the planner is never offered one (bwrap-only, unchanged).
         _, pkw = r["plan"].call_args
         self.assertIsNone(pkw["agent_image"])
+        self.assertEqual(pkw["injected_env"]["PROJECT_ID"], "project-123")
 
     def test_declined_task_type_not_spawned(self):
         """A write task type on a docker-only (read-only image) box declines before

@@ -24,6 +24,8 @@ vi.mock('fs', () => ({
     existsSync: vi.fn().mockReturnValue(false),
     appendFileSync: vi.fn(),
     mkdirSync: vi.fn(),
+    lstatSync: vi.fn().mockReturnValue({ isFile: () => true }),
+    rmSync: vi.fn(),
     openSync: vi.fn().mockReturnValue(3),
     closeSync: vi.fn(),
     chmodSync: vi.fn(),
@@ -72,6 +74,7 @@ vi.mock('../processTracking.js', () => ({
 // file's partial ../index.js mock. The ambient block is a guarded no-op here
 // anyway (fs is fully mocked), so these are never meaningfully exercised.
 vi.mock('../prompt.js', () => ({
+  AGENT_HELPER_NAMES: ['playbook'],
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
   writeSymbolsHelper: vi.fn(),
@@ -93,6 +96,7 @@ import {
   __setCommandExistsOverrideForSmoke,
   refreshRuntimeState,
   provisionAmbientHelpers,
+  syncAgentHelpersToPath,
 } from './runners.js';
 import { recordLlmTokens, recordToolResultBytes } from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
@@ -689,5 +693,20 @@ describe('provisionAmbientHelpers note script', () => {
     const content = (noteCall as Array<unknown>)[1] as string;
     expect(content).toContain('_json_str');
     expect(content).not.toContain('sed');
+  });
+});
+
+describe('syncAgentHelpersToPath', () => {
+  it('copies only allowlisted helpers and prepends the stable bin directory', () => {
+    const env = { PATH: '/usr/bin:/bin' };
+    const helperBin = syncAgentHelpersToPath('/tmp/ws', env);
+
+    expect(helperBin).toContain('blueprint-agent-bin-');
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining('blueprint-agent-bin-'),
+      expect.stringContaining(`playbook' "$@"`),
+      { mode: 0o755 },
+    );
+    expect(env.PATH.startsWith(helperBin)).toBe(true);
   });
 });

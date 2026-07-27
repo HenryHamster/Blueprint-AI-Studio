@@ -23,6 +23,7 @@ class TestAgentSecretManifest:
             auth_mode="oauth",
             model="claude-sonnet-4-6",
             execution_mode="advisor",
+            project_id="project-456",
         )
 
         assert manifest["env"]["PROVIDER"] == "anthropic"
@@ -31,7 +32,9 @@ class TestAgentSecretManifest:
         assert manifest["env"]["LLM_EXECUTION_MODE"] == "advisor"
         assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test"
         assert manifest["env"]["TASK_ID"] == str(task_id)
+        assert manifest["env"]["PROJECT_ID"] == "project-456"
         assert manifest["metadata"]["task_type"] == "create"
+        assert manifest["metadata"]["project_id"] == "project-456"
         # Anthropic always materializes ~/.claude.json (even without claude_config_json)
         # so the CLI doesn't stall on the onboarding dialog.
         assert len(manifest["files"]) == 1
