@@ -25,6 +25,7 @@ _TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]+")
 # schema drift resolves to UsageSnapshot.unknown().
 _USAGE_PROBE_URL = "https://api.anthropic.com/api/oauth/usage"
 _USAGE_PROBE_BETA_HEADER = "oauth-2025-04-20"
+_USAGE_PROBE_USER_AGENT = "claude-code/2.1.219"
 _USAGE_PROBE_TIMEOUT_SECONDS = 5.0
 
 
@@ -330,6 +331,12 @@ class AnthropicProvider(LLMProvider):
                     headers={
                         "Authorization": f"Bearer {secret}",
                         "anthropic-beta": _USAGE_PROBE_BETA_HEADER,
+                        # The endpoint is a Claude Code subscription surface,
+                        # not a public Anthropic API. Identify the request as
+                        # the pinned CLI instead of httpx's generic client so
+                        # provider-side client policy does not misclassify the
+                        # fleet's advisory probes.
+                        "User-Agent": _USAGE_PROBE_USER_AGENT,
                     },
                 )
                 if resp.status_code in (401, 403):

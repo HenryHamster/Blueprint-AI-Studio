@@ -415,8 +415,8 @@ class TestUsageAttemptDiagnostics:
         persisted = {
             "source": "oauth_usage_probe",
             "known": True,
-            "probed_at": (now - timedelta(minutes=20)).isoformat(),
-            "updated_at": (now - timedelta(minutes=20)).isoformat(),
+            "probed_at": (now - timedelta(minutes=60)).isoformat(),
+            "updated_at": (now - timedelta(minutes=60)).isoformat(),
             "five_hour": {"utilization": 43.0},
             "last_attempt_at": now.isoformat(),
             "last_attempt_status": "timeout",

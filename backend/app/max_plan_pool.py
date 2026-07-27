@@ -2825,19 +2825,20 @@ async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> No
 # Everything here is advisory: an unknown snapshot makes selection behave
 # exactly as it did before this feature. The reactive rate-limit cooldowns
 # (disable_account_model / _account_state_for_model) remain the backstop.
-_USAGE_SNAPSHOT_TTL_SECONDS = 300
+_USAGE_SNAPSHOT_TTL_SECONDS = 900
 # Cadence for the display-oriented usage-meter refresh (orchestrator calls
 # refresh_usage_meter_snapshots on this interval). Aligned with the selection
-# TTL above: probes run every 300 s, so the selection gate considers a snapshot
+# TTL above: probes run every 900 s, so the selection gate considers a snapshot
 # fresh for the same window to avoid treating the gap as "unknown" on every call.
-_USAGE_METER_REFRESH_INTERVAL_SECONDS = 300
+_USAGE_METER_REFRESH_INTERVAL_SECONDS = 900
 # Spread cadence-triggered probes so a pool refresh does not hit every provider
-# account in the same millisecond and manufacture avoidable 429s.
-_USAGE_METER_PROBE_STAGGER_SECONDS = 0.5
+# account in one provider-side burst and manufacture avoidable 429s. Claude's
+# subscription usage endpoint is much more tightly throttled than inference.
+_USAGE_METER_PROBE_STAGGER_SECONDS = 30.0
 # A snapshot older than this renders as "stale" on the admin meter — three
-# missed meter refreshes. The 60s selection TTL is intentionally NOT used for
-# display: with a 300s refresh cadence it would flag virtually every render.
-_USAGE_METER_DISPLAY_STALE_SECONDS = 900
+# missed meter refreshes. Keeping display freshness separate from one missed
+# probe prevents a transient provider throttle from immediately greying values.
+_USAGE_METER_DISPLAY_STALE_SECONDS = 2700
 # Neutral headroom rank for accounts whose snapshot is unknown — the midpoint of
 # the [0, 100] headroom scale, mirroring how sparse success-rate falls back to
 # 0.5. Keeps unprobed accounts from being either starved or unduly preferred.
