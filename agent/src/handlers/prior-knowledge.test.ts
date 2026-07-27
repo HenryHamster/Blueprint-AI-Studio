@@ -276,6 +276,21 @@ describe('buildPrerequisiteArtifactSection', () => {
     expect(section).toContain('signed_download_url: https://signed.example/artifact');
   });
 
+  it('names the hydrated archive and extracted contents without suggesting they be committed', () => {
+    const localPath = '.blueprint-inputs/compute-jobs/job-123';
+    const section = buildPrerequisiteArtifactSection(
+      [{ artifact_id: 'artifact-compute', artifact_type: 'COMPUTE_RESULT' }],
+      new Map([['artifact-compute', 'https://signed.example/artifact']]),
+      'task-abc',
+      new Map([['artifact-compute', localPath]]),
+    );
+    expect(section).toContain(`local_path: ${localPath}/`);
+    expect(section).toContain(`downloaded_archive: ${localPath}/bundle.tar.gz`);
+    expect(section).toContain(`extracted_contents: ${localPath}/contents/`);
+    expect(section).toContain('must not be staged or committed wholesale');
+    expect(section).not.toContain('signed_download_url:');
+  });
+
   it('embeds the concrete task-specific consumed-artifacts file path', () => {
     const section = buildPrerequisiteArtifactSection(
       [{ artifact_id: 'artifact-2', logical_key: 'my-artifact' }],

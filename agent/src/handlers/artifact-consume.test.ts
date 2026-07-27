@@ -38,6 +38,8 @@ import {
   downloadBundle,
   recordConsumedArtifacts,
   consumeAndCommitArtifacts,
+  hydrateComputeResultArtifacts,
+  computeArtifactInputPath,
   COMMITTABLE_ARTIFACT_TYPES,
 } from './artifact-consume.js';
 
@@ -143,6 +145,15 @@ describe('extractTarGzToDir', () => {
     expect(res.written).toHaveLength(2);
     expect(res.skipped).toHaveLength(3);
   });
+
+  it('bounds decompression before a compressed bomb can allocate unbounded output', () => {
+    const compressed = zlib.gzipSync(Buffer.alloc(32 * 1024, 0x41));
+    expect(() => extractTarGzToDir(compressed, tmpRepo, {
+      maxFiles: 1,
+      maxTotalBytes: 16,
+      maxEntryBytes: 16,
+    })).toThrow();
+  });
 });
 
 describe('downloadBundle', () => {
@@ -151,26 +162,66 @@ describe('downloadBundle', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       headers: { get: () => null },
-      arrayBuffer: () => Promise.resolve(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(payload);
+          controller.close();
+        },
+      }),
     }));
     const buf = await downloadBundle('https://signed.example/bundle.tar.gz');
     expect(buf?.toString('utf-8')).toBe('bundle-bytes');
   });
 
   it('returns null fail-soft on non-2xx, network error, and empty body', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, headers: { get: () => null }, arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) }));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, headers: { get: () => null }, body: null }));
     expect(await downloadBundle('https://x')).toBeNull();
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNRESET')));
     expect(await downloadBundle('https://x')).toBeNull();
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, headers: { get: () => null }, arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) }));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      body: new ReadableStream({ start(controller) { controller.close(); } }),
+    }));
     expect(await downloadBundle('https://x')).toBeNull();
   });
 
   it('refuses an over-cap content-length without reading the body', async () => {
-    const arrayBuffer = vi.fn();
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, headers: { get: () => String(200 * 1024 * 1024) }, arrayBuffer }));
+    const getReader = vi.fn();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => String(200 * 1024 * 1024) },
+      body: { getReader },
+    }));
     expect(await downloadBundle('https://x')).toBeNull();
-    expect(arrayBuffer).not.toHaveBeenCalled();
+    expect(getReader).not.toHaveBeenCalled();
+  });
+
+  it('stops a chunked response as soon as the compressed-byte cap is exceeded', async () => {
+    const chunks = [Buffer.from('1234'), Buffer.from('5678')];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      body: new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(chunk);
+          controller.close();
+        },
+      }),
+    }));
+    expect(await downloadBundle('https://x', 5)).toBeNull();
+  });
+
+  it('aborts a stalled signed-url request at the hydration deadline', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(
+      (_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          reject(new Error('aborted'));
+        });
+      }),
+    ));
+
+    expect(await downloadBundle('https://x', 1024, 5)).toBeNull();
   });
 });
 
@@ -191,11 +242,9 @@ describe('consumeAndCommitArtifacts (fetch → untar → extract → commit)', (
   it('downloads the signed URL, extracts the bundle, and git-commits citing the artifact_id', async () => {
     const gz = makeTarGz(FIXTURE_ENTRIES);
     fetchArtifactDownloadUrlMock.mockResolvedValue('https://signed.example/bundle.tar.gz');
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      headers: { get: () => null },
-      arrayBuffer: () => Promise.resolve(gz.buffer.slice(gz.byteOffset, gz.byteOffset + gz.byteLength)),
-    });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(Uint8Array.from(gz)),
+    );
     vi.stubGlobal('fetch', fetchMock);
 
     const taskId = 'consume-task-abcdef';
@@ -217,7 +266,10 @@ describe('consumeAndCommitArtifacts (fetch → untar → extract → commit)', (
 
     // Signed URL was minted via the existing helper, and the bundle fetched.
     expect(fetchArtifactDownloadUrlMock).toHaveBeenCalledWith('artifact-xyz');
-    expect(fetchMock).toHaveBeenCalledWith('https://signed.example/bundle.tar.gz');
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://signed.example/bundle.tar.gz',
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
 
     // Safe files extracted into the repo clone; traversal entry rejected.
     expect(fs.readFileSync(path.join(tmpRepo, 'committed/file.txt'), 'utf-8')).toBe('hello artifact');
@@ -281,5 +333,104 @@ describe('consumeAndCommitArtifacts (fetch → untar → extract → commit)', (
     expect(download).toHaveBeenCalledWith('https://pre.example/bundle.tar.gz');
     expect(fetchArtifactDownloadUrlMock).not.toHaveBeenCalled();
     expect(outcome.committedArtifactIds).toEqual(['artifact-pre']);
+  });
+});
+
+describe('hydrateComputeResultArtifacts', () => {
+  it('preserves the archive and extracts COMPUTE_RESULT files into the job path without git writes', async () => {
+    const gz = makeTarGz([
+      { name: 'result.json', content: '{"score":0.9}' },
+      { name: 'logs/stdout.txt', content: 'done' },
+    ]);
+    const pointer = {
+      artifact_id: 'artifact-compute-1',
+      artifact_type: 'COMPUTE_RESULT',
+      source_compute_job_id: 'job-canonical',
+      storage_uri: 'gs://bucket/compute-jobs/job-02b10b7b/artifacts/transfers/x.tar.gz',
+    };
+    const outcome = await hydrateComputeResultArtifacts({
+      repoRoot: tmpRepo,
+      pointers: [pointer],
+      signedUrls: new Map([['artifact-compute-1', 'https://signed.example/bundle']]),
+      download: vi.fn().mockResolvedValue(gz),
+      ensureIgnored: vi.fn().mockReturnValue(true),
+    });
+
+    const relative = '.blueprint-inputs/compute-jobs/job-canonical';
+    expect(computeArtifactInputPath(pointer)).toBe(relative);
+    expect(outcome.localPaths.get('artifact-compute-1')).toBe(relative);
+    expect(fs.readFileSync(path.join(tmpRepo, relative, 'bundle.tar.gz'))).toEqual(gz);
+    expect(fs.readFileSync(path.join(tmpRepo, relative, 'contents/result.json'), 'utf-8')).toBe('{"score":0.9}');
+    expect(fs.readFileSync(path.join(tmpRepo, relative, 'contents/logs/stdout.txt'), 'utf-8')).toBe('done');
+    expect(gitCalls).toHaveLength(0);
+  });
+
+  it('rejects traversal entries while keeping safe contents bounded inside the input directory', async () => {
+    const gz = makeTarGz([
+      { name: '../escape.txt', content: 'bad' },
+      { name: 'safe.txt', content: 'good' },
+      { name: 'too-large.bin', content: '0123456789' },
+    ]);
+    const outcome = await hydrateComputeResultArtifacts({
+      repoRoot: tmpRepo,
+      pointers: [{ artifact_id: 'artifact-safe', artifact_type: 'COMPUTE_RESULT' }],
+      signedUrls: new Map([['artifact-safe', 'https://signed.example/bundle']]),
+      download: vi.fn().mockResolvedValue(gz),
+      ensureIgnored: vi.fn().mockReturnValue(true),
+      limits: { maxFiles: 10, maxTotalBytes: 100, maxEntryBytes: 5 },
+    });
+
+    expect(outcome.rejectedEntries[0].entries).toContain('../escape.txt');
+    expect(fs.existsSync(path.join(tmpRepo, 'escape.txt'))).toBe(false);
+    expect(fs.readFileSync(path.join(
+      tmpRepo,
+      '.blueprint-inputs/compute-jobs/artifact-safe/contents/safe.txt',
+    ), 'utf-8')).toBe('good');
+    expect(fs.existsSync(path.join(
+      tmpRepo,
+      '.blueprint-inputs/compute-jobs/artifact-safe/contents/too-large.bin',
+    ))).toBe(false);
+  });
+
+  it('fails soft without files when ignore installation or download fails', async () => {
+    const pointer = { artifact_id: 'artifact-fail', artifact_type: 'COMPUTE_RESULT' };
+    const download = vi.fn().mockResolvedValue(null);
+    const ignoredFailure = await hydrateComputeResultArtifacts({
+      repoRoot: tmpRepo,
+      pointers: [pointer],
+      ensureIgnored: vi.fn().mockReturnValue(false),
+      download,
+    });
+    expect(ignoredFailure.localPaths.size).toBe(0);
+    expect(download).not.toHaveBeenCalled();
+
+    const downloadFailure = await hydrateComputeResultArtifacts({
+      repoRoot: tmpRepo,
+      pointers: [pointer],
+      signedUrls: new Map([['artifact-fail', 'https://signed.example/bundle']]),
+      ensureIgnored: vi.fn().mockReturnValue(true),
+      download,
+    });
+    expect(downloadFailure.localPaths.size).toBe(0);
+    expect(fs.existsSync(path.join(tmpRepo, '.blueprint-inputs'))).toBe(false);
+  });
+
+  it('refuses an existing symlink in the runtime input path', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'artifact-outside-'));
+    try {
+      fs.symlinkSync(outside, path.join(tmpRepo, '.blueprint-inputs'), 'dir');
+      const download = vi.fn().mockResolvedValue(makeTarGz([{ name: 'x', content: 'y' }]));
+      const outcome = await hydrateComputeResultArtifacts({
+        repoRoot: tmpRepo,
+        pointers: [{ artifact_id: 'artifact-link', artifact_type: 'COMPUTE_RESULT' }],
+        signedUrls: new Map([['artifact-link', 'https://signed.example/bundle']]),
+        ensureIgnored: vi.fn().mockReturnValue(true),
+        download,
+      });
+      expect(outcome.localPaths.size).toBe(0);
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

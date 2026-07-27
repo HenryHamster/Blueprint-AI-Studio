@@ -49,6 +49,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.artifact_prerequisites import (
+    ARTIFACT_PREREQUISITES_KEY,
+    compute_result_pointer_for_knowledge,
+)
 from app.broadcast import broadcast_to_project
 from app.direct_llm_client import DIRECT_LLM_MODEL
 from app.inline_llm import (
@@ -871,6 +875,20 @@ async def _deliver_knowledge_to_dependents(
         "title": normalized["title"],
         "summary": normalized["summary"],
     }
+    artifact_pointer = None
+    if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value:
+        try:
+            artifact_pointer = await compute_result_pointer_for_knowledge(
+                task, doc, session
+            )
+        except Exception:  # noqa: BLE001 — artifact delivery is best-effort
+            logger.warning(
+                "[%s] compute artifact resolution failed for document %s",
+                _kind_tag(doc.source_kind),
+                doc.id,
+                exc_info=True,
+            )
+
     touched = 0
     for dep in dependents:
         if task_id_str not in (dep.depends_on or []):
@@ -879,13 +897,35 @@ async def _deliver_knowledge_to_dependents(
         existing = ctx.get(KNOWLEDGE_PREREQUISITES_KEY)
         prereqs = list(existing) if isinstance(existing, list) else []
         # Dedupe by doc id so a re-entrant completion never stamps twice.
-        if any(
+        knowledge_present = any(
             isinstance(p, dict) and p.get("doc_id") == pointer["doc_id"]
             for p in prereqs
-        ):
+        )
+        changed = False
+        if not knowledge_present:
+            prereqs.append(pointer)
+            ctx[KNOWLEDGE_PREREQUISITES_KEY] = prereqs
+            changed = True
+
+        if artifact_pointer is not None:
+            existing_artifacts = ctx.get(ARTIFACT_PREREQUISITES_KEY)
+            artifact_prereqs = (
+                list(existing_artifacts)
+                if isinstance(existing_artifacts, list)
+                else []
+            )
+            artifact_present = any(
+                isinstance(p, dict)
+                and p.get("artifact_id") == artifact_pointer["artifact_id"]
+                for p in artifact_prereqs
+            )
+            if not artifact_present:
+                artifact_prereqs.append(artifact_pointer)
+                ctx[ARTIFACT_PREREQUISITES_KEY] = artifact_prereqs
+                changed = True
+
+        if not changed:
             continue
-        prereqs.append(pointer)
-        ctx[KNOWLEDGE_PREREQUISITES_KEY] = prereqs
         dep.context = ctx
         flag_modified(dep, "context")
         session.add(dep)

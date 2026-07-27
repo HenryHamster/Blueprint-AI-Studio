@@ -69,6 +69,7 @@ export interface PrerequisiteArtifactPointer {
   logical_key?: string;
   artifact_type?: string;
   source_task_id?: string;
+  source_compute_job_id?: string;
   storage_uri?: string;
 }
 
@@ -147,6 +148,7 @@ export function buildPrerequisiteArtifactSection(
   pointers: PrerequisiteArtifactPointer[],
   signedUrls: Map<string, string>,
   taskId: string,
+  localPaths: Map<string, string> = new Map(),
 ): string {
   if (pointers.length === 0) return '';
   const entries = pointers
@@ -156,13 +158,19 @@ export function buildPrerequisiteArtifactSection(
       const label = (p.logical_key || p.artifact_type || 'artifact').trim();
       const url = signedUrls.get(id);
       const source = p.source_task_id ? ` from task ${p.source_task_id}` : '';
-      const link = url ? `\n  signed_download_url: ${url}` : '';
-      return `- ${label} [artifact_id: ${id}]${source}${link}`;
+      const localPath = localPaths.get(id);
+      const link = url && !localPath ? `\n  signed_download_url: ${url}` : '';
+      const local = localPath
+        ? `\n  local_path: ${localPath}/\n  downloaded_archive: ${localPath}/bundle.tar.gz\n  extracted_contents: ${localPath}/contents/`
+        : '';
+      return `- ${label} [artifact_id: ${id}]${source}${local}${link}`;
     });
   if (entries.length === 0) return '';
   const consumedFile = `/tmp/consumed_artifacts_${taskId}.json`;
   return `## Commissioned Prerequisite Artifacts
 The following artifacts were produced SPECIFICALLY for this task by direct dependencies. Use the signed URL when present, cite the artifact_id(s) your work actually relies on, and only record artifact ids you truly consumed. When you finish: write ${consumedFile} as a JSON array of the artifact_id strings you actually consumed (e.g. ["id1","id2"]). If you used none, write an empty array [] to that file — do NOT omit the file, because omitting triggers a legacy fallback that over-credits all delivered artifacts as consumed.
+
+When a local_path is present, the exact downloaded archive is at downloaded_archive and a bounded, traversal-safe extracted view is at extracted_contents. Read them directly; this is an ignored runtime input and must not be staged or committed wholesale. Use the signed URL only as a fallback.
 
 ${entries.join('\n')}
 

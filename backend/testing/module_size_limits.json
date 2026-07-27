@@ -260,7 +260,7 @@
   },
   "testing": {
     "test_admin_routers.py": 22725,
-    "test_agent.py": 27332,
+    "test_agent.py": 27390,
     "test_compute.py": 7976,
     "test_research_completion.py": 23850,
     "test_strategic_completion.py": 22750,

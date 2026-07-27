@@ -24085,6 +24085,241 @@ async def test_heartbeat_image_persist_skipped_when_pool_disabled(
 # ---------------------------------------------------------------------------
 
 
+_CANONICAL_COMPUTE_ARTIFACT_URI = object()
+
+
+async def _seed_compute_artifact_download(
+    db_session,
+    *,
+    name: str,
+    storage_uri: str | None | object = _CANONICAL_COMPUTE_ARTIFACT_URI,
+    attach_artifact: bool = True,
+):
+    """Seed a producer job and an active same-project code-agent consumer."""
+    project = Project(name=name, user_id=f"user-{uuid.uuid4()}")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "compute_experiment", "experiment": "benchmark"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"vm-producer-{uuid.uuid4()}",
+    )
+    consumer = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ingest compute result"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"vm-consumer-{uuid.uuid4()}",
+    )
+    db_session.add_all([producer, consumer])
+    await db_session.commit()
+    await db_session.refresh(producer)
+    await db_session.refresh(consumer)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=producer.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    artifact = None
+    if attach_artifact:
+        if storage_uri is _CANONICAL_COMPUTE_ARTIFACT_URI:
+            storage_uri = (
+                "gs://blueprint-agent-artifacts/"
+                f"compute-jobs/{job.id}/artifacts/transfers/result.tar.gz"
+            )
+        artifact = Artifact(
+            task_id=producer.id,
+            artifact_type=ArtifactType.COMPUTE_RESULT,
+            storage_uri=storage_uri,
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+        await db_session.refresh(artifact)
+        job.artifact_id = artifact.id
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+    return project, producer, consumer, job, artifact
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_artifact_download_returns_url(
+    client: AsyncClient, db_session, mocker
+):
+    """An active task may fetch a result bundle from a same-project compute job."""
+    _project, _producer, consumer, job, _artifact = (
+        await _seed_compute_artifact_download(
+            db_session, name="Compute Artifact Job Download"
+        )
+    )
+    fake_url = "https://storage.googleapis.com/bucket/result?sig=compute"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(str(consumer.id), consumer.vm_instance_id)
+    response = await client.get(
+        f"/api/agent/compute-jobs/{job.id}/artifact/download-url",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_artifact_download_rejects_cross_project_job(
+    client: AsyncClient, db_session, mocker
+):
+    """Cross-project and nonexistent jobs are indistinguishable 404s."""
+    _project_a, _producer_a, consumer_a, _job_a, _artifact_a = (
+        await _seed_compute_artifact_download(
+            db_session, name="Compute Artifact Project A"
+        )
+    )
+    _project_b, _producer_b, _consumer_b, job_b, _artifact_b = (
+        await _seed_compute_artifact_download(
+            db_session, name="Compute Artifact Project B"
+        )
+    )
+    signer = mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value="https://should-not-be-used"),
+    )
+
+    token = create_agent_token(str(consumer_a.id), consumer_a.vm_instance_id)
+    response = await client.get(
+        f"/api/agent/compute-jobs/{job_b.id}/artifact/download-url",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 404
+    signer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attach_artifact", "storage_uri"),
+    [(False, None), (True, None)],
+    ids=["missing-artifact", "missing-storage-uri"],
+)
+async def test_agent_compute_job_artifact_download_rejects_incomplete_linkage(
+    client: AsyncClient,
+    db_session,
+    mocker,
+    attach_artifact,
+    storage_uri,
+):
+    """Missing artifact rows and storage references fail closed with 404."""
+    _project, _producer, consumer, job, _artifact = (
+        await _seed_compute_artifact_download(
+            db_session,
+            name=f"Compute Artifact Missing {attach_artifact}",
+            attach_artifact=attach_artifact,
+            storage_uri=storage_uri,
+        )
+    )
+    signer = mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value="https://should-not-be-used"),
+    )
+
+    token = create_agent_token(str(consumer.id), consumer.vm_instance_id)
+    response = await client.get(
+        f"/api/agent/compute-jobs/{job.id}/artifact/download-url",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 404
+    signer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_artifact_download_rejects_mismatched_producer(
+    client: AsyncClient, db_session, mocker
+):
+    """A corrupted job-to-artifact link cannot expose another task's artifact."""
+    project, _producer, consumer, job, _artifact = (
+        await _seed_compute_artifact_download(
+            db_session,
+            name="Compute Artifact Producer Mismatch",
+            attach_artifact=False,
+        )
+    )
+    other_producer = Task(
+        project_id=project.id,
+        payloads=[{"type": "compute_experiment", "experiment": "other"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(other_producer)
+    await db_session.commit()
+    await db_session.refresh(other_producer)
+    foreign_artifact = Artifact(
+        task_id=other_producer.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri="gs://blueprint-agent-artifacts/compute-jobs/other.tar.gz",
+    )
+    db_session.add(foreign_artifact)
+    await db_session.commit()
+    await db_session.refresh(foreign_artifact)
+    job.artifact_id = foreign_artifact.id
+    db_session.add(job)
+    await db_session.commit()
+    signer = mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value="https://should-not-be-used"),
+    )
+
+    token = create_agent_token(str(consumer.id), consumer.vm_instance_id)
+    response = await client.get(
+        f"/api/agent/compute-jobs/{job.id}/artifact/download-url",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 404
+    signer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_artifact_download_rejects_mismatched_uri_job(
+    client: AsyncClient, db_session, mocker
+):
+    """A corrupted artifact URI cannot turn the job endpoint into a signing oracle."""
+    other_job_id = uuid.uuid4()
+    _project, _producer, consumer, job, _artifact = (
+        await _seed_compute_artifact_download(
+            db_session,
+            name="Compute Artifact URI Job Mismatch",
+            storage_uri=(
+                "gs://blueprint-agent-artifacts/"
+                f"compute-jobs/{other_job_id}/artifacts/transfers/result.tar.gz"
+            ),
+        )
+    )
+    signer = mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value="https://should-not-be-used"),
+    )
+
+    token = create_agent_token(str(consumer.id), consumer.vm_instance_id)
+    response = await client.get(
+        f"/api/agent/compute-jobs/{job.id}/artifact/download-url",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 404
+    signer.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_agent_artifact_download_url_delivered_artifact_returns_url(
     client: AsyncClient, db_session, mocker

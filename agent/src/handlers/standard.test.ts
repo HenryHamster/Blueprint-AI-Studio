@@ -154,6 +154,22 @@ vi.mock('./prior-knowledge.js', async (importOriginal) => {
   };
 });
 
+vi.mock('./artifact-consume.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./artifact-consume.js')>();
+  return {
+    ...actual,
+    hydrateComputeResultArtifacts: vi.fn().mockResolvedValue({
+      localPaths: new Map(),
+      rejectedEntries: [],
+    }),
+    consumeAndCommitArtifacts: vi.fn().mockResolvedValue({
+      committedArtifactIds: [],
+      commits: [],
+      rejectedEntries: [],
+    }),
+  };
+});
+
 vi.mock('../workspacePrep.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../workspacePrep.js')>();
   return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
@@ -226,6 +242,8 @@ import { runCodeChangeTask } from './code-change.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
 import { writeDiagnosticsAfterEditHook } from '../prompts/diagnostics-after-edit-hook.js';
+import { fetchArtifactDownloadUrl } from './prior-knowledge.js';
+import { hydrateComputeResultArtifacts } from './artifact-consume.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -1643,6 +1661,73 @@ describe('commissioned artifact prerequisite injection', () => {
       expect.anything(),
       expect.anything(),
     );
+  });
+
+  it('hydrates compute results before provider launch and prompts only with fixed local paths', async () => {
+    vi.mocked(fetchArtifactDownloadUrl).mockResolvedValueOnce(
+      'https://signed.example/secret-bundle',
+    );
+    vi.mocked(hydrateComputeResultArtifacts).mockResolvedValueOnce({
+      localPaths: new Map([
+        [
+          'artifact-compute',
+          '.blueprint-inputs/compute-jobs/job-canonical',
+        ],
+      ]),
+      rejectedEntries: [],
+    });
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {
+        artifact_prerequisites: [
+          {
+            artifact_id: 'artifact-compute',
+            artifact_type: 'COMPUTE_RESULT',
+            source_task_id: 'producer-1',
+            source_compute_job_id: 'job-canonical',
+            storage_uri: (
+              'gs://blueprint-agent-artifacts/compute-jobs/job-other/'
+              + 'artifacts/transfers/bundle.tar.gz'
+            ),
+          },
+        ],
+      },
+      project_context: {},
+    };
+
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Use the compute evidence' },
+      task,
+      GH_TOKEN,
+      OWNER,
+      REPO,
+      WS,
+      STATUS_REF(),
+    );
+
+    expect(hydrateComputeResultArtifacts).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pointers: [
+          expect.objectContaining({
+            artifact_id: 'artifact-compute',
+            source_compute_job_id: 'job-canonical',
+          }),
+        ],
+      }),
+    );
+    expect(
+      vi.mocked(hydrateComputeResultArtifacts).mock.invocationCallOrder[0],
+    ).toBeLessThan(vi.mocked(runCodeChangeTask).mock.invocationCallOrder[0]);
+    const prompt = capturedPrompt();
+    expect(prompt).toContain(
+      '.blueprint-inputs/compute-jobs/job-canonical/bundle.tar.gz',
+    );
+    expect(prompt).toContain(
+      '.blueprint-inputs/compute-jobs/job-canonical/contents/',
+    );
+    expect(prompt).not.toContain('https://signed.example/secret-bundle');
   });
 });
 

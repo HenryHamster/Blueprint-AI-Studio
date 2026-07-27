@@ -9,7 +9,16 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Artifact, Task, TaskStatus
+from app import storage
+from app.models import (
+    Artifact,
+    ArtifactType,
+    ComputeJob,
+    KnowledgeDocument,
+    SourceKind,
+    Task,
+    TaskStatus,
+)
 from app.payload_schemas import read_acceptance_evidence
 
 logger = logging.getLogger(__name__)
@@ -53,6 +62,66 @@ def _artifact_pointer(artifact: Artifact, source_task_id: str) -> dict[str, Any]
     return pointer
 
 
+async def compute_result_pointer_for_knowledge(
+    task: Task,
+    doc: KnowledgeDocument,
+    session,
+) -> dict[str, Any] | None:
+    """Resolve the exact compute artifact represented by ``doc``.
+
+    A compute knowledge document and its result bundle are two views of the same
+    execution.  This helper bridges them without widening artifact access: the
+    document, job, artifact, and producing task must all agree on project and
+    producer identity.  Missing or legacy linkage is a fail-soft no-op.
+    """
+    if (
+        doc.source_kind != SourceKind.COMPUTE_EXPERIMENT.value
+        or doc.source_compute_job_id is None
+        or doc.project_id != task.project_id
+        or doc.source_task_id != task.id
+    ):
+        return None
+
+    job = (
+        (
+            await session.execute(
+                select(ComputeJob).where(
+                    ComputeJob.id == doc.source_compute_job_id,
+                    ComputeJob.project_id == task.project_id,
+                    ComputeJob.task_id == task.id,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if job is None or job.artifact_id is None:
+        return None
+
+    artifact = (
+        (
+            await session.execute(
+                select(Artifact).where(
+                    Artifact.id == job.artifact_id,
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.COMPUTE_RESULT,
+                    Artifact.storage_uri.isnot(None),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if artifact is None or not (artifact.storage_uri or "").strip():
+        return None
+    if storage.compute_job_id_for_artifact_uri(artifact.storage_uri) != job.id:
+        return None
+
+    pointer = _artifact_pointer(artifact, str(task.id))
+    pointer["source_compute_job_id"] = str(job.id)
+    return pointer
+
+
 async def backfill_artifact_prerequisites(task: Task, session) -> None:
     """Hydrate artifact_prerequisites from already-completed direct dependencies.
 
@@ -81,8 +150,23 @@ async def backfill_artifact_prerequisites(task: Task, session) -> None:
             )
         )
         artifacts = (await session.execute(artifact_query)).scalars().all()
-        if not artifacts:
-            return
+        compute_docs = (
+            (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.project_id == task.project_id,
+                        KnowledgeDocument.source_task_id.in_(
+                            [p.id for p in producers]
+                        ),
+                        KnowledgeDocument.source_kind
+                        == SourceKind.COMPUTE_EXPERIMENT.value,
+                        KnowledgeDocument.source_compute_job_id.isnot(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         ctx = dict(task.context or {})
         existing = ctx.get(ARTIFACT_PREREQUISITES_KEY)
@@ -101,6 +185,26 @@ async def backfill_artifact_prerequisites(task: Task, session) -> None:
             pointer = _artifact_pointer(artifact, str(artifact.task_id))
             prereqs.append(pointer)
             existing_ids.add(aid)
+            added += 1
+
+        # A compute result delivered through its KnowledgeDocument is canonical
+        # even when the Artifact has no plan-time logical_key. This covers the
+        # document-before-child ordering: the dependent did not exist when the
+        # producer completed, so claim-time backfill must follow the durable
+        # document -> job -> artifact identity rather than selecting every
+        # COMPUTE_RESULT row left by retries.
+        producer_by_id = {producer.id: producer for producer in producers}
+        for doc in compute_docs:
+            producer = producer_by_id.get(doc.source_task_id)
+            if producer is None:
+                continue
+            pointer = await compute_result_pointer_for_knowledge(
+                producer, doc, session
+            )
+            if pointer is None or pointer["artifact_id"] in existing_ids:
+                continue
+            prereqs.append(pointer)
+            existing_ids.add(pointer["artifact_id"])
             added += 1
 
         if added:

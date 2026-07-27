@@ -29,9 +29,21 @@ from app.compute_jobs import (
     get_compute_job_for_task,
 )
 from app.database import get_session
-from app.models import ComputeJob, ComputeJobFile, ComputeJobStatus, Task
+from app.models import (
+    Artifact,
+    ArtifactType,
+    ComputeJob,
+    ComputeJobFile,
+    ComputeJobStatus,
+    Task,
+    TaskStatus,
+)
 from app.routers.agent import verify_agent_token
-from app.schemas import redact_command_log_text, serialize_compute_job_response
+from app.schemas import (
+    ArtifactDownloadResponse,
+    redact_command_log_text,
+    serialize_compute_job_response,
+)
 from app.shared_state import limiter
 from app.task_capabilities import COMPUTE_JOB_LAUNCH_TASK_TYPES
 from app.time_utils import _utcnow
@@ -210,6 +222,79 @@ async def poll_compute_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Compute job not found")
     return {"status": "success", "data": serialize_compute_job_response(job)}
+
+
+@router.get(
+    "/compute-jobs/{job_id}/artifact/download-url",
+    response_model=ArtifactDownloadResponse,
+)
+@limiter.limit("120/minute")
+async def get_compute_job_artifact_download_url(
+    request: Request,
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Mint a signed URL for a result bundle owned by the agent's project.
+
+    This is the explicit recovery path for compute evidence discovered through
+    research context rather than a direct task dependency.  The job need not
+    belong to the requesting task, but every ownership edge is checked before
+    signing: requesting task -> project -> job -> producing task -> artifact.
+    """
+    task_id_raw = token.get("sub")
+    if not task_id_raw:
+        raise HTTPException(status_code=403, detail="Invalid token: missing sub")
+    try:
+        task_id = uuid.UUID(task_id_raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=403, detail="Invalid token: bad sub") from exc
+
+    task = await session.get(Task, task_id)
+    if task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=404, detail="Compute artifact not found")
+
+    job = (
+        (
+            await session.execute(
+                select(ComputeJob).where(
+                    ComputeJob.id == job_id,
+                    ComputeJob.project_id == task.project_id,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if job is None or job.task_id is None or job.artifact_id is None:
+        raise HTTPException(status_code=404, detail="Compute artifact not found")
+
+    artifact = (
+        (
+            await session.execute(
+                select(Artifact).where(
+                    Artifact.id == job.artifact_id,
+                    Artifact.task_id == job.task_id,
+                    Artifact.artifact_type == ArtifactType.COMPUTE_RESULT,
+                    Artifact.storage_uri.isnot(None),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if artifact is None or not (artifact.storage_uri or "").strip():
+        raise HTTPException(status_code=404, detail="Compute artifact not found")
+    if storage.compute_job_id_for_artifact_uri(artifact.storage_uri) != job.id:
+        raise HTTPException(status_code=404, detail="Compute artifact not found")
+
+    try:
+        url = await storage.generate_download_signed_url(artifact.storage_uri)
+    except storage.StorageUriError:
+        raise HTTPException(status_code=400, detail="Invalid artifact reference")  # noqa: B904
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")  # noqa: B904
+    return ArtifactDownloadResponse(url=url)
 
 
 @router.post("/compute-jobs/{job_id}/heartbeat", status_code=204)
