@@ -1041,6 +1041,7 @@ class TestAnthropicProbeUsage:
             "Bearer sk-ant-oat01-secret"
         )
         assert _FakeAsyncClient.last_headers["anthropic-beta"] == "oauth-2025-04-20"
+        assert _FakeAsyncClient.last_headers["User-Agent"] == "claude-code/2.1.219"
 
     @pytest.mark.asyncio
     async def test_http_error_resolves_to_unknown(self, monkeypatch):
@@ -1132,10 +1133,12 @@ class TestOpenAIProbeUsage:
                     "primary_window": {
                         "used_percent": 45,
                         "reset_at": 1785617248,
+                        "limit_window_seconds": 18000,
                     },
                     "secondary_window": {
                         "used_percent": 12.5,
                         "reset_at": 1786000000,
+                        "limit_window_seconds": 604800,
                     },
                 }
             }
@@ -1155,6 +1158,56 @@ class TestOpenAIProbeUsage:
             "Authorization": "Bearer codex-access-token",
             "ChatGPT-Account-ID": "account-123",
         }
+
+    @pytest.mark.asyncio
+    async def test_weekly_only_primary_window_is_not_labeled_five_hour(
+        self, monkeypatch
+    ):
+        provider = get_provider(LLMProviderName.OPENAI)
+        response = _FakeResponse(
+            json_data={
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 48,
+                        "reset_at": 1785617248,
+                        "limit_window_seconds": 604800,
+                    },
+                    "secondary_window": None,
+                }
+            }
+        )
+        _patch_httpx(monkeypatch, _FakeAsyncClient(response=response))
+
+        snap = await provider.probe_usage(
+            self._oauth_secret(), LLMAuthMode.OAUTH, {}
+        )
+
+        assert snap.known is True
+        assert snap.window_utilizations == {"seven_day": 48.0}
+        assert "five_hour" not in snap.resets_at
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_window_duration_fails_closed(self, monkeypatch):
+        provider = get_provider(LLMProviderName.OPENAI)
+        response = _FakeResponse(
+            json_data={
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 48,
+                        "reset_at": 1785617248,
+                        "limit_window_seconds": 86400,
+                    }
+                }
+            }
+        )
+        _patch_httpx(monkeypatch, _FakeAsyncClient(response=response))
+
+        snap = await provider.probe_usage(
+            self._oauth_secret(), LLMAuthMode.OAUTH, {}
+        )
+
+        assert snap.known is False
+        assert snap.probe_failure_kind == "schema"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
