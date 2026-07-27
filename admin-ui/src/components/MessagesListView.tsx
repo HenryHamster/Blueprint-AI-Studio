@@ -926,7 +926,10 @@ function ConversationVirtualList({
   const listRef = useListRef(null);
   const rowHeight = useDynamicRowHeight({ defaultRowHeight: 96 });
   const renderedRangeRef = useRef({ startIndex: -1, stopIndex: -1 });
-  const userHasScrolledRef = useRef(false);
+  const olderHistoryIntentRef = useRef(false);
+  const initialBottomAnchorRef = useRef<number | null>(null);
+  const initialBottomAnchorFrameRef = useRef<number | null>(null);
+  const initialBottomAnchoredRef = useRef(false);
   const autoLoadingOlderRef = useRef(false);
   const pendingNavigationRef = useRef<{
     index: number;
@@ -956,6 +959,11 @@ function ConversationVirtualList({
 
   useImperativeHandle(conversationListRef, () => ({
     scrollToMessage: (messageId: string) => {
+      initialBottomAnchorRef.current = null;
+      if (initialBottomAnchorFrameRef.current != null) {
+        window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
+        initialBottomAnchorFrameRef.current = null;
+      }
       const index = rows.findIndex(row => row.kind === 'message' && row.message.id === messageId);
       if (index < 0 || !listRef.current) return Promise.resolve(false);
       const rendered = renderedRangeRef.current;
@@ -1005,18 +1013,22 @@ function ConversationVirtualList({
     // retrieves the next bounded history page. The explicit top button stays
     // available for keyboard and as a fallback if scrolling is interrupted.
     if (
-      userHasScrolledRef.current
+      olderHistoryIntentRef.current
       && visible.startIndex === 0
       && rows[0]?.kind === 'load_older'
       && !loadingOlderConversationMessages
       && !autoLoadingOlderRef.current
     ) {
+      olderHistoryIntentRef.current = false;
       autoLoadingOlderRef.current = true;
       handleLoadOlder();
     }
   }, [handleLoadOlder, listRef, loadingOlderConversationMessages, rows]);
 
   useEffect(() => () => {
+    if (initialBottomAnchorFrameRef.current != null) {
+      window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
+    }
     if (!pendingNavigationRef.current) return;
     window.clearTimeout(pendingNavigationRef.current.timeout);
     pendingNavigationRef.current.resolve(false);
@@ -1031,16 +1043,74 @@ function ConversationVirtualList({
   useEffect(() => {
     const element = listRef.current?.element;
     if (!element) return;
-    const markUserScroll = () => { userHasScrolledRef.current = true; };
-    element.addEventListener('touchstart', markUserScroll, { passive: true });
-    element.addEventListener('wheel', markUserScroll, { passive: true });
-    element.addEventListener('keydown', markUserScroll);
+    let touchY: number | null = null;
+    const stopInitialAnchor = () => {
+      initialBottomAnchorRef.current = null;
+      if (initialBottomAnchorFrameRef.current != null) {
+        window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
+        initialBottomAnchorFrameRef.current = null;
+      }
+    };
+    const onWheel = (event: WheelEvent) => {
+      stopInitialAnchor();
+      olderHistoryIntentRef.current = event.deltaY < 0;
+    };
+    const onTouchStart = (event: TouchEvent) => {
+      stopInitialAnchor();
+      touchY = event.touches[0]?.clientY ?? null;
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      const nextY = event.touches[0]?.clientY ?? null;
+      if (touchY != null && nextY != null) olderHistoryIntentRef.current = nextY > touchY;
+      touchY = nextY;
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      stopInitialAnchor();
+      olderHistoryIntentRef.current = event.key === 'ArrowUp'
+        || event.key === 'PageUp'
+        || event.key === 'Home';
+    };
+    element.addEventListener('touchstart', onTouchStart, { passive: true });
+    element.addEventListener('touchmove', onTouchMove, { passive: true });
+    element.addEventListener('wheel', onWheel, { passive: true });
+    element.addEventListener('keydown', onKeyDown);
     return () => {
-      element.removeEventListener('touchstart', markUserScroll);
-      element.removeEventListener('wheel', markUserScroll);
-      element.removeEventListener('keydown', markUserScroll);
+      element.removeEventListener('touchstart', onTouchStart);
+      element.removeEventListener('touchmove', onTouchMove);
+      element.removeEventListener('wheel', onWheel);
+      element.removeEventListener('keydown', onKeyDown);
     };
   }, [listRef]);
+
+  // Dynamic markdown rows are measured after their first paint. A single
+  // scroll-to-last call can therefore use stale estimates and leave a newly
+  // opened conversation in the middle. Keep the initial viewport pinned to the
+  // latest row briefly while measurements settle, stopping immediately on any
+  // operator scroll intent.
+  useEffect(() => {
+    if (messages.length === 0) {
+      initialBottomAnchorRef.current = null;
+      initialBottomAnchoredRef.current = false;
+      return;
+    }
+    if (initialBottomAnchorRef.current != null || initialBottomAnchoredRef.current) return;
+    initialBottomAnchoredRef.current = true;
+    initialBottomAnchorRef.current = performance.now() + 500;
+    const pinToLatest = () => {
+      const until = initialBottomAnchorRef.current;
+      if (until == null || performance.now() >= until) {
+        initialBottomAnchorRef.current = null;
+        initialBottomAnchorFrameRef.current = null;
+        return;
+      }
+      const lastIndex = rows.length - 1;
+      if (lastIndex >= 0) {
+        listRef.current?.scrollToRow({ index: lastIndex, align: 'end', behavior: 'instant' });
+      }
+      initialBottomAnchorFrameRef.current = window.requestAnimationFrame(pinToLatest);
+    };
+    initialBottomAnchorFrameRef.current = window.requestAnimationFrame(pinToLatest);
+  }, [listRef, messages.length, rows.length]);
 
   useEffect(() => {
     if (!loadingOlderConversationMessages) autoLoadingOlderRef.current = false;

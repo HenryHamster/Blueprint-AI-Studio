@@ -7,8 +7,8 @@ import type { ProjectMessage } from '../types/messages';
 import { parseTimestamp } from '../utils/time';
 import { messageHasClientIdentity } from '../utils/conversationMessageIdentity';
 
-/** Mobile-first initial window: enough recent context without fetching an entire transcript. */
-export const CONVERSATION_INITIAL_WINDOW = 50;
+/** Enough recent context for either layout without fetching an entire transcript. */
+export const CONVERSATION_INITIAL_WINDOW = 30;
 
 export function compareConversationMessages(a: ProjectMessage, b: ProjectMessage): number {
   if (a.sequence != null || b.sequence != null) {
