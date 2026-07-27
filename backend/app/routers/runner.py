@@ -1399,6 +1399,7 @@ async def next_task(
 
     return {
         "task_id": str(task.id),
+        "project_id": str(task.project_id),
         "agent_token": agent_token,
         "vm_instance_id": pinned_vm_id,
         "payload": task.payloads,

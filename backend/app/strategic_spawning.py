@@ -3797,12 +3797,14 @@ def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
     nothing qualifies so the key can be omitted from the payload.
     """
     doc = project.design_doc or {}
+    from app.playbook_storage import visible_playbook_entry
+
     candidates: list[dict[str, Any]] = []
     for key, entry in doc.items():
-        if not key.startswith("playbook/") or not isinstance(entry, dict):
+        if not key.startswith("playbook/"):
             continue
-        # Skip pending entries (mid-flight writes from non-completed tasks).
-        if entry.get("pending_source"):
+        entry = visible_playbook_entry(entry)
+        if entry is None:
             continue
         source = entry.get("source") or ""
         content = entry.get("content") or ""
@@ -3846,12 +3848,14 @@ def _build_playbook_keys_index(project: Project) -> dict[str, Any] | None:
     Returns None when no playbook entries exist so the key can be omitted.
     """
     doc = project.design_doc or {}
+    from app.playbook_storage import visible_playbook_entry
+
     entries: list[dict[str, Any]] = []
     for key, entry in doc.items():
-        if not key.startswith("playbook/") or not isinstance(entry, dict):
+        if not key.startswith("playbook/"):
             continue
-        # Skip pending entries (mid-flight writes from non-completed tasks).
-        if entry.get("pending_source"):
+        entry = visible_playbook_entry(entry)
+        if entry is None:
             continue
         entries.append(
             {

@@ -6372,7 +6372,7 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
     headers = {"x-agent-token": token}
 
     # Per-entry limit: value > 2048 bytes should be rejected
-    oversized_value = "x" * 2049
+    oversized_value = "é" * 1025
     resp = await client.post(
         "/api/agent/playbook",
         json={
@@ -6384,7 +6384,7 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
         headers=headers,
     )
     assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
-    assert "2KB" in resp.json()["error"]["message"]
+    assert "2050 bytes" in resp.json()["error"]["message"]
 
     # Total playbook limit: at capacity, new writes succeed by evicting old entries
     # rather than hard-rejecting.  Each entry ~1500 chars value; with metadata

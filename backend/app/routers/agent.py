@@ -2270,16 +2270,18 @@ async def claim_task(
             if isinstance(_file_to_system.get(f), str) and _file_to_system.get(f)
         }
         _my_task_id = str(_claimed_task_id)
+        from app.playbook_storage import visible_playbook_entry
+
         for k, v in (project_for_playbook.design_doc or {}).items():
-            if k.startswith("playbook/") and isinstance(v, dict):
+            if k.startswith("playbook/"):
                 # Anti-poisoning: skip entries that are pending writes from
                 # OTHER non-completed tasks. The source task can still see
                 # its own pending entries; peers see them only after the
                 # source task COMPLETES (pending_source cleared) or skip
                 # them entirely if the source FAILED (entry removed). See
                 # main.py update_playbook for the rationale.
-                pending_source = v.get("pending_source")
-                if pending_source and pending_source != _my_task_id:
+                v = visible_playbook_entry(v, viewer_task_id=_my_task_id)
+                if v is None:
                     continue
                 applicable_types = v.get("applicable_types")
                 if applicable_types is not None:
@@ -2629,20 +2631,30 @@ async def claim_task(
                         for short_key in playbook_entries:
                             full_key = f"playbook/{short_key}"
                             if full_key in doc and isinstance(doc[full_key], dict):
-                                entry = dict(doc[full_key])
-                                entry["reference_count"] = (
-                                    entry.get("reference_count", 0) + 1
+                                from app.playbook_storage import (
+                                    mutate_visible_playbook_entry,
                                 )
-                                entry["last_referenced_at"] = now_iso
-                                outcomes = list(entry.get("recent_outcomes", []))
-                                outcomes.append(False)
-                                outcomes = outcomes[-10:]
-                                entry["recent_outcomes"] = outcomes
-                                # Auto-archive: if 10 entries and all False, mark stale
-                                if len(outcomes) >= 10 and not any(outcomes):
-                                    entry["stale"] = True
-                                    entry["effectiveness_score"] = 0.0
-                                doc[full_key] = entry
+
+                                def _record_reference(entry: dict) -> None:
+                                    entry["reference_count"] = (
+                                        entry.get("reference_count", 0) + 1
+                                    )
+                                    entry["last_referenced_at"] = now_iso
+                                    outcomes = list(entry.get("recent_outcomes", []))
+                                    outcomes.append(False)
+                                    outcomes = outcomes[-10:]
+                                    entry["recent_outcomes"] = outcomes
+                                    if len(outcomes) >= 10 and not any(outcomes):
+                                        entry["stale"] = True
+                                        entry["effectiveness_score"] = 0.0
+
+                                updated = mutate_visible_playbook_entry(
+                                    doc[full_key],
+                                    viewer_task_id=_my_task_id,
+                                    mutate=_record_reference,
+                                )
+                                if updated is not None:
+                                    doc[full_key] = updated
                         # Ground stale playbook file refs AND present-status
                         # design-doc systems/capabilities against the project's
                         # REAL integration branch (GitHub contents API) — the same

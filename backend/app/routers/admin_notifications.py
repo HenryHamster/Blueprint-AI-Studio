@@ -1762,10 +1762,11 @@ async def admin_playbook_set(
             status_code=400,
             detail="Invalid key: must match ^[a-zA-Z0-9][a-zA-Z0-9\\-]{0,49}$",
         )
-    if len(payload.value) > 2048:
+    value_size = len(payload.value.encode("utf-8"))
+    if value_size > 2048:
         raise HTTPException(
             status_code=400,
-            detail=f"Value too large ({len(payload.value)} bytes, max 2048)",
+            detail=f"Value too large ({value_size} bytes, max 2048)",
         )
     if payload.applicable_types is not None:
         invalid = [t for t in payload.applicable_types if t not in _VALID_TASK_TYPES]

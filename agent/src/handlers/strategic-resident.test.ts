@@ -92,6 +92,7 @@ vi.mock('./artifacts-helper.js', () => ({
 }));
 vi.mock('../providers/runners.js', () => ({
   provisionAmbientHelpers: vi.fn(),
+  syncAgentHelpersToPath: vi.fn(() => '/tmp/blueprint-agent-bin-test'),
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
   __resetClaudeCapabilityCacheForTesting: vi.fn(),
   probeClaudeCapabilities: vi.fn(() => null),

@@ -1087,22 +1087,25 @@ def test_hotfix_promote_current_version_function_exists():
 
 
 def test_dispatch_resolves_default_container_image_from_project():
-    """_dispatch_compute_experiment_directly calls resolve_project_default_container_image.
+    """Dispatch calls the strict project-image resolver before runner selection.
 
     Finding cb-1: the dispatch path used to forward the payload's container_image
     verbatim to create_compute_job without ever consulting ProjectComputeImage.
-    The fix wires in resolve_project_default_container_image so that image-less
-    payloads get a digest-pinned default image before runner selection.
+    The fix wires in resolve_project_baked_image_strict so image-less payloads
+    get either an explicitly declared external image or a digest-pinned
+    Blueprint-managed image before runner selection, and declared-but-unbuilt
+    managed images fail closed.
     """
     import inspect
     from app.orchestrator_runner_dispatch import _dispatch_compute_experiment_directly
 
     source = inspect.getsource(_dispatch_compute_experiment_directly)
 
-    assert "resolve_project_default_container_image" in source, (
-        "_dispatch_compute_experiment_directly must call resolve_project_default_container_image "
-        "to pin the project's declared baked image when the payload carries no container_image. "
-        "Without this, image-less payloads run unreproducibly on the host toolchain."
+    assert "resolve_project_baked_image_strict" in source, (
+        "_dispatch_compute_experiment_directly must call resolve_project_baked_image_strict "
+        "to resolve the project's declared image when the payload carries no container_image. "
+        "Without this, image-less payloads may run unreproducibly on the host toolchain and "
+        "declared-but-unbuilt managed images can silently bypass isolation."
     )
     assert "resolved_default_container_image" in source, (
         "_dispatch_compute_experiment_directly must assign the resolved default to a local "

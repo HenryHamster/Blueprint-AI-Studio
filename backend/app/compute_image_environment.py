@@ -120,9 +120,10 @@ async def resolve_project_compute_image_environment(
 ) -> dict[str, Any]:
     """Return an actionable, non-blocking image environment for *project*.
 
-    ``ready`` supplies the digest-pinned image that the normal compute launch
-    path already defaults to.  The other states are guidance only: neither a
-    missing manifest nor a failed candidate scan changes bare-compute behavior.
+    ``ready`` supplies either the declared external runtime image or the
+    digest-pinned Blueprint-built image that the normal compute launch path
+    defaults to. The other states are guidance only: neither a missing manifest
+    nor a failed candidate scan changes bare-compute behavior.
     """
     if manifest_fn is None:
         from app.routers.admin_project_tools import _discover_manifest_tools
@@ -137,6 +138,22 @@ async def resolve_project_compute_image_environment(
     manifest = await manifest_fn(project)
     compute_image = ((manifest.get("compute") or {}).get("image") or {})
     if isinstance(compute_image, dict) and compute_image.get("name"):
+        build = compute_image.get("build")
+        if not isinstance(build, dict):
+            return {
+                "state": ComputeImageEnvironmentState.READY,
+                "action": "launch",
+                "managed_build": False,
+                "container_image": compute_image["name"],
+                "manifest_image": compute_image["name"],
+                "launch_guidance": (
+                    "This is a declared external runtime image with no Blueprint "
+                    "build recipe. The platform launches it as declared; project "
+                    "setup_step/bootstrap logic remains responsible for runtime "
+                    "provisioning."
+                ),
+            }
+
         from app.compute_backends import resolve_project_baked_image_strict
 
         pinned_ref, resolution_error = await resolve_project_baked_image_strict(
@@ -146,6 +163,7 @@ async def resolve_project_compute_image_environment(
             return {
                 "state": ComputeImageEnvironmentState.READY,
                 "action": "launch",
+                "managed_build": True,
                 "container_image": pinned_ref,
                 "manifest_image": compute_image["name"],
                 "launch_guidance": (
@@ -155,25 +173,14 @@ async def resolve_project_compute_image_environment(
                 ),
             }
 
-        build = compute_image.get("build")
-        if isinstance(build, dict):
-            return {
-                "state": ComputeImageEnvironmentState.DECLARED_NEEDS_BUILD,
-                "action": "build",
-                "manifest_image": compute_image["name"],
-                "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
-                "build_recipe_identity": _build_recipe_identity(compute_image),
-                "next_step": "Run ./compute-image build, then re-check status before launching.",
-                **({"reason": resolution_error} if resolution_error else {}),
-            }
         return {
             "state": ComputeImageEnvironmentState.DECLARED_NEEDS_BUILD,
-            "action": "add_build_config",
+            "action": "build",
+            "managed_build": True,
             "manifest_image": compute_image["name"],
-            "next_step": (
-                "The image is declared but has no build recipe. Add compute.image.build "
-                "to .blueprint/tools.json before requesting a build."
-            ),
+            "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
+            "build_recipe_identity": _build_recipe_identity(compute_image),
+            "next_step": "Run compute-image build, then re-check status before launching.",
             **({"reason": resolution_error} if resolution_error else {}),
         }
 
@@ -194,7 +201,7 @@ async def resolve_project_compute_image_environment(
             },
             "next_step": (
                 "Create a project change adding this compute.image declaration to "
-                ".blueprint/tools.json; after it lands, run ./compute-image build."
+                ".blueprint/tools.json; after it lands, run compute-image build."
             ),
         }
 

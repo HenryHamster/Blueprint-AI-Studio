@@ -1,5 +1,6 @@
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 import { execFileSync, spawn } from 'child_process';
 import type WebSocket from 'ws';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
@@ -16,7 +17,13 @@ import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
   recordLlmTokens, recordProviderReportedUsage, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
-import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPostShellFn } from '../prompt.js';
+import {
+  AGENT_HELPER_NAMES,
+  writePlaybookHelper,
+  writeMessagesHelper,
+  writeSymbolsHelper,
+  retryPostShellFn,
+} from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
 import { normalizeProviderTokenUsage } from './usage.js';
 import { applyDeepSeekModelEnv, pinDeepSeekModel } from './deepseek-env.js';
@@ -1076,6 +1083,57 @@ exit $rc
   }
 }
 
+/**
+ * Mirror generated workspace helpers into a dedicated PATH directory.
+ *
+ * Root-level ``./helper`` files remain for compatibility, while bare helper
+ * names keep working after an agent changes into a repository subdirectory.
+ * Only the explicit helper allowlist is copied; arbitrary repository
+ * executables never enter PATH.
+ */
+export function syncAgentHelpersToPath(
+  workspace: string,
+  env: Record<string, string>,
+): string {
+  const taskKey = (process.env.TASK_ID || 'current').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const helperBin = path.join(os.tmpdir(), `blueprint-agent-bin-${taskKey}`);
+  // Node always provides rmSync in the supported runtime. Some focused tests
+  // intentionally install a narrow fs facade because they exercise provider
+  // streaming rather than filesystem behavior. Allow that facade only when it
+  // proves there is no stale helper directory to clear; otherwise fail closed
+  // rather than leaving wrappers from an earlier task on PATH.
+  if (typeof fs.rmSync === 'function') {
+    fs.rmSync(helperBin, { recursive: true, force: true });
+  } else if (fs.existsSync(helperBin)) {
+    throw new Error(
+      `Cannot safely reset agent helper PATH directory without fs.rmSync: ${helperBin}`,
+    );
+  }
+  fs.mkdirSync(helperBin, { recursive: true, mode: 0o700 });
+  for (const name of AGENT_HELPER_NAMES) {
+    const source = path.join(workspace, name);
+    const target = path.join(helperBin, name);
+    try {
+      const stat = fs.lstatSync(source);
+      if (!stat.isFile()) continue;
+      const quotedSource = `'${source.replace(/'/g, `'\"'\"'`)}'`;
+      // A wrapper preserves script-relative workspace behavior. Copying helper
+      // bytes would break helpers such as `artifacts`, which intentionally
+      // locate .blueprint-inputs relative to their own workspace path.
+      fs.writeFileSync(
+        target,
+        `#!/bin/sh\nexec ${quotedSource} "$@"\n`,
+        { mode: 0o755 },
+      );
+    } catch {
+      // A helper not provisioned for this task type is intentionally absent.
+    }
+  }
+  const currentPath = env.PATH || '/usr/local/bin:/usr/bin:/bin';
+  env.PATH = `${helperBin}${path.delimiter}${currentPath}`;
+  return helperBin;
+}
+
 export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
@@ -1236,6 +1294,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // every model task may use regardless of handler. Self-guarding and
   // idempotent — see provisionAmbientHelpers.
   provisionAmbientHelpers(process.env.TASK_ID || '', WORKSPACE);
+  syncAgentHelpersToPath(WORKSPACE, runCommand.env);
 
   const exitCode = await new Promise<number>((resolve) => {
     let promptFile = '';

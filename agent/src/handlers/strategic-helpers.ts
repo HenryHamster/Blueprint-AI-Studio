@@ -6,6 +6,7 @@ import { boundedRegularReadShellFn, excludeAgentHelpers, writeDesignDocHelper, s
 import { extractJsonObject } from '../json-extract.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
+import { writeComputeImageHelper } from '../compute-image-helper.js';
 import { cliOpInput, cliOps } from './strategic-ops-registry.js';
 
 // Strategic shell-helper generators
@@ -523,57 +524,6 @@ export function writeFetchHelper(
   const fetchScript = generateFetchScript(projectId, opts.verbs);
   fs.writeFileSync(`${workspace}/fetch`, fetchScript, { mode: 0o755 });
   excludeAgentHelpers();
-}
-
-function generateComputeImageScript(projectIdRaw: string): string {
-  const projectId = shellEscapeDoubleQuoted(projectIdRaw);
-  return `#!/bin/bash
-# Project compute-image environment resolver.  Status is read-only; build is a
-# Strategic-only, manifest-declared action that reuses the platform's digest
-# build pipeline.  It intentionally accepts no arbitrary image/build arguments.
-OP="\${1:?Usage: compute-image status|build. Run status first; CPU-only experiments do not need a compute image.}"
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-${agentTokenShellFn()}
-_load_agent_token || exit 1
-PROJECT="${projectId}"
-[ -n "$PROJECT" ] || { echo "[ERROR] no project_id available" >&2; exit 1; }
-
-case "$OP" in
-  status)
-    response=$(curl -sS --max-time 30 --connect-timeout 10 \\
-      -X GET "$API/api/agent/projects/$PROJECT/compute-environment" \\
-      -H "X-Agent-Token: $TOKEN" -w '\\n%{http_code}')
-    ;;
-  build)
-    # The request returns accepted/reused promptly and shares the platform's
-    # single-builder guard. Do not poll or retry from this resident turn.
-    # Re-check status only in a later turn.
-    response=$(curl -sS --max-time 30 --connect-timeout 10 \\
-      -X POST "$API/api/agent/projects/$PROJECT/compute-image/build" \\
-      -H "X-Agent-Token: $TOKEN" -w '\\n%{http_code}')
-    ;;
-  *) echo "Usage: compute-image status|build. Run status first; omit accelerator/container_image for CPU-only work." >&2; exit 1 ;;
-esac
-
-http_code=$(printf '%s' "$response" | tail -n1)
-body=$(printf '%s' "$response" | head -n -1)
-if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-  printf '%s\\n' "$body"
-  exit 0
-fi
-printf '%s\\n' "$body" >&2
-echo "[ERROR] compute-image $OP failed (HTTP $http_code)" >&2
-echo "[HINT] Inspect the structured error above. CPU-only jobs can omit accelerator and container_image; GPU jobs should use the candidate Dockerfile/manifest entry returned by status." >&2
-exit 1
-`;
-}
-
-function writeComputeImageHelper(projectId: string, workspace: string): void {
-  fs.writeFileSync(
-    `${workspace}/compute-image`,
-    generateComputeImageScript(projectId),
-    { mode: 0o755 },
-  );
 }
 
 // Render a short prompt block telling the agent the read-only ./fetch helper

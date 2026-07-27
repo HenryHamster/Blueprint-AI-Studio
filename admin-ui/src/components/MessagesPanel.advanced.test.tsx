@@ -1194,7 +1194,9 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     );
     await waitFor(() => expect((view.container.querySelector('textarea') as HTMLTextAreaElement).value)
       .toBe(payload.content));
-    fireEvent.click(view.container.querySelector('button[aria-label="Retry message"]') as HTMLButtonElement);
+    const retryButton = view.container.querySelector('button[aria-label="Retry message"]') as HTMLButtonElement;
+    await waitFor(() => expect(retryButton.disabled).toBe(false));
+    fireEvent.click(retryButton);
     await waitFor(() => expect(posted).not.toBeNull());
     expect(posted).toEqual(payload);
   });

@@ -112,7 +112,9 @@ describe.skipIf(!SUPPORTS_EXEC_BIT)('per-handler prompt/helper provisioning pari
   // by these read-only handlers. A read-only handler that references one in
   // passing is not a contract breach, so they are exempt from the on-disk
   // requirement here. (The global allowlist test above still pins their spelling.)
-  const LIFECYCLE_EXEMPT = new Set(['check', 'pr', 'done', 'fail', 'blocked']);
+  const LIFECYCLE_EXEMPT = new Set([
+    'check', 'pr', 'done', 'fail', 'blocked', 'compute-image',
+  ]);
 
   // Collect the ./<helper> tokens (restricted to real helper names) in a blob.
   const helperTokensIn = (text: string): Set<string> => {

@@ -2379,6 +2379,7 @@ class TestRunnerEndpoints:
             assert resp.status_code == 200
             body = resp.json()
             assert body["task_id"] == str(task.id)
+            assert body["project_id"] == str(project.id)
             assert body["task_type"] == "create"
             assert body["agent_token"]
             assert body["vm_instance_id"] == f"runner:{runner.id}"

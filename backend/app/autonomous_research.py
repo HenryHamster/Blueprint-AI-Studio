@@ -2358,10 +2358,12 @@ async def _spawn_research_task_inner(
         # Skip pending_source entries — those are mid-flight writes whose
         # source task hasn't completed yet. See main.py update_playbook for
         # the anti-poisoning rationale.
+        from app.playbook_storage import visible_playbook_entry
+
         playbook_keys = [
             k[len("playbook/"):]
             for k, v in doc.items()
-            if k.startswith("playbook/") and isinstance(v, dict) and not v.get("pending_source")
+            if k.startswith("playbook/") and visible_playbook_entry(v) is not None
         ]
         if playbook_keys:
             design_doc_summary["_playbook_keys"] = playbook_keys

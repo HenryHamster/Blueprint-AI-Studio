@@ -415,7 +415,9 @@ async def _apply_agent_compute_image_build_state(
 
     state_name = environment.get("state")
     if state_name == ComputeImageEnvironmentState.READY:
-        environment["build_status"] = "ready"
+        environment["build_status"] = (
+            "ready" if environment.get("managed_build") is True else "not_applicable"
+        )
         return
     is_buildable = (
         state_name == ComputeImageEnvironmentState.DECLARED_NEEDS_BUILD
@@ -814,7 +816,10 @@ async def agent_build_project_compute_image(
     environment = await resolve_project_compute_image_environment(
         session, project, manifest_fn=fresh_manifest
     )
-    if environment.get("state") == ComputeImageEnvironmentState.READY:
+    if (
+        environment.get("state") == ComputeImageEnvironmentState.READY
+        and environment.get("managed_build") is True
+    ):
         return {
             "status": "success",
             "build": {"status": "already_ready"},
@@ -1017,12 +1022,11 @@ async def agent_fetch_playbook_entry(
     entry = design_doc.get(full_key)
     if entry is None:
         raise HTTPException(status_code=404, detail="Playbook entry not found")
-    # Enforce pending_source visibility: hide entries written by other in-flight
-    # tasks (same rule as claim-time loader and /api/agent/playbook get/list).
-    if isinstance(entry, dict):
-        pending_source = entry.get("pending_source")
-        if pending_source and pending_source != my_task_id:
-            raise HTTPException(status_code=404, detail="Playbook entry not found")
+    from app.playbook_storage import visible_playbook_entry
+
+    entry = visible_playbook_entry(entry, viewer_task_id=my_task_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Playbook entry not found")
     return {"status": "success", "data": {"key": full_key, "entry": entry}}
 
 

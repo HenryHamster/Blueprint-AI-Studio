@@ -20,6 +20,7 @@ import {
   portfolioOperationFingerprint,
 } from './strategic-helpers.js';
 import { VmConfigMissingError, provisionAmbientHelpers } from '../providers/runners.js';
+import { generateComputeImageScript } from '../compute-image-helper.js';
 import {
   writePlaybookHelper,
   writeMessagesHelper,
@@ -63,6 +64,13 @@ describe('writeStrategicHelpers', () => {
     expect(script).toContain('curl -sS --max-time 30 --connect-timeout 10');
     expect(script).not.toContain('--max-time 5500');
     expect(script).toContain('Do not poll or retry from this resident turn.');
+  });
+
+  it('single-quotes project ids without activating shell substitutions', () => {
+    const script = generateComputeImageScript("project'$(touch /tmp/pwn)");
+
+    expect(script).toContain(`PROJECT='project'"'"'$(touch /tmp/pwn)'`);
+    expect(script).not.toContain(`PROJECT='project'$(touch /tmp/pwn)`);
   });
 
   it('writes scripts with executable permissions', () => {
@@ -1532,6 +1540,8 @@ describe('shared _post_with_retry retry logic across all write helpers', () => {
     writePlaybookHelper('t-retry', ws);
     const script = fs.readFileSync(`${ws}/playbook`, 'utf-8');
     assertRetryPresent(script, 'playbook');
+    expect(script).toContain('maximum is 2048 bytes (2KB)');
+    expect(script).toContain('VALUE_BYTES=$(printf');
     // The set write op routes through the shared retry wrapper.
     expect(script).toContain('_post_with_retry "$API/api/agent/playbook" "playbook set"');
     // Read ops (get/list) remain fail-fast (no retry wrapper).

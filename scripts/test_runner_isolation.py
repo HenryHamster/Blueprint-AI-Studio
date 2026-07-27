@@ -1051,6 +1051,53 @@ class TestComputePlan(unittest.TestCase):
         # Client env carries the inner vars for `-e` forwarding but NOT the token.
         self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", plan.env)
 
+    def test_docker_clone_honors_nested_cwd(self):
+        plan = self._common(
+            caps=_caps(docker_usable=True),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            clone_dir_host="/tmp/bp_x/repo",
+            cwd_host="/tmp/bp_x/repo/DEN",
+        )
+
+        self.assertEqual(plan.argv[plan.argv.index("-w") + 1], "/workspace/DEN")
+
+    def test_docker_clone_allows_directory_name_starting_with_dotdot(self):
+        plan = self._common(
+            caps=_caps(docker_usable=True),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            clone_dir_host="/tmp/bp_x/repo",
+            cwd_host="/tmp/bp_x/repo/..cache",
+        )
+
+        self.assertEqual(
+            plan.argv[plan.argv.index("-w") + 1],
+            "/workspace/..cache",
+        )
+
+    def test_apptainer_clone_honors_nested_cwd(self):
+        plan = self._common(
+            caps=_caps(apptainer_path="/usr/bin/apptainer"),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            clone_dir_host="/tmp/bp_x/repo",
+            cwd_host="/tmp/bp_x/repo/DEN",
+        )
+
+        self.assertEqual(
+            plan.argv[plan.argv.index("--pwd") + 1],
+            "/workspace/repo/DEN",
+        )
+
+    def test_bwrap_clone_honors_nested_cwd(self):
+        plan = self._common(
+            clone_dir_host="/tmp/bp_x/repo",
+            cwd_host="/tmp/bp_x/repo/DEN",
+        )
+
+        self.assertEqual(
+            plan.argv[plan.argv.index("--chdir") + 1],
+            "/workspace/repo/DEN",
+        )
+
     def test_docker_cdi_daemon_gets_cdi_device_flags(self):
         plan = self._common(
             caps=_caps(docker_usable=True, docker_cdi_gpu=True, gpu_indices=(0, 1)),

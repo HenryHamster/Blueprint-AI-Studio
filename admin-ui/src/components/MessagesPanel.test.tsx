@@ -10,6 +10,7 @@ import {
   loadQueuedResidentToolHandoffs,
 } from '../utils/residentToolHandoff';
 import { saveComposerDraft } from '../utils/conversationDraftState';
+import { CONVERSATION_INITIAL_WINDOW } from '../hooks/useConversation';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -467,7 +468,9 @@ describe('MessagesPanel chrome modes', () => {
     const conversationRequests = vi.mocked(apiFetch).mock.calls
       .map(call => String(call[0]))
       .filter(url => url.includes('/strategic-conversation'));
-    expect(conversationRequests.some(url => url.includes('limit=50'))).toBe(true);
+    expect(conversationRequests.some(
+      url => url.includes(`limit=${CONVERSATION_INITIAL_WINDOW}`),
+    )).toBe(true);
   });
 
   test('opens a durable tool handoff as an exact conversation draft', async () => {

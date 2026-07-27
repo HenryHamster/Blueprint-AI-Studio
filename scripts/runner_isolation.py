@@ -1735,7 +1735,7 @@ def _rel_to_sandbox(host_path: str | None, workspace_host: str, mount: str) -> s
     if not host_path:
         return None
     rel = os.path.relpath(host_path, workspace_host)
-    if rel.startswith(".."):
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
         return host_path  # not under the workspace bind; leave as-is
     return mount if rel == "." else f"{mount}/{rel.replace(os.sep, '/')}"
 
@@ -1806,7 +1806,11 @@ def plan_compute_execution(
         inner.update({k: str(v) for k, v in job_env.items()})
         for forbidden in FORBIDDEN_ENV_KEYS:
             inner.pop(forbidden, None)
-        cwd_in = "/workspace" if clone_dir_host else cwd_host
+        cwd_in = (
+            _rel_to_sandbox(cwd_host, clone_dir_host, "/workspace")
+            if clone_dir_host and cwd_host
+            else ("/workspace" if clone_dir_host else cwd_host)
+        )
         argv = build_docker_argv(
             image=image or "",
             command=command,
@@ -1863,7 +1867,11 @@ def plan_compute_execution(
         inner.update({k: str(v) for k, v in job_env.items()})
         for forbidden in FORBIDDEN_ENV_KEYS:
             inner.pop(forbidden, None)
-        cwd_in = clone_in or "/workspace"
+        cwd_in = (
+            _rel_to_sandbox(cwd_host, workspace_host, "/workspace")
+            if cwd_host
+            else (clone_in or "/workspace")
+        )
         argv = build_apptainer_argv(
             apptainer_path=caps.apptainer_path,
             image=image or "",
@@ -1924,8 +1932,10 @@ def plan_compute_execution(
                 if not _covered_by(lib, ("/usr", "/lib", "/lib64", "/lib32"))
             ]
     env = build_compute_env(job_env, injected, source_env)
-    cwd_in = clone_in or (
-        _rel_to_sandbox(cwd_host, workspace_host, SANDBOX_WORKSPACE) if cwd_host else SANDBOX_WORKSPACE
+    cwd_in = (
+        _rel_to_sandbox(cwd_host, workspace_host, SANDBOX_WORKSPACE)
+        if cwd_host
+        else (clone_in or SANDBOX_WORKSPACE)
     )
     argv = build_bwrap_argv(
         bwrap_path=caps.bwrap_path,

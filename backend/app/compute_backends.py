@@ -5036,20 +5036,19 @@ async def resolve_project_default_container_image(
     session: Any,
     project: Any,
 ) -> str | None:
-    """Resolve a project's default baked compute image to a digest-pinned ref.
+    """Resolve a project's declared default compute image.
 
-    The SINGLE shared implementation of the manifest-fetch + digest-pin idiom
-    used to default a ``compute_experiment``'s ``container_image`` to the
-    project's declared baked image. Both the completion authors
+    The SINGLE shared implementation used to default a ``compute_experiment``'s
+    ``container_image`` to the project's declared image. Both completion authors
     (``plan_completion`` / ``research_completion``) and the orchestrator dispatch
-    path (``_dispatch_compute_experiment_directly``) call this so the two cannot
-    drift — a compute_experiment gets the same digest-pinned default whether it
-    is authored through a completion handler or dispatched directly (operator
-    experiment, planned prerequisite, retry).
+    path consult the same manifest contract: external runtime images without a
+    build recipe are preserved verbatim, while Blueprint-built images are pinned
+    to their durable build digest.
 
-    Reads the project's ``.blueprint/tools.json`` ``compute.image.name`` manifest
-    entry and, when present, pins the (typically mutable) tag to a
-    content-addressed ``registry/repo@sha256:...`` reference via
+    Reads the project's ``.blueprint/tools.json`` ``compute.image`` manifest
+    entry. A buildless external image is returned verbatim; a Blueprint build
+    recipe pins its typically mutable tag to a content-addressed
+    ``registry/repo@sha256:...`` reference via
     :func:`resolve_digest_pinned_default_image`.
 
     Fail-OPEN and additive: returns ``None`` when the project is missing, its
@@ -5065,6 +5064,8 @@ async def resolve_project_default_container_image(
         name = compute_image.get("name") if isinstance(compute_image, dict) else None
         if not name:
             return None
+        if not isinstance(compute_image.get("build"), dict):
+            return str(name)
         # resolve_digest_pinned_default_image is idempotent (already-digest-pinned
         # refs return unchanged), so double-resolution across authoring + dispatch
         # is safe.
@@ -5084,17 +5085,19 @@ async def resolve_project_baked_image_strict(
 ) -> tuple[str | None, str | None]:
     """Resolve a project's declared baked compute image — fail CLOSED on unresolvable.
 
-    Returns ``(pinned_ref, None)`` when the project's manifest declares
-    ``compute.image.name`` AND a ``ProjectComputeImage`` row exists with
-    ``built=True`` and a non-null ``digest``.
+    Returns ``(image_ref, None)`` when the project's manifest declares an
+    external runtime image without ``compute.image.build``. External images are
+    intentionally provisioned at job start and do not have a Blueprint build
+    record. When ``build`` is declared, returns a digest-pinned reference only
+    when a ``ProjectComputeImage`` row exists with ``built=True`` and a digest.
 
     Returns ``(None, None)`` when the project genuinely declares NO baked image
     (no manifest at all, no ``compute.image.name`` key, OR a transient manifest
     failure on a project with zero ``ProjectComputeImage`` history) — the caller
     must preserve image-less behavior, identical to today.
 
-    Returns ``(None, reason)`` when the project declares a baked image name but
-    no resolved, digest-pinned build record can be found — OR when a transient
+    Returns ``(None, reason)`` when the project declares a Blueprint build recipe
+    but no resolved, digest-pinned build record can be found — OR when a transient
     manifest-fetch failure occurs on a project that HAS ``ProjectComputeImage``
     rows (i.e., previously declared and built a baked image). The caller MUST
     terminal-fail the dispatch with the returned reason rather than silently
@@ -5154,7 +5157,16 @@ async def resolve_project_baked_image_strict(
         )
         return None, None
 
-    # Image is declared — resolve to a built, digest-pinned record or fail closed.
+    # A declared image without a build recipe is an external runtime image, not
+    # a Blueprint-baked image. Preserve that explicit contract as-is; projects
+    # commonly provision dependencies in setup_step against a vendor base image.
+    # Requiring a ProjectComputeImage row here makes those valid manifests
+    # impossible to launch and contradicts the explicit-container-image path.
+    if not isinstance(compute_image.get("build"), dict):
+        return str(name), None
+
+    # Blueprint build recipe declared — resolve to a built, digest-pinned record
+    # or fail closed.
     if "@sha256:" in name:
         # Already content-addressed; accept as-is (no build record needed).
         return name, None

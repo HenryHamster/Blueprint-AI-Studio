@@ -91,7 +91,12 @@ async def test_resolver_returns_digest_pinned_ready_image(monkeypatch):
 
     async def manifest(_project: Project) -> dict:
         return {
-            "compute": {"image": {"name": "registry.example/project:latest"}},
+            "compute": {
+                "image": {
+                    "name": "registry.example/project:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
+            },
             "error": None,
         }
 
@@ -111,6 +116,43 @@ async def test_resolver_returns_digest_pinned_ready_image(monkeypatch):
 
     assert result["state"] == ComputeImageEnvironmentState.READY
     assert result["container_image"] == pinned
+    assert result["managed_build"] is True
+
+
+@pytest.mark.asyncio
+async def test_resolver_returns_declared_external_image_without_requesting_build(
+    monkeypatch,
+):
+    project = _project()
+    image = "nvcr.io/nvidia/tensorflow:25.01-tf2-py3"
+
+    async def manifest(_project: Project) -> dict:
+        return {
+            "compute": {"image": {"name": image}},
+            "error": None,
+        }
+
+    from app import compute_backends
+
+    async def strict_resolver_must_not_run(*_args, **_kwargs):
+        raise AssertionError("external image status must not query build records")
+
+    monkeypatch.setattr(
+        compute_backends,
+        "resolve_project_baked_image_strict",
+        strict_resolver_must_not_run,
+    )
+    result = await resolve_project_compute_image_environment(
+        object(),  # type: ignore[arg-type]
+        project,
+        manifest_fn=manifest,
+    )
+
+    assert result["state"] == ComputeImageEnvironmentState.READY
+    assert result["action"] == "launch"
+    assert result["managed_build"] is False
+    assert result["container_image"] == image
+    assert "external runtime image" in result["launch_guidance"]
 
 
 @pytest.mark.asyncio
@@ -152,7 +194,7 @@ async def test_agent_compute_environment_is_project_scoped(client: AsyncClient, 
     project = _project()
     db_session.add(project)
     await db_session.commit()
-    task = Task(project_id=project.id, payloads=[{"type": "strategic_review"}], vm_instance_id="env-agent")
+    task = Task(project_id=project.id, payloads=[{"type": "fix"}], vm_instance_id="env-agent")
     db_session.add(task)
     await db_session.commit()
 
@@ -162,7 +204,7 @@ async def test_agent_compute_environment_is_project_scoped(client: AsyncClient, 
     from app import compute_image_environment
 
     monkeypatch.setattr(compute_image_environment, "resolve_project_compute_image_environment", fake_resolver)
-    token = create_agent_token(str(task.id), "env-agent", task_type="strategic_review")
+    token = create_agent_token(str(task.id), "env-agent", task_type="fix")
     response = await client.get(
         f"/api/agent/projects/{project.id}/compute-environment",
         headers={"x-agent-token": token},
@@ -796,6 +838,50 @@ async def test_agent_compute_image_build_rejects_non_strategic_task(client: Asyn
     )
 
     assert response.status_code == 403, response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_image_build_rejects_external_runtime_image(
+    client: AsyncClient, db_session, monkeypatch
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="env-strategic-external",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    async def fake_resolver(*_args, **_kwargs):
+        return {
+            "state": ComputeImageEnvironmentState.READY,
+            "action": "launch",
+            "managed_build": False,
+            "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        }
+
+    from app import compute_image_environment
+
+    monkeypatch.setattr(
+        compute_image_environment,
+        "resolve_project_compute_image_environment",
+        fake_resolver,
+    )
+    token = create_agent_token(
+        str(task.id),
+        "env-strategic-external",
+        task_type="strategic_review",
+    )
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/compute-image/build",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 422, response.text
+    assert "compute.image.build recipe" in response.json()["error"]["message"]
 
 
 @pytest.mark.asyncio

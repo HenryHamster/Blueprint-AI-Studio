@@ -3777,11 +3777,24 @@ async def update_agent_status(
                                     f"playbook/{k}"
                                     for k in (_ctx.get("_shown_playbook_keys") or [])
                                 }
+                                from app.playbook_storage import (
+                                    mutate_visible_playbook_entry,
+                                    visible_playbook_entry,
+                                )
+
                                 for _pk, _pv in list(_doc.items()):
                                     if _pk.startswith("playbook/") and isinstance(
                                         _pv, dict
                                     ):
-                                        _applicable = _pv.get("applicable_types")
+                                        _visible_entry = visible_playbook_entry(
+                                            _pv,
+                                            viewer_task_id=_task_id_str,
+                                        )
+                                        if _visible_entry is None:
+                                            continue
+                                        _applicable = _visible_entry.get(
+                                            "applicable_types"
+                                        )
                                         if _applicable is not None:
                                             if _task_type not in _applicable:
                                                 continue
@@ -3790,13 +3803,12 @@ async def update_agent_status(
                                         # Only credit entries that were actually shown to this task
                                         if _pk not in _shown_keys:
                                             continue
-                                        _entry = dict(_pv)
-                                        _entry["confirmed_count"] = (
-                                            _entry.get("confirmed_count", 0) + 1
-                                        )
-                                        _entry["last_confirmed_at"] = _now_iso
-                                        # Update rolling recent_outcomes for entries shown to this task
-                                        if _pk in _shown_keys:
+
+                                        def _record_confirmation(_entry: dict) -> None:
+                                            _entry["confirmed_count"] = (
+                                                _entry.get("confirmed_count", 0) + 1
+                                            )
+                                            _entry["last_confirmed_at"] = _now_iso
                                             _recent = list(
                                                 _entry.get("recent_outcomes", [])
                                             )
@@ -3819,8 +3831,15 @@ async def update_agent_status(
                                                 _entry["effectiveness_score"] = round(
                                                     _conf / max(_ref, 1), 4
                                                 )
-                                        _doc[_pk] = _entry
-                                        _confirmed_changed = True
+
+                                        _updated = mutate_visible_playbook_entry(
+                                            _pv,
+                                            viewer_task_id=_task_id_str,
+                                            mutate=_record_confirmation,
+                                        )
+                                        if _updated is not None:
+                                            _doc[_pk] = _updated
+                                            _confirmed_changed = True
                                 if _confirmed_changed:
                                     _proj_locked.design_doc = _doc
                                     flag_modified(_proj_locked, "design_doc")

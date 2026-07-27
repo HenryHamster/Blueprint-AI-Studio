@@ -333,7 +333,7 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   return hints;
 }
 
-export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER) or ./messages send --stdin for quote-safe multiline text.';
+export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Workspace helpers are also on PATH: after changing into a subdirectory, use bare names such as `playbook`, `messages`, or `symbols` instead of a root-relative helper path. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER) or ./messages send --stdin for quote-safe multiline text.';
 
 // Shared parenthetical for every read-only handler that instructs the agent to
 // write a /tmp output file. The Write/Edit tools are stripped for read-only
@@ -828,6 +828,11 @@ if [ "$OP" = "get" ]; then
   fi
 elif [ "$OP" = "set" ]; then
   [ -z "$KEY" ] || [ -z "$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
+  VALUE_BYTES=$(printf '%s' "$VALUE" | wc -c | tr -d '[:space:]')
+  [ "$VALUE_BYTES" -le 2048 ] || {
+    echo "Error: playbook content is $VALUE_BYTES bytes; maximum is 2048 bytes (2KB). Shorten it before retrying." >&2
+    exit 1
+  }
   # Capture branch/HEAD provenance at write time so the backend can stamp it on
   # the entry. Absent (non-git workspace) => omitted => backend keeps it legacy.
   BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
@@ -1387,10 +1392,9 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
 `;
 
 export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`, commits
-  changes, pushes branch, creates PR. Writes /tmp/pr_url_<task_id> on success.
-  Pass \`--with-tests\` to run \`./check test\` instead. **Exit 4 = conflicts.**
-  Rebase onto origin/<base>, resolve via Edit or \`git checkout --theirs\`,
-  \`./check\`, then \`./pr open\` again. If unresolved after ~2 attempts, \`./blocked\`.
+  and pushes changes, opens the PR, and records its URL. \`--with-tests\` runs
+  \`./check test\`. **Exit 4 = conflicts:** rebase on origin/<base>, resolve,
+  re-check and reopen; after ~2 failed attempts, \`./blocked\`.
 - \`./done\` — marks COMPLETED with the PR URL. Requires \`./pr open\` first.
   - \`./done --already-done "<reason>"\` — Deliverable EXISTS on base branch.
     Reason MUST name concrete artifact (≥30 chars), e.g.
@@ -1406,6 +1410,7 @@ export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --bod
   run cheapest faithful checks, \`./pr open\`, \`./done\`; CI is authoritative.
   A real assertion/lint/build/test failure still blocks publication and must be fixed.
 - \`./blocked "<reason>"\` — Only when no code edit can fix it; routes to strategic.
+- \`compute-image status\` — diagnose compute images; \`build\` is Strategic-only.
 
 Exit: edit -> ./check -> ./pr open -> ./done
 
@@ -1569,11 +1574,11 @@ export const CODE_CHANGE_HELPER_GUIDANCE =
 
 export const PLAYBOOK_GUIDANCE = `
 ## Operational Playbook — Active Collective Memory
-The playbook is shared, mutable knowledge across all agents — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge or overwrite an existing entry, and \`./playbook get\` to review. If an entry led you astray, overwrite it.
+Use \`./playbook get\` to review shared repo knowledge and \`./playbook set <key> <value>\` to add or replace it. Values are limited to 2048 UTF-8 bytes.
 
-**When to save:** after fixing a build/test error, discovering non-obvious configuration, running successful commands, or finding undocumented patterns. Check \`./playbook get\` first to avoid duplicates.
+Active-task writes are staged: the writer sees its update immediately; peers keep the prior committed entry (or none). Completion publishes it; failure/cancellation restores the prior entry or removes a new one.
 
-**Before completing your task:** reflect on repo-level knowledge you gained and save it — the next agent starts cold, and one good entry compounds across hundreds of tasks.
+Before completing, save concise reusable facts such as working commands, configuration, quirks, or undocumented patterns. Check existing entries first.
 
 \`\`\`bash
 ./playbook set "key-name" "Concise operational knowledge here."
