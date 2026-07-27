@@ -354,6 +354,13 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
+vi.mock('./artifacts-helper.js', () => ({
+  writeArtifactsHelper: vi.fn(() => true),
+  generateArtifactsScript: vi.fn(() => ''),
+  COMPUTE_ARTIFACT_GUIDANCE:
+    '## Compute job artifacts\nRun `./artifacts fetch <compute-job-id>`.\n',
+}));
+
 // Default challenge record the mocked runStrategicChallenge resolves with. Tests
 // that care about the challenge override it per-case via mockResolvedValueOnce.
 // Hoisted so it is initialized before the (hoisted) vi.mock factory references it.
@@ -609,6 +616,7 @@ import {
 } from '../prompts/thinker.js';
 import * as mockedStrategicHelpersModule from './strategic-helpers.js';
 import { runStrategicChallenge } from './strategic-helpers.js';
+import { writeArtifactsHelper } from './artifacts-helper.js';
 import * as mockedTimeModule from '../utils/time.js';
 import * as mockedDesignDocPresenceModule from '../utils/design-doc-presence.js';
 import * as mockedResearchDirectionContextModule from './research-direction-context.js';
@@ -2195,6 +2203,8 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
     expect(executorPrompt).toContain('require_durable_artifact: true');
     expect(executorPrompt).toContain('$BLUEPRINT_ARTIFACT_DIR');
     expect(executorPrompt).toContain('manifest.json');
+    expect(executorPrompt).toContain('./artifacts fetch <compute-job-id>');
+    expect(vi.mocked(writeArtifactsHelper)).toHaveBeenCalledWith('/tmp/workspace');
   });
 });
 

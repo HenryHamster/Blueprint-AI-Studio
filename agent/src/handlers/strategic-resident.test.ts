@@ -84,6 +84,12 @@ vi.mock('./strategic-helpers.js', () => ({
   buildFetchGuidance: vi.fn(() => ''),
   STRATEGIC_FETCH_VERBS: [],
 }));
+vi.mock('./artifacts-helper.js', () => ({
+  writeArtifactsHelper: vi.fn(() => true),
+  generateArtifactsScript: vi.fn(() => ''),
+  COMPUTE_ARTIFACT_GUIDANCE:
+    '## Compute job artifacts\nRun `./artifacts fetch <compute-job-id>`.\n',
+}));
 vi.mock('../providers/runners.js', () => ({
   provisionAmbientHelpers: vi.fn(),
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
@@ -146,6 +152,7 @@ import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.j
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { writePlaybookHelper, writeMessagesHelper, buildContextPrefix } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
+import { writeArtifactsHelper } from './artifacts-helper.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
@@ -263,6 +270,7 @@ const mockPrepareWorkspaceForRole = vi.mocked(prepareWorkspaceForRole);
 const mockWritePlaybookHelper = vi.mocked(writePlaybookHelper);
 const mockWriteMessagesHelper = vi.mocked(writeMessagesHelper);
 const mockWriteStrategicHelpers = vi.mocked(writeStrategicHelpers);
+const mockWriteArtifactsHelper = vi.mocked(writeArtifactsHelper);
 const mockProvisionAmbientHelpers = vi.mocked(provisionAmbientHelpers);
 const mockBuildContextPrefix = vi.mocked(buildContextPrefix);
 
@@ -350,6 +358,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     mockSendLog.mockReset();
     mockSendWsFrame.mockReset();
     mockSendWsFrame.mockReturnValue(true);
+    mockWriteArtifactsHelper.mockClear();
+    mockWriteArtifactsHelper.mockReturnValue(true);
     // Workspace guard must NOT fire in general-purpose tests (WORKSPACE='' otherwise
     // always looks vanished). Recovery-specific tests override this spy.
     vi.spyOn(fs, 'existsSync').mockReturnValue(true);
@@ -429,6 +439,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
         stagedReplyPath: replyRuntime.stagedReplyPath,
       }),
     );
+    expect(mockWriteArtifactsHelper).toHaveBeenCalledWith('/tmp');
     const heartbeat = mockApiPost.mock.calls.find(([url]) =>
       url.includes('/strategic-session/heartbeat'),
     );
@@ -756,6 +767,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
 
     // The restored flag drove the corrective frame into the first autonomous prompt.
     expect(autonomousPrompt).toContain('OPERATOR-DECISION REVIEW');
+    expect(autonomousPrompt).toContain('./artifacts fetch <compute-job-id>');
   });
 
   it('re-clones the vanished workspace with a FRESH READ token, never the session-start push token', async () => {
@@ -805,6 +817,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     vi.spyOn(fs, 'existsSync').mockReturnValue(false);
     mockWritePlaybookHelper.mockReset();
     mockWriteStrategicHelpers.mockReset();
+    mockWriteArtifactsHelper.mockReset();
+    mockWriteArtifactsHelper.mockReturnValue(true);
     mockProvisionAmbientHelpers.mockReset();
 
     mockApiGet.mockImplementation((url: string) => {
@@ -844,6 +858,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // helpers were re-provisioned into the recreated checkout (startup + recovery = 2 calls each)
     expect(mockWritePlaybookHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mockWriteStrategicHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(mockWriteArtifactsHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mockProvisionAmbientHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
