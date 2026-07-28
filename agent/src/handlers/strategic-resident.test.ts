@@ -368,10 +368,10 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
   afterEach(() => { vi.restoreAllMocks(); });
 
   it('places reply authority outside the mutable Git workspace', () => {
-    // WORKSPACE is mocked to /tmp in this suite.  Do not consult the host's
-    // AGENT_WORKSPACE: an ambient CI value can itself be under os.tmpdir and
-    // makes this invariant test environment-dependent.
-    const workspace = '/tmp';
+    // Use a distinct mutable-workspace path. CI may set AGENT_WORKSPACE to
+    // os.tmpdir(), so comparing the runtime directory with /tmp itself makes
+    // this otherwise-valid isolation assertion environment-dependent.
+    const workspace = path.join(os.tmpdir(), 'mutable-git-workspace');
     const paths = residentReplyRuntimePaths('task-runtime-boundary');
     expect(paths.runtimeDir.startsWith(`${path.resolve(workspace)}${path.sep}`)).toBe(false);
     expect(paths.replyReceiptPath).toBe(path.join(
