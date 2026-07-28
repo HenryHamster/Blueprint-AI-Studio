@@ -2392,6 +2392,45 @@ describe('handleFix — iteration header in enriched prompt', () => {
     expect(prompt).toContain('Convergence mode');
     expect(prompt).toContain('minimal changes');
   });
+
+  it('permits discovered related tests when convergence scope starts from a reviewed source file', async () => {
+    vi.mocked(promptMod.discoverRelatedTests).mockReturnValue(
+      '## Related Tests\nThese tests cover files you\'ll be modifying:\n' +
+      '- DEN/testing/test_results_analysis.py: test_clip_stats_admission\n',
+    );
+    await handleFix(
+      'task-fix-related-regression',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 50, prompt: 'add the requested regression' },
+      {
+        context: {
+          scope: 'medium',
+          review_loop: {
+            iteration: 6,
+            review_history: [{
+              iteration: 5,
+              feedback: 'The source fix needs direct regression coverage.',
+              issues: [{
+                severity: 'major',
+                description: 'Add a focused regression for this admission path.',
+                file: 'DEN/results_analysis.py',
+                line: 3349,
+              }],
+            }],
+          },
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(promptMod.discoverRelatedTests).toHaveBeenCalledWith(
+      null,
+      ['DEN/results_analysis.py'],
+      expect.anything(),
+    );
+    expect(capturedFixPrompt()).toContain(
+      'Files you may modify: DEN/results_analysis.py, DEN/testing/test_results_analysis.py',
+    );
+  });
 });
 
 // ── pushForceWithLeaseRetrying: concurrent push retry paths ─────────────────
@@ -3227,6 +3266,47 @@ describe('handleReview — exact-SHA delta execution', () => {
     const verdictJson = JSON.parse(String(status.verdict_json)) as { reviewed_base_sha?: string };
     expect(verdictJson.reviewed_base_sha).toBe(targetBase);
     expect(vi.mocked(indexMod.git).mock.calls.some(([args]) => args[0] === 'fetch')).toBe(false);
+  });
+
+  it('overwrites model-authored SHA provenance with the mechanical review target', async () => {
+    const priorHead = 'd'.repeat(40);
+    const targetBase = 'c'.repeat(40);
+    const targetHead = 'f'.repeat(40);
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'REQUEST_CHANGES',
+      feedback: 'Needs a narrow fix.',
+      issues: [{ severity: 'major', description: 'Bug', file: 'src/a.ts', line: 1 }],
+      requires_rereview: true,
+      reviewed_base_sha: 'a'.repeat(40),
+      reviewed_head_sha: 'b'.repeat(40),
+    }));
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) =>
+      args?.[0] === 'rev-parse' && args[1] === 'HEAD' ? targetHead : '',
+    );
+
+    await handleReview(
+      'task-delta-authoritative-provenance',
+      { pr_number: 253, branch: 'feature/x', base_branch: 'main', delta_base_sha: priorHead },
+      {
+        ...REVIEW_TASK,
+        context: {
+          review_loop: {
+            iteration: 2,
+            review_target: { base_sha: targetBase, head_sha: targetHead },
+          },
+        },
+      },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
+    const verdictJson = JSON.parse(String(status.verdict_json)) as {
+      reviewed_base_sha?: string;
+      reviewed_head_sha?: string;
+    };
+    expect(verdictJson.reviewed_base_sha).toBe(targetBase);
+    expect(verdictJson.reviewed_head_sha).toBe(targetHead);
   });
 
   it('does not fan out an exact delta review even when its changed-file list meets the full-review threshold', async () => {

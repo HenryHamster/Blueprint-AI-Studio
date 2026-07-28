@@ -932,10 +932,12 @@ ${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewC
     if (parallelReviewInjected) {
       augmented.review_was_parallelized = true;
     }
-    if (reviewedHeadSha && !augmented.reviewed_head_sha) {
+    // SHA provenance is mechanical. Never let model-authored JSON replace the
+    // exact local head and mechanically resolved base the agent actually used.
+    if (reviewedHeadSha) {
       augmented.reviewed_head_sha = reviewedHeadSha;
     }
-    if (reviewedBaseSha && !augmented.reviewed_base_sha) {
+    if (reviewedBaseSha) {
       augmented.reviewed_base_sha = reviewedBaseSha;
     }
     return JSON.stringify(augmented);
@@ -1043,12 +1045,35 @@ export async function handleFix(
   writeMessagesHelper(taskId);
   const disallowedToolsFix = configureAgentPermissions('fix');
   const fixBuildConfig = resolveBuildConfig(task);
-  const fixRelatedFiles = (
-    ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+  type FixIssue = { severity: string; description: string; file?: string; line?: number };
+  const fixTaskContext = (task.context as Record<string, unknown> | undefined) || {};
+  const fixReviewLoop = fixTaskContext.review_loop as Record<string, unknown> | undefined;
+  const fixReviewHistory = (fixReviewLoop?.review_history as Array<{
+    iteration: number;
+    feedback: string;
+    issues?: Array<{ severity: string; description: string; file?: string; line?: number }>;
+  }> | undefined) || [];
+  const latestReviewIssueFiles = (fixTaskContext.surviving_issues as FixIssue[] | undefined)
+    ?.map(issue => issue.file)
+    .filter((file): file is string => typeof file === 'string' && file.length > 0)
+    ?? fixReviewHistory[fixReviewHistory.length - 1]?.issues
+      ?.map(issue => issue.file)
+      .filter((file): file is string => typeof file === 'string' && file.length > 0)
+    ?? [];
+  const existingFixRelatedFiles = (
+    (fixTaskContext.related_files as string[] | undefined) ||
     (payload.related_files as string[] | undefined) ||
     []
   );
+  const fixRelatedFiles = Array.from(new Set([
+    ...existingFixRelatedFiles,
+    ...latestReviewIssueFiles,
+  ]));
   const fixRelatedTestContext = discoverRelatedTests(ws, fixRelatedFiles, fixBuildConfig);
+  const fixRelatedTestFiles = fixRelatedTestContext
+    .split('\n')
+    .map(line => line.match(/^- ([^:]+)(?::|$)/)?.[1]?.trim())
+    .filter((file): file is string => Boolean(file));
 
   git(['config', 'user.email', fixBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', fixBuildConfig?.git_user_name || 'Blueprint Agent']);
@@ -1111,15 +1136,14 @@ export async function handleFix(
   }
 
   // Prepend accumulated review history so the agent knows what was previously requested
-  const reviewLoop = (task.context as Record<string, unknown> | undefined)?.review_loop as Record<string, unknown> | undefined;
+  const reviewLoop = fixReviewLoop;
   const fixReason = reviewLoop?.fix_reason as string | undefined;
-  const taskContext = (task.context as Record<string, unknown> | undefined) || {};
+  const taskContext = fixTaskContext;
   // Challenge-reconciliation: when the backend has resolved a second-opinion
   // challenge, it passes only the challenge-surviving issues (issues the
   // challenger confirmed or didn't reject) so the fix agent doesn't address
   // issues the challenge invalidated. Falls back to the raw review-history
   // issues when absent (no challenge, or pre-challenge tasks).
-  type FixIssue = { severity: string; description: string; file?: string; line?: number };
   const survivingIssues: FixIssue[] | undefined = Array.isArray(payload.surviving_issues)
     ? payload.surviving_issues as FixIssue[]
     : Array.isArray(taskContext.surviving_issues)
@@ -1134,7 +1158,7 @@ export async function handleFix(
   const ciFailureSelectors = fixReason === 'ci_failure'
     ? extractPytestSelectorsFromOutput(ciFailureLogs)
     : [];
-  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string; file?: string; line?: number}> }> | undefined) || [];
+  const reviewHistory = fixReviewHistory;
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
   const maxIterations = computeMaxFixIterations(task);
   let iterationHeader = `You are on fix iteration ${iteration} of ${maxIterations}.\n`;
@@ -1156,7 +1180,14 @@ export async function handleFix(
           ...((payload.related_files as string[] | undefined) || []),
         ].filter((f): f is string => typeof f === 'string' && f.length > 0)
       : [];
-    const allowedFiles = Array.from(new Set([...issueFiles, ...originalScopeFiles]));
+    // Related tests are part of the repair surface, not scope drift. They are
+    // discovered from cited source files using the repository's existing test
+    // conventions, so a requested regression is not blocked by convergence.
+    const allowedFiles = Array.from(new Set([
+      ...issueFiles,
+      ...originalScopeFiles,
+      ...fixRelatedTestFiles,
+    ]));
     if (allowedFiles.length > 0) {
       iterationHeader += `Files you may modify: ${allowedFiles.join(', ')}\n`;
     }

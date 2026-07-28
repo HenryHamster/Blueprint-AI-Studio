@@ -234,11 +234,13 @@ export function buildReviewVerdictInstructions(taskId: string, opts?: { repairCo
 {"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here."}
 
 **REQUEST_CHANGES** — block only on a concrete, substantiated CODE defect: a logic/correctness bug, a security hole, a missing test for new behavior, a broken invariant, a design flaw, or a merge conflict in the diff. Build/type-check/test pass is CI's job, not yours — do not block on it. Uncertainty rooted in something you could NOT verify in your sandbox (a command you couldn't run, a tool that was missing, an API that 401'd) is NOT grounds to block: judge the code on its merits and trust CI for build/test pass. If your concern is a real, substantiated defect, list it; if it is only a "couldn't confirm", do not REQUEST_CHANGES.
-{"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}], "requires_rereview": true}
+{"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}], "requires_rereview": false}
 
 Every REQUEST_CHANGES verdict MUST include the boolean \`requires_rereview\`. Explicitly choose:
 - \`true\` — an independent follow-up review is required after the fixer responds. Use this whenever the correctness of the resulting repair still needs independent judgment.
 - \`false\` — you are comfortable delegating closure of this specific repair to the fixer's self-check and the normal CI/merge gates. This is not mechanical proof that the repair is correct; it is your judgment that an independent follow-up review is unnecessary.
+
+Do not choose \`true\` merely because the issue is labeled critical or major, or because re-review feels safer by default. A localized, fully specified repair with a focused regression test that directly exercises acceptance is normally \`false\`. Choose \`true\` when the repair itself will still require independent design or behavioral judgment—for example, when multiple valid implementations could preserve different invariants or the change crosses a security, data-integrity, migration, or external-contract boundary.
 
 \`APPROVE\` ignores \`requires_rereview\`; omit it from APPROVE verdicts.
 
