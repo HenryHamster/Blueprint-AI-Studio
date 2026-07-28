@@ -3016,6 +3016,18 @@ async def strategic_operation(
         raw_covered_ids = data.get("covered_message_ids")
         covered_message_ids: list[uuid.UUID] | None = None
         covered_message_id_strings: list[str] | None = None
+        raw_conversation_claim_id = data.get("conversation_claim_id")
+        conversation_claim_id: uuid.UUID | None = None
+        if raw_conversation_claim_id is not None:
+            try:
+                conversation_claim_id = uuid.UUID(
+                    str(raw_conversation_claim_id).strip()
+                )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid conversation_claim_id",
+                ) from None
         if raw_covered_ids is not None:
             if not isinstance(raw_covered_ids, list) or not raw_covered_ids:
                 raise HTTPException(
@@ -3059,6 +3071,11 @@ async def strategic_operation(
                 )
             covered_message_ids = parsed_covered
             covered_message_id_strings = sorted(str(value) for value in parsed_covered)
+        if conversation_claim_id is not None and covered_message_ids is None:
+            raise HTTPException(
+                status_code=400,
+                detail="conversation_claim_id requires covered_message_ids",
+            )
         from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
 
         event_type = str(msg_ctx.get("event_type") or "").strip() or None
@@ -3081,6 +3098,8 @@ async def strategic_operation(
         if covered_message_id_strings is not None:
             msg_ctx[covered_context_key] = covered_message_id_strings
             msg_ctx["message_role"] = "operator_reply"
+        if conversation_claim_id is not None:
+            msg_ctx["_conversation_claim_id"] = str(conversation_claim_id)
         raw_turn_state = data.get("resident_turn_state")
         resident_turn_state: dict[str, Any] | None = None
         resident_turn_state_sha256: str | None = None
@@ -3246,7 +3265,45 @@ async def strategic_operation(
                         status_code=409,
                         detail="covered_message_ids contains a non-open message",
                     )
+                if conversation_claim_id is not None:
+                    try:
+                        resident_generation = int(
+                            resident_ctx.get("_resident_worker_generation") or 1
+                        )
+                    except (TypeError, ValueError):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Resident worker generation is invalid",
+                        ) from None
+                    if (
+                        inbound.handling_state != MessageHandlingState.CLAIMED
+                        or inbound.conversation_claim_id
+                        != conversation_claim_id
+                        or inbound.handled_by_task_id != task.id
+                        or inbound.conversation_claim_generation
+                        != resident_generation
+                        or inbound.conversation_claim_expires_at is None
+                        or inbound.conversation_claim_expires_at <= _utcnow()
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "conversation claim expired, superseded, "
+                                "or belongs to another worker"
+                            ),
+                        )
+                elif inbound.conversation_claim_id is not None:
+                    # Once a message has entered the durable Coordinator path,
+                    # every completion must present its exact claim. This keeps a
+                    # rolling-deploy legacy worker from racing the current owner.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="conversation_claim_id is required for this message",
+                    )
                 inbound.status = "handled"
+                inbound.handling_state = MessageHandlingState.RESPONDED
+                inbound.handled_by_task_id = task.id
+                inbound.conversation_claim_expires_at = None
                 session.add(inbound)
 
         def _apply_resident_turn_state() -> None:
@@ -3284,6 +3341,12 @@ async def strategic_operation(
                     and existing.content == content
                     and (existing.context or {}).get(covered_context_key)
                     == covered_message_id_strings
+                    and (existing.context or {}).get("_conversation_claim_id")
+                    == (
+                        str(conversation_claim_id)
+                        if conversation_claim_id is not None
+                        else None
+                    )
                     and (existing.context or {}).get(turn_state_context_key)
                     == resident_turn_state_sha256
                     and existing.reply_to_message_id == reply_to_message_id
@@ -3374,6 +3437,12 @@ async def strategic_operation(
                         and existing.content == content
                         and (existing.context or {}).get(covered_context_key)
                         == covered_message_id_strings
+                        and (existing.context or {}).get("_conversation_claim_id")
+                        == (
+                            str(conversation_claim_id)
+                            if conversation_claim_id is not None
+                            else None
+                        )
                         and (existing.context or {}).get(turn_state_context_key)
                         == resident_turn_state_sha256
                         and existing.reply_to_message_id == reply_to_message_id

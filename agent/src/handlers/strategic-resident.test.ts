@@ -2092,7 +2092,10 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
 
     // The early ack must have been posted
     expect(strategicPosts).toHaveLength(0);
-    expect(session.sendTurn).toHaveBeenCalledWith(expect.anything(), { stallTimeoutMs: 300_000 });
+    expect(session.sendTurn).toHaveBeenCalledWith(expect.anything(), {
+      stallTimeoutMs: 120_000,
+      hardTimeoutMs: 150_000,
+    });
 
     // Resolve the slow turn; handler should proceed to the heartbeat and stop
     resolveTurn(turnResult({ sentOperatorMessage: true, resultText: 'operator reply' }));
@@ -2870,6 +2873,77 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(heartbeatBodies.every(body => !('handled_message_ids' in body))).toBe(true);
   });
 
+  it('claims the exact polled batch and fences its persisted reply', async () => {
+    const operatorMessage = {
+      id: 'msg-durable-claim',
+      content: 'finish this without losing it if the worker crashes',
+      created_at: '2026-07-21T20:00:00.000Z',
+      from_type: 'user',
+    };
+    let delivered = false;
+    const claimBodies: Array<Record<string, unknown>> = [];
+    const replyBodies: Array<Record<string, unknown>> = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage], claim_required: true });
+      }
+      if (url.includes('/messages?')) {
+        return Promise.resolve({ messages: [], claim_required: true });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/messages/claim')) {
+        claimBodies.push(body ?? {});
+        return Promise.resolve({
+          claim_id: 'claim-durable-1',
+          message_ids: [operatorMessage.id],
+          lease_expires_at: '2026-07-21T20:01:00.000Z',
+          attempt: 1,
+        });
+      }
+      if (body?.op === 'create_message') {
+        replyBodies.push(body.data as Record<string, unknown>);
+        return Promise.resolve({});
+      }
+      if (url.includes('/heartbeat')) {
+        return Promise.resolve({ authority_held: false, stop_requested: true });
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ sentOperatorMessage: true, resultText: 'durable reply' })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-durable-claim',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+        strategic_session_id: 'durable-session',
+        _resident_worker_generation: 1,
+      },
+      { project_metadata: { project_id: 'proj-durable-claim' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(claimBodies).toEqual([expect.objectContaining({
+      task_id: 'task-durable-claim',
+      session_id: 'durable-session',
+      worker_generation: 1,
+      message_ids: [operatorMessage.id],
+    })]);
+    expect(replyBodies).toHaveLength(1);
+    expect(replyBodies[0]).toMatchObject({
+      covered_message_ids: [operatorMessage.id],
+      conversation_claim_id: 'claim-durable-1',
+    });
+  });
+
   it('drains 201 same-timestamp operator messages as atomic one-page batches without suppressing deferred rows', async () => {
     const sharedCreatedAt = '2026-07-21T20:00:00.000Z';
     const open = Array.from({ length: 201 }, (_, index) => ({
@@ -3138,6 +3212,73 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       taskId === 'task-inline-only' && payload.status === 'FAILED'
     ))).toBe(false);
   });
+
+  it('replaces the worker after the native reply protocol fails twice', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-reply-protocol-broken',
+      content: 'Do not retry this forever.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({
+      authority_held: true,
+      stop_requested: false,
+    });
+    const firstBrokenSession = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'inline output is not delivery',
+        accumulatedTurnText: 'inline output is not delivery',
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    const secondBrokenSession = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'still missing the native reply',
+        accumulatedTurnText: 'still missing the native reply',
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    mockStartSession
+      .mockReturnValueOnce(firstBrokenSession)
+      .mockReturnValueOnce(secondBrokenSession);
+
+    const run = handleStrategicResident(
+      'task-reply-protocol-broken',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      {
+        project_metadata: { project_id: 'proj-reply-protocol-broken' },
+        context: {},
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await run;
+
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    expect(firstBrokenSession.close).toHaveBeenCalled();
+    expect(secondBrokenSession.sendTurn).toHaveBeenCalledTimes(1);
+    expect(mockApiPost.mock.calls.filter(([, body]) =>
+      body?.op === 'create_message')).toHaveLength(0);
+    expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
+      taskId === 'task-reply-protocol-broken'
+      && payload.status === 'FAILED'
+      && String(payload.logs).includes('operator_reply_protocol_failed')
+    ))).toBe(true);
+  });
+
   it('folds the checkpoint into the first operator turn after bounded wedged preemption', async () => {
     vi.useFakeTimers();
     const operatorMessage = {

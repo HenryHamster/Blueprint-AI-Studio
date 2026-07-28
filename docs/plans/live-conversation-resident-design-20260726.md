@@ -59,7 +59,7 @@ The present code already contains most of the durable and UI primitives:
 
 There are also constraints the design must not hide:
 
-- Operator pickup currently has a 750 ms floor and defaults to a 1.5 s poll (`strategic-resident-lib.ts`). That is acceptable for text, but should not sit on the voice critical path.
+- Ordinary operator pickup now defaults to a 750 ms poll (`strategic-resident-lib.ts`). That is suitable for text, but should not sit on the voice critical path.
 - Workday's ordinary public delivery contract is one correlated native `reply_to_operator` call. Raw model streaming is only a preview. Call mode needs a separate internal result path so Workday cannot race the Fast Resident for public ownership.
 - Workday's present operator-turn handler treats absence of `reply_to_operator` as failure/retry, sends its raw deltas to the public live stream, and does not poll for new operator messages during that turn. Its current process-level interruption can terminate the Resident task. Call mode therefore needs a distinct internal request handler; it cannot be implemented only by changing the prompt.
 - The existing persistent Resident launcher inherits the repository working directory and a broad provider/runner environment. `runners.ts` propagates orchestrator, agent, provider, token-file, GitHub, and cloud-related values; its ordinary Codex and Claude execution paths also use broad permission flags. That launcher must not be reused unchanged for the public voice process.
@@ -228,11 +228,15 @@ Rules:
 
 ### Active
 
-- Human input is event-driven. The current 1.5 s Workday message poll is not on the foreground path.
+- Human input is event-driven. The ordinary Workday message poll is not on the foreground path.
 - The Fast Resident keeps one coherent conversational context for the call.
 - Workday is invoked only for explicit internal requests.
 - The Coordinator maintains a single public speech queue and one active user-turn lineage.
-- Possible operator speech triggers fast local audio ducking. Configured …8 tokens truncated…tools or MCP servers; if the adapter uses structured model calls for `request_workday` or display output, they terminate in a local schema-validated Coordinator shim and cannot reach a network service;
+- Possible operator speech triggers fast local audio ducking. Confirmed speech interrupts queued playout and steers the active Fast turn; false starts restore playout without committing an operator turn.
+
+The Fast model subprocess uses a restricted runtime profile:
+
+- no inherited Codex tools or MCP servers; if the adapter uses structured model calls for `request_workday` or display output, they terminate in a local schema-validated Coordinator shim and cannot reach a network service;
 - no shell, filesystem, browser, task-control, raw backend client, or model-callable networking tool; process egress is allowlisted to the leased model provider and local Coordinator only;
 - a local authenticated Coordinator channel exposing only schema-validated call operations;
 - resource ceilings for CPU, memory, process count, and turn duration;

@@ -131,6 +131,16 @@ class EndResidentCall(BaseModel):
     reason: Literal["operator_disconnected"]
 
 
+class ClaimResidentMessages(BaseModel):
+    """Exact read-poll batch to admit as one durable foreground turn."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    message_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=20)
+    lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
 def _resident_poll_rate_limit_key(request: Request) -> str:
     """Isolate high-frequency polls by network origin and project.
 
@@ -576,6 +586,19 @@ async def _lock_resident_poll_project(
         select(Project)
         .where(Project.id == project_id)
         .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _lock_resident_claim_project(
+    session: AsyncSession, project_id: uuid.UUID
+) -> Project | None:
+    """Exclusively lock conversation authority across validation and claim."""
+    result = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update()
         .execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
@@ -1074,6 +1097,80 @@ async def _quarantine_permanent_artifact_message(
     return source, created_notice
 
 
+@router.post("/projects/{project_id}/messages/claim")
+@limiter.limit(_RESIDENT_POLL_RATE_LIMIT, key_func=_resident_poll_rate_limit_key)
+async def claim_resident_messages(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ClaimResidentMessages,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Atomically admit one read-poll batch to an exact Resident generation."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    # Resolve project membership before taking the exclusive authority lock.
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    task = await session.get(Task, payload.task_id, populate_existing=True)
+    task_context = task.context if task is not None else {}
+    authenticated_session_id = str(
+        (task_context or {}).get("strategic_session_id") or ""
+    )
+    authenticated_generation = _parse_persisted_worker_generation(
+        (task_context or {}).get("_resident_worker_generation")
+    )
+    resident_blob = (
+        (project.vision or {}).get("_resident_strategic_session") or {}
+    )
+    current_generation = _parse_persisted_worker_generation(
+        resident_blob.get("worker_generation")
+    )
+    if (
+        task is None
+        or (task_context or {}).get("_resident_session") is not True
+        or authenticated_session_id != payload.session_id
+        or authenticated_generation != payload.worker_generation
+        or current_generation != payload.worker_generation
+        or resident_blob.get("status") != "active"
+        or bool(resident_blob.get("stop_requested"))
+        or str(resident_blob.get("session_id") or "") != payload.session_id
+        or str(resident_blob.get("task_id") or "") != str(payload.task_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident worker generation superseded or inactive",
+        )
+
+    from app.conversation_coordinator import claim_operator_messages
+
+    claim = await claim_operator_messages(
+        session,
+        project_id=project_id,
+        session_id=payload.session_id,
+        task_id=payload.task_id,
+        worker_generation=payload.worker_generation,
+        message_ids=payload.message_ids,
+        lease_seconds=payload.lease_seconds,
+    )
+    if claim is None:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Operator batch was already claimed or changed",
+        )
+    await session.commit()
+    return {
+        "claim_id": str(claim.claim_id),
+        "message_ids": [str(row.id) for row in claim.rows],
+        "lease_expires_at": claim.lease_expires_at.isoformat(),
+        "attempt": claim.attempt,
+    }
+
+
 @router.get("/projects/{project_id}/messages")
 @limiter.limit(_RESIDENT_POLL_RATE_LIMIT, key_func=_resident_poll_rate_limit_key)
 async def agent_poll_messages(
@@ -1408,4 +1505,11 @@ async def agent_poll_messages(
             projected["context"] = context
         projected_messages.append(projected)
 
-    return {"messages": projected_messages, "server_time": server_time.isoformat()}
+    return {
+        "messages": projected_messages,
+        "server_time": server_time.isoformat(),
+        # New agents must atomically claim the exact materialized batch before
+        # giving it to a provider. Older agents ignore this additive field during
+        # the rolling-deploy window; generation fencing still prevents overlap.
+        "claim_required": resident_poll,
+    }

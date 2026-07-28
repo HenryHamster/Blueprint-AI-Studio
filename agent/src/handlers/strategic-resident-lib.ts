@@ -55,6 +55,14 @@ export interface ResidentInboundMessage {
 export interface MessagesPollResponse {
   messages?: ResidentInboundMessage[];
   server_time?: string;
+  claim_required?: boolean;
+}
+
+export interface ConversationClaimResponse {
+  claim_id?: string;
+  message_ids?: string[];
+  lease_expires_at?: string;
+  attempt?: number;
 }
 
 export interface StrategicWatchReceipt {
@@ -87,6 +95,7 @@ export interface SessionHeartbeatResponse {
   leased_until?: string;
   stop_requested?: boolean;
   status?: string;
+  conversation_claim_held?: boolean;
   /** Monotonic marker over strategist-relevant change sources (task transitions,
    *  operator messages, direction/cycle mutations). State-gated pacing fires an
    *  autonomous turn when this differs from the rev recorded at the last turn.
@@ -307,7 +316,10 @@ export function buildStagedDirectionsText(
  */
 export function residentConfig(payload: Record<string, unknown>): ResidentConfig {
   const idleTickSec = num(payload.strategic_session_idle_tick_seconds, 5);
-  const messagePollSec = num(payload.strategic_session_message_poll_seconds, 1.5);
+  // Match the backend's explicitly budgeted 80/minute Resident cadence. This
+  // removes up to 750 ms of avoidable pickup latency for every typed turn while
+  // preserving enough rate-limit headroom for one overlapping replacement.
+  const messagePollSec = num(payload.strategic_session_message_poll_seconds, 0.75);
   const turnTimeoutSec = num(payload.strategic_session_turn_timeout_seconds, 120);
   const minTickSec = num(payload.strategic_session_min_tick_seconds, 600);
   const autonomousTurnTimeoutSec = num(payload.strategic_session_autonomous_turn_timeout_seconds, 300);
@@ -361,6 +373,10 @@ const MODEL_CONTEXT_LIMITS: ReadonlyArray<{ pattern: string; limit: number }> = 
   { pattern: 'haiku', limit: 128_000 },
   // Claude Fable family: 200K
   { pattern: 'fable', limit: 200_000 },
+  // Routed DeepSeek Residents have shown materially higher latency and prompt
+  // growth near the generic 200K fallback. Compact conservatively before an
+  // interactive turn inherits a six-figure prompt.
+  { pattern: 'deepseek', limit: 128_000 },
 ];
 
 /** Default context-window limit when the model is unrecognized (tokens). */

@@ -18,7 +18,14 @@ from starlette.requests import Request
 
 from app.auth import create_agent_token
 from app.main import app
-from app.models import MessageSurface, MessageType, Project, ProjectMessage, Task
+from app.models import (
+    MessageHandlingState,
+    MessageSurface,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+)
 from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_EXPECTED_PER_MINUTE,
     _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE,
@@ -647,6 +654,122 @@ async def test_resident_poll_uses_authenticated_session_scope(
     )
     assert response.status_code == 200, response.text
     assert [row["id"] for row in response.json()["messages"]] == [str(own.id)]
+    assert response.json()["claim_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_resident_claim_is_durable_and_idempotent_for_same_generation(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    first = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="first claimed input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    second = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="second claimed input",
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=1),
+    )
+    payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "message_ids": [str(first.id), str(second.id)],
+        "lease_seconds": 45,
+    }
+
+    claimed = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert claimed.status_code == 200, claimed.text
+    body = claimed.json()
+    assert body["message_ids"] == [str(first.id), str(second.id)]
+    assert body["attempt"] == 1
+
+    repeated = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["claim_id"] == body["claim_id"]
+    assert repeated.json()["attempt"] == 1
+
+    await db_session.refresh(first)
+    await db_session.refresh(second)
+    for row in (first, second):
+        assert row.handling_state == MessageHandlingState.CLAIMED
+        assert str(row.conversation_claim_id) == body["claim_id"]
+        assert row.handled_by_task_id == task.id
+        assert row.conversation_claim_generation == 2
+        assert row.conversation_claim_attempt == 1
+        assert row.conversation_claim_expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_stale_resident_generation_cannot_claim_operator_batch(
+    client: AsyncClient, db_session
+):
+    project, stale_task = await _make_resident_poll_worker(db_session, generation=1)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="generation-fenced input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    current_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-current-resident",
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "resident-session",
+            "_resident_worker_generation": 2,
+        },
+    )
+    db_session.add(current_task)
+    await db_session.commit()
+    await db_session.refresh(current_task)
+    project.vision = {
+        "_resident_strategic_session": {
+            "session_id": "resident-session",
+            "task_id": str(current_task.id),
+            "worker_generation": 2,
+            "status": "active",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(stale_task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(stale_task.id),
+            "session_id": "resident-session",
+            "worker_generation": 1,
+            "message_ids": [str(message.id)],
+        },
+    )
+    assert response.status_code == 409
+    await db_session.refresh(message)
+    assert message.handling_state == MessageHandlingState.PENDING
+    assert message.conversation_claim_id is None
 
 
 @pytest.mark.asyncio

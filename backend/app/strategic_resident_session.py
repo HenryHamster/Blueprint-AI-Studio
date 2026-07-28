@@ -39,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, func, or_, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -1221,27 +1221,36 @@ def _resident_worker_task_is_healthy(
             started
             and (now - started).total_seconds() <= _RESIDENT_START_CLAIM_STALE_SECONDS
         )
+    heartbeat = task.last_heartbeat
+    if heartbeat is not None:
+        if heartbeat.tzinfo is not None:
+            heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
+        if (
+            now - heartbeat
+        ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
+            # This is the heartbeat of the exact active task, not merely the
+            # runner hosting it. A delayed resident-session projection must not
+            # cancel a worker that the task lifecycle still observes as alive.
+            # Doing so creates a second generation while the first is running
+            # and can leave the conversation without a worker during dispatch.
+            return True
+
     worker_heartbeat = _parse_iso_naive(blob.get("worker_heartbeat_at"))
     if worker_heartbeat is not None:
         return (
             now - worker_heartbeat
         ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
 
-    # The generic task heartbeat can bridge startup compatibility only. It
-    # proves runner liveness, not resident-loop health, so it cannot renew a
-    # steady-state worker after the bounded startup window.
+    # During startup an absent heartbeat is expected until the resident handler
+    # makes its first lease renewal. Keep the start claim briefly even when the
+    # generic task heartbeat has not arrived yet.
     startup_seen = _parse_iso_naive(blob.get("started_at"))
     if (
         startup_seen is None
         or (now - startup_seen).total_seconds() > _RESIDENT_START_CLAIM_STALE_SECONDS
     ):
         return False
-    heartbeat = task.last_heartbeat
-    if heartbeat is None:
-        return True
-    if heartbeat.tzinfo is not None:
-        heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
-    return (now - heartbeat).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+    return heartbeat is None
 
 
 async def sync_resident_worker_retry_wait(
@@ -4647,6 +4656,8 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     call_ttl_seconds: int | None = None
     call_ready: bool = False
     call_usage: dict[str, Any] | None = None
+    conversation_claim_id: uuid.UUID | None = None
+    conversation_claim_lease_seconds: int = Field(default=45, ge=15, le=300)
 
 
 class ResidentCallSpeechCredentialsRequest(BaseModel):
@@ -4744,6 +4755,18 @@ async def resident_session_heartbeat(
         activity=payload.activity,
         repo_head=payload.repo_head,
     )
+    if payload.conversation_claim_id is not None:
+        from app.conversation_coordinator import renew_conversation_claim
+
+        response["conversation_claim_held"] = await renew_conversation_claim(
+            session,
+            project_id=project.id,
+            claim_id=payload.conversation_claim_id,
+            task_id=uuid.UUID(payload.task_id),
+            worker_generation=payload.worker_generation,
+            lease_seconds=payload.conversation_claim_lease_seconds,
+        )
+        await session.commit()
     if payload.call_id is not None or payload.call_generation is not None:
         if not payload.call_id or payload.call_generation is None:
             raise HTTPException(

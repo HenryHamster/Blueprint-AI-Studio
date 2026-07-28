@@ -9,6 +9,7 @@ Split from test_admin_routers.py; no behavior change."""
 
 import logging
 import uuid
+from datetime import timedelta
 from unittest.mock import (
     AsyncMock,
     patch,
@@ -1191,6 +1192,63 @@ async def test_resident_reply_receipt_is_atomic_and_idempotent(
         )
     ).scalars().all()
     assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_resident_reply_completes_exact_live_conversation_claim(
+    client: AsyncClient, db_session
+):
+    """Only the worker holding the durable turn lease can commit its reply."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    claim_id = uuid.uuid4()
+    inbound = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        conversation_claim_id=claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_expires_at=_utcnow() + timedelta(minutes=1),
+        conversation_claim_attempt=1,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Please finish this exact durable turn.",
+        resident_session_id="resident-receipt-session",
+    )
+    db_session.add(inbound)
+    await db_session.commit()
+    await db_session.refresh(inbound)
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+    body = {
+        "task_id": str(task.id),
+        "op": "create_message",
+        "data": {
+            "type": "NOTE",
+            "content": "The durable turn is complete.",
+            "idempotency_key": "resident-durable-claim-reply",
+            "covered_message_ids": [str(inbound.id)],
+            "conversation_claim_id": str(claim_id),
+        },
+    }
+    headers = {"x-agent-token": token}
+
+    first = await client.post("/api/agent/strategic", headers=headers, json=body)
+    assert first.status_code == 200, first.text
+    await db_session.refresh(inbound)
+    assert inbound.status == "handled"
+    assert inbound.handling_state == MessageHandlingState.RESPONDED
+    assert inbound.conversation_claim_id == claim_id
+    assert inbound.conversation_claim_expires_at is None
+
+    replay = await client.post("/api/agent/strategic", headers=headers, json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["message_id"] == first.json()["message_id"]
 
 
 @pytest.mark.asyncio

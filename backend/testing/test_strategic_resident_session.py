@@ -946,6 +946,47 @@ async def test_reload_ensure_keeps_worker_during_transient_heartbeat_gap(db_sess
 
 
 @pytest.mark.asyncio
+async def test_reload_ensure_does_not_supersede_fresh_task_on_stale_projection(
+    db_session,
+):
+    """The exact task heartbeat wins over a lagging resident-session mirror."""
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.IN_PROGRESS
+    old_task.last_heartbeat = _utcnow() - timedelta(seconds=8)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob["worker_heartbeat_at"] = stale_at.isoformat()
+    blob["updated_at"] = stale_at.isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    reused = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert reused["session_id"] == started["session_id"]
+    assert reused["worker_generation"] == started["worker_generation"]
+    assert reused["task_id"] == started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retry_status", [TaskStatus.QUEUED, TaskStatus.PROVISIONING])
 async def test_reload_ensure_keeps_fresh_retry_heartbeat_past_startup_window(
     db_session, retry_status
@@ -1451,6 +1492,7 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     session_id = "ss-ended"
+    durable_claim_id = uuid.uuid4()
     unanswered = ProjectMessage(
         project_id=project.id,
         message_type=MessageType.QUESTION,
@@ -1459,6 +1501,10 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
         status="open",
         handling_state=MessageHandlingState.CLAIMED,
         handled_by_task_id=task.id,
+        conversation_claim_id=durable_claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_expires_at=_utcnow() + timedelta(minutes=1),
+        conversation_claim_attempt=1,
         resident_session_id=session_id,
     )
     answered = ProjectMessage(
@@ -1493,6 +1539,8 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
     assert unanswered.resident_session_id is None
     assert unanswered.handling_state == MessageHandlingState.PENDING
     assert unanswered.handled_by_task_id is None
+    assert unanswered.conversation_claim_id == durable_claim_id
+    assert unanswered.conversation_claim_expires_at <= _utcnow()
     await db_session.refresh(answered)
     assert answered.status == "resolved"
     assert answered.handling_state == MessageHandlingState.RESPONDED

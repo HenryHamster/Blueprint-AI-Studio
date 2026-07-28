@@ -1298,17 +1298,19 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_operability_0708_is_the_expected_schema_head():
-    """The additive operability migration extends 0707 and is the app head."""
+def test_conversation_claims_0709_is_the_expected_schema_head():
+    """Durable conversation claims extend the operability migration."""
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
-    migration_path = versions_dir / "0708_pipeline_operability_foundation.py"
-    content = migration_path.read_text()
-    revision, down_revision = parse_revision_identifiers(content)
-    assert (revision, down_revision) == ("0708", "0707")
+    operability = (
+        versions_dir / "0708_pipeline_operability_foundation.py"
+    ).read_text()
+    claims = (versions_dir / "0709_durable_conversation_claims.py").read_text()
+    assert parse_revision_identifiers(operability) == ("0708", "0707")
+    assert parse_revision_identifiers(claims) == ("0709", "0708")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0708", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0708', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0709", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0709', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

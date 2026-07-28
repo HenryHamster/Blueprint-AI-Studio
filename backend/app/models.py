@@ -3790,6 +3790,30 @@ class ProjectMessage(SQLModel, table=True):
             nullable=True,
         ),
     )
+    # Durable foreground-turn claim. A Resident may read an operator message
+    # only after atomically claiming it; every message in one response batch
+    # shares the same claim id. The short lease lets a replacement generation
+    # reclaim the exact batch after a provider/process/runner failure.
+    conversation_claim_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True),
+    )
+    conversation_claim_generation: int | None = Field(
+        default=None,
+        sa_column=Column(Integer, nullable=True),
+    )
+    conversation_claim_expires_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    conversation_claim_attempt: int = Field(
+        default=0,
+        sa_column=Column(
+            Integer,
+            nullable=False,
+            server_default=text("0"),
+        ),
+    )
     reply_to_message_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(
@@ -3872,6 +3896,10 @@ class ProjectMessage(SQLModel, table=True):
             "reply_to_message_id IS NULL OR reply_to_message_id <> id",
             name="chk_projectmessage_reply_not_self",
         ),
+        CheckConstraint(
+            "conversation_claim_attempt >= 0",
+            name="chk_projectmessage_claim_attempt_nonnegative",
+        ),
         Index("ix_projectmessage_project_status", "project_id", "status"),
         Index(
             "ux_projectmessage_project_sequence",
@@ -3895,6 +3923,17 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_actor_user_id", "actor_user_id"),
         Index("ix_projectmessage_handled_by_task_id", "handled_by_task_id"),
+        Index(
+            "ix_projectmessage_project_claim",
+            "project_id",
+            "conversation_claim_id",
+        ),
+        Index(
+            "ix_projectmessage_project_claim_lease",
+            "project_id",
+            "handling_state",
+            "conversation_claim_expires_at",
+        ),
         Index("ix_projectmessage_reply_to_message_id", "reply_to_message_id"),
         # One logical message per (project, client key). Partial so keyless
         # legacy sends are unconstrained; the create endpoint queries this

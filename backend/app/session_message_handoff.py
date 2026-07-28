@@ -148,6 +148,7 @@ async def _apply_handoff_mutations(
         if answered:
             message.status = "resolved"
             message.handling_state = MessageHandlingState.RESPONDED
+            message.conversation_claim_expires_at = None
             message.resolution = message.resolution or "session_handoff_answered"
             message.resolved_at = message.resolved_at or now
             answered_count += 1
@@ -155,6 +156,11 @@ async def _apply_handoff_mutations(
             message.resident_session_id = None
             message.handling_state = MessageHandlingState.PENDING
             message.handled_by_task_id = None
+            # Preserve the durable claim id as the logical-turn identity, but
+            # expire its ownership immediately so a replacement Resident can
+            # reclaim the same turn without waiting for the old lease.
+            if message.conversation_claim_id is not None:
+                message.conversation_claim_expires_at = now
             message.resolution = None
             message.resolved_at = None
             released_count += 1

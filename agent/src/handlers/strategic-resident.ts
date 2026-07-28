@@ -52,7 +52,8 @@ import {
   decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
   serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
-  type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
+  type ConversationClaimResponse, type MessagesPollResponse,
+  type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
   type PendingOperatorDecisionReview,
@@ -98,7 +99,12 @@ const MAX_CONSECUTIVE_STALLS = 3;
 // and avoids spawning a new task/account claim; keep a hard bound so a real
 // provider outage still surfaces with evidence instead of looping forever.
 const MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES = 2;
+// One same-generation retry distinguishes a transient native reply-tool miss
+// from a broken delivery channel. A second miss replaces the worker instead of
+// silently retrying the operator's message forever.
+const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
+const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
 export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
 
 export interface ResidentReplyRuntimePaths {
@@ -875,6 +881,8 @@ export async function handleStrategicResident(
     cursorBefore: string;
     messages: ResidentInboundMessage[];
   } | null = null;
+  let activeConversationClaimId: string | null = null;
+  let activeConversationClaimMessageIds: string[] = [];
   let artifactRetryFailures = 0;
   let operatorReplyProtocolFailures = 0;
   let lastDeliveredRepoHead = typeof ctx._resident_repo_head === 'string'
@@ -1094,11 +1102,19 @@ export async function handleStrategicResident(
     });
   };
   const invalidateSessionEvents = (): void => { sessionEventEpoch += 1; };
-  // The operator response target is a UI/progress SLO, never a cancellation
-  // deadline. Use the deeper autonomous no-output budget for the subprocess
-  // watchdog, while the session provider keeps its independent 15-minute hard
-  // backstop for a genuinely non-terminating child.
-  const sessionStallTimeoutMs = Math.max(cfg.turnTimeoutMs, cfg.autonomousTurnTimeoutMs);
+  // ResidentSession clamps per-turn stall overrides to its configured base.
+  // Configure that base to the SHORTER interactive budget, then explicitly give
+  // autonomous turns their deeper allowance in runTurn(). Using max() here
+  // previously erased the operator deadline and made every chat turn inherit
+  // the autonomous five-minute no-output window.
+  const sessionBaseStallTimeoutMs = Math.min(
+    cfg.turnTimeoutMs,
+    cfg.autonomousTurnTimeoutMs,
+  );
+  const operatorHardTimeoutMs = Math.max(
+    60_000,
+    cfg.turnTimeoutMs + OPERATOR_HARD_TIMEOUT_GRACE_MS,
+  );
   let residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
     receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
@@ -1107,7 +1123,11 @@ export async function handleStrategicResident(
     WORKSPACE, residentReplyTool.configPath, workdayCallTool.configPath,
   );
   const residentSessionOptions = () => ({
-    model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
+    model,
+    effort,
+    disallowedTools,
+    workspace: WORKSPACE,
+    turnTimeoutMs: sessionBaseStallTimeoutMs,
     replyTool: {
       mcpConfigPath: residentCallMcpConfigPath,
       toolName: RESIDENT_REPLY_TOOL_NAME,
@@ -1209,9 +1229,9 @@ export async function handleStrategicResident(
     } else {
       streamer.working();
     }
-    // All turns get the same no-output budget. The shorter operator response
-    // target below is progress-only, so a slow healthy reply cannot terminate
-    // the resident.
+    const stallTimeoutMs = operator
+      ? cfg.turnTimeoutMs
+      : cfg.autonomousTurnTimeoutMs;
     let residentInput: string | Array<Record<string, unknown>>;
     if (Array.isArray(full)) {
       const materialized = await materializeContentBlocks(full);
@@ -1225,7 +1245,14 @@ export async function handleStrategicResident(
       }, cfg.turnTimeoutMs)
       : null;
     try {
-      const r = await session.sendTurn(residentInput, { stallTimeoutMs: sessionStallTimeoutMs });
+      const r = await session.sendTurn(residentInput, {
+        stallTimeoutMs,
+        // Interactive work must never inherit the session provider's fifteen
+        // minute absolute ceiling. Deep work belongs in the private/autonomous
+        // lane; a foreground worker that cannot finish within this bound is
+        // fenced and replaced with the durable message still open.
+        ...(operator ? { hardTimeoutMs: operatorHardTimeoutMs } : {}),
+      });
       streamer.flush();
       streamer.done();
       recordResidentTurnLatency({
@@ -1451,6 +1478,9 @@ export async function handleStrategicResident(
           content: text,
           idempotency_key: residentMessageKey('reply', anchorMessageId),
           covered_message_ids: coveredMessageIds,
+          ...(activeConversationClaimId === null
+            ? {}
+            : { conversation_claim_id: activeConversationClaimId }),
           ...(stagedReply.context === undefined ? {} : { context: stagedReply.context }),
           resident_turn_state: residentTurnState,
         },
@@ -1519,6 +1549,7 @@ export async function handleStrategicResident(
     if (callCoordinator.suppressOrdinaryWorkday()) return [];
     const collected: ResidentInboundMessage[] = [];
     let collectedRequiredImages = 0;
+    let claimRequired = false;
     const cursorBefore = cursor;
     try {
       for (let page = 0; page < MAX_POLL_PAGES; page++) {
@@ -1529,6 +1560,7 @@ export async function handleStrategicResident(
         const sessionScope = sessionId ? `&session_id=${encodeURIComponent(sessionId)}&worker_generation=${workerGeneration}` : '';
         const q = `since=${encodeURIComponent(cursor)}&from_type=user&status=open&limit=${MESSAGE_POLL_LIMIT}${sessionScope}`;
         const resp = await apiGet(`/api/agent/projects/${projectId}/messages?${q}`) as MessagesPollResponse;
+        claimRequired = claimRequired || resp.claim_required === true;
         const raw = Array.isArray(resp.messages) ? resp.messages : [];
         const admission = admitMessageBatchPage(
           raw,
@@ -1561,6 +1593,46 @@ export async function handleStrategicResident(
         cursorBefore,
         messages: [...collected],
       };
+      if (claimRequired) {
+        const messageIds = collected
+          .map(message => typeof message.id === 'string' ? message.id.trim() : '')
+          .filter(Boolean);
+        if (messageIds.length !== collected.length) {
+          rollbackPendingOperatorAdmission();
+          return [];
+        }
+        try {
+          const claimed = await apiPost(
+            `/api/agent/projects/${projectId}/messages/claim`,
+            {
+              task_id: taskId,
+              session_id: sessionId,
+              worker_generation: workerGeneration,
+              message_ids: messageIds,
+              lease_seconds: 45,
+            },
+          ) as ConversationClaimResponse;
+          const claimedIds = Array.isArray(claimed.message_ids)
+            ? claimed.message_ids.filter((value): value is string => typeof value === 'string')
+            : [];
+          if (
+            typeof claimed.claim_id !== 'string'
+            || claimed.claim_id.length === 0
+            || [...claimedIds].sort().join('\n') !== [...messageIds].sort().join('\n')
+          ) {
+            throw new Error('conversation claim response did not cover the exact operator batch');
+          }
+          activeConversationClaimId = claimed.claim_id;
+          activeConversationClaimMessageIds = [...claimedIds];
+        } catch (error) {
+          sendLog(
+            ws,
+            `[resident] durable conversation admission deferred: ${sanitize(String(error))}\n`,
+          );
+          rollbackPendingOperatorAdmission();
+          return [];
+        }
+      }
     }
     return collected;
   };
@@ -1634,6 +1706,22 @@ export async function handleStrategicResident(
     } catch (e) {
       sendLog(ws, `[resident] reply retry cleanup incomplete: ${String(e)}\n`);
     }
+    if (
+      operatorReplyProtocolFailures
+      >= MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES
+    ) {
+      stopReason = 'operator_reply_protocol_failed';
+      setResidentActivity(
+        'waiting',
+        'Reply channel failed repeatedly; replacing the Resident worker',
+      );
+      sendLog(
+        ws,
+        `[resident] FATAL: ${detail}; native reply delivery failed `
+          + `${operatorReplyProtocolFailures} consecutive times; replacing worker\n`,
+      );
+      return 'stop';
+    }
     const retryMs = Math.min(
       30_000,
       Math.max(cfg.messagePollMs, 1_500)
@@ -1692,6 +1780,12 @@ export async function handleStrategicResident(
       // crash) can restore settled decisions from task.context._decisions_reg.
       decisions_reg: decisionsReg.length > 0 ? serializeDecisionsReg(decisionsReg) : null,
       activity: residentActivity,
+      ...(activeConversationClaimId === null
+        ? {}
+        : {
+          conversation_claim_id: activeConversationClaimId,
+          conversation_claim_lease_seconds: 45,
+        }),
     };
     const activeCallLease = callCoordinator.currentLease();
     if (callLeaseIsPubliclyActive(activeCallLease) && activeCallLease) {
@@ -2426,6 +2520,10 @@ export async function handleStrategicResident(
       if (raced === 'done') return 'done';
       if (livenessHeartbeatDue()) {
         const hb = await livenessHeartbeat();
+        if (hb?.conversation_claim_held === false) {
+          stopReason = 'conversation_claim_lost';
+          return 'stop';
+        }
         if (hb?.stop_requested || !authorityHeld) return 'stop';
       }
     }
@@ -2510,6 +2608,18 @@ export async function handleStrategicResident(
     const coveredMessageIds = msgs
       .map(message => typeof message.id === 'string' ? message.id.trim() : '')
       .filter(Boolean);
+    if (
+      activeConversationClaimId !== null
+      && [...coveredMessageIds].sort().join('\n')
+        !== [...activeConversationClaimMessageIds].sort().join('\n')
+    ) {
+      stopReason = 'conversation_claim_batch_mismatch';
+      sendLog(
+        ws,
+        '[resident] durable conversation claim no longer matches the admitted operator batch\n',
+      );
+      return 'stop';
+    }
     const replyAnchorId = oldestStableInboundMessageId(msgs);
     if (replyAnchorId === null || coveredMessageIds.length !== msgs.length) {
       stopReason = 'operator_reply_missing_stable_message_id';
@@ -2716,6 +2826,8 @@ export async function handleStrategicResident(
     }
     operatorReplyProtocolFailures = 0;
     pendingOperatorAdmission = null;
+    activeConversationClaimId = null;
+    activeConversationClaimMessageIds = [];
     // The create_message transaction already marked exactly this receipt's
     // covered IDs handled and persisted the restart-critical turn metadata.
     // The heartbeat only renews authority and reports ancillary session state;

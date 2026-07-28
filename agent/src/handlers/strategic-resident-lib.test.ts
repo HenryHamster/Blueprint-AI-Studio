@@ -39,7 +39,7 @@ describe('residentConfig', () => {
   it('uses contract defaults when the payload omits the knobs', () => {
     const c = residentConfig({});
     expect(c.idleTickMs).toBe(5000);
-    expect(c.messagePollMs).toBe(1500); // fast operator pickup default (1.5s)
+    expect(c.messagePollMs).toBe(750); // backend-budgeted fast pickup default
     expect(c.turnTimeoutMs).toBe(120_000);
     expect(c.autonomousEnabled).toBe(true);
     expect(c.minTickMs).toBe(600_000);
@@ -2908,6 +2908,14 @@ describe('modelContextLimit', () => {
   it('returns 200K for fable models', () => {
     expect(modelContextLimit('claude-fable-5')).toBe(200_000);
     expect(modelContextLimit('fable')).toBe(200_000);
+  });
+
+  it('uses a conservative context limit for routed DeepSeek residents', () => {
+    expect(modelContextLimit('deepseek-v4-pro')).toBe(128_000);
+    expect(modelContextLimit('DeepSeek')).toBe(128_000);
+    expect(compactionThreshold('deepseek-v4-pro')).toBe(
+      Math.floor(128_000 * COMPACTION_THRESHOLD_RATIO),
+    );
   });
 
   it('returns DEFAULT_CONTEXT_LIMIT for unrecognized models', () => {
