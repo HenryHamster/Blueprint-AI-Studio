@@ -229,11 +229,13 @@ describe('buildReviewVerdictInstructions — block on substantiated code defects
   });
 
   it('requires the reviewer to choose whether a requested fix needs independent re-review', () => {
-    expect(out).toContain('"requires_rereview": true');
+    expect(out).toContain('"requires_rereview": false');
     expect(out).toContain('REQUEST_CHANGES verdict MUST include the boolean `requires_rereview`');
     expect(out).toContain('`true` — an independent follow-up review is required');
     expect(out).toContain('`false` — you are comfortable delegating closure');
     expect(out).toContain('not mechanical proof that the repair is correct');
+    expect(out).toContain('localized, fully specified repair with a focused regression test');
+    expect(out).toContain('Do not choose `true` merely because the issue is labeled critical or major');
   });
 
   it('keeps requires_rereview out of APPROVE verdicts', () => {
