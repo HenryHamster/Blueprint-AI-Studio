@@ -88,6 +88,8 @@ sudo chmod 0600 /etc/blueprint-livekit/secret-refs
 sudo tee /etc/blueprint-livekit/public.env >/dev/null <<'EOF'
 LIVEKIT_PUBLIC_HOST=livekit.example.com
 LIVEKIT_TURN_HOST=turn.example.com
+# Optional; defaults to 443 behind the production TCP proxy.
+LIVEKIT_TURN_TLS_PORT=443
 CADDY_ACME_EMAIL=ops@example.com
 EOF
 sudo chmod 0600 /etc/blueprint-livekit/public.env
@@ -99,6 +101,9 @@ The production config's `turn.domain` must exactly equal `LIVEKIT_TURN_HOST`;
 it must not be `LIVEKIT_PUBLIC_HOST`. The gateway preflight fetches the pinned
 config into a temporary protected directory and rejects that mismatch before a
 service start or reload. The TURN certificate must cover that same TURN host.
+`LIVEKIT_TURN_TLS_PORT` must match `turn.tls_port` in the pinned config. Leave
+it at `443` behind the production TCP proxy; a direct staging gateway may use
+`5349`.
 
 ## Backend token and speech credentials
 

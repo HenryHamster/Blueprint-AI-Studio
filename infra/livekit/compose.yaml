@@ -18,9 +18,10 @@ services:
     ports:
       - "127.0.0.1:7880:7880/tcp"
       - "127.0.0.1:6789:6789/tcp"
-      # The GCE TCP proxy's backend is this VM:5349. LiveKit itself listens on
-      # 443 and advertises 443 in ICE/TURN configuration.
-      - "5349:443/tcp"
+      # The GCE TCP proxy's backend is this VM:5349. Production keeps the
+      # default internal/advertised port 443; direct staging can explicitly
+      # set LIVEKIT_TURN_TLS_PORT=5349 without changing the public bind.
+      - "5349:${LIVEKIT_TURN_TLS_PORT:-443}/tcp"
       - "7881:7881/tcp"
       - "3478:3478/udp"
       - "50000-60000:50000-60000/udp"

@@ -37,6 +37,7 @@ Environment=BLUEPRINT_LIVEKIT_RUNTIME_DIR=/run/blueprint-livekit
 Environment=BLUEPRINT_LIVEKIT_STATE_DIR=/var/lib/blueprint-livekit
 Environment=BLUEPRINT_LIVEKIT_UID=65532
 Environment=BLUEPRINT_LIVEKIT_GCLOUD=@GCLOUD@
+EnvironmentFile=/etc/blueprint-livekit/public.env
 # Keep gcloud's cache outside both /root and the container-mounted runtime dir.
 Environment=CLOUDSDK_CONFIG=/var/cache/blueprint-livekit-gcloud
 ExecStartPre=@BASH@ @LIVEKIT_DIR@/bin/render-livekit-secrets
