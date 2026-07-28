@@ -7804,6 +7804,15 @@ def main() -> None:
         print(__doc__ or "", flush=True)
         return
 
+    if br.livekit_gateway_role_is_selected():
+        print(
+            "ERROR: this host is reserved for the Blueprint LiveKit gateway role; "
+            "refusing to start task capacity. Stop and remove the gateway role "
+            "explicitly before running local_runner.py.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     check_mode = "--check" in sys.argv[1:]
 
     signal.signal(signal.SIGTERM, _handle_signal)

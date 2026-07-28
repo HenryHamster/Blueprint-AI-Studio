@@ -176,7 +176,14 @@ export interface ResidentSessionOptions {
   /** called once when the child process exits */
   onExit?: (code: number | null) => void;
   /** Required native MCP reply tool for this Resident session. */
-  replyTool?: { mcpConfigPath: string; toolName?: string };
+  replyTool?: { mcpConfigPath: string; toolName?: string; allowedTools?: readonly string[] };
+  /**
+   * Restricted foreground launch supplied by the Call Coordinator.  Unlike the
+   * ordinary coding Resident it has an empty cwd, a filtered environment, and
+   * no broad-permission CLI arguments.  The caller must have already built the
+   * strict local-MCP configuration; this transport remains Claude-compatible.
+   */
+  foregroundLaunch?: { command: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string };
 }
 
 interface ActiveTurn {
@@ -247,7 +254,15 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     ?? Math.max(DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS, turnTimeoutMs + RESIDENT_TURN_FORCE_SETTLE_MS);
 
   const runner = getProviderRunner();
-  const base = runner.buildRunCommand('', opts.model, opts.effort, opts.disallowedTools);
+  const runnerBase = runner.buildRunCommand('', opts.model, opts.effort, opts.disallowedTools);
+  const base = opts.foregroundLaunch
+    ? {
+      command: opts.foregroundLaunch.command,
+      args: opts.foregroundLaunch.args,
+      env: opts.foregroundLaunch.env,
+      outputMode: runnerBase.outputMode,
+    }
+    : runnerBase;
   if (base.outputMode !== 'claude-stream-json') {
     throw new Error(
       `resident session requires a Claude-compatible provider (anthropic/zai/deepseek); got ${runner.provider}/${base.outputMode}`,
@@ -260,8 +275,12 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // Keep resident launch compatible with the installed Claude binary just like
   // the ordinary one-shot runner path.
   const capabilities = probeClaudeCapabilities(base.command, base.env);
-  const compatibleBaseArgs = stripUnsupportedClaudeOptionalArgs(base.args, capabilities);
-  const args = [...compatibleBaseArgs, '--input-format', 'stream-json'];
+  const compatibleBaseArgs = opts.foregroundLaunch
+    ? [...base.args]
+    : stripUnsupportedClaudeOptionalArgs(base.args, capabilities);
+  const args = opts.foregroundLaunch || compatibleBaseArgs.includes('--input-format')
+    ? compatibleBaseArgs
+    : [...compatibleBaseArgs, '--input-format', 'stream-json'];
   if (opts.replyTool) {
     if (capabilities && (
       !capabilities.has('--mcp-config')
@@ -270,21 +289,23 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     )) {
       throw new Error('resident native reply tool requires Claude --mcp-config, --strict-mcp-config, and --allowedTools support');
     }
-    args.push(
-      '--mcp-config', opts.replyTool.mcpConfigPath,
-      '--strict-mcp-config',
-      '--allowedTools', opts.replyTool.toolName ?? RESIDENT_REPLY_TOOL_NAME,
-    );
+    args.push('--mcp-config', opts.replyTool.mcpConfigPath, '--strict-mcp-config');
+    for (const toolName of opts.replyTool.allowedTools ?? [opts.replyTool.toolName ?? RESIDENT_REPLY_TOOL_NAME]) {
+      args.push('--allowedTools', toolName);
+    }
   }
 
   // Guarantee the live token file exists with the CURRENT token before the
   // long-lived subprocess (and its bash helpers) start reading it. Refreshes
   // thereafter keep it current via setToken. Best-effort/no-op when the file is
   // unconfigured or the token is empty (tests).
-  writeAgentTokenFile(getAgentToken());
+  // The normal Resident keeps an agent token file for its project helpers.
+  // A foreground Call Resident has no helpers and must not create or inherit
+  // that backend credential in its isolated environment.
+  if (!opts.foregroundLaunch) writeAgentTokenFile(getAgentToken());
 
   const child = spawn(base.command, args, {
-    cwd: workspace,
+    cwd: opts.foregroundLaunch?.cwd ?? workspace,
     env: base.env,
     detached: true,
     stdio: ['pipe', 'pipe', 'pipe'],

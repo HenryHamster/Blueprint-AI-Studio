@@ -1,0 +1,32 @@
+# Store the production version of this file in the explicitly-versioned
+# `blueprint-livekit-config` Secret Manager secret. Do not deploy this example:
+# it intentionally contains non-working credentials and a placeholder host.
+port: 7880
+log_level: info
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  # Required when the server runs on a GCE VM with a public address and host
+  # networking. Validate the advertised candidates during staging.
+  use_external_ip: true
+
+turn:
+  enabled: true
+  # Must exactly equal LIVEKIT_TURN_HOST in /etc/blueprint-livekit/public.env.
+  # This is the separate TCP-proxy hostname, not the public WSS hostname.
+  domain: turn.example.com
+  udp_port: 3478
+  # This is the public port advertised to browsers. Compose maps internal 443
+  # to VM port 5349, and a separate GCE TCP proxy exposes it as external 443.
+  tls_port: 443
+  cert_file: /run/blueprint-livekit/turn.crt
+  key_file: /run/blueprint-livekit/turn.key
+
+# Keep Prometheus private to the VM. A local collector or authenticated tunnel
+# may scrape it; do not add a public firewall rule for this port.
+prometheus_port: 6789
+
+keys:
+  REPLACE_WITH_LIVEKIT_API_KEY: REPLACE_WITH_LIVEKIT_API_SECRET

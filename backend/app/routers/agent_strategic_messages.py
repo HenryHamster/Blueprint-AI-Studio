@@ -43,10 +43,11 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from slowapi.util import get_remote_address
@@ -70,7 +71,12 @@ from app.project_message_projection import (
     message_updated_event_payload,
     project_message_base,
 )
-from app.project_message_creation import build_project_message
+from app.project_message_creation import (
+    build_project_message,
+    create_operator_project_message,
+    lock_project_and_next_message_sequence,
+    parse_operator_message_type,
+)
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter
@@ -92,6 +98,39 @@ _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE = 240
 _RESIDENT_POLL_RATE_LIMIT = f"{_RESIDENT_POLL_RATE_LIMIT_PER_MINUTE}/minute"
 
 
+class FinalizedCallTranscript(BaseModel):
+    """Coordinator-authenticated final transcript; operator identity is never input."""
+
+    task_id: uuid.UUID
+    call_id: str = Field(..., min_length=1, max_length=128)
+    call_generation: int = Field(..., ge=1)
+    content: str = Field(..., min_length=1, max_length=20_000)
+    message_type: str = Field(default="NOTE", max_length=32)
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+    input_source: Literal["voice", "typed", "whiteboard"]
+
+
+class CompleteCallTurn(BaseModel):
+    task_id: uuid.UUID
+    call_id: str = Field(..., min_length=1, max_length=128)
+    call_generation: int = Field(..., ge=1)
+    input_revision: int = Field(..., ge=1)
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+    covered_message_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=20)
+    content: str = Field(..., min_length=1, max_length=20_000)
+    exact_text: str | None = Field(default=None, max_length=20_000)
+    display_blocks: list[dict[str, str]] = Field(default_factory=list, max_length=8)
+
+
+class EndResidentCall(BaseModel):
+    """Exact worker/call fence for coordinator-initiated empty-room cleanup."""
+
+    task_id: uuid.UUID
+    call_id: str = Field(..., min_length=1, max_length=128)
+    call_generation: int = Field(..., ge=1)
+    reason: Literal["operator_disconnected"]
+
+
 def _resident_poll_rate_limit_key(request: Request) -> str:
     """Isolate high-frequency polls by network origin and project.
 
@@ -102,6 +141,392 @@ def _resident_poll_rate_limit_key(request: Request) -> str:
     remote = get_remote_address(request)
     project_scope = str(request.path_params.get("project_id") or "unknown-project")
     return f"resident-message-poll:{remote}:{project_scope}"
+
+
+@router.post("/projects/{project_id}/strategic-call/finalized-transcript")
+@limiter.limit("60/minute")
+async def create_finalized_call_transcript(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: FinalizedCallTranscript,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Persist one canonical call input using the server-owned lease actor.
+
+    The coordinator may authenticate only as the Workday Resident task.  It
+    cannot choose an operator, project, generation, or reply owner; all are
+    checked against the locked nested lease immediately before the existing
+    idempotent operator-message transaction commits.
+    """
+    if str(payload.task_id) != str(token.get("sub")):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    project = await _resolve_agent_project(project_id, token, session)
+    task = await session.get(Task, payload.task_id)
+    task_context = task.context if task is not None else {}
+    if task is None or task_context.get("_resident_session") is not True:
+        raise HTTPException(status_code=409, detail="Finalized transcripts require a Resident task")
+
+    from app.strategic_resident_session import (
+        bind_resident_call_input_to_locked_project,
+        read_resident_call,
+        resident_call_is_active,
+    )
+
+    def _lease_actor(vision: dict | None) -> str:
+        call = read_resident_call(vision)
+        if (
+            not resident_call_is_active(call)
+            or str((call or {}).get("call_id")) != payload.call_id
+            or int((call or {}).get("generation") or 0) != payload.call_generation
+            or str((call or {}).get("worker_task_id")) != str(payload.task_id)
+        ):
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        actor = str((call or {}).get("actor_user_id") or "").strip()
+        if not actor:
+            raise HTTPException(status_code=409, detail="Call lease has no operator actor")
+        return actor
+
+    actor_user_id = _lease_actor(project.vision)
+    message_context = {
+        "call_id": payload.call_id,
+        "call_generation": payload.call_generation,
+        "input_source": payload.input_source,
+    }
+
+    async def _revalidate_call_lease(
+        locked_session: AsyncSession,
+        _message_id: uuid.UUID,
+        current_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        locked_project = (
+            await locked_session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if locked_project is None or _lease_actor(locked_project.vision) != actor_user_id:
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        return bind_resident_call_input_to_locked_project(
+            locked_project,
+            actor_user_id=actor_user_id,
+            context=current_context,
+            input_source=payload.input_source,
+        )
+
+    result = await create_operator_project_message(
+        session,
+        project=project,
+        user_id=actor_user_id,
+        message_type=parse_operator_message_type(payload.message_type),
+        content=payload.content,
+        context=message_context,
+        workbench_context=None,
+        idempotency_key=payload.idempotency_key,
+        surface=MessageSurface.CONVERSATION,
+        include_strategic_session_snapshot=False,
+        precommit_validate=_revalidate_call_lease,
+    )
+    if result.message_event is not None:
+        await broadcast_to_project(str(project_id), "message_created", result.message_event)
+    return {
+        "id": result.message_id,
+        "status": result.status,
+        "message": _poll_message_dict(result.message),
+        "input_revision": (result.message.context or {}).get("input_revision"),
+    }
+
+
+@router.post("/projects/{project_id}/strategic-call/end")
+@limiter.limit("30/minute")
+async def end_resident_call_after_operator_disconnect(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: EndResidentCall,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Release a call only when its exact Resident worker observes an empty room."""
+    if str(payload.task_id) != str(token.get("sub")):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    project = await _resolve_agent_project(project_id, token, session)
+    task = await session.get(Task, payload.task_id)
+    if task is None or (task.context or {}).get("_resident_session") is not True:
+        raise HTTPException(status_code=409, detail="Call end requires a Resident task")
+
+    from app.strategic_resident_session import (
+        read_resident_call,
+        release_resident_call_lease,
+        resident_call_snapshot,
+    )
+
+    call = read_resident_call(project.vision)
+    if (
+        not isinstance(call, dict)
+        or str(call.get("call_id")) != payload.call_id
+        or int(call.get("generation") or 0) != payload.call_generation
+        or str(call.get("worker_task_id")) != str(payload.task_id)
+    ):
+        raise HTTPException(status_code=409, detail="Call lease superseded")
+
+    _call, account_id, changed = await release_resident_call_lease(
+        session,
+        project,
+        call_id=payload.call_id,
+        generation=payload.call_generation,
+        reason=payload.reason,
+    )
+    if changed and account_id:
+        from app.max_plan_pool import release_max_plan_call_slot
+
+        await release_max_plan_call_slot(account_id, project_id=str(project.id))
+    public_call = resident_call_snapshot(project.vision)
+    if changed:
+        await broadcast_to_project(
+            str(project.id), "call_updated", {"call": public_call}
+        )
+    return {
+        "project_id": str(project.id),
+        "call": public_call,
+        "status": "ended" if changed else "already_ended",
+    }
+
+
+@router.get("/projects/{project_id}/strategic-call/inputs")
+@limiter.limit("120/minute")
+async def get_call_inputs(
+    request: Request,
+    project_id: uuid.UUID,
+    call_id: str = Query(..., min_length=1, max_length=128),
+    call_generation: int = Query(..., ge=1),
+    message_id: uuid.UUID | None = Query(default=None),
+    after_sequence: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=20, ge=1, le=20),
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Fetch canonical typed/voice/Whiteboard turns for the active coordinator."""
+    if message_id is not None and after_sequence is not None:
+        raise HTTPException(status_code=400, detail="message_id and after_sequence are mutually exclusive")
+    project = await _resolve_agent_project(project_id, token, session)
+    task_id = uuid.UUID(str(token.get("sub")))
+    task = await session.get(Task, task_id)
+    task_context = task.context if task is not None else {}
+    from app.strategic_resident_session import read_resident_call, resident_call_is_active
+
+    call = read_resident_call(project.vision)
+    if (
+        task is None
+        or task_context.get("_resident_session") is not True
+        or not resident_call_is_active(call)
+        or str((call or {}).get("call_id")) != call_id
+        or int((call or {}).get("generation") or 0) != call_generation
+        or str((call or {}).get("worker_task_id")) != str(task_id)
+    ):
+        raise HTTPException(status_code=409, detail="Call lease superseded")
+
+    conditions = [
+        ProjectMessage.project_id == project_id,
+        ProjectMessage.from_type == "user",
+        ProjectMessage.surface == MessageSurface.CONVERSATION,
+        # Apply the call fence before the bounded page limit.  Filtering only
+        # after ``LIMIT`` lets unrelated ordinary chat rows starve canonical
+        # call input delivery indefinitely (and lets any project member turn
+        # that into a cheap availability attack against the call owner).
+        ProjectMessage.context["call_id"].as_string() == call_id,
+        ProjectMessage.context["call_generation"].as_integer() == call_generation,
+    ]
+    if message_id is not None:
+        conditions.append(ProjectMessage.id == message_id)
+    if after_sequence is not None:
+        conditions.append(ProjectMessage.sequence > after_sequence)
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(*conditions)
+                .order_by(ProjectMessage.sequence.asc(), ProjectMessage.id.asc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Keep an in-process defence-in-depth fence for malformed/cross-dialect JSON
+    # values even though the SQL predicate above is what protects the page limit.
+    rows = [
+        row
+        for row in rows
+        if isinstance(row.context, dict)
+        and row.context.get("call_id") == call_id
+        and int(row.context.get("call_generation") or 0) == call_generation
+    ]
+    attachments = await _materialize_workday_artifact_attachments(session, project_id, rows)
+    messages: list[dict[str, Any]] = []
+    for row in rows:
+        # The call coordinator advances its durable cursor by sequence, while
+        # the legacy resident poll intentionally exposes a narrower seven-field
+        # projection.  Add it only on this call-specific endpoint; without it
+        # every otherwise-valid call input is discarded by the coordinator's
+        # strict canonical-input parser.
+        projected = {**_poll_message_dict(row), "sequence": row.sequence}
+        if attachments.get(row.id):
+            projected["context"] = {
+                **dict(projected.get("context") or {}),
+                "attachments": attachments[row.id],
+            }
+        messages.append(projected)
+    return {
+        "call_id": call_id,
+        "call_generation": call_generation,
+        "input_revision": int((call or {}).get("input_revision") or 0),
+        "messages": messages,
+    }
+
+
+@router.post("/projects/{project_id}/strategic-call/complete-turn")
+@limiter.limit("60/minute")
+async def complete_call_turn(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: CompleteCallTurn,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Atomically commit the Fast-owned public answer for one fenced input revision."""
+    if str(payload.task_id) != str(token.get("sub")):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    if len(set(payload.covered_message_ids)) != len(payload.covered_message_ids):
+        raise HTTPException(status_code=400, detail="covered_message_ids contains duplicates")
+    allowed_blocks = {"latex", "code", "table", "artifact_ref"}
+    normalized_blocks: list[dict[str, str]] = []
+    for block in payload.display_blocks:
+        if set(block) != {"type", "content"} or block.get("type") not in allowed_blocks:
+            raise HTTPException(status_code=400, detail="Invalid display block")
+        content = str(block["content"])
+        if not content or len(content) > 10_000:
+            raise HTTPException(status_code=400, detail="Invalid display block content")
+        normalized_blocks.append({"type": block["type"], "content": content})
+
+    project = await _resolve_agent_project(project_id, token, session)
+    task = await session.get(Task, payload.task_id)
+    if task is None or (task.context or {}).get("_resident_session") is not True:
+        raise HTTPException(status_code=409, detail="Call completion requires a Resident task")
+    # Take the Project authority boundary before the message sequence and user
+    # rows, matching the existing Project -> sequence -> message lock order.
+    locked_project = (
+        await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    from app.strategic_resident_session import read_resident_call, resident_call_is_active
+
+    call = read_resident_call(locked_project.vision if locked_project else None)
+    if (
+        locked_project is None
+        or not resident_call_is_active(call)
+        or str((call or {}).get("call_id")) != payload.call_id
+        or int((call or {}).get("generation") or 0) != payload.call_generation
+        or str((call or {}).get("worker_task_id")) != str(payload.task_id)
+        or int((call or {}).get("input_revision") or 0) != payload.input_revision
+    ):
+        raise HTTPException(status_code=409, detail="Call input revision superseded")
+
+    existing = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == payload.idempotency_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        context = existing.context if isinstance(existing.context, dict) else {}
+        if (
+            existing.from_type != "strategic"
+            or existing.from_task_id != payload.task_id
+            or existing.content != payload.content.strip()
+            or context.get("call_id") != payload.call_id
+            or int(context.get("call_generation") or 0) != payload.call_generation
+            or int(context.get("input_revision") or 0) != payload.input_revision
+        ):
+            raise HTTPException(status_code=409, detail="idempotency_key already belongs to a different message")
+        return {"id": str(existing.id), "status": "duplicate", "input_revision": payload.input_revision}
+
+    covered_rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.id.in_(payload.covered_message_ids),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {row.id: row for row in covered_rows}
+    if len(by_id) != len(payload.covered_message_ids):
+        raise HTTPException(status_code=409, detail="covered message is unavailable")
+    for message_id in payload.covered_message_ids:
+        inbound = by_id[message_id]
+        inbound_context = inbound.context if isinstance(inbound.context, dict) else {}
+        if (
+            inbound.from_type != "user"
+            or inbound.status != "open"
+            or inbound_context.get("call_id") != payload.call_id
+            or int(inbound_context.get("call_generation") or 0) != payload.call_generation
+            or int(inbound_context.get("input_revision") or 0) > payload.input_revision
+        ):
+            raise HTTPException(status_code=409, detail="covered message is outside this active call input")
+
+    sequence = await lock_project_and_next_message_sequence(session, project_id)
+    context = stamp_message_audience(
+        {
+            "call_id": payload.call_id,
+            "call_generation": payload.call_generation,
+            "input_revision": payload.input_revision,
+            "message_role": "operator_reply",
+            "_resident_reply_covered_message_ids": sorted(
+                str(message_id) for message_id in payload.covered_message_ids
+            ),
+            **({"exact_text": payload.exact_text} if payload.exact_text else {}),
+            **({"display_blocks": normalized_blocks} if normalized_blocks else {}),
+        },
+        "question_answer",
+        message_type="NOTE",
+    )
+    output = await build_project_message(
+        session,
+        project_id=project_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        from_task_id=payload.task_id,
+        content=payload.content.strip(),
+        context=context,
+        idempotency_key=payload.idempotency_key,
+        resident_session_id=(locked_project.vision or {}).get("_resident_strategic_session", {}).get("session_id"),
+    )
+    session.add(output)
+    for inbound in covered_rows:
+        inbound.status = "handled"
+        inbound.handling_state = MessageHandlingState.RESPONDED
+        inbound.handled_by_task_id = payload.task_id
+        session.add(inbound)
+    await session.commit()
+    await session.refresh(output)
+    await broadcast_to_project(str(project_id), "message_created", message_event_payload(output))
+    return {"id": str(output.id), "status": "created", "input_revision": payload.input_revision}
 
 
 class PermanentWorkdayArtifactError(ValueError):
@@ -743,6 +1168,24 @@ async def agent_poll_messages(
                 status_code=409,
                 detail="Resident worker generation superseded or inactive",
             )
+        # The call coordinator owns finalized inputs and every public reply
+        # while its nested lease is live.  Suppress ordinary Workday pickup at
+        # the source instead of allowing the legacy turn loop to consume a
+        # message and then fail later at the reply CAS.
+        from app.strategic_resident_session import resident_call_is_active
+
+        active_call = resident_blob.get("call")
+        if (
+            resident_call_is_active(active_call)
+            and str((active_call or {}).get("worker_task_id"))
+            == str(authenticated_task_id)
+        ):
+            await session.commit()
+            return {
+                "messages": [],
+                "server_time": datetime.now(timezone.utc).isoformat(),
+                "call_active": True,
+            }
         # Caller-supplied scope is advisory only; authenticated task authority
         # always selects the current Resident conversation.
         session_id = authenticated_session_id

@@ -74,6 +74,14 @@ from app.project_message_projection import (
     message_preview_dict,
 )
 from app.knowledge_query import build_strategic_memory_index
+from app.livekit_tokens import (
+    LiveKitConfigurationError,
+    issue_browser_call_credentials,
+)
+from app.voice_credentials import (
+    VoiceCredentialConfigurationError,
+    validate_resident_call_deployment_configuration,
+)
 from app.strategic_context_package import (
     build_strategic_context_package_summary,
     load_strategic_context_evidence,
@@ -145,8 +153,15 @@ from app.storage import (
 from app.message_audience import stamp_message_audience, STRATEGIST_INTERNAL, PIPELINE_LOG
 from app.strategic_resident_session import (
     _ResidentEnsureModeChanged,
+    acquire_resident_call_lease,
     authoritative_resident_session_snapshot,
+    bind_resident_call_input_to_locked_project,
     build_resident_runner_options,
+    read_resident_call,
+    record_resident_call_playout_receipt,
+    release_resident_call_lease,
+    resident_call_is_active,
+    resident_call_snapshot,
     start_resident_session,
     stop_resident_session,
     sync_resident_session_for_interaction_mode,
@@ -578,6 +593,23 @@ class StrategicResidentSessionStart(BaseModel):
     runner_id: str | None = None
     expected_interaction_mode: Literal["continuous"] | None = None
     allow_no_runner: bool = False
+
+
+class StrategicCallStart(BaseModel):
+    ttl_seconds: int | None = Field(default=None, ge=30, le=900)
+
+
+class StrategicCallEnd(BaseModel):
+    call_id: str | None = Field(default=None, min_length=1, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+
+
+class StrategicCallPlayoutReceipt(BaseModel):
+    call_id: str = Field(..., min_length=1, max_length=128)
+    generation: int = Field(..., ge=1)
+    phrase_id: str = Field(..., min_length=1, max_length=128)
+    event: Literal["started", "interrupted", "completed"]
+    at: str | None = Field(default=None, max_length=80)
 
 
 _ATTACHMENT_DEFAULT_CONTENT_TYPE = "application/octet-stream"
@@ -3348,12 +3380,31 @@ async def create_project_strategic_session_message(
                 status_code=409,
                 detail="Message references changed before commit; refresh and retry",
             )
-        return await _consume_message_attachment_uploads(
+        consumed_context = await _consume_message_attachment_uploads(
             locked_session,
             project_id=project_id,
             actor_user_id=current_user["user_id"],
             message_id=message_id,
             context=current_context,
+        )
+        locked_project = (
+            await locked_session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        return bind_resident_call_input_to_locked_project(
+            locked_project,
+            actor_user_id=current_user["user_id"],
+            context=consumed_context,
+            input_source=(
+                "whiteboard"
+                if isinstance(consumed_context.get("artifact_refs"), list)
+                and consumed_context.get("artifact_refs")
+                else "typed"
+            ),
         )
 
     result = await create_operator_project_message(
@@ -3390,6 +3441,9 @@ async def create_project_strategic_session_message(
         "message": message_preview,
         "project_id": str(project_id),
     }
+    call_input_revision = (result.message.context or {}).get("input_revision")
+    if isinstance(call_input_revision, int):
+        response["input_revision"] = call_input_revision
     if result.message_event is not None:
         await broadcast_to_project(
             str(project_id),
@@ -3669,6 +3723,247 @@ async def start_project_strategic_resident_session(
     }
 
 
+@router.post("/projects/{project_id}/strategic-call/start")
+@limiter.limit("30/minute")
+async def start_project_strategic_call(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicCallStart | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Acquire the temporary Fast-Resident reply-owner lease for Workday."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    resident = await authoritative_resident_session_snapshot(session, project)
+    if not resident or resident.get("status") != "active" or resident.get("stop_requested"):
+        raise HTTPException(status_code=409, detail="An active Workday Resident is required")
+    existing_call = read_resident_call(project.vision)
+    if resident_call_is_active(existing_call) and str(
+        (existing_call or {}).get("actor_user_id")
+    ) != str(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="Only the call owner may reconnect")
+    worker_task_id = resident.get("task_id")
+    worker_task = await session.get(Task, uuid.UUID(str(worker_task_id))) if worker_task_id else None
+    account_id = (getattr(worker_task, "llm_account_id", None) or "").strip()
+    if not account_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Workday has no pooled account available for a Fast Resident slot",
+        )
+    from app.max_plan_pool import get_task_llm_provider
+
+    foreground_provider = (get_task_llm_provider(worker_task) or "").strip().lower()
+    if foreground_provider not in {"anthropic", "zai", "deepseek"}:
+        # Phase 0's restricted foreground launcher is Claude-stream compatible.
+        # Refuse before reserving a slot or acquiring public reply ownership;
+        # OpenAI/Gemini require their qualified app-server/streaming adapters.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Workday provider does not yet have a qualified Fast Resident "
+                "adapter; typed conversation remains available"
+            ),
+        )
+    try:
+        validate_resident_call_deployment_configuration()
+    except VoiceCredentialConfigurationError as exc:
+        # Do not reserve a model slot or suppress typed delivery for a
+        # deployment that cannot start the complete call path.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    # The first caller reserves the additional process before publishing the
+    # owner fence. A racing caller compensates its reservation when the lease
+    # acquisition reports that the first call already won.
+    from app.max_plan_pool import (
+        release_max_plan_call_slot,
+        reserve_max_plan_call_slot,
+    )
+
+    if isinstance(existing_call, dict) and existing_call.get("status") == "active" and not resident_call_is_active(existing_call):
+        _expired_call, expired_account_id, expired_changed = await release_resident_call_lease(
+            session,
+            project,
+            call_id=str(existing_call.get("call_id") or ""),
+            generation=int(existing_call.get("generation") or 0),
+            reason="expired",
+        )
+        if expired_changed and expired_account_id:
+            await release_max_plan_call_slot(
+                expired_account_id, project_id=str(project.id)
+            )
+        existing_call = read_resident_call(project.vision)
+    reserved_here = False
+    if not resident_call_is_active(existing_call):
+        reserved_here = await reserve_max_plan_call_slot(
+            account_id, project_id=str(project.id)
+        )
+        if not reserved_here:
+            raise HTTPException(
+                status_code=409,
+                detail="No concurrent pooled-account capacity for a Fast Resident",
+            )
+    try:
+        call, expired_account_id, created = await acquire_resident_call_lease(
+            session,
+            project,
+            operator_user_id=current_user["user_id"],
+            account_id=account_id,
+            ttl_seconds=(payload.ttl_seconds if payload else None),
+        )
+    except Exception:
+        if reserved_here:
+            await release_max_plan_call_slot(account_id, project_id=str(project.id))
+        raise
+    if reserved_here and not created:
+        await release_max_plan_call_slot(account_id, project_id=str(project.id))
+    if expired_account_id:
+        await release_max_plan_call_slot(expired_account_id, project_id=str(project.id))
+    try:
+        transport = issue_browser_call_credentials(
+            call=call, user_id=current_user["user_id"]
+        )
+    except LiveKitConfigurationError as exc:
+        # Do not leave a public-owner fence or pooled slot behind when voice
+        # transport was explicitly enabled but cannot issue a browser token.
+        if created:
+            _call, release_account_id, changed = await release_resident_call_lease(
+                session,
+                project,
+                call_id=str(call.get("call_id") or ""),
+                generation=int(call.get("generation") or 0),
+                reason="transport_unavailable",
+            )
+            if changed and release_account_id:
+                await release_max_plan_call_slot(
+                    release_account_id, project_id=str(project.id)
+                )
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    public_call = resident_call_snapshot(project.vision)
+    await broadcast_to_project(
+        str(project.id), "call_updated", {"call": public_call}
+    )
+    return {
+        "project_id": str(project.id),
+        "call": public_call,
+        "readiness": {"fast_slot_reserved": bool(call.get("slot_reserved"))},
+        **transport,
+    }
+
+
+@router.get("/projects/{project_id}/strategic-call")
+@limiter.limit("60/minute")
+async def get_project_strategic_call(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return/reconcile the reconnect-safe public call lease projection."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    call = read_resident_call(project.vision)
+    if isinstance(call, dict) and call.get("status") == "active" and not resident_call_is_active(call):
+        _call, account_id, changed = await release_resident_call_lease(
+            session,
+            project,
+            call_id=str(call.get("call_id") or ""),
+            generation=int(call.get("generation") or 0),
+            reason="expired",
+        )
+        if changed and account_id:
+            from app.max_plan_pool import release_max_plan_call_slot
+
+            await release_max_plan_call_slot(account_id, project_id=str(project.id))
+    public_call = resident_call_snapshot(project.vision)
+    transport: dict[str, str] = {}
+    current_call = read_resident_call(project.vision)
+    if resident_call_is_active(current_call):
+        if str((current_call or {}).get("actor_user_id")) != str(current_user["user_id"]):
+            raise HTTPException(status_code=403, detail="Only the call owner may reconnect")
+        try:
+            transport = issue_browser_call_credentials(
+                call=current_call or {}, user_id=current_user["user_id"]
+            )
+        except LiveKitConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"project_id": str(project.id), "call": public_call, **transport}
+
+
+@router.post("/projects/{project_id}/strategic-call/end")
+@limiter.limit("30/minute")
+async def end_project_strategic_call(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicCallEnd | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Fence and idempotently release the temporary call reply owner."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    active_call = read_resident_call(project.vision)
+    if resident_call_is_active(active_call) and str(
+        (active_call or {}).get("actor_user_id")
+    ) != str(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="Only the call owner may end this call")
+    call, account_id, changed = await release_resident_call_lease(
+        session,
+        project,
+        call_id=payload.call_id if payload else None,
+        generation=payload.generation if payload else None,
+    )
+    if changed and account_id:
+        from app.max_plan_pool import release_max_plan_call_slot
+
+        await release_max_plan_call_slot(account_id, project_id=str(project.id))
+    public_call = resident_call_snapshot(project.vision)
+    if changed:
+        await broadcast_to_project(
+            str(project.id), "call_updated", {"call": public_call}
+        )
+    return {
+        "project_id": str(project.id),
+        "call": public_call,
+        "status": "ended" if changed else "already_ended",
+    }
+
+
+@router.post("/projects/{project_id}/strategic-call/playout")
+@limiter.limit("120/minute")
+async def record_project_strategic_call_playout(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicCallPlayoutReceipt,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Accept a bounded browser receipt for what was actually played aloud."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    call, duplicate = await record_resident_call_playout_receipt(
+        session,
+        project,
+        actor_user_id=current_user["user_id"],
+        call_id=payload.call_id,
+        generation=payload.generation,
+        phrase_id=payload.phrase_id,
+        event=payload.event,
+        reported_at=payload.at,
+    )
+    return {
+        "project_id": str(project.id),
+        "call_id": payload.call_id,
+        "generation": payload.generation,
+        "status": "duplicate" if duplicate else "recorded",
+        "call": call,
+    }
+
+
 @router.post("/projects/{project_id}/strategic-session/stop")
 @limiter.limit("30/minute")
 async def stop_project_strategic_resident_session(
@@ -3681,9 +3976,26 @@ async def stop_project_strategic_resident_session(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    active_call = read_resident_call(project.vision)
     snapshot = await stop_resident_session(
         session,
         project,
         operator_user_id=current_user["user_id"],
     )
+    if resident_call_is_active(active_call):
+        _call, account_id, changed = await release_resident_call_lease(
+            session,
+            project,
+            call_id=str((active_call or {}).get("call_id") or ""),
+            generation=int((active_call or {}).get("generation") or 0),
+            reason="resident_stopped",
+        )
+        if changed and account_id:
+            from app.max_plan_pool import release_max_plan_call_slot
+
+            await release_max_plan_call_slot(account_id, project_id=str(project.id))
+        if changed:
+            await broadcast_to_project(
+                str(project.id), "call_updated", {"call": resident_call_snapshot(project.vision)}
+            )
     return {"project_id": str(project_id), "session": snapshot}

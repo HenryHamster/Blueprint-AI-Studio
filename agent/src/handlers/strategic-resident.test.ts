@@ -105,6 +105,18 @@ vi.mock('../providers/resident-reply-tool.js', () => ({
   RESIDENT_REPLY_TOOL_NAME: 'mcp__workday__reply_to_operator',
   provisionResidentReplyTool: mockProvisionResidentReplyTool,
 }));
+// Existing Workday tests stub only the native reply MCP path.  The new
+// call-only config is irrelevant when no call lease is present, so keep these
+// tests focused on the Workday lifecycle rather than requiring a real file in
+// the mocked /tmp workspace. Dedicated call-resident-tool tests cover config
+// generation and merge semantics.
+vi.mock('../providers/call-resident-tool.js', () => ({
+  provisionCallResidentTool: vi.fn(() => ({
+    configPath: '/tmp/call-mcp.json',
+    toolNames: ['mcp__call__emit_call_packet'],
+  })),
+  mergeCallMcpConfigs: vi.fn((_workspace: string, baseConfigPath: string) => baseConfigPath),
+}));
 vi.mock('./resident-repo-freshness.js', () => ({
   syncResidentRepository: vi.fn((_workspace: string, _baseBranch: string, previousHead?: string | null) => ({
     status: 'CURRENT',

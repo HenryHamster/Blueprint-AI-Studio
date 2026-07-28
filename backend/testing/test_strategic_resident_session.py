@@ -33,6 +33,7 @@ from app.models import (
 )
 from app.routers.admin_project_strategic_session import (
     StrategicResidentSessionStart,
+    start_project_strategic_call,
     start_project_strategic_resident_session,
 )
 from app.reaper_orphan_classify import _classify_resident_session
@@ -49,6 +50,9 @@ from app.strategic_resident_session import (
     _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
     new_session_id,
     read_resident_session,
+    resident_call_is_active,
+    resident_call_snapshot,
+    renew_resident_call_lease,
     renew_resident_session_lease,
     resident_session_is_active,
     resident_session_snapshot,
@@ -106,6 +110,223 @@ async def _make_runner(db_session, project: Project) -> LocalRunner:
     return runner
 
 
+@pytest.mark.asyncio
+async def test_call_speech_credentials_require_exact_active_resident_lease(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    owner = await _make_task(db_session, project)
+    other = await _make_task(db_session, project)
+    owner.context = {"_resident_session": True}
+    other.context = {"_resident_session": True}
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "call": {
+                "call_id": "call-speech-1",
+                "generation": 3,
+                "status": "active",
+                "worker_task_id": str(owner.id),
+                "expires_at": (_utcnow() + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add_all([project, owner, other])
+    await db_session.commit()
+
+    secret = "never-log-or-dispatch-this"
+    resolver = AsyncMock(return_value={"CALL_DEEPGRAM_API_KEY": secret})
+    monkeypatch.setattr(
+        resident_session_module,
+        "resolve_resident_call_speech_credentials",
+        resolver,
+    )
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
+    monkeypatch.setenv(
+        "CALL_DEEPGRAM_API_KEY_SECRET_VERSION",
+        "projects/test/secrets/deepgram/versions/7",
+    )
+    monkeypatch.setenv(
+        "CALL_CARTESIA_API_KEY_SECRET_VERSION",
+        "projects/test/secrets/cartesia/versions/3",
+    )
+    monkeypatch.setenv("CALL_DEEPGRAM_STT_MODEL", "flux-general-en")
+    monkeypatch.setenv("CALL_CARTESIA_TTS_MODEL", "sonic-3")
+    monkeypatch.setenv("CALL_CARTESIA_VOICE_ID", "voice-id")
+    payload = resident_session_module.ResidentCallSpeechCredentialsRequest(
+        task_id=str(owner.id), call_id="call-speech-1", call_generation=3
+    )
+    response = await resident_session_module.resident_call_speech_credentials(
+        request=None,
+        project_id=project.id,
+        payload=payload,
+        session=db_session,
+        token={"sub": str(owner.id)},
+    )
+    assert response == {
+        "speech": {"CALL_DEEPGRAM_API_KEY": secret},
+        "foreground_qualification": "claude-warm-stream-json:phase0-v1",
+    }
+    resolver.assert_awaited_once_with(owner)
+
+    # A valid agent token for another task in the same project still receives
+    # neither the response nor a Secret Manager lookup.
+    with pytest.raises(HTTPException) as wrong_worker:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=resident_session_module.ResidentCallSpeechCredentialsRequest(
+                task_id=str(other.id), call_id="call-speech-1", call_generation=3
+            ),
+            session=db_session,
+            token={"sub": str(other.id)},
+        )
+    assert wrong_worker.value.status_code == 409
+    assert secret not in str(wrong_worker.value.detail)
+    resolver.assert_awaited_once()
+
+    with pytest.raises(HTTPException) as stale_generation:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=resident_session_module.ResidentCallSpeechCredentialsRequest(
+                task_id=str(owner.id), call_id="call-speech-1", call_generation=2
+            ),
+            session=db_session,
+            token={"sub": str(owner.id)},
+        )
+    assert stale_generation.value.status_code == 409
+    resolver.assert_awaited_once()
+
+    # A token cannot name the owning task in the body while authenticating as
+    # another project task.
+    with pytest.raises(HTTPException) as token_mismatch:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=payload,
+            session=db_session,
+            token={"sub": str(other.id)},
+        )
+    assert token_mismatch.value.status_code == 403
+    resolver.assert_awaited_once()
+
+    project.vision[RESIDENT_SESSION_KEY]["call"]["expires_at"] = (
+        _utcnow() - timedelta(seconds=1)
+    ).isoformat()
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    with pytest.raises(HTTPException) as inactive_call:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=payload,
+            session=db_session,
+            token={"sub": str(owner.id)},
+        )
+    assert inactive_call.value.status_code == 409
+    resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_call_lease_expires_when_coordinator_never_becomes_ready(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    now = _utcnow()
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "stop_requested": False,
+            "call": {
+                "call_id": "call-not-ready",
+                "generation": 1,
+                "status": "active",
+                "worker_task_id": str(task.id),
+                "account_id": "account-1",
+                "slot_reserved": True,
+                "started_at": (now - timedelta(seconds=31)).isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    released = AsyncMock()
+    monkeypatch.setattr("app.max_plan_pool.release_max_plan_call_slot", released)
+
+    snapshot = await renew_resident_call_lease(
+        db_session,
+        project,
+        task_id=str(task.id),
+        call_id="call-not-ready",
+        generation=1,
+        ready=False,
+    )
+
+    assert snapshot["status"] == "expired"
+    assert snapshot["failure"] == "coordinator_not_ready"
+    released.assert_awaited_once_with("account-1", project_id=str(project.id))
+
+
+@pytest.mark.asyncio
+async def test_ready_call_renewal_is_capped_at_absolute_duration(db_session):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    now = _utcnow()
+    started_at = now - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "stop_requested": False,
+            "call": {
+                "call_id": "call-ready",
+                "generation": 2,
+                "status": "active",
+                "worker_task_id": str(task.id),
+                "started_at": started_at.isoformat(),
+                "ready_at": (started_at + timedelta(seconds=5)).isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    snapshot = await renew_resident_call_lease(
+        db_session,
+        project,
+        task_id=str(task.id),
+        call_id="call-ready",
+        generation=2,
+        ttl_seconds=900,
+        ready=True,
+        usage={
+            "input_audio_ms": 12_000,
+            "output_characters": 850,
+            "provider_errors": -5,
+            "credential": "must-not-persist",
+        },
+    )
+
+    assert snapshot["status"] == "active"
+    assert datetime.fromisoformat(snapshot["expires_at"]) <= started_at + timedelta(
+        seconds=resident_session_module._RESIDENT_CALL_MAX_DURATION_SECONDS
+    )
+    assert snapshot["usage"] == {
+        "input_audio_ms": 12_000,
+        "output_characters": 850,
+        "provider_errors": 0,
+    }
+
+
 def _test_session_factory(session):
     return async_sessionmaker(
         resolve_async_engine(session),
@@ -135,6 +356,32 @@ def test_session_state_helpers_remain_table_free():
     )
     assert snapshot is not None
     assert snapshot["session_id"] == "ss-restored"
+
+
+def test_nested_call_projection_hides_actor_account_and_playout_receipts():
+    now = datetime.fromisoformat("2026-07-27T12:00:00")
+    vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "call": {
+                "call_id": "call-opaque",
+                "generation": 4,
+                "status": "active",
+                "actor_user_id": "operator-secret",
+                "account_id": "pool-secret",
+                "expires_at": "2026-07-27T12:01:00",
+                "playout_receipts": [{"phrase_id": "p", "event": "started"}],
+                "worker_task_id": "worker",
+            },
+        }
+    }
+    assert resident_call_is_active(vision[RESIDENT_SESSION_KEY]["call"], now=now)
+    snapshot = resident_call_snapshot(vision, now=now)
+    assert snapshot is not None
+    assert snapshot["call_id"] == "call-opaque"
+    assert "actor_user_id" not in snapshot
+    assert "account_id" not in snapshot
+    assert "playout_receipts" not in snapshot
 
 
 def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(
@@ -327,6 +574,43 @@ async def test_continuous_hydration_ensure_succeeds(db_session):
         ).scalars().all()
     assert len(tasks) == 1
     assert str(tasks[0].id) == response["session"]["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_call_start_rejects_provider_without_qualified_foreground_adapter(
+    db_session,
+):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    started = await unwrap(start_project_strategic_resident_session)(
+        request=None,
+        project_id=project.id,
+        payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+        session=db_session,
+        current_user={"user_id": TEST_USER_ID},
+    )
+    task = await db_session.get(Task, uuid.UUID(started["session"]["task_id"]))
+    assert task is not None
+    task.llm_account_id = "pool-openai"
+    task.context = {**(task.context or {}), "llm_provider": "openai"}
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await unwrap(start_project_strategic_call)(
+            request=None,
+            project_id=project.id,
+            payload=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+    assert exc.value.status_code == 409
+    assert "does not yet have a qualified Fast Resident adapter" in str(
+        exc.value.detail
+    )
+    await db_session.refresh(project)
+    assert resident_call_snapshot(project.vision) is None
 
 
 @pytest.mark.asyncio

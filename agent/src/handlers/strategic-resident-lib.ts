@@ -112,6 +112,9 @@ export interface SessionHeartbeatResponse {
    *  so the resumed session sees current directions rather than session-start
    *  snapshots. Absent on older backends — agent degrades to bootstrap data. */
   direction_grounding?: Array<{id: string; text: string; status: string}>;
+  /** Non-sensitive nested Call lease plus a short-lived coordinator transport. */
+  call?: unknown;
+  call_transport?: unknown;
 }
 
 /**

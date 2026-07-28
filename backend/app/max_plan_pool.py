@@ -1167,6 +1167,43 @@ async def load_max_plan_pool():
                     proj_map = active_per_account_project.setdefault(acct_id, {})
                     proj_map[pid] = proj_map.get(pid, 0) + 1
 
+        # A live Conversation Fast Resident is a second model process without a
+        # Task row.  Its bounded lease is persisted inside the owning project's
+        # Resident state, so include it in the same active-concurrency ledger on
+        # every rebuild while deliberately NOT touching daily_task_count.  This
+        # is also the crash/restart reconciliation path: expired lease records
+        # disappear from the capacity floor without relying on an in-memory
+        # release callback surviving the coordinator.
+        now = _utcnow()
+        call_rows = await session.execute(sql_select(Project.id, Project.vision))
+        for project_id, vision in call_rows.all():
+            resident = (vision or {}).get("_resident_strategic_session")
+            call = resident.get("call") if isinstance(resident, dict) else None
+            if (
+                not isinstance(resident, dict)
+                or resident.get("status") != "active"
+                or bool(resident.get("stop_requested"))
+                or not isinstance(call, dict)
+                or call.get("status") != "active"
+            ):
+                continue
+            raw_expiry = call.get("expires_at")
+            try:
+                expiry = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
+                if expiry.tzinfo is not None:
+                    expiry = expiry.replace(tzinfo=None) - expiry.utcoffset()
+            except (TypeError, ValueError):
+                continue
+            if expiry <= now:
+                continue
+            account_id = str(call.get("account_id") or "")
+            if not account_id or not bool(call.get("slot_reserved")):
+                continue
+            active_per_account[account_id] = active_per_account.get(account_id, 0) + 1
+            project_counts = active_per_account_project.setdefault(account_id, {})
+            pid = str(project_id)
+            project_counts[pid] = project_counts.get(pid, 0) + 1
+
         # Preserve in-memory usage-meter state across the periodic rebuild —
         # this loader runs every ~300s from the orchestrator cycle, and the
         # probe cache would otherwise be wiped with every refresh (the meter
@@ -5112,6 +5149,46 @@ async def reserve_max_plan_account(account_id: str) -> bool:
             return False
         account["active_tasks"] = int(account.get("active_tasks") or 0) + 1
         return True
+
+
+async def reserve_max_plan_call_slot(account_id: str, *, project_id: str) -> bool:
+    """Reserve a Fast-Resident concurrency slot without charging a task quota.
+
+    The caller supplies the already-assigned Workday account.  Reusing that
+    account is permitted only when both its global and project concurrent caps
+    have room for the additional model process.  Unlike task selection this
+    path intentionally skips daily caps/counters.
+    """
+    if not account_id or not project_id:
+        return False
+    async with _max_plan_pool_lock:
+        account = _account_by_id.get(str(account_id))
+        if account is None:
+            return False
+        concurrent_cap = account.get("max_concurrent_tasks")
+        if concurrent_cap is not None and int(account.get("active_tasks") or 0) >= int(concurrent_cap):
+            return False
+        project_cap = (account.get("project_max_concurrent_tasks") or {}).get(project_id)
+        project_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+        if project_cap is not None and int(project_state.get("active_tasks") or 0) >= int(project_cap):
+            return False
+        account["active_tasks"] = int(account.get("active_tasks") or 0) + 1
+        project_state["active_tasks"] = int(project_state.get("active_tasks") or 0) + 1
+        return True
+
+
+async def release_max_plan_call_slot(account_id: str | None, *, project_id: str | None) -> None:
+    """Idempotently release a call-only slot; daily task use is untouched."""
+    if not account_id:
+        return
+    async with _max_plan_pool_lock:
+        account = _account_by_id.get(str(account_id))
+        if account is None:
+            return
+        account["active_tasks"] = max(0, int(account.get("active_tasks") or 0) - 1)
+        if project_id:
+            project_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+            project_state["active_tasks"] = max(0, int(project_state.get("active_tasks") or 0) - 1)
 
 
 def build_account_retarget_manifest(

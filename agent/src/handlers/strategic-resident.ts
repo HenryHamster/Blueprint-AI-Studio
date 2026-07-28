@@ -65,6 +65,23 @@ import {
   syncResidentRepository,
   type ResidentRepoSnapshot,
 } from './resident-repo-freshness.js';
+import {
+  CallCoordinatorState, CallCoordinatorWakeGate, ForegroundCallController,
+  callLeaseIsPubliclyActive, callLeaseKey, parseCallLeaseProjection, parseCallTransportProjection,
+  speechOriginIsCurrent,
+  shouldImmediatelyReconcileCallMedia,
+  type CallDisplayBlock, type CallTurnReceipt, type CallWorkPacket,
+} from './live-conversation-resident.js';
+import { configuredClaudeForegroundAdapter } from '../providers/foreground-resident.js';
+import {
+  mergeCallMcpConfigs, provisionCallResidentTool,
+} from '../providers/call-resident-tool.js';
+import { CallMediaSession } from '../media/livekit-call-media.js';
+import { CallSpeechPipeline } from '../call-speech/pipeline.js';
+import {
+  loadCallSpeechConfig,
+  parseCallSpeechCredentialEnvelope,
+} from '../call-speech/config.js';
 
 const _RESIDENT_STRATEGIC_TASK_TYPE = 'strategic_review' as const;
 
@@ -77,6 +94,7 @@ const STREAM_FLUSH_MS = 100;
 // session is considered wedged and stopped as FAILED rather than spun forever.
 const MAX_CONSECUTIVE_STALLS = 3;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
+export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
 
 export interface ResidentReplyRuntimePaths {
   runtimeDir: string;
@@ -756,6 +774,94 @@ export async function handleStrategicResident(
   });
 
   const cfg = residentConfig(payload);
+  // The task bootstrap never grants call ownership.  Only a current backend
+  // heartbeat/control projection may activate this Coordinator state.
+  const callCoordinator = new CallCoordinatorState();
+  const callWakeGate = new CallCoordinatorWakeGate();
+  let operatorPresent = false;
+  let operatorDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let expireAbsentOperatorCall: (callId: string, generation: number) => Promise<void> = async () => {};
+  const clearOperatorDisconnectTimer = (): void => {
+    if (operatorDisconnectTimer !== null) clearTimeout(operatorDisconnectTimer);
+    operatorDisconnectTimer = null;
+  };
+  let callSpeech: CallSpeechPipeline | null = null;
+  let speechCallKey: string | null = null;
+  // Provider secrets are fetched after an exact call lease becomes active and
+  // retained only in Coordinator memory. They never enter process.env or Fast.
+  let speechCredentialKey: string | null = null;
+  let speechCredentialEnvironment: NodeJS.ProcessEnv | null = null;
+  let foregroundQualification: string | null = null;
+  let speechRetirement: Promise<void> = Promise.resolve();
+  const retireCallSpeech = (): Promise<void> => {
+    const retiring = callSpeech;
+    callSpeech = null;
+    speechCallKey = null;
+    if (retiring === null) return speechRetirement;
+    speechRetirement = speechRetirement.then(async () => {
+      await retiring.bargeIn().catch(() => undefined);
+      await retiring.close().catch(() => undefined);
+    });
+    return speechRetirement;
+  };
+  let speechInputPump: Promise<void> | null = null;
+  let speechInputPumpGeneration = 0;
+  let speechTurnNonce = 0;
+  const submittedSpeechTurns = new Set<string>();
+  const callMedia = new CallMediaSession({
+    callbacks: {
+      onCommittedMessageHint: (hint) => {
+        const lease = callCoordinator.currentLease();
+        // A data-channel packet is only an authenticated wake hint. It has no
+        // content authority; the coordinator fetches the durable row by lease.
+        if (lease?.callId === hint.callId && lease.generation === hint.generation) callWakeGate.notify();
+      },
+      onBargeIn: () => {
+        callCoordinator.interruptPlayback('');
+        foregroundCall?.interrupt();
+        void callSpeech?.bargeIn();
+        void callMedia.cancelPlayback().catch(() => undefined);
+      },
+      onOperatorPresenceChanged: (present) => {
+        operatorPresent = present;
+        clearOperatorDisconnectTimer();
+        if (present) return;
+        // Never keep speaking into an empty room. A reconnect may resume future
+        // turns, but already-queued playout is discarded immediately.
+        foregroundCall?.interrupt();
+        void callSpeech?.bargeIn();
+        void callMedia.cancelPlayback().catch(() => undefined);
+        const lease = callCoordinator.currentLease();
+        if (!lease) return;
+        operatorDisconnectTimer = setTimeout(() => {
+          operatorDisconnectTimer = null;
+          void expireAbsentOperatorCall(lease.callId, lease.generation);
+        }, CALL_OPERATOR_RECONNECT_GRACE_MS);
+      },
+    },
+  });
+  let mediaCallKey: string | null = null;
+  // A heartbeat can arrive again while provider/RTC startup is in flight.
+  // Serialize that lifecycle so one lease cannot produce competing joins.
+  let callMediaReconciling: Promise<void> | null = null;
+  // Private Workday packets use a separate, task-local directory. They are
+  // never browser transport and never a public reply capability.
+  const callRuntimeDir = path.join(replyRuntime.runtimeDir, 'call-coordinator');
+  const workdayCallStageDir = path.join(callRuntimeDir, 'workday-stage');
+  fs.mkdirSync(workdayCallStageDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(callRuntimeDir, 0o700);
+  let workdayCallTool = provisionCallResidentTool(WORKSPACE, 'workday', {
+    stageDir: workdayCallStageDir,
+  });
+  let foregroundCall: ForegroundCallController | null = null;
+  let activeCallKey: string | null = null;
+  let callInputAfterSequence = 0;
+  let callDispatching = false;
+  const pendingWorkdayPackets: CallWorkPacket[] = [];
+  // The persistent Workday subprocess can execute only one turn at a time.
+  // Keep private requests serialized, but never make the foreground input loop
+  // await them: newer operator input must remain immediately dispatchable.
+  let privateWorkdayChain: Promise<void> = Promise.resolve();
   let cursor = initialCursor(task, payload);
   // Bounded set of message ids already handled — with `created_at >= since` poll
   // semantics the boundary message re-appears each poll and is dropped here.
@@ -949,6 +1055,10 @@ export async function handleStrategicResident(
   const streamer = new SessionStreamer(ws, sessionId, taskId);
   const handleSessionEvent = (ev: ResidentSessionEvent): void => {
     if (ev.kind === 'text' && ev.text) {
+      // During a call, Workday is a private reasoner. Raw deltas are neither a
+      // second public voice nor a second typed reply; only Coordinator-validated
+      // Fast completions may reach the shared conversation.
+      if (callCoordinator.suppressOrdinaryWorkday()) return;
       // Assistant reply text — the only content that reaches the durable
       // transcript is the native reply_to_operator payload. This text is only
       // a live transcript stream, surfaced as `message`.
@@ -988,9 +1098,18 @@ export async function handleStrategicResident(
     receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
   });
+  let residentCallMcpConfigPath = mergeCallMcpConfigs(
+    WORKSPACE, residentReplyTool.configPath, workdayCallTool.configPath,
+  );
   const residentSessionOptions = () => ({
     model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: sessionStallTimeoutMs,
-    replyTool: { mcpConfigPath: residentReplyTool.configPath, toolName: RESIDENT_REPLY_TOOL_NAME },
+    replyTool: {
+      mcpConfigPath: residentCallMcpConfigPath,
+      toolName: RESIDENT_REPLY_TOOL_NAME,
+      // Workday can produce a typed private packet, but cannot reply publicly
+      // through it. The existing native reply is fenced by backend call state.
+      allowedTools: [RESIDENT_REPLY_TOOL_NAME, 'mcp__call__emit_call_packet'],
+    },
   });
   let session: ResidentSession = startResidentClaudeSession({
     ...residentSessionOptions(),
@@ -1094,7 +1213,9 @@ export async function handleStrategicResident(
       residentInput = full;
     }
     const slowResponseTimer = operator
-      ? setTimeout(() => streamer.status('still working on your response'), cfg.turnTimeoutMs)
+      ? setTimeout(() => {
+        streamer.status('still working on your response');
+      }, cfg.turnTimeoutMs)
       : null;
     try {
       const r = await session.sendTurn(residentInput, { stallTimeoutMs: sessionStallTimeoutMs });
@@ -1370,6 +1491,10 @@ export async function handleStrategicResident(
   };
 
   const pollMessages = async (): Promise<ResidentInboundMessage[]> => {
+    // During a call the Fast Resident is the only public reply owner.  Its
+    // Coordinator uses a canonical call input path; this legacy Workday poller
+    // must neither claim nor pre-empt those public turns.
+    if (callCoordinator.suppressOrdinaryWorkday()) return [];
     const collected: ResidentInboundMessage[] = [];
     let collectedRequiredImages = 0;
     const cursorBefore = cursor;
@@ -1502,6 +1627,25 @@ export async function handleStrategicResident(
       decisions_reg: decisionsReg.length > 0 ? serializeDecisionsReg(decisionsReg) : null,
       activity: residentActivity,
     };
+    const activeCallLease = callCoordinator.currentLease();
+    if (callLeaseIsPubliclyActive(activeCallLease) && activeCallLease) {
+      // The nested call lease is renewed only by its owning Resident task and
+      // always carries the exact generation; a stale worker cannot extend it.
+      body.call_id = activeCallLease.callId;
+      body.call_generation = activeCallLease.generation;
+      body.call_ttl_seconds = 300;
+      body.call_ready = mediaCallKey === callLeaseKey(activeCallLease)
+        && callMedia.isConnected();
+      const speechUsage = callSpeech?.metrics();
+      if (speechUsage) {
+        body.call_usage = {
+          input_audio_ms: Math.max(0, Math.round(speechUsage.inputAudioMs)),
+          output_audio_bytes: Math.max(0, Math.round(speechUsage.outputAudioBytes)),
+          output_characters: Math.max(0, Math.round(speechUsage.outputCharacters)),
+          provider_errors: Math.max(0, Math.round(speechUsage.providerErrors)),
+        };
+      }
+    }
     if (handledIds && handledIds.length > 0) {
       body.handled_message_ids = handledIds;
     }
@@ -1524,6 +1668,14 @@ export async function handleStrategicResident(
         HEARTBEAT_API_MAX_RETRIES,
         HEARTBEAT_API_TIMEOUT,
       ) as SessionHeartbeatResponse;
+      if (Object.prototype.hasOwnProperty.call(resp, 'call')) {
+        const callControl = resp as SessionHeartbeatResponse & { call?: unknown; call_transport?: unknown };
+        callCoordinator.updateControlProjection(
+          parseCallLeaseProjection(callControl.call),
+          parseCallTransportProjection(callControl.call_transport),
+        );
+        reconcileCallLifecycle();
+      }
       // Fold the lease state so the loop's autonomous gate tracks the backend.
       authorityHeld = nextAuthorityHeld(authorityHeld, resp);
       // Track the work-state revision (when the backend ships it) so state-gated
@@ -1532,9 +1684,7 @@ export async function handleStrategicResident(
       if (Array.isArray(resp.fired_watches)) {
         firedStrategicWatches = resp.fired_watches.filter(
           (watch): watch is StrategicWatchReceipt =>
-            watch !== null
-            && typeof watch === 'object'
-            && typeof watch.id === 'string',
+            typeof watch.id === 'string',
         );
       }
       // Refresh the surface catalog from the backend's live direction list so
@@ -1562,6 +1712,130 @@ export async function handleStrategicResident(
     }
   };
 
+  /** Keep Fast lifecycle independent from the persistent Workday subprocess. */
+  const reconcileCallLifecycle = (): void => {
+    const lease = callCoordinator.currentLease();
+    const key = callLeaseKey(lease);
+    if (!callLeaseIsPubliclyActive(lease)) {
+      clearOperatorDisconnectTimer();
+      operatorPresent = false;
+      foregroundCall?.close();
+      foregroundCall = null;
+      void retireCallSpeech();
+      void callMedia.cancelPlayback().catch(() => undefined);
+      activeCallKey = null;
+      speechCredentialKey = null;
+      speechCredentialEnvironment = null;
+      foregroundQualification = null;
+      callInputAfterSequence = 0;
+      pendingWorkdayPackets.length = 0;
+      void reconcileCallMedia();
+      return;
+    }
+    if (key === activeCallKey) {
+      // Startup can fail transiently before an RTC participant is published
+      // (provider warm-up, short-lived LiveKit credential, network). Heartbeat
+      // pacing provides a bounded retry cadence without a tight local loop.
+      if (mediaCallKey !== key) void reconcileCallMedia();
+      return;
+    }
+    foregroundCall?.close();
+    // Provider cancellation is asynchronous. Detach the old pipeline
+    // immediately and make media reconciliation await its retirement before a
+    // replacement pipeline/room can become ready.
+    void retireCallSpeech();
+    void callMedia.cancelPlayback().catch(() => undefined);
+    clearOperatorDisconnectTimer();
+    operatorPresent = false;
+    pendingWorkdayPackets.length = 0;
+    speechCredentialKey = null;
+    speechCredentialEnvironment = null;
+    foregroundQualification = null;
+    foregroundCall = null;
+    activeCallKey = key;
+    callInputAfterSequence = 0;
+    void reconcileCallMedia();
+    sendLog(ws, `[resident] call ${activeCallKey} activated; isolated Fast/media startup scheduled\n`);
+  };
+
+  /** Media has no model/API credential and receives no durable message content. */
+  const reconcileCallMedia = (): Promise<void> => {
+    if (callMediaReconciling !== null) return callMediaReconciling;
+    let attemptedKey: string | null = null;
+    const reconcile = async (): Promise<void> => {
+      const lease = callCoordinator.currentLease();
+      const transport = callCoordinator.currentTransport();
+      const key = callLeaseKey(lease);
+      attemptedKey = key;
+      if (!callLeaseIsPubliclyActive(lease) || !lease || !transport) {
+        if (callMedia.isConnected()) await callMedia.disconnect();
+        await retireCallSpeech();
+        mediaCallKey = null;
+        return;
+      }
+      if (callMedia.isConnected() && mediaCallKey === key) return;
+      try {
+        // A replacement speech pipeline fixes its RTC formats before provider
+        // startup. Tear down the old generation's published tracks first;
+        // CallMedia intentionally rejects format mutation while a track exists.
+        if (callMedia.isConnected()) {
+          await callMedia.disconnect();
+          mediaCallKey = null;
+        }
+        // Do not let the browser infer conversational readiness from its RTC
+        // socket. Validate and warm Fast plus both speech providers first.
+        await ensureSpeechForCurrentCall();
+        if (!foregroundCall) throw new Error('Fast Resident controller is unavailable');
+        foregroundCall.ensureStarted();
+        const current = callCoordinator.currentLease();
+        if (!current || current.callId !== lease.callId || current.generation !== lease.generation) return;
+        await callMedia.connect(
+          { callId: lease.callId, generation: lease.generation },
+          {
+            serverUrl: transport.serverUrl,
+            participantToken: transport.participantToken,
+            room: transport.room,
+            participantIdentity: transport.participantIdentity,
+            operatorIdentity: transport.operatorIdentity,
+          },
+        );
+        const afterConnect = callCoordinator.currentLease();
+        if (!afterConnect || afterConnect.callId !== lease.callId || afterConnect.generation !== lease.generation) {
+          await callMedia.disconnect();
+          return;
+        }
+        mediaCallKey = key;
+        startSpeechInputPump();
+        // A trusted coordinator packet, not browser RTC state, is the UI's
+        // proof that the full voice path is ready to accept a turn.
+        await callMedia.publishReady();
+        callWakeGate.notify();
+      } catch (error) {
+        mediaCallKey = null;
+        // A partial startup must not leave an RTC participant consuming audio
+        // while the UI correctly waits for readiness.  It will be retried from
+        // the next heartbeat with fresh short-lived transport credentials.
+        if (callMedia.isConnected()) await callMedia.disconnect().catch(() => undefined);
+        await retireCallSpeech();
+        sendLog(ws, `[resident] call media connection deferred: ${sanitize(String(error))}\n`);
+      }
+    };
+    const pending = reconcile().finally(() => {
+      if (callMediaReconciling !== pending) return;
+      callMediaReconciling = null;
+      // Collapse a lease-generation race into one fresh reconciliation after
+      // startup. Same-generation failures retry from the paced heartbeat path;
+      // immediately recursing here would hammer unavailable providers.
+      const latest = callCoordinator.currentLease();
+      const latestKey = callLeaseKey(latest);
+      if (shouldImmediatelyReconcileCallMedia(attemptedKey, latestKey, mediaCallKey)) {
+        void reconcileCallMedia();
+      }
+    });
+    callMediaReconciling = pending;
+    return pending;
+  };
+
   // Liveness-heartbeat pacing. Operator messages are polled at the fast
   // cfg.messagePollMs cadence (prompt pickup), but a bare liveness heartbeat
   // (progress=false) fires only every cfg.idleTickMs so the faster poll does not
@@ -1574,6 +1848,474 @@ export async function handleStrategicResident(
     const hb = await heartbeat(false);
     lastLivenessHeartbeatAt = Date.now();
     return hb;
+  };
+
+  type CanonicalCallInput = {
+    id: string;
+    sequence: number;
+    content: string;
+    inputSource: 'voice' | 'typed' | 'whiteboard';
+  };
+
+  const parseCanonicalCallInputs = (value: unknown): CanonicalCallInput[] => {
+    const raw = value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown> : {};
+    const rows = Array.isArray(raw.inputs) ? raw.inputs : Array.isArray(raw.messages) ? raw.messages : [];
+    return rows.flatMap((row): CanonicalCallInput[] => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return [];
+      const item = row as Record<string, unknown>;
+      const id = typeof item.id === 'string' ? item.id.trim() : '';
+      const content = typeof item.content === 'string' ? item.content.trim() : '';
+      const sequence = typeof item.sequence === 'number' && Number.isSafeInteger(item.sequence) ? item.sequence : -1;
+      const context = item.context && typeof item.context === 'object' && !Array.isArray(item.context)
+        ? item.context as Record<string, unknown> : {};
+      const source = item.input_source ?? context.input_source;
+      if (!id || !content || sequence < 0 || (source !== 'voice' && source !== 'typed' && source !== 'whiteboard')) return [];
+      return [{ id, content, sequence, inputSource: source }];
+    }).sort((a, b) => a.sequence - b.sequence);
+  };
+
+  const fetchCanonicalCallInputs = async (): Promise<CanonicalCallInput[]> => {
+    const lease = callCoordinator.currentLease();
+    if (!callLeaseIsPubliclyActive(lease) || !lease) return [];
+    const query = new URLSearchParams({
+      call_id: lease.callId,
+      call_generation: String(lease.generation),
+      after_sequence: String(callInputAfterSequence),
+    });
+    // This is deliberately a call-scoped server projection rather than the
+    // legacy open-message poll. The server validates ID/generation and returns
+    // canonical durable rows, so LiveKit wake hints can never become content.
+    const response = await apiGet(
+      `/api/agent/projects/${projectId}/strategic-call/inputs?${query.toString()}`,
+    );
+    return parseCanonicalCallInputs(response);
+  };
+
+  const commitCallCompletion = async (
+    receipt: CallTurnReceipt,
+    completion: { spoken_text: string; exact_text?: string; display_blocks?: CallDisplayBlock[] },
+    coveredMessageIds: string[],
+  ): Promise<boolean> => {
+    if (!callCoordinator.completionIsCurrent(receipt)) return false;
+    try {
+      await apiPost(`/api/agent/projects/${projectId}/strategic-call/complete-turn`, {
+        task_id: taskId,
+        call_id: receipt.call_id,
+        call_generation: receipt.call_generation,
+        input_revision: receipt.input_revision,
+        idempotency_key: receipt.idempotency_key,
+        covered_message_ids: coveredMessageIds,
+        content: completion.spoken_text,
+        ...(completion.exact_text ? { exact_text: completion.exact_text } : {}),
+        ...(completion.display_blocks ? { display_blocks: completion.display_blocks } : {}),
+      });
+      return true;
+    } catch (error) {
+      // A 409 is expected after end/restart. Never turn it into a legacy reply.
+      sendLog(ws, `[resident] Fast call completion rejected or unavailable: ${sanitize(String(error))}\n`);
+      return false;
+    }
+  };
+
+  expireAbsentOperatorCall = async (callId: string, generation: number): Promise<void> => {
+    const lease = callCoordinator.currentLease();
+    if (operatorPresent || !lease || lease.callId !== callId || lease.generation !== generation) return;
+    try {
+      await apiPost(`/api/agent/projects/${projectId}/strategic-call/end`, {
+        task_id: taskId,
+        call_id: callId,
+        call_generation: generation,
+        reason: 'operator_disconnected',
+      });
+      await heartbeat(false);
+      callWakeGate.notify();
+    } catch (error) {
+      sendLog(ws, `[resident] absent-operator call release deferred: ${sanitize(String(error))}\n`);
+    }
+  };
+
+  const submitFinalSpeechTranscript = async (
+    transcript: string,
+    origin: { callId: string; generation: number; key: string },
+    turnIndex?: number,
+  ): Promise<void> => {
+    if (!speechOriginIsCurrent(origin.key, callCoordinator.currentLease(), activeCallKey)
+      || !transcript.trim()) return;
+    const nonce = turnIndex ?? ++speechTurnNonce;
+    const idempotencyKey = `call-stt:${origin.callId}:${origin.generation}:${nonce}`;
+    if (submittedSpeechTurns.has(idempotencyKey)) return;
+    submittedSpeechTurns.add(idempotencyKey);
+    try {
+      await apiPost(`/api/agent/projects/${projectId}/strategic-call/finalized-transcript`, {
+        task_id: taskId,
+        call_id: origin.callId,
+        call_generation: origin.generation,
+        content: transcript.trim(),
+        idempotency_key: idempotencyKey,
+        input_source: 'voice',
+      });
+      // Never dispatch provider transcript directly to Fast. The durable write
+      // is followed by a canonical call-input fetch through the wake gate.
+      callWakeGate.notify();
+    } catch (error) {
+      submittedSpeechTurns.delete(idempotencyKey);
+      sendLog(ws, `[resident] final speech transcript was not committed: ${sanitize(String(error))}\n`);
+    }
+  };
+
+  const ensureSpeechForCurrentCall = async (): Promise<void> => {
+    const lease = callCoordinator.currentLease();
+    const originKey = callLeaseKey(lease);
+    if (!lease || originKey === null
+      || !speechOriginIsCurrent(originKey, lease, activeCallKey)) {
+      throw new Error('speech call lease is unavailable');
+    }
+    if (callSpeech !== null && speechCallKey === originKey) return;
+    if (callSpeech !== null) await retireCallSpeech();
+    await speechRetirement;
+    if (!speechOriginIsCurrent(originKey, callCoordinator.currentLease(), activeCallKey)) {
+      throw new Error('speech call lease was superseded');
+    }
+    if (callSpeech === null) {
+      if (speechCredentialKey !== originKey || speechCredentialEnvironment === null) {
+        const envelope = await apiPost(
+          `/api/agent/projects/${projectId}/strategic-call/speech-credentials`,
+          {
+            task_id: taskId,
+            call_id: lease.callId,
+            call_generation: lease.generation,
+          },
+        );
+        speechCredentialEnvironment = parseCallSpeechCredentialEnvelope(envelope);
+        const rawEnvelope = envelope && typeof envelope === 'object' && !Array.isArray(envelope)
+          ? envelope as Record<string, unknown> : {};
+        foregroundQualification = typeof rawEnvelope.foreground_qualification === 'string'
+          ? rawEnvelope.foreground_qualification : null;
+        speechCredentialKey = originKey;
+      }
+      const speechConfig = loadCallSpeechConfig(speechCredentialEnvironment);
+      if (foregroundCall === null) {
+        foregroundCall = new ForegroundCallController({
+          adapter: configuredClaudeForegroundAdapter({
+            CALL_FOREGROUND_QUALIFICATION: foregroundQualification ?? undefined,
+          }),
+          model,
+          effort,
+        });
+      }
+      // Lock both RTC directions to the provider contracts before either track
+      // is published. rtc-node performs the actual browser resampling.
+      callMedia.setOutputFormat({
+        sampleRate: speechConfig.cartesia.sampleRateHz,
+        channels: 1,
+      });
+      callMedia.setInputFormat({
+        sampleRate: speechConfig.deepgram.sampleRateHz,
+        channels: 1,
+        frameSizeMs: 20,
+      });
+      const origin = { callId: lease.callId, generation: lease.generation, key: originKey };
+      const pipeline = new CallSpeechPipeline(speechConfig, {
+        onTranscript: (event) => {
+          if (!speechOriginIsCurrent(origin.key, callCoordinator.currentLease(), activeCallKey)
+            || callSpeech !== pipeline) return;
+          if (event.kind === 'turn_start') {
+            // Flux StartOfTurn is the lowest-latency barge-in signal. It must
+            // cancel public generation before end-of-turn/durable transcript.
+            foregroundCall?.interrupt();
+            void pipeline.bargeIn();
+            void callMedia.cancelPlayback().catch(() => undefined);
+          }
+          if ((event.kind === 'partial' || event.kind === 'final') && event.transcript.trim()) {
+            void callMedia.publishTransientTranscript({
+              callId: origin.callId,
+              generation: origin.generation,
+              segmentId: `stt:${event.turnIndex ?? 'live'}`,
+              text: event.transcript.trim(),
+              final: event.kind === 'final',
+            }).catch(() => undefined);
+          }
+          // Only a Flux final/EndOfTurn is admitted durably. Partials and
+          // StartOfTurn are visible but never model input.
+          if (event.kind === 'final') {
+            void submitFinalSpeechTranscript(event.transcript, origin, event.turnIndex);
+          }
+        },
+        onAudio: (event) => {
+          // TTS can still emit a buffered provider chunk after a backend
+          // partition or lease expiry.  The coordinator's wall-clock fence is
+          // checked again at the media egress boundary so expired calls never
+          // keep speaking solely because the WebSocket remains connected.
+          if (!speechOriginIsCurrent(origin.key, callCoordinator.currentLease(), activeCallKey)
+            || callSpeech !== pipeline
+            || mediaCallKey !== origin.key) return;
+          if (event.pcm.byteLength % 2 !== 0 || event.channels < 1) return;
+          const samples = new Int16Array(
+            event.pcm.buffer,
+            event.pcm.byteOffset,
+            event.pcm.byteLength / Int16Array.BYTES_PER_ELEMENT,
+          );
+          void callMedia.writeOutputFrame({
+            data: samples,
+            sampleRate: event.sampleRateHz,
+            channels: event.channels,
+            samplesPerChannel: samples.length / event.channels,
+          }).catch(() => undefined);
+        },
+        onCaption: (event) => {
+          if (!speechOriginIsCurrent(origin.key, callCoordinator.currentLease(), activeCallKey)
+            || callSpeech !== pipeline
+            || mediaCallKey !== origin.key
+            || event.words.length === 0) return;
+          void callMedia.publishCaption({
+            callId: origin.callId,
+            generation: origin.generation,
+            segmentId: event.phraseId,
+            text: event.words.join(' '),
+            final: true,
+            startTimeMs: event.startMs[0],
+            endTimeMs: event.endMs.at(-1),
+          }).catch(() => undefined);
+        },
+        onPhraseLifecycle: (event) => {
+          if (!speechOriginIsCurrent(origin.key, callCoordinator.currentLease(), activeCallKey)
+            || callSpeech !== pipeline
+            || mediaCallKey !== origin.key
+            || !callMedia.isConnected()) return;
+          void callMedia.publishTtsSourceLifecycle({
+            callId: origin.callId,
+            generation: origin.generation,
+            phraseId: event.phraseId,
+            event: event.event,
+          }).catch(() => undefined);
+        },
+      });
+      callSpeech = pipeline;
+      speechCallKey = origin.key;
+      await pipeline.start();
+      if (!speechOriginIsCurrent(origin.key, callCoordinator.currentLease(), activeCallKey)
+        || callSpeech !== pipeline) {
+        await retireCallSpeech();
+        throw new Error('speech call lease was superseded during startup');
+      }
+    }
+  };
+
+  const startSpeechInputPump = (): void => {
+    const pipeline = callSpeech;
+    const originKey = speechCallKey;
+    if (pipeline === null || originKey === null) return;
+    if (speechInputPump !== null) return;
+    const pumpGeneration = ++speechInputPumpGeneration;
+    let pump: Promise<void> = Promise.resolve();
+    pump = (async () => {
+      // Yield once so `pump` is assigned before the finally identity fence can
+      // run, including when the lease changed before this task was scheduled.
+      await Promise.resolve();
+      try {
+        while (callMedia.isConnected()
+          && callSpeech === pipeline
+          && speechCallKey === originKey
+          && mediaCallKey === originKey
+          && speechOriginIsCurrent(originKey, callCoordinator.currentLease(), activeCallKey)) {
+          const frame = await callMedia.readInputFrame();
+          if (frame !== null
+            && callSpeech === pipeline
+            && speechOriginIsCurrent(originKey, callCoordinator.currentLease(), activeCallKey)) {
+            pipeline.pushRtcFrame(frame);
+          }
+        }
+      } catch (error) {
+        sendLog(ws, `[resident] call microphone stream deferred: ${sanitize(String(error))}\n`);
+      } finally {
+        if (speechInputPumpGeneration === pumpGeneration) {
+          speechInputPump = null;
+          // A generation swap can finish the old read after the replacement
+          // media connection asked to start its pump. Restart against the
+          // current pipeline instead of leaving the new call microphone idle.
+          if (callMedia.isConnected() && callSpeech !== null) startSpeechInputPump();
+        }
+      }
+    })();
+    speechInputPump = pump;
+  };
+
+  const readWorkdayPackets = (): CallWorkPacket[] => {
+    if (!fs.existsSync(workdayCallStageDir)) return [];
+    const packets: CallWorkPacket[] = [];
+    for (const name of fs.readdirSync(workdayCallStageDir).sort()) {
+      if (!name.startsWith('packet-') || !name.endsWith('.json')) continue;
+      const stagedPath = path.join(workdayCallStageDir, name);
+      try {
+        const stat = fs.lstatSync(stagedPath);
+        if (!stat.isFile() || stat.size > 64 * 1024) throw new Error('invalid Workday packet staging');
+        const packet = callCoordinator.acceptWorkPacket(JSON.parse(fs.readFileSync(stagedPath, 'utf8')), projectId);
+        if (packet) packets.push(packet);
+      } catch (error) {
+        sendLog(ws, `[resident] invalid private call packet dropped: ${sanitize(String(error))}\n`);
+      } finally {
+        try { fs.unlinkSync(stagedPath); } catch { /* duplicate fence remains in memory */ }
+      }
+    }
+    return packets;
+  };
+
+  const fastPromptForInput = (input: CanonicalCallInput): string => [
+    'You are Fast Resident, the single public conversational mind for an active research call.',
+    'Respond naturally and concisely. You have no filesystem, shell, backend, or broad tools.',
+    'Do not treat plain assistant text as delivery. You MUST use mcp__call__complete_turn exactly once to deliver a reply.',
+    'If deeper research is necessary, use mcp__call__request_workday with a precise private request and DO NOT call complete_turn for this input; a later fenced Workday packet will resume you.',
+    'Do not claim private Workday progress as a public result. Exact equations/code belong in show_display_blocks or complete_turn display_blocks.',
+    `Canonical ${input.inputSource} input (${input.id}):\n${input.content}`,
+  ].join('\n\n');
+
+  const fastPromptForPacket = (packet: CallWorkPacket): string => [
+    'You are Fast Resident. A private Workday packet has been fenced by the Coordinator for this exact active call.',
+    'Turn it into a clear public response. Do not expose internal chain-of-thought or say the packet is authoritative without checking its stated limits.',
+    'Use mcp__call__complete_turn exactly once. Preserve opaque display blocks only through the appropriate call tool.',
+    `Private packet (${packet.kind}) for request ${packet.request_id}:\n${packet.spoken_text}`,
+    packet.exact_text ? `Exact text:\n${packet.exact_text}` : '',
+  ].filter(Boolean).join('\n\n');
+
+  const runPrivateWorkdayRequest = async (request: { request_id: string; prompt: string; receipt: CallTurnReceipt }): Promise<CallWorkPacket[]> => {
+    if (!callCoordinator.completionIsCurrent(request.receipt)) return [];
+    const lease = callCoordinator.currentLease();
+    if (!lease) return [];
+    const turn = await runTurn([
+      { type: 'text', text: [
+        'This is private Call Workday reasoning. You MUST NOT reply to the operator or use the native Workday reply tool.',
+        'Use only mcp__call__emit_call_packet to return a schema-valid progress/final/blocked packet to Fast Resident.',
+        `Call ${lease.callId} generation ${lease.generation}, input revision ${lease.inputRevision}, request ${request.request_id}.`,
+        `Private request:\n${request.prompt}`,
+      ].join('\n\n') },
+    ], false);
+    if (turn.processGone) sendLog(ws, '[resident] Workday exited during private call request; preserving call state\n');
+    return readWorkdayPackets();
+  };
+
+  const schedulePrivateWorkdayRequest = (
+    request: { request_id: string; prompt: string; receipt: CallTurnReceipt },
+  ): void => {
+    privateWorkdayChain = privateWorkdayChain
+      .catch(() => undefined)
+      .then(async () => {
+        if (!callCoordinator.completionIsCurrent(request.receipt)) return;
+        const packets = await runPrivateWorkdayRequest(request);
+        for (const packet of packets) {
+          // Progress may be reflected by a future receipt-bound progress
+          // protocol. It is deliberately not public model text in v1.
+          if (packet.kind !== 'progress') pendingWorkdayPackets.push(packet);
+        }
+        if (pendingWorkdayPackets.length > 0) callWakeGate.notify();
+      })
+      .catch((error: unknown) => {
+        sendLog(ws, `[resident] private call Workday request failed: ${sanitize(String(error))}\n`);
+      });
+  };
+
+  const dispatchFastPrompt = async (
+    receipt: CallTurnReceipt,
+    prompt: string,
+    coveredMessageIds: string[],
+  ): Promise<void> => {
+    const foreground = foregroundCall;
+    if (!foreground || !callCoordinator.completionIsCurrent(receipt)) return;
+    let turn = await foreground.dispatch(receipt, prompt);
+    if (turn.result.processGone && callCoordinator.completionIsCurrent(receipt)) {
+      // Replace just the restricted Fast child. The same immutable receipt
+      // makes this retry safe: stale/duplicate completion cannot commit.
+      foreground.replaceAfterCrash();
+      turn = await foreground.dispatch(receipt, prompt);
+    }
+    const completion = turn.workdayRequests.length === 0 ? turn.completion : null;
+    if (completion && callCoordinator.completionIsCurrent(receipt)) {
+      const displays = completion.display_blocks ?? turn.displayBlocks[0]?.display_blocks;
+      const accepted = await commitCallCompletion(
+        receipt,
+        { ...completion, display_blocks: displays },
+        coveredMessageIds,
+      );
+      // Only a backend-accepted, receipt-bound completion may become public
+      // media. Plain model text is never speech, captions, or display delivery.
+      if (accepted && callCoordinator.completionIsCurrent(receipt)) {
+        const lease = callCoordinator.currentLease();
+        if (lease && displays.length > 0 && callMedia.isConnected()) {
+          void callMedia.publishDisplay({
+            callId: lease.callId,
+            generation: lease.generation,
+            packetId: receipt.idempotency_key,
+            text: completion.exact_text ?? completion.spoken_text,
+            displayBlocks: displays,
+          }).catch((error: unknown) => {
+            sendLog(ws, `[resident] receipt-bound display delivery dropped: ${sanitize(String(error))}\n`);
+          });
+        }
+        const speech = callSpeech;
+        const receiptCallKey = `${receipt.call_id}:${receipt.call_generation}`;
+        if (speech !== null && speechCallKey === receiptCallKey && operatorPresent) {
+          void speech.speak(completion.spoken_text, { sentenceId: receipt.idempotency_key }).catch((error: unknown) => {
+            sendLog(ws, `[resident] receipt-bound speech delivery dropped: ${sanitize(String(error))}\n`);
+          });
+        }
+      }
+    }
+    for (const request of turn.workdayRequests) {
+      if (!callCoordinator.completionIsCurrent(request.receipt)) continue;
+      schedulePrivateWorkdayRequest(request);
+    }
+  };
+
+  const processCallInputs = async (): Promise<void> => {
+    if (callDispatching || !callCoordinator.suppressOrdinaryWorkday()) return;
+    callDispatching = true;
+    try {
+      // Refresh the server-owned lease/input revision immediately before the
+      // canonical fetch rather than trusting a delayed browser/media wakeup.
+      const renewed = await heartbeat(false);
+      if (renewed?.stop_requested || !callCoordinator.suppressOrdinaryWorkday()) return;
+      const inputs = await fetchCanonicalCallInputs();
+      // Input revision is a latest-wins interruption fence. If several inputs
+      // committed before this poll, only the newest can legitimately complete;
+      // advance past the older ones instead of spending Fast capacity on replies
+      // the backend must reject as stale.
+      const newest = inputs.at(-1);
+      if (inputs.length > 0) callInputAfterSequence = Math.max(...inputs.map(input => input.sequence));
+      if (newest) {
+        const input = newest;
+        const receipt = callCoordinator.beginPublicTurn(input.id);
+        await dispatchFastPrompt(receipt, fastPromptForInput(input), [input.id]);
+        if (!callCoordinator.completionIsCurrent(receipt)) return;
+        return;
+      }
+      // Private Workday completes in the background. Only drain it when no
+      // newer canonical operator input is waiting, and re-check the full lease
+      // fence because input revision may have advanced while Workday thought.
+      while (pendingWorkdayPackets.length > 0) {
+        const packet = pendingWorkdayPackets.shift();
+        if (!packet) continue;
+        const lease = callCoordinator.currentLease();
+        if (!lease
+          || packet.call_session_id !== lease.callId
+          || packet.call_generation !== lease.generation
+          || packet.input_revision !== lease.inputRevision) continue;
+        const packetReceipt = callCoordinator.beginPublicTurn(
+          packet.originating_user_turn_ids[0] ?? packet.request_id,
+        );
+        await dispatchFastPrompt(
+          packetReceipt,
+          fastPromptForPacket(packet),
+          packet.originating_user_turn_ids,
+        );
+        break;
+      }
+    } catch (error) {
+      // A 409 commonly means end/restart or a newer input won the revision.
+      // Preserve the Workday session and let the next heartbeat reconcile state.
+      sendLog(ws, `[resident] canonical call input fetch/dispatch deferred: ${sanitize(String(error))}\n`);
+    } finally {
+      callDispatching = false;
+    }
   };
 
   // Poll + heartbeat while an autonomous turn runs; resolves the moment the turn
@@ -1975,6 +2717,12 @@ export async function handleStrategicResident(
             receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
             stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
           });
+          workdayCallTool = provisionCallResidentTool(WORKSPACE, 'workday', {
+            stageDir: workdayCallStageDir,
+          });
+          residentCallMcpConfigPath = mergeCallMcpConfigs(
+            WORKSPACE, residentReplyTool.configPath, workdayCallTool.configPath,
+          );
           sendLog(ws, '[resident] workspace recovery — helper tools re-provisioned\n');
 
           // Restart the subprocess so its cwd points to the new directory inode.
@@ -2027,6 +2775,21 @@ export async function handleStrategicResident(
         continue;
       }
 
+      // Call mode has its own canonical durable input feed.  The old Workday
+      // message poll intentionally returns no rows while a call owns public
+      // conversation, so this must run before the ordinary passive/autonomy
+      // gates. It is sequential: one fenced public owner at a time.
+      if (callCoordinator.suppressOrdinaryWorkday()) {
+        setResidentActivity('working', 'Fast Resident is handling canonical call input');
+        await processCallInputs();
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested) break;
+        }
+        await callWakeGate.wait(cfg.messagePollMs);
+        continue;
+      }
+
       // Passive mode: chat-only, no self-driven work. Entered either for a
       // read-only monitor session (autonomous disabled) OR when the authority
       // lease has lapsed (backend's unattended cap → authority_held:false). We
@@ -2035,12 +2798,10 @@ export async function handleStrategicResident(
       // and folds any re-arm (authority_held:true — set when a new operator
       // message re-engages) so the NEXT iteration reopens the autonomous path.
       // We never self-prompt or mutate strategic state on a lapsed lease.
-      if (!autonomousActive(cfg.autonomousEnabled, authorityHeld)) {
+      if (callCoordinator.suppressAutonomy() || !autonomousActive(cfg.autonomousEnabled, authorityHeld)) {
         setResidentActivity(
           'waiting',
-          authorityHeld
-            ? 'Waiting in chat-only mode'
-            : 'Waiting for operator interaction to re-arm autonomy',
+          'Waiting in chat-only mode',
           new Date(Date.now() + cfg.messagePollMs).toISOString(),
         );
         // Poll operator messages at the fast cadence (the fast path at the top of
@@ -2401,6 +3162,13 @@ export async function handleStrategicResident(
     clearTimeout(gitTokenRefreshTimer);
     streamer.flush();
     invalidateSessionEvents();
+    const foregroundToClose: ForegroundCallController | null = foregroundCall;
+    (foregroundToClose as ForegroundCallController | null)?.close();
+    foregroundCall = null;
+    callWakeGate.close();
+    clearOperatorDisconnectTimer();
+    await callMedia.disconnect();
+    await retireCallSpeech();
     session.close();
     try {
       removeResidentReplyArtifactsAtPaths(

@@ -18,7 +18,7 @@ from starlette.requests import Request
 
 from app.auth import create_agent_token
 from app.main import app
-from app.models import MessageType, Project, ProjectMessage, Task
+from app.models import MessageSurface, MessageType, Project, ProjectMessage, Task
 from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_EXPECTED_PER_MINUTE,
     _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE,
@@ -49,6 +49,60 @@ async def _make_project_task(db_session, *, vm="agent-vm-msgpoll"):
     await db_session.commit()
     await db_session.refresh(task)
     return project, task
+
+
+@pytest.mark.asyncio
+async def test_resident_worker_can_fence_and_release_call_after_operator_disconnect(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_project_task(db_session)
+    task.context = {"_resident_session": True}
+    project.vision = {
+        "_resident_strategic_session": {
+            "status": "active",
+            "call": {
+                "call_id": "call-empty-room",
+                "generation": 3,
+                "status": "active",
+                "worker_task_id": str(task.id),
+                "actor_user_id": "test-user-msgpoll",
+                "input_revision": 1,
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(minutes=5)
+                ).isoformat(),
+            },
+        }
+    }
+    db_session.add(task)
+    db_session.add(project)
+    await db_session.commit()
+
+    stale = await client.post(
+        f"/api/agent/projects/{project.id}/strategic-call/end",
+        headers=_headers(task),
+        json={
+            "task_id": str(task.id),
+            "call_id": "call-empty-room",
+            "call_generation": 2,
+            "reason": "operator_disconnected",
+        },
+    )
+    assert stale.status_code == 409
+
+    ended = await client.post(
+        f"/api/agent/projects/{project.id}/strategic-call/end",
+        headers=_headers(task),
+        json={
+            "task_id": str(task.id),
+            "call_id": "call-empty-room",
+            "call_generation": 3,
+            "reason": "operator_disconnected",
+        },
+    )
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "ended"
+    assert ended.json()["call"]["status"] == "expired"
+    assert ended.json()["call"]["failure"] == "operator_disconnected"
 
 
 async def _add_message(db_session, project, *, created_at=None, **kwargs):
@@ -243,6 +297,65 @@ async def test_poll_since_accepts_tz_aware_cursor(
     assert res.status_code == 200, res.text
     ids = [m["id"] for m in res.json()["messages"]]
     assert ids == [str(newer.id)]
+
+
+@pytest.mark.asyncio
+async def test_call_inputs_filter_before_limit_and_include_sequence(
+    client: AsyncClient, db_session
+):
+    """Ordinary chat cannot crowd a canonical call input out of a 20-row page."""
+    project, task = await _make_project_task(db_session)
+    call_id = "call-limit-fence"
+    call_generation = 7
+    project.vision = {
+        "_resident_strategic_session": {
+            "call": {
+                "call_id": call_id,
+                "generation": call_generation,
+                "status": "active",
+                "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+                "worker_task_id": str(task.id),
+            }
+        }
+    }
+    task.context = {"_resident_session": True}
+    db_session.add_all([project, task])
+    await db_session.commit()
+
+    # These are all newer than the canonical input.  A filter after LIMIT would
+    # return this page and then discard every row, starving the call forever.
+    for sequence in range(1, 22):
+        await _add_message(
+            db_session,
+            project,
+            from_type="user",
+            status="open",
+            surface=MessageSurface.CONVERSATION,
+            sequence=sequence,
+            content=f"ordinary-{sequence}",
+            context={"call_id": "other-call", "call_generation": 1},
+        )
+    canonical = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        surface=MessageSurface.CONVERSATION,
+        sequence=22,
+        content="canonical input",
+        context={"call_id": call_id, "call_generation": call_generation},
+    )
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-call/inputs",
+        params={"call_id": call_id, "call_generation": call_generation},
+        headers=_headers(task),
+    )
+    assert res.status_code == 200, res.text
+    messages = res.json()["messages"]
+    assert [message["id"] for message in messages] == [str(canonical.id)]
+    assert messages[0]["sequence"] == 22
+    assert isinstance(messages[0]["sequence"], int)
 
 
 @pytest.mark.asyncio

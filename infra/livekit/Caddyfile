@@ -1,0 +1,21 @@
+{
+	# Caddy's admin API is not part of the deployment surface.
+	admin off
+	email {$CADDY_ACME_EMAIL}
+}
+
+# The public host must resolve to this VM before Caddy can obtain a trusted
+# certificate. Caddy preserves WebSocket upgrades without special headers.
+{$LIVEKIT_PUBLIC_HOST} {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:7880 {
+		transport http {
+			versions h1
+		}
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

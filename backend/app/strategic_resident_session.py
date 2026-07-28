@@ -36,7 +36,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -48,6 +48,15 @@ from sqlmodel import select
 from app.database import AsyncSessionLocal, get_session
 from app.failure_classification import ADMIN_CANCEL
 from app.knowledge_query import build_strategic_memory_index
+from app.livekit_tokens import (
+    LiveKitConfigurationError,
+    issue_resident_call_credentials,
+)
+from app.voice_credentials import (
+    VoiceCredentialConfigurationError,
+    resolve_resident_call_speech_credentials,
+    validate_resident_call_deployment_configuration,
+)
 from app.models import (
     Direction,
     Project,
@@ -90,6 +99,26 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 # ``_strategic_workbench`` (per-operator prefs) and ``_strategic_local_continuation``
 # (the lease marker) so the three concerns never clobber one another.
 RESIDENT_SESSION_KEY = "_resident_strategic_session"
+
+# A call is deliberately a bounded, nested lease on the existing Workday
+# session record, not a third interaction_mode or a new persistent table.  The
+# generation is the public-reply fence: every call-owned mutation must present
+# the exact id + generation recorded here.
+RESIDENT_CALL_KEY = "call"
+CALL_STATUS_ACTIVE = "active"
+CALL_STATUS_ENDED = "ended"
+CALL_STATUS_EXPIRED = "expired"
+_DEFAULT_RESIDENT_CALL_TTL_SECONDS = 300
+_RESIDENT_CALL_TTL_MIN_SECONDS = 30
+_RESIDENT_CALL_TTL_MAX_SECONDS = 900
+_RESIDENT_CALL_READY_DEADLINE_SECONDS = 30
+_RESIDENT_CALL_MAX_DURATION_SECONDS = 7200
+_RESIDENT_CALL_USAGE_LIMITS = {
+    "input_audio_ms": _RESIDENT_CALL_MAX_DURATION_SECONDS * 1000,
+    "output_audio_bytes": 2_000_000_000,
+    "output_characters": 20_000_000,
+    "provider_errors": 100_000,
+}
 
 # ``Project.vision`` key holding the reason the *last* Workday auto-start was
 # blocked or failed (surfaced by the strategic read model so the operator sees
@@ -339,6 +368,347 @@ def read_resident_session(vision: dict[str, Any] | None) -> dict[str, Any] | Non
     """Return the raw session-state blob from ``Project.vision`` (or None)."""
     blob = (vision or {}).get(RESIDENT_SESSION_KEY)
     return blob if isinstance(blob, dict) else None
+
+
+def read_resident_call(vision: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the nested call lease from the canonical Resident state."""
+    session_blob = read_resident_session(vision)
+    call = (session_blob or {}).get(RESIDENT_CALL_KEY)
+    return call if isinstance(call, dict) else None
+
+
+def resident_call_is_active(
+    call: dict[str, Any] | None, *, now: datetime | None = None
+) -> bool:
+    """True only for an unexpired active call lease."""
+    if not isinstance(call, dict) or call.get("status") != CALL_STATUS_ACTIVE:
+        return False
+    expires_at = _parse_iso_naive(call.get("expires_at"))
+    return expires_at is not None and expires_at > (now or _utcnow())
+
+
+def resident_call_snapshot(
+    vision: dict[str, Any] | None, *, now: datetime | None = None
+) -> dict[str, Any] | None:
+    """Bounded public projection; never exposes the operator or pool account."""
+    call = read_resident_call(vision)
+    if call is None:
+        return None
+    current_now = now or _utcnow()
+    status = call.get("status")
+    if status == CALL_STATUS_ACTIVE and not resident_call_is_active(call, now=current_now):
+        status = CALL_STATUS_EXPIRED
+    return {
+        "call_id": call.get("call_id"),
+        "generation": int(call.get("generation") or 1),
+        "status": status,
+        "started_at": call.get("started_at"),
+        "ready_at": call.get("ready_at"),
+        "updated_at": call.get("updated_at"),
+        "expires_at": call.get("expires_at"),
+        "last_heartbeat_at": call.get("last_heartbeat_at"),
+        "worker_task_id": call.get("worker_task_id"),
+        "worker_generation": int(call.get("worker_generation") or 1),
+        "runner_id": call.get("runner_id"),
+        "input_revision": int(call.get("input_revision") or 0),
+        "failure": call.get("failure"),
+        "usage": _bounded_resident_call_usage(call.get("usage")),
+    }
+
+
+def bind_resident_call_input_to_locked_project(
+    project: Project,
+    *,
+    actor_user_id: str,
+    context: dict[str, Any],
+    input_source: Literal["voice", "typed", "whiteboard"],
+) -> dict[str, Any]:
+    """Stamp/increment an active call input while the caller owns Project lock.
+
+    This intentionally performs no locking or commit: it is called from the
+    existing canonical operator-message transaction after that transaction has
+    acquired the Project row lock and before it allocates the message sequence.
+    """
+    resident = read_resident_session(project.vision)
+    call = (resident or {}).get(RESIDENT_CALL_KEY)
+    if not resident_call_is_active(call):
+        return context
+    if str((call or {}).get("actor_user_id")) != str(actor_user_id):
+        raise HTTPException(status_code=403, detail="Only the call owner may add call input")
+    revision = int((call or {}).get("input_revision") or 0) + 1
+    call["input_revision"] = revision
+    call["updated_at"] = _utcnow().isoformat()
+    resident[RESIDENT_CALL_KEY] = call
+    project.vision = dict(project.vision or {})
+    project.vision[RESIDENT_SESSION_KEY] = resident
+    flag_modified(project, "vision")
+    return {
+        **context,
+        "call_id": call.get("call_id"),
+        "call_generation": int(call.get("generation") or 1),
+        "input_source": input_source,
+        "input_revision": revision,
+    }
+
+
+def _bounded_call_ttl_seconds(value: int | None) -> int:
+    try:
+        parsed = int(value or _DEFAULT_RESIDENT_CALL_TTL_SECONDS)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_RESIDENT_CALL_TTL_SECONDS
+    return min(_RESIDENT_CALL_TTL_MAX_SECONDS, max(_RESIDENT_CALL_TTL_MIN_SECONDS, parsed))
+
+
+def _bounded_resident_call_usage(value: dict[str, Any] | None) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, upper in _RESIDENT_CALL_USAGE_LIMITS.items():
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        result[key] = min(upper, max(0, parsed))
+    return result
+
+
+async def acquire_resident_call_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    operator_user_id: str,
+    account_id: str | None,
+    ttl_seconds: int | None = None,
+) -> tuple[dict[str, Any], str | None, bool]:
+    """Atomically acquire/reuse a nested call lease.
+
+    Returns the full (server-only) lease and an expired account id whose old
+    slot must be released by the caller after commit.  Capacity reservation is
+    intentionally outside this DB lock; the endpoint compensates if this write
+    loses its race.
+    """
+    now = _utcnow()
+    now_iso = now.isoformat()
+    ttl = _bounded_call_ttl_seconds(ttl_seconds)
+    holder: dict[str, Any] = {"call": None, "expired_account_id": None, "created": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        if not resident_session_is_active(resident):
+            raise HTTPException(status_code=409, detail="An active Workday Resident is required")
+        existing = resident.get(RESIDENT_CALL_KEY)
+        if resident_call_is_active(existing, now=now):
+            holder["call"] = dict(existing)
+            return
+        if isinstance(existing, dict) and existing.get("status") == CALL_STATUS_ACTIVE:
+            holder["expired_account_id"] = str(existing.get("account_id") or "") or None
+        prior_generation = int(existing.get("generation") or 0) if isinstance(existing, dict) else 0
+        call = {
+            "call_id": f"call-{uuid.uuid4().hex[:16]}",
+            "generation": prior_generation + 1,
+            "status": CALL_STATUS_ACTIVE,
+            "actor_user_id": str(operator_user_id),
+            "started_at": now_iso,
+            "updated_at": now_iso,
+            "expires_at": (now + timedelta(seconds=ttl)).isoformat(),
+            "last_heartbeat_at": now_iso,
+            "worker_task_id": resident.get("task_id"),
+            "worker_generation": int(resident.get("worker_generation") or 1),
+            "runner_id": resident.get("runner_id"),
+            "account_id": account_id,
+            "slot_reserved": bool(account_id),
+            "input_revision": 0,
+            "failure": None,
+        }
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+        holder["call"] = dict(call)
+        holder["created"] = True
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    return dict(holder["call"]), holder["expired_account_id"], bool(holder["created"])
+
+
+async def release_resident_call_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    call_id: str | None = None,
+    generation: int | None = None,
+    reason: str = "ended",
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Fenced, idempotent call shutdown; returns lease, account id, changed."""
+    now_iso = _utcnow().isoformat()
+    holder: dict[str, Any] = {"call": None, "account_id": None, "changed": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        existing = (resident or {}).get(RESIDENT_CALL_KEY)
+        if not isinstance(existing, dict):
+            return
+        if call_id is not None and str(existing.get("call_id")) != str(call_id):
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        if generation is not None and int(existing.get("generation") or 0) != generation:
+            raise HTTPException(status_code=409, detail="Call generation superseded")
+        holder["call"] = dict(existing)
+        if existing.get("status") == CALL_STATUS_ACTIVE:
+            holder["account_id"] = str(existing.get("account_id") or "") or None
+            existing["status"] = CALL_STATUS_ENDED if reason == "ended" else CALL_STATUS_EXPIRED
+            existing["ended_at"] = now_iso
+            existing["updated_at"] = now_iso
+            existing["failure"] = reason if reason != "ended" else None
+            holder["changed"] = True
+            if isinstance(resident, dict):
+                resident[RESIDENT_CALL_KEY] = existing
+                vision[RESIDENT_SESSION_KEY] = resident
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    if holder["call"] is not None:
+        await session.commit()
+        await session.refresh(project)
+    return holder["call"], holder["account_id"], bool(holder["changed"])
+
+
+async def renew_resident_call_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    task_id: str,
+    call_id: str,
+    generation: int,
+    ttl_seconds: int | None = None,
+    ready: bool = False,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Renew only the exact Resident-owned nested lease."""
+    now = _utcnow()
+    now_iso = now.isoformat()
+    ttl = _bounded_call_ttl_seconds(ttl_seconds)
+    holder: dict[str, Any] = {"call": None, "release_account_id": None}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        call = (resident or {}).get(RESIDENT_CALL_KEY)
+        if not resident_session_is_active(resident) or not isinstance(call, dict):
+            raise HTTPException(status_code=409, detail="No active call lease")
+        if (
+            str(call.get("call_id")) != call_id
+            or int(call.get("generation") or 0) != generation
+            or str(call.get("worker_task_id")) != str(task_id)
+            or call.get("status") != CALL_STATUS_ACTIVE
+        ):
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        started_at = _parse_iso_naive(call.get("started_at"))
+        if started_at is None:
+            raise HTTPException(status_code=409, detail="Call lease has invalid start time")
+        age_seconds = max(0.0, (now - started_at).total_seconds())
+        expiry_reason: str | None = None
+        if age_seconds >= _RESIDENT_CALL_MAX_DURATION_SECONDS:
+            expiry_reason = "maximum_duration_reached"
+        elif (
+            not call.get("ready_at")
+            and not ready
+            and age_seconds >= _RESIDENT_CALL_READY_DEADLINE_SECONDS
+        ):
+            expiry_reason = "coordinator_not_ready"
+        if expiry_reason is not None:
+            call["status"] = CALL_STATUS_EXPIRED
+            call["ended_at"] = now_iso
+            call["updated_at"] = now_iso
+            call["failure"] = expiry_reason
+            holder["release_account_id"] = str(call.get("account_id") or "") or None
+            call["slot_reserved"] = False
+            resident[RESIDENT_CALL_KEY] = call
+            vision[RESIDENT_SESSION_KEY] = resident
+            holder["call"] = dict(call)
+            return
+        if ready and not call.get("ready_at"):
+            call["ready_at"] = now_iso
+        incoming_usage = _bounded_resident_call_usage(usage)
+        if incoming_usage:
+            prior_usage = _bounded_resident_call_usage(call.get("usage"))
+            merged_usage = dict(prior_usage)
+            for key, value in incoming_usage.items():
+                merged_usage[key] = max(value, prior_usage.get(key, 0))
+            call["usage"] = merged_usage
+        call["last_heartbeat_at"] = now_iso
+        call["updated_at"] = now_iso
+        absolute_expiry = started_at + timedelta(
+            seconds=_RESIDENT_CALL_MAX_DURATION_SECONDS
+        )
+        call["expires_at"] = min(
+            now + timedelta(seconds=ttl), absolute_expiry
+        ).isoformat()
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+        holder["call"] = dict(call)
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    if holder["release_account_id"]:
+        from app.max_plan_pool import release_max_plan_call_slot
+
+        await release_max_plan_call_slot(
+            holder["release_account_id"], project_id=str(project.id)
+        )
+    return resident_call_snapshot(project.vision) or {}
+
+
+async def record_resident_call_playout_receipt(
+    session: AsyncSession,
+    project: Project,
+    *,
+    actor_user_id: str,
+    call_id: str,
+    generation: int,
+    phrase_id: str,
+    event: Literal["started", "interrupted", "completed"],
+    reported_at: str | None,
+) -> tuple[dict[str, Any], bool]:
+    """Store a bounded, idempotent browser playout receipt on the call lease."""
+    now_iso = _utcnow().isoformat()
+    receipt_key = f"{phrase_id}:{event}"
+    holder: dict[str, Any] = {"duplicate": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        call = (resident or {}).get(RESIDENT_CALL_KEY)
+        if (
+            not resident_call_is_active(call)
+            or str((call or {}).get("call_id")) != call_id
+            or int((call or {}).get("generation") or 0) != generation
+            or str((call or {}).get("actor_user_id")) != str(actor_user_id)
+        ):
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        prior = call.get("playout_receipts")
+        receipts = list(prior) if isinstance(prior, list) else []
+        if any(isinstance(item, dict) and item.get("key") == receipt_key for item in receipts):
+            holder["duplicate"] = True
+            return
+        receipt = {
+            "key": receipt_key,
+            "phrase_id": phrase_id[:128],
+            "event": event,
+            "reported_at": reported_at[:80] if isinstance(reported_at, str) else None,
+            "received_at": now_iso,
+        }
+        receipts.append(receipt)
+        call["playout_receipts"] = receipts[-32:]
+        call["last_playout"] = receipt
+        call["updated_at"] = now_iso
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    return resident_call_snapshot(project.vision) or {}, bool(holder["duplicate"])
 
 
 def read_resident_session_blocked_reason(vision: dict[str, Any] | None) -> str | None:
@@ -4207,6 +4577,69 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     decisions_reg: str | None = None
     activity: dict[str, Any] | None = None
     repo_head: str | None = None
+    call_id: str | None = None
+    call_generation: int | None = None
+    call_ttl_seconds: int | None = None
+    call_ready: bool = False
+    call_usage: dict[str, Any] | None = None
+
+
+class ResidentCallSpeechCredentialsRequest(BaseModel):
+    """One exact active-call fence for Coordinator-only speech credentials."""
+
+    task_id: str
+    call_id: str
+    call_generation: int
+
+
+@router.post("/projects/{project_id}/strategic-call/speech-credentials")
+@limiter.limit("30/minute")
+async def resident_call_speech_credentials(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ResidentCallSpeechCredentialsRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Vend speech credentials only to the Resident owning this active call.
+
+    This deliberately does not reuse runner dispatch credentials: a Workday
+    Resident can live for hours before a call begins, while provider keys are
+    needed only by its deterministic Coordinator.  The browser and Fast child
+    never call this route.  Do not log request or response bodies here: the
+    response contains provider credentials.
+    """
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    project = await _resolve_agent_project(project_id, token, session)
+    active_call = read_resident_call(project.vision)
+    if (
+        not resident_call_is_active(active_call)
+        or str((active_call or {}).get("worker_task_id")) != str(payload.task_id)
+        or str((active_call or {}).get("call_id")) != payload.call_id
+        or int((active_call or {}).get("generation") or 0)
+        != payload.call_generation
+    ):
+        # Avoid exposing whether another Resident owns a call.  In particular,
+        # do not invoke Secret Manager before every server-owned fence passes.
+        raise HTTPException(
+            status_code=409,
+            detail="No active call is owned by this Resident",
+        )
+    task = await session.get(Task, uuid.UUID(payload.task_id))
+    if task is None or (task.context or {}).get("_resident_session") is not True:
+        raise HTTPException(status_code=409, detail="Call requires a Resident task")
+    try:
+        speech = await resolve_resident_call_speech_credentials(task)
+    except VoiceCredentialConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not speech:
+        raise HTTPException(status_code=503, detail="Resident call speech is not configured")
+    try:
+        qualification = validate_resident_call_deployment_configuration()
+    except VoiceCredentialConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"speech": speech, "foreground_qualification": qualification}
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -4228,7 +4661,7 @@ async def resident_session_heartbeat(
     if str(token.get("sub")) != str(payload.task_id):
         # The heartbeat must come from the resident session task's own token.
         raise HTTPException(status_code=403, detail="Token task mismatch")
-    return await renew_resident_session_lease(
+    response = await renew_resident_session_lease(
         session,
         project,
         session_id=payload.session_id,
@@ -4246,3 +4679,33 @@ async def resident_session_heartbeat(
         activity=payload.activity,
         repo_head=payload.repo_head,
     )
+    if payload.call_id is not None or payload.call_generation is not None:
+        if not payload.call_id or payload.call_generation is None:
+            raise HTTPException(
+                status_code=400,
+                detail="call_id and call_generation must be supplied together",
+            )
+        response["call"] = await renew_resident_call_lease(
+            session,
+            project,
+            task_id=payload.task_id,
+            call_id=payload.call_id,
+            generation=payload.call_generation,
+            ttl_seconds=payload.call_ttl_seconds,
+            ready=payload.call_ready,
+            usage=payload.call_usage,
+        )
+    else:
+        response["call"] = resident_call_snapshot(project.vision)
+    active_call = read_resident_call(project.vision)
+    if (
+        resident_call_is_active(active_call)
+        and str((active_call or {}).get("worker_task_id")) == str(payload.task_id)
+    ):
+        try:
+            response["call_transport"] = issue_resident_call_credentials(
+                call=active_call or {}, task_id=payload.task_id
+            )
+        except LiveKitConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return response

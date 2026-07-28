@@ -1184,6 +1184,23 @@ async def strategic_operation(
             )
 
         await _enforce_resident_mutation_fence(session, project, task, payload.op)
+        # A Live Conversation lease is a server-owned public reply owner.  This
+        # runs while the Project row is locked, after the Resident generation
+        # validation and before *any* create_message bookkeeping, so a native
+        # Workday reply that began before call activation cannot commit after it.
+        # Do not delegate this to prompts: an old runner/token must fail closed.
+        if payload.op == "create_message":
+            from app.strategic_resident_session import (
+                read_resident_call,
+                resident_call_is_active,
+            )
+
+            active_call = read_resident_call(project.vision)
+            if resident_call_is_active(active_call):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Call lease owns public replies for this Resident generation",
+                )
     data = payload.data
     warnings: List[str] = []
 
