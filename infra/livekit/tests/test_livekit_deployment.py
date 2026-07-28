@@ -27,6 +27,14 @@ class LiveKitDeploymentContractTests(unittest.TestCase):
         self.assertIn('"$GCLOUD_BIN" secrets versions access', renderer)
         self.assertIn("install -m 0400", renderer)
 
+    def test_linux_runtime_files_are_lf_only(self) -> None:
+        attributes = (ROOT.parents[1] / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("infra/livekit/bin/* text eol=lf", attributes)
+        self.assertIn(
+            "scripts/blueprint-livekit-system.service text eol=lf",
+            attributes,
+        )
+
     def test_turn_domain_is_checked_against_the_tcp_proxy_host(self) -> None:
         config = (ROOT / "livekit.yaml.example").read_text(encoding="utf-8")
         renderer = (ROOT / "bin" / "render-livekit-secrets").read_text(encoding="utf-8")
