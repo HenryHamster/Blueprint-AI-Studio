@@ -235,6 +235,28 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
+  it('retains a diagnostic for a generic top-level provider error while the child stays alive', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    const turn = session.sendTurn('hello');
+    ctl.pushLine({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      result: '',
+    });
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: true,
+      failureCategory: null,
+      failureDetail: 'provider returned a top-level error result without diagnostic text',
+    });
+    expect(session.isAlive()).toBe(true);
+    session.close();
+  });
+
   it('treats a successful-looking weekly-limit result as a provider failure', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);

@@ -151,6 +151,9 @@ class TestNormalizeRlModel:
     def test_haiku_maps_to_opus(self):
         assert _normalize_rl_model(HAIKU) == OPUS
 
+    def test_current_opus_alias_maps_to_shared_opus_bucket(self):
+        assert _normalize_rl_model("claude-opus-5") == OPUS
+
     def test_opus_passes_through(self):
         assert _normalize_rl_model(OPUS) == OPUS
 
@@ -180,6 +183,12 @@ class TestCascadeDisabledModels:
         # fable-5 availability window elapsed; it now cascades to the shared
         # opus-4-8 meter like other legacy entries.
         assert cascade_disabled_models("claude-fable-5") == ("claude-opus-4-8",)
+
+    def test_opus_5_cooldown_blocks_the_current_opus_alias(self):
+        account = _acct(
+            disabled_models={OPUS: {"hits": 1, "at": _utcnow()}},
+        )
+        assert _account_state_for_model(account, "claude-opus-5") == "unavailable"
 
 
 # ── _filter_providers_by_cli ──────────────────────────────────────────────────
