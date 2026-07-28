@@ -233,7 +233,12 @@
         "test_heartbeat_absent_decision_summary_recovery_clears_dedup",
         "test_allow_no_runner_default_false_blocks_without_device",
         "test_start_allow_no_runner_creates_session_without_task",
-        "test_stop_cleans_up_no_runner_session_without_error"
+        "test_stop_cleans_up_no_runner_session_without_error",
+        "test_call_lease_expires_when_coordinator_never_becomes_ready",
+        "test_call_speech_credentials_require_exact_active_resident_lease",
+        "test_call_start_rejects_provider_without_qualified_foreground_adapter",
+        "test_nested_call_projection_hides_actor_account_and_playout_receipts",
+        "test_ready_call_renewal_is_capped_at_absolute_duration"
       ]
     },
     {

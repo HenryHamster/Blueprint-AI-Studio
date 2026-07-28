@@ -3395,7 +3395,8 @@ async def create_project_strategic_session_message(
                 .execution_options(populate_existing=True)
             )
         ).scalar_one()
-        return bind_resident_call_input_to_locked_project(
+        return await bind_resident_call_input_to_locked_project(
+            locked_session,
             locked_project,
             actor_user_id=current_user["user_id"],
             context=consumed_context,

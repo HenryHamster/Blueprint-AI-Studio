@@ -19,7 +19,9 @@ vi.mock('livekit-client', () => {
     disconnect() { rtc.disconnect(); }
     startAudio() { return rtc.startAudio(); }
   }
-  class RemoteAudioTrack {}
+  class RemoteAudioTrack {
+    detach() { return undefined; }
+  }
   return {
     Room,
     RemoteAudioTrack,
@@ -32,11 +34,10 @@ vi.mock('livekit-client', () => {
   };
 });
 
-vi.mock('../strategicStateApi', () => ({
-  startStrategicCall: vi.fn(),
-  fetchStrategicCall: vi.fn(),
-  endStrategicCall: vi.fn(),
-}));
+vi.mock('../strategicStateApi', async () => {
+  const { createStrategicStateApiMock } = await import('../test/strategic-state-api-mock-complete');
+  return createStrategicStateApiMock();
+});
 
 const mockStartStrategicCall = vi.mocked(startStrategicCall);
 const mockFetchStrategicCall = vi.mocked(fetchStrategicCall);

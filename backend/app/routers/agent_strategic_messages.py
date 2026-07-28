@@ -209,7 +209,8 @@ async def create_finalized_call_transcript(
         ).scalar_one_or_none()
         if locked_project is None or _lease_actor(locked_project.vision) != actor_user_id:
             raise HTTPException(status_code=409, detail="Call lease superseded")
-        return bind_resident_call_input_to_locked_project(
+        return await bind_resident_call_input_to_locked_project(
+            locked_session,
             locked_project,
             actor_user_id=actor_user_id,
             context=current_context,

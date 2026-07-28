@@ -416,7 +416,8 @@ def resident_call_snapshot(
     }
 
 
-def bind_resident_call_input_to_locked_project(
+async def bind_resident_call_input_to_locked_project(
+    session: AsyncSession,
     project: Project,
     *,
     actor_user_id: str,
@@ -425,30 +426,43 @@ def bind_resident_call_input_to_locked_project(
 ) -> dict[str, Any]:
     """Stamp/increment an active call input while the caller owns Project lock.
 
-    This intentionally performs no locking or commit: it is called from the
-    existing canonical operator-message transaction after that transaction has
-    acquired the Project row lock and before it allocates the message sequence.
+    This intentionally performs no commit: it is called from the existing
+    canonical operator-message transaction after that transaction has acquired
+    the Project row lock and before it allocates the message sequence.  Route
+    the mutation through the re-entrant ``with_vision_locked`` bridge so the
+    whole-column write remains centralized in the canonical helper.
     """
-    resident = read_resident_session(project.vision)
-    call = (resident or {}).get(RESIDENT_CALL_KEY)
-    if not resident_call_is_active(call):
-        return context
-    if str((call or {}).get("actor_user_id")) != str(actor_user_id):
-        raise HTTPException(status_code=403, detail="Only the call owner may add call input")
-    revision = int((call or {}).get("input_revision") or 0) + 1
-    call["input_revision"] = revision
-    call["updated_at"] = _utcnow().isoformat()
-    resident[RESIDENT_CALL_KEY] = call
-    project.vision = dict(project.vision or {})
-    project.vision[RESIDENT_SESSION_KEY] = resident
-    flag_modified(project, "vision")
-    return {
-        **context,
-        "call_id": call.get("call_id"),
-        "call_generation": int(call.get("generation") or 1),
-        "input_source": input_source,
-        "input_revision": revision,
-    }
+    result = context
+
+    def _apply(vision: dict[str, Any]) -> None:
+        nonlocal result
+        resident = read_resident_session(vision)
+        call = (resident or {}).get(RESIDENT_CALL_KEY)
+        if not resident_call_is_active(call):
+            return
+        if str((call or {}).get("actor_user_id")) != str(actor_user_id):
+            raise HTTPException(status_code=403, detail="Only the call owner may add call input")
+        revision = int((call or {}).get("input_revision") or 0) + 1
+        call["input_revision"] = revision
+        call["updated_at"] = _utcnow().isoformat()
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+        result = {
+            **context,
+            "call_id": call.get("call_id"),
+            "call_generation": int(call.get("generation") or 1),
+            "input_source": input_source,
+            "input_revision": revision,
+        }
+
+    await with_vision_locked(
+        session,
+        project.id,
+        _apply,
+        skip_locked=False,
+        _locked_project=project,
+    )
+    return result
 
 
 def _bounded_call_ttl_seconds(value: int | None) -> int:
