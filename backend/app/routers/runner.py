@@ -47,6 +47,7 @@ from app.field_encryption import decrypt_field
 from app.broadcast import broadcast_to_project
 from app import storage as app_storage
 from app.runner_project_binding import allowed_project_ids
+from app.runner_pins import release_unpulled_runner_pins
 from app.compute_backends import (
     RUNNER_SUBPROCESS_BACKEND_NAME,
     _MAX_VIEWABLE_FILE_BYTES,
@@ -616,6 +617,9 @@ class HeartbeatRequest(BaseModel):
     # daemon that omits the field keeps the prior stamp-every-heartbeat behaviour
     # (every loop heartbeat IS a genuine report), while the preflight opts out.
     active_work_report: StrictBool = True
+    # True while a version-mismatched daemon drains existing work before its
+    # self-update. This is claim availability, not heartbeat liveness.
+    update_draining: StrictBool | None = None
     agent_available: StrictBool | None = None
     # Why the agent is unavailable (null when agent_available=True or unknown).
     # COMPOUND, "; "-joined string enumerating EVERY failing leg — the runner no
@@ -1142,7 +1146,9 @@ async def next_task(
 
     # A draining runner may finish work it has already pulled, but it must not
     # receive another agent task while the operator is quiescing the host.
-    if runner.status != "active":
+    if runner.status != "active" or (runner.capabilities or {}).get(
+        "update_draining"
+    ) is True:
         response.status_code = status.HTTP_204_NO_CONTENT
         return response
 
@@ -1607,6 +1613,24 @@ async def heartbeat(
     if runner.status not in ("paused", "draining"):
         runner.status = "active"
     caps = dict(runner.capabilities or {})
+    if payload.update_draining is not None:
+        was_update_draining = caps.get("update_draining") is True
+        caps["update_draining"] = payload.update_draining
+        if payload.update_draining:
+            # Recheck on every draining heartbeat, not only the transition.
+            # A dispatcher may have built its runner snapshot immediately before
+            # the first drain report and pin one final task after that report's
+            # release query. Repeating this cheap bounded query closes that race
+            # within one heartbeat instead of stranding the late pin.
+            released_pins = await release_unpulled_runner_pins(session, runner.id)
+            if released_pins or not was_update_draining:
+                logger.warning(
+                    "[RUNNERS] Runner %s %s auto-update drain; "
+                    "released_unpulled_pins=%s",
+                    runner.id,
+                    "entered" if not was_update_draining else "remains in",
+                    released_pins,
+                )
     # Refresh the reported active-work set + its report timestamp ONLY for a
     # genuine active-work report. A ``--check`` preflight posts active_task_ids=[]
     # as a probe (active_work_report=False), NOT a real report: writing that empty
@@ -2090,7 +2114,9 @@ async def next_compute_job(
     # keep reporting and finish normally, but no new subprocess may be handed to
     # this runner.  Return the ordinary empty-poll response so older runners
     # simply back off while an operator drains the host.
-    if runner.status != "active":
+    if runner.status != "active" or (runner.capabilities or {}).get(
+        "update_draining"
+    ) is True:
         response.status_code = status.HTTP_204_NO_CONTENT
         return response
 

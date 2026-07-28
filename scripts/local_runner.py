@@ -3579,6 +3579,9 @@ def _heartbeat_loop(
                 # reaper-trusted active-set snapshot + stamp only for reports
                 # flagged here (a --check preflight sets this False).
                 "active_work_report": True,
+                # Version mismatch drains both claim loops while existing work
+                # finishes. Tell the server this heartbeat is not availability.
+                "update_draining": _update_in_progress.is_set(),
                 "agent_available": agent_available,
                 "agent_unavailable_reason": agent_unavailable_reason,
                 "agent_unavailable_legs": agent_unavailable_legs,
