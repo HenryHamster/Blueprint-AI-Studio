@@ -15,6 +15,7 @@ import {
   STRATEGIC_STATE_NOT_MODIFIED,
   updateStrategicWorkbenchState,
   startStrategicCall,
+  fetchStrategicCall,
   endStrategicCall,
   type StrategicWorkbenchState,
 } from './strategicStateApi';
@@ -70,6 +71,19 @@ describe('Strategic call contract', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ call_id: 'call-1', generation: 3 }),
     });
+  });
+
+  test('treats the backend empty-call response as no existing call', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ project_id: 'proj-1', call: null }));
+
+    await expect(fetchStrategicCall('proj-1')).resolves.toBeNull();
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-call',
+      undefined,
+      2,
+      30000,
+      undefined,
+    );
   });
 });
 

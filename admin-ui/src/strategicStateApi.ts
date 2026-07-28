@@ -1506,6 +1506,13 @@ export async function fetchStrategicCall(projectId: string, signal?: AbortSignal
     signal,
   );
   if (res.status === 404) return null;
+  if (res.ok) {
+    const data = await res.clone().json() as {
+      call?: StrategicCallState | null;
+      strategic_call?: StrategicCallState | null;
+    };
+    if (data.call === null || data.strategic_call === null) return null;
+  }
   return strategicCallResponse(res, 'Failed to fetch call');
 }
 
