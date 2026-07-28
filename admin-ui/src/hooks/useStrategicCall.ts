@@ -25,6 +25,7 @@ export interface CallDisplayBlock {
 }
 
 export type StrategicCallConnectionState = 'idle' | 'starting' | 'connecting' | 'waiting_for_resident' | 'connected' | 'reconnecting' | 'error';
+export type StrategicCallMicrophoneState = 'off' | 'enabling' | 'disabling' | 'on' | 'denied';
 
 /** A media socket alone is not a useful call. Keep this bounded and explicit. */
 export const CALL_COORDINATOR_READY_TIMEOUT_MS = 20_000;
@@ -145,7 +146,7 @@ export function useStrategicCall(projectId: string | null) {
   const callRef = useRef<StrategicCallState | null>(null);
   const [call, setCall] = useState<StrategicCallState | null>(null);
   const [connectionState, setConnectionState] = useState<StrategicCallConnectionState>('idle');
-  const [microphoneState, setMicrophoneState] = useState<'off' | 'requesting' | 'on' | 'denied'>('off');
+  const [microphoneState, setMicrophoneState] = useState<StrategicCallMicrophoneState>('off');
   const [audioPlaybackState, setAudioPlaybackState] = useState<'unknown' | 'enabled' | 'blocked'>('unknown');
   const [captions, setCaptions] = useState<LiveCaption[]>([]);
   const [displayBlocks, setDisplayBlocks] = useState<CallDisplayBlock[]>([]);
@@ -353,7 +354,7 @@ export function useStrategicCall(projectId: string | null) {
       setAudioPlaybackState('blocked');
       setError('Browser audio playback is blocked. Select Enable audio to hear the Resident.');
     }
-    setMicrophoneState('requesting');
+    setMicrophoneState('enabling');
     try {
       await room.localParticipant.setMicrophoneEnabled(true);
       setMicrophoneState('on');
@@ -433,15 +434,17 @@ export function useStrategicCall(projectId: string | null) {
 
   const toggleMicrophone = useCallback(async () => {
     const room = roomRef.current;
-    if (!room) return;
+    if (!room || microphoneState === 'enabling' || microphoneState === 'disabling') return;
     const enabled = microphoneState !== 'on';
-    setMicrophoneState('requesting');
+    const previous = microphoneState;
+    setMicrophoneState(enabled ? 'enabling' : 'disabling');
     try {
       await room.startAudio();
       await room.localParticipant.setMicrophoneEnabled(enabled);
       setMicrophoneState(enabled ? 'on' : 'off');
+      setError(null);
     } catch (reason) {
-      setMicrophoneState('denied');
+      setMicrophoneState(enabled ? 'denied' : previous);
       setError(reason instanceof Error ? reason.message : 'Unable to change microphone state.');
     }
   }, [microphoneState]);

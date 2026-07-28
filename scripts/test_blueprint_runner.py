@@ -1158,6 +1158,27 @@ class CredentialDirTests(unittest.TestCase):
             self.assertTrue(result.endswith(".blueprint"),
                            f"expected path ending with .blueprint, got {result!r}")
 
+    def test_named_instance_isolates_credentials_and_service(self):
+        with patch.dict(
+            "os.environ",
+            {"BLUEPRINT_RUNNER_INSTANCE": "voice-staging"},
+            clear=True,
+        ):
+            self.assertTrue(br._credential_dir().endswith(".blueprint-voice-staging"))
+            self.assertEqual(
+                br._runner_service_unit_name(),
+                "blueprint-runner-voice-staging.service",
+            )
+
+    def test_named_instance_rejects_systemd_or_path_metacharacters(self):
+        with patch.dict(
+            "os.environ",
+            {"BLUEPRINT_RUNNER_INSTANCE": "../voice"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                br._runner_instance()
+
     def test_load_persisted_token_returns_none_on_oserror(self):
         """_load_persisted_token returns None when file open raises OSError."""
         with patch("builtins.open", side_effect=OSError("permission denied")):
@@ -1659,6 +1680,24 @@ class WriteEnvFileResourceLimitsTests(unittest.TestCase):
                 content = f.read()
         self.assertNotIn("MAX_CONCURRENT", content)
         self.assertNotIn("GPU", content)
+
+    def test_named_instance_writes_isolated_runtime_paths(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ",
+            {"BLUEPRINT_RUNNER_INSTANCE": "voice-staging"},
+            clear=False,
+        ):
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(path, url="https://orch.example", token=None)
+            with open(path) as f:
+                content = f.read()
+        self.assertIn("BLUEPRINT_RUNNER_INSTANCE=voice-staging", content)
+        self.assertIn(f"BLUEPRINT_CREDENTIAL_DIR={tmpdir}", content)
+        self.assertIn(
+            "BLUEPRINT_RUNNER_WORKSPACE_ROOT=/tmp/blueprint-agent-workspaces-voice-staging",
+            content,
+        )
 
     def test_all_resource_limit_flags_written(self):
         import tempfile

@@ -3594,6 +3594,15 @@ class TestGpuDetection(unittest.TestCase):
         with patch.object(local_runner.socket, "gethostname", side_effect=OSError):
             self.assertIsNone(local_runner._hostname())
 
+    def test_hostname_distinguishes_an_isolated_runner_instance(self):
+        with patch.object(local_runner.socket, "gethostname", return_value="dgx-1"), \
+             patch.dict(
+                 local_runner.os.environ,
+                 {"BLUEPRINT_RUNNER_INSTANCE": "voice-staging"},
+                 clear=False,
+             ):
+            self.assertEqual(local_runner._hostname(), "dgx-1:voice-staging")
+
     def test_isolation_backends_included_in_heartbeat_body(self):
         """Heartbeat body carries the isolation-backend inventory, selected
         agent/compute backends, and the runner version when caps are supplied."""

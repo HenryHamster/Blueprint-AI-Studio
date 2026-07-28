@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { StrategicCallMode } from './StrategicCallMode';
+import { StrategicCallLauncher, StrategicCallMode } from './StrategicCallMode';
 
 describe('StrategicCallMode', () => {
   let root: Root | null = null;
@@ -35,10 +35,18 @@ describe('StrategicCallMode', () => {
     />));
   }
 
-  test('keeps typed conversation available while voice is off', () => {
+  test('does not occupy conversation space while voice is off', () => {
     render();
-    expect(host?.textContent).toContain('typed messages still use this conversation');
-    expect(host?.querySelector('button')?.textContent).toContain('Start call');
+    expect(host?.querySelector('[data-testid="strategic-call-mode"]')).toBeNull();
+  });
+
+  test('provides a compact composer launcher with the privacy disclosure', () => {
+    host = document.createElement('div');
+    document.body.append(host);
+    root = createRoot(host);
+    act(() => root?.render(<StrategicCallLauncher onStart={() => {}} />));
+    expect(host.querySelector('button')?.textContent).toContain('Call');
+    expect(host.textContent).toContain('does not record raw call audio');
   });
 
   test('renders only ephemeral captions and byte-preserving theory blocks during an active call', () => {
@@ -51,7 +59,7 @@ describe('StrategicCallMode', () => {
     });
     expect(host?.querySelector('[data-testid="strategic-call-captions"]')?.textContent).toContain('eta sub t');
     expect(host?.querySelector('[data-testid="strategic-call-display-blocks"]')?.textContent).toContain('\\eta_t');
-    expect(host?.textContent).toContain('One participant only');
+    expect(host?.textContent).toContain('Listening now');
   });
 
   test('keeps the end-call escape hatch visible when an active lease has a media error', () => {
@@ -69,20 +77,48 @@ describe('StrategicCallMode', () => {
   test('does not present an RTC-only connection as a usable Resident call', () => {
     render({ enabled: true, connectionState: 'waiting_for_resident', microphoneState: 'on' });
     expect(host!.textContent).toContain('waiting for Resident');
+    expect(host!.textContent).toContain('there is no transcription or reply audio yet');
     expect(host!.textContent).toContain('End call');
     expect(host!.textContent).not.toContain('call active');
   });
 
+  test('keeps the active surface from being flex-shrunk out of view', () => {
+    render({ enabled: true, connectionState: 'connected', microphoneState: 'on' });
+    expect(host?.querySelector('[data-testid="strategic-call-mode"]')?.classList).toContain('shrink-0');
+  });
+
   test('discloses configured call services before microphone activation', () => {
-    render();
+    host = document.createElement('div');
+    document.body.append(host);
+    root = createRoot(host);
+    act(() => root?.render(<StrategicCallLauncher onStart={() => {}} />));
     expect(host!.textContent).toContain('transcribed by Deepgram');
     expect(host!.textContent).toContain('voiced by Cartesia');
-    expect(host!.textContent).toContain('does not record the raw call audio');
+    expect(host!.textContent).toContain('does not record raw call audio');
   });
 
   test('offers a visible mute control during an active call', () => {
     render({ enabled: true, connectionState: 'connected', microphoneState: 'on' });
-    expect(host!.querySelector('[aria-label="Mute microphone"]')?.textContent).toContain('Mute');
+    const button = host!.querySelector<HTMLButtonElement>('[aria-label="Mute microphone"]');
+    expect(button?.textContent).toContain('Mute');
+    expect(button?.getAttribute('aria-pressed')).toBe('true');
+    expect(host!.textContent).toContain('Listening now');
+  });
+
+  test('makes mute transitions explicit and prevents a second click from reversing them', () => {
+    render({ enabled: true, connectionState: 'connected', microphoneState: 'disabling' });
+    const button = host!.querySelector<HTMLButtonElement>('[aria-label="Mute microphone"]');
+    expect(button?.textContent).toContain('Muting');
+    expect(button?.disabled).toBe(true);
+    expect(host!.textContent).toContain('Muting the microphone');
+  });
+
+  test('clearly confirms that a completed mute persists', () => {
+    render({ enabled: true, connectionState: 'connected', microphoneState: 'off' });
+    const button = host!.querySelector<HTMLButtonElement>('[aria-label="Unmute microphone"]');
+    expect(button?.textContent).toContain('Unmute');
+    expect(button?.getAttribute('aria-pressed')).toBe('false');
+    expect(host!.textContent).toContain('Muted — the Resident cannot hear you');
   });
 
   test('offers a direct user-gesture audio recovery control when autoplay is blocked', () => {

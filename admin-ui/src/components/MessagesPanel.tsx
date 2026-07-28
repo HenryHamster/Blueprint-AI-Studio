@@ -31,7 +31,7 @@ import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useConversationSend } from '../hooks/useConversationSend';
 import { compareConversationMessages, useConversation } from '../hooks/useConversation';
 import { useStrategicCall } from '../hooks/useStrategicCall';
-import { StrategicCallMode } from './StrategicCallMode';
+import { StrategicCallLauncher, StrategicCallMode } from './StrategicCallMode';
 import { useStrategistStatus } from '../hooks/useStrategistStatus';
 import { StrategistStatusChip } from './StrategistStatusChip';
 import { DirectionsAddForm } from './DirectionsAddForm';
@@ -507,6 +507,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
   const conversationMode = resolvedFilterChrome === 'minimal';
   const strategicCall = useStrategicCall(conversationMode ? selectedProjectId : null);
+  const strategicCallEnabled = Boolean(
+    strategicCall.call
+    && !['ended', 'failed', 'expired'].includes(strategicCall.call.status),
+  );
   const currentActorUserId = auth.currentUser?.uid ?? auth.currentUser?.email ?? null;
   const currentStrategicState = strategicState?.project_id === selectedProjectId ? strategicState : null;
   const usesStrategicReadModel = currentStrategicState != null;
@@ -3289,10 +3293,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       {/* Compose area — bottom, chat-style */}
       {conversationMode && (
         <StrategicCallMode
-          enabled={Boolean(
-            strategicCall.call
-            && !['ended', 'failed', 'expired'].includes(strategicCall.call.status),
-          )}
+          enabled={strategicCallEnabled}
           connectionState={strategicCall.connectionState}
           microphoneState={strategicCall.microphoneState}
           audioPlaybackState={strategicCall.audioPlaybackState}
@@ -3342,6 +3343,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         capabilityHint={showEmptyConversationHint ? WORKDAY_CAPABILITY_HINT : undefined}
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
+        leadingControl={conversationMode && !strategicCallEnabled && strategicCall.connectionState === 'idle'
+          ? <StrategicCallLauncher onStart={() => { void strategicCall.start(); }} />
+          : undefined}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
         onOpenCommandPalette={conversationMode ? openMessageCommandSurface : undefined}
       />

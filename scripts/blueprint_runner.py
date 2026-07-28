@@ -77,6 +77,7 @@ SERVICE_UNIT_NAME = "blueprint-runner.service"
 _USER_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner.service")
 _SYSTEM_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner-system.service")
 _SYSTEM_WANTED_BY = "multi-user.target"
+_RUNNER_INSTANCE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$")
 
 # The LiveKit gateway is a deliberately narrow companion service for a selected
 # always-on Linux host. It is not registered as runner capacity and cannot be
@@ -674,6 +675,23 @@ def _print_docker_agent_status(result: AgentImageResult) -> None:
 # — the installer never claims success when a step failed.
 
 
+def _runner_instance() -> str | None:
+    value = os.environ.get("BLUEPRINT_RUNNER_INSTANCE", "").strip()
+    if not value:
+        return None
+    if not _RUNNER_INSTANCE_RE.fullmatch(value):
+        raise ValueError(
+            "BLUEPRINT_RUNNER_INSTANCE must use 1-48 lowercase letters, digits, "
+            "or internal hyphens"
+        )
+    return value
+
+
+def _runner_service_unit_name() -> str:
+    instance = _runner_instance()
+    return SERVICE_UNIT_NAME if instance is None else f"blueprint-runner-{instance}.service"
+
+
 def _credential_dir() -> str:
     """The Blueprint credential dir — mirrors local_runner._credential_dir().
 
@@ -681,10 +699,12 @@ def _credential_dir() -> str:
     env file the service reads lands in the same place local_runner persists the
     token to (``runner_token``).
     """
-    return (
-        os.environ.get("BLUEPRINT_CREDENTIAL_DIR", "").strip()
-        or os.path.expanduser("~/.blueprint")
-    )
+    configured = os.environ.get("BLUEPRINT_CREDENTIAL_DIR", "").strip()
+    if configured:
+        return configured
+    instance = _runner_instance()
+    suffix = "" if instance is None else f"-{instance}"
+    return os.path.expanduser(f"~/.blueprint{suffix}")
 
 
 def _env_file_path() -> str:
@@ -693,11 +713,11 @@ def _env_file_path() -> str:
 
 
 def _user_unit_path() -> str:
-    return os.path.expanduser(f"~/.config/systemd/user/{SERVICE_UNIT_NAME}")
+    return os.path.expanduser(f"~/.config/systemd/user/{_runner_service_unit_name()}")
 
 
 def _system_unit_path() -> str:
-    return f"/etc/systemd/system/{SERVICE_UNIT_NAME}"
+    return f"/etc/systemd/system/{_runner_service_unit_name()}"
 
 
 def _install_user() -> str:
@@ -832,6 +852,15 @@ def _write_env_file(
         "# Written by `blueprint-runner install`. Mode 0600 — do not commit.\n",
         f"BLUEPRINT_ORCHESTRATOR_URL={url}\n",
     ]
+    instance = _runner_instance()
+    if instance:
+        lines.extend(
+            [
+                f"BLUEPRINT_RUNNER_INSTANCE={instance}\n",
+                f"BLUEPRINT_CREDENTIAL_DIR={cred_dir}\n",
+                f"BLUEPRINT_RUNNER_WORKSPACE_ROOT=/tmp/blueprint-agent-workspaces-{instance}\n",
+            ]
+        )
     if token:
         lines.append(f"BLUEPRINT_RUNNER_TOKEN={token}\n")
     if resource_limits:
@@ -871,6 +900,7 @@ def do_install(
         return 1
 
     env_file = _env_file_path()
+    service_unit_name = _runner_service_unit_name()
     subs = {
         "@PYTHON@": sys.executable,
         "@LOCAL_RUNNER@": _LOCAL_RUNNER,
@@ -891,7 +921,7 @@ def do_install(
         print(f"[dry-run] would seed env file: {env_file}", flush=True)
         print(f"[dry-run] would write unit:    {unit_path}", flush=True)
         print(f"[dry-run] would run: systemctl {'' if system else '--user '}"
-              f"daemon-reload / enable --now {SERVICE_UNIT_NAME}", flush=True)
+              f"daemon-reload / enable --now {service_unit_name}", flush=True)
         if not system:
             print(f"[dry-run] would run: loginctl enable-linger {_install_user()}", flush=True)
         print("\n" + unit_text, flush=True)
@@ -910,7 +940,7 @@ def do_install(
 
     for args, label in (
         (["daemon-reload"], "daemon-reload"),
-        (["enable", "--now", SERVICE_UNIT_NAME], "enable --now"),
+        (["enable", "--now", service_unit_name], "enable --now"),
     ):
         result = _systemctl(args, system=system, _run=_run)
         if getattr(result, "returncode", 1) != 0:
@@ -946,20 +976,20 @@ def do_install(
             )
 
     # Verify the unit actually came up — never claim success on a dead unit.
-    active = _systemctl(["is-active", SERVICE_UNIT_NAME], system=system, _run=_run)
-    enabled = _systemctl(["is-enabled", SERVICE_UNIT_NAME], system=system, _run=_run)
+    active = _systemctl(["is-active", service_unit_name], system=system, _run=_run)
+    enabled = _systemctl(["is-enabled", service_unit_name], system=system, _run=_run)
     if getattr(active, "returncode", 1) != 0 or getattr(enabled, "returncode", 1) != 0:
         print(
             "ERROR: the unit did not come up active AND enabled after install "
             f"(is-active rc={getattr(active, 'returncode', '?')}, "
             f"is-enabled rc={getattr(enabled, 'returncode', '?')}). Inspect: "
-            f"journalctl {'' if system else '--user '}-u {SERVICE_UNIT_NAME} -n 50",
+            f"journalctl {'' if system else '--user '}-u {service_unit_name} -n 50",
             file=sys.stderr,
         )
         return 1
 
     scope = "--system" if system else "--user"
-    follow = f"journalctl {'' if system else '--user '}-u {SERVICE_UNIT_NAME} -f"
+    follow = f"journalctl {'' if system else '--user '}-u {service_unit_name} -f"
     print(
         f"[blueprint-runner] installed and started ({scope}). "
         f"The runner is active and enabled at boot.\n"
@@ -978,10 +1008,11 @@ def do_install(
 def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess.run) -> int:
     """Stop, disable, and remove the runner unit. Idempotent; credentials kept."""
     unit_path = _system_unit_path() if system else _user_unit_path()
+    service_unit_name = _runner_service_unit_name()
 
     if dry_run:
         print(f"[dry-run] would run: systemctl {'' if system else '--user '}"
-              f"disable --now {SERVICE_UNIT_NAME}", flush=True)
+              f"disable --now {service_unit_name}", flush=True)
         print(f"[dry-run] would remove unit: {unit_path}", flush=True)
         return 0
 
@@ -996,7 +1027,7 @@ def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess
     # the unit is already gone, so run it regardless; we only care that a
     # PRESENT unit is removed cleanly. Do NOT touch credential files.
     if shutil.which("systemctl") is not None:
-        _systemctl(["disable", "--now", SERVICE_UNIT_NAME], system=system, _run=_run)
+        _systemctl(["disable", "--now", service_unit_name], system=system, _run=_run)
 
     removed = False
     if unit_present:
@@ -1394,19 +1425,20 @@ def _restart_runner_service(*, _run=subprocess.run) -> bool:
     if shutil.which("systemctl") is None:
         return False
 
+    service_unit_name = _runner_service_unit_name()
     for system in (False, True):
         unit_path = _system_unit_path() if system else _user_unit_path()
         if not os.path.isfile(unit_path):
             continue
-        result = _systemctl(["is-active", SERVICE_UNIT_NAME], system=system, _run=_run)
+        result = _systemctl(["is-active", service_unit_name], system=system, _run=_run)
         if getattr(result, "returncode", 1) == 0:
             scope_label = "system" if system else "user"
             print(
-                f"[blueprint-runner] restarting {SERVICE_UNIT_NAME} "
+                f"[blueprint-runner] restarting {service_unit_name} "
                 f"({scope_label} scope)...",
                 flush=True,
             )
-            _systemctl(["restart", SERVICE_UNIT_NAME], system=system, _run=_run)
+            _systemctl(["restart", service_unit_name], system=system, _run=_run)
             return True
     return False
 
@@ -1794,6 +1826,10 @@ def build_parser() -> argparse.ArgumentParser:
             help=f"Orchestrator base URL (default: {DEFAULT_ORCHESTRATOR_URL}).",
         )
         sub_parser.add_argument(
+            "--instance",
+            help="Isolated runner instance name (separate credentials, workspace, and service).",
+        )
+        sub_parser.add_argument(
             "--agent-image",
             metavar="TAG",
             help=(
@@ -1849,6 +1885,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Orchestrator base URL to bake into the env file (default: {DEFAULT_ORCHESTRATOR_URL}).",
     )
     install_parser.add_argument(
+        "--instance",
+        help="Isolated runner instance name (separate credentials, workspace, and service).",
+    )
+    install_parser.add_argument(
         "--system",
         action="store_true",
         default=False,
@@ -1894,6 +1934,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Print the commands that would run, without touching the host.",
     )
+    uninstall_parser.add_argument(
+        "--instance",
+        help="Isolated runner instance name to uninstall.",
+    )
 
     for name, help_text in (
         (
@@ -1928,14 +1972,16 @@ def build_parser() -> argparse.ArgumentParser:
             help="Print the rendered unit and commands without touching the host.",
         )
 
-    sub.add_parser(
+    update_parser = sub.add_parser(
         "update",
         help="Update the local checkout and reinstall dependencies only when needed.",
     )
-    sub.add_parser(
+    update_parser.add_argument("--instance", help="Isolated runner instance name.")
+    status_parser = sub.add_parser(
         "status",
         help="Show runner process status from ~/.blueprint/status.json.",
     )
+    status_parser.add_argument("--instance", help="Isolated runner instance name.")
     return parser
 
 
@@ -1982,6 +2028,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         parser.print_help()
         return 2
+
+    instance = getattr(args, "instance", None)
+    if instance:
+        os.environ["BLUEPRINT_RUNNER_INSTANCE"] = instance
+        try:
+            _runner_instance()
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if args.command == "update":
         return _run_update_and_report()

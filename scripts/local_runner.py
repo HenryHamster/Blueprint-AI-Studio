@@ -1204,7 +1204,10 @@ def _hostname() -> str | None:
         name = socket.gethostname()
     except OSError:
         return None
-    return name or None
+    if not name:
+        return None
+    instance = os.environ.get("BLUEPRINT_RUNNER_INSTANCE", "").strip()
+    return f"{name}:{instance}" if instance else name
 
 
 def _runner_version() -> str | None:

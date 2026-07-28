@@ -190,3 +190,30 @@ describe('useStrategicCall failed-start cleanup', () => {
     expect(result.current.connectionState).toBe('error');
   });
 });
+
+describe('useStrategicCall microphone transitions', () => {
+  test('keeps a mute operation pending and ignores a second toggle until LiveKit confirms it', async () => {
+    mockStartStrategicCall.mockResolvedValue(connection);
+    let finishMute: (() => void) | undefined;
+    const mutePending = new Promise<void>(resolve => { finishMute = resolve; });
+    rtc.setMicrophoneEnabled
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(mutePending);
+    const { result } = renderHook(() => useStrategicCall('project-1'));
+
+    await waitFor(() => expect(mockFetchStrategicCall).toHaveBeenCalled());
+    await act(async () => { await result.current.start(); });
+
+    let firstToggle: Promise<void> | undefined;
+    act(() => { firstToggle = result.current.toggleMicrophone(); });
+    await waitFor(() => expect(result.current.microphoneState).toBe('disabling'));
+
+    await act(async () => { await result.current.toggleMicrophone(); });
+    expect(rtc.setMicrophoneEnabled).toHaveBeenCalledTimes(2);
+
+    finishMute?.();
+    await act(async () => { await firstToggle; });
+    expect(result.current.microphoneState).toBe('off');
+    expect(rtc.setMicrophoneEnabled).toHaveBeenLastCalledWith(false);
+  });
+});
