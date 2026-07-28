@@ -39,7 +39,10 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.resource_envelope import resolve_project_require_local_runner
+from app.resource_envelope import (
+    resolve_project_execution_placement_policy,
+    resolve_project_require_local_runner,
+)
 from app.runner_project_binding import allowed_project_ids
 from app.runner_decline import (
     decline_exclusion_is_advisory,
@@ -93,6 +96,90 @@ logger = logging.getLogger("blueprint")
 # cloud — when it is not eligible this cycle the task is HELD QUEUED. The soft
 # preferred hint keeps its fallback behaviour untouched.
 FORCED_RUNNER_TARGET_CONTEXT_KEY = "forced_runner_target_id"
+
+# One durable, task-wide wait record for the project placement contract.  Unlike
+# the older capability-specific timestamps below, this is not a failure timer:
+# ``local_only`` explicitly means that lack of capacity is backpressure, not a
+# reason to spend money elsewhere or to fail useful work.  Keep the value a
+# structured record so operators can distinguish a policy wait from a runner
+# capability fault without adding another top-level timestamp for each task type.
+EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY = "execution_placement_wait"
+
+
+def _stage_local_only_placement_wait(task: Task, *, reason: str) -> bool:
+    """Stage a durable ``local_only`` wait and return whether it changed ``task``.
+
+    This helper intentionally does not commit.  Dispatch callers can commit the
+    wait immediately, while timeout/recovery code can stage it together with its
+    other updates.  The original ``since`` is retained while the policy and
+    reason are stable so queue age is truthful across dispatcher cycles.
+    """
+    ctx = dict(task.context or {})
+    current = ctx.get(EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY)
+    current_since = (
+        current.get("since")
+        if isinstance(current, dict) and isinstance(current.get("since"), str)
+        else None
+    )
+    wait_record = {
+        "policy": "local_only",
+        "reason": reason,
+        "since": current_since or _utcnow().isoformat(),
+    }
+    changed = ctx.get(EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY) != wait_record
+    if ctx.pop("runner_target_id", None) is not None:
+        changed = True
+    if ctx.pop("runner_hostname", None) is not None:
+        changed = True
+    ctx[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY] = wait_record
+    message = "Waiting for local execution capacity (project policy: local_only)."
+    if task.latest_status_message != message:
+        task.latest_status_message = message
+        changed = True
+    if changed:
+        task.context = ctx
+    return changed
+
+
+def _clear_execution_placement_wait(ctx: dict) -> None:
+    """Clear a policy wait once a task has durably acquired local execution."""
+    ctx.pop(EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY, None)
+
+
+async def _hold_task_for_local_only_placement(
+    session: AsyncSession,
+    task: Task,
+    *,
+    reason: str = "no_eligible_local_runner",
+) -> bool:
+    """Keep a ``local_only`` task queued when no runner can take it.
+
+    Returns ``True`` only when the project contract is strict and the task was
+    handled.  It deliberately has no timeout: the policy promises local
+    execution, so absence of a runner must never become an implicit managed
+    fallback or a terminal failure.
+    """
+    project = await session.get(Project, task.project_id)
+    if (
+        project is None
+        or resolve_project_execution_placement_policy(project) != "local_only"
+    ):
+        return False
+    task_id = task.id
+    changed = _stage_local_only_placement_wait(task, reason=reason)
+    if changed:
+        session.add(task)
+        await session.commit()
+    else:
+        # Keep the orchestrator's transaction boundary small.  Do not touch
+        # ``task`` after this rollback: SQLAlchemy expires ORM attributes.
+        await session.rollback()
+    logger.info(
+        "[RUNNERS] Holding task %s for local_only placement: %s",
+        task_id,
+        reason,
+    )
+    return True
 
 # task.context marker stamped (ISO-8601) the first cycle a forced-pin
 # compute_experiment is held waiting for its target runner to become eligible —
@@ -738,6 +825,7 @@ async def _try_runner_dispatch(
     new_ctx.pop(CONTAINER_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop("runner_pin_hold", None)
+    _clear_execution_placement_wait(new_ctx)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
     task.status = TaskStatus.PROVISIONING
@@ -1782,9 +1870,12 @@ async def _dispatch_compute_experiment_directly(
     from app.models import WakeAction
     from app.task_lifecycle import park_task
 
-    # resolve_project_require_local_runner is imported at module scope (see the
-    # top-of-file app.resource_envelope import).
+    # Placement-policy resolvers are imported at module scope (see the top-of-file
+    # app.resource_envelope import).  Legacy require_local_runner remains a
+    # compute-experiment-only compatibility rule; the new local_only policy is
+    # task-wide and never converts runner absence into a failure.
 
+    task_id = task.id
     payload = task.first_payload or {}
 
     # ── Validate launch fields up front (mirror the agent handler) ─────────────
@@ -1903,6 +1994,23 @@ async def _dispatch_compute_experiment_directly(
             task, "compute_experiment"
         ),
     )
+
+    # Resolve the task-wide contract before any of the legacy specialized holds.
+    # Some of those markers intentionally have bounded timeout semantics for
+    # old compatibility behavior.  An explicit local_only policy must instead
+    # get the durable structured wait regardless of whether the immediate
+    # blocker is a strict pin, a forced host, or missing container/GPU capacity.
+    if runner is None and await _hold_task_for_local_only_placement(
+        session,
+        task,
+        reason="no_eligible_local_runner",
+    ):
+        logger.info(
+            "[RUNNERS] Holding compute_experiment %s: project placement policy "
+            "is local_only and no live eligible runner is available",
+            task_id,
+        )
+        return "held"
 
     # ── Strict runner pin: ONLY the pinned runner may take this job ────────────
     # When the pinned runner is not currently eligible, hold QUEUED with a
@@ -2233,7 +2341,7 @@ async def _dispatch_compute_experiment_directly(
             )
             return "held"
 
-    # ── Enforce-local hold: require_local + no runner → keep QUEUED, never cloud ─
+    # ── Legacy enforce-local hold: require_local + no runner → no cloud ─────────
     # Keep this after the proof-specific hold above: a local-only GPU image job
     # whose live runner fails functional passthrough needs the actionable runtime
     # diagnosis, not the generic "no live eligible runner" message.
@@ -2314,6 +2422,7 @@ async def _dispatch_compute_experiment_directly(
         # already running on a runner).
         for _hold_key in COMPUTE_RUNNER_HOLD_CONTEXT_KEYS:
             ctx.pop(_hold_key, None)
+        _clear_execution_placement_wait(ctx)
         # A strict-pin hold that is now dispatching must drop its stale hold
         # reason — the pinned runner became eligible.
         ctx.pop("runner_pin_hold", None)
@@ -2775,7 +2884,9 @@ def _strategic_local_hold_timeout_seconds() -> int:
 async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
     """Resolve tasks held too long for a local runner.
 
-    Two hold classes share the bounded-wait contract but resolve DIFFERENTLY:
+    Legacy hold classes share a bounded-wait contract but resolve differently.
+    The explicit project-level ``local_only`` placement wait is deliberately
+    outside that contract: it remains QUEUED until local capacity returns.
 
     * **compute_experiment** (``context['awaiting_local_runner_since']``,
       ``context['awaiting_container_runner_since']`` or
@@ -2824,6 +2935,7 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
 
     failed = 0
     redispatched = 0
+    retained_for_local_only = 0
     for task in rows:
         ctx = task.context or {}
         task_type = str((task.first_payload or {}).get("type") or "")
@@ -2878,6 +2990,37 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not is_forced_runner_hold
             and not is_strategic_hold
         ):
+            continue
+
+        # A task may have acquired the explicit project-level policy after it
+        # was parked under one of the legacy, bounded hold markers.  Migrate it
+        # in-place before any timeout logic: local_only is durable backpressure
+        # for every task type, so an unavailable runner must not trigger either
+        # the old compute terminal failure or the old Strategic cloud self-heal.
+        project = await session.get(Project, task.project_id)
+        if (
+            project is not None
+            and resolve_project_execution_placement_policy(project) == "local_only"
+        ):
+            new_ctx = dict(ctx)
+            for hold_key in COMPUTE_RUNNER_HOLD_CONTEXT_KEYS:
+                new_ctx.pop(hold_key, None)
+            new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+            new_ctx.pop(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY, None)
+            new_ctx.pop(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY, None)
+            task.context = new_ctx
+            _stage_local_only_placement_wait(
+                task,
+                reason="no_eligible_local_runner",
+            )
+            session.add(task)
+            retained_for_local_only += 1
+            logger.info(
+                "[RUNNERS] Retained task %s in local_only placement wait instead "
+                "of resolving legacy runner hold (%s)",
+                task.id,
+                task_type,
+            )
             continue
 
         if is_strategic_hold:
@@ -3056,7 +3199,7 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
         )
         failed += 1
 
-    if failed or redispatched:
+    if failed or redispatched or retained_for_local_only:
         await session.commit()
     return failed
 

@@ -3,9 +3,12 @@
 import asyncio
 import sys
 import types
-from unittest.mock import MagicMock, patch
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from app.managed_compute import LocalOnlyExecutionPlacement, ManagedComputeDisabled
 
 
 def _make_fake_gcp_harness():
@@ -60,6 +63,67 @@ def _make_fake_gcp_harness():
     return fake_run_v2, fake_duration_pb2, captured
 
 
+@pytest.mark.asyncio
+async def test_managed_compute_disabled_blocks_cloud_run_job_before_client(monkeypatch):
+    """The kill switch affects Jobs, not the Cloud Run web service."""
+    import app.compute_cloud_run as ccr
+    from app import compute
+    from app.runtime_config_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "managed_compute_enabled", False)
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(ccr, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/a")
+
+    with pytest.raises(ManagedComputeDisabled, match="managed compute is disabled"):
+        await ccr.launch_agent_cloud_run_job(
+            vm_id="cloud-run-managed-gate",
+            task_id="task-abc",
+            payload_uri=None,
+            secret_version_name=None,
+            task_type="research",
+        )
+
+
+@pytest.mark.asyncio
+async def test_final_local_only_fence_is_rethrown_without_cloud_run_submission(
+    monkeypatch,
+):
+    """A placement flip after staging must never become a GCE fallback."""
+    import app.compute_cloud_run as ccr
+    import app.managed_compute as managed_compute
+    from app import compute
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(ccr, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/a")
+    denied = AsyncMock(
+        side_effect=LocalOnlyExecutionPlacement("project is local_only")
+    )
+    monkeypatch.setattr(
+        managed_compute,
+        "assert_task_managed_execution_allowed_authoritative",
+        denied,
+    )
+
+    class _NeverSubmit:
+        def run_job(self, request):
+            raise AssertionError("Cloud Run must not be submitted after local_only")
+
+    import google.cloud.run_v2 as run_v2
+
+    monkeypatch.setattr(run_v2, "JobsClient", _NeverSubmit)
+
+    with pytest.raises(LocalOnlyExecutionPlacement, match="local_only"):
+        await ccr.launch_agent_cloud_run_job(
+            vm_id="cloud-run-placement-fence",
+            task_id=uuid.uuid4(),
+            payload_uri=None,
+            secret_version_name=None,
+            task_type="research",
+        )
+
+    denied.assert_awaited_once()
+
+
 def test_build_duration_raises_on_missing_protobuf(monkeypatch):
     """_build_duration must raise ImportError when google.protobuf is absent."""
     # Hide google.protobuf so the lazy import inside _build_duration fails.
@@ -91,11 +155,27 @@ def test_build_duration_raises_on_missing_protobuf(monkeypatch):
         _build_duration(300)
 
 
-def test_no_plaintext_credentials_in_env_overrides(monkeypatch):
+@pytest.fixture
+def allow_cloud_run_payload_launch(monkeypatch):
+    """Isolate Cloud Run request-payload tests from durable placement lookup."""
+    import app.managed_compute as managed_compute
+
+    async def allow_managed_execution(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        managed_compute,
+        "assert_task_managed_execution_allowed_authoritative",
+        allow_managed_execution,
+    )
+
+
+def test_no_plaintext_credentials_in_env_overrides(
+    monkeypatch, allow_cloud_run_payload_launch
+):
     """launch_agent_cloud_run_job must never emit AGENT_SECRET_TOKEN or LLM
     credential values as plaintext RunJobRequest override values."""
     import app.compute_cloud_run as ccr
-
     # Capture the overrides passed to the (stubbed) Cloud Run client.
     captured_overrides: list[dict] = []
 
@@ -235,7 +315,9 @@ def test_no_plaintext_credentials_in_env_overrides(monkeypatch):
     assert "AUTH_MODE" in override_names
 
 
-def test_file_path_cred_skipped_in_overrides_but_delivered_via_manifest(monkeypatch):
+def test_file_path_cred_skipped_in_overrides_but_delivered_via_manifest(
+    monkeypatch, allow_cloud_run_payload_launch
+):
     """File-path credentials must be skipped from env overrides (they cannot be
     carried as override values) but the AGENT_SECRET_VERSION must always be set
     so the agent can resolve the manifest containing file-path credentials."""
@@ -364,7 +446,9 @@ def test_file_path_cred_skipped_in_overrides_but_delivered_via_manifest(monkeypa
     assert override_dict.get("AUTH_MODE") == "service_account"
 
 
-def test_real_provider_secret_values_never_appear_as_plaintext_overrides(monkeypatch):
+def test_real_provider_secret_values_never_appear_as_plaintext_overrides(
+    monkeypatch, allow_cloud_run_payload_launch
+):
     """Integration guard: real provider materials (no compute_manifest stub) through
     launch_agent_cloud_run_job for each provider x auth_mode with a sentinel secret.
     Asserts the sentinel never appears as a plaintext override value.
@@ -500,6 +584,10 @@ def test_real_provider_secret_values_never_appear_as_plaintext_overrides(monkeyp
 
 class TestLaunchAgentCloudRunJob:
     """Tests for compute_cloud_run.launch_agent_cloud_run_job."""
+
+    @pytest.fixture(autouse=True)
+    def _allow_cloud_run_payload_launch(self, allow_cloud_run_payload_launch):
+        """Keep request-payload tests independent of durable task lookup."""
 
     @pytest.mark.asyncio
     async def test_launch_injects_agent_secret_version(self, monkeypatch):

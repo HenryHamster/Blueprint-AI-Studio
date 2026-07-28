@@ -65,12 +65,12 @@ def test_env_requirement_is_frozen():
 
 def test_encryption_key_entry_uses_shared_constant():
     entries = [r for r in REQUIRED_RUNTIME_ENV if r.name == ENCRYPTION_KEY_ENV]
-    assert len(entries) == 1, "expected exactly one GITHUB_PAT_ENCRYPTION_KEY entry"
-    entry = entries[0]
-    # It must be the imported constant, not a duplicated literal.
-    assert entry.name is ENCRYPTION_KEY_ENV
-    assert entry.scope == "cloud_run"
-    assert entry.reason, "entry must carry a human reason"
+    assert len(entries) == 2
+    assert {entry.scope for entry in entries} == {"cloud_run", "local_production"}
+    # Every encrypted credential host must use the shared constant, not a
+    # duplicated literal, and must explain why that requirement exists.
+    assert all(entry.name is ENCRYPTION_KEY_ENV for entry in entries)
+    assert all(entry.reason for entry in entries)
 
 
 def test_migration_apply_scratch_url_is_not_a_boot_requirement():

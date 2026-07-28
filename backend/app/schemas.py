@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
@@ -1131,10 +1131,31 @@ class ResourceEnvelope(BaseModel):
     # to compute_experiment tasks for now; a future field could extend the
     # policy to other task types. Absent/None ⇒ False (cloud fallback permitted).
     require_local_runner: bool | None = Field(None)
+    # Placement policy for all executable project work.  This supersedes the
+    # compute-experiment-only ``require_local_runner`` flag above.  It remains
+    # optional solely for backwards compatibility: absent means
+    # ``managed_allowed`` while a legacy true flag retains its narrow scope.
+    execution_placement_policy: Literal[
+        "local_only", "local_preferred", "managed_allowed"
+    ] | None = Field(None)
     # When True, exceeding the spend ceiling automatically pauses the project
     # (project.paused = True) until an operator manually unpauses it.
     # Absent/None ⇒ False (soft-defer tasks but don't pause the project).
     pause_on_ceiling_exceeded: bool | None = Field(None)
+
+    @model_validator(mode="after")
+    def _reject_conflicting_placement_policies(self) -> "ResourceEnvelope":
+        """Do not silently reinterpret the old narrow policy as a broad one."""
+        if (
+            self.execution_placement_policy is not None
+            and self.require_local_runner is True
+        ):
+            raise ValueError(
+                "execution_placement_policy conflicts with legacy "
+                "require_local_runner=true; clear the legacy field before "
+                "setting the broader policy"
+            )
+        return self
 
     @field_validator("allowed_machine_types", mode="before")
     @classmethod

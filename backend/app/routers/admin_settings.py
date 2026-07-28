@@ -154,6 +154,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_concurrent_compute_jobs_by_project",
         "max_concurrent_tasks_by_project",
         "max_concurrent_vms",
+        "managed_compute_enabled",
         "max_global_autonomous_tasks_per_hour",
         "max_global_autonomous_initiative_tasks_per_hour",
         "max_parallel_research_per_project",
@@ -562,6 +563,9 @@ async def get_settings(
 
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
+        "managed_compute_enabled": bool(
+            _runtime_config.get("managed_compute_enabled", True)
+        ),
         "max_retries": _runtime_config["max_retries"],
         "max_autonomous_tasks_per_hour": _runtime_config[
             "max_autonomous_tasks_per_hour"
@@ -1145,6 +1149,13 @@ async def _apply_settings(
         # Otherwise the next cold start will override back to 0
         if val > 0:
             clear_pause_state = True
+    if "managed_compute_enabled" in payload:
+        val = payload["managed_compute_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400, detail="managed_compute_enabled must be a boolean"
+            )
+        _runtime_config["managed_compute_enabled"] = val
     if "max_retries" in payload:
         try:
             val = int(payload["max_retries"])
@@ -3385,6 +3396,12 @@ async def _apply_settings(
     _pool_disable_transition = bool(
         _config_snapshot.get("warm_pool_enabled", False)
     ) and not bool(_runtime_config.get("warm_pool_enabled", False))
+    # Disabling managed execution is an even stronger boundary: no new pool
+    # member can boot (guarded at the primitive), and existing idle members
+    # should be drained promptly instead of billing until their ordinary TTL.
+    _managed_compute_disable_transition = bool(
+        _config_snapshot.get("managed_compute_enabled", True)
+    ) and not bool(_runtime_config.get("managed_compute_enabled", True))
 
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency
@@ -3407,7 +3424,7 @@ async def _apply_settings(
                     # No DeploymentState row yet — runtime config is in-memory only.
                     # Skip the persist; the next admin/deploy bootstrap will create the row.
                     # Still drain the pool if the global disable transition fired.
-                    if _pool_disable_transition:
+                    if _pool_disable_transition or _managed_compute_disable_transition:
                         from app.warm_pool_maintainer import drain_global_warm_pool
 
                         try:
@@ -3566,6 +3583,13 @@ async def _apply_settings(
                         "reserved_slots_for_types", {"create": 1, "research": 1}
                     ),
                     "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
+                    # Fleet-wide hard boundary for billable execution launches.
+                    # Stored in JSONB so every Cloud Run API instance converges
+                    # without a redeploy; this does not govern the Cloud Run API
+                    # service itself, only GCE/Cloud Run Job execution paths.
+                    "managed_compute_enabled": bool(
+                        _runtime_config.get("managed_compute_enabled", True)
+                    ),
                     "evaluating_pipeline_timeout_minutes": _runtime_config.get(
                         "evaluating_pipeline_timeout_minutes", 120
                     ),
@@ -4053,7 +4077,7 @@ async def _apply_settings(
     # If warm_pool_enabled transitioned True→False and the DB commit succeeded,
     # drain all live pool members fleet-wide. Errors are best-effort — a
     # partial drain is recoverable by the idle reaper.
-    if _pool_disable_transition:
+    if _pool_disable_transition or _managed_compute_disable_transition:
         from app.warm_pool_maintainer import drain_global_warm_pool
 
         try:

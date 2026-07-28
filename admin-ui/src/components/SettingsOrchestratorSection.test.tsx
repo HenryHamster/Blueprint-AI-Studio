@@ -6,6 +6,7 @@ import {
   fetchMetricsIntegrityObservability,
   patchMetricsIntegritySettings,
   patchCapabilityProofGateSettings,
+  patchManagedComputeSettings,
   apiFetch,
 } from '../api';
 
@@ -23,6 +24,7 @@ vi.mock('../api', () => ({
   patchStructuralHealthSettings: vi.fn().mockResolvedValue(undefined),
   patchMetricsIntegritySettings: vi.fn().mockResolvedValue(undefined),
   patchCapabilityProofGateSettings: vi.fn().mockResolvedValue(undefined),
+  patchManagedComputeSettings: vi.fn().mockResolvedValue(undefined),
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: vi.fn().mockResolvedValue({
@@ -32,6 +34,7 @@ vi.mock('../api', () => ({
       capability_proof_gate_auto_graduation_enabled: false,
       capability_proof_gate_auto_graduation_observe_threshold: 0.5,
       capability_proof_gate_auto_graduation_enforce_threshold: 0.95,
+      managed_compute_enabled: true,
     }),
   }),
   fetchEvergreenFillObservability: vi.fn().mockResolvedValue({
@@ -115,6 +118,54 @@ const baseProps = {
 };
 
 describe('SettingsOrchestratorSection', () => {
+  it('shows the confirmed fleet-wide managed compute state from settings', async () => {
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    expect(await screen.findByTestId('managed-compute-state')).toHaveTextContent('Managed compute enabled');
+    expect(screen.getByTestId('managed-compute-boundary')).toHaveTextContent('fleet-wide');
+  });
+
+  it('shows managed compute as disabled when the server boundary is off', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ managed_compute_enabled: false }),
+    } as unknown as Response);
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    expect(await screen.findByTestId('managed-compute-state')).toHaveTextContent('Managed compute disabled');
+    expect(screen.getByTestId('managed-compute-boundary')).toHaveTextContent('Existing work is not forcibly terminated');
+  });
+
+  it('requires confirmation before disabling managed compute and sends the typed settings patch', async () => {
+    const user = userEvent.setup();
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Disable managed compute' }));
+    expect(screen.getByText('Disable managed compute?')).toBeInTheDocument();
+    expect(patchManagedComputeSettings).not.toHaveBeenCalled();
+
+    await user.type(screen.getByTestId('confirm-dialog-attestation-input'), 'cost stop');
+    await user.click(screen.getByTestId('confirm-dialog-confirm'));
+
+    await waitFor(() => {
+      expect(patchManagedComputeSettings).toHaveBeenCalledWith({ managed_compute_enabled: false });
+    });
+    expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute disabled');
+  });
+
+  it('keeps the last confirmed state visible when changing the managed compute boundary fails', async () => {
+    vi.mocked(patchManagedComputeSettings).mockRejectedValueOnce(new Error('unavailable'));
+    const user = userEvent.setup();
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Disable managed compute' }));
+    await user.type(screen.getByTestId('confirm-dialog-attestation-input'), 'cost stop');
+    await user.click(screen.getByTestId('confirm-dialog-confirm'));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not update the managed-compute boundary');
+    expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute enabled');
+  });
+
   it('renders structural health observability panel with mode toggle', async () => {
     render(<SettingsOrchestratorSection {...baseProps} />);
     // Panel should be rendered

@@ -121,6 +121,11 @@ async def launch_agent_cloud_run_job(
         False on any error (caller should treat as provision failure).
     """
     from app.compute import LOCAL_MODE, ORCHESTRATOR_URL
+    from app.managed_compute import (
+        assert_managed_compute_enabled,
+        assert_task_managed_execution_allowed_authoritative,
+        ManagedComputeDisabled,
+    )
 
     _orch_url = orchestrator_url or ORCHESTRATOR_URL
 
@@ -131,6 +136,10 @@ async def launch_agent_cloud_run_job(
             vm_id,
         )
         return True
+
+    # This gates Cloud Run *Jobs* only.  It does not affect the Cloud Run
+    # service that may be hosting Blueprint's API/control plane.
+    assert_managed_compute_enabled("Cloud Run Job")
 
     job_name = CLOUD_RUN_JOB_NAME
     if not job_name:
@@ -273,6 +282,13 @@ async def launch_agent_cloud_run_job(
         )
 
         request = run_v2.RunJobRequest(name=job_name, overrides=overrides)
+        # ``runtime_config`` is only a per-instance cache. Re-read both durable
+        # global state and the task's current project placement immediately
+        # before submitting the paid execution, so either a fleet disable or a
+        # local_only change received by another instance wins over a stale cache.
+        await assert_task_managed_execution_allowed_authoritative(
+            "Cloud Run Job", task_id
+        )
         operation = client.run_job(request=request)
         logger.info(
             "[CLOUD-RUN] Submitted Job execution for task %s (vm_id=%s, "
@@ -284,6 +300,11 @@ async def launch_agent_cloud_run_job(
         )
         return True
 
+    except ManagedComputeDisabled:
+        # This is a typed intentional placement denial, not a transient Cloud
+        # Run failure. The orchestrator restores the task to its queued hold;
+        # converting it to False here would incorrectly fall back to GCE.
+        raise
     except Exception as exc:
         logger.error(
             "[CLOUD-RUN] Failed to submit Job execution for task %s (vm_id=%s): %s",

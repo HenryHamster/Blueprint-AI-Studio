@@ -26,6 +26,12 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.field_encryption import encrypt_field
+from app.managed_compute import (
+    ManagedComputeDisabled,
+    LocalOnlyExecutionPlacement,
+    is_managed_compute_enabled_authoritative,
+    managed_compute_denial_snapshot,
+)
 from app.compute_backends import (
     GCP_BACKEND_NAME,
     LOCAL_GPU_BACKEND_NAME,
@@ -45,6 +51,7 @@ from app.compute_backends import (
     validate_backend_name,
 )
 from app.resource_envelope import (
+    resolve_project_execution_placement_policy,
     resolve_project_hardware_policy,
     resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
@@ -684,6 +691,21 @@ async def create_compute_job(
     # that no billable cloud GPU/VM is ever created for a require-local project.
     _policy_project = await session.get(Project, locked_task.project_id)
     _is_compute_experiment = str((locked_task.first_payload or {}).get("type") or "") == "compute_experiment"
+    if (
+        _policy_project is not None
+        and resolve_project_execution_placement_policy(_policy_project) == "local_only"
+        and not is_zero_cost_backend(normalized_backend)
+    ):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "execution_placement_local_only",
+                "message": (
+                    "project execution_placement_policy is local_only: refusing "
+                    "managed compute because no local execution backend was selected."
+                ),
+                "backend": normalized_backend,
+            }
+        )
     if (
         _policy_project is not None
         and _is_compute_experiment
@@ -2509,6 +2531,68 @@ async def referenced_compute_image_digests(
 _COMPUTE_JOB_BATCH_SIZE = 50
 
 
+def _uses_managed_compute_backend(job: ComputeJob) -> bool:
+    """Whether launching this persisted job can create billable cloud compute."""
+
+    return job.backend == GCP_BACKEND_NAME
+
+
+async def _hold_compute_job_for_managed_compute(
+    session_factory,
+    job_id: uuid.UUID,
+    *,
+    now: datetime,
+    local_only: bool = False,
+) -> None:
+    """Return a pre-launch cloud job to QUEUED with an auditable hold reason."""
+
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if live is None or live.status not in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+            return
+        live.status = ComputeJobStatus.QUEUED
+        live.started_at = None
+        live.updated_at = now
+        live.next_poll_at = now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
+        if local_only:
+            _set_meta(
+                live,
+                status_message=(
+                    "Waiting for local execution capacity (project policy: local_only)."
+                ),
+                execution_placement_wait={
+                    "policy": "local_only",
+                    "reason": "policy_changed_before_compute_launch",
+                    "since": now.isoformat(),
+                },
+            )
+        else:
+            _set_meta(
+                live,
+                status_message="Waiting for local capacity: managed cloud execution is disabled",
+                managed_compute=managed_compute_denial_snapshot(
+                    backend="gcp_compute_job"
+                ),
+            )
+        await session.commit()
+
+
+async def _compute_job_project_is_local_only(session_factory, job: ComputeJob) -> bool:
+    """Resolve current placement from durable task/project rows before launch."""
+
+    if job.task_id is None:
+        return False
+    async with session_factory() as session:
+        task = await session.get(Task, job.task_id)
+        if task is None:
+            return False
+        project = await session.get(Project, task.project_id)
+        return bool(
+            project is not None
+            and resolve_project_execution_placement_policy(project) == "local_only"
+        )
+
+
 async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
     last_created_at = None
     last_id = None
@@ -2853,6 +2937,16 @@ async def _process_single_compute_job(
         return
 
     if job.status in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+        # First gate: do not even reserve/transition to STARTING while the
+        # fleet is local-only.  The backend and GCE primitive repeat this for
+        # direct callers and configuration races.
+        if _uses_managed_compute_backend(job):
+            local_only = await _compute_job_project_is_local_only(session_factory, job)
+            if local_only or not await is_managed_compute_enabled_authoritative():
+                await _hold_compute_job_for_managed_compute(
+                    session_factory, job.id, now=now, local_only=local_only
+                )
+                return
         # Pre-flight smoke: run ONCE on QUEUED jobs before reserving the full launch.
         # Idempotent: the flag in polling_metadata guards against re-running on restart.
         # Skip for runner-subprocess: the command must run on operator hardware
@@ -2869,6 +2963,21 @@ async def _process_single_compute_job(
         )
         if reserved is None:
             return
+        # Re-check after the durable reservation: settings can change between
+        # the pre-launch read and this point.  Restore QUEUED rather than
+        # misclassifying an intentional cost hold as a provisioning failure.
+        if _uses_managed_compute_backend(reserved):
+            local_only = await _compute_job_project_is_local_only(
+                session_factory, reserved
+            )
+            if local_only or not await is_managed_compute_enabled_authoritative():
+                await _hold_compute_job_for_managed_compute(
+                    session_factory,
+                    reserved.id,
+                    now=_utcnow(),
+                    local_only=local_only,
+                )
+                return
         provisioning_timeout_seconds = _provisioning_timeout_seconds(job, now=now)
         if provisioning_timeout_seconds == 0.0:
             # Guard: if the VM has heartbeated (first heartbeat already transitions
@@ -2934,6 +3043,21 @@ async def _process_single_compute_job(
             spec = await _attach_repo_clone(
                 session_factory, reserved, _build_launch_spec(reserved), task=task
             )
+            # Repo/image preparation can take long enough for either policy to
+            # change.  Resolve both durable controls once more immediately
+            # before the backend launch RPC.
+            if _uses_managed_compute_backend(reserved):
+                local_only = await _compute_job_project_is_local_only(
+                    session_factory, reserved
+                )
+                if local_only or not await is_managed_compute_enabled_authoritative():
+                    await _hold_compute_job_for_managed_compute(
+                        session_factory,
+                        reserved.id,
+                        now=_utcnow(),
+                        local_only=local_only,
+                    )
+                    return
             launch_coro = backend.launch(spec)
             if provisioning_timeout_seconds is not None:
                 result = await asyncio.wait_for(
@@ -2941,6 +3065,17 @@ async def _process_single_compute_job(
                 )
             else:
                 result = await launch_coro
+        except ManagedComputeDisabled as exc:
+            # Final configuration-race defense from the backend/primitive.  No
+            # terminal failure or retry budget: this job is waiting for the
+            # operator to re-enable managed execution or for a local placement.
+            await _hold_compute_job_for_managed_compute(
+                session_factory,
+                reserved.id,
+                now=_utcnow(),
+                local_only=isinstance(exc, LocalOnlyExecutionPlacement),
+            )
+            return
         except asyncio.TimeoutError:
             failed_at = _utcnow()
             logger.warning(
@@ -3876,6 +4011,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
     )
     return ComputeLaunchSpec(
         job_id=job.id,
+        task_id=job.task_id,
         external_id=job.external_compute_id,
         command=str(meta.get("command") or ""),
         machine_type=job.machine_type or "",

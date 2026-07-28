@@ -38,6 +38,8 @@ from app.resource_envelope import (
     assess_ceiling_gate_trustworthiness,
     get_project_recent_spend_usd,
     resolve_project_hardware_policy,
+    resolve_project_execution_placement_policy,
+    project_has_explicit_execution_placement_policy,
     resolve_project_pause_on_ceiling_exceeded,
     resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
@@ -880,6 +882,13 @@ def _resource_envelope_response(
         ),
         "allowed_machine_types": allowed_machines,
         "allowed_accelerator_types": allowed_accels,
+        "execution_placement_policy": resolve_project_execution_placement_policy(
+            project
+        ),
+        "execution_placement_policy_is_explicit": (
+            project_has_explicit_execution_placement_policy(project)
+        ),
+        "legacy_require_local_runner_active": resolve_project_require_local_runner(project),
         "require_local_runner": resolve_project_require_local_runner(project),
         "pause_on_ceiling_exceeded": resolve_project_pause_on_ceiling_exceeded(project),
         "active_vm_count": active_vm_count,
@@ -1376,6 +1385,7 @@ async def update_resource_envelope_config(
         "allowed_machine_types",
         "allowed_accelerator_types",
         "require_local_runner",
+        "execution_placement_policy",
         "pause_on_ceiling_exceeded",
     }
     if not body:

@@ -32,6 +32,11 @@ from pathlib import Path
 # compute.
 from app.compute_manifest import validate_payload_uri, build_agent_secret_manifest
 from app.database import AsyncSessionLocal
+from app.managed_compute import (
+    assert_managed_compute_enabled,
+    assert_task_managed_execution_allowed_authoritative,
+    assert_task_managed_execution_allowed_authoritative_sync,
+)
 
 # Quota-scope classification (project-global vs regional vs zonal blast radius
 # for provisioning errors) lives in app.provision_error_scope — extracted to
@@ -770,6 +775,13 @@ async def provision_agent_vm(
             provider_metadata=provider_metadata,
             provider_settings=provider_settings,
         )
+    # Defense in depth: dispatchers reject this before they write
+    # PROVISIONING, but direct callers must never be able to bypass the
+    # fleet-wide managed-compute boundary.
+    assert_managed_compute_enabled("GCE agent VM")
+    await assert_task_managed_execution_allowed_authoritative(
+        "GCE agent VM", task_id
+    )
     return await _provision_gcp(
         vm_instance_id,
         task_id,
@@ -924,6 +936,8 @@ async def provision_pool_vm(
             f"[WARM-POOL] LOCAL_MODE pool VM registered (no boot): {vm_instance_id}"
         )
         return vm_instance_id
+
+    assert_managed_compute_enabled("GCE warm-pool VM")
 
     from app.compute_manifest import build_taskless_agent_secret_manifest
     from app.compute_startup_script import build_pool_agent_startup_script
@@ -1975,6 +1989,11 @@ async def _provision_gcp(
     live-migrate). CPU jobs and agent/pool VMs are unaffected — every GPU branch is
     gated on ``accel_spec`` being non-None.
     """
+    # Last-resort guard immediately adjacent to the Compute Engine primitive.
+    # Keep this even though public entry points check it: private/direct callers
+    # have historically accumulated here as the backend evolved.
+    assert_managed_compute_enabled("GCE VM")
+
     from google.cloud import compute_v1
 
     # Resolve the accelerator request to a supported single-GPU shape. None ⇒ a
@@ -2161,6 +2180,14 @@ async def _provision_gcp(
             existing scope classifier.
             """
 
+            # This is the last instruction before the billable GCE RPC. It
+            # reads durable global and task/project placement state through a
+            # thread-safe fresh connection, so either a fleet disable or a
+            # local_only policy committed on another instance wins over stale
+            # process caches.
+            assert_task_managed_execution_allowed_authoritative_sync(
+                "GCE VM", task_id
+            )
             operation = instance_client.insert(
                 project=GCP_PROJECT_ID,
                 zone=zone,
@@ -2183,6 +2210,12 @@ async def _provision_gcp(
                     f"zones/{zone}/diskTypes/pd-standard"
                 )
                 instance_config.disks = [disk]
+                # The fallback is a second paid insert and can occur minutes
+                # after the first quota response; re-check both durable fences
+                # rather than carrying forward a stale allow decision.
+                assert_task_managed_execution_allowed_authoritative_sync(
+                    "GCE VM", task_id
+                )
                 fallback_operation = instance_client.insert(
                     project=GCP_PROJECT_ID,
                     zone=zone,
@@ -2641,6 +2674,7 @@ async def _provision_gcp(
 async def provision_ephemeral_vm(
     vm_instance_id: str,
     *,
+    task_id: uuid.UUID | None = None,
     startup_script: str,
     machine_type: str | None = None,
     provisioning_model: str | None = None,
@@ -2668,9 +2702,13 @@ async def provision_ephemeral_vm(
         raise RuntimeError(
             "provision_ephemeral_vm is unavailable in LOCAL_MODE; use the local backend"
         )
+    assert_managed_compute_enabled("GCE ephemeral VM")
+    await assert_task_managed_execution_allowed_authoritative(
+        "GCE ephemeral VM", task_id
+    )
     return await _provision_gcp(
         vm_instance_id=vm_instance_id,
-        task_id=None,
+        task_id=task_id,
         provisioning_model=provisioning_model,
         startup_script_override=startup_script,
         machine_type=machine_type,

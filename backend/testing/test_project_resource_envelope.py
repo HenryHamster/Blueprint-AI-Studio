@@ -9,6 +9,8 @@ from pydantic import ValidationError
 from app.schemas import BuildConfig, ResourceEnvelope
 from app.resource_envelope import (
     resolve_project_hardware_policy,
+    resolve_project_execution_placement_policy,
+    resolve_project_require_local_runner,
     resolve_project_vm_cap,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
@@ -84,6 +86,21 @@ def test_resource_envelope_rejects_unknown_fields():
         ResourceEnvelope(unknown_field=42)
 
 
+def test_resource_envelope_rejects_broad_policy_with_legacy_local_flag():
+    """The old compute-only policy cannot be silently broadened."""
+    with pytest.raises(ValidationError, match="conflicts with legacy"):
+        ResourceEnvelope(
+            execution_placement_policy="local_only",
+            require_local_runner=True,
+        )
+
+
+def test_resource_envelope_accepts_each_execution_placement_policy():
+    for policy in ("local_only", "local_preferred", "managed_allowed"):
+        envelope = ResourceEnvelope(execution_placement_policy=policy)
+        assert envelope.execution_placement_policy == policy
+
+
 # ---------------------------------------------------------------------------
 # BuildConfig round-trips with resource_envelope
 # ---------------------------------------------------------------------------
@@ -132,6 +149,31 @@ def test_build_config_resource_envelope_from_dict():
     )
     assert bc.resource_envelope is not None
     assert bc.resource_envelope.max_concurrent_vms == 2
+
+
+def test_execution_placement_policy_keeps_legacy_flag_compute_only():
+    legacy = make_project(
+        build_config={"resource_envelope": {"require_local_runner": True}}
+    )
+    assert resolve_project_execution_placement_policy(legacy) == "managed_allowed"
+    assert resolve_project_require_local_runner(legacy) is True
+
+    broad = make_project(
+        build_config={
+            "resource_envelope": {"execution_placement_policy": "local_only"}
+        }
+    )
+    assert resolve_project_execution_placement_policy(broad) == "local_only"
+    assert resolve_project_require_local_runner(broad) is False
+
+
+def test_invalid_hand_edited_execution_placement_policy_falls_back_safely():
+    project = make_project(
+        build_config={
+            "resource_envelope": {"execution_placement_policy": "everywhere"}
+        }
+    )
+    assert resolve_project_execution_placement_policy(project) == "managed_allowed"
 
 
 def test_build_config_resource_envelope_rejects_invalid_nested():

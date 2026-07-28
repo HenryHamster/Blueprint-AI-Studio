@@ -1,0 +1,26 @@
+# Blueprint node role — systemd SYSTEM unit TEMPLATE
+#
+# Rendered only by `blueprint-node install --system`; never copy or hand-edit.
+# Each role remains independently supervised and receives its own EnvironmentFile.
+
+[Unit]
+Description=Blueprint node role: @ROLE@
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@USER@
+ExecStart=@PYTHON@ @EXECUTABLE@
+Restart=always
+RestartSec=5
+EnvironmentFile=-@ENV_FILE@
+StandardOutput=journal
+StandardError=journal
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=@WANTED_BY@

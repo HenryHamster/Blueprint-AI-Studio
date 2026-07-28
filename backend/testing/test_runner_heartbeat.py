@@ -220,6 +220,39 @@ async def test_heartbeat_persists_snapshot_row(db_session):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_bounded_shared_resource_capacity(db_session):
+    _project, runner = await _make_runner(db_session)
+    await heartbeat(
+        payload=HeartbeatRequest(
+            resource_capacity={
+                "enabled": True,
+                "reservations": 3,
+                "cpu": {"total_cores": 8, "reserved_cores": 3.5, "free_cores": 4.5},
+                "memory": {"total_bytes": 16_000, "reserved_bytes": 6_000, "free_bytes": 7_000},
+                "disk": {"total_bytes": 50_000, "reserved_bytes": 4_000, "free_bytes": 30_000},
+                "gpu": {"total": 2, "reserved": 1, "free": 1},
+                "unexpected": "discarded",
+            }
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    capacity = runner.capabilities["resource_capacity"]
+    assert capacity["enabled"] is True
+    assert capacity["cpu"] == {
+        "total_cores": 8.0,
+        "reserved_cores": 3.5,
+        "host_reserved_cores": None,
+        "free_cores": 4.5,
+    }
+    assert capacity["memory"]["reserved_bytes"] == 6_000
+    assert capacity["disk"]["reserved_bytes"] == 4_000
+    assert capacity["gpu"] == {"total": 2, "reserved": 1, "free": 1}
+    assert "unexpected" not in capacity
+
+
+@pytest.mark.asyncio
 async def test_explicit_null_image_store_telemetry_clears_stale_capacity(db_session):
     """A transient Docker-info failure must not retain an old low data-root."""
     _project, runner = await _make_runner(

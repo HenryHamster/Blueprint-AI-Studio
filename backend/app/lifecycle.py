@@ -64,6 +64,72 @@ _BACKGROUND_CRASH_EPISODE_WINDOW_SECONDS: int = 600
 logger = logging.getLogger("blueprint")
 
 
+# Process placement is deliberately resolved in the backend rather than only in
+# deployment manifests: a mis-routed API process must fail closed instead of
+# quietly starting billable/side-effecting worker loops. ``all`` preserves the
+# historical single-service deployment while the split is rolled out.
+PROCESS_ROLE_ENV = "BLUEPRINT_PROCESS_ROLE"
+PROCESS_ROLE_API = "api"
+PROCESS_ROLE_WORKER = "worker"
+PROCESS_ROLE_ALL = "all"
+_PROCESS_ROLES = frozenset(
+    {PROCESS_ROLE_API, PROCESS_ROLE_WORKER, PROCESS_ROLE_ALL}
+)
+
+
+def resolve_process_role(raw_role: str | None = None) -> str:
+    """Resolve and validate the process role, defaulting to legacy ``all``.
+
+    Valid values are ``api`` (HTTP only), ``worker`` (background services), and
+    ``all`` (legacy combined behavior).  Leading/trailing whitespace is ignored;
+    an absent, empty, or whitespace-only value retains the legacy ``all``
+    default. Unknown values fail startup with an actionable error rather than
+    accidentally running background dispatch on an API-only deployment.
+    """
+    value = os.getenv(PROCESS_ROLE_ENV) if raw_role is None else raw_role
+    role = value.strip().lower() if value else ""
+    if not role:
+        return PROCESS_ROLE_ALL
+    if role not in _PROCESS_ROLES:
+        allowed = ", ".join(sorted(_PROCESS_ROLES))
+        raise ValueError(
+            f"{PROCESS_ROLE_ENV} must be one of {allowed}; got {value!r}"
+        )
+    return role
+
+
+def process_role_is_activated(role: str) -> bool:
+    """Whether this foundation currently activates *role* in the lifespan.
+
+    ``api`` and ``worker`` are recognised deployment targets but deliberately
+    fail closed until durable bootstrap ownership has been split.  Keeping this
+    predicate identical to the real lifespan gate avoids a prospective helper
+    accidentally being mistaken for active behavior.
+    """
+    if role not in _PROCESS_ROLES:
+        raise ValueError(f"unknown process role: {role!r}")
+    return role == PROCESS_ROLE_ALL
+
+
+def process_role_status(role: str, *, is_leader: bool) -> dict[str, object]:
+    """Non-sensitive lifecycle status attached to ``app.state`` for operators.
+
+    Until the persistent bootstrap/ownership contract is split, only legacy
+    ``all`` is activatable. The other values remain visible as recognized but
+    intentionally disabled groundwork rather than claiming they run workers.
+    """
+    activated = process_role_is_activated(role)
+    worker_services_permitted = role in {PROCESS_ROLE_WORKER, PROCESS_ROLE_ALL}
+    return {
+        "role": role,
+        "lifecycle_activation": "active" if activated else "not_activated",
+        "worker_services_permitted": worker_services_permitted,
+        "worker_services_running": activated and is_leader,
+        "leader_election_enabled": activated,
+        "is_leader": is_leader,
+    }
+
+
 def _record_crash_and_count(
     crash_timestamps: Dict[str, List[datetime]],
     name: str,
@@ -803,6 +869,17 @@ async def _shutdown_background_task_registry(
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan context manager — startup and shutdown hooks."""
+    # Resolve/reject this first: a recognised-but-not-yet-activated role must
+    # fail before mutating global logging/warning handlers, app.state, the DB,
+    # the advisory lock, or any task registry.
+    process_role = resolve_process_role()
+    if not process_role_is_activated(process_role):
+        raise RuntimeError(
+            f"{PROCESS_ROLE_ENV}={process_role!r} is recognized but not yet "
+            "activated; use BLUEPRINT_PROCESS_ROLE=all until the control-plane "
+            "bootstrap split is deployed"
+        )
+
     # Root logger was never configured — named loggers propagated to a root with
     # no handlers, so every [ORCHESTRATOR]/[DEPLOY]/[HEALTH]/[MONITOR] line
     # vanished silently. Cloud Run captures stdout+stderr; force a basic
@@ -837,6 +914,13 @@ async def lifespan(app):
     warnings.showwarning = _show_warning_via_logger
     logger.info("[STARTUP] Logging configured — app logs now visible in Cloud Logging")
 
+    # ``app.state`` is local-only and contains no secrets. It gives an embedded
+    # health/debug surface and tests a reliable way to inspect the resolved role
+    # without relying on environment values that may change after startup.
+    app.state.process_role_status = process_role_status(
+        process_role, is_leader=False
+    )
+    logger.info("[STARTUP] Process role resolved: %s", process_role)
     # Late imports to avoid circular dependency with app.main
     from app.artifact_ref_cleanup import (
         artifact_ref_lifecycle_service,
@@ -868,6 +952,9 @@ async def lifespan(app):
     )
     from app.shared_state import runtime_config_sync_service
 
+    # Legacy ``all`` startup follows unchanged below. A future activated API
+    # role will need its own bounded read-only readiness sequence; it must not
+    # inherit these durable initialization and repair steps by accident.
     # Startup: Initialize DB tables
     await init_db()
 
@@ -986,6 +1073,9 @@ async def lifespan(app):
             )
 
     _shared_state.is_leader = is_leader
+    app.state.process_role_status = process_role_status(
+        process_role, is_leader=is_leader
+    )
 
     if not is_leader:
         # Release the lock-acquisition connection immediately — we did not win the

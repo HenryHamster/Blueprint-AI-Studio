@@ -1684,6 +1684,86 @@ async def test_patch_resource_envelope_rejects_invalid_values(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_patch_resource_envelope_sets_broad_execution_placement_policy(
+    client: AsyncClient, db_session, project_owner
+):
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={"execution_placement_policy": "local_only"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["execution_placement_policy"] == "local_only"
+    assert data["execution_placement_policy_is_explicit"] is True
+    assert data["legacy_require_local_runner_active"] is False
+    await db_session.refresh(project)
+    assert (
+        project.build_config["resource_envelope"]["execution_placement_policy"]
+        == "local_only"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_requires_explicit_legacy_migration(
+    client: AsyncClient, db_session, project_owner
+):
+    """A legacy compute-only setting cannot become a broad policy by accident."""
+    project = project_owner
+    project.build_config = {"resource_envelope": {"require_local_runner": True}}
+    db_session.add(project)
+    await db_session.commit()
+
+    rejected = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={"execution_placement_policy": "local_only"},
+    )
+    assert rejected.status_code == 422, rejected.text
+
+    migrated = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={
+            "execution_placement_policy": "local_only",
+            "require_local_runner": None,
+        },
+    )
+    assert migrated.status_code == 200, migrated.text
+    data = migrated.json()
+    assert data["execution_placement_policy"] == "local_only"
+    assert data["legacy_require_local_runner_active"] is False
+    await db_session.refresh(project)
+    assert project.build_config["resource_envelope"] == {
+        "execution_placement_policy": "local_only",
+        # ResourceEnvelopeSchema serializes the existing default introduced by
+        # the current mainline spend-window contract. The migration assertion is
+        # about clearing the legacy flag, not suppressing that independent
+        # default.
+        "spend_window_days": 30,
+    }
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_resource_envelope_marks_legacy_local_runner_scope(
+    client: AsyncClient, db_session, project_viewer
+):
+    project = project_viewer
+    project.build_config = {"resource_envelope": {"require_local_runner": True}}
+    db_session.add(project)
+    await db_session.commit()
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/resource-envelope"
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["execution_placement_policy"] == "managed_allowed"
+    assert data["execution_placement_policy_is_explicit"] is False
+    assert data["legacy_require_local_runner_active"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_get_resource_envelope_includes_compute_job_cap(
     client: AsyncClient, project_viewer
 ):

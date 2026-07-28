@@ -8,6 +8,7 @@ import {
   patchStructuralHealthSettings,
   patchMetricsIntegritySettings,
   patchCapabilityProofGateSettings,
+  patchManagedComputeSettings,
   apiFetch,
   type EvergreenFillSettings,
   type CapabilityProofGateMode,
@@ -18,6 +19,7 @@ import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPan
 import { StructuralHealthObservabilityPanel } from './StructuralHealthObservabilityPanel';
 import { MetricsIntegrityObservabilityPanel } from './MetricsIntegrityObservabilityPanel';
 import { EvergreenBacklogPanel } from './EvergreenBacklogPanel';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface SettingsOrchestratorSectionProps {
   maxConcurrentVMs: number;
@@ -166,6 +168,13 @@ export function SettingsOrchestratorSection({
   const [reviewRecommendThresholdInputVal, setReviewRecommendThresholdInputVal] = useState(String(directionReviewRecommendationThreshold));
   const [restarting, setRestarting] = useState(false);
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  // Fleet-wide billable-execution boundary. This is intentionally separate
+  // from per-project placement policies: it is the immediate stop switch.
+  const [managedComputeEnabled, setManagedComputeEnabled] = useState(true);
+  const [managedComputeLoading, setManagedComputeLoading] = useState(true);
+  const [managedComputeSaving, setManagedComputeSaving] = useState(false);
+  const [managedComputeError, setManagedComputeError] = useState<string | null>(null);
+  const [pendingManagedComputeEnabled, setPendingManagedComputeEnabled] = useState<boolean | null>(null);
 
   // Evergreen fill settings — fetched directly and patched on change.
   const [fillSettings, setFillSettings] = useState<EvergreenFillSettings>({
@@ -221,6 +230,7 @@ export function SettingsOrchestratorSection({
       const res = await apiFetch('/api/admin/settings');
       if (res.ok) {
         const data = await res.json();
+        setManagedComputeEnabled(Boolean(data?.managed_compute_enabled ?? true));
         const mode = data?.structural_health_audit_mode ?? 'off';
         setAuditMode(String(mode));
         const sweep = data?.metrics_integrity_sweep_mode ?? 'off';
@@ -255,6 +265,8 @@ export function SettingsOrchestratorSection({
       }
     } catch {
       // silently ignore — defaults remain
+    } finally {
+      setManagedComputeLoading(false);
     }
   }, []);
 
@@ -285,6 +297,22 @@ export function SettingsOrchestratorSection({
       setSweepMode(mode);
     } catch {
       // on error, keep current mode
+    }
+  }, []);
+
+  const updateManagedCompute = useCallback(async (enabled: boolean) => {
+    setManagedComputeSaving(true);
+    setManagedComputeError(null);
+    try {
+      await patchManagedComputeSettings({ managed_compute_enabled: enabled });
+      setManagedComputeEnabled(enabled);
+    } catch {
+      // Do not optimistically show a spend boundary that the API did not
+      // persist. The visible state remains the last confirmed server value.
+      setManagedComputeError('Could not update the managed-compute boundary. Its previous state is still shown.');
+    } finally {
+      setManagedComputeSaving(false);
+      setPendingManagedComputeEnabled(null);
     }
   }, []);
 
@@ -465,6 +493,47 @@ export function SettingsOrchestratorSection({
         </div>
       </div>
 
+      <div data-testid="managed-compute-boundary" className="border border-amber-900/60 bg-amber-950/20 rounded-lg p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h3 className="text-xs font-semibold text-amber-300 uppercase tracking-wider">Managed Compute Safety Boundary</h3>
+            <p className="text-xs text-neutral-300 mt-2 max-w-2xl">
+              {managedComputeEnabled
+                ? 'Enabled: eligible work may launch billable GCE VMs or Cloud Run Jobs when its project policy permits it.'
+                : 'Disabled: no new managed execution launches are allowed. Existing work is not forcibly terminated; local runners remain available.'}
+            </p>
+            <p className="text-xs text-amber-200/80 mt-2">
+              This is fleet-wide and overrides per-project placement policies. It does not turn off the Blueprint API service itself.
+            </p>
+            {managedComputeError && <p role="alert" className="text-xs text-red-300 mt-2">{managedComputeError}</p>}
+          </div>
+          <div className="shrink-0">
+            <span
+              data-testid="managed-compute-state"
+              className={`inline-flex rounded-full border px-2 py-1 text-xs font-medium ${
+                managedComputeEnabled
+                  ? 'border-emerald-700/70 bg-emerald-950/50 text-emerald-300'
+                  : 'border-amber-700/70 bg-amber-950/50 text-amber-300'
+              }`}
+            >
+              {managedComputeLoading ? 'Loading…' : managedComputeEnabled ? 'Managed compute enabled' : 'Managed compute disabled'}
+            </span>
+            <button
+              type="button"
+              disabled={managedComputeLoading || managedComputeSaving}
+              onClick={() => setPendingManagedComputeEnabled(!managedComputeEnabled)}
+              className={`mt-2 block w-full rounded-lg border px-3 py-2 text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                managedComputeEnabled
+                  ? 'border-amber-500/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
+                  : 'border-emerald-500/50 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25'
+              }`}
+            >
+              {managedComputeEnabled ? 'Disable managed compute' : 'Enable managed compute'}
+            </button>
+          </div>
+        </div>
+      </div>
+
       {/* Pipeline Slots */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pipeline Slots</h3>
@@ -504,6 +573,22 @@ export function SettingsOrchestratorSection({
           ))}
         </div>
       </div>
+
+      {pendingManagedComputeEnabled !== null && (
+        <ConfirmDialog
+          title={pendingManagedComputeEnabled ? 'Enable managed compute?' : 'Disable managed compute?'}
+          message={pendingManagedComputeEnabled
+            ? 'This permits eligible projects to launch billable GCE VMs and Cloud Run Jobs again. Project placement policies and other limits still apply.'
+            : 'This immediately blocks new billable GCE VM and Cloud Run Job launches across every project. Existing managed work is not terminated; local runners continue to work.'}
+          confirmLabel={pendingManagedComputeEnabled ? 'Enable managed compute' : 'Disable managed compute'}
+          attestationInput={pendingManagedComputeEnabled ? undefined : {
+            label: 'Reason or acknowledgement (required)',
+            placeholder: 'I understand new managed launches will be blocked',
+          }}
+          onConfirm={() => void updateManagedCompute(pendingManagedComputeEnabled)}
+          onCancel={() => setPendingManagedComputeEnabled(null)}
+        />
+      )}
 
       {/* Pipeline Timeouts */}
       <div>

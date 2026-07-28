@@ -10,12 +10,28 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select
 
 if TYPE_CHECKING:
     from app.models import Project
+
+
+ExecutionPlacementPolicy = Literal[
+    "local_only", "local_preferred", "managed_allowed"
+]
+"""How a project's executable work may be placed.
+
+``local_only`` never permits managed/cloud execution, ``local_preferred``
+uses local capacity first but permits managed fallback, and
+``managed_allowed`` permits either placement.  The explicit value is new; a
+legacy ``require_local_runner`` value remains compute-experiment-only.
+"""
+
+EXECUTION_PLACEMENT_POLICIES = frozenset(
+    {"local_only", "local_preferred", "managed_allowed"}
+)
 
 
 def _utcnow() -> datetime:
@@ -94,8 +110,40 @@ def resolve_project_require_local_runner(project: Project) -> bool:
     permitted by default (legacy/hand-edited config cannot accidentally enable
     a hold-the-project policy).
     """
-    raw = _get_envelope(project).get("require_local_runner")
+    env = _get_envelope(project)
+    # The replacement policy applies to all supported executable work.  Never
+    # combine that broader policy with the legacy compute-experiment-only flag,
+    # even when a hand-edited envelope contains both fields.
+    if env.get("execution_placement_policy") in EXECUTION_PLACEMENT_POLICIES:
+        return False
+    raw = env.get("require_local_runner")
     return raw is True
+
+
+def resolve_project_execution_placement_policy(
+    project: Project,
+) -> ExecutionPlacementPolicy:
+    """Return the project's explicit execution-placement policy.
+
+    Invalid or absent hand-edited values deliberately resolve to
+    ``managed_allowed`` so legacy projects retain their existing behaviour.
+    In particular, legacy ``require_local_runner=true`` is intentionally *not*
+    translated to ``local_only``: it only ever applied to compute experiments.
+    Callers that enforce the legacy compute-experiment contract must continue
+    to use :func:`resolve_project_require_local_runner` as well.
+    """
+    raw = _get_envelope(project).get("execution_placement_policy")
+    if raw in EXECUTION_PLACEMENT_POLICIES:
+        return raw
+    return "managed_allowed"
+
+
+def project_has_explicit_execution_placement_policy(project: Project) -> bool:
+    """Whether a valid broad placement policy is stored on the project."""
+    return (
+        _get_envelope(project).get("execution_placement_policy")
+        in EXECUTION_PLACEMENT_POLICIES
+    )
 
 
 def resolve_project_pause_on_ceiling_exceeded(project: Project) -> bool:

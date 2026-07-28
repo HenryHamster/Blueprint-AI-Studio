@@ -21,6 +21,10 @@ from typing import Dict, Sequence
 
 from app import compute_image_build
 from app.compute_image_build import BuildResult
+from app.managed_compute import (
+    assert_managed_compute_enabled,
+    assert_managed_compute_enabled_authoritative_sync,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +208,10 @@ def _submit_cloud_build(*, source_tarball: str, full_image_ref: str,
                         parent: str | None, tag: str, region: str | None = None,
                         _client=None, _storage_client=None, **_ignored) -> _CloudBuildSubmission:
     """Upload the exact source object and submit it with the Cloud Build API."""
+    # Cloud Build is a separately-billed managed execution surface.  Keep the
+    # guard at its RPC boundary as well as at the public build entry point so a
+    # direct helper caller cannot bypass the fleet-wide spending boundary.
+    assert_managed_compute_enabled("Cloud Build compute-image build")
     del tag
     from google.cloud import storage
     from google.cloud.devtools import cloudbuild_v1
@@ -239,6 +247,12 @@ def _submit_cloud_build(*, source_tarball: str, full_image_ref: str,
     )
     client = _client or _cloud_build_client(region)
     try:
+        # Remote image assembly runs in a worker thread. Re-read durable state
+        # at the actual billing RPC; the entry guard above may be stale by the
+        # time packaging and upload have completed.
+        assert_managed_compute_enabled_authoritative_sync(
+            "Cloud Build compute-image build"
+        )
         operation = client.create_build(request={"project_id": project, "build": build,
                                                  "parent": f"projects/{project}/locations/{region}"})
         metadata = operation.metadata
@@ -387,6 +401,7 @@ def remote_build_and_push(*, repo_dir: str, registry_repo: str, image_name: str,
                           **_ignored) -> BuildResult:
     """Hash, validate, remotely build, scan, publish, and return a digest pin."""
     from app.compute_image_build import CredentialLeakError
+    assert_managed_compute_enabled("Cloud Build compute-image build")
     if not _remote_build_configured():
         raise RuntimeError("Remote compute-image build is not configured")
     build_args = dict(build_args or {})

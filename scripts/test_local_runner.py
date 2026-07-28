@@ -5062,6 +5062,31 @@ class TestHeartbeatTelemetryPayload(unittest.TestCase):
         self.assertIsNone(body["disk_free_bytes"])  # workspace_root None
         self.assertIsNone(body["gpu_utilization_pct"])
 
+    def test_emits_shared_resource_capacity_when_ledger_is_present(self):
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+             patch.object(local_runner, "_write_status_json"):
+            ledger = local_runner._ResourceLedger("/tmp", enabled=True)
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                workspace_root="/tmp", resource_ledger=ledger,
+            )
+
+        capacity = posted[0]["resource_capacity"]
+        self.assertTrue(capacity["enabled"])
+        self.assertIn("total_cores", capacity["cpu"])
+        self.assertIn("reserved_bytes", capacity["memory"])
+        self.assertIn("free_bytes", capacity["disk"])
+
 
 class TestHeartbeat401Streak(unittest.TestCase):
     def setUp(self):
@@ -9663,6 +9688,131 @@ class TestCpuLoadAvgAndMemoryFree(unittest.TestCase):
     def test_memory_free_bytes_handles_oserror(self):
         with patch("builtins.open", side_effect=OSError("no /proc")):
             self.assertIsNone(local_runner._memory_free_bytes())
+
+
+class TestSharedResourceAdmission(unittest.TestCase):
+    """Agent and compute pools share one conservative host resource ledger."""
+
+    def _ledger(self):
+        return local_runner._ResourceLedger(
+            "/tmp",
+            enabled=True,
+            agent=local_runner._ResourceRequest(1.0, 2, 0),
+            compute=local_runner._ResourceRequest(2.0, 4, 0),
+            reserved_cpu_cores=1.0,
+            reserved_memory_bytes=1,
+            min_free_memory_bytes=1,
+        )
+
+    def test_compute_cannot_overcommit_agent_reservation(self):
+        ledger = self._ledger()
+        with patch.object(local_runner.os, "cpu_count", return_value=4), \
+             patch.object(local_runner, "_memory_total_bytes", return_value=100), \
+             patch.object(local_runner, "_memory_free_bytes", return_value=100), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=100):
+            self.assertIsNone(ledger.try_reserve("agent:a", "agent"))
+            self.assertIsNone(ledger.try_reserve("compute:b", "compute"))
+            # 1 host core + 1 agent + 2 compute already consumes all four cores.
+            self.assertEqual(ledger.try_reserve("agent:c", "agent"), "cpu_reservation")
+            ledger.release("compute:b")
+            self.assertIsNone(ledger.try_reserve("agent:c", "agent"))
+
+    def test_observed_memory_pressure_rejects_before_claim(self):
+        ledger = self._ledger()
+        with patch.object(local_runner.os, "cpu_count", return_value=32), \
+             patch.object(local_runner, "_memory_total_bytes", return_value=100), \
+             patch.object(local_runner, "_memory_free_bytes", return_value=2), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=100):
+            self.assertEqual(ledger.try_reserve("agent:a", "agent"), "memory_pressure")
+
+    def test_observed_memory_pressure_counts_existing_reservations(self):
+        ledger = self._ledger()
+        with patch.object(local_runner.os, "cpu_count", return_value=32), \
+             patch.object(local_runner, "_memory_total_bytes", return_value=100), \
+             patch.object(local_runner, "_memory_free_bytes", return_value=6), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=100):
+            self.assertIsNone(ledger.try_reserve("agent:a", "agent"))
+            # Pressure floor + existing agent reservation + requested compute
+            # reservation exceeds observed free memory.
+            self.assertEqual(ledger.try_reserve("compute:b", "compute"), "memory_pressure")
+
+    def test_snapshot_reports_total_reserved_and_free_with_gpu_ledger(self):
+        ledger = self._ledger()
+        gpu_state = {
+            "allowed": [0, 1], "in_use": {1}, "per_job": 1,
+            "lock": threading.Lock(),
+        }
+        with patch.object(local_runner.os, "cpu_count", return_value=8), \
+             patch.object(local_runner, "_memory_total_bytes", return_value=100), \
+             patch.object(local_runner, "_memory_free_bytes", return_value=80), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=100):
+            self.assertIsNone(ledger.try_reserve("agent:a", "agent"))
+            snapshot = ledger.snapshot(gpu_state)
+        self.assertEqual(snapshot["cpu"]["total_cores"], 8)
+        self.assertEqual(snapshot["cpu"]["reserved_cores"], 1.0)
+        self.assertEqual(snapshot["memory"]["reserved_bytes"], 2)
+        self.assertEqual(snapshot["gpu"], {"total": 2, "reserved": 1, "free": 1})
+
+    def test_disk_reservations_are_cumulative_and_snapshot_is_conservative(self):
+        ledger = local_runner._ResourceLedger(
+            "/tmp",
+            enabled=True,
+            agent=local_runner._ResourceRequest(1.0, 2, 10),
+            compute=local_runner._ResourceRequest(1.0, 2, 10),
+            reserved_cpu_cores=0,
+            reserved_memory_bytes=1,
+            min_free_memory_bytes=1,
+        )
+        with patch.object(local_runner.os, "cpu_count", return_value=8), \
+             patch.object(local_runner, "_memory_total_bytes", return_value=100), \
+             patch.object(local_runner, "_memory_free_bytes", return_value=80), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=25), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=10), \
+             patch.object(local_runner.shutil, "disk_usage", return_value=MagicMock(total=100, free=25)):
+            self.assertIsNone(ledger.try_reserve("agent:a", "agent"))
+            self.assertEqual(ledger.try_reserve("compute:b", "compute"), "disk_pressure")
+            snapshot = ledger.snapshot()
+        self.assertEqual(snapshot["memory"]["free_bytes"], 77)
+        self.assertEqual(snapshot["disk"]["free_bytes"], 5)
+
+    def test_default_admission_keeps_one_vcpu_agent_runners_compatible(self):
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(local_runner.os, "cpu_count", return_value=1), \
+             patch.object(local_runner, "_memory_total_bytes", return_value=100), \
+             patch.object(local_runner, "_memory_free_bytes", return_value=100), \
+             patch.object(local_runner, "_disk_free_bytes", return_value=100), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=0):
+            ledger = local_runner._ResourceLedger(
+                "/tmp",
+                agent=local_runner._ResourceRequest(1.0, 1, 0),
+                compute=local_runner._ResourceRequest(2.0, 1, 0),
+                reserved_memory_bytes=0,
+                min_free_memory_bytes=0,
+            )
+            self.assertEqual(ledger.reserved_cpu_cores, 0.0)
+            self.assertIsNone(ledger.try_reserve("agent:a", "agent"))
+
+    def test_malformed_compute_response_releases_capacity_and_claim_reservation(self):
+        ledger = local_runner._ResourceLedger("/tmp", enabled=False)
+        capacity = threading.BoundedSemaphore(1)
+
+        def stop_after_error(_seconds):
+            local_runner._shutdown_event.set()
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", return_value=(200, [])), \
+                 patch.object(local_runner, "_disk_below_min", return_value=False), \
+                 patch.object(local_runner, "_container_image_store", return_value=None), \
+                 patch.object(local_runner.time, "sleep", side_effect=stop_after_error):
+                local_runner._compute_poll_loop(
+                    "https://api.example", "tok", set(), threading.Lock(), 1,
+                    capacity=capacity, resource_ledger=ledger,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+        self.assertEqual(ledger.snapshot()["reservations"], 0)
+        self.assertTrue(capacity.acquire(blocking=False))
 
 
 class TestProgressTail(unittest.TestCase):

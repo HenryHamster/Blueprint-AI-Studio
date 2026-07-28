@@ -1,0 +1,26 @@
+# Blueprint node role — systemd --user unit TEMPLATE
+#
+# Rendered only by `blueprint-node install`; never copy or hand-edit this file.
+# Each role receives a distinct unit and EnvironmentFile, so an execution-lane
+# failure cannot restart a future control-plane or Actions service.
+
+[Unit]
+Description=Blueprint node role: @ROLE@
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=@PYTHON@ @EXECUTABLE@
+Restart=always
+RestartSec=5
+EnvironmentFile=-@ENV_FILE@
+StandardOutput=journal
+StandardError=journal
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

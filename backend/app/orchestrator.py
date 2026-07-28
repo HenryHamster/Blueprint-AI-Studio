@@ -576,6 +576,7 @@ from app.orchestrator_runner_dispatch import (  # noqa: F401
     _emit_all_accounts_blocked_stall,
     _fail_compute_experiment_task,
     _fail_stale_local_runner_holds,
+    _hold_task_for_local_only_placement,
     _hold_strategic_local_runner_task,
     _load_active_runners_cache,
     _load_runner_compute_job_assignments,
@@ -1216,6 +1217,10 @@ async def orchestrator_worker():
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
+    from app.managed_compute import (
+        is_managed_compute_enabled,
+        managed_compute_denial_snapshot,
+    )
     from app.vm_lifecycle import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
@@ -3496,6 +3501,20 @@ async def orchestrator_worker():
                         if await _hold_strategic_local_runner_task(session, task):
                             continue
 
+                        # Project-level local_only is broader than the older
+                        # compute/Workbench-specific markers: ordinary agent
+                        # work, Strategic retries, recovery work, and any future
+                        # task type all queue here when no local runner can take
+                        # them.  This sits before warm-pool and managed launch
+                        # paths so strict placement can never become an implicit
+                        # cloud fallback.
+                        if await _hold_task_for_local_only_placement(
+                            session,
+                            task,
+                            reason="no_eligible_local_runner",
+                        ):
+                            continue
+
                         # Phase 2c: warm-VM continuity skip-provision branch.
                         # Three outcomes when warm_target_vm_id is set on the task:
                         #   (a) deadline expired → clear warm fields, fall through
@@ -4346,6 +4365,47 @@ async def orchestrator_worker():
                         # (D2 over-fetch fix) — context keys are still written
                         # above so in-flight rows / rollbacks stay safe.
                         task.llm_account_id = account_id
+
+                        # Hard fleet-wide spending boundary.  This is the last
+                        # dispatcher checkpoint immediately BEFORE the durable
+                        # QUEUED -> PROVISIONING transition.  Local runner
+                        # dispatch has already been attempted above; reaching
+                        # this point means the legacy managed-execution fallback
+                        # would otherwise create a billable GCE VM or Cloud Run
+                        # Job.  Preserve the task in QUEUED state with an audit
+                        # snapshot instead of silently falling through.
+                        if not is_managed_compute_enabled():
+                            held_context = clear_task_llm_runtime_context(task.context)
+                            task.context = {
+                                **(held_context or {}),
+                                "managed_compute": managed_compute_denial_snapshot(
+                                    backend="agent_dispatch"
+                                ),
+                            }
+                            task.llm_account_id = None
+                            task.latest_status_message = (
+                                "Waiting for local capacity: managed cloud execution is disabled"
+                            )
+                            session.add(task)
+                            await session.commit()
+                            if account_id:
+                                await release_max_plan_account(
+                                    account_id,
+                                    revert_daily_task_count=True,
+                                    project_id=(
+                                        str(task.project_id)
+                                        if task.project_id
+                                        else None
+                                    ),
+                                )
+                            _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
+                            logger.info(
+                                "[ORCHESTRATOR] Held task %s before managed execution "
+                                "provisioning because managed_compute_enabled is false",
+                                task.id,
+                            )
+                            continue
                         # A dispatch that reaches the PROVISIONING commit resets
                         # the contained-crash counter (persisted by that commit;
                         # rolled back with everything else if prep still crashes
