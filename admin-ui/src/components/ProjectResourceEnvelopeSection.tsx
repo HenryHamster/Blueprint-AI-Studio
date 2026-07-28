@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { ProjectResourceEnvelopeResponse } from '../types/project';
 import type { ResourceEnvelopePatch } from '../api';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface ProjectResourceEnvelopeSectionProps {
   githubOwner: string | null;
@@ -25,6 +26,8 @@ const KNOWN_MACHINE_TYPES = [
   'e2-standard-32',
 ] as const;
 const KNOWN_ACCELERATOR_TYPES = ['T4', 'L4', 'V100'] as const;
+type ExecutionPlacementPolicy = 'local_only' | 'local_preferred' | 'managed_allowed';
+type ExecutionPlacementSelection = ExecutionPlacementPolicy | 'legacy_compute_only';
 
 function formatUsd(value: number | null | undefined): string {
   return value == null ? 'Unlimited' : `$${value.toFixed(2)}`;
@@ -77,11 +80,14 @@ export function ProjectResourceEnvelopeSection({
   // Distinct from "no accelerators selected": when true we save an explicit
   // empty list (`[]`) that blocks all GPU jobs, rather than `null` (unlimited).
   const [blockAllGpu, setBlockAllGpu] = useState(false);
-  // When true, compute experiments only run on registered self-hosted runners
-  // and never fall back to billable cloud compute.
-  const [requireLocalRunner, setRequireLocalRunner] = useState(false);
+  const [executionPlacementPolicy, setExecutionPlacementPolicy] =
+    useState<ExecutionPlacementSelection>('managed_allowed');
   const [pauseOnCeilingExceeded, setPauseOnCeilingExceeded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [pendingPlacementSave, setPendingPlacementSave] = useState<{
+    patch: ResourceEnvelopePatch;
+    policy: 'local_preferred' | 'managed_allowed';
+  } | null>(null);
 
   useEffect(() => {
     setMaxConcurrentVmsInput(data?.max_concurrent_vms != null ? String(data.max_concurrent_vms) : '');
@@ -95,8 +101,18 @@ export function ProjectResourceEnvelopeSection({
     // whitelist; null/absent means unrestricted.
     setBlockAllGpu(Array.isArray(accel) && accel.length === 0);
     setAcceleratorTypes(accel != null ? [...accel] : []);
-    setRequireLocalRunner(data?.require_local_runner ?? false);
+    // Preserve the legacy flag's deliberately narrow scope.  Showing it as a
+    // sentinel forces an owner to choose a broad replacement policy explicitly;
+    // simply opening or saving this form cannot broaden the legacy setting.
+    const legacyPolicyActive = data?.legacy_require_local_runner_active
+      ?? (data?.require_local_runner === true && !data?.execution_placement_policy_is_explicit);
+    setExecutionPlacementPolicy(
+      legacyPolicyActive
+        ? 'legacy_compute_only'
+        : (data?.execution_placement_policy ?? 'managed_allowed'),
+    );
     setPauseOnCeilingExceeded(data?.pause_on_ceiling_exceeded ?? false);
+    setPendingPlacementSave(null);
   }, [data]);
 
   const parsedMaxConcurrent = useMemo(() => {
@@ -137,6 +153,9 @@ export function ProjectResourceEnvelopeSection({
     max_concurrent_compute_jobs: null,
     allowed_machine_types: null,
     allowed_accelerator_types: null,
+    execution_placement_policy: 'managed_allowed' as ExecutionPlacementPolicy,
+    execution_placement_policy_is_explicit: false,
+    legacy_require_local_runner_active: false,
     require_local_runner: false,
     pause_on_ceiling_exceeded: false,
     active_vm_count: 0,
@@ -187,7 +206,12 @@ export function ProjectResourceEnvelopeSection({
       : current.max_concurrent_compute_jobs !== null;
     const machineTypesChanged = !policyEquals(current.allowed_machine_types ?? null, machineTypesToSave);
     const acceleratorTypesChanged = !policyEquals(current.allowed_accelerator_types ?? null, acceleratorTypesToSave);
-    const requireLocalRunnerChanged = (current.require_local_runner ?? false) !== requireLocalRunner;
+    const legacyPolicyActive = current.legacy_require_local_runner_active
+      ?? (current.require_local_runner === true && !current.execution_placement_policy_is_explicit);
+    const currentPlacementPolicy = current.execution_placement_policy ?? 'managed_allowed';
+    const executionPlacementPolicyChanged = legacyPolicyActive
+      ? executionPlacementPolicy !== 'legacy_compute_only'
+      : executionPlacementPolicy !== currentPlacementPolicy;
     const pauseOnCeilingExceededChanged = (current.pause_on_ceiling_exceeded ?? false) !== pauseOnCeilingExceeded;
     return (
       maxChanged ||
@@ -197,7 +221,7 @@ export function ProjectResourceEnvelopeSection({
       computeJobsChanged ||
       machineTypesChanged ||
       acceleratorTypesChanged ||
-      requireLocalRunnerChanged ||
+      executionPlacementPolicyChanged ||
       pauseOnCeilingExceededChanged
     );
   }, [
@@ -208,6 +232,9 @@ export function ProjectResourceEnvelopeSection({
     current.max_concurrent_compute_jobs,
     current.allowed_machine_types,
     current.allowed_accelerator_types,
+    current.execution_placement_policy,
+    current.execution_placement_policy_is_explicit,
+    current.legacy_require_local_runner_active,
     current.require_local_runner,
     current.pause_on_ceiling_exceeded,
     maxConcurrentVmsInput,
@@ -217,30 +244,60 @@ export function ProjectResourceEnvelopeSection({
     maxConcurrentComputeJobsInput,
     machineTypesToSave,
     acceleratorTypesToSave,
-    requireLocalRunner,
+    executionPlacementPolicy,
     pauseOnCeilingExceeded,
   ]);
 
-  const handleSave = async () => {
+  const savePatch = async (patch: ResourceEnvelopePatch) => {
+    setSaving(true);
+    try {
+      await onSave(patch);
+    } finally {
+      setSaving(false);
+      setPendingPlacementSave(null);
+    }
+  };
+
+  const handleSave = () => {
     if (!canSave || Number.isNaN(parsedMaxConcurrent) || Number.isNaN(parsedSpendCeiling) || Number.isNaN(parsedSpendWindowDays) || Number.isNaN(parsedSpendWarningFraction) || Number.isNaN(parsedMaxConcurrentComputeJobs)) {
       return;
     }
-    setSaving(true);
-    try {
-      await onSave({
-        max_concurrent_vms: parsedMaxConcurrent,
-        spend_ceiling_usd: parsedSpendCeiling,
-        spend_window_days: parsedSpendWindowDays,
-        spend_warning_fraction: parsedSpendWarningFraction,
-        max_concurrent_compute_jobs: parsedMaxConcurrentComputeJobs,
-        allowed_machine_types: machineTypesToSave,
-        allowed_accelerator_types: acceleratorTypesToSave,
-        require_local_runner: requireLocalRunner,
-        pause_on_ceiling_exceeded: pauseOnCeilingExceeded,
-      });
-    } finally {
-      setSaving(false);
+
+    const patch: ResourceEnvelopePatch = {
+      max_concurrent_vms: parsedMaxConcurrent,
+      spend_ceiling_usd: parsedSpendCeiling,
+      spend_window_days: parsedSpendWindowDays,
+      spend_warning_fraction: parsedSpendWarningFraction,
+      max_concurrent_compute_jobs: parsedMaxConcurrentComputeJobs,
+      allowed_machine_types: machineTypesToSave,
+      allowed_accelerator_types: acceleratorTypesToSave,
+      pause_on_ceiling_exceeded: pauseOnCeilingExceeded,
+    };
+    const legacyPolicyActive = current.legacy_require_local_runner_active
+      ?? (current.require_local_runner === true && !current.execution_placement_policy_is_explicit);
+    const currentPlacementPolicy = current.execution_placement_policy ?? 'managed_allowed';
+    const executionPlacementPolicyChanged = legacyPolicyActive
+      ? executionPlacementPolicy !== 'legacy_compute_only'
+      : executionPlacementPolicy !== currentPlacementPolicy;
+    if (executionPlacementPolicyChanged && executionPlacementPolicy !== 'legacy_compute_only') {
+      patch.execution_placement_policy = executionPlacementPolicy;
+      // An explicit replacement must clear the old field in the same atomic
+      // PATCH. The backend rejects a broad policy plus legacy true.
+      if (legacyPolicyActive) patch.require_local_runner = null;
     }
+
+    // A project that was strict (including the old compute-experiment-only
+    // contract) is about to permit an immediate managed fallback. Confirm the
+    // exact patch rather than saving a broader policy as a side effect of other
+    // resource-envelope edits.
+    const placementBroadensManagedExecution =
+      (legacyPolicyActive || currentPlacementPolicy === 'local_only')
+      && (executionPlacementPolicy === 'local_preferred' || executionPlacementPolicy === 'managed_allowed');
+    if (placementBroadensManagedExecution) {
+      setPendingPlacementSave({ patch, policy: executionPlacementPolicy });
+      return;
+    }
+    void savePatch(patch);
   };
 
   const toggleMachineType = (type: string) => {
@@ -511,25 +568,38 @@ export function ProjectResourceEnvelopeSection({
       </div>
 
       <div>
-        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Compute Runner</h3>
-        <label className="flex items-start gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={requireLocalRunner}
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Execution Placement</h3>
+        <label className="block">
+          <span className="block text-xs text-neutral-400 mb-1">Where executable work may run</span>
+          <select
+            aria-label="Execution placement policy"
+            value={executionPlacementPolicy}
             disabled={inputDisabled}
-            onChange={() => setRequireLocalRunner(prev => !prev)}
-            className="h-4 w-4 mt-0.5 rounded border-neutral-700 bg-neutral-950 disabled:opacity-60"
-          />
-          <span className="text-xs text-neutral-200">
-            Require local runner for compute experiments
-            <span className="block text-ui-md text-neutral-600 mt-1">
-              When on, this project's compute experiments only run on registered self-hosted
-              runners and never fall back to billable cloud compute. With no live runner,
-              experiments are held until one comes online (and time out after a few hours
-              rather than wedging).
-            </span>
-          </span>
+            onChange={e => setExecutionPlacementPolicy(e.target.value as ExecutionPlacementSelection)}
+            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 disabled:opacity-60"
+          >
+            {executionPlacementPolicy === 'legacy_compute_only' && (
+              <option value="legacy_compute_only" disabled>Legacy: local only for compute experiments</option>
+            )}
+            <option value="local_only">Local only — never use managed execution</option>
+            <option value="local_preferred">Local preferred — try local first, then immediately fall back</option>
+            <option value="managed_allowed">Managed allowed — same immediate fallback behavior today</option>
+          </select>
         </label>
+        {(current.legacy_require_local_runner_active
+          ?? (current.require_local_runner === true && !current.execution_placement_policy_is_explicit)) && (
+          <p className="text-ui-md text-amber-300 mt-2">
+            Legacy policy active: only compute experiments require local runners. Select a new
+            placement policy and save to replace it deliberately; it is not automatically broadened.
+          </p>
+        )}
+        <p className="text-ui-md text-neutral-600 mt-1">
+          This policy applies across supported executable work. Local-only work waits indefinitely
+          for local capacity instead of silently creating billable managed execution. Today,
+          local-preferred tries an eligible local runner first; if none is eligible in that dispatch
+          cycle, it immediately continues to configured warm-pool or managed execution — there is no
+          local-capacity timeout. Managed-allowed has the same fallback behavior today.
+        </p>
       </div>
 
       <div>
@@ -563,6 +633,18 @@ export function ProjectResourceEnvelopeSection({
           {saving ? 'Saving...' : 'Save Resource Envelope'}
         </button>
       </div>
+
+      {pendingPlacementSave && (
+        <ConfirmDialog
+          title="Allow managed execution fallback?"
+          message={pendingPlacementSave.policy === 'local_preferred'
+            ? 'This changes a strict local policy to local-preferred. Under the current dispatcher, an eligible local runner is tried first, but if none is eligible in that dispatch cycle the task immediately continues to configured warm-pool or managed execution. There is no local-capacity timeout.'
+            : 'This changes a strict local policy to managed-allowed. Under the current dispatcher, an eligible local runner is tried first, but if none is eligible in that dispatch cycle the task immediately continues to configured warm-pool or managed execution.'}
+          confirmLabel="Allow managed fallback"
+          onConfirm={() => void savePatch(pendingPlacementSave.patch)}
+          onCancel={() => setPendingPlacementSave(null)}
+        />
+      )}
     </div>
   );
 }

@@ -45,6 +45,10 @@ from app import compute
 from app import storage
 from app.compute_experiment_contract import ENV_KEY_RE
 from app.failure_classification import NO_PROGRESS_TIMEOUT_TERMINAL_REASON
+from app.managed_compute import (
+    assert_managed_compute_enabled,
+    assert_task_managed_execution_allowed_authoritative,
+)
 from app.models import (
     ComputeJob,
     ComputeJobStatus,
@@ -596,6 +600,9 @@ class ComputeLaunchSpec:
     machine_type: str
     spend_cap_usd: float
     deadline_at: datetime | None
+    # Owning task used by the final managed-placement fence. None is retained
+    # for legacy/taskless backends that cannot bill the GCP compute path.
+    task_id: uuid.UUID | None = None
     # Provisioning timeout used by the monitor to bound the launch phase. This
     # remains separate from the command's runtime budget so launch delay never
     # steals runtime from the command itself.
@@ -1160,6 +1167,13 @@ class GcpComputeBackend:
         return f"compute-job-vm-{job.id.hex[:12]}"
 
     async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
+        # The compute primitive repeats this check, but retain a guard at the
+        # backend boundary so no artifact/signing or GCP discovery work occurs
+        # after the fleet has been switched to local-only execution.
+        assert_managed_compute_enabled("GCP compute backend")
+        await assert_task_managed_execution_allowed_authoritative(
+            "GCP compute backend", spec.task_id
+        )
         external_id = spec.external_id or f"compute-job-vm-{spec.job_id.hex[:12]}"
         artifact_uri = storage.compute_job_artifact_uri(spec.job_id)
         # Idempotent re-launch: if the reserved VM already exists (a crash between
@@ -1214,6 +1228,7 @@ class GcpComputeBackend:
             )
         ok = await compute.provision_ephemeral_vm(
             external_id,
+            task_id=spec.task_id,
             startup_script=_build_gcp_startup_script(
                 spec,
                 artifact_upload_url=artifact_upload_url,

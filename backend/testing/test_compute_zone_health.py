@@ -16,6 +16,28 @@ from app import compute
 from app import provision_error_scope
 
 
+@pytest.fixture
+def allow_gce_behavior_launch(monkeypatch):
+    """Keep direct GCE behavior tests independent of placement policy lookup."""
+
+    async def allow_managed_execution(*_args, **_kwargs):
+        return None
+
+    def allow_managed_execution_sync(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        compute,
+        "assert_task_managed_execution_allowed_authoritative",
+        allow_managed_execution,
+    )
+    monkeypatch.setattr(
+        compute,
+        "assert_task_managed_execution_allowed_authoritative_sync",
+        allow_managed_execution_sync,
+    )
+
+
 # ─── Zone success-rate tracking tests ────────────────────────────────────────
 
 
@@ -163,6 +185,7 @@ class TestZoneHealthOutput:
 # ─── Spot preemption override tests ──────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("allow_gce_behavior_launch")
 class TestSpotPreemptionOverride:
     """provision_agent_vm respects the provisioning_model override parameter.
 
@@ -846,6 +869,7 @@ class TestZoneSuspectCorroboration:
         assert health["last_failure_reason"] == "RESOURCE_POOL_EXHAUSTED"
 
 
+@pytest.mark.usefixtures("allow_gce_behavior_launch")
 class TestProvisionQuotaScope:
     """Integration: the _provision_gcp zone loop must not paint zones on
     global/regional quota errors."""
@@ -1115,6 +1139,7 @@ class TestGetVmStatus:
             assert compute.get_vm_status("agent-vm-abc", "us-central1-a") is None
 
 
+@pytest.mark.usefixtures("allow_gce_behavior_launch")
 class TestBootDiskType:
     """provision_agent_vm requests a pd-balanced (SSD-backed) boot disk.
 

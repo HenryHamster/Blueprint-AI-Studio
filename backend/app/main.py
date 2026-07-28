@@ -178,9 +178,11 @@ _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 async def _verify_encryption_config():
     """Validate encryption configuration at startup.
 
-    On Cloud Run (``K_REVISION`` is set): require ``GITHUB_PAT_ENCRYPTION_KEY``
-    to be configured — raise ``RuntimeError`` so the deploy fails immediately
-    instead of silently storing credentials in plaintext.
+    In a production scope (Cloud Run's ``K_REVISION`` or explicit
+    ``BLUEPRINT_DEPLOYMENT_MODE=local-production``): require
+    ``GITHUB_PAT_ENCRYPTION_KEY`` to be configured — raise ``RuntimeError`` so
+    the deploy fails immediately instead of silently storing credentials in
+    plaintext.
 
     In development/test (``K_REVISION`` not set): warn when both the encryption
     key and ``ALLOW_PLAINTEXT_CREDENTIALS`` are absent, so developers know to
@@ -199,13 +201,26 @@ async def _verify_encryption_config():
         is_encryption_active,
         probe_key_continuity,
     )
-    from app.required_runtime_env import _verify_required_env
+    from app.required_runtime_env import (
+        LOCAL_DEPLOYMENT_MODE_ENV,
+        LOCAL_PRODUCTION_DEPLOYMENT_MODE,
+        _verify_required_env,
+        active_scopes,
+    )
 
-    # Presence enforcement is delegated to the declarative manifest: on Cloud Run
-    # it raises RuntimeError when GITHUB_PAT_ENCRYPTION_KEY is absent. This keeps a
-    # single machine-readable source of truth for the boot env contract; the
-    # value-validity specialisation (is the key a parseable Fernet key) stays here.
+    # Presence enforcement is delegated to the declarative manifest: in either
+    # production scope it raises RuntimeError when GITHUB_PAT_ENCRYPTION_KEY is
+    # absent. This keeps a single machine-readable source of truth for the boot
+    # env contract; value-validity specialisation stays here.
     _verify_required_env()
+
+    local_production = "local_production" in active_scopes()
+    if local_production and os.getenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV):
+        raise RuntimeError(
+            "[STARTUP] ALLOW_PLAINTEXT_CREDENTIALS is forbidden when "
+            f"{LOCAL_DEPLOYMENT_MODE_ENV}={LOCAL_PRODUCTION_DEPLOYMENT_MODE}; "
+            "configure GITHUB_PAT_ENCRYPTION_KEY instead."
+        )
 
     if is_encryption_active():
         from app.database import AsyncSessionLocal
@@ -236,8 +251,8 @@ async def _verify_encryption_config():
                     await session.commit()
         return
 
-    on_cloud_run = bool(os.getenv("K_REVISION"))
-    if on_cloud_run:
+    production_scope = bool(os.getenv("K_REVISION")) or local_production
+    if production_scope:
         # Presence already passed (_verify_required_env would have raised), so the
         # key is set but not a valid Fernet key — the value-validity failure.
         msg = (

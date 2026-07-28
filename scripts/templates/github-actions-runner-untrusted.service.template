@@ -1,0 +1,51 @@
+# Blueprint GitHub Actions runner role — untrusted/fork work only.
+# This profile is EPHEMERAL only. It intentionally has no Docker socket,
+# production credentials, or access to user homes. Rendered by
+# scripts/github_actions_runner.py; do not install this template directly.
+
+[Unit]
+Description=Blueprint GitHub Actions runner (@ROLE@, untrusted ephemeral)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@RUNNER_ROOT@
+Environment=HOME=@STATE_ROOT@
+Environment=RUNNER_ALLOW_RUNASROOT=0
+Environment=BLUEPRINT_GITHUB_ACTIONS_ROLE=@ROLE@
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@RUNNER_ROOT@/run.sh
+Restart=no
+TimeoutStopSec=@STOP_TIMEOUT@
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Do not let public/fork workflow code mint cloud workload credentials from the
+# host metadata service. Covers GCP, Azure, AWS/ECS IPv4 and AWS IPv6 metadata.
+IPAddressDeny=169.254.169.254/32
+IPAddressDeny=fd00:ec2::254/128
+SystemCallArchitectures=native
+InaccessiblePaths=/var/run/docker.sock /run/docker.sock
+ReadWritePaths=@STATE_ROOT@
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

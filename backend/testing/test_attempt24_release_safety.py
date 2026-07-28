@@ -532,6 +532,33 @@ class TestVerifyEncryptionConfigBootGate:
             await _verify_encryption_config()
 
     @pytest.mark.asyncio
+    async def test_local_production_no_key_or_plaintext_opt_in_raises(self, monkeypatch):
+        """A local control-plane deployment has the same encryption boundary."""
+        monkeypatch.delenv("K_REVISION", raising=False)
+        monkeypatch.setenv("BLUEPRINT_DEPLOYMENT_MODE", "local-production")
+        monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+        monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+        from app.main import _verify_encryption_config
+
+        with pytest.raises(RuntimeError, match="GITHUB_PAT_ENCRYPTION_KEY"):
+            await _verify_encryption_config()
+
+    @pytest.mark.asyncio
+    async def test_local_production_rejects_plaintext_opt_in_even_with_key(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("K_REVISION", raising=False)
+        monkeypatch.setenv("BLUEPRINT_DEPLOYMENT_MODE", "local-production")
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", Fernet.generate_key().decode())
+        monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+        from app.main import _verify_encryption_config
+
+        with pytest.raises(RuntimeError, match="ALLOW_PLAINTEXT_CREDENTIALS"):
+            await _verify_encryption_config()
+
+    @pytest.mark.asyncio
     async def test_dev_no_key_with_plaintext_opt_in_no_raise(self, monkeypatch):
         """K_REVISION absent + no key + ALLOW_PLAINTEXT_CREDENTIALS → no raise (dev mode)."""
         monkeypatch.delenv("K_REVISION", raising=False)

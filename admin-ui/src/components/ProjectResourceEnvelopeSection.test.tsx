@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ProjectResourceEnvelopeSection } from './ProjectResourceEnvelopeSection';
 
 describe('ProjectResourceEnvelopeSection', () => {
@@ -195,7 +195,6 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: null,
       allowed_accelerator_types: null,
-      require_local_runner: false,
       pause_on_ceiling_exceeded: false,
     });
   });
@@ -338,7 +337,6 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: ['e2-standard-4'],
       allowed_accelerator_types: ['L4'],
-      require_local_runner: false,
       pause_on_ceiling_exceeded: false,
     });
   });
@@ -379,7 +377,6 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: null,
       allowed_accelerator_types: [],
-      require_local_runner: false,
       pause_on_ceiling_exceeded: false,
     });
   });
@@ -423,8 +420,136 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: null,
       allowed_accelerator_types: null,
-      require_local_runner: false,
       pause_on_ceiling_exceeded: false,
     });
+  });
+
+  it('saves a selected broad execution placement policy', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={{
+          project_id: 'project-1',
+          max_concurrent_vms: 4,
+          spend_ceiling_usd: 50,
+          spend_window_days: 14,
+          execution_placement_policy: 'managed_allowed',
+          execution_placement_policy_is_explicit: true,
+          active_vm_count: 0,
+          recent_spend_usd: 0,
+          recent_spend_compute_usd: 0,
+          recent_spend_agent_vm_usd: 0,
+          recent_spend_idle_usd: 0,
+          is_throttled: false,
+        }}
+        loading={false}
+        error={null}
+        canSave
+        onSave={onSave}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('Execution placement policy'), {
+      target: { value: 'local_only' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Resource Envelope' }));
+
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      execution_placement_policy: 'local_only',
+    }));
+    expect(onSave.mock.calls[0][0]).not.toHaveProperty('require_local_runner');
+  });
+
+  it('marks and explicitly migrates the legacy compute-experiment-only policy', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={{
+          project_id: 'project-1',
+          max_concurrent_vms: 4,
+          spend_ceiling_usd: 50,
+          spend_window_days: 14,
+          require_local_runner: true,
+          legacy_require_local_runner_active: true,
+          execution_placement_policy: 'managed_allowed',
+          execution_placement_policy_is_explicit: false,
+          active_vm_count: 0,
+          recent_spend_usd: 0,
+          recent_spend_compute_usd: 0,
+          recent_spend_agent_vm_usd: 0,
+          recent_spend_idle_usd: 0,
+          is_throttled: false,
+        }}
+        loading={false}
+        error={null}
+        canSave
+        onSave={onSave}
+      />,
+    );
+
+    expect(screen.getByText(/Legacy policy active/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Execution placement policy')).toHaveValue('legacy_compute_only');
+
+    fireEvent.change(screen.getByLabelText('Execution placement policy'), {
+      target: { value: 'local_preferred' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Resource Envelope' }));
+
+    expect(screen.getByText('Allow managed execution fallback?')).toBeInTheDocument();
+    expect(onSave).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      execution_placement_policy: 'local_preferred',
+      require_local_runner: null,
+    })));
+  });
+
+  it('requires confirmation before broadening an explicit local-only policy', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ProjectResourceEnvelopeSection
+        githubOwner="myorg"
+        githubRepo="myrepo"
+        data={{
+          project_id: 'project-1',
+          max_concurrent_vms: 4,
+          spend_ceiling_usd: 50,
+          spend_window_days: 14,
+          execution_placement_policy: 'local_only',
+          execution_placement_policy_is_explicit: true,
+          active_vm_count: 0,
+          recent_spend_usd: 0,
+          recent_spend_compute_usd: 0,
+          recent_spend_agent_vm_usd: 0,
+          recent_spend_idle_usd: 0,
+          is_throttled: false,
+        }}
+        loading={false}
+        error={null}
+        canSave
+        onSave={onSave}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('Execution placement policy'), {
+      target: { value: 'managed_allowed' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Resource Envelope' }));
+
+    expect(screen.getByText('Allow managed execution fallback?')).toBeInTheDocument();
+    expect(onSave).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
+    expect(onSave).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Resource Envelope' }));
+    fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      execution_placement_policy: 'managed_allowed',
+    })));
   });
 });

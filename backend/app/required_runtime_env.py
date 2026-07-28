@@ -22,13 +22,18 @@ from app.field_encryption import ENCRYPTION_KEY_ENV
 
 # Recognised scopes. ``always`` requirements are enforced in every runtime;
 # ``cloud_run`` requirements are enforced only when the process is running on
-# Cloud Run (signalled by the platform-injected ``K_REVISION`` env var).
-VALID_SCOPES = frozenset({"always", "cloud_run"})
+# Cloud Run (signalled by the platform-injected ``K_REVISION`` env var), while
+# ``local_production`` is an explicit operator-selected scope for a local
+# control plane. Do not infer local production from host names or a missing
+# Cloud Run marker: that would turn development/test processes into deployments.
+VALID_SCOPES = frozenset({"always", "cloud_run", "local_production"})
 
 # Cloud Run injects this variable into every revision; it is the canonical
 # "am I serving in production on Cloud Run" signal, mirrored from
 # ``app.main._verify_encryption_config``.
 CLOUD_RUN_SIGNAL_ENV = "K_REVISION"
+LOCAL_DEPLOYMENT_MODE_ENV = "BLUEPRINT_DEPLOYMENT_MODE"
+LOCAL_PRODUCTION_DEPLOYMENT_MODE = "local-production"
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,15 @@ REQUIRED_RUNTIME_ENV: list[EnvRequirement] = [
             "credentials in plaintext."
         ),
     ),
+    EnvRequirement(
+        name=ENCRYPTION_KEY_ENV,
+        scope="local_production",
+        reason=(
+            "A local production control plane handles the same credentials as "
+            "Cloud Run and requires a Fernet key; plaintext credentials are "
+            "never permitted in this deployment mode."
+        ),
+    ),
 ]
 
 def active_scopes() -> frozenset[str]:
@@ -70,6 +84,11 @@ def active_scopes() -> frozenset[str]:
     scopes = {"always"}
     if bool(os.getenv(CLOUD_RUN_SIGNAL_ENV)):
         scopes.add("cloud_run")
+    if (
+        os.getenv(LOCAL_DEPLOYMENT_MODE_ENV, "").strip().lower()
+        == LOCAL_PRODUCTION_DEPLOYMENT_MODE
+    ):
+        scopes.add("local_production")
     return frozenset(scopes)
 
 

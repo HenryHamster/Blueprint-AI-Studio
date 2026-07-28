@@ -877,6 +877,7 @@ async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
     async def fake_provision(
         vm_id,
         *,
+        task_id,
         startup_script,
         machine_type,
         provisioning_model,
@@ -886,6 +887,7 @@ async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
         provision_calls.append(
             {
                 "vm_id": vm_id,
+                "task_id": task_id,
                 "startup_script": startup_script,
                 "machine_type": machine_type,
                 "provisioning_model": provisioning_model,
@@ -909,6 +911,7 @@ async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
     assert signed_url_calls[0]["job_id"] == job_id
     assert signed_url_calls[0]["expires_at"] is not None
     assert len(provision_calls) == 1
+    assert provision_calls[0]["task_id"] is None
     startup_script = provision_calls[0]["startup_script"]
     assert "trap upload_artifacts EXIT HUP INT TERM QUIT" in startup_script
     assert "BLUEPRINT_COMPUTE_COMMAND_LOG=" in startup_script

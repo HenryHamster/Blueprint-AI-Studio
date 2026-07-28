@@ -7,8 +7,30 @@ import tarfile
 
 import pytest
 
+from app.managed_compute import ManagedComputeDisabled
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def test_managed_compute_disabled_blocks_cloud_build_submission_before_upload(
+    monkeypatch,
+):
+    """The global execution boundary includes separately-billed Cloud Build."""
+    from app import compute_image_remote_build as remote
+    from app.runtime_config_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "managed_compute_enabled", False)
+
+    with pytest.raises(ManagedComputeDisabled, match="managed compute is disabled"):
+        remote._submit_cloud_build(
+            source_tarball="unused.tar.gz",
+            full_image_ref="us-docker.pkg.dev/proj/repo/image:tag",
+            dockerfile_rel="Dockerfile",
+            build_args=None,
+            parent=None,
+            tag="tag",
+        )
 
 def _write_repo(tmp_path, dockerfile=b"FROM python:3.11-slim\nRUN pip install numpy\n",
                 deps=None):

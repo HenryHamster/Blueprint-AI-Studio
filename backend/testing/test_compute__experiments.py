@@ -1226,13 +1226,19 @@ async def _make_require_local_runner_task(
     *,
     require_local_runner: bool,
     runner_target_id: str | None = None,
+    execution_placement_policy: str | None = None,
 ):
     """Project (optionally carrying the require_local_runner policy) plus a
     compute_experiment task, optionally runner-pinned via context. Mirrors
     _make_compute_task but lets each case toggle the policy and the pin."""
     build_config: dict = {}
+    envelope: dict = {}
     if require_local_runner:
-        build_config["resource_envelope"] = {"require_local_runner": True}
+        envelope["require_local_runner"] = True
+    if execution_placement_policy is not None:
+        envelope["execution_placement_policy"] = execution_placement_policy
+    if envelope:
+        build_config["resource_envelope"] = envelope
     project = Project(
         name="Require Local Runner",
         user_id="test-user",
@@ -1281,6 +1287,33 @@ class TestCreateComputeJobRequireLocalRunner:
                 deadline_seconds=300,
             )
         assert excinfo.value.detail.get("error") == "local_runner_required"
+
+    @pytest.mark.asyncio
+    async def test_local_only_rejects_managed_backend_for_any_task_type(
+        self, db_session, monkeypatch
+    ):
+        """The lower-level launch API cannot bypass task-wide local_only."""
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+        _project, task = await _make_require_local_runner_task(
+            db_session,
+            require_local_runner=False,
+            execution_placement_policy="local_only",
+        )
+        task.payloads = [{"type": "create"}]
+        db_session.add(task)
+        await db_session.commit()
+
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as excinfo:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="python train.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+            )
+        assert excinfo.value.detail.get("error") == "execution_placement_local_only"
 
     @pytest.mark.asyncio
     async def test_runner_pinned_compute_experiment_allowed_when_policy_set(

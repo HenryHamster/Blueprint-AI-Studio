@@ -1634,6 +1634,25 @@ export interface EvergreenFillSettings {
   evergreen_fill_deferred_memo_enrollment: boolean;
 }
 
+/** Fleet-wide hard boundary for billable managed execution launches. */
+export interface ManagedComputeSettings {
+  managed_compute_enabled: boolean;
+}
+
+export async function patchManagedComputeSettings(
+  patch: ManagedComputeSettings,
+): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update managed compute setting: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update managed compute setting: ${res.status}`);
+  }
+}
+
 export async function fetchEvergreenFillObservability(
   signal?: AbortSignal,
 ): Promise<EvergreenFillObservabilityResponse> {

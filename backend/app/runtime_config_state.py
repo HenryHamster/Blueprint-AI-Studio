@@ -45,6 +45,13 @@ def resolve_capability_proof_gate_mode_default(default: str = "observe") -> str:
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "8")),
+    # Fleet-wide hard spending boundary for NEW managed execution only.  This
+    # deliberately does not stop the Cloud Run web service/control plane; launch
+    # primitives enforce it for GCE agent VMs, Cloud Run Jobs, and direct GCP
+    # compute jobs.  Default true preserves existing deployments until an
+    # operator explicitly switches to local-only execution.
+    "managed_compute_enabled": os.getenv("MANAGED_COMPUTE_ENABLED", "true").lower()
+    in ("1", "true", "yes"),
     # Per-task-type slot reservations for priority inversion prevention.
     # When the queue contains both reserved-type and non-reserved-type tasks
     # competing for the last slots, at least N slots are held for the listed
@@ -2423,6 +2430,13 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_pool_enabled",
                         bool(config_json["warm_pool_enabled"]),
                     )
+                if "managed_compute_enabled" in config_json:
+                    # This is a safety boundary, so only a real JSON boolean is
+                    # accepted.  A malformed/string value must not silently flip
+                    # the fleet's execution policy during config rehydration.
+                    raw_managed_compute = config_json["managed_compute_enabled"]
+                    if isinstance(raw_managed_compute, bool):
+                        _set("managed_compute_enabled", raw_managed_compute)
                 if "cloud_run_task_type_allowlist" in config_json:
                     # Persisted Cloud Run task-type allowlist. Normalize to a
                     # sorted list of strings — mirroring the admin PATCH surface —

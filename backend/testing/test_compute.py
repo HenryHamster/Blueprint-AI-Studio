@@ -30,6 +30,10 @@ from app import compute_backends as compute_backends_module
 from app import compute_jobs
 from app import provision_error_scope
 from app import storage
+from app.managed_compute import (
+    ManagedComputeDisabled,
+    is_managed_compute_enabled_authoritative,
+)
 from app.compute_backends import (
     ComputeCostResult,
     GcpComputeBackend,
@@ -56,6 +60,7 @@ from app.models import (
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
+    DeploymentState,
     KnowledgeDocument,
     LocalRunner,
     Project,
@@ -68,6 +73,158 @@ from app.models import (
     WakeAction,
     WakeDeliveryState,
 )
+
+
+@pytest.mark.asyncio
+async def test_managed_compute_disabled_blocks_gce_agent_before_primitive(monkeypatch):
+    """The public agent entrypoint must not reach the GCE primitive when off."""
+    from app.runtime_config_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "managed_compute_enabled", False)
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    image_check = MagicMock()
+    provision = AsyncMock()
+    monkeypatch.setattr(compute, "_ensure_image_family_valid", image_check)
+    monkeypatch.setattr(compute, "_provision_gcp", provision)
+
+    with pytest.raises(ManagedComputeDisabled, match="managed compute is disabled"):
+        await compute.provision_agent_vm(
+            "agent-vm-managed-gate",
+            uuid.uuid4(),
+            task_type="research",
+        )
+
+    image_check.assert_called_once()
+    provision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_managed_compute_disabled_blocks_gcp_backend_before_vm_primitive(
+    monkeypatch,
+):
+    """Direct ComputeJob GCP backend callers cannot bypass the cost boundary."""
+    from app.runtime_config_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "managed_compute_enabled", False)
+    provision = AsyncMock()
+    monkeypatch.setattr(compute, "provision_ephemeral_vm", provision)
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo blocked",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+
+    with pytest.raises(ManagedComputeDisabled, match="managed compute is disabled"):
+        await GcpComputeBackend().launch(spec)
+
+    provision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_managed_compute_gate_overrides_stale_process_cache(
+    db_session, monkeypatch
+):
+    """A second Cloud Run instance's stale cache cannot defeat a DB disable."""
+    from app.runtime_config_state import runtime_config
+
+    state = await db_session.get(DeploymentState, 1)
+    if state is None:
+        state = DeploymentState(id=1)
+        db_session.add(state)
+    state.runtime_config_json = {"managed_compute_enabled": False}
+    db_session.add(state)
+    await db_session.commit()
+    monkeypatch.setitem(runtime_config, "managed_compute_enabled", True)
+
+    assert await is_managed_compute_enabled_authoritative(db_session) is False
+
+
+@pytest.mark.asyncio
+async def test_project_placement_fence_fails_closed_when_production_db_read_fails(
+    monkeypatch,
+):
+    """An unreadable project policy cannot permit a paid provisioning path."""
+    from app import database
+    from app.orchestrator_provision import _project_placement_fence
+
+    class _BrokenSession:
+        async def __aenter__(self):
+            raise RuntimeError("database unavailable")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _BrokenFactory:
+        def __call__(self):
+            return _BrokenSession()
+
+    monkeypatch.setattr(database, "DATABASE_URL", "postgresql+asyncpg://db/blueprint")
+
+    assert await _project_placement_fence(_BrokenFactory(), uuid.uuid4()) == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_project_placement_fence_preserves_sqlite_test_behavior_on_read_failure(
+    monkeypatch,
+):
+    from app import database
+    from app.orchestrator_provision import _project_placement_fence
+
+    class _BrokenSession:
+        async def __aenter__(self):
+            raise RuntimeError("fixture database unavailable")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _BrokenFactory:
+        def __call__(self):
+            return _BrokenSession()
+
+    monkeypatch.setattr(database, "DATABASE_URL", "sqlite+aiosqlite://")
+
+    assert await _project_placement_fence(_BrokenFactory(), uuid.uuid4()) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_local_only_policy_returns_reserved_gcp_compute_job_to_queued(
+    db_session,
+):
+    """A policy change after STARTING must still prevent the paid launch."""
+    project = Project(
+        name="Compute placement race",
+        user_id="test-user",
+        build_config={
+            "resource_envelope": {"execution_placement_policy": "local_only"}
+        },
+    )
+    task = Task(project_id=project.id, status=TaskStatus.QUEUED)
+    db_session.add_all([project, task])
+    await db_session.flush()
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="gcp",
+        status=ComputeJobStatus.STARTING,
+        started_at=_utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession
+    )
+    assert await compute_jobs._compute_job_project_is_local_only(session_factory, job)
+    await compute_jobs._hold_compute_job_for_managed_compute(
+        session_factory, job.id, now=_utcnow(), local_only=True
+    )
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.QUEUED
+    assert job.started_at is None
+    assert (job.polling_metadata or {})["execution_placement_wait"]["policy"] == "local_only"
 
 
 def _make_job_with_command_log(text: str, truncated: bool = False) -> ComputeJob:

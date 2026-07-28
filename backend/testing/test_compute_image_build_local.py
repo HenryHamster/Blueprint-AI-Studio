@@ -6199,12 +6199,14 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
         download_calls.append(jid)
         return "https://storage.example.com/predecessor-bundle"
 
-    provision_calls: list = []
+    provision_calls: list[str] = []
+    provision_task_ids: list[object] = []
 
     async def fake_provision(
-        vm_id, *, startup_script, machine_type, provisioning_model,
+        vm_id, *, task_id, startup_script, machine_type, provisioning_model,
         accelerator=None, accelerator_count=1,
     ):
+        provision_task_ids.append(task_id)
         provision_calls.append(startup_script)
         return True
 
@@ -6221,6 +6223,7 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
     await backend.launch(spec)
 
     assert download_calls == [str(predecessor_id)]
+    assert provision_task_ids == [None]
     script = provision_calls[0]
     # Downloads the predecessor bundle and extracts it into the staging dir first,
     # then moves it into the artifact dir (so partial extracts never corrupt it).

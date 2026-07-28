@@ -50,6 +50,22 @@ Optional environment variables:
     BLUEPRINT_RUNNER_MAX_GPU_UTIL_PCT Host-load guard: stop claiming new compute jobs when
                                       max GPU utilization meets or exceeds this percentage
                                       (int 0–100, default: 0 = disabled)
+    BLUEPRINT_RUNNER_RESOURCE_ADMISSION Enable host-wide CPU/RAM/disk admission across
+                                      both agent and compute pools (default: 1). Set 0 only
+                                      for compatibility troubleshooting.
+    BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES / _MEMORY_RESERVATION_BYTES
+                                      Per-agent reservation before claiming work (defaults:
+                                      1 core, 2 GiB).
+    BLUEPRINT_RUNNER_COMPUTE_CPU_RESERVATION_CORES / _MEMORY_RESERVATION_BYTES
+                                      Per-compute-job reservation (defaults: 2 cores, 4 GiB).
+    BLUEPRINT_RUNNER_RESERVED_CPU_CORES / _RESERVED_MEMORY_BYTES
+                                      Capacity held back for the host/control plane (defaults:
+                                      1 core, 1 GiB; CPU default is 0 on a one-vCPU host).
+    BLUEPRINT_RUNNER_MIN_FREE_MEMORY_BYTES
+                                      Required observed available RAM after a reservation
+                                      (default: 1 GiB).
+    BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES / _COMPUTE_DISK_RESERVATION_BYTES
+                                      Per-workload workspace-disk reservation (default: 0).
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
     BLUEPRINT_RUNNER_GPU_PROBE_IMAGE  Image used to prove container GPU passthrough.
@@ -127,6 +143,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import runner_isolation as iso
@@ -1405,6 +1422,237 @@ def _memory_free_bytes() -> int | None:
             return fallback
     except (OSError, ValueError, FileNotFoundError, IndexError):
         return None
+
+
+def _memory_total_bytes() -> int | None:
+    """Total host RAM in bytes, or ``None`` when the host cannot report it."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, FileNotFoundError, IndexError):
+        pass
+    return None
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    """Parse a conventional boolean env var without making startup fragile."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+@dataclass(frozen=True)
+class _ResourceRequest:
+    cpu_cores: float
+    memory_bytes: int
+    disk_bytes: int
+
+
+class _ResourceLedger:
+    """Single-daemon resource admission ledger shared by agent and compute pools.
+
+    The existing per-pool semaphores remain useful policy ceilings, but cannot
+    protect a host from ``agents + compute`` together exceeding its CPU or RAM.
+    This ledger reserves a conservative, operator-configurable amount before the
+    claim RPC. Reservations are keyed and released only when the corresponding
+    task/job leaves the runner, so the two poll loops cannot race into admitting
+    the same host capacity.
+    """
+
+    _GIB = 1024 * 1024 * 1024
+
+    def __init__(
+        self,
+        workspace_root: str | None,
+        *,
+        enabled: bool | None = None,
+        agent: _ResourceRequest | None = None,
+        compute: _ResourceRequest | None = None,
+        reserved_cpu_cores: float | None = None,
+        reserved_memory_bytes: int | None = None,
+        min_free_memory_bytes: int | None = None,
+    ) -> None:
+        self.workspace_root = workspace_root
+        self.enabled = (
+            _env_enabled("BLUEPRINT_RUNNER_RESOURCE_ADMISSION", True)
+            if enabled is None else enabled
+        )
+        self.agent = agent or _ResourceRequest(
+            cpu_cores=_env_float("BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES", 1.0, minimum=0.0),
+            memory_bytes=_env_int("BLUEPRINT_RUNNER_AGENT_MEMORY_RESERVATION_BYTES", 2 * self._GIB, minimum=0),
+            disk_bytes=_env_int("BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES", 0, minimum=0),
+        )
+        self.compute = compute or _ResourceRequest(
+            cpu_cores=_env_float("BLUEPRINT_RUNNER_COMPUTE_CPU_RESERVATION_CORES", 2.0, minimum=0.0),
+            memory_bytes=_env_int("BLUEPRINT_RUNNER_COMPUTE_MEMORY_RESERVATION_BYTES", 4 * self._GIB, minimum=0),
+            disk_bytes=_env_int("BLUEPRINT_RUNNER_COMPUTE_DISK_RESERVATION_BYTES", 0, minimum=0),
+        )
+        # A one-vCPU host used to be a supported runner configuration.  Retain
+        # that compatibility by not consuming its only core with the *default*
+        # control-plane reserve.  An operator who explicitly sets the variable
+        # still gets the exact requested fail-closed reservation.
+        default_reserved_cpu = 0.0 if os.cpu_count() == 1 else 1.0
+        self.reserved_cpu_cores = (
+            _env_float("BLUEPRINT_RUNNER_RESERVED_CPU_CORES", default_reserved_cpu, minimum=0.0)
+            if reserved_cpu_cores is None else max(0.0, reserved_cpu_cores)
+        )
+        self.reserved_memory_bytes = (
+            _env_int("BLUEPRINT_RUNNER_RESERVED_MEMORY_BYTES", self._GIB, minimum=0)
+            if reserved_memory_bytes is None else max(0, reserved_memory_bytes)
+        )
+        self.min_free_memory_bytes = (
+            _env_int("BLUEPRINT_RUNNER_MIN_FREE_MEMORY_BYTES", self._GIB, minimum=0)
+            if min_free_memory_bytes is None else max(0, min_free_memory_bytes)
+        )
+        self._lock = threading.Lock()
+        self._reservations: dict[str, _ResourceRequest] = {}
+
+    def request_for(self, workload: str) -> _ResourceRequest:
+        return self.compute if workload == "compute" else self.agent
+
+    def _reason_locked(self, request: _ResourceRequest) -> str | None:
+        if not self.enabled:
+            return None
+        reserved_cpu = sum(item.cpu_cores for item in self._reservations.values())
+        total_cpu = os.cpu_count()
+        if (
+            total_cpu is not None
+            and reserved_cpu + request.cpu_cores + self.reserved_cpu_cores > total_cpu
+        ):
+            return "cpu_reservation"
+
+        reserved_memory = sum(item.memory_bytes for item in self._reservations.values())
+        total_memory = _memory_total_bytes()
+        if (
+            total_memory is not None
+            and reserved_memory + request.memory_bytes + self.reserved_memory_bytes > total_memory
+        ):
+            return "memory_reservation"
+        free_memory = _memory_free_bytes()
+        if (
+            free_memory is not None
+            and free_memory < self.min_free_memory_bytes + reserved_memory + request.memory_bytes
+        ):
+            return "memory_pressure"
+
+        reserved_disk = sum(item.disk_bytes for item in self._reservations.values())
+        min_disk = _min_free_disk_bytes()
+        free_disk = _disk_free_bytes(self.workspace_root)
+        if (
+            free_disk is not None
+            and free_disk < min_disk + reserved_disk + request.disk_bytes
+        ):
+            return "disk_pressure"
+        return None
+
+    def try_reserve(self, key: str, workload: str) -> str | None:
+        """Atomically reserve one workload slot; return a rejection reason or None."""
+        request = self.request_for(workload)
+        with self._lock:
+            if key in self._reservations:
+                return None
+            reason = self._reason_locked(request)
+            if reason is not None:
+                return reason
+            self._reservations[key] = request
+            return None
+
+    def rename(self, old_key: str, new_key: str) -> None:
+        """Transfer a pre-claim permit to its durable task/job identity."""
+        with self._lock:
+            request = self._reservations.pop(old_key, None)
+            if request is not None:
+                self._reservations[new_key] = request
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._reservations.pop(key, None)
+
+    def snapshot(self, gpu_state: dict | None = None) -> dict:
+        """Heartbeat-safe capacity report. Physical probes remain best effort."""
+        with self._lock:
+            reserved_cpu = round(sum(item.cpu_cores for item in self._reservations.values()), 3)
+            reserved_memory = sum(item.memory_bytes for item in self._reservations.values())
+            reserved_disk = sum(item.disk_bytes for item in self._reservations.values())
+            reservations = len(self._reservations)
+        total_cpu = os.cpu_count()
+        total_memory = _memory_total_bytes()
+        free_memory = _memory_free_bytes()
+        total_disk = free_disk = None
+        if self.workspace_root:
+            try:
+                usage = shutil.disk_usage(self.workspace_root)
+                total_disk, free_disk = int(usage.total), int(usage.free)
+            except (OSError, ValueError):
+                pass
+        if gpu_state:
+            with gpu_state["lock"]:
+                gpu_total = len(gpu_state.get("allowed") or [])
+                gpu_reserved = len(gpu_state.get("in_use") or [])
+        else:
+            gpu_total = gpu_reserved = 0
+        return {
+            "enabled": self.enabled,
+            "reservations": reservations,
+            "cpu": {
+                "total_cores": total_cpu,
+                "reserved_cores": reserved_cpu,
+                "host_reserved_cores": self.reserved_cpu_cores,
+                "free_cores": (
+                    max(0.0, round(total_cpu - self.reserved_cpu_cores - reserved_cpu, 3))
+                    if total_cpu is not None else None
+                ),
+            },
+            "memory": {
+                "total_bytes": total_memory,
+                "reserved_bytes": reserved_memory,
+                "host_reserved_bytes": self.reserved_memory_bytes,
+                "observed_free_bytes": free_memory,
+                "free_bytes": _available_memory_capacity_bytes(
+                    total_memory=total_memory,
+                    observed_free_memory=free_memory,
+                    host_reserved_memory=self.reserved_memory_bytes,
+                    workload_reserved_memory=reserved_memory,
+                    min_free_memory=self.min_free_memory_bytes,
+                ),
+                "min_free_bytes": self.min_free_memory_bytes,
+            },
+            "disk": {
+                "total_bytes": total_disk,
+                "reserved_bytes": reserved_disk,
+                "observed_free_bytes": free_disk,
+                "free_bytes": (
+                    max(0, free_disk - _min_free_disk_bytes() - reserved_disk)
+                    if free_disk is not None else None
+                ),
+                "min_free_bytes": _min_free_disk_bytes(),
+            },
+            "gpu": {
+                "total": gpu_total,
+                "reserved": gpu_reserved,
+                "free": max(0, gpu_total - gpu_reserved),
+            },
+        }
+
+
+def _available_memory_capacity_bytes(
+    *,
+    total_memory: int | None,
+    observed_free_memory: int | None,
+    host_reserved_memory: int,
+    workload_reserved_memory: int,
+    min_free_memory: int,
+) -> int | None:
+    """Return the conservative memory admission headroom used by the ledger."""
+    candidates: list[int] = []
+    if total_memory is not None:
+        candidates.append(total_memory - host_reserved_memory - workload_reserved_memory)
+    if observed_free_memory is not None:
+        candidates.append(observed_free_memory - min_free_memory - workload_reserved_memory)
+    return max(0, min(candidates)) if candidates else None
 
 
 class _TelemetryState:
@@ -2711,6 +2959,7 @@ def _reap_loop(
     agent_max_seconds: float | None = None,
     telemetry: "_TelemetryState | None" = None,
     agent_teardown: dict | None = None,
+    resource_ledger: "_ResourceLedger | None" = None,
 ) -> None:
     """Reap finished agents and terminate any that blow past their wall-clock deadline.
 
@@ -2729,6 +2978,12 @@ def _reap_loop(
                 for tid in done:
                     proc = active_tasks[tid]
                     code = proc.returncode
+                    # Release the durable resource permit while this task ID is
+                    # still visible as active.  Otherwise a fresh dispatch of
+                    # the same ID could install a new permit between `del` and
+                    # release, and the old reaper would remove the new permit.
+                    if resource_ledger is not None:
+                        resource_ledger.release(f"agent:{tid}")
                     del active_tasks[tid]
                     if agent_started_at is not None:
                         agent_started_at.pop(tid, None)
@@ -2770,6 +3025,8 @@ def _reap_loop(
                             )
                             overdue.append((tid, proc, backend, cname))
                     for tid, _proc, _b, _c in overdue:
+                        if resource_ledger is not None:
+                            resource_ledger.release(f"agent:{tid}")
                         del active_tasks[tid]
                         agent_started_at.pop(tid, None)
                         if agent_teardown is not None:
@@ -3353,6 +3610,8 @@ def _heartbeat_loop(
     agent_image: str | None = None,
     live_config: "_LiveRunnerConfig | None" = None,
     project_verification: dict | None = None,
+    resource_ledger: "_ResourceLedger | None" = None,
+    gpu_state: dict | None = None,
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     has_gpu = bool(gpu_capabilities.get("has_gpu"))
@@ -3625,6 +3884,13 @@ def _heartbeat_loop(
                 "image_cache_by_project": image_cache,
                 "cpu_load_avg": _cpu_load_avg(),
                 "memory_free_bytes": _memory_free_bytes(),
+                # New, additive field. Older orchestrators ignore it; newer fleet
+                # surfaces can use it to explain why a high-concurrency runner is
+                # temporarily declining work rather than looking mysteriously idle.
+                "resource_capacity": (
+                    resource_ledger.snapshot(gpu_state)
+                    if resource_ledger is not None else None
+                ),
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
                 # Free-VRAM list (read by dispatch VRAM-fit gating) derived from
                 # the superset (total, free) probe — no second nvidia-smi call.
@@ -5520,6 +5786,7 @@ def _run_compute_job(
     capabilities: "iso.Capabilities | None" = None,
     gpu_state: dict | None = None,
     telemetry: "_TelemetryState | None" = None,
+    resource_ledger: "_ResourceLedger | None" = None,
 ) -> None:
     """Worker thread: execute a claimed compute job INSIDE an isolation boundary.
 
@@ -6271,6 +6538,11 @@ def _run_compute_job(
                 flush=True,
             )
         _release_gpus(gpu_state, assigned_gpus)
+        # Keep the durable permit and the active set in the same visibility
+        # order. A new claim for this job ID must never be able to rename a new
+        # permit before this completed worker releases its old one.
+        if resource_ledger is not None:
+            resource_ledger.release(f"compute:{job_id}")
         with lock:
             active_jobs.discard(job_id)
         _release_capacity(capacity)
@@ -6321,6 +6593,7 @@ def _compute_poll_loop(
     telemetry: "_TelemetryState | None" = None,
     max_gpu_util_pct: int = 0,
     live_config: "_LiveRunnerConfig | None" = None,
+    resource_ledger: "_ResourceLedger | None" = None,
 ) -> None:
     """Background thread: poll for compute jobs and spawn a worker per claimed job.
 
@@ -6333,6 +6606,10 @@ def _compute_poll_loop(
     last_low_disk_reclaim_at = float("-inf")
 
     while not _shutdown_event.is_set():
+        capacity_acquired = False
+        reservation_key: str | None = None
+        durable_reservation_key: str | None = None
+        claimed_job_id: str | None = None
         try:
             if _update_in_progress.is_set():
                 time.sleep(poll_interval)
@@ -6356,6 +6633,7 @@ def _compute_poll_loop(
             if not _try_acquire_capacity(capacity):
                 time.sleep(poll_interval)
                 continue
+            capacity_acquired = True
 
             # Keep workspace pressure and container-image pressure separate. An
             # imageless/bwrap job only needs workspace scratch, while a Docker
@@ -6420,6 +6698,7 @@ def _compute_poll_loop(
                         )
             if _disk_below_min(workspace_root, min_free_disk_bytes):
                 _release_capacity(capacity)
+                capacity_acquired = False
                 print(
                     f"[compute] low disk on workspace {workspace_root} "
                     f"(< {min_free_disk_bytes} bytes free) — skipping compute claim.",
@@ -6433,9 +6712,24 @@ def _compute_poll_loop(
                 util = _gpu_utilization_pct()
                 if util is not None and util >= max_gpu_util_pct:
                     _release_capacity(capacity)
+                    capacity_acquired = False
                     print(
                         f"[compute] gpu_utilization_pct {util} >= threshold {max_gpu_util_pct}"
                         " — skipping compute claim",
+                        flush=True,
+                    )
+                    time.sleep(poll_interval)
+                    continue
+
+            reservation_key = f"compute:claim:{secrets.token_hex(8)}"
+            if resource_ledger is not None:
+                rejection = resource_ledger.try_reserve(reservation_key, "compute")
+                if rejection is not None:
+                    _release_capacity(capacity)
+                    capacity_acquired = False
+                    print(
+                        f"[compute] resource admission rejected ({rejection}) — "
+                        "skipping compute claim",
                         flush=True,
                     )
                     time.sleep(poll_interval)
@@ -6449,22 +6743,33 @@ def _compute_poll_loop(
                     status, body = resp
                     retry_after = None
             except Exception as exc:
+                if resource_ledger is not None:
+                    resource_ledger.release(reservation_key)
+                reservation_key = None
                 _release_capacity(capacity)
+                capacity_acquired = False
                 print(f"[compute] poll error: {exc}", flush=True)
                 time.sleep(5)
                 continue
 
             if status == 429:
+                if resource_ledger is not None:
+                    resource_ledger.release(reservation_key)
+                reservation_key = None
                 # Rate limited: honor the server's Retry-After instead of a fixed
                 # sleep so we back off exactly as long as asked (and no longer).
                 wait = retry_after if retry_after is not None else min(poll_interval * 2, 30.0)
                 wait = max(0.0, min(wait, 300.0))
                 print(f"[compute] poll 429 — backing off {wait:.1f}s (Retry-After)", flush=True)
                 _release_capacity(capacity)
+                capacity_acquired = False
                 time.sleep(wait)
                 continue
 
             if status == 401:
+                if resource_ledger is not None:
+                    resource_ledger.release(reservation_key)
+                reservation_key = None
                 # A 401 is NOT fatal: the token is still valid, but the runner row may
                 # have been deactivated after a missed heartbeat (slept/network-dropped
                 # laptop).  The background heartbeat re-arms the row (status->active),
@@ -6475,18 +6780,27 @@ def _compute_poll_loop(
                     flush=True,
                 )
                 _release_capacity(capacity)
+                capacity_acquired = False
                 poll_interval = min(poll_interval * 2, 30.0)
                 time.sleep(poll_interval)
                 continue
 
             if status == 204 or body is None:
+                if resource_ledger is not None:
+                    resource_ledger.release(reservation_key)
+                reservation_key = None
                 _release_capacity(capacity)
+                capacity_acquired = False
                 poll_interval = min(poll_interval * 2, 30.0)
                 time.sleep(poll_interval)
                 continue
 
             if status != 200:
+                if resource_ledger is not None:
+                    resource_ledger.release(reservation_key)
+                reservation_key = None
                 _release_capacity(capacity)
+                capacity_acquired = False
                 print(f"[compute] poll warning: HTTP {status}", flush=True)
                 time.sleep(5)
                 continue
@@ -6497,10 +6811,19 @@ def _compute_poll_loop(
             with lock:
                 if job_id in active_jobs:
                     print(f"[compute] skipping duplicate job {job_id}", flush=True)
+                    if resource_ledger is not None:
+                        resource_ledger.release(reservation_key)
+                    reservation_key = None
                     _release_capacity(capacity)
+                    capacity_acquired = False
                     time.sleep(poll_interval)
                     continue
                 active_jobs.add(job_id)
+            claimed_job_id = job_id
+            if resource_ledger is not None:
+                resource_ledger.rename(reservation_key, f"compute:{job_id}")
+                durable_reservation_key = f"compute:{job_id}"
+            reservation_key = None
 
             print(f"[compute] claimed job {job_id}", flush=True)
             try:
@@ -6511,14 +6834,20 @@ def _compute_poll_loop(
                         "capabilities": capabilities,
                         "gpu_state": gpu_state,
                         "telemetry": telemetry,
+                        "resource_ledger": resource_ledger,
                     },
                     daemon=True,
                 )
                 worker.start()
             except Exception as exc:
+                # Do this before exposing the ID as inactive: a replacement
+                # claim must not be released by this failed-start cleanup.
+                if resource_ledger is not None:
+                    resource_ledger.release(f"compute:{job_id}")
                 with lock:
                     active_jobs.discard(job_id)
                 _release_capacity(capacity)
+                capacity_acquired = False
                 print(f"[compute] failed to start worker for job {job_id}: {exc}", flush=True)
                 try:
                     _report_compute_job(
@@ -6531,7 +6860,21 @@ def _compute_poll_loop(
                     )
                 except Exception:
                     pass
+            else:
+                # The worker now owns both the semaphore and durable permit.
+                capacity_acquired = False
+                durable_reservation_key = None
+                claimed_job_id = None
         except Exception as exc:  # noqa: BLE001 — keep the poll thread alive
+            if reservation_key is not None and resource_ledger is not None:
+                resource_ledger.release(reservation_key)
+            if durable_reservation_key is not None and resource_ledger is not None:
+                resource_ledger.release(durable_reservation_key)
+            if claimed_job_id is not None:
+                with lock:
+                    active_jobs.discard(claimed_job_id)
+            if capacity_acquired:
+                _release_capacity(capacity)
             print(f"[compute] poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
 
@@ -6858,6 +7201,7 @@ def _preflight(
     max_concurrent_compute: int,
     agent_image: str | None = None,
     project_verification: dict | None = None,
+    resource_ledger: "_ResourceLedger | None" = None,
 ) -> dict:
     """Print the aligned preflight block; return a dict of the decisions.
 
@@ -6978,8 +7322,16 @@ def _preflight(
     _fmt(
         "concurrency",
         f"agents={max_concurrent}  compute={max_concurrent_compute}  "
-        f"(separate pools; up to {max_concurrent + max_concurrent_compute} tasks total)",
+        "(separate policy pools; shared resource admission prevents host overcommit)",
     )
+    if resource_ledger is not None:
+        capacity = resource_ledger.snapshot(gpu_state)
+        _fmt(
+            "resource admission",
+            f"{'enabled' if capacity['enabled'] else 'DISABLED'}  "
+            f"cpu={capacity['cpu']['free_cores']}/{capacity['cpu']['total_cores']} free cores  "
+            f"ram={capacity['memory']['free_bytes']}/{capacity['memory']['total_bytes']} free bytes",
+        )
 
     print("  isolation boundaries:", flush=True)
     bwrap_state = "not installed"
@@ -7638,6 +7990,7 @@ def main() -> None:
         )
 
     gpu_state = _make_gpu_state(caps)
+    resource_ledger = _ResourceLedger(_workspace_root())
 
     # Best-effort startup sweep of any stray tagged containers from a prior crash.
     iso.sweep_stale_containers(caps)
@@ -7645,7 +7998,7 @@ def main() -> None:
     result = _preflight(
         orchestrator_url, token, agent_binary, caps, gpu_state,
         max_concurrent, max_concurrent_compute, agent_image,
-        project_verification,
+        project_verification, resource_ledger,
     )
     claimable = result["claimable"]
     gpu_capabilities = result["gpu_caps"]
@@ -7749,6 +8102,7 @@ def main() -> None:
             "agent_max_seconds": agent_max_seconds,
             "telemetry": telemetry,
             "agent_teardown": agent_teardown,
+            "resource_ledger": resource_ledger,
         },
         daemon=True,
     )
@@ -7779,6 +8133,8 @@ def main() -> None:
             # config block and echoes applied-vs-pending back.
             "live_config": live_config,
             "project_verification": project_verification,
+            "resource_ledger": resource_ledger,
+            "gpu_state": gpu_state,
         },
         daemon=True,
     )
@@ -7808,7 +8164,8 @@ def main() -> None:
             kwargs={"base_poll_interval": base_poll_interval, "capabilities": caps,
                     "gpu_state": gpu_state, "telemetry": telemetry,
                     "max_gpu_util_pct": max_gpu_util_pct,
-                    "live_config": live_config},
+                    "live_config": live_config,
+                    "resource_ledger": resource_ledger},
             daemon=True,
         )
         compute_poll.start()
@@ -7827,6 +8184,8 @@ def main() -> None:
     # The whole body is wrapped so a transient error keeps the runner alive; the
     # supervisor check makes an actually-dead background thread fatal.
     while not _shutdown_event.is_set():
+        reservation_key: str | None = None
+        task_reservation_key: str | None = None
         try:
             _supervise_threads(background_threads)
 
@@ -7902,6 +8261,18 @@ def main() -> None:
                     time.sleep(min(pause_rem, poll_interval, 10.0))
                     continue
 
+            reservation_key = f"agent:claim:{secrets.token_hex(8)}"
+            rejection = resource_ledger.try_reserve(reservation_key, "agent")
+            if rejection is not None:
+                _release_capacity(agent_capacity)
+                print(
+                    f"[runner] resource admission rejected ({rejection}) — "
+                    "skipping agent claim",
+                    flush=True,
+                )
+                time.sleep(poll_interval)
+                continue
+
             try:
                 resp = _post(next_task_url, token, {}, return_headers=True)
                 if isinstance(resp, tuple) and len(resp) == 3:
@@ -7910,6 +8281,7 @@ def main() -> None:
                     status, body = resp
                     retry_after = None
             except Exception as exc:
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 print(f"[runner] poll error: {exc}", flush=True)
                 time.sleep(5)
@@ -7919,6 +8291,7 @@ def main() -> None:
                 wait = retry_after if retry_after is not None else min(poll_interval * 2, 30.0)
                 wait = max(0.0, min(wait, 300.0))
                 print(f"[runner] poll 429 — backing off {wait:.1f}s (Retry-After)", flush=True)
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 time.sleep(wait)
                 continue
@@ -7929,6 +8302,7 @@ def main() -> None:
                     "(row may be reactivating via heartbeat).",
                     flush=True,
                 )
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 poll_interval = min(poll_interval * 2, 30.0)
                 time.sleep(poll_interval)
@@ -7938,6 +8312,7 @@ def main() -> None:
             # not on a body key, so a new orchestrator reason shape can never make
             # this branch miss and leak the capacity permit acquired above.
             if status == 503 and isinstance(body, dict):
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 reason = body.get("reason") or "no reason reported by orchestrator"
                 if body.get("credential_resolution_failed"):
@@ -7965,12 +8340,14 @@ def main() -> None:
                 continue
 
             if status == 204 or body is None:
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 poll_interval = min(poll_interval * 2, 30.0)
                 time.sleep(poll_interval)
                 continue
 
             if status != 200:
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 print(f"[runner] poll warning: HTTP {status}", flush=True)
                 time.sleep(5)
@@ -8022,6 +8399,7 @@ def main() -> None:
                 already_active = task_id in active_tasks
             if already_active:
                 print(f"[runner] skipping duplicate dispatch for task {task_id}", flush=True)
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 time.sleep(poll_interval)
                 continue
@@ -8037,6 +8415,7 @@ def main() -> None:
                 workspace = _agent_workspace_for_task(task_id)
             except Exception as exc:
                 print(f"[runner] failed to prepare workspace for task {task_id}: {exc}", flush=True)
+                resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
                 # Decline explicitly: without this the task stays pinned in
                 # PROVISIONING until this runner goes offline, even though we
@@ -8049,6 +8428,10 @@ def main() -> None:
                 )
                 time.sleep(poll_interval)
                 continue
+
+            resource_ledger.rename(reservation_key, f"agent:{task_id}")
+            task_reservation_key = f"agent:{task_id}"
+            reservation_key = None
 
             decline_reason: list[str] = []
             spawned = _spawn_agent_task(
@@ -8073,6 +8456,8 @@ def main() -> None:
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
                 # permit must be released here.
+                resource_ledger.release(f"agent:{task_id}")
+                task_reservation_key = None
                 _release_capacity(agent_capacity)
                 # Notify the orchestrator so the task returns to QUEUED instead of
                 # stranding in PROVISIONING until the runner goes offline — WITH the
@@ -8086,6 +8471,10 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
         except Exception as exc:  # noqa: BLE001 — a transient error must not crash the runner
+            if reservation_key is not None:
+                resource_ledger.release(reservation_key)
+            if task_reservation_key is not None:
+                resource_ledger.release(task_reservation_key)
             print(f"[runner] agent poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
 

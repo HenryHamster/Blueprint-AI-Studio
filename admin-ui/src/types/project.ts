@@ -48,7 +48,12 @@ export interface ResourceEnvelopeConfig {
    *  live runner, experiments are held until one comes online (and time out after
    *  a few hours rather than wedging). `false`/undefined means cloud fallback is
    *  allowed (the default). */
-  require_local_runner?: boolean;
+  require_local_runner?: boolean | null;
+  /** Placement for all executable work. `local_only` never falls back to
+   *  managed execution; `local_preferred` uses local capacity first; and
+   *  `managed_allowed` permits either placement. Absent preserves legacy
+   *  behavior, including the narrower `require_local_runner` flag. */
+  execution_placement_policy?: 'local_only' | 'local_preferred' | 'managed_allowed' | null;
   /** When true, exceeding the spend ceiling automatically pauses the project
    *  (project.paused = True) until an operator manually unpauses it. `false`/
    *  undefined means soft-defer tasks but don't pause the project (the default). */
@@ -256,6 +261,12 @@ export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig 
   recent_spend_agent_vm_usd: number;
   recent_spend_idle_usd: number;
   is_throttled: boolean;
+  /** Whether execution_placement_policy was explicitly stored rather than
+   *  resolved to its legacy default. */
+  execution_placement_policy_is_explicit?: boolean;
+  /** True only for the old compute-experiment-only local-runner setting when
+   *  no broad placement policy is active. */
+  legacy_require_local_runner_active?: boolean;
 }
 
 /**

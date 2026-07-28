@@ -1,0 +1,33 @@
+# Blueprint GitHub Actions runner role — trusted internal repositories only.
+# Rendered by scripts/github_actions_runner.py; do not install this template
+# directly. Credentials belong only in the role-scoped EnvironmentFile.
+
+[Unit]
+Description=Blueprint GitHub Actions runner (@ROLE@)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@RUNNER_ROOT@
+Environment=HOME=@STATE_ROOT@
+Environment=RUNNER_ALLOW_RUNASROOT=0
+Environment=BLUEPRINT_GITHUB_ACTIONS_ROLE=@ROLE@
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@RUNNER_ROOT@/run.sh
+Restart=@RESTART@
+RestartSec=5
+TimeoutStopSec=@STOP_TIMEOUT@
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

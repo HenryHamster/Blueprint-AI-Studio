@@ -17,7 +17,7 @@ compute_jobs defense-in-depth rejection that other modules own.
 
 import uuid
 from datetime import timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from sqlmodel import select
@@ -37,7 +37,9 @@ from app.models import (
 )
 from app.orchestrator_runner_dispatch import (
     AWAITING_FORCED_RUNNER_CONTEXT_KEY,
+    EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY,
     FORCED_RUNNER_TARGET_CONTEXT_KEY,
+    _hold_task_for_local_only_placement,
 )
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
@@ -153,6 +155,42 @@ class TestHeldTaskClearsItsStampOnDispatch:
 
 
 class TestFailStaleLocalRunnerHolds:
+    @pytest.mark.asyncio
+    async def test_explicit_local_only_migrates_legacy_hold_without_failing(
+        self, db_session
+    ):
+        """The new task-wide policy is durable backpressure, not a 6h failure.
+
+        This covers an important rollout case: a task may already have an old
+        require_local_runner marker when an operator switches the project to
+        local_only.  The sweeper must migrate that row to the structured wait
+        instead of applying the legacy terminal timeout.
+        """
+        project = await _make_project(db_session)
+        project.build_config = {
+            "resource_envelope": {"execution_placement_policy": "local_only"}
+        }
+        db_session.add(project)
+        await db_session.commit()
+        task = await _make_held_task(
+            db_session,
+            project.id,
+            held_ago_seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600,
+        )
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 0
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        ctx = task.context or {}
+        assert "awaiting_local_runner_since" not in ctx
+        assert ctx[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY] == {
+            "policy": "local_only",
+            "reason": "no_eligible_local_runner",
+            "since": ANY,
+        }
+
     @pytest.mark.asyncio
     async def test_fails_hold_older_than_timeout(self, db_session):
         project = await _make_project(db_session)
@@ -573,6 +611,67 @@ class TestPinClearsStaleHoldStamp:
         assert task.status == TaskStatus.PROVISIONING
         assert task.context.get("runner_target_id") == str(runner.id)
         assert "awaiting_local_runner_since" not in task.context
+
+
+class TestTaskWideLocalOnlyPlacement:
+    @pytest.mark.asyncio
+    async def test_direct_compute_waits_without_managed_fallback(self, db_session):
+        """The direct ComputeJob path honors local_only before it can bill cloud."""
+        project = await _make_project(db_session, require_local_runner=False)
+        project.build_config = {
+            "resource_envelope": {"execution_placement_policy": "local_only"}
+        }
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "command": "echo local",
+                    "spend_cap_usd": 1.0,
+                    "deadline_seconds": 60,
+                }
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([project, task])
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: []}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        ctx = task.context or {}
+        assert ctx[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY]["policy"] == "local_only"
+        assert "awaiting_local_runner_since" not in ctx
+
+    @pytest.mark.asyncio
+    async def test_holds_ordinary_task_without_a_runner(self, db_session):
+        """local_only applies to ordinary work, not just compute experiments."""
+        project = await _make_project(db_session, require_local_runner=False)
+        project.build_config = {
+            "resource_envelope": {"execution_placement_policy": "local_only"}
+        }
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([project, task])
+        await db_session.commit()
+
+        handled = await _hold_task_for_local_only_placement(db_session, task)
+
+        assert handled is True
+        await db_session.refresh(task)
+        ctx = task.context or {}
+        wait = ctx[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY]
+        assert wait["policy"] == "local_only"
+        assert wait["reason"] == "no_eligible_local_runner"
+        assert wait["since"]
+        assert task.status == TaskStatus.QUEUED
+        assert "local_only" in (task.latest_status_message or "")
 
 
 class TestHoldStrategicLocalRunnerTask:

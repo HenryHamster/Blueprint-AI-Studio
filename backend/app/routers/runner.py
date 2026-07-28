@@ -132,6 +132,9 @@ _MAX_IMAGE_CACHE_PROJECTS = 64
 # 1 PiB per bucket — far beyond any real image cache, so an absurd runner-reported
 # integer can never poison the telemetry while every plausible value passes.
 _MAX_IMAGE_CACHE_BYTES = 1 << 50
+_MAX_RESOURCE_CAPACITY_BYTES = 1 << 60
+_MAX_RESOURCE_CAPACITY_CORES = 1_000_000.0
+_MAX_RESOURCE_CAPACITY_COUNT = 1_000_000
 
 
 def _observed_runner_hardware(runner: LocalRunner) -> dict[str, Any]:
@@ -254,6 +257,60 @@ def _sanitize_container_image_reclaim(raw: Any) -> dict | None:
         "kept": _count(raw.get("kept")),
         "in_use_skipped": _count(raw.get("in_use_skipped")),
         "reason": reason,
+    }
+
+
+def _sanitize_resource_capacity(raw: Any) -> dict | None:
+    """Normalize bounded, display-only shared-admission telemetry."""
+    if not isinstance(raw, dict):
+        return None
+
+    def _int(value: Any, limit: int) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return max(0, min(limit, int(value)))
+        except (TypeError, ValueError):
+            return None
+
+    def _float(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return max(0.0, min(_MAX_RESOURCE_CAPACITY_CORES, float(value)))
+        except (TypeError, ValueError):
+            return None
+
+    def _section(name: str, keys: tuple[str, ...], parser) -> dict:
+        source = raw.get(name)
+        source = source if isinstance(source, dict) else {}
+        return {key: parser(source.get(key)) for key in keys}
+
+    enabled = raw.get("enabled")
+    return {
+        "enabled": enabled if isinstance(enabled, bool) else None,
+        "reservations": _int(raw.get("reservations"), _MAX_RESOURCE_CAPACITY_COUNT),
+        "cpu": _section(
+            "cpu", ("total_cores", "reserved_cores", "host_reserved_cores", "free_cores"), _float
+        ),
+        "memory": _section(
+            "memory",
+            (
+                "total_bytes",
+                "reserved_bytes",
+                "host_reserved_bytes",
+                "observed_free_bytes",
+                "free_bytes",
+                "min_free_bytes",
+            ),
+            lambda value: _int(value, _MAX_RESOURCE_CAPACITY_BYTES),
+        ),
+        "disk": _section(
+            "disk",
+            ("total_bytes", "reserved_bytes", "observed_free_bytes", "free_bytes", "min_free_bytes"),
+            lambda value: _int(value, _MAX_RESOURCE_CAPACITY_BYTES),
+        ),
+        "gpu": _section("gpu", ("total", "reserved", "free"), lambda value: _int(value, _MAX_RESOURCE_CAPACITY_COUNT)),
     }
 
 
@@ -706,6 +763,9 @@ class HeartbeatRequest(BaseModel):
     memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
     gpu_free_vram_mib: List[int] | None = None
+    # Shared host admission telemetry. Optional and display-only: older daemons
+    # omit it, while newer daemons report a bounded capacity snapshot.
+    resource_capacity: dict | None = None
     # Per-project docker image-cache accounting (optional; only docker-backed
     # runners report it). Shape:
     #   {"total_bytes": int, "image_count": int,
@@ -1809,6 +1869,9 @@ async def heartbeat(
         caps["gpu_utilization_pct"] = max(0, min(100, int(payload.gpu_utilization_pct)))
     if payload.gpu_free_vram_mib is not None:
         caps["gpu_free_vram_mib"] = [max(0, int(v)) for v in payload.gpu_free_vram_mib]
+    sanitized_resource_capacity = _sanitize_resource_capacity(payload.resource_capacity)
+    if sanitized_resource_capacity is not None:
+        caps["resource_capacity"] = sanitized_resource_capacity
     # Applied-config report. Stored under dedicated caps keys (applied_config /
     # applied_config_generation) so it never clobbers the operator-configured
     # desired subset (max_concurrent, task_types, gpu_indices_allowed) or the
