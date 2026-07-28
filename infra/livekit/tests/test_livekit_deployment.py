@@ -12,8 +12,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class LiveKitDeploymentContractTests(unittest.TestCase):
     def test_images_are_digest_pinned_and_networking_separates_turn_tls(self) -> None:
         compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        caddyfile = (ROOT / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("livekit/livekit-server:v1.9.12@sha256:", compose)
         self.assertIn("caddy:2.10.2@sha256:", compose)
+        self.assertIn("versions 1.1", caddyfile)
+        self.assertNotIn("versions h1", caddyfile)
         self.assertEqual(compose.count("network_mode: host"), 1)
         self.assertIn('"5349:${LIVEKIT_TURN_TLS_PORT:-443}/tcp"', compose)
         self.assertIn('"50000-60000:50000-60000/udp"', compose)
