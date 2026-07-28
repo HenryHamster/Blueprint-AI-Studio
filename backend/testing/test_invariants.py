@@ -12134,6 +12134,7 @@ def _find_vacuous_mocks(
         )
     return findings
 
+@pytest.mark.timeout(90)
 def test_patched_app_symbols_have_production_call_sites():
     """A patched ``app.*`` function that production never calls is an INERT mock.
 
