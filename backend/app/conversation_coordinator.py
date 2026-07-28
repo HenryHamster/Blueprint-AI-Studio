@@ -28,6 +28,20 @@ class ConversationClaim:
     attempt: int
 
 
+def legacy_conversation_claim_incarnation(
+    task_id: uuid.UUID,
+    worker_generation: int,
+) -> uuid.UUID:
+    """Stable rollout identity for pre-incarnation Resident agents."""
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        (
+            "blueprint:resident-conversation-claim:"
+            f"{task_id}:{worker_generation}"
+        ),
+    )
+
+
 def _session_scope(session_id: str) -> object:
     return or_(
         ProjectMessage.resident_session_id == session_id,
@@ -50,6 +64,7 @@ async def claim_operator_messages(
     session_id: str,
     task_id: uuid.UUID,
     worker_generation: int,
+    incarnation_id: uuid.UUID,
     message_ids: list[uuid.UUID],
     lease_seconds: int,
 ) -> ConversationClaim | None:
@@ -98,10 +113,21 @@ async def claim_operator_messages(
     claimed_rows = tuple(
         row for row in ordered if row.conversation_claim_id is not None
     )
+    legacy_incarnation = legacy_conversation_claim_incarnation(
+        task_id,
+        worker_generation,
+    )
     same_owner = bool(claimed_rows) and all(
         row.handling_state == MessageHandlingState.CLAIMED
         and row.handled_by_task_id == task_id
         and row.conversation_claim_generation == worker_generation
+        and (
+            row.conversation_claim_incarnation == incarnation_id
+            or (
+                row.conversation_claim_incarnation is None
+                and incarnation_id == legacy_incarnation
+            )
+        )
         for row in claimed_rows
     )
     lease_live = any(
@@ -125,6 +151,7 @@ async def claim_operator_messages(
         row.handled_by_task_id = task_id
         row.conversation_claim_id = claim_id
         row.conversation_claim_generation = worker_generation
+        row.conversation_claim_incarnation = incarnation_id
         row.conversation_claim_expires_at = expires_at
         row.conversation_claim_attempt = attempt
         row.updated_at = now
@@ -145,6 +172,7 @@ async def renew_conversation_claim(
     claim_id: uuid.UUID,
     task_id: uuid.UUID,
     worker_generation: int,
+    incarnation_id: uuid.UUID,
     lease_seconds: int = 45,
 ) -> bool:
     """Renew only an exact live claim owner; stale generations fail closed."""
@@ -163,10 +191,21 @@ async def renew_conversation_claim(
         .scalars()
         .all()
     )
+    legacy_incarnation = legacy_conversation_claim_incarnation(
+        task_id,
+        worker_generation,
+    )
     if not rows or any(
         row.handling_state != MessageHandlingState.CLAIMED
         or row.handled_by_task_id != task_id
         or row.conversation_claim_generation != worker_generation
+        or (
+            row.conversation_claim_incarnation != incarnation_id
+            and not (
+                row.conversation_claim_incarnation is None
+                and incarnation_id == legacy_incarnation
+            )
+        )
         or row.conversation_claim_expires_at is None
         or row.conversation_claim_expires_at <= now
         for row in rows
@@ -174,6 +213,7 @@ async def renew_conversation_claim(
         return False
     expires_at = now + timedelta(seconds=min(300, max(15, int(lease_seconds))))
     for row in rows:
+        row.conversation_claim_incarnation = incarnation_id
         row.conversation_claim_expires_at = expires_at
         row.updated_at = now
         session.add(row)

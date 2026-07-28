@@ -1146,7 +1146,9 @@ async def test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale(db_s
 
 
 @pytest.mark.asyncio
-async def test_reload_ensure_replaces_worker_stale_past_recovery_threshold(db_session):
+async def test_reload_ensure_replaces_worker_after_task_corroboration_grace(
+    db_session,
+):
     project = await _make_project(db_session)
     old_task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
@@ -1154,12 +1156,16 @@ async def test_reload_ensure_replaces_worker_stale_past_recovery_threshold(db_se
         db_session, project, operator_user_id=TEST_USER_ID
     )
     stale_at = _utcnow() - timedelta(
-        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+        seconds=(
+            resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+            + resident_session_module._RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS
+            + 1
+        )
     )
 
     old_task = await db_session.get(Task, old_task.id)
     old_task.status = TaskStatus.IN_PROGRESS
-    old_task.last_heartbeat = stale_at
+    old_task.last_heartbeat = _utcnow() - timedelta(seconds=8)
     project = await db_session.get(Project, project.id)
     vision = dict(project.vision or {})
     blob = dict(vision[RESIDENT_SESSION_KEY])

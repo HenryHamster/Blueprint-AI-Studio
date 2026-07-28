@@ -168,6 +168,7 @@ import { writeStrategicHelpers } from './strategic-helpers.js';
 import { writeArtifactsHelper } from './artifacts-helper.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
+import { syncResidentRepository } from './resident-repo-freshness.js';
 import type {
   ResidentSessionEvent, ResidentTurnResult,
 } from '../providers/resident-session.js';
@@ -2935,13 +2936,212 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       task_id: 'task-durable-claim',
       session_id: 'durable-session',
       worker_generation: 1,
+      incarnation_id: expect.any(String),
       message_ids: [operatorMessage.id],
     })]);
     expect(replyBodies).toHaveLength(1);
     expect(replyBodies[0]).toMatchObject({
       covered_message_ids: [operatorMessage.id],
       conversation_claim_id: 'claim-durable-1',
+      conversation_claim_incarnation: claimBodies[0].incarnation_id,
     });
+  });
+
+  it('claims after preflight and renews a slow turn independently of idle pacing', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-slow-durable-claim',
+      content: 'take the time needed but retain this exact turn',
+      created_at: '2026-07-21T20:00:00.000Z',
+      from_type: 'user',
+    };
+    const events: string[] = [];
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+    let delivered = false;
+    let replyPersisted = false;
+    vi.mocked(syncResidentRepository).mockImplementationOnce(() => {
+      events.push('repo-preflight');
+      return {
+        status: 'CURRENT',
+        head: '0123456789abcdef0123456789abcdef01234567',
+        previousHead: null,
+        commits: [],
+        changedFiles: [],
+        omittedCommits: 0,
+        omittedChangedFiles: 0,
+        deltaAvailable: false,
+        reason: null,
+      };
+    });
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage], claim_required: true });
+      }
+      if (url.includes('/messages?')) {
+        return Promise.resolve({ messages: [], claim_required: true });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/messages/claim')) {
+        events.push('claim');
+        return Promise.resolve({
+          claim_id: 'claim-slow-1',
+          message_ids: [operatorMessage.id],
+          lease_expires_at: '2026-07-21T20:01:30.000Z',
+          attempt: 1,
+        });
+      }
+      if (url.includes('/heartbeat')) {
+        heartbeatBodies.push(body ?? {});
+        if (replyPersisted && !body?.conversation_claim_id) {
+          return Promise.resolve({ authority_held: false, stop_requested: true });
+        }
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: false,
+          conversation_claim_held: true,
+        });
+      }
+      if (body?.op === 'create_message') {
+        replyPersisted = true;
+        return Promise.resolve({});
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => {
+        events.push('provider-turn');
+        return new Promise<ResidentTurnResult>((resolve) => {
+          setTimeout(() => {
+            resolve(turnResult({
+              sentOperatorMessage: true,
+              resultText: 'slow durable reply',
+            }));
+          }, 35_000);
+        });
+      },
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    try {
+      const handling = handleStrategicResident(
+        'task-slow-durable-claim',
+        {
+          project_name: 'P',
+          open_messages: [],
+          strategic_session_operator_ack_threshold_seconds: 0,
+          strategic_session_idle_tick_seconds: 300,
+          strategic_session_id: 'slow-durable-session',
+          _resident_worker_generation: 1,
+        },
+        { project_metadata: { project_id: 'proj-slow-durable-claim' }, context: {} },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(events.slice(0, 3)).toEqual([
+        'repo-preflight',
+        'claim',
+        'provider-turn',
+      ]);
+      await vi.advanceTimersByTimeAsync(36_000);
+      await handling;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+
+    const claimHeartbeats = heartbeatBodies.filter(
+      body => body.conversation_claim_id === 'claim-slow-1',
+    );
+    expect(claimHeartbeats.length).toBeGreaterThanOrEqual(2);
+    expect(claimHeartbeats.every(
+      body => typeof body.conversation_claim_incarnation === 'string',
+    )).toBe(true);
+    expect(claimHeartbeats.every(
+      body => body.conversation_claim_lease_seconds === 90,
+    )).toBe(true);
+  });
+
+  it('preserves conversation_claim_lost as the terminal replacement cause', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-lost-durable-claim',
+      content: 'do not misclassify a fenced turn',
+      created_at: '2026-07-21T20:00:00.000Z',
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage], claim_required: true });
+      }
+      if (url.includes('/messages?')) {
+        return Promise.resolve({ messages: [], claim_required: true });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-lost-1',
+          message_ids: [operatorMessage.id],
+          lease_expires_at: '2026-07-21T20:01:30.000Z',
+          attempt: 1,
+        });
+      }
+      if (url.includes('/heartbeat') && body?.conversation_claim_id) {
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: false,
+          conversation_claim_held: false,
+        });
+      }
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const session = makeSession(
+      () => new Promise<ResidentTurnResult>((resolve) => {
+        setTimeout(() => {
+          resolve(turnResult({
+            sentOperatorMessage: true,
+            resultText: 'must not be persisted',
+          }));
+        }, 5_000);
+      }),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    try {
+      const handling = handleStrategicResident(
+        'task-lost-durable-claim',
+        {
+          project_name: 'P',
+          open_messages: [],
+          strategic_session_operator_ack_threshold_seconds: 0,
+          strategic_session_id: 'lost-durable-session',
+          _resident_worker_generation: 1,
+        },
+        { project_metadata: { project_id: 'proj-lost-durable-claim' }, context: {} },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+      await vi.advanceTimersByTimeAsync(6_000);
+      await handling;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+
+    expect(session.interrupt).toHaveBeenCalled();
+    expect(mockApiPost.mock.calls.filter(([, body]) =>
+      body?.op === 'create_message')).toHaveLength(0);
+    expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
+      taskId === 'task-lost-durable-claim'
+      && String(payload.logs).includes('conversation_claim_lost')
+    ))).toBe(true);
   });
 
   it('drains 201 same-timestamp operator messages as atomic one-page batches without suppressing deferred rows', async () => {

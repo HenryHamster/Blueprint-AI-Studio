@@ -3802,6 +3802,10 @@ class ProjectMessage(SQLModel, table=True):
         default=None,
         sa_column=Column(Integer, nullable=True),
     )
+    conversation_claim_incarnation: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True),
+    )
     conversation_claim_expires_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),

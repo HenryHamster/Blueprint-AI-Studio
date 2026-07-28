@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import os from 'os';
 import path from 'path';
 import type WebSocket from 'ws';
@@ -105,6 +105,9 @@ const MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES = 2;
 const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
+const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 60_000;
+const CONVERSATION_CLAIM_LEASE_SECONDS = 90;
+const CONVERSATION_CLAIM_RENEW_MS = 15_000;
 export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
 
 export interface ResidentReplyRuntimePaths {
@@ -880,7 +883,9 @@ export async function handleStrategicResident(
   let pendingOperatorAdmission: {
     cursorBefore: string;
     messages: ResidentInboundMessage[];
+    claimRequired: boolean;
   } | null = null;
+  const conversationClaimIncarnation = randomUUID();
   let activeConversationClaimId: string | null = null;
   let activeConversationClaimMessageIds: string[] = [];
   let artifactRetryFailures = 0;
@@ -1480,7 +1485,10 @@ export async function handleStrategicResident(
           covered_message_ids: coveredMessageIds,
           ...(activeConversationClaimId === null
             ? {}
-            : { conversation_claim_id: activeConversationClaimId }),
+            : {
+              conversation_claim_id: activeConversationClaimId,
+              conversation_claim_incarnation: conversationClaimIncarnation,
+            }),
           ...(stagedReply.context === undefined ? {} : { context: stagedReply.context }),
           resident_turn_state: residentTurnState,
         },
@@ -1592,47 +1600,8 @@ export async function handleStrategicResident(
       pendingOperatorAdmission = {
         cursorBefore,
         messages: [...collected],
+        claimRequired,
       };
-      if (claimRequired) {
-        const messageIds = collected
-          .map(message => typeof message.id === 'string' ? message.id.trim() : '')
-          .filter(Boolean);
-        if (messageIds.length !== collected.length) {
-          rollbackPendingOperatorAdmission();
-          return [];
-        }
-        try {
-          const claimed = await apiPost(
-            `/api/agent/projects/${projectId}/messages/claim`,
-            {
-              task_id: taskId,
-              session_id: sessionId,
-              worker_generation: workerGeneration,
-              message_ids: messageIds,
-              lease_seconds: 45,
-            },
-          ) as ConversationClaimResponse;
-          const claimedIds = Array.isArray(claimed.message_ids)
-            ? claimed.message_ids.filter((value): value is string => typeof value === 'string')
-            : [];
-          if (
-            typeof claimed.claim_id !== 'string'
-            || claimed.claim_id.length === 0
-            || [...claimedIds].sort().join('\n') !== [...messageIds].sort().join('\n')
-          ) {
-            throw new Error('conversation claim response did not cover the exact operator batch');
-          }
-          activeConversationClaimId = claimed.claim_id;
-          activeConversationClaimMessageIds = [...claimedIds];
-        } catch (error) {
-          sendLog(
-            ws,
-            `[resident] durable conversation admission deferred: ${sanitize(String(error))}\n`,
-          );
-          rollbackPendingOperatorAdmission();
-          return [];
-        }
-      }
     }
     return collected;
   };
@@ -1645,6 +1614,60 @@ export async function handleStrategicResident(
       pendingOperatorAdmission.messages,
     );
     pendingOperatorAdmission = null;
+  };
+
+  const claimPendingOperatorBatch = async (
+    messages: ResidentInboundMessage[],
+  ): Promise<boolean> => {
+    if (!pendingOperatorAdmission?.claimRequired) return true;
+    const messageIds = messages
+      .map(message => typeof message.id === 'string' ? message.id.trim() : '')
+      .filter(Boolean);
+    if (messageIds.length !== messages.length) {
+      rollbackPendingOperatorAdmission();
+      return false;
+    }
+    if (activeConversationClaimId !== null) {
+      return [...activeConversationClaimMessageIds].sort().join('\n')
+        === [...messageIds].sort().join('\n');
+    }
+    try {
+      const claimed = await apiPost(
+        `/api/agent/projects/${projectId}/messages/claim`,
+        {
+          task_id: taskId,
+          session_id: sessionId,
+          worker_generation: workerGeneration,
+          incarnation_id: conversationClaimIncarnation,
+          message_ids: messageIds,
+          lease_seconds: CONVERSATION_CLAIM_LEASE_SECONDS,
+        },
+      ) as ConversationClaimResponse;
+      const claimedIds = Array.isArray(claimed.message_ids)
+        ? claimed.message_ids.filter(
+          (value): value is string => typeof value === 'string',
+        )
+        : [];
+      if (
+        typeof claimed.claim_id !== 'string'
+        || claimed.claim_id.length === 0
+        || [...claimedIds].sort().join('\n') !== [...messageIds].sort().join('\n')
+      ) {
+        throw new Error(
+          'conversation claim response did not cover the exact operator batch',
+        );
+      }
+      activeConversationClaimId = claimed.claim_id;
+      activeConversationClaimMessageIds = [...claimedIds];
+      return true;
+    } catch (error) {
+      sendLog(
+        ws,
+        `[resident] durable conversation admission deferred: ${sanitize(String(error))}\n`,
+      );
+      rollbackPendingOperatorAdmission();
+      return false;
+    }
   };
 
   const retryGenericProviderTurnInPlace = async (
@@ -1784,7 +1807,8 @@ export async function handleStrategicResident(
         ? {}
         : {
           conversation_claim_id: activeConversationClaimId,
-          conversation_claim_lease_seconds: 45,
+          conversation_claim_incarnation: conversationClaimIncarnation,
+          conversation_claim_lease_seconds: CONVERSATION_CLAIM_LEASE_SECONDS,
         }),
     };
     const activeCallLease = callCoordinator.currentLease();
@@ -1998,12 +2022,17 @@ export async function handleStrategicResident(
 
   // Liveness-heartbeat pacing. Operator messages are polled at the fast
   // cfg.messagePollMs cadence (prompt pickup), but a bare liveness heartbeat
-  // (progress=false) fires only every cfg.idleTickMs so the faster poll does not
-  // hammer the backend. Progress heartbeats (operator interaction / applied op)
-  // are always sent directly and are unaffected by this gate.
+  // (progress=false) is capped at one minute so the Resident-specific liveness
+  // signal cannot trail the reaper indefinitely. While a foreground claim is
+  // active it renews every 15 seconds, independently of the configurable idle
+  // tick. Progress heartbeats remain unaffected by this gate.
   let lastLivenessHeartbeatAt = 0;
-  const livenessHeartbeatDue = (): boolean =>
-    Date.now() - lastLivenessHeartbeatAt >= cfg.idleTickMs;
+  const livenessHeartbeatDue = (): boolean => {
+    const cadenceMs = activeConversationClaimId === null
+      ? Math.min(cfg.idleTickMs, RESIDENT_LIVENESS_HEARTBEAT_MAX_MS)
+      : CONVERSATION_CLAIM_RENEW_MS;
+    return Date.now() - lastLivenessHeartbeatAt >= cadenceMs;
+  };
   const livenessHeartbeat = async (): Promise<SessionHeartbeatResponse | null> => {
     const hb = await heartbeat(false);
     lastLivenessHeartbeatAt = Date.now();
@@ -2658,29 +2687,7 @@ export async function handleStrategicResident(
       covered_message_ids: coveredMessageIds,
     };
 
-    // Threshold-gated early acknowledgment: start a timer that fires after
-    // cfg.operatorAckThresholdMs so the operator sees a progress signal during
-    // slow turns. If the turn completes before the threshold, the timer is
-    // cancelled and no ack is posted. A threshold of 0 disables the ack.
     let ackTimer: ReturnType<typeof setTimeout> | null = null;
-    if (cfg.operatorAckThresholdMs > 0) {
-      ackTimer = setTimeout(() => {
-        const ackText = msgs.length === 1
-          ? `On it — working on your message (this may take a moment).`
-          : `On it — working on ${msgs.length} messages (this may take a moment).`;
-        apiPost('/api/agent/strategic', {
-          task_id: taskId,
-          op: 'create_message',
-          data: {
-            type: 'NOTE',
-            content: ackText,
-            idempotency_key: residentMessageKey('ack', replyAnchorId),
-          },
-        }).catch((e: unknown) => {
-          sendLog(ws, `[resident] early acknowledgment failed (non-fatal): ${String(e)}\n`);
-        });
-      }, cfg.operatorAckThresholdMs);
-    }
     let r: ResidentTurnResult;
     let cleanupError: unknown = null;
     try {
@@ -2716,6 +2723,37 @@ export async function handleStrategicResident(
           `[resident] repository freshness UNKNOWN for operator turn: ${repoSnapshot.reason}\n`,
         );
       }
+      if (!(await claimPendingOperatorBatch(msgs))) {
+        setResidentActivity(
+          'waiting',
+          'Operator turn was claimed by another Resident worker',
+        );
+        return 'continue';
+      }
+      // Start public acknowledgment only after this exact process incarnation
+      // owns the durable turn. Preflight can be slow, but it must remain silent
+      // if another incarnation wins admission.
+      if (cfg.operatorAckThresholdMs > 0) {
+        ackTimer = setTimeout(() => {
+          const ackText = msgs.length === 1
+            ? `On it — working on your message (this may take a moment).`
+            : `On it — working on ${msgs.length} messages (this may take a moment).`;
+          apiPost('/api/agent/strategic', {
+            task_id: taskId,
+            op: 'create_message',
+            data: {
+              type: 'NOTE',
+              content: ackText,
+              idempotency_key: residentMessageKey('ack', replyAnchorId),
+            },
+          }).catch((e: unknown) => {
+            sendLog(
+              ws,
+              `[resident] early acknowledgment failed (non-fatal): ${String(e)}\n`,
+            );
+          });
+        }, cfg.operatorAckThresholdMs);
+      }
       const turnPromise = runTurn(operatorBlocks, true, pickupLagMs, repoSnapshot);
       const watch = await watchOperatorTurn(turnPromise);
       if (watch === 'stop') {
@@ -2729,7 +2767,9 @@ export async function handleStrategicResident(
           session.close();
         }
         await turnPromise;
-        stopReason = 'operator_turn_interrupted';
+        if (stopReason !== 'conversation_claim_lost') {
+          stopReason = 'operator_turn_interrupted';
+        }
         return 'stop';
       }
       r = await turnPromise;

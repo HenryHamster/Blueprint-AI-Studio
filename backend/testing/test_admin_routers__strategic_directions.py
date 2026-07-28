@@ -1244,11 +1244,140 @@ async def test_resident_reply_completes_exact_live_conversation_claim(
     assert inbound.status == "handled"
     assert inbound.handling_state == MessageHandlingState.RESPONDED
     assert inbound.conversation_claim_id == claim_id
+    assert inbound.conversation_claim_incarnation is not None
     assert inbound.conversation_claim_expires_at is None
 
     replay = await client.post("/api/agent/strategic", headers=headers, json=body)
     assert replay.status_code == 200, replay.text
     assert replay.json()["message_id"] == first.json()["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_resident_reply_rejects_partial_conversation_claim(
+    client: AsyncClient, db_session
+):
+    """A reply must complete every row in its durable logical turn."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    claim_id = uuid.uuid4()
+    incarnation = uuid.uuid4()
+    rows = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            handling_state=MessageHandlingState.CLAIMED,
+            handled_by_task_id=task.id,
+            conversation_claim_id=claim_id,
+            conversation_claim_generation=1,
+            conversation_claim_incarnation=incarnation,
+            conversation_claim_expires_at=_utcnow() + timedelta(minutes=1),
+            conversation_claim_attempt=1,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            status="open",
+            content=f"Claimed input {index}",
+            resident_session_id="resident-receipt-session",
+        )
+        for index in (1, 2)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Incomplete coverage must fail.",
+                "idempotency_key": "resident-partial-claim-reply",
+                "covered_message_ids": [str(rows[0].id)],
+                "conversation_claim_id": str(claim_id),
+                "conversation_claim_incarnation": str(incarnation),
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    for row in rows:
+        await db_session.refresh(row)
+        assert row.status == "open"
+        assert row.handling_state == MessageHandlingState.CLAIMED
+
+
+@pytest.mark.asyncio
+async def test_resident_claim_reply_to_must_belong_to_covered_batch(
+    client: AsyncClient, db_session
+):
+    """Claim completion cannot resolve an unrelated operator message."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    claim_id = uuid.uuid4()
+    incarnation = uuid.uuid4()
+    claimed = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        conversation_claim_id=claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=incarnation,
+        conversation_claim_expires_at=_utcnow() + timedelta(minutes=1),
+        conversation_claim_attempt=1,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Claimed input",
+        resident_session_id="resident-receipt-session",
+    )
+    unrelated = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Unrelated input",
+        resident_session_id="resident-receipt-session",
+    )
+    db_session.add_all([claimed, unrelated])
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Wrong reply target must fail.",
+                "idempotency_key": "resident-wrong-reply-target",
+                "covered_message_ids": [str(claimed.id)],
+                "conversation_claim_id": str(claim_id),
+                "conversation_claim_incarnation": str(incarnation),
+                "context": {"reply_to": str(unrelated.id)},
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    await db_session.refresh(unrelated)
+    assert unrelated.handling_state == MessageHandlingState.PENDING
+    assert unrelated.status == "open"
 
 
 @pytest.mark.asyncio

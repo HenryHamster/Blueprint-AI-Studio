@@ -65,6 +65,7 @@ from app.models import (
     Project,
     ProjectMessage,
     Task,
+    TaskStatus,
 )
 from app.project_message_projection import (
     message_event_payload,
@@ -137,6 +138,7 @@ class ClaimResidentMessages(BaseModel):
     task_id: uuid.UUID
     session_id: str = Field(..., min_length=1, max_length=255)
     worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID | None = None
     message_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=20)
     lease_seconds: int = Field(default=45, ge=15, le=300)
 
@@ -1131,6 +1133,7 @@ async def claim_resident_messages(
     )
     if (
         task is None
+        or task.status not in {TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING}
         or (task_context or {}).get("_resident_session") is not True
         or authenticated_session_id != payload.session_id
         or authenticated_generation != payload.worker_generation
@@ -1145,7 +1148,10 @@ async def claim_resident_messages(
             detail="Resident worker generation superseded or inactive",
         )
 
-    from app.conversation_coordinator import claim_operator_messages
+    from app.conversation_coordinator import (
+        claim_operator_messages,
+        legacy_conversation_claim_incarnation,
+    )
 
     claim = await claim_operator_messages(
         session,
@@ -1153,6 +1159,13 @@ async def claim_resident_messages(
         session_id=payload.session_id,
         task_id=payload.task_id,
         worker_generation=payload.worker_generation,
+        incarnation_id=(
+            payload.incarnation_id
+            or legacy_conversation_claim_incarnation(
+                payload.task_id,
+                payload.worker_generation,
+            )
+        ),
         message_ids=payload.message_ids,
         lease_seconds=payload.lease_seconds,
     )

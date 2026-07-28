@@ -167,6 +167,10 @@ _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 7200  # 2h
 # slack; otherwise a healthy resident is cancelled while its generic task
 # heartbeat and runner both remain live.
 _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS = 180
+# A fresh heartbeat from the exact Task can corroborate a transient lag in the
+# Resident-session projection, but it is emitted by an outer runner timer and
+# cannot prove the conversation loop is making progress forever.
+_RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS = 120
 
 # A provisional spawn-claim (an active session blob whose ``task_id`` is still
 # None because the spawn is in flight) blocks a concurrent start from spawning a
@@ -1221,25 +1225,27 @@ def _resident_worker_task_is_healthy(
             started
             and (now - started).total_seconds() <= _RESIDENT_START_CLAIM_STALE_SECONDS
         )
-    heartbeat = task.last_heartbeat
-    if heartbeat is not None:
-        if heartbeat.tzinfo is not None:
-            heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
-        if (
-            now - heartbeat
-        ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
-            # This is the heartbeat of the exact active task, not merely the
-            # runner hosting it. A delayed resident-session projection must not
-            # cancel a worker that the task lifecycle still observes as alive.
-            # Doing so creates a second generation while the first is running
-            # and can leave the conversation without a worker during dispatch.
-            return True
-
     worker_heartbeat = _parse_iso_naive(blob.get("worker_heartbeat_at"))
     if worker_heartbeat is not None:
-        return (
-            now - worker_heartbeat
-        ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+        worker_age = (now - worker_heartbeat).total_seconds()
+        if worker_age <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
+            return True
+        heartbeat = task.last_heartbeat
+        if heartbeat is not None:
+            if heartbeat.tzinfo is not None:
+                heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
+            task_fresh = (
+                now - heartbeat
+            ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+            return bool(
+                task_fresh
+                and worker_age
+                <= (
+                    _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+                    + _RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS
+                )
+            )
+        return False
 
     # During startup an absent heartbeat is expected until the resident handler
     # makes its first lease renewal. Keep the start claim briefly even when the
@@ -1250,7 +1256,12 @@ def _resident_worker_task_is_healthy(
         or (now - startup_seen).total_seconds() > _RESIDENT_START_CLAIM_STALE_SECONDS
     ):
         return False
-    return heartbeat is None
+    heartbeat = task.last_heartbeat
+    if heartbeat is None:
+        return True
+    if heartbeat.tzinfo is not None:
+        heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
+    return (now - heartbeat).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
 
 
 async def sync_resident_worker_retry_wait(
@@ -4657,6 +4668,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     call_ready: bool = False
     call_usage: dict[str, Any] | None = None
     conversation_claim_id: uuid.UUID | None = None
+    conversation_claim_incarnation: uuid.UUID | None = None
     conversation_claim_lease_seconds: int = Field(default=45, ge=15, le=300)
 
 
@@ -4755,8 +4767,19 @@ async def resident_session_heartbeat(
         activity=payload.activity,
         repo_head=payload.repo_head,
     )
+    if (
+        payload.conversation_claim_incarnation is not None
+        and payload.conversation_claim_id is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="conversation claim incarnation requires a claim id",
+        )
     if payload.conversation_claim_id is not None:
-        from app.conversation_coordinator import renew_conversation_claim
+        from app.conversation_coordinator import (
+            legacy_conversation_claim_incarnation,
+            renew_conversation_claim,
+        )
 
         response["conversation_claim_held"] = await renew_conversation_claim(
             session,
@@ -4764,6 +4787,13 @@ async def resident_session_heartbeat(
             claim_id=payload.conversation_claim_id,
             task_id=uuid.UUID(payload.task_id),
             worker_generation=payload.worker_generation,
+            incarnation_id=(
+                payload.conversation_claim_incarnation
+                or legacy_conversation_claim_incarnation(
+                    uuid.UUID(payload.task_id),
+                    payload.worker_generation,
+                )
+            ),
             lease_seconds=payload.conversation_claim_lease_seconds,
         )
         await session.commit()

@@ -17,6 +17,7 @@ from httpx import AsyncClient
 from starlette.requests import Request
 
 from app.auth import create_agent_token
+from app.conversation_coordinator import renew_conversation_claim
 from app.main import app
 from app.models import (
     MessageHandlingState,
@@ -25,6 +26,7 @@ from app.models import (
     Project,
     ProjectMessage,
     Task,
+    TaskStatus,
 )
 from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_EXPECTED_PER_MINUTE,
@@ -618,6 +620,7 @@ async def _make_resident_poll_worker(
         "strategic_session_id": session_id,
         "_resident_worker_generation": generation,
     }
+    task.status = TaskStatus.IN_PROGRESS
     project.vision = {
         "_resident_strategic_session": {
             "session_id": session_id,
@@ -684,6 +687,7 @@ async def test_resident_claim_is_durable_and_idempotent_for_same_generation(
         "task_id": str(task.id),
         "session_id": "resident-session",
         "worker_generation": 2,
+        "incarnation_id": "00000000-0000-0000-0000-000000000111",
         "message_ids": [str(first.id), str(second.id)],
         "lease_seconds": 45,
     }
@@ -714,8 +718,143 @@ async def test_resident_claim_is_durable_and_idempotent_for_same_generation(
         assert str(row.conversation_claim_id) == body["claim_id"]
         assert row.handled_by_task_id == task.id
         assert row.conversation_claim_generation == 2
+        assert str(row.conversation_claim_incarnation) == payload["incarnation_id"]
         assert row.conversation_claim_attempt == 1
         assert row.conversation_claim_expires_at is not None
+    assert not await renew_conversation_claim(
+        db_session,
+        project_id=project.id,
+        claim_id=uuid.UUID(body["claim_id"]),
+        task_id=task.id,
+        worker_generation=2,
+        incarnation_id=uuid.UUID(
+            "00000000-0000-0000-0000-000000000999"
+        ),
+        lease_seconds=90,
+    )
+    assert await renew_conversation_claim(
+        db_session,
+        project_id=project.id,
+        claim_id=uuid.UUID(body["claim_id"]),
+        task_id=task.id,
+        worker_generation=2,
+        incarnation_id=uuid.UUID(payload["incarnation_id"]),
+        lease_seconds=90,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_claim_rejects_different_process_incarnation(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="single-owner input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": "00000000-0000-0000-0000-000000000333",
+        "message_ids": [str(message.id)],
+    }
+    first = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+
+    overlapping = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **payload,
+            "incarnation_id": "00000000-0000-0000-0000-000000000444",
+        },
+    )
+    assert overlapping.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_legacy_resident_claim_gets_stable_rollout_incarnation(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="rolling deploy input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "message_ids": [str(message.id)],
+    }
+
+    first = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    repeated = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+
+    assert first.status_code == 200, first.text
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["claim_id"] == first.json()["claim_id"]
+    await db_session.refresh(message)
+    assert message.conversation_claim_incarnation is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_resident_task_cannot_claim_operator_batch(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="must remain pending",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    task.status = TaskStatus.CANCELLED
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "incarnation_id": "00000000-0000-0000-0000-000000000555",
+            "message_ids": [str(message.id)],
+        },
+    )
+    # Token verification rejects terminal tasks before the route's own
+    # under-lock status fence; both layers fail closed.
+    assert response.status_code == 401
+    await db_session.refresh(message)
+    assert message.handling_state == MessageHandlingState.PENDING
 
 
 @pytest.mark.asyncio
@@ -763,6 +902,7 @@ async def test_stale_resident_generation_cannot_claim_operator_batch(
             "task_id": str(stale_task.id),
             "session_id": "resident-session",
             "worker_generation": 1,
+            "incarnation_id": "00000000-0000-0000-0000-000000000222",
             "message_ids": [str(message.id)],
         },
     )

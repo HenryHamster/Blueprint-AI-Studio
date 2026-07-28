@@ -3028,6 +3028,20 @@ async def strategic_operation(
                     status_code=400,
                     detail="Invalid conversation_claim_id",
                 ) from None
+        raw_conversation_claim_incarnation = data.get(
+            "conversation_claim_incarnation"
+        )
+        conversation_claim_incarnation: uuid.UUID | None = None
+        if raw_conversation_claim_incarnation is not None:
+            try:
+                conversation_claim_incarnation = uuid.UUID(
+                    str(raw_conversation_claim_incarnation).strip()
+                )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid conversation_claim_incarnation",
+                ) from None
         if raw_covered_ids is not None:
             if not isinstance(raw_covered_ids, list) or not raw_covered_ids:
                 raise HTTPException(
@@ -3071,10 +3085,44 @@ async def strategic_operation(
                 )
             covered_message_ids = parsed_covered
             covered_message_id_strings = sorted(str(value) for value in parsed_covered)
-        if conversation_claim_id is not None and covered_message_ids is None:
+        conversation_claim_generation: int | None = None
+        legacy_claim_incarnation: uuid.UUID | None = None
+        if conversation_claim_id is not None:
+            try:
+                conversation_claim_generation = int(
+                    resident_ctx.get("_resident_worker_generation") or 1
+                )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Resident worker generation is invalid",
+                ) from None
+            from app.conversation_coordinator import (
+                legacy_conversation_claim_incarnation,
+            )
+
+            legacy_claim_incarnation = legacy_conversation_claim_incarnation(
+                task.id,
+                conversation_claim_generation,
+            )
+            if conversation_claim_incarnation is None:
+                conversation_claim_incarnation = legacy_claim_incarnation
+        if (
+            (
+                conversation_claim_incarnation is not None
+                and conversation_claim_id is None
+            )
+            or (
+                conversation_claim_id is not None
+                and covered_message_ids is None
+            )
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="conversation_claim_id requires covered_message_ids",
+                detail=(
+                    "conversation claim incarnation requires a claim id, and "
+                    "claim id requires covered message ids"
+                ),
             )
         from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
 
@@ -3100,6 +3148,9 @@ async def strategic_operation(
             msg_ctx["message_role"] = "operator_reply"
         if conversation_claim_id is not None:
             msg_ctx["_conversation_claim_id"] = str(conversation_claim_id)
+            msg_ctx["_conversation_claim_incarnation"] = str(
+                conversation_claim_incarnation
+            )
         raw_turn_state = data.get("resident_turn_state")
         resident_turn_state: dict[str, Any] | None = None
         resident_turn_state_sha256: str | None = None
@@ -3181,6 +3232,17 @@ async def strategic_operation(
                 reply_to_message_id = uuid.UUID(str(raw_reply_to))
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid reply_to message") from None
+            if (
+                conversation_claim_id is not None
+                and (
+                    covered_message_ids is None
+                    or reply_to_message_id not in covered_message_ids
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="reply_to must belong to the exact conversation claim",
+                )
             reply_target = (
                 await session.execute(
                     select(ProjectMessage)
@@ -3229,7 +3291,7 @@ async def strategic_operation(
         async def _apply_covered_messages() -> None:
             if covered_message_ids is None:
                 return
-            rows = (
+            covered_rows = (
                 (
                     await session.execute(
                         select(ProjectMessage)
@@ -3243,12 +3305,37 @@ async def strategic_operation(
                 .scalars()
                 .all()
             )
-            by_id = {row.id: row for row in rows}
+            by_id = {row.id: row for row in covered_rows}
             if len(by_id) != len(covered_message_ids):
                 raise HTTPException(
                     status_code=409,
                     detail="covered_message_ids contains an unavailable message",
                 )
+            if conversation_claim_id is not None:
+                claim_rows = (
+                    (
+                        await session.execute(
+                            select(ProjectMessage)
+                            .where(
+                                ProjectMessage.project_id == _project_id,
+                                ProjectMessage.conversation_claim_id
+                                == conversation_claim_id,
+                            )
+                            .with_for_update()
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if {row.id for row in claim_rows} != set(covered_message_ids):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "covered_message_ids must equal the exact "
+                            "conversation claim"
+                        ),
+                    )
+                by_id = {row.id: row for row in claim_rows}
             for covered_id in covered_message_ids:
                 inbound = by_id[covered_id]
                 if inbound.from_type != "user" or (
@@ -3264,24 +3351,24 @@ async def strategic_operation(
                     raise HTTPException(
                         status_code=409,
                         detail="covered_message_ids contains a non-open message",
-                    )
+                )
                 if conversation_claim_id is not None:
-                    try:
-                        resident_generation = int(
-                            resident_ctx.get("_resident_worker_generation") or 1
-                        )
-                    except (TypeError, ValueError):
-                        raise HTTPException(
-                            status_code=409,
-                            detail="Resident worker generation is invalid",
-                        ) from None
                     if (
                         inbound.handling_state != MessageHandlingState.CLAIMED
                         or inbound.conversation_claim_id
                         != conversation_claim_id
                         or inbound.handled_by_task_id != task.id
                         or inbound.conversation_claim_generation
-                        != resident_generation
+                        != conversation_claim_generation
+                        or (
+                            inbound.conversation_claim_incarnation
+                            != conversation_claim_incarnation
+                            and not (
+                                inbound.conversation_claim_incarnation is None
+                                and conversation_claim_incarnation
+                                == legacy_claim_incarnation
+                            )
+                        )
                         or inbound.conversation_claim_expires_at is None
                         or inbound.conversation_claim_expires_at <= _utcnow()
                     ):
@@ -3292,6 +3379,9 @@ async def strategic_operation(
                                 "or belongs to another worker"
                             ),
                         )
+                    inbound.conversation_claim_incarnation = (
+                        conversation_claim_incarnation
+                    )
                 elif inbound.conversation_claim_id is not None:
                     # Once a message has entered the durable Coordinator path,
                     # every completion must present its exact claim. This keeps a
@@ -3345,6 +3435,14 @@ async def strategic_operation(
                     == (
                         str(conversation_claim_id)
                         if conversation_claim_id is not None
+                        else None
+                    )
+                    and (existing.context or {}).get(
+                        "_conversation_claim_incarnation"
+                    )
+                    == (
+                        str(conversation_claim_incarnation)
+                        if conversation_claim_incarnation is not None
                         else None
                     )
                     and (existing.context or {}).get(turn_state_context_key)
@@ -3441,6 +3539,14 @@ async def strategic_operation(
                         == (
                             str(conversation_claim_id)
                             if conversation_claim_id is not None
+                            else None
+                        )
+                        and (existing.context or {}).get(
+                            "_conversation_claim_incarnation"
+                        )
+                        == (
+                            str(conversation_claim_incarnation)
+                            if conversation_claim_incarnation is not None
                             else None
                         )
                         and (existing.context or {}).get(turn_state_context_key)

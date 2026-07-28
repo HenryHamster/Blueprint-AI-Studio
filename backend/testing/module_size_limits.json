@@ -383,8 +383,9 @@
     "test_compute__experiments.py": 1600,
     "test_release_qualifier__retry_episode_cap.py": 750,
     "test_compute_park_wake.py": 2000,
-    "test_strategic_resident_session.py": 2500,
+    "test_strategic_resident_session.py": 3000,
     "test_conversational_workday_protection.py": 1800,
-    "test_admin_routers__projects.py": 4100
+    "test_admin_routers__projects.py": 4100,
+    "test_admin_routers__strategic_directions.py": 1800
   }
 }
