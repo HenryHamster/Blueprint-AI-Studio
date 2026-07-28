@@ -404,6 +404,32 @@ export function formatLaneResumeSection(
 }
 
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
+function validatedCachedReviewVerdict(
+  payload: Record<string, unknown>,
+  reviewTarget: Record<string, unknown> | undefined,
+): string | undefined {
+  const raw = strVal(payload.cached_verdict_json);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const verdict = parsed.verdict;
+    if (verdict !== 'APPROVE' && verdict !== 'REQUEST_CHANGES') return undefined;
+    const targetBaseSha = strVal(reviewTarget?.base_sha);
+    const targetHeadSha = strVal(reviewTarget?.head_sha);
+    const cachedBaseSha = strVal(parsed.reviewed_base_sha);
+    const cachedHeadSha = strVal(parsed.reviewed_head_sha);
+    const isSha = (sha: string) => /^[0-9a-f]{7,64}$/i.test(sha);
+    if (!isSha(targetBaseSha) || !isSha(targetHeadSha)
+      || !isSha(cachedBaseSha) || !isSha(cachedHeadSha)
+      || cachedBaseSha !== targetBaseSha || cachedHeadSha !== targetHeadSha) {
+      return undefined;
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function handleReview(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -422,6 +448,37 @@ export async function handleReview(
   const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string; file?: string; line?: number}> }> | undefined) || [];
   const taskScope = (taskContext?.scope as string | undefined) || 'medium';
   const origTaskType = strVal(payload.original_task_type || '');
+  // A follow-up reviewer may be given the exact head SHA the prior review
+  // examined.  Treat it as an opaque Git object only after validating its
+  // shape and resolving it locally below; a missing or unavailable object must
+  // preserve the established full-review path rather than guessing a range.
+  const suppliedDeltaBaseSha = strVal(payload.delta_base_sha) || strVal(reviewLoop?.delta_base_sha);
+  const validDeltaBaseSha = /^[0-9a-f]{7,64}$/i.test(suppliedDeltaBaseSha)
+    ? suppliedDeltaBaseSha
+    : '';
+  const reviewTarget = reviewLoop?.review_target as Record<string, unknown> | undefined;
+  const reviewTargetBaseSha = strVal(reviewTarget?.base_sha);
+
+  // Deduplication is defense in depth: the backend may dispatch a normal
+  // review task carrying a completed structured verdict for this exact target.
+  // Reuse it only when its JSON parses, contains a recognized terminal
+  // verdict, and proves it reviewed this task's exact immutable target.
+  // Missing or mismatched provenance follows the normal independent review.
+  const cachedVerdictJson = validatedCachedReviewVerdict(payload, reviewTarget);
+  if (cachedVerdictJson) {
+    const sourceTaskId = strVal(payload.cached_review_task_id);
+    const reuseMessage = sourceTaskId
+      ? `Reused completed review verdict from task ${sourceTaskId}; no new model call was needed.`
+      : 'Reused a completed review verdict; no new model call was needed.';
+    sendLog(ws, reuseMessage + '\n');
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'COMPLETED',
+      logs: reuseMessage,
+      verdict_json: cachedVerdictJson,
+    });
+    return;
+  }
 
   // Clone the full repo so Claude can explore everything, then checkout the PR branch
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
@@ -460,16 +517,39 @@ export async function handleReview(
     // stays cold and independent. Defense in depth against a leaked lane env.
     allowLaneResume: false,
   });
-  // Fetch the base branch into the shallow clone so `git diff origin/${baseBranch}...HEAD`
-  // and `git merge-base --is-ancestor ... origin/${baseBranch}` actually work.  Without
-  // this, the changed-files list and every verification instruction in the review prompt
-  // silently fail — the reviewer then hallucinates verdicts from commit-title patterns
-  // (notably flagging valid rollup PRs as "empty" because it pattern-matched "(#NNNN)"
-  // without a real diff to look at).
-  try {
-    git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]);
-  } catch (e) {
-    sendLog(ws, `WARNING: Failed to fetch origin/${baseBranch} for diff comparison: ${String(e)}\n`);
+  // Prefer an exact prior-review SHA for follow-ups.  This avoids both the
+  // ambiguous HEAD~1 heuristic and eagerly fetching/scanning the full
+  // base-branch diff.  A shallow clone can lack an older commit, so prove the
+  // object is available before selecting delta mode; otherwise retain the
+  // existing full-review behavior.
+  let deltaBaseSha = '';
+  // A delta review deliberately does not fetch the base branch. Its task
+  // target is therefore the first provenance source; GitHub PR metadata below
+  // supplies the current base SHA when the target was not populated.
+  let reviewedBaseSha = /^[0-9a-f]{7,64}$/i.test(reviewTargetBaseSha)
+    ? reviewTargetBaseSha
+    : '';
+  if (suppliedDeltaBaseSha && !validDeltaBaseSha) {
+    sendLog(ws, `WARNING: Ignoring invalid delta_base_sha; falling back to full PR review.\n`);
+  } else if (validDeltaBaseSha) {
+    try {
+      git(['cat-file', '-e', `${validDeltaBaseSha}^{commit}`]);
+      deltaBaseSha = validDeltaBaseSha;
+      sendLog(ws, `Running exact-SHA delta review: ${deltaBaseSha}..HEAD\n`);
+    } catch (e) {
+      sendLog(ws, `WARNING: delta_base_sha ${validDeltaBaseSha} is unavailable locally; falling back to full PR review: ${String(e)}\n`);
+    }
+  }
+  // Full reviews need the base ref. Delta reviews intentionally do not fetch
+  // it: their primary evidence is the exact prior-head-to-current-head range.
+  if (!deltaBaseSha) {
+    try {
+      git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]);
+      const fetchedBaseSha = git(['rev-parse', `origin/${baseBranch}`]).trim();
+      if (fetchedBaseSha) reviewedBaseSha = fetchedBaseSha;
+    } catch (e) {
+      sendLog(ws, `WARNING: Failed to fetch origin/${baseBranch} for diff comparison: ${String(e)}\n`);
+    }
   }
   // Pin the head SHA this review runs against so the backend can detect stale verdicts.
   let reviewedHeadSha = '';
@@ -486,7 +566,13 @@ export async function handleReview(
   // when running `npm run build`, mistakes the empty workspace for a real
   // build defect, and flags it as a blocker — burning review-fix iterations on
   // a phantom env failure.
-  preinstallNodeDeps(WORKSPACE, reviewBuildConfig, ws, taskId);
+  // A delta reviewer is not being asked to run the broad review's build/lint
+  // sweep; avoid paying the cold npm-install cost before it has inspected the
+  // narrow fix range. It may still use the repository and run a targeted check
+  // if that is necessary to substantiate a specific concern.
+  if (!deltaBaseSha) {
+    preinstallNodeDeps(WORKSPACE, reviewBuildConfig, ws, taskId);
+  }
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
   let prTitle = '';
@@ -500,9 +586,15 @@ export async function handleReview(
         signal: prMetaController.signal,
       });
       if (prRes.ok) {
-        const prData = await prRes.json() as { title?: string; body?: string };
+        const prData = await prRes.json() as { title?: string; body?: string; base?: { sha?: string } };
         prTitle = prData.title || '';
         prBody = prData.body || '';
+        // In delta mode the base ref is intentionally not fetched. PR metadata
+        // is a second, live provenance source; do not overwrite an explicit
+        // task review target, which is the dispatch-time target identity.
+        if (!reviewedBaseSha && /^[0-9a-f]{7,64}$/i.test(prData.base?.sha || '')) {
+          reviewedBaseSha = String(prData.base?.sha);
+        }
       }
     } finally {
       clearTimeout(prMetaTimeout);
@@ -519,7 +611,7 @@ export async function handleReview(
   const reviewProjectIdEarly = strVal(reviewProjectMetaEarly?.project_id);
   const reviewOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
   let downloadedShotPaths: string[] = [];
-  if (viewportShotEntries.length > 0 && viewportSourceTaskId && reviewProjectIdEarly) {
+  if (!deltaBaseSha && viewportShotEntries.length > 0 && viewportSourceTaskId && reviewProjectIdEarly) {
     downloadedShotPaths = downloadViewportShots({
       entries: viewportShotEntries,
       shotDir: `/tmp/viewport_review_${taskId}`,
@@ -535,10 +627,13 @@ export async function handleReview(
     }
   }
 
-  // Get a summary of changed files for context
+  // Get a summary of the actual review target. A delta review is deliberately
+  // the exact two-SHA range; the established full review retains its
+  // merge-base PR comparison.
+  const reviewDiffRange = deltaBaseSha ? `${deltaBaseSha}..HEAD` : `origin/${baseBranch}...HEAD`;
   let changedFiles = '';
   try {
-    changedFiles = git(['diff', '--name-status', `origin/${baseBranch}...HEAD`]);
+    changedFiles = git(['diff', '--name-status', reviewDiffRange]);
   } catch { changedFiles = '(could not generate file list)'; }
 
   // Shortstat gives the reviewer objective line-change volume alongside the
@@ -547,7 +642,7 @@ export async function handleReview(
   // mismatches and gives rollup reviewers proof the PR has real changes.
   let diffShortstat = '';
   try {
-    diffShortstat = git(['diff', '--shortstat', `origin/${baseBranch}...HEAD`]).trim();
+    diffShortstat = git(['diff', '--shortstat', reviewDiffRange]).trim();
   } catch { /* shortstat is best-effort context */ }
 
   // Scope-drift handling: the `taskScope` label is set at task creation and never
@@ -611,6 +706,17 @@ export async function handleReview(
   const iterationPreamble = buildReviewIterationPreamble(
     iteration, reviewMaxIterations, reviewMidBudget, smallScopeEarly,
   );
+  const deltaReviewSection = deltaBaseSha
+    ? `## Exact-SHA Delta Review\n` +
+      `This follow-up review is scoped to the fix delta from the previously reviewed head to the current head: ` +
+      `\`git diff ${deltaBaseSha}..HEAD\`. Treat that exact range as the primary evidence. ` +
+      `Verify whether the prior findings were resolved and whether this delta introduced a new blocker. ` +
+      `Do not start a full base-branch/PR rescan or re-litigate unrelated pre-existing code. ` +
+      `You retain full repository access: inspect surrounding code when it is needed to understand or verify this delta.\n\n`
+    : '';
+  const reviewIterationContext = deltaBaseSha
+    ? `This is a focused follow-up after review iteration ${iteration}.\n\n`
+    : `${iterationPreamble}\n`;
 
   // Rollup PRs (head branch research/* or plan/*) contain N subtask squash-merge
   // commits whose titles end in "(#NNNN)". The `(#NNNN)` marker means a PR was
@@ -625,7 +731,7 @@ export async function handleReview(
   // merge-base / diff --stat non-emptiness verification every round is pure
   // overhead that pulls the reviewer into "verification-only" drift instead of
   // converging on the remaining code issues.
-  const rollupGuidance = iteration === 1
+  const rollupGuidance = !deltaBaseSha && iteration === 1
     ? buildRollupReviewGuidance(branch, baseBranch, reviewBuildConfig?.staging_branch_prefixes)
     : '';
 
@@ -717,19 +823,47 @@ export async function handleReview(
   // Group by component/width prefix (strip trailing -before/-after/-diff suffix)
   // so the reviewer sees paired sets rather than a flat list.
   const viewportScreenshotSection = buildViewportScreenshotSection(downloadedShotPaths);
+  const reviewDiffAccessHint = deltaBaseSha
+    ? `You have full access to the codebase. Start with \`git diff ${deltaBaseSha}..HEAD\`; read surrounding files only as needed to understand that delta.\n`
+    : buildReviewDiffAccessHint(baseBranch);
+  // The standard checklist also emits base-branch-scoped lint suggestions when
+  // given a build config.  Do not inject those into an exact delta review: they
+  // would undermine the narrow review range. The generic checklist and verdict
+  // contract remain identical.
+  const reviewCoreGuidance = buildReviewCoreGuidance(
+    deltaBaseSha ? undefined : reviewBuildConfig,
+    taskId,
+    deltaBaseSha ? undefined : baseBranch,
+  );
+  const reviewScopePreamble = deltaBaseSha ? '' : scopePreamble;
+  const changedFilesLabel = deltaBaseSha
+    ? `Files changed in the exact review delta (${deltaBaseSha}..HEAD):`
+    : 'Files changed in this PR:';
 
-  const reviewPrompt = `${reviewStrategicFraming}${reviewStrategicFraming ? '\n\n' : ''}${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
+  // Exact-SHA follow-ups need decision-relevant context, not the entire first
+  // review briefing. Keep repository instructions, findings/responses and PR
+  // summary, but leave out broad strategic/project framing, playbook, planned
+  // file analysis, self-review blind spots, screenshots and scope metadata.
+  const reviewStrategicFramingForPrompt = deltaBaseSha ? '' : reviewStrategicFraming;
+  const reviewPlaybookForPrompt = deltaBaseSha ? '' : reviewPlaybookSection;
+  const reviewProjectCtxForPrompt = deltaBaseSha ? '' : reviewProjectCtxSection;
+  const selfReviewBlindSpotsForPrompt = deltaBaseSha ? '' : selfReviewBlindSpotsSection;
+  const plannedFilesForPrompt = deltaBaseSha ? '' : plannedFilesSection;
+  const viewportScreenshotsForPrompt = deltaBaseSha ? '' : viewportScreenshotSection;
+  const reviewScopeBudgetForPrompt = deltaBaseSha ? '' : reviewScopeBudgetSection;
 
-${iterationPreamble}
+  const reviewPrompt = `${reviewStrategicFramingForPrompt}${reviewStrategicFramingForPrompt ? '\n\n' : ''}${reviewClaudeMdPrefix}${reviewPlaybookForPrompt}${reviewProjectCtxForPrompt}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
+
+${reviewIterationContext}${deltaReviewSection}
 ${rollupGuidance}
-${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
+${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}${changedFilesLabel}
 ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 
-${selfReviewBlindSpotsSection}
-${plannedFilesSection}
-${viewportScreenshotSection}
-${buildReviewDiffAccessHint(baseBranch)}
-${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId, baseBranch)}`;
+${selfReviewBlindSpotsForPrompt}
+${plannedFilesForPrompt}
+${viewportScreenshotsForPrompt}
+${reviewDiffAccessHint}
+${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewCoreGuidance}`;
 
   // Parallel-review fan-out gating: per-project flag AND helper-threshold both
   // required. False positives (extra fan-out) are cheap subagent overhead;
@@ -738,7 +872,12 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
   // ordering stays deterministic for the fingerprint.
   const reviewProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const parallelReviewFlag = reviewProjectMeta?.enable_parallel_review === true;
-  const parallelReviewInjected = parallelReviewFlag && shouldFanOutReview(changedFilePathList, reviewBuildConfig);
+  // Follow-up delta review is intentionally a single focused judgment over the
+  // exact repair range. Fan-out belongs to full PR discovery, not this narrow
+  // verification pass.
+  const parallelReviewInjected = !deltaBaseSha
+    && parallelReviewFlag
+    && shouldFanOutReview(changedFilePathList, reviewBuildConfig);
   const parallelReviewBlock = parallelReviewInjected ? `\n\n${PARALLEL_REVIEW_GUIDANCE}` : '';
   // Read-only ./fetch (direction, section, playbook) so the reviewer can resolve
   // by-reference ids and trimmed launch snapshots mid-run. Gate provisioning and
@@ -748,16 +887,16 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
   const reviewFetchGuidance = reviewProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const launchedReviewPrompt = reviewPrompt + parallelReviewBlock + `\n\n${reviewFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   const reviewTelemetry = buildPromptSizeTelemetry(launchedReviewPrompt, [
-    ['strategic_framing', reviewStrategicFraming],
+    ['strategic_framing', reviewStrategicFramingForPrompt],
     ['claude_md', reviewClaudeMdPrefix],
-    ['playbook', reviewPlaybookSection],
-    ['project_context', reviewProjectCtxSection],
+    ['playbook', reviewPlaybookForPrompt],
+    ['project_context', reviewProjectCtxForPrompt],
     ['review_history', reviewHistorySection],
     ['fix_responses', fixResponsesSection],
     ['review_preamble', buildReviewMasterPreamble(prNumber, branch, baseBranch)],
-    ['pr_context', `${iterationPreamble}${rollupGuidance}${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:\n${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}`],
-    ['review_meta', `${selfReviewBlindSpotsSection}${plannedFilesSection}${viewportScreenshotSection}${buildReviewDiffAccessHint(baseBranch)}`],
-    ['review_guidance', `${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId, baseBranch)}`],
+    ['pr_context', `${reviewIterationContext}${deltaReviewSection}${rollupGuidance}${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}${changedFilesLabel}\n${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}`],
+    ['review_meta', `${selfReviewBlindSpotsForPrompt}${plannedFilesForPrompt}${viewportScreenshotsForPrompt}${reviewDiffAccessHint}`],
+    ['review_guidance', `${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewCoreGuidance}`],
     ['parallel_review', parallelReviewBlock],
     ['fetch_and_tools', `\n\n${reviewFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
   ]);
@@ -795,6 +934,9 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
     }
     if (reviewedHeadSha && !augmented.reviewed_head_sha) {
       augmented.reviewed_head_sha = reviewedHeadSha;
+    }
+    if (reviewedBaseSha && !augmented.reviewed_base_sha) {
+      augmented.reviewed_base_sha = reviewedBaseSha;
     }
     return JSON.stringify(augmented);
   }

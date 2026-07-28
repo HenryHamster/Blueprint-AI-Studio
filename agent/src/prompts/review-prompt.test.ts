@@ -227,6 +227,27 @@ describe('buildReviewVerdictInstructions — block on substantiated code defects
   it('still writes the verdict JSON to the per-task /tmp file', () => {
     expect(out).toContain('/tmp/review_verdict_task-xyz.json');
   });
+
+  it('requires the reviewer to choose whether a requested fix needs independent re-review', () => {
+    expect(out).toContain('"requires_rereview": true');
+    expect(out).toContain('REQUEST_CHANGES verdict MUST include the boolean `requires_rereview`');
+    expect(out).toContain('`true` — an independent follow-up review is required');
+    expect(out).toContain('`false` — you are comfortable delegating closure');
+    expect(out).toContain('not mechanical proof that the repair is correct');
+  });
+
+  it('keeps requires_rereview out of APPROVE verdicts', () => {
+    const approveExample = out.match(/\{\"verdict\": \"APPROVE\"[^\n]*/)?.[0] ?? '';
+    expect(approveExample).not.toContain('requires_rereview');
+    expect(out).toContain('APPROVE` ignores `requires_rereview`; omit it from APPROVE verdicts');
+  });
+
+  it('uses the same re-review instructions in the repair-format prompt', () => {
+    const repairOut = buildReviewVerdictInstructions('task-xyz', { repairContext: true });
+    expect(repairOut).toContain('requires_rereview');
+    expect(repairOut).toContain('independent follow-up review is required');
+    expect(repairOut).toContain('Your review analysis is complete above');
+  });
 });
 
 describe('buildReviewPromptFingerprintContent — no duplicate constants', () => {

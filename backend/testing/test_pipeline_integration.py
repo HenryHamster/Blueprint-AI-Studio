@@ -13,6 +13,7 @@ import json
 import uuid
 import pytest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 from httpx import AsyncClient
 from sqlalchemy import select
 
@@ -326,6 +327,17 @@ async def test_create_task_spawns_review_on_pr_completion(
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "owner", "repo"),
     )
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "merged": False,
+                "state": "open",
+                "base": {"ref": "main", "sha": "base-99"},
+                "head": {"sha": "head-99"},
+            }
+        ),
+    )
     # Cold-provision claim flow — pin warm-VM continuity off (see
     # test_full_review_fix_cycle for rationale).
     mocker.patch.dict(
@@ -384,6 +396,12 @@ async def test_create_task_spawns_review_on_pr_completion(
     r_loop = _review_loop(rt)
     assert r_loop.get("pr_number") == 99
     assert r_loop.get("iteration") == 1
+    assert r_loop.get("review_target") == {
+        "project_id": str(project.id),
+        "pr_number": 99,
+        "base_sha": "base-99",
+        "head_sha": "head-99",
+    }
 
 
 @pytest.mark.asyncio
@@ -727,6 +745,7 @@ async def test_fix_task_spawns_review_on_completion(
                 "branch": "blueprint/task-11223344",
                 "base_branch": "main",
                 "iteration": 2,
+                "reviewed_head_sha": "reviewed-before-fix",
             }
         },
         vm_instance_id=vm_id,
@@ -763,15 +782,15 @@ async def test_fix_task_spawns_review_on_completion(
     nr_loop = _review_loop(nr)
     assert nr_loop.get("pr_number") == 55
     assert nr_loop.get("iteration") == 3
+    assert nr_loop.get("delta_base_sha") == "reviewed-before-fix"
+    assert nr.first_payload.get("delta_base_sha") == "reviewed-before-fix"
 
 
 @pytest.mark.asyncio
-async def test_review_minor_only_verdict_marks_fix_skip_rereview(
+async def test_review_explicit_waiver_marks_fix_skip_rereview(
     client: AsyncClient, db_session, mocker
 ):
-    """First-pass REQUEST_CHANGES where every blocking issue is minor → the
-    spawned fix carries review_loop.skip_rereview_minor_only so its completion
-    handler can skip the follow-up re-review."""
+    """Only an explicit reviewer waiver lets an ordinary fix skip follow-up."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
@@ -818,6 +837,7 @@ async def test_review_minor_only_verdict_marks_fix_skip_rereview(
                 {"severity": "minor", "description": "Rename variable x to count"},
                 {"severity": "minor", "description": "Add a docstring to helper()"},
             ],
+            "requires_rereview": False,
         }
     )
     await _status(
@@ -837,15 +857,14 @@ async def test_review_minor_only_verdict_marks_fix_skip_rereview(
     fix_tasks = [t for t in result.scalars().all() if _task_type(t) == "fix"]
     assert len(fix_tasks) == 1
     f_loop = _review_loop(fix_tasks[0])
-    assert f_loop.get("skip_rereview_minor_only") is True
+    assert f_loop.get("rereview_waived") is True
 
 
 @pytest.mark.asyncio
-async def test_review_with_major_issue_does_not_mark_skip_rereview(
+async def test_review_malformed_rereview_choice_defaults_to_followup(
     client: AsyncClient, db_session, mocker
 ):
-    """A REQUEST_CHANGES verdict containing a major issue must NOT mark the
-    spawned fix skip_rereview_minor_only — the re-review is still needed."""
+    """A non-boolean requires_rereview is conservative even in valid JSON."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
@@ -891,6 +910,7 @@ async def test_review_with_major_issue_does_not_mark_skip_rereview(
                 {"severity": "major", "description": "Null deref on user.id"},
                 {"severity": "minor", "description": "Rename variable x"},
             ],
+            "requires_rereview": "false",
         }
     )
     await _status(
@@ -910,14 +930,14 @@ async def test_review_with_major_issue_does_not_mark_skip_rereview(
     fix_tasks = [t for t in result.scalars().all() if _task_type(t) == "fix"]
     assert len(fix_tasks) == 1
     f_loop = _review_loop(fix_tasks[0])
-    assert not f_loop.get("skip_rereview_minor_only")
+    assert not f_loop.get("rereview_waived")
 
 
 @pytest.mark.asyncio
-async def test_fix_task_minor_only_skips_rereview(
+async def test_fix_task_reviewer_waiver_skips_rereview(
     client: AsyncClient, db_session, mocker
 ):
-    """A fix task carrying skip_rereview_minor_only COMPLETED → no re-review is
+    """A fix task carrying the reviewer waiver COMPLETED → no re-review is
     spawned; the task parks in EVALUATING/ci_waiting so CI gates the merge."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
@@ -946,7 +966,8 @@ async def test_fix_task_minor_only_skips_rereview(
                 "branch": "blueprint/task-minor063",
                 "base_branch": "main",
                 "iteration": 2,
-                "skip_rereview_minor_only": True,
+                "fix_reason": "code_review",
+                "rereview_waived": True,
             }
         },
         vm_instance_id="agent-vm-minor-fix-001",
@@ -1067,6 +1088,106 @@ async def test_review_approve_does_not_spawn_fix(
     assert len(fix_tasks) == 0, (
         f"APPROVE verdict should not spawn a fix task, but found: {[t.id for t in fix_tasks]}"
     )
+
+
+@pytest.mark.asyncio
+async def test_cached_approve_with_stale_base_respawns_after_discard_cap(
+    client: AsyncClient, db_session, mocker
+):
+    """A stale cached APPROVE cannot use the live-review discard escape hatch."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "merged": False,
+                "state": "open",
+                "base": {"ref": "main", "sha": "live-base"},
+                "head": {"ref": "blueprint/task-stale-base", "sha": "same-head"},
+            }
+        ),
+    )
+    mocker.patch("app.github.submit_pr_review", AsyncMock(return_value={"id": 1}))
+    mocker.patch("app.github.create_pr_comment", AsyncMock(return_value={"id": 2}))
+    merge_mock = mocker.patch("app.github.merge_pull_request", AsyncMock(return_value=True))
+
+    project = Project(name="Stale Base Approval Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #110",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 110,
+                "branch": "blueprint/task-stale-base",
+                "base_branch": "main",
+                "cached_verdict_json": '{"verdict":"APPROVE"}',
+                "cached_review_task_id": "cached-review-110",
+            }
+        ],
+        context={
+            # Ordinary live reviews may use the bounded stale-target escape
+            # hatch. A cached replay must not: it is only authoritative for
+            # its exact original base/head target.
+            "stale_head_consecutive_discards": 2,
+            "review_loop": {
+                "pr_number": 110,
+                "branch": "blueprint/task-stale-base",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
+        vm_instance_id="agent-vm-stale-base-approve",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    await _status(
+        client,
+        review_task,
+        status="COMPLETED",
+        verdict_json=json.dumps(
+            {
+                "verdict": "APPROVE",
+                "feedback": "Looks good",
+                "reviewed_base_sha": "old-base",
+                "reviewed_head_sha": "same-head",
+            }
+        ),
+        logs="Approved against an older base",
+    )
+
+    await db_session.refresh(review_task)
+    assert "Stale-target approval discarded" in (review_task.latest_status_message or "")
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    children = result.scalars().all()
+    assert not [task for task in children if _task_type(task) == "fix"]
+    merge_mock.assert_not_awaited()
+    rereviews = [task for task in children if _task_type(task) == "review"]
+    assert len(rereviews) == 1
+    assert _review_loop(rereviews[0]).get("review_target") == {
+        "project_id": str(project.id),
+        "pr_number": 110,
+        "base_sha": "live-base",
+        "head_sha": "same-head",
+    }
 
 
 @pytest.mark.asyncio

@@ -23,7 +23,6 @@ from app.review_heuristics import detect_hedges_in_diff
 from app.review_policy import (
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     evaluate_auto_approve_small_main,
-    is_first_pass_minor_only,
     should_auto_approve_diff,
     should_skip_initial_review,
     should_skip_re_review,
@@ -80,11 +79,11 @@ def _old_auto_approve_small_main_skip(
 
 
 def _old_rereview_outcome(
-    fix_reason: str, skip_rereview_minor_only: bool, scan_blocked: bool
+    fix_reason: str, rereview_waived: bool, scan_blocked: bool
 ) -> str:
     """Mirrors the OLD three-way task_lifecycle branch:
     ``if not scan_blocked and skip: ci_wait / elif not scan_blocked: spawn / else: blocked``."""
-    skip, _ = should_skip_rereview(fix_reason, skip_rereview_minor_only)
+    skip, _ = should_skip_rereview(fix_reason, rereview_waived)
     if not scan_blocked and skip:
         return "ci_wait"
     if not scan_blocked:
@@ -93,9 +92,9 @@ def _old_rereview_outcome(
 
 
 def _new_rereview_outcome(
-    fix_reason: str, skip_rereview_minor_only: bool, scan_blocked: bool
+    fix_reason: str, rereview_waived: bool, scan_blocked: bool
 ) -> str:
-    d = should_skip_re_review(fix_reason, skip_rereview_minor_only, scan_blocked)
+    d = should_skip_re_review(fix_reason, rereview_waived, scan_blocked)
     if d.rule == "security_blocked":
         return "blocked"
     if d.skip:
@@ -224,11 +223,11 @@ _FIX_REASONS = ["ci_failure", "merge_conflict", "migration_guard", "code_review"
 
 class TestReReviewSkipParity:
     @pytest.mark.parametrize("fix_reason", _FIX_REASONS)
-    @pytest.mark.parametrize("minor_only", [True, False])
+    @pytest.mark.parametrize("rereview_waived", [True, False])
     @pytest.mark.parametrize("scan_blocked", [True, False])
-    def test_matches_reference(self, fix_reason, minor_only, scan_blocked):
-        assert _new_rereview_outcome(fix_reason, minor_only, scan_blocked) == _old_rereview_outcome(
-            fix_reason, minor_only, scan_blocked
+    def test_matches_reference(self, fix_reason, rereview_waived, scan_blocked):
+        assert _new_rereview_outcome(fix_reason, rereview_waived, scan_blocked) == _old_rereview_outcome(
+            fix_reason, rereview_waived, scan_blocked
         )
 
     def test_scan_blocked_overrides_everything(self):
@@ -252,117 +251,15 @@ class TestReReviewSkipParity:
         assert d.skip is True
         assert d.rule == "migration_guard"
 
-    def test_minor_only_skips(self):
+    def test_reviewer_waiver_skips(self):
         d = should_skip_re_review("code_review", True, scan_blocked=False)
         assert d.skip is True
-        assert d.rule == "minor_only"
+        assert d.rule == "reviewer_waived"
 
     def test_plain_code_review_spawns(self):
         d = should_skip_re_review("code_review", False, scan_blocked=False)
         assert d.skip is False
         assert d.rule == "none"
-
-
-# ── is_first_pass_minor_only — documented, testable predicate ──────────────────
-
-
-class TestIsFirstPassMinorOnly:
-    """Tests for the ``is_first_pass_minor_only`` predicate.
-
-    The predicate returns True only when: it is the first review iteration
-    (iteration==1), there is a non-empty list of issues, and every issue that
-    has a ``description`` has a ``severity`` that is (case-insensitively)
-    "minor" — missing/None severity also counts as minor.
-    """
-
-    def test_all_minor_issues_returns_true(self):
-        assert is_first_pass_minor_only(
-            [
-                {"severity": "minor", "description": "nit: spacing"},
-                {"severity": "minor", "description": "nit: naming"},
-            ],
-            iteration=1,
-        ) is True
-
-    def test_any_major_returns_false(self):
-        assert is_first_pass_minor_only(
-            [
-                {"severity": "minor", "description": "nit: spacing"},
-                {"severity": "MAJOR", "description": "missing null check"},
-            ],
-            iteration=1,
-        ) is False
-
-    def test_any_critical_returns_false(self):
-        assert is_first_pass_minor_only(
-            [
-                {"severity": "minor", "description": "nit: spacing"},
-                {"severity": "CRITICAL", "description": "security vulnerability"},
-            ],
-            iteration=1,
-        ) is False
-
-    def test_empty_issues_returns_false(self):
-        assert is_first_pass_minor_only([], iteration=1) is False
-
-    def test_none_issues_returns_false(self):
-        assert is_first_pass_minor_only(None, iteration=1) is False
-
-    def test_missing_description_filtered_not_false_positive(self):
-        """Issues without a description are filtered out and do not cause a
-        false negative — as long as all other (described) issues are minor."""
-        assert is_first_pass_minor_only(
-            [
-                {"severity": "minor", "description": "nit: spacing"},
-                {"severity": "MAJOR"},  # no description → skipped
-            ],
-            iteration=1,
-        ) is True
-
-    def test_none_severity_treated_as_minor(self):
-        assert is_first_pass_minor_only(
-            [
-                {"severity": None, "description": "something"},
-                {"severity": "minor", "description": "another nit"},
-            ],
-            iteration=1,
-        ) is True
-
-    def test_missing_severity_key_treated_as_minor(self):
-        assert is_first_pass_minor_only(
-            [
-                {"description": "something without severity key"},
-            ],
-            iteration=1,
-        ) is True
-
-    def test_second_iteration_returns_false(self):
-        assert is_first_pass_minor_only(
-            [
-                {"severity": "minor", "description": "nit: spacing"},
-            ],
-            iteration=2,
-        ) is False
-
-    def test_iteration_zero_returns_false(self):
-        assert is_first_pass_minor_only(
-            [
-                {"severity": "minor", "description": "nit"},
-            ],
-            iteration=0,
-        ) is False
-
-    def test_mixed_minor_and_missing_description_returns_true(self):
-        """All described issues are minor → True, even with blank entries."""
-        assert is_first_pass_minor_only(
-            [
-                {"severity": "minor", "description": "nit: spacing"},
-                {"severity": "minor", "description": "nit: naming"},
-                {"severity": "MAJOR"},  # no description → filtered
-                {},
-            ],
-            iteration=1,
-        ) is True
 
 
 # ── Mechanical hedge detection ────────────────────────────────────────────────

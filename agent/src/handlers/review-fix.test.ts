@@ -105,6 +105,10 @@ vi.mock('./strategic-helpers.js', async (importOriginal) => {
   return { ...actual, writeFetchHelper: vi.fn() };
 });
 
+vi.mock('../utils/viewport-shot-download.js', () => ({
+  downloadViewportShots: vi.fn().mockReturnValue([]),
+}));
+
 vi.mock('fs', () => {
   const stub = {
     readFileSync: vi.fn().mockReturnValue(''),
@@ -139,10 +143,12 @@ import {
 import { computeReviewPromptFingerprint } from '../prompts/review-prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 import { resolveBuildConfig } from '../build-config.js';
+import * as promptMod from '../prompt.js';
 import { shouldFanOutReview, shouldFanOutFix } from '../constants.js';
 import { computePromptFingerprint, buildScopedLintOneliner, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { getFormatComplianceTelemetry, resetFormatComplianceTelemetry } from '../telemetry.js';
+import * as viewportShotMod from '../utils/viewport-shot-download.js';
 
 const BLUEPRINT_CONFIG = {
   directories: [
@@ -1275,7 +1281,7 @@ describe('handleReview — verdict file parsing', () => {
     expect(String(status.logs)).toContain('"verdict":"APPROVE"');
   });
 
-  it('includes reviewed_head_sha from git rev-parse HEAD in the augmented verdict JSON', async () => {
+  it('includes reviewed head and fetched base SHAs in the augmented verdict JSON', async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue(
       '{"verdict":"REQUEST_CHANGES","feedback":"a bug"}',
@@ -1286,6 +1292,7 @@ describe('handleReview — verdict file parsing', () => {
     // Simulate git rev-parse HEAD returning a SHA after clone.
     vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
       if (args[0] === 'rev-parse' && args[1] === 'HEAD') return 'abc123def456789';
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return 'base123def456789';
       return '';
     });
 
@@ -1295,8 +1302,11 @@ describe('handleReview — verdict file parsing', () => {
     );
 
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
-    const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; reviewed_head_sha?: string };
+    const verdictJson = JSON.parse(String(status.verdict_json)) as {
+      verdict: string; reviewed_head_sha?: string; reviewed_base_sha?: string;
+    };
     expect(verdictJson.reviewed_head_sha).toBe('abc123def456789');
+    expect(verdictJson.reviewed_base_sha).toBe('base123def456789');
     expect(verdictJson.verdict).toBe('REQUEST_CHANGES');
   });
 
@@ -3088,6 +3098,280 @@ describe('handleReview — delta-focus guidance (iteration ≥2)', () => {
       'token', 'owner', 'repo', null, statusRef(),
     );
     expect(lastReviewPrompt()).toContain(DELTA_MARKER);
+  });
+});
+
+// ── handleReview: exact-SHA follow-up delta ─────────────────────────────────
+describe('handleReview — exact-SHA delta execution', () => {
+  const REVIEW_TASK = { title: 'Review', description: '', project_context: {} };
+
+  function lastReviewPrompt(): string {
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    // Empty mocked output triggers the structured-verdict repair pass. The
+    // first call is the review prompt whose delta scope we are asserting.
+    return calls[0][0];
+  }
+
+  it('uses the supplied prior head as an exact two-dot diff and carries prior review context', async () => {
+    const priorHead = 'a'.repeat(40);
+    vi.mocked(promptMod.formatPlaybook).mockReturnValue('PLAYBOOK_CONTEXT');
+    vi.mocked(promptMod.formatProjectContext).mockReturnValue('PROJECT_CONTEXT');
+    vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('SELF_REVIEW_BLIND_SPOTS');
+    const reviewHistory = [{
+      iteration: 1,
+      feedback: 'Validate the null guard.',
+      issues: [{ severity: 'major', description: 'Missing null guard', file: 'agent/a.ts', line: 12 }],
+    }];
+    const fixerResponses = [{
+      issue_summary: 'Missing null guard', source_iteration: 1, response_type: 'alternative',
+      claim: 'Added an early return.', verify: ['npx vitest run agent/a.test.ts'],
+    }];
+
+    await handleReview(
+      'task-exact-delta',
+      { pr_number: 24, branch: 'feature/x', base_branch: 'main', delta_base_sha: priorHead },
+      {
+        ...REVIEW_TASK,
+        project_context: { project: 'context' },
+        playbook: { rule: 'avoid regressions' },
+        context: {
+          scope: 'medium', _planned_files: ['agent/a.ts'],
+          review_loop: { iteration: 2, review_history: reviewHistory, fix_agent_responses: fixerResponses },
+        },
+      },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expectCalledWith(indexMod.git, ['cat-file', '-e', `${priorHead}^{commit}`]);
+    expectCalledWith(indexMod.git, ['diff', '--name-status', `${priorHead}..HEAD`]);
+    expectCalledWith(indexMod.git, ['diff', '--shortstat', `${priorHead}..HEAD`]);
+    expect(vi.mocked(indexMod.git).mock.calls.some(([args]) =>
+      args[0] === 'fetch' && args.includes('+refs/heads/main:refs/remotes/origin/main'),
+    )).toBe(false);
+
+    const prompt = lastReviewPrompt();
+    expect(prompt).toContain(`git diff ${priorHead}..HEAD`);
+    expect(prompt).toContain(`Files changed in the exact review delta (${priorHead}..HEAD):`);
+    expect(prompt).toContain('Missing null guard');
+    expect(prompt).toContain('Added an early return.');
+    expect(prompt).toContain('Do not start a full base-branch/PR rescan');
+    expect(prompt).not.toContain('git diff origin/main...HEAD');
+    expect(prompt).not.toContain('PLAYBOOK_CONTEXT');
+    expect(prompt).not.toContain('PROJECT_CONTEXT');
+    expect(prompt).not.toContain('SELF_REVIEW_BLIND_SPOTS');
+  });
+
+  it('accepts delta_base_sha from task context when the payload omits it', async () => {
+    const priorHead = 'b'.repeat(40);
+    await handleReview(
+      'task-context-delta',
+      { pr_number: 25, branch: 'feature/x', base_branch: 'main' },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 2, delta_base_sha: priorHead } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expectCalledWith(indexMod.git, ['diff', '--name-status', `${priorHead}..HEAD`]);
+    expect(lastReviewPrompt()).toContain(`git diff ${priorHead}..HEAD`);
+  });
+
+  it('pins the delta review base from live PR metadata without fetching the base branch', async () => {
+    const priorHead = 'd'.repeat(40);
+    const currentBase = 'e'.repeat(40);
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('{"verdict":"APPROVE","feedback":"fixed"}');
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ title: 'PR title', body: 'PR body', base: { sha: currentBase } }),
+    });
+
+    await handleReview(
+      'task-delta-base-metadata',
+      { pr_number: 251, branch: 'feature/x', base_branch: 'main', delta_base_sha: priorHead },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 2 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { reviewed_base_sha?: string };
+    expect(verdictJson.reviewed_base_sha).toBe(currentBase);
+    expect(vi.mocked(indexMod.git).mock.calls.some(([args]) => args[0] === 'fetch')).toBe(false);
+  });
+
+  it('pins the delta review base from the backend review target', async () => {
+    const priorHead = 'd'.repeat(40);
+    const targetBase = 'c'.repeat(40);
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('{"verdict":"APPROVE","feedback":"fixed"}');
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ title: 'PR title', body: 'PR body' }),
+    });
+
+    await handleReview(
+      'task-delta-base-target',
+      { pr_number: 252, branch: 'feature/x', base_branch: 'main', delta_base_sha: priorHead },
+      {
+        ...REVIEW_TASK,
+        context: {
+          review_loop: {
+            iteration: 2,
+            review_target: { base_sha: targetBase, head_sha: 'f'.repeat(40) },
+          },
+        },
+      },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { reviewed_base_sha?: string };
+    expect(verdictJson.reviewed_base_sha).toBe(targetBase);
+    expect(vi.mocked(indexMod.git).mock.calls.some(([args]) => args[0] === 'fetch')).toBe(false);
+  });
+
+  it('does not fan out an exact delta review even when its changed-file list meets the full-review threshold', async () => {
+    const priorHead = 'f'.repeat(40);
+    const changedFiles = [
+      'M\tagent/src/a.ts', 'M\tagent/src/b.ts', 'M\tagent/src/c.ts',
+      'M\tadmin-ui/src/d.tsx', 'M\tadmin-ui/src/e.tsx',
+      'M\tbackend/app/f.py', 'M\tbackend/app/g.py', 'M\tbackend/app/h.py',
+    ].join('\n');
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) =>
+      args?.[0] === 'diff' && args[1] === '--name-status' ? changedFiles : '',
+    );
+    expect(shouldFanOutReview(changedFiles.split('\n').map(line => line.slice(2)), BLUEPRINT_CONFIG)).toBe(true);
+
+    await handleReview(
+      'task-delta-no-fanout',
+      { pr_number: 252, branch: 'feature/x', base_branch: 'main', delta_base_sha: priorHead },
+      {
+        ...REVIEW_TASK,
+        context: { review_loop: { iteration: 2 } },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(lastReviewPrompt()).not.toContain('Parallel review fan-out');
+  });
+
+  it('does not download full-review viewport screenshots for an exact delta review', async () => {
+    const priorHead = '9'.repeat(40);
+    await handleReview(
+      'task-delta-no-viewport-download',
+      {
+        pr_number: 253,
+        branch: 'feature/x',
+        base_branch: 'main',
+        delta_base_sha: priorHead,
+        viewport_shot_entries: [{ name: 'component-before.png' }],
+        viewport_source_task_id: 'task-fix',
+      },
+      {
+        ...REVIEW_TASK,
+        context: { review_loop: { iteration: 2 } },
+        project_metadata: { project_id: 'project-1' },
+      },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(viewportShotMod.downloadViewportShots).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the established full PR review when the exact SHA is unavailable', async () => {
+    const priorHead = 'c'.repeat(40);
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
+      if (args?.[0] === 'cat-file') throw new Error('missing object');
+      return '';
+    });
+
+    await handleReview(
+      'task-unavailable-delta',
+      { pr_number: 26, branch: 'feature/x', base_branch: 'main', delta_base_sha: priorHead },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 2 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expectCalledWith(indexMod.git, ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main', '--depth', '50']);
+    expectCalledWith(indexMod.git, ['diff', '--name-status', 'origin/main...HEAD']);
+    expect(lastReviewPrompt()).toContain('git diff origin/main...HEAD');
+    expect(lastReviewPrompt()).not.toContain(`git diff ${priorHead}..HEAD`);
+  });
+});
+
+// ── handleReview: completed-target deduplication ────────────────────────────
+describe('handleReview — cached completed verdict replay', () => {
+  const payload = { pr_number: 27, branch: 'feature/x', base_branch: 'main' };
+  const reviewTarget = {
+    project_id: 'project-1', pr_number: 27,
+    base_sha: 'f'.repeat(40), head_sha: 'a'.repeat(40),
+  };
+  const task = {
+    title: 'Review', description: '', project_context: {},
+    context: { review_loop: { review_target: reviewTarget } },
+  };
+
+  it('replays a validated cached verdict without cloning or invoking the model', async () => {
+    const cachedVerdict = JSON.stringify({
+      verdict: 'APPROVE', feedback: 'Already reviewed.',
+      reviewed_base_sha: reviewTarget.base_sha, reviewed_head_sha: reviewTarget.head_sha,
+    });
+    await handleReview(
+      'task-cached-review',
+      { ...payload, cached_verdict_json: cachedVerdict, cached_review_task_id: 'task-original-review' },
+      task,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(indexMod.runClaudeCode).not.toHaveBeenCalled();
+    expectCalledWith(indexMod.persistAndPostStatus, 'task-cached-review', {
+      task_id: 'task-cached-review',
+      status: 'COMPLETED',
+      logs: 'Reused completed review verdict from task task-original-review; no new model call was needed.',
+      verdict_json: cachedVerdict,
+    });
+  });
+
+  it('does not trust a malformed cached verdict and runs the normal review', async () => {
+    await handleReview(
+      'task-bad-cached-review',
+      { ...payload, cached_verdict_json: '{"verdict":"COMMENT"}' },
+      task,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(indexMod.runClaudeCode).toHaveBeenCalled();
+  });
+
+  it('does not trust a cached verdict without both stamped target SHAs', async () => {
+    const cachedVerdict = JSON.stringify({
+      verdict: 'APPROVE', feedback: 'Missing head provenance.',
+      reviewed_base_sha: reviewTarget.base_sha,
+    });
+    await handleReview(
+      'task-cache-missing-provenance',
+      { ...payload, cached_verdict_json: cachedVerdict },
+      task,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(indexMod.runClaudeCode).toHaveBeenCalled();
+  });
+
+  it('does not trust a cached verdict for a different base or head target', async () => {
+    const cachedVerdict = JSON.stringify({
+      verdict: 'APPROVE', feedback: 'Wrong target.',
+      reviewed_base_sha: reviewTarget.base_sha, reviewed_head_sha: 'b'.repeat(40),
+    });
+    await handleReview(
+      'task-cache-mismatched-provenance',
+      { ...payload, cached_verdict_json: cachedVerdict },
+      task,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(indexMod.runClaudeCode).toHaveBeenCalled();
   });
 });
 

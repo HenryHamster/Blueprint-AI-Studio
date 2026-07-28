@@ -170,38 +170,15 @@ def should_skip_initial_review(is_intermediate: bool, scope: str) -> tuple[bool,
     return (False, f"{scope} scope on intermediate branch: full review required")
 
 
-def is_first_pass_minor_only(issues: list | None, iteration: int = 1) -> bool:
-    """Whether every blocking finding from the initial review is minor-severity.
-
-    When this is True the spawned fix only addresses nits, so its completion
-    handler can skip the follow-up re-review (CI gates the merge instead),
-    saving one review iteration + one review-phase LLM call.
-
-    The predicate mirrors the inline computation that previously lived in
-    ``task_lifecycle.py`` (first pass, non-empty issues, every described issue
-    is minor severity — missing/None severity also counts as minor).
-
-    Pure / side-effect-free — unit-testable without a database.
-    """
-    if iteration != 1:
-        return False
-    if not issues:
-        return False
-    return all(
-        (i.get("severity", "minor") or "minor").lower() == "minor"
-        for i in issues
-        if i.get("description")
-    )
-
-
 def should_skip_rereview(
-    fix_reason: str, skip_rereview_minor_only: bool
+    fix_reason: str, rereview_waived: bool
 ) -> tuple[bool, str]:
     """Whether to skip re-review after a fix task completes.
 
     Skips when the fix addresses mechanical issues that don't change the
     review decision (CI failures, merge conflicts, migration repairs), or
-    when the initial review flagged only minor-severity issues.
+    when the reviewer explicitly waived follow-up review for an ordinary
+    code-review fix.
 
     Does NOT consider the security-scan override — a blocked scan halts the
     whole flow, which is a separate outcome from skip/re-review. The composite
@@ -209,8 +186,8 @@ def should_skip_rereview(
 
     Returns (skip, reason).
     """
-    if skip_rereview_minor_only:
-        return (True, "first-pass minor-only verdict: CI gates the merge")
+    if fix_reason == "code_review" and rereview_waived:
+        return (True, "reviewer waived follow-up review: CI gates the merge")
     if fix_reason in ("ci_failure", "merge_conflict", "migration_guard"):
         return (True, f"{fix_reason}: original review already approved; CI gates merge")
     return (False, f"{fix_reason}: re-review required")
@@ -315,7 +292,7 @@ def evaluate_auto_approve_small_main(
 #   can distinguish "do nothing / await approval" from "spawn re-review".
 def should_skip_re_review(
     fix_reason: str,
-    skip_rereview_minor_only: bool,
+    rereview_waived: bool,
     scan_blocked: bool,
 ) -> ReviewSkipDecision:
     """Composite re-review decision including the security-scan override.
@@ -324,7 +301,7 @@ def should_skip_re_review(
       - ``rule == "security_blocked"`` (skip=False) → the scan blocked the PR;
         the caller must NOT spawn a re-review nor park for CI. The task is
         already flagged for manual approval.
-      - ``skip == True`` → mechanical/minor-only fix; park for CI instead of
+      - ``skip == True`` → mechanical or reviewer-waived fix; park for CI instead of
         re-reviewing (rule names which mechanical reason fired).
       - ``skip == False, rule == "none"`` → spawn a fresh re-review.
     """
@@ -334,8 +311,12 @@ def should_skip_re_review(
             "security scan blocked fix output; manual approval required",
             "security_blocked",
         )
-    skip, reason = should_skip_rereview(fix_reason, skip_rereview_minor_only)
+    skip, reason = should_skip_rereview(fix_reason, rereview_waived)
     if not skip:
         return ReviewSkipDecision(False, reason, "none")
-    rule = "minor_only" if skip_rereview_minor_only else fix_reason
+    rule = (
+        "reviewer_waived"
+        if rereview_waived and fix_reason == "code_review"
+        else fix_reason
+    )
     return ReviewSkipDecision(True, reason, rule)

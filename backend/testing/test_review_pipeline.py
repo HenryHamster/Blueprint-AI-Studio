@@ -73,6 +73,233 @@ from app.review_pipeline import (
 from testing.factories import make_project, make_task
 
 
+def _review_target(project_id, pr_number: int, base_sha: str, head_sha: str) -> dict:
+    return {
+        "project_id": str(project_id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_active_review_target_is_reused_across_chains(db_session, mocker):
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 701, "branch": "feat/x"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    await _persist(db_session, source)
+    target = _review_target(project.id, 701, "base-701", "head-701")
+    active_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 701,
+                # A separate pipeline chain can legitimately reach the same
+                # project/PR/base/head target. Immutable target dedup must
+                # share that active review rather than dispatching another.
+                "original_task_id": str(uuid.uuid4()),
+            }
+        ],
+        context={"review_loop": {"review_target": target}},
+    )
+    await _persist(db_session, active_review)
+
+    reused, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        701,
+        "feat/x",
+        "main",
+        original_task_id=str(source.id),
+        review_target=target,
+    )
+
+    assert created is False
+    assert reused is not None and reused.id == active_review.id
+
+
+@pytest.mark.asyncio
+async def test_different_active_review_target_is_not_reused(db_session, mocker):
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 702, "branch": "feat/x"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    await _persist(db_session, source)
+    requested = _review_target(project.id, 702, "base-702", "head-new")
+    active_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 702,
+                "original_task_id": str(source.id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "review_target": _review_target(
+                    project.id, 702, "base-702", "head-old"
+                )
+            }
+        },
+    )
+    await _persist(db_session, active_review)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        702,
+        "feat/x",
+        "main",
+        original_task_id=str(source.id),
+        review_target=requested,
+    )
+
+    assert created is True
+    assert spawned is not None and spawned.id != active_review.id
+
+
+@pytest.mark.asyncio
+async def test_completed_exact_target_replays_structured_verdict(db_session, mocker):
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 703, "branch": "feat/x"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    await _persist(db_session, source)
+    target = _review_target(project.id, 703, "base-703", "head-703")
+    cached = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "fix this",
+            "issues": [{"severity": "major", "description": "broken"}],
+            "reviewed_base_sha": "base-703",
+            "reviewed_head_sha": "head-703",
+            "requires_rereview": True,
+        }
+    )
+    completed_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        idempotency_key=(
+            f"review_pipeline:{project.id}:cached-chain:703:review:1:"
+            "base-703:head-703"
+        ),
+        payloads=[{"type": "review", "pr_number": 703}],
+        context={
+            "review_loop": {"review_target": target},
+            "review_result": {
+                "structured": True,
+                "verdict": "REQUEST_CHANGES",
+                "verdict_json": cached,
+            },
+        },
+    )
+    await _persist(db_session, completed_review)
+    # The reusable result must not disappear merely because unrelated completed
+    # tasks were created later in this project.
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "pr_number": 800 + index}],
+            )
+            for index in range(51)
+        ]
+    )
+    await db_session.commit()
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        703,
+        "feat/x",
+        "main",
+        original_task_id=str(source.id),
+        review_target=target,
+        delta_base_sha="reviewed-before-fix",
+    )
+
+    assert created is True and spawned is not None
+    payload = spawned.first_payload
+    assert payload["cached_verdict_json"] == cached
+    assert payload["cached_review_task_id"] == str(completed_review.id)
+    assert payload["delta_base_sha"] == "reviewed-before-fix"
+
+
+@pytest.mark.asyncio
+async def test_malformed_or_stale_completed_verdict_is_not_replayed(db_session, mocker):
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 704, "branch": "feat/x"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    await _persist(db_session, source)
+    target = _review_target(project.id, 704, "base-704", "head-live")
+    completed_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        idempotency_key=(
+            f"review_pipeline:{project.id}:cached-chain:704:review:1:"
+            "base-704:head-live"
+        ),
+        payloads=[{"type": "review", "pr_number": 704}],
+        context={
+            "review_loop": {"review_target": target},
+            "review_result": {
+                "structured": True,
+                "verdict": "APPROVE",
+                # The persisted target matches, but the signed result does not.
+                "verdict_json": json.dumps(
+                    {
+                        "verdict": "APPROVE",
+                        "reviewed_base_sha": "base-stale",
+                        "reviewed_head_sha": "head-live",
+                    }
+                ),
+            },
+        },
+    )
+    await _persist(db_session, completed_review)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        704,
+        "feat/x",
+        "main",
+        original_task_id=str(source.id),
+        review_target=target,
+    )
+
+    assert created is True and spawned is not None
+    assert "cached_verdict_json" not in spawned.first_payload
+
+
 # ── merge-conflict fix prompt ───────────────────────────────────────────────
 
 
@@ -18754,10 +18981,10 @@ class TestShouldSkipInitialReview:
 
 
 class TestShouldSkipRereview:
-    def test_minor_only_first_pass_skips(self):
+    def test_reviewer_waiver_skips(self):
         skip, reason = should_skip_rereview("code_review", True)
         assert skip is True
-        assert "minor-only" in reason
+        assert "waived" in reason
 
     def test_ci_failure_skips(self):
         skip, reason = should_skip_rereview("ci_failure", False)
@@ -18777,7 +19004,6 @@ class TestShouldSkipRereview:
         assert skip is False
         assert "re-review required" in reason
 
-    def test_minor_only_overrides_code_review(self):
-        # skip_rereview_minor_only takes priority over fix_reason
+    def test_reviewer_waiver_applies_only_to_code_review(self):
         skip, _ = should_skip_rereview("code_review", True)
         assert skip is True
