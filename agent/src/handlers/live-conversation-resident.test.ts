@@ -151,6 +151,71 @@ describe('live conversation coordinator', () => {
     }
   });
 
+  it('cannot bind a late completion from an interrupted Fast child to the next turn', async () => {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-stale-turn-'));
+    const launches: Array<{ receiptPath: string; stageDir: string }> = [];
+    let turnCalls = 0;
+    const adapter: ForegroundResidentAdapter = {
+      id: 'fake', validation: 'qualified',
+      start({ mcpConfigPath }) {
+        const config = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8')) as {
+          mcpServers: { call: { env: { CALL_TURN_RECEIPT_PATH: string; CALL_LOCAL_STAGE_DIR: string } } };
+        };
+        const env = config.mcpServers.call.env;
+        launches.push({ receiptPath: env.CALL_TURN_RECEIPT_PATH, stageDir: env.CALL_LOCAL_STAGE_DIR });
+        return {
+          isAlive: () => true,
+          close: () => undefined,
+          onEvent: () => undefined,
+          sendTurn: async () => {
+            turnCalls += 1;
+            if (turnCalls === 1) {
+              const receipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8'));
+              fs.mkdirSync(env.CALL_LOCAL_STAGE_DIR, { recursive: true });
+              fs.writeFileSync(path.join(env.CALL_LOCAL_STAGE_DIR, 'complete-early-a.json'), JSON.stringify({
+                receipt, spoken_text: 'Abandoned A completion.', durable: true,
+              }));
+              return { interrupted: true, timedOut: false };
+            }
+            // B's receipt is installed now. Simulate A's still-alive MCP call
+            // completing late, before B writes its own accepted completion.
+            const staleLaunch = launches[0];
+            const staleReceipt = JSON.parse(fs.readFileSync(staleLaunch.receiptPath, 'utf8'));
+            fs.mkdirSync(staleLaunch.stageDir, { recursive: true });
+            fs.writeFileSync(path.join(staleLaunch.stageDir, 'complete-00-late-a.json'), JSON.stringify({
+              receipt: staleReceipt, spoken_text: 'Stale A completion.', durable: true,
+            }));
+            const currentReceipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8'));
+            fs.mkdirSync(env.CALL_LOCAL_STAGE_DIR, { recursive: true });
+            fs.writeFileSync(path.join(env.CALL_LOCAL_STAGE_DIR, 'complete-10-current-b.json'), JSON.stringify({
+              receipt: currentReceipt, spoken_text: 'Current B completion.', durable: true,
+            }));
+            return { interrupted: false, timedOut: false };
+          },
+        } as unknown as import('../providers/resident-session.js').ResidentSession;
+      },
+    };
+    const controller = new ForegroundCallController({
+      adapter, runtimeRoot: runtime, environment: { PATH: process.env.PATH },
+    });
+    try {
+      const coordinator = new CallCoordinatorState();
+      coordinator.updateLease(parseCallLeaseProjection(lease));
+      const turnA = coordinator.beginPublicTurn('message-a');
+      const resultA = await controller.dispatch(turnA, 'turn A');
+      expect(resultA.completion).toBeNull();
+      const turnB = coordinator.beginPublicTurn('message-b');
+      const resultB = await controller.dispatch(turnB, 'turn B');
+      expect(resultB.completion?.spoken_text).toBe('Current B completion.');
+      expect(launches).toHaveLength(2);
+      expect(launches[0].receiptPath).not.toBe(launches[1].receiptPath);
+      expect(launches[0].stageDir).not.toBe(launches[1].stageDir);
+    } finally {
+      controller.close();
+      fs.rmSync(runtime, { recursive: true, force: true });
+    }
+  });
+
   it('lets authenticated media/speech wake the coordinator without waiting for the poll timeout', async () => {
     const gate = new CallCoordinatorWakeGate();
     const waiting = gate.wait(10_000);

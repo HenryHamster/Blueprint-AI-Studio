@@ -48,6 +48,7 @@ from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
     _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
+    acquire_resident_call_lease,
     new_session_id,
     read_resident_session,
     resident_call_is_active,
@@ -382,6 +383,44 @@ def test_nested_call_projection_hides_actor_account_and_playout_receipts():
     assert "actor_user_id" not in snapshot
     assert "account_id" not in snapshot
     assert "playout_receipts" not in snapshot
+
+
+@pytest.mark.asyncio
+async def test_call_lease_reuse_rechecks_owner_under_project_lock(db_session):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "ss-call-owner-race",
+            "status": "active",
+            "stop_requested": False,
+            "call": {
+                "call_id": "call-owner-race",
+                "generation": 2,
+                "status": "active",
+                "actor_user_id": TEST_USER_ID,
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await acquire_resident_call_lease(
+            db_session,
+            project,
+            operator_user_id="different-project-member",
+            account_id="pool-account",
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Only the call owner may reconnect"
+    await db_session.refresh(project)
+    call = read_resident_session(project.vision)["call"]
+    assert call["actor_user_id"] == TEST_USER_ID
+    assert call["call_id"] == "call-owner-race"
 
 
 def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(

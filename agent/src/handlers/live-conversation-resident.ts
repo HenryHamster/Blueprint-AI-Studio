@@ -408,8 +408,9 @@ function displaysFromStaged(value: unknown): StagedDisplayBlocks {
  */
 export class ForegroundCallController {
   private readonly runtimeDir: string;
-  private readonly stageDir: string;
-  private readonly receiptPath: string;
+  private stageDir: string;
+  private receiptPath: string;
+  private sessionGeneration = 0;
   private profile: ForegroundResidentProfile | null = null;
   private tool: ProvisionedCallResidentTool | null = null;
   private session: ResidentSession | null = null;
@@ -417,8 +418,8 @@ export class ForegroundCallController {
   constructor(private readonly options: ForegroundCallControllerOptions) {
     this.runtimeDir = fs.mkdtempSync(path.join(options.runtimeRoot ?? os.tmpdir(), 'blueprint-call-coordinator-'));
     fs.chmodSync(this.runtimeDir, 0o700);
-    this.stageDir = path.join(this.runtimeDir, 'fast-stage');
-    this.receiptPath = path.join(this.runtimeDir, 'turn-receipt.json');
+    this.stageDir = path.join(this.runtimeDir, 'fast-stage-0');
+    this.receiptPath = path.join(this.runtimeDir, 'turn-receipt-0.json');
   }
 
   isAlive(): boolean { return this.session?.isAlive() === true; }
@@ -433,6 +434,12 @@ export class ForegroundCallController {
       throw new Error(`Fast adapter ${this.options.adapter.id} is not qualification-approved for calls`);
     }
     this.closeSessionOnly();
+    this.sessionGeneration += 1;
+    // A retired child may remain alive during its SIGTERM/SIGKILL grace period.
+    // Never let that process observe a later turn's receipt: each process
+    // generation gets paths that are immutable for its whole lifetime.
+    this.stageDir = path.join(this.runtimeDir, `fast-stage-${this.sessionGeneration}`);
+    this.receiptPath = path.join(this.runtimeDir, `turn-receipt-${this.sessionGeneration}.json`);
     this.profile = createForegroundResidentProfile(this.options.environment ?? process.env);
     this.tool = provisionCallResidentTool(this.profile.cwd, 'fast', {
       receiptPath: this.receiptPath,
@@ -486,6 +493,16 @@ export class ForegroundCallController {
     const current = this.session;
     if (!current) throw new Error('Fast Resident failed to start');
     const result = await current.sendTurn(prompt);
+    // ResidentSession can force-settle an interrupted/stalled turn while its
+    // child still runs. The abandoned generation owns no deliverable intents:
+    // retire it before reading its stage, and let ensureStarted() provision
+    // distinct receipt/stage paths before any later turn.
+    if (result.interrupted || result.timedOut) {
+      if (this.session === current) this.closeSessionOnly();
+      return {
+        receipt, result, completion: null, workdayRequests: [], displayBlocks: [],
+      };
+    }
     const completions = this.drainStage('complete-', completionFromStaged, receipt);
     const requests = this.drainStage('request-', requestFromStaged, receipt);
     const displays = this.drainStage('display-', displaysFromStaged, receipt);

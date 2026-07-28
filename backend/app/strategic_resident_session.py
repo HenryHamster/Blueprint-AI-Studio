@@ -515,6 +515,11 @@ async def acquire_resident_call_lease(
             raise HTTPException(status_code=409, detail="An active Workday Resident is required")
         existing = resident.get(RESIDENT_CALL_KEY)
         if resident_call_is_active(existing, now=now):
+            if str(existing.get("actor_user_id")) != str(operator_user_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only the call owner may reconnect",
+                )
             holder["call"] = dict(existing)
             return
         if isinstance(existing, dict) and existing.get("status") == CALL_STATUS_ACTIVE:
