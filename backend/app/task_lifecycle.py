@@ -65,7 +65,6 @@ from app.review_pipeline import (
     fix_all_occurrences_directive,
     reconciled_approve_markers,
     evaluate_auto_approve_small_main,
-    is_first_pass_minor_only,
     should_skip_initial_review,
     should_skip_re_review,
 )
@@ -208,6 +207,49 @@ def _resolve_fallback_verdict(verdict_text: str) -> str | None:
     if approve_idx > rc_idx:
         return "APPROVE"
     return "REQUEST_CHANGES"
+
+
+async def _resolve_live_review_target(
+    task: Task,
+    session: AsyncSession,
+    pr_number: int,
+) -> dict[str, str | int] | None:
+    """Return the PR's current immutable review target, when GitHub is reachable.
+
+    Target-aware review deduplication is defence in depth, so a transient
+    metadata lookup must not block the normal review lifecycle.  Callers pass
+    ``None`` on failure and retain the legacy same-chain guard in that case.
+    """
+    try:
+        from app.github import get_pull_request
+        from app.routers.agent import get_github_token_for_task
+
+        token, owner, repo = await get_github_token_for_task(task.id, session)
+        pr_data = await get_pull_request(
+            token,
+            owner,
+            repo,
+            pr_number,
+            project_id=str(task.project_id),
+        )
+        base_sha = str(pr_data.get("base", {}).get("sha", ""))
+        head_sha = str(pr_data.get("head", {}).get("sha", ""))
+        if base_sha and head_sha:
+            return {
+                "project_id": str(task.project_id),
+                "pr_number": int(pr_number),
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+            }
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "[REVIEW PIPELINE] Could not resolve immutable review target for "
+            "PR #%s (task %s): %s — using legacy same-chain dedup",
+            pr_number,
+            task.id,
+            exc,
+        )
+    return None
 
 
 class PostCommitLocked(Exception):
@@ -2187,6 +2229,12 @@ async def _process_post_commit(
                                             pr_number, base_branch
                                         )
                                     )
+                                elif recovery_type == "review":
+                                    spawn_kwargs["review_target"] = (
+                                        await _resolve_live_review_target(
+                                            task, session, pr_number
+                                        )
+                                    )
                                 recovery_task, was_created = await _spawn_pipeline_task(
                                     task,
                                     recovery_type,
@@ -2242,6 +2290,9 @@ async def _process_post_commit(
                                 base_branch,
                                 original_prompt=original_prompt,
                                 original_task_id=str(task.id),
+                                review_target=await _resolve_live_review_target(
+                                    task, session, pr_number
+                                ),
                             )
                             if fb_was_created:
                                 logger.info(
@@ -2423,6 +2474,9 @@ async def _process_post_commit(
                         base_branch,
                         original_prompt=original_prompt,
                         original_task_id=str(task.id),
+                        review_target=await _resolve_live_review_target(
+                            task, session, pr_number
+                        ),
                     )
                     if review_task:
                         if task.requires_approval:
@@ -2458,6 +2512,14 @@ async def _process_post_commit(
                     "original_task_id", ""
                 ) or task_payload.get("original_task_id", "")
                 original_prompt = task_payload.get("original_prompt", "")
+                # A cached replay is only valid for the exact immutable target
+                # that produced it. Unlike an ordinary live reviewer result, it
+                # must never use the bounded stale-target escape hatch below:
+                # doing so would let an old cached APPROVE merge a changed PR.
+                is_cached_verdict_replay = bool(
+                    task_payload.get("cached_verdict_json")
+                    and task_payload.get("cached_review_task_id")
+                )
 
                 if not pr_number or not branch:
                     logger.info(
@@ -2526,6 +2588,10 @@ async def _process_post_commit(
                 verdict_unparseable = False
                 review_was_parallelized = False
                 reviewed_head_sha: str = ""
+                reviewed_base_sha: str = ""
+                # Missing or malformed output deliberately requires a follow-up
+                # review. Only a literal JSON boolean ``false`` is a waiver.
+                requires_rereview = True
 
                 # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
                 if payload.verdict_json:
@@ -2550,6 +2616,13 @@ async def _process_post_commit(
                                 vj.get("review_was_parallelized", False)
                             )
                             reviewed_head_sha = str(vj.get("reviewed_head_sha") or "")
+                            reviewed_base_sha = str(vj.get("reviewed_base_sha") or "")
+                            if vj.get("verdict") == "REQUEST_CHANGES":
+                                requires_rereview = (
+                                    vj["requires_rereview"]
+                                    if isinstance(vj.get("requires_rereview"), bool)
+                                    else True
+                                )
                             verdict_parsed = True
                             logger.info(
                                 f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}"
@@ -2572,6 +2645,18 @@ async def _process_post_commit(
                                 candidate.get("issues", [])
                                 if isinstance(candidate.get("issues"), list)
                                 else []
+                            )
+                            if candidate.get("verdict") == "REQUEST_CHANGES":
+                                requires_rereview = (
+                                    candidate["requires_rereview"]
+                                    if isinstance(candidate.get("requires_rereview"), bool)
+                                    else True
+                                )
+                            reviewed_head_sha = str(
+                                candidate.get("reviewed_head_sha") or ""
+                            )
+                            reviewed_base_sha = str(
+                                candidate.get("reviewed_base_sha") or ""
                             )
                             verdict_parsed = True
                     except Exception as e:
@@ -2888,6 +2973,38 @@ async def _process_post_commit(
                 }
                 session.add(task)
 
+                def _record_structured_review_result(
+                    target: dict[str, str | int] | None,
+                ) -> None:
+                    """Persist only replay-safe structured results for exact-target reuse."""
+                    if not verdict_parsed or verdict_unparseable or not target:
+                        return
+                    replay_verdict = {
+                        "verdict": verdict,
+                        "feedback": feedback,
+                        "issues": issues,
+                        "investigated_files": investigated_files,
+                        # Cache only a verdict whose agent-stamped SHAs matched
+                        # the live target; preserve both for replay validation.
+                        "reviewed_head_sha": target["head_sha"],
+                        "reviewed_base_sha": target["base_sha"],
+                    }
+                    if verdict == "REQUEST_CHANGES":
+                        replay_verdict["requires_rereview"] = requires_rereview
+                    task.context = {
+                        **(task.context or {}),
+                        "review_result": {
+                            "structured": True,
+                            "verdict": verdict,
+                            "verdict_json": json.dumps(replay_verdict),
+                        },
+                        "review_loop": {
+                            **review_loop,
+                            "review_target": target,
+                        },
+                    }
+                    session.add(task)
+
                 action_taken = False
                 head_sha = ""
                 if verdict == "APPROVE":
@@ -3200,6 +3317,103 @@ async def _process_post_commit(
                         # post-cutover it is the promotion / hotfix-rollup
                         # target, and a merge to main must never bypass CI.
                         head_sha = pr_data.get("head", {}).get("sha", "")
+                        live_base_sha = str(pr_data.get("base", {}).get("sha", ""))
+                        approve_target_is_stale = (
+                            (
+                                reviewed_head_sha
+                                and head_sha
+                                and reviewed_head_sha != head_sha
+                            )
+                            or (
+                                reviewed_base_sha
+                                and reviewed_head_sha
+                                and live_base_sha
+                                and reviewed_base_sha != live_base_sha
+                            )
+                        )
+                        if approve_target_is_stale:
+                            stale_discard_count = int(
+                                (task.context or {}).get(
+                                    "stale_head_consecutive_discards", 0
+                                )
+                            )
+                            # Do not let an APPROVE issued for a different
+                            # comparison range enter CI/merge lifecycle. Mirror
+                            # the REQUEST_CHANGES stale-target handoff below;
+                            # the bounded second-discard escape hatch remains
+                            # for a PR that is actively changing underneath us.
+                            if stale_discard_count < 2 or is_cached_verdict_replay:
+                                if not (task.context or {}).get("_review_stale_head"):
+                                    task.context = {
+                                        **(task.context or {}),
+                                        "stale_head_consecutive_discards": stale_discard_count
+                                        + 1,
+                                        "_review_stale_head": True,
+                                    }
+                                    flag_modified(task, "context")
+                                    task.status = TaskStatus.COMPLETED
+                                    task.latest_status_message = (
+                                        f"Stale-target approval discarded for PR #{pr_number} "
+                                        f"(reviewed {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
+                                        f"now {live_base_sha[:8]}..{head_sha[:8]}) — "
+                                        "respawning fresh review"
+                                    )
+                                    session.add(task)
+                                    fresh_review, _ = await _spawn_pipeline_task(
+                                        task,
+                                        "review",
+                                        session,
+                                        pr_number,
+                                        branch,
+                                        base_branch,
+                                        original_task_id=original_task_id,
+                                        review_target={
+                                            "project_id": str(task.project_id),
+                                            "pr_number": int(pr_number),
+                                            "base_sha": live_base_sha,
+                                            "head_sha": head_sha,
+                                        }
+                                        if live_base_sha and head_sha
+                                        else None,
+                                    )
+                                    if fresh_review:
+                                        logger.info(
+                                            "[REVIEW PIPELINE] Discarded stale-target "
+                                            "approval for PR #%s; spawned review %s",
+                                            pr_number,
+                                            fresh_review.id,
+                                        )
+                                # A post-commit retry can re-enter after this
+                                # task already spawned its replacement. Cached
+                                # replays must stop safely rather than falling
+                                # through to the ordinary escape hatch.
+                                await session.commit()
+                                return {"status": "accepted"}
+                            logger.warning(
+                                "[REVIEW PIPELINE] PR #%s: stale-target approval "
+                                "reached discard escape hatch; continuing without "
+                                "caching (reviewed=%s..%s, live=%s..%s)",
+                                pr_number,
+                                reviewed_base_sha[:8],
+                                reviewed_head_sha[:8],
+                                live_base_sha[:8],
+                                head_sha[:8],
+                            )
+                        if (
+                            reviewed_head_sha == head_sha
+                            and reviewed_base_sha
+                            == live_base_sha
+                        ):
+                            _record_structured_review_result(
+                                {
+                                    "project_id": str(task.project_id),
+                                    "pr_number": int(pr_number),
+                                    "base_sha": live_base_sha,
+                                    "head_sha": head_sha,
+                                }
+                                if head_sha and live_base_sha
+                                else None
+                            )
                         project = (
                             await session.get(Project, task.project_id)
                             if task.project_id
@@ -4611,6 +4825,7 @@ async def _process_post_commit(
                     ci_errors_text = ""
                     ci_check: dict | None = None
                     head_sha = ""
+                    base_sha = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(
                             task.id, session
@@ -4619,6 +4834,7 @@ async def _process_post_commit(
                             gh_token, owner, repo, pr_number
                         )
                         head_sha = pr_data.get("head", {}).get("sha", "")
+                        base_sha = str(pr_data.get("base", {}).get("sha", ""))
                         if head_sha:
                             ci_check = await get_check_runs_cached(
                                 gh_token, owner, repo, head_sha
@@ -4633,18 +4849,26 @@ async def _process_post_commit(
                             exc_info=True,
                         )
 
-                    # Stale-head guard: the review ran against an older PR head than
-                    # the current one. Discard the verdict and respawn a fresh review
-                    # so the fix isn't guided by findings on code that's already changed.
-                    # Backward compat: old verdicts without reviewed_head_sha are treated
-                    # as current-head (no action).
-                    if reviewed_head_sha and head_sha and reviewed_head_sha != head_sha:
+                    # Stale-target guard: the review ran against a different PR
+                    # base or head than the current one. Discard the verdict and
+                    # respawn a fresh review so lifecycle actions are not guided by
+                    # a diff whose comparison range has changed. Backward compat:
+                    # old verdicts without either reviewed SHA are treated as current.
+                    if (
+                        (reviewed_head_sha and head_sha and reviewed_head_sha != head_sha)
+                        or (
+                            reviewed_base_sha
+                            and reviewed_head_sha
+                            and base_sha
+                            and reviewed_base_sha != base_sha
+                        )
+                    ):
                         _stale_discard_count = int(
                             (task.context or {}).get(
                                 "stale_head_consecutive_discards", 0
                             )
                         )
-                        if _stale_discard_count < 2:
+                        if _stale_discard_count < 2 or is_cached_verdict_replay:
                             # Discard: mark this review as stale, respawn fresh review.
                             # _review_stale_head: underscore-prefix so it is NOT propagated
                             # to the fresh review task (only exempts THIS discarded review
@@ -4666,15 +4890,15 @@ async def _process_post_commit(
                                 flag_modified(task, "context")
                                 task.status = TaskStatus.COMPLETED
                                 task.latest_status_message = (
-                                    f"Stale-head review discarded for PR #{pr_number} "
-                                    f"(reviewed {reviewed_head_sha[:8]}, "
-                                    f"head is now {head_sha[:8]}) — respawning fresh review"
+                                    f"Stale-target review discarded for PR #{pr_number} "
+                                    f"(reviewed {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
+                                    f"now {base_sha[:8]}..{head_sha[:8]}) — respawning fresh review"
                                 )
                                 session.add(task)
                                 logger.warning(
-                                    f"[REVIEW PIPELINE] PR #{pr_number}: stale-head verdict "
-                                    f"discarded (reviewed={reviewed_head_sha[:8]}, "
-                                    f"live={head_sha[:8]}) — respawning review "
+                                    f"[REVIEW PIPELINE] PR #{pr_number}: stale-target verdict "
+                                    f"discarded (reviewed={reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
+                                    f"live={base_sha[:8]}..{head_sha[:8]}) — respawning review "
                                     f"(discard #{_stale_discard_count + 1})"
                                 )
                                 fresh_review, _ = await _spawn_pipeline_task(
@@ -4685,6 +4909,14 @@ async def _process_post_commit(
                                     branch,
                                     base_branch,
                                     original_task_id=original_task_id,
+                                    review_target={
+                                        "project_id": str(task.project_id),
+                                        "pr_number": int(pr_number),
+                                        "base_sha": base_sha,
+                                        "head_sha": head_sha,
+                                    }
+                                    if base_sha and head_sha
+                                    else None,
                                 )
                                 if fresh_review:
                                     logger.info(
@@ -4695,17 +4927,37 @@ async def _process_post_commit(
                             await session.commit()
                             return {"status": "accepted"}
                         else:
-                            # 2nd consecutive stale-head: accept verdict, annotate it.
+                            # 2nd consecutive stale target: accept verdict, annotate it.
                             _stale_note = (
-                                f"_(Reviewer judged head {reviewed_head_sha[:8]}; "
-                                f"PR head is now {head_sha[:8]}.)_\n\n"
+                                f"_(Reviewer judged {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}; "
+                                f"PR is now {base_sha[:8]}..{head_sha[:8]}.)_\n\n"
                             )
                             feedback = _stale_note + feedback
                             logger.warning(
                                 f"[REVIEW PIPELINE] PR #{pr_number}: 2nd consecutive "
-                                f"stale-head discard — accepting verdict with annotation "
-                                f"(reviewed={reviewed_head_sha[:8]}, live={head_sha[:8]})"
+                                f"stale-target discard — accepting verdict with annotation "
+                                f"(reviewed={reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
+                                f"live={base_sha[:8]}..{head_sha[:8]})"
                             )
+
+                    # A cached verdict must have evaluated this exact head.
+                    # The stale-head safety valve above can eventually accept a
+                    # stale result to keep the live workflow moving, but it must
+                    # never make that result reusable on a later dispatch.
+                    if (
+                        reviewed_head_sha == head_sha
+                        and reviewed_base_sha == base_sha
+                    ):
+                        _record_structured_review_result(
+                            {
+                                "project_id": str(task.project_id),
+                                "pr_number": int(pr_number),
+                                "base_sha": base_sha,
+                                "head_sha": head_sha,
+                            }
+                            if base_sha and head_sha
+                            else None
+                        )
 
                     # CI vs reviewer build-gate disagreement detector. When the
                     # reviewer flags build/lint complaints but CI shows the
@@ -4772,15 +5024,6 @@ async def _process_post_commit(
                         fix_prompt_text = (
                             f"{fix_all_occurrences_directive()}{fix_prompt_text}"
                         )
-                    # First-pass minor-only verdict: when every blocking finding
-                    # from the initial review is minor-severity, the spawned fix
-                    # only addresses nits. Mark the fix so its completion handler
-                    # skips the follow-up re-review (CI gates the merge instead),
-                    # saving one review iteration + one review-phase LLM call.
-                    review_iteration = review_loop.get("iteration", 1)
-                    first_attempt_minor_only = is_first_pass_minor_only(
-                        issues, review_iteration
-                    )
                     fix_task, _ = await _spawn_pipeline_task(
                         task,
                         "fix",
@@ -4794,7 +5037,8 @@ async def _process_post_commit(
                         current_feedback=feedback,
                         current_issues=issues,
                         investigated_files=investigated_files,
-                        skip_rereview_minor_only=first_attempt_minor_only,
+                        rereview_waived=not requires_rereview,
+                        reviewed_head_sha=reviewed_head_sha or head_sha,
                     )
                     if fix_task:
                         logger.info(
@@ -4937,9 +5181,6 @@ async def _process_post_commit(
                                             task_ctx[
                                                 "_first_attempt_rejection_categories"
                                             ] = rejection_cats
-                                            task_ctx["_first_attempt_minor_only"] = (
-                                                first_attempt_minor_only
-                                            )
                                         existing_all = dict(
                                             task_ctx.get(
                                                 "_all_iterations_rejection_categories"
@@ -5024,6 +5265,7 @@ async def _process_post_commit(
                 # (close+reopen to force GitHub to recompute mergeable=None).
                 # Gating on merged==True only prevents silently dropping the
                 # re-review handoff during that brief closed window.
+                rereview_target: dict[str, str | int] | None = None
                 try:
                     (
                         gh_token_check,
@@ -5033,6 +5275,15 @@ async def _process_post_commit(
                     pr_data_check = await get_pull_request(
                         gh_token_check, owner_check, repo_check, pr_number
                     )
+                    _rr_head_sha = str(pr_data_check.get("head", {}).get("sha", ""))
+                    _rr_base_sha = str(pr_data_check.get("base", {}).get("sha", ""))
+                    if _rr_head_sha and _rr_base_sha:
+                        rereview_target = {
+                            "project_id": str(task.project_id),
+                            "pr_number": int(pr_number),
+                            "base_sha": _rr_base_sha,
+                            "head_sha": _rr_head_sha,
+                        }
                     if pr_data_check.get("merged"):
                         logger.info(
                             f"[REVIEW PIPELINE] PR #{pr_number} already merged — skipping fix re-review for task {task.id}"
@@ -5091,8 +5342,9 @@ async def _process_post_commit(
                     await session.commit()
 
                 fix_reason = review_loop.get("fix_reason", "code_review")
-                skip_rereview_minor_only = bool(
-                    review_loop.get("skip_rereview_minor_only")
+                rereview_waived = (
+                    fix_reason == "code_review"
+                    and review_loop.get("rereview_waived") is True
                 )
                 # Skip re-review for fixes whose origin doesn't add review-worthy
                 # logic on top of an already-decided merge gate:
@@ -5108,15 +5360,15 @@ async def _process_post_commit(
                 #                   repair may drop already-landed semantic work
                 #                   or renumber genuinely new schema work.
                 #                   Wait for CI then merge.
-                #   - minor-only first-pass verdict → the fix only addressed
-                #                   minor nits; a re-review would near-certainly
-                #                   approve, so spend CI as the only gate.
+                #   - explicit reviewer waiver → the reviewer delegated closure
+                #                   of this ordinary code-review fix to the fixer
+                #                   and normal CI; it is not a mechanical proof.
                 #   - security scan blocked → halt and wait for manual approval;
                 #                   neither skip-to-CI nor re-review is spawned.
                 # The full policy (including the scan-blocked override) is owned by
                 # review_policy.should_skip_re_review.
                 _rr_decision = should_skip_re_review(
-                    fix_reason, skip_rereview_minor_only, scan_blocked
+                    fix_reason, rereview_waived, scan_blocked
                 )
                 if _rr_decision.rule == "security_blocked":
                     # Scan blocked the fix output; task already flagged for manual
@@ -5147,7 +5399,7 @@ async def _process_post_commit(
                     elif fix_reason == "migration_guard":
                         label = "migration-guard fix"
                     else:
-                        label = "minor-nit fix"
+                        label = "reviewer-waived fix"
                     task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {_rr_decision.reason})"
                     session.add(task)
                     await session.commit()
@@ -5164,6 +5416,8 @@ async def _process_post_commit(
                         branch,
                         base_branch,
                         original_task_id=original_task_id,
+                        delta_base_sha=str(review_loop.get("reviewed_head_sha") or ""),
+                        review_target=rereview_target,
                     )
                     if review_task:
                         logger.info(
@@ -5215,6 +5469,8 @@ async def _process_post_commit(
                                 branch,
                                 base_branch,
                                 original_task_id=original_task_id,
+                                delta_base_sha=str(review_loop.get("reviewed_head_sha") or ""),
+                                review_target=rereview_target,
                             )
                             if review_task:
                                 logger.info(

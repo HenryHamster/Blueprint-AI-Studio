@@ -7,6 +7,7 @@ All imports are module-level — no circular dependency risk with app.main
 or app.task_lifecycle.
 """
 
+import json
 import logging
 import os
 import re
@@ -100,7 +101,6 @@ from app.review_policy import (  # noqa: F401
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     ReviewSkipDecision,
     evaluate_auto_approve_small_main,
-    is_first_pass_minor_only,
     should_auto_approve_diff,
     should_auto_approve_small_diff,
     should_skip_initial_review,
@@ -736,10 +736,17 @@ def _pipeline_task_idempotency_key(
     original_task_id: str,
     iteration: int,
     is_rollup: bool,
+    review_target: dict[str, str | int] | None = None,
 ) -> str:
     chain_id = f"rollup-pr-{pr_number}" if is_rollup else original_task_id
+    target_suffix = ""
+    if task_type == "review" and review_target is not None:
+        target_suffix = (
+            f":{review_target['base_sha']}:{review_target['head_sha']}"
+        )
     return (
         f"review_pipeline:{project_id}:{chain_id}:{pr_number}:{task_type}:{iteration}"
+        f"{target_suffix}"
     )
 
 
@@ -765,6 +772,38 @@ def _set_spawn_reason(task: Task, reason: str) -> None:
     ctx = dict(task.context or {})
     ctx[SPAWN_REASON_KEY] = reason
     task.context = ctx
+
+
+def _normalized_review_target(
+    target: dict[str, str | int] | None,
+    *,
+    project_id: object,
+    pr_number: int,
+) -> dict[str, str | int] | None:
+    """Return a comparable immutable review target, or ``None`` when incomplete."""
+    if not isinstance(target, dict):
+        return None
+    base_sha = target.get("base_sha")
+    head_sha = target.get("head_sha")
+    if (
+        not isinstance(base_sha, str)
+        or not base_sha
+        or not isinstance(head_sha, str)
+        or not head_sha
+    ):
+        return None
+    return {
+        "project_id": str(project_id),
+        "pr_number": int(pr_number),
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+
+
+def _review_task_matches_target(task: Task, target: dict[str, str | int]) -> bool:
+    """Whether a spawned review is for exactly ``target`` (never a loose PR match)."""
+    task_target = ((task.context or {}).get("review_loop") or {}).get("review_target")
+    return task_target == target
 
 
 async def _load_vm_contact_lookup(
@@ -1855,7 +1894,10 @@ async def _spawn_pipeline_task(
     current_issues: list | None = None,
     ci_failure_logs: str = "",
     investigated_files: list[str] | None = None,
-    skip_rereview_minor_only: bool = False,
+    rereview_waived: bool = False,
+    reviewed_head_sha: str = "",
+    delta_base_sha: str = "",
+    review_target: dict[str, str | int] | None = None,
     suppress_warm_handoff: bool = False,
     attempt: int = 0,
 ) -> tuple[Task | None, bool]:
@@ -1969,6 +2011,15 @@ async def _spawn_pipeline_task(
         .get("original_task_id", "")
         or (source_task.first_payload).get("original_task_id", "")
         or str(source_task.id)
+    )
+    requested_review_target = (
+        _normalized_review_target(
+            review_target,
+            project_id=source_task.project_id,
+            pr_number=pr_number,
+        )
+        if task_type == "review"
+        else None
     )
 
     # Guard: don't spawn if PR is already merged (check both original and source).
@@ -2190,7 +2241,18 @@ async def _spawn_pipeline_task(
         t_orig = t_payload.get("original_task_id") or ""
         if t_payload.get("pr_number") != pr_number or t_type not in ("review", "fix"):
             continue
-        if not is_rollup_source and t_orig != resolved_original_id:
+        same_chain = is_rollup_source or t_orig == resolved_original_id
+        same_target_review = (
+            task_type == "review"
+            and t_type == "review"
+            and requested_review_target is not None
+            and _review_task_matches_target(t, requested_review_target)
+        )
+        # Exact immutable review targets are safe to share across independent
+        # chains for the same project/PR.  Other task types retain the existing
+        # chain boundary so a foreign fix can never block or be cancelled by this
+        # pipeline invocation.
+        if not same_chain and not same_target_review:
             continue
 
         # A BLOCKED task is a deliberate precondition park, not a dying VM, so
@@ -2299,6 +2361,22 @@ async def _spawn_pipeline_task(
             continue
 
         if t_type == task_type:
+            # A review is only deduplicated by its immutable Git target.  The
+            # older same-chain guard remains a safe fallback for legacy callers
+            # that cannot supply both SHAs, but a known different target must
+            # never suppress a review of newer code.
+            if (
+                task_type == "review"
+                and requested_review_target is not None
+                and not _review_task_matches_target(t, requested_review_target)
+            ):
+                logger.info(
+                    "[PIPELINE] Active review %s for PR #%s targets a different "
+                    "base/head; not reusing it",
+                    t.id,
+                    pr_number,
+                )
+                continue
             logger.warning(
                 f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — "
                 f"same-chain {t_type} already active: {t.id}"
@@ -3153,6 +3231,66 @@ async def _spawn_pipeline_task(
     # fixable issues (duplicate vi.mock keys) because the per-chain cap had
     # not been bumped in step with the global cap.
     source_loop = (source_task.context or {}).get("review_loop", {})
+    cached_verdict_json = ""
+    cached_review_task_id = ""
+    if task_type == "review" and requested_review_target is not None:
+        # Completed-result reuse deliberately creates a normal review task with
+        # a cached structured verdict instead of returning the old terminal row.
+        # The normal completion path must still run to apply CI/fix lifecycle
+        # effects to this source task. The review agent validates this payload
+        # before short-circuiting its model call.
+        # Review targets also suffix review idempotency keys.  A LIKE suffix
+        # predicate is portable across SQLite/PostgreSQL and avoids an
+        # unbounded project-wide JSON-context scan, while final Python checks
+        # below retain the full structured-result validation.
+        target_key_suffix = (
+            f":{requested_review_target['base_sha']}:"
+            f"{requested_review_target['head_sha']}"
+        )
+        completed_candidates = await session.stream(
+            select(Task)
+            .where(
+                Task.project_id == source_task.project_id,
+                Task.status == TaskStatus.COMPLETED,
+                Task.idempotency_key.like(f"%{target_key_suffix}"),
+            )
+            .order_by(Task.created_at.desc())
+        )
+        async for candidate in completed_candidates.scalars():
+            if (candidate.first_payload or {}).get("type") != "review":
+                continue
+            if not _review_task_matches_target(candidate, requested_review_target):
+                continue
+            result = (candidate.context or {}).get("review_result")
+            if not isinstance(result, dict) or result.get("structured") is not True:
+                continue
+            if result.get("verdict") not in ("APPROVE", "REQUEST_CHANGES"):
+                continue
+            raw_verdict = result.get("verdict_json")
+            if not isinstance(raw_verdict, str) or not raw_verdict:
+                continue
+            try:
+                cached_verdict = json.loads(raw_verdict)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(cached_verdict, dict):
+                continue
+            if (
+                cached_verdict.get("reviewed_base_sha")
+                != requested_review_target["base_sha"]
+                or cached_verdict.get("reviewed_head_sha")
+                != requested_review_target["head_sha"]
+            ):
+                continue
+            cached_verdict_json = raw_verdict
+            cached_review_task_id = str(candidate.id)
+            logger.info(
+                "[PIPELINE] Replaying structured review %s for identical target "
+                "on PR #%s through a fresh lifecycle task",
+                candidate.id,
+                pr_number,
+            )
+            break
     iteration = source_loop.get("iteration", 0) + 1
     per_chain_cap = MAX_REVIEW_FIX_ITERATIONS if is_rollup else base_cap
 
@@ -3180,6 +3318,7 @@ async def _spawn_pipeline_task(
         original_task_id=resolved_original_id,
         iteration=iteration,
         is_rollup=is_rollup,
+        review_target=requested_review_target,
     )
     existing_by_key = await _get_active_pipeline_task_by_key(session, idempotency_key)
     if existing_by_key is not None:
@@ -3274,6 +3413,21 @@ async def _spawn_pipeline_task(
             "original_prompt": original_prompt,
             "original_task_id": resolved_original_id,
             "original_task_type": source_task.first_payload.get("type", ""),
+            **(
+                {
+                    "delta_base_sha": delta_base_sha,
+                }
+                if delta_base_sha
+                else {}
+            ),
+            **(
+                {
+                    "cached_verdict_json": cached_verdict_json,
+                    "cached_review_task_id": cached_review_task_id,
+                }
+                if cached_verdict_json and cached_review_task_id
+                else {}
+            ),
             **({"hotfix": True} if orig_hotfix else {}),
             **({"model": type_model} if type_model else {}),
             **({"effort": type_effort} if type_effort else {}),
@@ -4047,6 +4201,26 @@ async def _spawn_pipeline_task(
             {"review_history": bounded_review_history} if bounded_review_history else {}
         ),
         **({"fix_reason": fix_reason} if fix_reason else {}),
+        **(
+            {"rereview_waived": True}
+            if task_type == "fix" and rereview_waived
+            else {}
+        ),
+        **(
+            {"reviewed_head_sha": reviewed_head_sha}
+            if task_type == "fix" and reviewed_head_sha
+            else {}
+        ),
+        **(
+            {"delta_base_sha": delta_base_sha}
+            if task_type == "review" and delta_base_sha
+            else {}
+        ),
+        **(
+            {"review_target": requested_review_target}
+            if task_type == "review" and requested_review_target is not None
+            else {}
+        ),
         **({"churn_detections": churn_detections} if churn_detections else {}),
         **({"scope_overflow_warned": True} if overflow_warning else {}),
         **({"drift_signal": drift_signal} if drift_signal else {}),
@@ -4065,14 +4239,6 @@ async def _spawn_pipeline_task(
         **(
             {"reviewer_model": reviewer_model_for_chain}
             if reviewer_model_for_chain
-            else {}
-        ),
-        # First-pass minor-only marker: when set, the fix-completion handler
-        # skips the follow-up re-review (CI gates the merge instead), since the
-        # fix only addressed minor nits. See task_lifecycle.py fix-completion.
-        **(
-            {"skip_rereview_minor_only": True}
-            if (task_type == "fix" and skip_rereview_minor_only)
             else {}
         ),
     }
