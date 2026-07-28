@@ -239,7 +239,8 @@
         "test_call_speech_credentials_require_exact_active_resident_lease",
         "test_call_start_rejects_provider_without_qualified_foreground_adapter",
         "test_nested_call_projection_hides_actor_account_and_playout_receipts",
-        "test_ready_call_renewal_is_capped_at_absolute_duration"
+        "test_ready_call_renewal_is_capped_at_absolute_duration",
+        "test_recovery_carries_rate_limit_denylist_but_not_failed_runtime_identity"
       ]
     },
     {
@@ -298,7 +299,8 @@
         "does not restart or mask a queued-message child close classified as %s",
         "re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
         "retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects",
-        "splits an aggregate required-image overflow into bounded same-timestamp model turns"
+        "splits an aggregate required-image overflow into bounded same-timestamp model turns",
+        "retries a generic provider error in place and re-delivers the operator turn"
       ]
     },
     {

@@ -112,6 +112,11 @@ export interface ResidentTurnResult {
   providerFailed: boolean;
   /** Canonical provider failure when terminal evidence is recognizable. */
   failureCategory: 'rate_limited' | 'dead_auth' | null;
+  /** Bounded raw provider evidence for a generic top-level failure.  This is
+   * intentionally present even while the warm child is still alive, so the
+   * resident handler can retain a useful terminal diagnostic across an in-place
+   * child restart. */
+  failureDetail?: string | null;
 }
 
 export interface ResidentSessionEvent {
@@ -202,6 +207,7 @@ interface ActiveTurn {
   hardTimedOut: boolean;
   providerFailed: boolean;
   failureCategory: 'rate_limited' | 'dead_auth' | null;
+  failureDetail: string | null;
   sawDeltaThisMessage: boolean;
   /** per-active-turn stall budget for THIS turn (may override the session default). */
   stallTimeoutMs: number;
@@ -424,6 +430,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       inputTokens: t.inputTokens,
       providerFailed: t.providerFailed,
       failureCategory: t.failureCategory,
+      failureDetail: t.failureDetail,
     });
     resolveIdleWaiters();
   };
@@ -671,6 +678,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         if (ev.isError && activeTurn) {
           activeTurn.providerFailed = true;
           activeTurn.failureCategory = classifyFailure(failureTextTail);
+          const detail = sanitize([ev.text ?? '', failureTextTail].filter(Boolean).join('\n')).trim();
+          activeTurn.failureDetail = detail.slice(-2_000)
+            || 'provider returned a top-level error result without diagnostic text';
         }
         if (resultFailure && !ev.isError) {
           // Do not render the quota banner as an assistant reply. It is an
@@ -720,7 +730,12 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     alive = false;
     emit({ kind: 'error', text: err.message });
     terminalFailureCategory = classifyFailure(failureTextTail);
-    if (activeTurn) settleTurn('', true);
+    if (activeTurn) {
+      activeTurn.failureCategory = terminalFailureCategory;
+      activeTurn.failureDetail = sanitize(failureTextTail).trim().slice(-2_000)
+        || 'provider child emitted an error without diagnostic text';
+      settleTurn('', true);
+    }
     resolveIdleWaiters();
   });
   child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
@@ -740,7 +755,14 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     // so a subsequent (post-restart) result is never wrongly discarded.
     if (!closed) {
       terminalFailureCategory = classifyFailure(failureTextTail);
-      if (activeTurn) activeTurn.failureCategory = terminalFailureCategory;
+      if (activeTurn) {
+        activeTurn.failureCategory = terminalFailureCategory;
+        if (!activeTurn.failureDetail) {
+          const detail = sanitize(failureTextTail).trim();
+          activeTurn.failureDetail = detail.slice(-2_000)
+            || 'provider child exited without a terminal result';
+        }
+      }
     }
     staleResultsPending = 0;
     if (typeof pid === 'number') unregisterChildPid(pid);
@@ -817,6 +839,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
         startedAtMs, firstTokenAtMs: null, toolCallCount: 0, totalToolCallDurationMs: 0,
         providerFailed: false, failureCategory: null,
+        failureDetail: null,
         toolCallStartTimes: new Map(), lastTokenAtMs: null, interTokenIntervalsMs: [],
         inputTokens: 0,
       };

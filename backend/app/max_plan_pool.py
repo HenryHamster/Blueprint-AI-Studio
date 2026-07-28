@@ -852,8 +852,9 @@ RATE_LIMIT_PATTERNS = list(
 # Claude Max plan shares session quota across model tiers. Empirically:
 #   - Opus 429 implies Sonnet is also rate-limited (shared session bucket);
 #     not symmetric, since Opus has a stricter sub-bucket of its own.
-#   - Haiku shares Opus's meter exactly — it does NOT have its own bucket,
-#     so haiku tracking normalizes to opus via _normalize_rl_model().
+#   - The current and legacy Claude aliases share the same Max-plan meter.  A
+#     cooldown is therefore stored under one canonical Opus bucket and every
+#     alias must normalize to it before availability is checked.
 _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-8": ("claude-opus-4-8",),
     # Opus 5 is the opus-tier default but still books against the opus-4-8
@@ -871,23 +872,27 @@ _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-7": ("claude-opus-4-8",),
     "claude-opus-4-6": ("claude-opus-4-8",),
     "claude-sonnet-4-6": ("claude-opus-4-8",),
+    "claude-haiku-4-5-20251001": ("claude-opus-4-8",),
     # fable-5 availability window elapsed (2026-06-09 + ~2 weeks); cascade to
     # the shared opus meter like other legacy entries.
     "claude-fable-5": ("claude-opus-4-8",),
 }
 
-_HAIKU_MODEL = "claude-haiku-4-5-20251001"
 _OPUS_MODEL = "claude-opus-4-8"
 
 
 def _normalize_rl_model(model: str | None) -> str | None:
-    """Map Haiku to Opus for rate-limit tracking — they share the same budget.
-    Used at every rate-limit code path that keys into disabled_models so Haiku
-    tasks bookkeep against Opus's meter and Opus disable/clear automatically
-    covers Haiku."""
-    if model == _HAIKU_MODEL:
-        return _OPUS_MODEL
-    return model
+    """Map every known shared Claude quota alias to its canonical bucket.
+
+    ``disable_account_model`` stores a Claude Opus 5 limit under
+    ``claude-opus-4-8`` (the shared Max-plan meter head).  Availability must
+    use the exact same normalization; otherwise a later task selected as
+    ``claude-opus-5`` sees no direct ``disabled_models`` entry and burns a
+    fresh claim rediscovering the already-known weekly limit.
+    """
+    if model is None:
+        return None
+    return _MODEL_TIER_CASCADE.get(model, (model,))[0]
 
 
 def cascade_disabled_models(model: str) -> tuple:

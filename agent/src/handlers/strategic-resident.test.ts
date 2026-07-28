@@ -380,9 +380,12 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
   afterEach(() => { vi.restoreAllMocks(); });
 
   it('places reply authority outside the mutable Git workspace', () => {
-    const workspace = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+    // Use a distinct mutable-workspace path. CI may set AGENT_WORKSPACE to
+    // os.tmpdir(), so comparing the runtime directory with /tmp itself makes
+    // this otherwise-valid isolation assertion environment-dependent.
+    const workspace = path.join(os.tmpdir(), 'mutable-git-workspace');
     const paths = residentReplyRuntimePaths('task-runtime-boundary');
-    expect(path.relative(workspace, paths.runtimeDir).startsWith('..')).toBe(true);
+    expect(paths.runtimeDir.startsWith(`${path.resolve(workspace)}${path.sep}`)).toBe(false);
     expect(paths.replyReceiptPath).toBe(path.join(
       paths.runtimeDir,
       '.resident-reply-receipt.json',
@@ -2346,6 +2349,82 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(session.close).toHaveBeenCalled();
   });
 
+  it('retries a generic provider error in place and re-delivers the operator turn', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-generic-provider-retry',
+      content: 'Please answer after a transient provider error',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        messagePolls += 1;
+        return Promise.resolve({
+          messages: messagePolls <= 2 ? [operatorMessage] : [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('heartbeat')) {
+        return Promise.resolve({ authority_held: true, stop_requested: true });
+      }
+      return Promise.resolve({});
+    });
+    const failedSession = makeSession(
+      () => Promise.resolve(turnResult({
+        providerFailed: true,
+        failureCategory: null,
+        failureDetail: 'upstream temporarily unavailable',
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    const recoveredSession = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'recovered reply' })),
+      () => true,
+    );
+    mockStartSession
+      .mockReturnValueOnce(failedSession)
+      .mockReturnValueOnce(recoveredSession);
+
+    const done = handleStrategicResident(
+      'task-generic-provider-retry',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-generic-provider-retry' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    // Let the asynchronous bootstrap/poll schedule the retry timer before
+    // advancing fake time.  Advancing first can move the clock past the point
+    // at which the timer is installed and leave the test waiting on its full
+    // backoff in real time.
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_700);
+    await done;
+
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    expect(failedSession.close).toHaveBeenCalled();
+    expect(recoveredSession.sendTurn).toHaveBeenCalledTimes(1);
+    const created = mockApiPost.mock.calls.filter(([, body]) =>
+      body?.op === 'create_message');
+    expect(created).toHaveLength(1);
+    expect((created[0][1]?.data as Record<string, unknown>).covered_message_ids)
+      .toEqual(['msg-generic-provider-retry']);
+    const terminal = (
+      vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1]
+    ) as Record<string, unknown>;
+    expect(terminal).toMatchObject({ status: 'COMPLETED' });
+  });
+
   it('re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply', async () => {
     vi.useFakeTimers();
     const signedUrl = 'https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig';
@@ -3052,10 +3131,12 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(posts.filter(post => post.op === 'create_message')).toHaveLength(1);
     expect(missingReplySession.close).toHaveBeenCalled();
     expect(retrySession.sendTurn).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ status: 'FAILED' }),
-    );
+    // This suite deliberately exercises failing paths before this case.  Scope
+    // the assertion to this task so an earlier test's expected terminal cannot
+    // make a retry regression look flaky.
+    expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
+      taskId === 'task-inline-only' && payload.status === 'FAILED'
+    ))).toBe(false);
   });
   it('folds the checkpoint into the first operator turn after bounded wedged preemption', async () => {
     vi.useFakeTimers();

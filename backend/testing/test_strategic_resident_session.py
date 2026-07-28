@@ -1160,6 +1160,62 @@ async def test_reload_ensure_replaces_worker_stale_past_recovery_threshold(db_se
     assert str(live_residents[0].id) == replaced["task_id"]
 
 
+@pytest.mark.asyncio
+async def test_recovery_carries_rate_limit_denylist_but_not_failed_runtime_identity(
+    db_session,
+):
+    """A new Resident generation must not rediscover exhausted accounts."""
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.IN_PROGRESS
+    old_task.last_heartbeat = stale_at
+    old_task.llm_account_id = "failed-account"
+    old_task.context = {
+        **(old_task.context or {}),
+        "blacklisted_accounts": ["account-one", " account-two ", "account-one", 7],
+        "llm_account_id": "failed-account",
+        "llm_provider": "anthropic",
+        "llm_model": "claude-opus-5",
+    }
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob["worker_heartbeat_at"] = stale_at.isoformat()
+    blob["updated_at"] = stale_at.isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    replaced = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert replaced["task_id"] != started["task_id"]
+    replacement = await db_session.get(Task, uuid.UUID(replaced["task_id"]))
+    assert replacement is not None
+    assert replacement.context["blacklisted_accounts"] == [
+        "account-one",
+        "account-two",
+    ]
+    # The dispatch path, rather than recovery, must select the next runtime.
+    assert "llm_account_id" not in replacement.context
+    assert "llm_provider" not in replacement.context
+    assert "llm_model" not in replacement.context
+    assert replacement.llm_account_id is None
+
+
 
 @pytest.mark.asyncio
 async def test_stop_ends_task_releases_continuation_and_hands_off_messages(

@@ -1870,6 +1870,7 @@ async def _spawn_resident_strategic_task(
     message_cursor: str | None = None,
     session_summary: str | None = None,
     decisions_register: str | None = None,
+    blacklisted_accounts: list[str] | None = None,
 ) -> Task | None:
     """Spawn a fresh ``strategic_review`` task via the canonical spawn path.
 
@@ -1922,6 +1923,7 @@ async def _spawn_resident_strategic_task(
             worker_generation=worker_generation,
             session_summary=session_summary,
             decisions_register=decisions_register,
+            blacklisted_accounts=blacklisted_accounts,
         ),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
@@ -2105,6 +2107,26 @@ async def build_resident_runner_options(
     return options
 
 
+def _resident_blacklisted_accounts(context: dict[str, Any] | None) -> list[str]:
+    """Return a de-duplicated predecessor account denylist.
+
+    A replacement may avoid an account that just exhausted its quota, but must
+    not inherit that attempt's ``llm_*`` runtime identity.  The dispatch path
+    selects the replacement account/provider/model anew.
+    """
+    raw = (context or {}).get("blacklisted_accounts")
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        account_id = value.strip()
+        if account_id and account_id not in result:
+            result.append(account_id)
+    return result
+
+
 def _resident_born_context(
     session_id: str,
     runner_id: str | None,
@@ -2114,6 +2136,7 @@ def _resident_born_context(
     message_cursor: str | None = None,
     session_summary: str | None = None,
     decisions_register: str | None = None,
+    blacklisted_accounts: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the resident-session context flags a SPAWNED task is BORN with.
 
@@ -2163,6 +2186,12 @@ def _resident_born_context(
     # array (which would cause re-derivation of settled facts).
     if decisions_register:
         context["_decisions_reg"] = decisions_register
+    # A replacement Resident must never spend a fresh claim rediscovering an
+    # account the predecessor already proved rate-limited.  Carry only this
+    # cross-attempt routing guidance, not the predecessor's llm_* runtime
+    # assignment: the dispatch path must still select a new account/provider.
+    if blacklisted_accounts:
+        context["blacklisted_accounts"] = list(blacklisted_accounts)
     return context
 
 
@@ -2176,6 +2205,7 @@ def _stamp_resident_context(
     message_cursor: str | None = None,
     session_summary: str | None = None,
     decisions_register: str | None = None,
+    blacklisted_accounts: list[str] | None = None,
 ) -> None:
     """Stamp the shared resident-session flags + AUTHORITATIVE runner pin onto *task*.
 
@@ -2229,6 +2259,11 @@ def _stamp_resident_context(
     # strategist's cross-tick decision memory.
     if decisions_register:
         context["_decisions_reg"] = decisions_register
+    # Adopt-path twin of _resident_born_context: preserve only the denylist
+    # needed to avoid an already-exhausted account.  Do not copy llm_* keys;
+    # they identify the failed predecessor attempt and would pin the replacement.
+    if blacklisted_accounts:
+        context["blacklisted_accounts"] = list(blacklisted_accounts)
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
         # Hard local-runner intent so dispatch pins the warm session to the
@@ -2455,6 +2490,10 @@ async def start_resident_session(
     carried_message_cursor: str | None = None
     carried_session_summary: str | None = None
     carried_decisions_register: str | None = None
+    # Unlike the session-state fields below, account denylist state belongs to
+    # the predecessor *attempt*.  It is populated only after that exact task is
+    # re-read under the recovery lock, never from an arbitrary old session blob.
+    carried_blacklisted_accounts: list[str] = []
     if isinstance(existing, dict):
         _raw_ledger = existing.get("_exam_ledger")
         if (
@@ -2643,6 +2682,11 @@ async def start_resident_session(
                                 decision["mode"] = "existing"
                             else:
                                 stale_locked_task = locked_task
+                                carried_blacklisted_accounts = (
+                                    _resident_blacklisted_accounts(
+                                        dict(locked_task.context or {})
+                                    )
+                                )
                     if decision["mode"] is None:
                         decision["session_id"] = str(fresh.get("session_id"))
                         decision["worker_generation"] = fresh_generation + 1
@@ -2942,6 +2986,7 @@ async def start_resident_session(
                             message_cursor=carried_message_cursor,
                             session_summary=carried_session_summary,
                             decisions_register=carried_decisions_register,
+                            blacklisted_accounts=carried_blacklisted_accounts,
                         )
                         session.add(task)
                         vision = dict(locked_project.vision or {})
@@ -3002,6 +3047,7 @@ async def start_resident_session(
                 message_cursor=carried_message_cursor,
                 session_summary=carried_session_summary,
                 decisions_register=carried_decisions_register,
+                blacklisted_accounts=carried_blacklisted_accounts,
             )
             if task is None:
                 from app.task_lifecycle import _has_active_strategic_task
