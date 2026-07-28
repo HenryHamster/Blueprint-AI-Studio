@@ -20,7 +20,7 @@ class LiveKitDeploymentContractTests(unittest.TestCase):
         self.assertIn("dns:\n      - 8.8.8.8", compose)
         self.assertEqual(compose.count("network_mode: host"), 1)
         self.assertIn('"5349:${LIVEKIT_TURN_TLS_PORT:-443}/tcp"', compose)
-        self.assertIn('"50000-60000:50000-60000/udp"', compose)
+        self.assertIn('"50000-50100:50000-50100/udp"', compose)
         self.assertNotIn("privileged:", compose)
 
     def test_runtime_secrets_are_not_environment_variables(self) -> None:

@@ -29,7 +29,7 @@ services:
       - "5349:${LIVEKIT_TURN_TLS_PORT:-443}/tcp"
       - "7881:7881/tcp"
       - "3478:3478/udp"
-      - "50000-60000:50000-60000/udp"
+      - "50000-50100:50000-50100/udp"
     security_opt:
       - no-new-privileges:true
     cap_drop:

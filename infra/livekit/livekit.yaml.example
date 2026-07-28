@@ -7,7 +7,9 @@ log_level: info
 rtc:
   tcp_port: 7881
   port_range_start: 50000
-  port_range_end: 60000
+  # 101 media ports are ample for this single-user gateway and avoid Docker
+  # creating ten thousand per-port NAT rules during every cold start.
+  port_range_end: 50100
   # Required when the server runs on a GCE VM with a public address and host
   # networking. Validate the advertised candidates during staging.
   use_external_ip: true

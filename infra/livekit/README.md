@@ -239,7 +239,7 @@ the normal runner pool.
 | ingress TCP | 80, 443 | ACME challenge and HTTPS/WSS signaling on the VM address |
 | ingress UDP | 3478 | embedded TURN/UDP |
 | ingress TCP | 7881 | ICE/TCP fallback |
-| ingress UDP | 50000-60000 | WebRTC media candidates |
+| ingress UDP | 50000-50100 | WebRTC media candidates |
 | ingress TCP | 5349 from the GCE TCP proxy only | backend for `turn.example.com:443` |
 | ingress | none for 7880 or 6789 | loopback-only signaling backend and Prometheus |
 | egress | TCP 443 plus DNS/NTP as required | Google Secret Manager, ACME, and normal service operation |
