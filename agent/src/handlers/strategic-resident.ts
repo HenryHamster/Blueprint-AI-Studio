@@ -76,6 +76,11 @@ const STREAM_FLUSH_MS = 100;
 // Consecutive per-turn stalls (the turn's stall watchdog fired) after which the
 // session is considered wedged and stopped as FAILED rather than spun forever.
 const MAX_CONSECUTIVE_STALLS = 3;
+// A provider can return a transient top-level error while the warm CLI process
+// is still alive.  Retrying that child in place preserves the Resident session
+// and avoids spawning a new task/account claim; keep a hard bound so a real
+// provider outage still surfaces with evidence instead of looping forever.
+const MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES = 2;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 
 export interface ResidentReplyRuntimePaths {
@@ -1000,6 +1005,8 @@ export async function handleStrategicResident(
   let firstTurnSent = false;
   let stopReason = 'stop_requested';
   const terminalProviderFailure: { value: 'rate_limited' | 'dead_auth' | null } = { value: null };
+  let genericProviderFailures = 0;
+  let lastGenericProviderFailureDetail: string | null = null;
   let pendingRestartCheckpoint: string | null = null;
   // Consecutive turns whose per-turn stall watchdog fired. N in a row ⇒ the
   // session is wedged (not merely slow) ⇒ fail it rather than spin forever.
@@ -1138,7 +1145,10 @@ export async function handleStrategicResident(
     // stderr tail even when no explicit provider-failed terminal event arrived.
     // Treat either signal as canonical so prompt-exit preemption never restarts
     // and masks a rate-limit/dead-auth failure as a benign SIGINT boundary.
-    if (!r.providerFailed && r.failureCategory === null) return false;
+    // Known quota/auth failures must leave this worker so the backend can
+    // blacklist/rotate the account.  A generic provider error is different:
+    // restart the warm child below without creating a new task generation.
+    if (r.failureCategory === null) return false;
     terminalProviderFailure.value = r.failureCategory;
     stopReason = r.failureCategory === 'rate_limited'
       ? 'provider_rate_limited'
@@ -1147,14 +1157,26 @@ export async function handleStrategicResident(
         : 'provider_turn_failed';
     return true;
   };
-  const checkpointPrimeFailed = (
+  const recoverableProviderInterruption = (r: ResidentTurnResult): boolean => (
+    (r.providerFailed && r.failureCategory === null)
+    || (
+      r.processGone
+      && !r.interrupted
+      && !r.timedOut
+      && !r.hardTimedOut
+    )
+  );
+  const checkpointPrimeFailed = async (
     r: ResidentTurnResult,
     fallbackStopReason: 'compaction_prime_failed' | 'workspace_recovery_prime_failed',
     label: string,
-  ): boolean => {
+  ): Promise<boolean> => {
     if (providerTurnFailed(r)) {
       sendLog(ws, `[resident] FATAL: ${label} failed (${stopReason})\n`);
       return true;
+    }
+    if (recoverableProviderInterruption(r)) {
+      return (await retryGenericProviderTurnInPlace(r, label, false)) === 'stop';
     }
     if (r.interrupted || r.timedOut || r.hardTimedOut || r.processGone) {
       // A prime timeout is a canonical timeout terminal, not a generic Claude
@@ -1268,7 +1290,7 @@ export async function handleStrategicResident(
     streamer.status('priming compacted session with checkpoint');
     try {
       const primeResult = await newSession.sendTurn(checkpoint);
-      if (checkpointPrimeFailed(primeResult, 'compaction_prime_failed', 'checkpoint prime')) {
+      if (await checkpointPrimeFailed(primeResult, 'compaction_prime_failed', 'checkpoint prime')) {
         return true; // caller must stop the loop
       }
       streamer.status(`session compacted (compaction #${compactionCount}) — context reset to preserve signal`);
@@ -1426,6 +1448,50 @@ export async function handleStrategicResident(
       pendingOperatorAdmission.messages,
     );
     pendingOperatorAdmission = null;
+  };
+
+  const retryGenericProviderTurnInPlace = async (
+    r: ResidentTurnResult,
+    label: string,
+    rollbackOperatorMessage: boolean,
+  ): Promise<'stop' | 'continue'> => {
+    if (rollbackOperatorMessage) rollbackPendingOperatorAdmission();
+    genericProviderFailures += 1;
+    const detail = r.failureDetail?.trim()
+      || (r.processGone
+        ? 'provider child exited without a terminal result'
+        : 'provider returned a top-level error result without diagnostic text');
+    lastGenericProviderFailureDetail = detail.slice(-2_000);
+    if (genericProviderFailures > MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES) {
+      stopReason = 'provider_turn_failed';
+      sendLog(
+        ws,
+        `[resident] FATAL: ${label} failed ${genericProviderFailures} times; `
+          + `last provider detail: ${lastGenericProviderFailureDetail}\n`,
+      );
+      return 'stop';
+    }
+    const retryMs = Math.min(
+      30_000,
+      Math.max(cfg.messagePollMs, 1_000)
+        * (2 ** Math.min(genericProviderFailures - 1, 4)),
+    );
+    setResidentActivity(
+      'waiting',
+      'Provider interrupted; restarting the resident worker in place',
+      new Date(Date.now() + retryMs).toISOString(),
+    );
+    sendLog(
+      ws,
+      `[resident] ${label} had a recoverable provider interruption; restarting `
+        + `in place (failure ${genericProviderFailures}, backoff ${retryMs}ms): `
+        + `${lastGenericProviderFailureDetail}\n`,
+    );
+    if (!restartSessionFromCheckpoint(`recoverable provider interruption during ${label}`)) {
+      return 'stop';
+    }
+    await sleep(retryMs);
+    return 'continue';
   };
 
   const retryOperatorReplyInPlace = async (
@@ -1828,11 +1894,15 @@ export async function handleStrategicResident(
       }
     }
     if (providerTurnFailed(r)) return 'stop';
+    if (recoverableProviderInterruption(r)) {
+      return retryGenericProviderTurnInPlace(r, 'operator turn', true);
+    }
     if (turnWedgedSession(r)) return 'stop';
     if (r.interrupted || r.timedOut || r.hardTimedOut || r.processGone) {
       stopReason = r.processGone ? 'session_process_exited' : 'operator_turn_interrupted';
       return 'stop';
     }
+    genericProviderFailures = 0;
     let stagedReply: ResidentStagedReply | null;
     try {
       stagedReply = readResidentStagedReplyAtPath(RESIDENT_STAGED_REPLY_PATH, replyReceipt);
@@ -1993,7 +2063,7 @@ export async function handleStrategicResident(
             const primeResult = await recoverySession.sendTurn(
               buildCompactionCheckpoint(buildCheckpointContext()),
             );
-            if (checkpointPrimeFailed(
+            if (await checkpointPrimeFailed(
               primeResult,
               'workspace_recovery_prime_failed',
               'workspace recovery checkpoint prime',
@@ -2192,6 +2262,12 @@ export async function handleStrategicResident(
       // never renew on bare examination (looking never renews freshness — the
       // dead-man's switch stays progress-gated).
       if (providerTurnFailed(r)) break;
+      if (recoverableProviderInterruption(r)) {
+        if (await retryGenericProviderTurnInPlace(r, 'autonomous turn', false) === 'stop') {
+          break;
+        }
+        continue;
+      }
       if (watch.kind === 'message' && r.processGone) {
         // SIGINT commonly makes the old CLI exit promptly. That is a successful
         // operator preemption boundary, not a Resident terminal, provided the
@@ -2202,6 +2278,7 @@ export async function handleStrategicResident(
       }
       if (turnWedgedSession(r)) break;
       if (r.processGone) { stopReason = 'session_process_exited'; break; }
+      genericProviderFailures = 0;
       // ResidentSession reports a child that closed without a terminal result as
       // processGone while leaving interrupted false and returning any partial
       // streamed text. Treat both signals identically for classification: partial
@@ -2426,7 +2503,13 @@ export async function handleStrategicResident(
     session.exitCode(),
     terminalProviderFailure.value ?? session.failureCategory?.() ?? null,
   );
-  const exitDiagnostic = status === 'FAILED' ? session.exitDiagnostic?.() : null;
+  const exitDiagnostic = status === 'FAILED'
+    ? [session.exitDiagnostic?.(), lastGenericProviderFailureDetail]
+      .filter((value, index, values): value is string => (
+        typeof value === 'string' && value.length > 0 && values.indexOf(value) === index
+      ))
+      .join('; ') || null
+    : null;
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
