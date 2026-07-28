@@ -127,9 +127,19 @@ export interface ResidentReplyRuntimePaths {
  * task-scoped runtime directory survives those repository operations while
  * remaining isolated from other resident generations.
  */
-export function residentReplyRuntimePaths(taskId: string): ResidentReplyRuntimePaths {
+export function residentReplyRuntimePaths(
+  taskId: string,
+  incarnationId?: string,
+): ResidentReplyRuntimePaths {
   const taskSlug = createHash('sha256').update(taskId).digest('hex').slice(0, 20);
-  const runtimeDir = path.join(os.tmpdir(), 'blueprint-resident-reply', `${taskSlug}-${process.pid}`);
+  const incarnationSlug = incarnationId
+    ? createHash('sha256').update(incarnationId).digest('hex').slice(0, 12)
+    : String(process.pid);
+  const runtimeDir = path.join(
+    os.tmpdir(),
+    'blueprint-resident-reply',
+    `${taskSlug}-${process.pid}-${incarnationSlug}`,
+  );
   return {
     runtimeDir,
     replyKeyPath: path.join(runtimeDir, '.resident-reply-idempotency-key'),
@@ -574,7 +584,11 @@ export async function handleStrategicResident(
   model?: string, effort?: string,
 ): Promise<void> {
   const baseBranch = resolveBaseBranch(payload, task);
-  const replyRuntime = residentReplyRuntimePaths(taskId);
+  const residentProcessIncarnation = randomUUID();
+  const replyRuntime = residentReplyRuntimePaths(
+    taskId,
+    residentProcessIncarnation,
+  );
   const {
     replyKeyPath: RESIDENT_REPLY_KEY_PATH,
     replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
@@ -885,9 +899,10 @@ export async function handleStrategicResident(
     messages: ResidentInboundMessage[];
     claimRequired: boolean;
   } | null = null;
-  const conversationClaimIncarnation = randomUUID();
+  let conversationIncarnationSupported = false;
   let activeConversationClaimId: string | null = null;
   let activeConversationClaimMessageIds: string[] = [];
+  let activeConversationClaimIncarnation: string | null = null;
   let artifactRetryFailures = 0;
   let operatorReplyProtocolFailures = 0;
   let lastDeliveredRepoHead = typeof ctx._resident_repo_head === 'string'
@@ -1487,7 +1502,12 @@ export async function handleStrategicResident(
             ? {}
             : {
               conversation_claim_id: activeConversationClaimId,
-              conversation_claim_incarnation: conversationClaimIncarnation,
+              ...(activeConversationClaimIncarnation === null
+                ? {}
+                : {
+                  conversation_claim_incarnation:
+                    activeConversationClaimIncarnation,
+                }),
             }),
           ...(stagedReply.context === undefined ? {} : { context: stagedReply.context }),
           resident_turn_state: residentTurnState,
@@ -1628,17 +1648,31 @@ export async function handleStrategicResident(
       return false;
     }
     if (activeConversationClaimId !== null) {
-      return [...activeConversationClaimMessageIds].sort().join('\n')
-        === [...messageIds].sort().join('\n');
+      const exactExistingBatch = [...activeConversationClaimMessageIds]
+        .sort().join('\n') === [...messageIds].sort().join('\n');
+      if (exactExistingBatch) {
+        const renewed = await heartbeat(false);
+        if (renewed?.conversation_claim_held === true) return true;
+        rollbackPendingOperatorAdmission();
+        return false;
+      }
     }
     try {
+      const existingClaimId = activeConversationClaimId;
       const claimed = await apiPost(
         `/api/agent/projects/${projectId}/messages/claim`,
         {
           task_id: taskId,
           session_id: sessionId,
           worker_generation: workerGeneration,
-          incarnation_id: conversationClaimIncarnation,
+          resident_incarnation_id: residentProcessIncarnation,
+          ...(activeConversationClaimId !== null
+            ? activeConversationClaimIncarnation !== null
+              ? { incarnation_id: activeConversationClaimIncarnation }
+              : {}
+            : conversationIncarnationSupported
+              ? { incarnation_id: residentProcessIncarnation }
+              : {}),
           message_ids: messageIds,
           lease_seconds: CONVERSATION_CLAIM_LEASE_SECONDS,
         },
@@ -1651,6 +1685,10 @@ export async function handleStrategicResident(
       if (
         typeof claimed.claim_id !== 'string'
         || claimed.claim_id.length === 0
+        || (
+          existingClaimId !== null
+          && claimed.claim_id !== existingClaimId
+        )
         || [...claimedIds].sort().join('\n') !== [...messageIds].sort().join('\n')
       ) {
         throw new Error(
@@ -1659,6 +1697,13 @@ export async function handleStrategicResident(
       }
       activeConversationClaimId = claimed.claim_id;
       activeConversationClaimMessageIds = [...claimedIds];
+      if (claimed.incarnation_supported === true) {
+        conversationIncarnationSupported = true;
+      }
+      activeConversationClaimIncarnation =
+        typeof claimed.incarnation_id === 'string'
+          ? claimed.incarnation_id
+          : activeConversationClaimIncarnation;
       return true;
     } catch (error) {
       sendLog(
@@ -1790,6 +1835,7 @@ export async function handleStrategicResident(
     const body: Record<string, unknown> = {
       session_id: sessionId, task_id: taskId, progress, note,
       worker_generation: workerGeneration,
+      resident_incarnation_id: residentProcessIncarnation,
       repo_head: lastDeliveredRepoHead,
       // Send the current cursor so the backend persists it; a restart will
       // restore it from task.context.message_cursor instead of falling back to
@@ -1807,7 +1853,12 @@ export async function handleStrategicResident(
         ? {}
         : {
           conversation_claim_id: activeConversationClaimId,
-          conversation_claim_incarnation: conversationClaimIncarnation,
+          ...(activeConversationClaimIncarnation === null
+            ? {}
+            : {
+              conversation_claim_incarnation:
+                activeConversationClaimIncarnation,
+            }),
           conversation_claim_lease_seconds: CONVERSATION_CLAIM_LEASE_SECONDS,
         }),
     };
@@ -1852,6 +1903,13 @@ export async function handleStrategicResident(
         HEARTBEAT_API_MAX_RETRIES,
         HEARTBEAT_API_TIMEOUT,
       ) as SessionHeartbeatResponse;
+      if (resp.resident_incarnation_id === residentProcessIncarnation) {
+        conversationIncarnationSupported = true;
+      }
+      if (resp.resident_incarnation_held === false) {
+        stopReason = 'resident_incarnation_lost';
+        authorityHeld = false;
+      }
       if (Object.prototype.hasOwnProperty.call(resp, 'call')) {
         const callControl = resp as SessionHeartbeatResponse & { call?: unknown; call_transport?: unknown };
         callCoordinator.updateControlProjection(
@@ -2070,6 +2128,7 @@ export async function handleStrategicResident(
     const query = new URLSearchParams({
       call_id: lease.callId,
       call_generation: String(lease.generation),
+      resident_incarnation_id: residentProcessIncarnation,
       after_sequence: String(callInputAfterSequence),
     });
     // This is deliberately a call-scoped server projection rather than the
@@ -2090,6 +2149,7 @@ export async function handleStrategicResident(
     try {
       await apiPost(`/api/agent/projects/${projectId}/strategic-call/complete-turn`, {
         task_id: taskId,
+        resident_incarnation_id: residentProcessIncarnation,
         call_id: receipt.call_id,
         call_generation: receipt.call_generation,
         input_revision: receipt.input_revision,
@@ -2113,6 +2173,7 @@ export async function handleStrategicResident(
     try {
       await apiPost(`/api/agent/projects/${projectId}/strategic-call/end`, {
         task_id: taskId,
+        resident_incarnation_id: residentProcessIncarnation,
         call_id: callId,
         call_generation: generation,
         reason: 'operator_disconnected',
@@ -2138,6 +2199,7 @@ export async function handleStrategicResident(
     try {
       await apiPost(`/api/agent/projects/${projectId}/strategic-call/finalized-transcript`, {
         task_id: taskId,
+        resident_incarnation_id: residentProcessIncarnation,
         call_id: origin.callId,
         call_generation: origin.generation,
         content: transcript.trim(),
@@ -2172,6 +2234,7 @@ export async function handleStrategicResident(
           `/api/agent/projects/${projectId}/strategic-call/speech-credentials`,
           {
             task_id: taskId,
+            resident_incarnation_id: residentProcessIncarnation,
             call_id: lease.callId,
             call_generation: lease.generation,
           },
@@ -2637,18 +2700,6 @@ export async function handleStrategicResident(
     const coveredMessageIds = msgs
       .map(message => typeof message.id === 'string' ? message.id.trim() : '')
       .filter(Boolean);
-    if (
-      activeConversationClaimId !== null
-      && [...coveredMessageIds].sort().join('\n')
-        !== [...activeConversationClaimMessageIds].sort().join('\n')
-    ) {
-      stopReason = 'conversation_claim_batch_mismatch';
-      sendLog(
-        ws,
-        '[resident] durable conversation claim no longer matches the admitted operator batch\n',
-      );
-      return 'stop';
-    }
     const replyAnchorId = oldestStableInboundMessageId(msgs);
     if (replyAnchorId === null || coveredMessageIds.length !== msgs.length) {
       stopReason = 'operator_reply_missing_stable_message_id';
@@ -2690,25 +2741,7 @@ export async function handleStrategicResident(
     let ackTimer: ReturnType<typeof setTimeout> | null = null;
     let r: ResidentTurnResult;
     let cleanupError: unknown = null;
-    try {
-      removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
-      installResidentReplyReceiptAtPaths(
-        RESIDENT_REPLY_KEY_PATH,
-        RESIDENT_REPLY_RECEIPT_PATH,
-        replyReceipt,
-      );
-    } catch (e) {
-      if (ackTimer !== null) clearTimeout(ackTimer);
-      try {
-        removeResidentReplyArtifactsAtPaths(
-          RESIDENT_REPLY_KEY_PATH,
-          RESIDENT_REPLY_RECEIPT_PATH,
-        );
-      } catch { /* setup already failed; leave both for startup cleanup */ }
-      stopReason = 'operator_reply_idempotency_setup_failed';
-      sendLog(ws, `[resident] idempotency key setup failed; leaving operator message open: ${String(e)}\n`);
-      return 'stop';
-    }
+    let replyReceiptInstalled = false;
     try {
       const repoSnapshot = syncResidentRepository(
         WORKSPACE,
@@ -2729,6 +2762,25 @@ export async function handleStrategicResident(
           'Operator turn was claimed by another Resident worker',
         );
         return 'continue';
+      }
+      try {
+        removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+        installResidentReplyReceiptAtPaths(
+          RESIDENT_REPLY_KEY_PATH,
+          RESIDENT_REPLY_RECEIPT_PATH,
+          replyReceipt,
+        );
+        replyReceiptInstalled = true;
+      } catch (e) {
+        try {
+          removeResidentReplyArtifactsAtPaths(
+            RESIDENT_REPLY_KEY_PATH,
+            RESIDENT_REPLY_RECEIPT_PATH,
+          );
+        } catch { /* setup already failed; leave both for startup cleanup */ }
+        stopReason = 'operator_reply_idempotency_setup_failed';
+        sendLog(ws, `[resident] idempotency key setup failed; leaving operator message open: ${String(e)}\n`);
+        return 'stop';
       }
       // Start public acknowledgment only after this exact process incarnation
       // owns the durable turn. Preflight can be slow, but it must remain silent
@@ -2775,14 +2827,16 @@ export async function handleStrategicResident(
       r = await turnPromise;
     } finally {
       if (ackTimer !== null) clearTimeout(ackTimer);
-      try {
-        removeResidentReplyArtifactsAtPaths(
-          RESIDENT_REPLY_KEY_PATH,
-          RESIDENT_REPLY_RECEIPT_PATH,
-        );
-      } catch (e) {
-        cleanupError = e;
-        sendLog(ws, `[resident] reply receipt cleanup failed; stopping after this turn: ${String(e)}\n`);
+      if (replyReceiptInstalled) {
+        try {
+          removeResidentReplyArtifactsAtPaths(
+            RESIDENT_REPLY_KEY_PATH,
+            RESIDENT_REPLY_RECEIPT_PATH,
+          );
+        } catch (e) {
+          cleanupError = e;
+          sendLog(ws, `[resident] reply receipt cleanup failed; stopping after this turn: ${String(e)}\n`);
+        }
       }
     }
     if (providerTurnFailed(r)) return 'stop';
@@ -2868,6 +2922,7 @@ export async function handleStrategicResident(
     pendingOperatorAdmission = null;
     activeConversationClaimId = null;
     activeConversationClaimMessageIds = [];
+    activeConversationClaimIncarnation = null;
     // The create_message transaction already marked exactly this receipt's
     // covered IDs handled and persisted the restart-critical turn metadata.
     // The heartbeat only renews authority and reports ancillary session state;

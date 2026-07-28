@@ -391,17 +391,27 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       paths.runtimeDir,
       '.resident-reply-receipt.json',
     ));
+    const competing = residentReplyRuntimePaths(
+      'task-runtime-boundary',
+      '00000000-0000-0000-0000-000000000901',
+    );
+    const winner = residentReplyRuntimePaths(
+      'task-runtime-boundary',
+      '00000000-0000-0000-0000-000000000902',
+    );
+    expect(competing.runtimeDir).not.toBe(winner.runtimeDir);
+    expect(competing.replyReceiptPath).not.toBe(winner.replyReceiptPath);
   });
 
   it('removes stale reply artifacts before the session starts or autonomous work runs', async () => {
     const events: string[] = [];
-    const replyRuntime = residentReplyRuntimePaths('task-stale-reply-key');
     vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+      expect(path.dirname(String(file))).toContain('blueprint-resident-reply');
       expect([
-        replyRuntime.replyKeyPath,
-        replyRuntime.replyReceiptPath,
-        replyRuntime.stagedReplyPath,
-      ]).toContain(file);
+        '.resident-reply-idempotency-key',
+        '.resident-reply-receipt.json',
+        '.resident-reply-staged-message.json',
+      ]).toContain(path.basename(String(file)));
       events.push(`stale-artifact-removed:${path.basename(String(file))}`);
     });
     mockApiGet.mockImplementation((url: string) => {
@@ -438,13 +448,14 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       'session-started',
       'autonomous-turn',
     ]);
+    const installedRuntime = mockWriteMessagesHelper.mock.calls[0]?.[2];
     expect(mockWriteMessagesHelper).toHaveBeenCalledWith(
       'task-stale-reply-key',
       '/tmp',
       expect.objectContaining({
         residentReplyOnly: true,
-        replyReceiptPath: replyRuntime.replyReceiptPath,
-        stagedReplyPath: replyRuntime.stagedReplyPath,
+        replyReceiptPath: expect.any(String),
+        stagedReplyPath: expect.any(String),
       }),
     );
     expect(mockWriteStrategicHelpers).toHaveBeenCalledWith(
@@ -452,8 +463,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       'proj-stale-reply-key',
       '/tmp',
       expect.objectContaining({
-        replyReceiptPath: replyRuntime.replyReceiptPath,
-        stagedReplyPath: replyRuntime.stagedReplyPath,
+        replyReceiptPath: installedRuntime?.replyReceiptPath,
+        stagedReplyPath: installedRuntime?.stagedReplyPath,
       }),
     );
     expect(mockWriteArtifactsHelper).toHaveBeenCalledWith('/tmp');
@@ -2902,6 +2913,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
           message_ids: [operatorMessage.id],
           lease_expires_at: '2026-07-21T20:01:00.000Z',
           attempt: 1,
+          incarnation_supported: true,
+          incarnation_id: body?.resident_incarnation_id,
+          resident_incarnation_id: body?.resident_incarnation_id,
         });
       }
       if (body?.op === 'create_message') {
@@ -2936,14 +2950,16 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       task_id: 'task-durable-claim',
       session_id: 'durable-session',
       worker_generation: 1,
-      incarnation_id: expect.any(String),
+      resident_incarnation_id: expect.any(String),
       message_ids: [operatorMessage.id],
     })]);
+    expect(claimBodies[0]).not.toHaveProperty('incarnation_id');
     expect(replyBodies).toHaveLength(1);
     expect(replyBodies[0]).toMatchObject({
       covered_message_ids: [operatorMessage.id],
       conversation_claim_id: 'claim-durable-1',
-      conversation_claim_incarnation: claimBodies[0].incarnation_id,
+      conversation_claim_incarnation:
+        claimBodies[0].resident_incarnation_id,
     });
   });
 
@@ -2991,6 +3007,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
           message_ids: [operatorMessage.id],
           lease_expires_at: '2026-07-21T20:01:30.000Z',
           attempt: 1,
+          incarnation_supported: true,
+          incarnation_id: body?.resident_incarnation_id,
+          resident_incarnation_id: body?.resident_incarnation_id,
         });
       }
       if (url.includes('/heartbeat')) {
@@ -3063,6 +3082,244 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(claimHeartbeats.every(
       body => body.conversation_claim_lease_seconds === 90,
     )).toBe(true);
+  });
+
+  it('extends a legacy claim after backend upgrade when a retry batch grows', async () => {
+    vi.useFakeTimers();
+    const firstMessage = {
+      id: 'msg-legacy-first',
+      content: 'first message',
+      created_at: '2026-07-21T20:00:00.000Z',
+      from_type: 'user',
+    };
+    const secondMessage = {
+      id: 'msg-legacy-second',
+      content: 'arrived during retry',
+      created_at: '2026-07-21T20:00:01.000Z',
+      from_type: 'user',
+    };
+    const legacyIncarnation = '00000000-0000-0000-0000-000000000811';
+    const claimBodies: Array<Record<string, unknown>> = [];
+    const replyBodies: Array<Record<string, unknown>> = [];
+    let pollCount = 0;
+    let replyPersisted = false;
+    let replacementAlive = true;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      pollCount += 1;
+      return Promise.resolve({
+        messages: pollCount === 1
+          ? [firstMessage]
+          : [firstMessage, secondMessage],
+        claim_required: true,
+      });
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/messages/claim')) {
+        claimBodies.push(body ?? {});
+        if (claimBodies.length === 1) {
+          // 0709 accepts the additive request field but cannot echo support.
+          return Promise.resolve({
+            claim_id: 'claim-rolling-upgrade',
+            message_ids: [firstMessage.id],
+            lease_expires_at: '2026-07-21T20:01:30.000Z',
+            attempt: 1,
+          });
+        }
+        // 0710 adopts the NULL 0709 rows under deterministic legacy identity
+        // and extends the same logical claim to the newly arrived row.
+        return Promise.resolve({
+          claim_id: 'claim-rolling-upgrade',
+          message_ids: [firstMessage.id, secondMessage.id],
+          lease_expires_at: '2026-07-21T20:02:30.000Z',
+          attempt: 1,
+          incarnation_supported: true,
+          incarnation_id: legacyIncarnation,
+          resident_incarnation_id: body?.resident_incarnation_id,
+        });
+      }
+      if (body?.op === 'create_message') {
+        replyPersisted = true;
+        replacementAlive = false;
+        replyBodies.push(body.data as Record<string, unknown>);
+        return Promise.resolve({});
+      }
+      if (url.includes('/heartbeat')) {
+        return Promise.resolve(replyPersisted
+          ? { authority_held: false, stop_requested: true }
+          : {
+            authority_held: true,
+            stop_requested: false,
+            ...(body?.conversation_claim_id
+              ? { conversation_claim_held: true }
+              : {}),
+          });
+      }
+      return Promise.resolve({});
+    });
+    const failedSession = makeSession(
+      () => Promise.resolve(turnResult({
+        processGone: true,
+        sentOperatorMessage: false,
+        failureDetail: 'provider process disappeared',
+      })),
+      () => true,
+    );
+    let replacementTurns = 0;
+    const replacementSession = makeSession(
+      () => {
+        replacementTurns += 1;
+        return Promise.resolve(replacementTurns === 1
+          ? turnResult({ sentOperatorMessage: false })
+          : turnResult({
+            sentOperatorMessage: true,
+            resultText: 'covered both messages after retry',
+          }));
+      },
+      () => replacementAlive,
+    );
+    mockStartSession
+      .mockReturnValueOnce(failedSession)
+      .mockReturnValue(replacementSession);
+
+    try {
+      const handling = handleStrategicResident(
+        'task-rolling-claim',
+        {
+          project_name: 'P',
+          open_messages: [],
+          strategic_session_operator_ack_threshold_seconds: 0,
+          strategic_session_message_poll_seconds: 1,
+          strategic_session_id: 'rolling-session',
+          _resident_worker_generation: 1,
+        },
+        { project_metadata: { project_id: 'proj-rolling-claim' }, context: {} },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+      let settled = false;
+      void handling.finally(() => { settled = true; });
+      for (let step = 0; step < 20 && !settled; step += 1) {
+        await vi.advanceTimersByTimeAsync(10_000);
+      }
+      expect(settled).toBe(true);
+      await handling;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+
+    expect(claimBodies).toHaveLength(2);
+    expect(claimBodies[0]).not.toHaveProperty('incarnation_id');
+    expect(claimBodies[1]).not.toHaveProperty('incarnation_id');
+    expect(claimBodies[1].message_ids).toEqual([
+      firstMessage.id,
+      secondMessage.id,
+    ]);
+    expect(replyBodies).toHaveLength(1);
+    expect(replyBodies[0]).toMatchObject({
+      conversation_claim_id: 'claim-rolling-upgrade',
+      conversation_claim_incarnation: legacyIncarnation,
+      covered_message_ids: [firstMessage.id, secondMessage.id],
+    });
+  });
+
+  it('revalidates an existing claim before retrying the provider turn', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-expired-between-attempts',
+      content: 'do not run twice after the lease expires',
+      created_at: '2026-07-21T20:00:00.000Z',
+      from_type: 'user',
+    };
+    let alive = true;
+    let claimCreated = false;
+    let claimRenewals = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        return Promise.resolve({
+          messages: [operatorMessage],
+          claim_required: true,
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/messages/claim')) {
+        claimCreated = true;
+        return Promise.resolve({
+          claim_id: 'claim-expired-before-retry',
+          message_ids: [operatorMessage.id],
+          lease_expires_at: '2026-07-21T20:01:30.000Z',
+          attempt: 1,
+        });
+      }
+      if (
+        url.includes('/heartbeat')
+        && body?.conversation_claim_id === 'claim-expired-before-retry'
+      ) {
+        claimRenewals += 1;
+        alive = false;
+        return Promise.resolve({
+          authority_held: false,
+          stop_requested: true,
+          conversation_claim_held: false,
+        });
+      }
+      return Promise.resolve({ authority_held: true, stop_requested: false });
+    });
+    const failedSession = makeSession(
+      () => Promise.resolve(turnResult({
+        processGone: true,
+        sentOperatorMessage: false,
+        failureDetail: 'provider process disappeared',
+      })),
+      () => true,
+    );
+    let replacementTurns = 0;
+    const replacementSession = makeSession(
+      () => {
+        replacementTurns += 1;
+        return Promise.resolve(turnResult({ sentOperatorMessage: false }));
+      },
+      () => alive,
+    );
+    mockStartSession
+      .mockReturnValueOnce(failedSession)
+      .mockReturnValue(replacementSession);
+
+    try {
+      const handling = handleStrategicResident(
+        'task-expired-claim-retry',
+        {
+          project_name: 'P',
+          open_messages: [],
+          strategic_session_operator_ack_threshold_seconds: 0,
+          strategic_session_message_poll_seconds: 1,
+          strategic_session_id: 'expired-claim-session',
+        },
+        {
+          project_metadata: { project_id: 'proj-expired-claim-retry' },
+          context: {},
+        },
+        'ghtok', 'owner', 'repo', null, { value: '' },
+      );
+      let settled = false;
+      void handling.finally(() => { settled = true; });
+      for (let step = 0; step < 20 && !settled; step += 1) {
+        await vi.advanceTimersByTimeAsync(10_000);
+      }
+      expect(settled).toBe(true);
+      await handling;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+
+    expect(claimCreated).toBe(true);
+    expect(claimRenewals).toBe(1);
+    // The operator retry is withheld after the backend rejects the expired
+    // claim; no replacement provider turn is allowed to start.
+    expect(replacementTurns).toBe(0);
   });
 
   it('preserves conversation_claim_lost as the terminal replacement cause', async () => {

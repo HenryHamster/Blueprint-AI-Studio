@@ -318,12 +318,17 @@ async def test_call_inputs_filter_before_limit_and_include_sequence(
     call_generation = 7
     project.vision = {
         "_resident_strategic_session": {
+            "session_id": "call-input-session",
+            "task_id": str(task.id),
+            "worker_generation": 1,
+            "status": "active",
             "call": {
                 "call_id": call_id,
                 "generation": call_generation,
                 "status": "active",
                 "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
                 "worker_task_id": str(task.id),
+                "worker_generation": 1,
             }
         }
     }
@@ -783,6 +788,112 @@ async def test_live_claim_rejects_different_process_incarnation(
 
 
 @pytest.mark.asyncio
+async def test_resident_process_incarnation_fences_different_message_batches(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    first = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="first process batch",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    second = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="second process batch",
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=1),
+    )
+    first_incarnation = "00000000-0000-0000-0000-000000000611"
+    second_incarnation = "00000000-0000-0000-0000-000000000622"
+
+    admitted = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "resident_incarnation_id": first_incarnation,
+            "incarnation_id": first_incarnation,
+            "message_ids": [str(first.id)],
+        },
+    )
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["resident_incarnation_id"] == first_incarnation
+
+    competing = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "resident_incarnation_id": second_incarnation,
+            "incarnation_id": second_incarnation,
+            "message_ids": [str(second.id)],
+        },
+    )
+    assert competing.status_code == 409
+    await db_session.refresh(second)
+    assert second.handling_state == MessageHandlingState.PENDING
+    assert second.conversation_claim_id is None
+
+
+@pytest.mark.asyncio
+async def test_message_claim_rejects_call_activated_after_poll(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="must wait for Fast Resident",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["call"] = {
+        "call_id": "call-activated-during-preflight",
+        "generation": 1,
+        "status": "active",
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+        "worker_task_id": str(task.id),
+        "worker_generation": 2,
+    }
+    project.vision = {"_resident_strategic_session": resident}
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "resident_incarnation_id":
+                "00000000-0000-0000-0000-000000000633",
+            "message_ids": [str(message.id)],
+        },
+    )
+    assert response.status_code == 409
+    assert "Fast Resident" in response.text
+    await db_session.refresh(message)
+    assert message.handling_state == MessageHandlingState.PENDING
+
+
+@pytest.mark.asyncio
 async def test_legacy_resident_claim_gets_stable_rollout_incarnation(
     client: AsyncClient, db_session
 ):
@@ -815,6 +926,8 @@ async def test_legacy_resident_claim_gets_stable_rollout_incarnation(
     )
 
     assert first.status_code == 200, first.text
+    assert first.json()["incarnation_supported"] is True
+    assert first.json()["incarnation_id"]
     assert repeated.status_code == 200, repeated.text
     assert repeated.json()["claim_id"] == first.json()["claim_id"]
     await db_session.refresh(message)

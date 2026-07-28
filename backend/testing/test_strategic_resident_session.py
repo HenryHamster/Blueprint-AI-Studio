@@ -123,11 +123,19 @@ async def test_call_speech_credentials_require_exact_active_resident_lease(
     project.vision = {
         RESIDENT_SESSION_KEY: {
             "status": "active",
+            "task_id": str(owner.id),
+            "worker_generation": 1,
+            "worker_incarnation_id":
+                "00000000-0000-0000-0000-000000000733",
+            "worker_incarnation_expires_at": (
+                _utcnow() + timedelta(minutes=5)
+            ).isoformat(),
             "call": {
                 "call_id": "call-speech-1",
                 "generation": 3,
                 "status": "active",
                 "worker_task_id": str(owner.id),
+                "worker_generation": 1,
                 "expires_at": (_utcnow() + timedelta(minutes=5)).isoformat(),
             },
         }
@@ -158,7 +166,12 @@ async def test_call_speech_credentials_require_exact_active_resident_lease(
     monkeypatch.setenv("CALL_CARTESIA_TTS_MODEL", "sonic-3")
     monkeypatch.setenv("CALL_CARTESIA_VOICE_ID", "voice-id")
     payload = resident_session_module.ResidentCallSpeechCredentialsRequest(
-        task_id=str(owner.id), call_id="call-speech-1", call_generation=3
+        task_id=str(owner.id),
+        resident_incarnation_id=uuid.UUID(
+            "00000000-0000-0000-0000-000000000733"
+        ),
+        call_id="call-speech-1",
+        call_generation=3,
     )
     response = await resident_session_module.resident_call_speech_credentials(
         request=None,
@@ -172,6 +185,24 @@ async def test_call_speech_credentials_require_exact_active_resident_lease(
         "foreground_qualification": "claude-warm-stream-json:phase0-v1",
     }
     resolver.assert_awaited_once_with(owner)
+
+    with pytest.raises(HTTPException) as wrong_incarnation:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=resident_session_module.ResidentCallSpeechCredentialsRequest(
+                task_id=str(owner.id),
+                resident_incarnation_id=uuid.UUID(
+                    "00000000-0000-0000-0000-000000000744"
+                ),
+                call_id="call-speech-1",
+                call_generation=3,
+            ),
+            session=db_session,
+            token={"sub": str(owner.id)},
+        )
+    assert wrong_incarnation.value.status_code == 409
+    resolver.assert_awaited_once()
 
     # A valid agent token for another task in the same project still receives
     # neither the response nor a Secret Manager lookup.
@@ -743,6 +774,60 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
     )
     assert liveness["authority_held"] is True
     assert liveness["leased_until"] == lease
+
+
+@pytest.mark.asyncio
+async def test_resident_heartbeat_fences_overlapping_process_incarnations(
+    db_session,
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    first_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000711"
+    )
+    second_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000722"
+    )
+
+    project = await db_session.get(Project, project.id)
+    first = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=first_incarnation,
+        progress=False,
+    )
+    assert first["resident_incarnation_held"] is True
+    assert first["resident_incarnation_id"] == str(first_incarnation)
+
+    project = await db_session.get(Project, project.id)
+    competing = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=second_incarnation,
+        progress=False,
+    )
+    assert competing["resident_incarnation_held"] is False
+    assert competing["authority_held"] is False
+    assert competing["stop_requested"] is True
+
+    project = await db_session.get(Project, project.id)
+    owner = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=first_incarnation,
+        progress=False,
+    )
+    assert owner["resident_incarnation_held"] is True
 
 
 @pytest.mark.asyncio

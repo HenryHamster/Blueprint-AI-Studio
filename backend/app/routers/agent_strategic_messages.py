@@ -103,6 +103,7 @@ class FinalizedCallTranscript(BaseModel):
     """Coordinator-authenticated final transcript; operator identity is never input."""
 
     task_id: uuid.UUID
+    resident_incarnation_id: uuid.UUID | None = None
     call_id: str = Field(..., min_length=1, max_length=128)
     call_generation: int = Field(..., ge=1)
     content: str = Field(..., min_length=1, max_length=20_000)
@@ -113,6 +114,7 @@ class FinalizedCallTranscript(BaseModel):
 
 class CompleteCallTurn(BaseModel):
     task_id: uuid.UUID
+    resident_incarnation_id: uuid.UUID | None = None
     call_id: str = Field(..., min_length=1, max_length=128)
     call_generation: int = Field(..., ge=1)
     input_revision: int = Field(..., ge=1)
@@ -127,6 +129,7 @@ class EndResidentCall(BaseModel):
     """Exact worker/call fence for coordinator-initiated empty-room cleanup."""
 
     task_id: uuid.UUID
+    resident_incarnation_id: uuid.UUID | None = None
     call_id: str = Field(..., min_length=1, max_length=128)
     call_generation: int = Field(..., ge=1)
     reason: Literal["operator_disconnected"]
@@ -138,6 +141,7 @@ class ClaimResidentMessages(BaseModel):
     task_id: uuid.UUID
     session_id: str = Field(..., min_length=1, max_length=255)
     worker_generation: int = Field(..., ge=1)
+    resident_incarnation_id: uuid.UUID | None = None
     incarnation_id: uuid.UUID | None = None
     message_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=20)
     lease_seconds: int = Field(default=45, ge=15, le=300)
@@ -183,6 +187,7 @@ async def create_finalized_call_transcript(
         bind_resident_call_input_to_locked_project,
         read_resident_call,
         resident_call_is_active,
+        resident_worker_incarnation_is_current,
     )
 
     def _lease_actor(vision: dict | None) -> str:
@@ -192,6 +197,14 @@ async def create_finalized_call_transcript(
             or str((call or {}).get("call_id")) != payload.call_id
             or int((call or {}).get("generation") or 0) != payload.call_generation
             or str((call or {}).get("worker_task_id")) != str(payload.task_id)
+            or not resident_worker_incarnation_is_current(
+                vision,
+                task_id=payload.task_id,
+                worker_generation=int(
+                    (call or {}).get("worker_generation") or 1
+                ),
+                incarnation_id=payload.resident_incarnation_id,
+            )
         ):
             raise HTTPException(status_code=409, detail="Call lease superseded")
         actor = str((call or {}).get("actor_user_id") or "").strip()
@@ -273,6 +286,7 @@ async def end_resident_call_after_operator_disconnect(
         read_resident_call,
         release_resident_call_lease,
         resident_call_snapshot,
+        resident_worker_incarnation_is_current,
     )
 
     call = read_resident_call(project.vision)
@@ -281,6 +295,12 @@ async def end_resident_call_after_operator_disconnect(
         or str(call.get("call_id")) != payload.call_id
         or int(call.get("generation") or 0) != payload.call_generation
         or str(call.get("worker_task_id")) != str(payload.task_id)
+        or not resident_worker_incarnation_is_current(
+            project.vision,
+            task_id=payload.task_id,
+            worker_generation=int(call.get("worker_generation") or 1),
+            incarnation_id=payload.resident_incarnation_id,
+        )
     ):
         raise HTTPException(status_code=409, detail="Call lease superseded")
 
@@ -289,6 +309,9 @@ async def end_resident_call_after_operator_disconnect(
         project,
         call_id=payload.call_id,
         generation=payload.call_generation,
+        task_id=payload.task_id,
+        worker_generation=int(call.get("worker_generation") or 1),
+        incarnation_id=payload.resident_incarnation_id,
         reason=payload.reason,
     )
     if changed and account_id:
@@ -314,6 +337,7 @@ async def get_call_inputs(
     project_id: uuid.UUID,
     call_id: str = Query(..., min_length=1, max_length=128),
     call_generation: int = Query(..., ge=1),
+    resident_incarnation_id: uuid.UUID | None = Query(default=None),
     message_id: uuid.UUID | None = Query(default=None),
     after_sequence: int | None = Query(default=None, ge=0),
     limit: int = Query(default=20, ge=1, le=20),
@@ -327,7 +351,11 @@ async def get_call_inputs(
     task_id = uuid.UUID(str(token.get("sub")))
     task = await session.get(Task, task_id)
     task_context = task.context if task is not None else {}
-    from app.strategic_resident_session import read_resident_call, resident_call_is_active
+    from app.strategic_resident_session import (
+        read_resident_call,
+        resident_call_is_active,
+        resident_worker_incarnation_is_current,
+    )
 
     call = read_resident_call(project.vision)
     if (
@@ -337,6 +365,14 @@ async def get_call_inputs(
         or str((call or {}).get("call_id")) != call_id
         or int((call or {}).get("generation") or 0) != call_generation
         or str((call or {}).get("worker_task_id")) != str(task_id)
+        or not resident_worker_incarnation_is_current(
+            project.vision,
+            task_id=task_id,
+            worker_generation=int(
+                (call or {}).get("worker_generation") or 1
+            ),
+            incarnation_id=resident_incarnation_id,
+        )
     ):
         raise HTTPException(status_code=409, detail="Call lease superseded")
 
@@ -437,7 +473,11 @@ async def complete_call_turn(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    from app.strategic_resident_session import read_resident_call, resident_call_is_active
+    from app.strategic_resident_session import (
+        read_resident_call,
+        resident_call_is_active,
+        resident_worker_incarnation_is_current,
+    )
 
     call = read_resident_call(locked_project.vision if locked_project else None)
     if (
@@ -447,6 +487,14 @@ async def complete_call_turn(
         or int((call or {}).get("generation") or 0) != payload.call_generation
         or str((call or {}).get("worker_task_id")) != str(payload.task_id)
         or int((call or {}).get("input_revision") or 0) != payload.input_revision
+        or not resident_worker_incarnation_is_current(
+            locked_project.vision,
+            task_id=payload.task_id,
+            worker_generation=int(
+                (call or {}).get("worker_generation") or 1
+            ),
+            incarnation_id=payload.resident_incarnation_id,
+        )
     ):
         raise HTTPException(status_code=409, detail="Call input revision superseded")
 
@@ -1117,7 +1165,14 @@ async def claim_resident_messages(
     project = await _lock_resident_claim_project(session, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-    task = await session.get(Task, payload.task_id, populate_existing=True)
+    task = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == payload.task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     task_context = task.context if task is not None else {}
     authenticated_session_id = str(
         (task_context or {}).get("strategic_session_id") or ""
@@ -1147,6 +1202,32 @@ async def claim_resident_messages(
             status_code=409,
             detail="Resident worker generation superseded or inactive",
         )
+
+    from app.strategic_resident_session import (
+        claim_resident_worker_incarnation,
+        read_resident_call,
+        resident_call_is_active,
+    )
+
+    if resident_call_is_active(read_resident_call(project.vision)):
+        raise HTTPException(
+            status_code=409,
+            detail="Fast Resident owns public replies while a call is active",
+        )
+    updated_vision = dict(project.vision or {})
+    accepted_resident_incarnation = claim_resident_worker_incarnation(
+        updated_vision,
+        task_id=payload.task_id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.resident_incarnation_id,
+    )
+    if accepted_resident_incarnation is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Resident process incarnation superseded",
+        )
+    project.vision = updated_vision
+    session.add(project)
 
     from app.conversation_coordinator import (
         claim_operator_messages,
@@ -1181,6 +1262,15 @@ async def claim_resident_messages(
         "message_ids": [str(row.id) for row in claim.rows],
         "lease_expires_at": claim.lease_expires_at.isoformat(),
         "attempt": claim.attempt,
+        "incarnation_supported": True,
+        "incarnation_id": str(
+            payload.incarnation_id
+            or legacy_conversation_claim_incarnation(
+                payload.task_id,
+                payload.worker_generation,
+            )
+        ),
+        "resident_incarnation_id": str(accepted_resident_incarnation),
     }
 
 

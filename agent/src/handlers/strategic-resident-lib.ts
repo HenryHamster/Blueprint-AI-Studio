@@ -63,6 +63,9 @@ export interface ConversationClaimResponse {
   message_ids?: string[];
   lease_expires_at?: string;
   attempt?: number;
+  incarnation_supported?: boolean;
+  incarnation_id?: string;
+  resident_incarnation_id?: string;
 }
 
 export interface StrategicWatchReceipt {
@@ -96,6 +99,8 @@ export interface SessionHeartbeatResponse {
   stop_requested?: boolean;
   status?: string;
   conversation_claim_held?: boolean;
+  resident_incarnation_held?: boolean;
+  resident_incarnation_id?: string;
   /** Monotonic marker over strategist-relevant change sources (task transitions,
    *  operator messages, direction/cycle mutations). State-gated pacing fires an
    *  autonomous turn when this differs from the rev recorded at the last turn.

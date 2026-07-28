@@ -119,6 +119,7 @@ _RESIDENT_CALL_USAGE_LIMITS = {
     "output_characters": 20_000_000,
     "provider_errors": 100_000,
 }
+_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS = 90
 
 # ``Project.vision`` key holding the reason the *last* Workday auto-start was
 # blocked or failed (surfaced by the strategic read model so the operator sees
@@ -381,6 +382,105 @@ def read_resident_call(vision: dict[str, Any] | None) -> dict[str, Any] | None:
     return call if isinstance(call, dict) else None
 
 
+def legacy_resident_worker_incarnation(
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+) -> uuid.UUID:
+    """Stable process identity used when a rolling-deploy peer lacks fencing."""
+    from app.conversation_coordinator import (
+        legacy_conversation_claim_incarnation,
+    )
+
+    return legacy_conversation_claim_incarnation(
+        uuid.UUID(str(task_id)),
+        worker_generation,
+    )
+
+
+def resident_worker_incarnation_is_current(
+    vision: dict[str, Any] | None,
+    *,
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+    incarnation_id: uuid.UUID | None,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether one process owns the unexpired Resident-wide authority."""
+    resident = read_resident_session(vision)
+    if not resident_session_is_active(resident):
+        return False
+    requested = incarnation_id or legacy_resident_worker_incarnation(
+        task_id,
+        worker_generation,
+    )
+    recorded = resident.get("worker_incarnation_id")
+    # Pre-fence session blobs belong only to the deterministic legacy process.
+    if recorded is None:
+        recorded = str(
+            legacy_resident_worker_incarnation(task_id, worker_generation)
+        )
+    expires_at = _parse_iso_naive(
+        resident.get("worker_incarnation_expires_at")
+    )
+    # A pre-fence blob has no process lease. It remains compatible only for the
+    # legacy identity; the next locked heartbeat/claim materializes its lease.
+    return (
+        str(recorded) == str(requested)
+        and (
+            expires_at is None
+            or expires_at > (now or _utcnow())
+        )
+    )
+
+
+def claim_resident_worker_incarnation(
+    vision: dict[str, Any],
+    *,
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+    incarnation_id: uuid.UUID | None,
+    now: datetime | None = None,
+) -> uuid.UUID | None:
+    """CAS the Resident-wide process lease while the Project row is locked."""
+    resident = read_resident_session(vision)
+    if not resident_session_is_active(resident):
+        return None
+    current_now = now or _utcnow()
+    requested = incarnation_id or legacy_resident_worker_incarnation(
+        task_id,
+        worker_generation,
+    )
+    recorded_raw = resident.get("worker_incarnation_id")
+    try:
+        recorded = (
+            uuid.UUID(str(recorded_raw))
+            if recorded_raw
+            else legacy_resident_worker_incarnation(
+                task_id,
+                worker_generation,
+            )
+        )
+    except (TypeError, ValueError, AttributeError):
+        return None
+    expires_at = _parse_iso_naive(
+        resident.get("worker_incarnation_expires_at")
+    )
+    if (
+        recorded != requested
+        and expires_at is not None
+        and expires_at > current_now
+    ):
+        return None
+    updated = dict(resident)
+    updated["worker_incarnation_id"] = str(requested)
+    updated["worker_incarnation_expires_at"] = (
+        current_now
+        + timedelta(seconds=_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = updated
+    return requested
+
+
 def resident_call_is_active(
     call: dict[str, Any] | None, *, now: datetime | None = None
 ) -> bool:
@@ -540,6 +640,7 @@ async def acquire_resident_call_lease(
             "last_heartbeat_at": now_iso,
             "worker_task_id": resident.get("task_id"),
             "worker_generation": int(resident.get("worker_generation") or 1),
+            "worker_incarnation_id": resident.get("worker_incarnation_id"),
             "runner_id": resident.get("runner_id"),
             "account_id": account_id,
             "slot_reserved": bool(account_id),
@@ -563,6 +664,9 @@ async def release_resident_call_lease(
     *,
     call_id: str | None = None,
     generation: int | None = None,
+    task_id: uuid.UUID | str | None = None,
+    worker_generation: int | None = None,
+    incarnation_id: uuid.UUID | None = None,
     reason: str = "ended",
 ) -> tuple[dict[str, Any] | None, str | None, bool]:
     """Fenced, idempotent call shutdown; returns lease, account id, changed."""
@@ -578,6 +682,20 @@ async def release_resident_call_lease(
             raise HTTPException(status_code=409, detail="Call lease superseded")
         if generation is not None and int(existing.get("generation") or 0) != generation:
             raise HTTPException(status_code=409, detail="Call generation superseded")
+        if task_id is not None and not resident_worker_incarnation_is_current(
+            vision,
+            task_id=task_id,
+            worker_generation=(
+                worker_generation
+                or int(existing.get("worker_generation") or 1)
+            ),
+            incarnation_id=incarnation_id,
+            now=_utcnow(),
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident process incarnation superseded",
+            )
         holder["call"] = dict(existing)
         if existing.get("status") == CALL_STATUS_ACTIVE:
             holder["account_id"] = str(existing.get("account_id") or "") or None
@@ -604,6 +722,7 @@ async def renew_resident_call_lease(
     task_id: str,
     call_id: str,
     generation: int,
+    incarnation_id: uuid.UUID | None = None,
     ttl_seconds: int | None = None,
     ready: bool = False,
     usage: dict[str, Any] | None = None,
@@ -623,6 +742,15 @@ async def renew_resident_call_lease(
             str(call.get("call_id")) != call_id
             or int(call.get("generation") or 0) != generation
             or str(call.get("worker_task_id")) != str(task_id)
+            or not resident_worker_incarnation_is_current(
+                vision,
+                task_id=task_id,
+                worker_generation=int(
+                    (resident or {}).get("worker_generation") or 1
+                ),
+                incarnation_id=incarnation_id,
+                now=now,
+            )
             or call.get("status") != CALL_STATUS_ACTIVE
         ):
             raise HTTPException(status_code=409, detail="Call lease superseded")
@@ -3859,6 +3987,7 @@ async def renew_resident_session_lease(
     *,
     session_id: str,
     task_id: str,
+    incarnation_id: uuid.UUID | None = None,
     worker_generation: int = 1,
     progress: bool = False,
     note: str | None = None,
@@ -4056,6 +4185,7 @@ async def renew_resident_session_lease(
 
     holder = {
         "authority_held": False,
+        "incarnation_held": False,
         "stopped": False,
         "capped": False,
         "lapsed": False,
@@ -4115,6 +4245,23 @@ async def renew_resident_session_lease(
             return
 
         if bool(fresh.get("stop_requested")) or fresh.get("status") == STATUS_ENDED:
+            holder["stopped"] = True
+            return
+        accepted_incarnation = claim_resident_worker_incarnation(
+            vision,
+            task_id=task_id,
+            worker_generation=worker_generation,
+            incarnation_id=incarnation_id,
+            now=now,
+        )
+        if accepted_incarnation is None:
+            holder["stopped"] = True
+            return
+        holder["incarnation_held"] = True
+        # The CAS replaces the nested blob; continue from that fenced copy so
+        # the ordinary heartbeat update cannot overwrite the new process lease.
+        fresh = read_resident_session(vision)
+        if not isinstance(fresh, dict):
             holder["stopped"] = True
             return
         # Finding 1 (unattended cap): the session has run past the max-unattended
@@ -4309,6 +4456,7 @@ async def renew_resident_session_lease(
         refreshed = read_resident_session(project.vision) or {}
         return {
             "authority_held": False,
+            "resident_incarnation_held": False,
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
@@ -4585,6 +4733,11 @@ async def renew_resident_session_lease(
         and not refreshed_stop
         and holder["authority_held"]
         and not other_strategic_active,
+        "resident_incarnation_held": holder["incarnation_held"],
+        "resident_incarnation_id": str(
+            incarnation_id
+            or legacy_resident_worker_incarnation(task_id, worker_generation)
+        ),
         "leased_until": cont.get("expires_at"),
         "stop_requested": refreshed_stop,
         "status": refreshed.get("status") or STATUS_ACTIVE,
@@ -4652,6 +4805,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     task_id: str
     progress: bool | None = None
     worker_generation: int = 1
+    resident_incarnation_id: uuid.UUID | None = None
     note: str | None = None
     message_cursor: str | None = None
     handled_message_ids: list[str] | None = None
@@ -4676,6 +4830,7 @@ class ResidentCallSpeechCredentialsRequest(BaseModel):
     """One exact active-call fence for Coordinator-only speech credentials."""
 
     task_id: str
+    resident_incarnation_id: uuid.UUID | None = None
     call_id: str
     call_generation: int
 
@@ -4707,6 +4862,14 @@ async def resident_call_speech_credentials(
         or str((active_call or {}).get("call_id")) != payload.call_id
         or int((active_call or {}).get("generation") or 0)
         != payload.call_generation
+        or not resident_worker_incarnation_is_current(
+            project.vision,
+            task_id=payload.task_id,
+            worker_generation=int(
+                (active_call or {}).get("worker_generation") or 1
+            ),
+            incarnation_id=payload.resident_incarnation_id,
+        )
     ):
         # Avoid exposing whether another Resident owns a call.  In particular,
         # do not invoke Secret Manager before every server-owned fence passes.
@@ -4754,6 +4917,7 @@ async def resident_session_heartbeat(
         project,
         session_id=payload.session_id,
         task_id=payload.task_id,
+        incarnation_id=payload.resident_incarnation_id,
         progress=bool(payload.progress),
         worker_generation=payload.worker_generation,
         note=payload.note,
@@ -4767,6 +4931,9 @@ async def resident_session_heartbeat(
         activity=payload.activity,
         repo_head=payload.repo_head,
     )
+    if response.get("resident_incarnation_held") is False:
+        await session.commit()
+        return response
     if (
         payload.conversation_claim_incarnation is not None
         and payload.conversation_claim_id is None
@@ -4807,6 +4974,7 @@ async def resident_session_heartbeat(
             session,
             project,
             task_id=payload.task_id,
+            incarnation_id=payload.resident_incarnation_id,
             call_id=payload.call_id,
             generation=payload.call_generation,
             ttl_seconds=payload.call_ttl_seconds,
