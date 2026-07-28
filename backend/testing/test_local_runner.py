@@ -9059,21 +9059,21 @@ class TestReportCommandLogDropsArbitraryKeys:
         assert len(stored["text"].encode("utf-8")) <= _MAX_RUNNER_COMMAND_LOG_BYTES
 
     @pytest.mark.asyncio
-    async def test_runner_report_drops_non_numeric_result_metric_values(
+    async def test_runner_report_preserves_bounded_string_result_metrics(
         self, client: AsyncClient, db_session
     ):
-        """Non-numeric values in result_metrics are dropped at the report endpoint.
+        """Bounded strings are retained while unsafe nested values are dropped.
 
-        Strings, None, and nested objects must be filtered out so a misbehaving
-        runner cannot corrupt a JSONB experiment record with non-serialisable or
-        unexpected types. Only finite numeric values survive.
+        String diagnostics make a running job debuggable; nulls and arbitrary
+        nested values remain excluded so a runner cannot grow the JSONB record
+        without a bounded, documented shape.
         """
         _project, _runner, token, job = await self._make_running_job(db_session)
 
         mixed_metrics = {
             "valid_int": 42,
             "valid_float": 3.14,
-            "string_val": "should_drop",
+            "string_val": "diagnostic label",
             "null_val": None,
             "nested_dict": {"inner": 1},
             "nested_list": [1, 2, 3],
@@ -9110,10 +9110,8 @@ class TestReportCommandLogDropsArbitraryKeys:
             f"expected bool_false=0.0, got {stored.get('bool_false')!r}"
         )
 
-        # Non-numeric types are dropped entirely.
-        assert "string_val" not in stored, (
-            "string value must be dropped, but 'string_val' found in stored metrics"
-        )
+        assert stored.get("string_val") == "diagnostic label"
+        # Null and nested types are dropped entirely.
         assert "null_val" not in stored, (
             "null value must be dropped, but 'null_val' found in stored metrics"
         )

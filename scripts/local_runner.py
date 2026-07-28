@@ -5439,7 +5439,7 @@ def _rehydrate_input_artifact(
 
 
 def _parse_result_metrics(result_file: str) -> dict | None:
-    """Read numeric metrics from a job's result.json (best-effort, tolerant)."""
+    """Read bounded scalar diagnostics from result.json (best-effort, tolerant)."""
     try:
         with open(result_file, encoding="utf-8") as fh:
             parsed = json.loads(fh.read())
@@ -5447,11 +5447,18 @@ def _parse_result_metrics(result_file: str) -> dict | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    filtered = {
-        k: v
-        for k, v in parsed.items()
-        if isinstance(v, (int, float)) and not isinstance(v, bool)
-    }
+    filtered = {}
+    for key, value in parsed.items():
+        if len(filtered) >= 256 or not isinstance(key, str):
+            continue
+        if isinstance(value, bool):
+            filtered[key] = value
+        elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+            filtered[key] = value
+        elif isinstance(value, str):
+            filtered[key] = value.encode("utf-8")[:4096].decode(
+                "utf-8", errors="ignore"
+            )
     return filtered or None
 
 
@@ -6148,6 +6155,7 @@ def _run_compute_job(
                 exec_status="running",
                 command_log=_interim_log_tail(),
                 progress=progress_tail.poll(),
+                result_metrics=_parse_result_metrics(result_file),
                 resume_hydration=resume_hydration,
                 viewable_omissions=_omissions or None,
             )

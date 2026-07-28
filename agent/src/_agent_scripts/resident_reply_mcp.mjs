@@ -46,6 +46,7 @@ function readRegularJson(pathname, maxBytes, label) {
 }
 
 function activeReceipt() {
+  if (!receiptPath || !fs.existsSync(receiptPath)) return null;
   const receipt = readRegularJson(receiptPath, 16_384, 'resident reply receipt');
   if (
     !receipt || typeof receipt !== 'object' || Array.isArray(receipt)
@@ -105,6 +106,18 @@ function handleToolCall(id, params) {
   }
   try {
     const receipt = activeReceipt();
+    if (receipt === null) {
+      return send({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [{
+            type: 'text',
+            text: 'No active operator turn is armed. Nothing was delivered; wait for an operator message before using reply_to_operator.',
+          }],
+        },
+      });
+    }
     stageReply({
       type,
       content,

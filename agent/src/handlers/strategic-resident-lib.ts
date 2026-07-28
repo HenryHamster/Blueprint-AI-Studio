@@ -668,6 +668,8 @@ export function buildCompactionCheckpoint(ctx: CompactionCheckpointContext): str
 The resident session's Claude subprocess was restarted because the context
 window approached its limit. This is a CHECKPOINT restore, not a fresh start.
 Your previous session was compacted. Continue operating exactly where you left off.
+This internal restore turn is not an operator message. Do not call reply_to_operator
+or send any user-facing message while absorbing this checkpoint.
 
 ${ctx.roleIdentity}`);
 

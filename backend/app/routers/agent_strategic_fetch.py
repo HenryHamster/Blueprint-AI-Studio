@@ -38,11 +38,12 @@ from app.knowledge_query import (
     build_sweep_knowledge_index,
 )
 from app.message_convergence import get_message_link, resolve_message_ref
-from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
+from app.models import ComputeJob, Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
 from app.project_message_projection import agent_fetch_message_dict
 from app.qualification_state_resolver import apply_verdict_substitution
 from app.release_scoring import blocker_execution_site as _blocker_execution_site
 from app.routers.agent import verify_agent_token
+from app.schemas import serialize_compute_job_response_safe
 from app.shared_state import limiter
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.source_ref_validation import (
@@ -777,6 +778,84 @@ async def agent_fetch_compute_environment(
     await _apply_agent_compute_image_build_state(session, project, environment)
 
     return {"status": "success", "data": environment}
+
+
+@router.get("/projects/{project_id}/compute-jobs/{job_id}")
+@limiter.limit("60/minute")
+async def agent_fetch_compute_job(
+    request: Request,
+    project_id: uuid.UUID,
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a redacted, truthful snapshot for one project-owned compute job.
+
+    This is deliberately job-centric rather than task-centric: a task can be
+    cancelled or retried while an already-launched job has independent runtime
+    state, output, cost, and hardware provenance.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    job = await session.get(ComputeJob, job_id)
+    if job is None or job.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    data = serialize_compute_job_response_safe(job)
+    metadata = data.get("polling_metadata")
+    if isinstance(metadata, dict):
+        data["live_output"] = metadata.get("live_output")
+        data["result_metrics"] = metadata.get("runner_result_metrics") or metadata.get("result_metrics")
+        data["progress"] = metadata.get("progress") or metadata.get("progress_series")
+    else:
+        data["live_output"] = None
+        data["result_metrics"] = None
+        data["progress"] = None
+    return {"status": "success", "data": data}
+
+
+@router.get("/projects/{project_id}/compute-limits")
+@limiter.limit("60/minute")
+async def agent_fetch_compute_limits(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the small set of dispatch constraints agents need before launch."""
+    project = await _resolve_agent_project(project_id, token, session)
+    from app.compute_jobs import (  # noqa: PLC0415
+        MAX_COMPUTE_JOB_DEADLINE_SECONDS,
+        MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+    )
+    from app.resource_envelope import (  # noqa: PLC0415
+        resolve_project_require_local_runner,
+        resolve_project_spend_ceiling,
+    )
+    from app.runtime_config_state import (  # noqa: PLC0415
+        resolve_project_compute_job_concurrency_cap,
+        runtime_config,
+    )
+    from app.strategic_local_runner import _load_local_runner_status  # noqa: PLC0415
+
+    return {
+        "status": "success",
+        "data": {
+            "deadline_seconds": {
+                "minimum": MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+                "maximum": MAX_COMPUTE_JOB_DEADLINE_SECONDS,
+            },
+            "project_concurrency_cap": resolve_project_compute_job_concurrency_cap(project_id),
+            "require_local_runner": resolve_project_require_local_runner(project),
+            "spend_ceiling_usd": resolve_project_spend_ceiling(project),
+            "monetary_approval_threshold_usd": runtime_config.get(
+                "compute_experiment_spend_threshold_usd"
+            ),
+            "cost_semantics": {
+                "local_only": "Local jobs have zero billable cloud cost; modeled_resource_cost_usd is operational telemetry only.",
+                "cloud": "Cloud jobs report modeled_resource_cost_usd as billable_cost_usd.",
+            },
+            "local_runner_status": await _load_local_runner_status(session, project_id),
+        },
+    }
 
 
 @router.post("/projects/{project_id}/compute-image/build")

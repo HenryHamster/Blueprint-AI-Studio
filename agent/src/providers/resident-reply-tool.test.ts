@@ -17,6 +17,32 @@ function runMcp(scriptPath: string, env: NodeJS.ProcessEnv, requests: unknown[])
 }
 
 describe('Resident Workday reply MCP tool', () => {
+  it('does not fail or stage a reply when no operator turn is armed', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'resident-reply-mcp-unarmed-'));
+    const receiptPath = path.join(workspace, '.resident-reply-receipt.json');
+    const stagedReplyPath = path.join(workspace, '.resident-reply-staged-message.json');
+    try {
+      const tool = provisionResidentReplyTool(workspace, { receiptPath, stagedReplyPath });
+      const config = JSON.parse(fs.readFileSync(tool.configPath, 'utf8')) as {
+        mcpServers: { workday: { args: string[]; env: NodeJS.ProcessEnv } };
+      };
+      const responses = runMcp(config.mcpServers.workday.args[0], {
+        ...process.env,
+        ...config.mcpServers.workday.env,
+      }, [{
+        jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name: 'reply_to_operator', arguments: { content: 'not deliverable' } },
+      }]) as Array<Record<string, unknown>>;
+
+      const result = responses[0].result as { isError?: boolean; content: Array<{ text: string }> };
+      expect(result.isError).not.toBe(true);
+      expect(result.content[0].text).toContain('No active operator turn is armed');
+      expect(fs.existsSync(stagedReplyPath)).toBe(false);
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('exposes only the native reply action and stages an authenticated receipt-bound reply', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'resident-reply-mcp-'));
     const receiptPath = path.join(workspace, '.resident-reply-receipt.json');

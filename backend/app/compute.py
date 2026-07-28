@@ -1119,24 +1119,52 @@ async def fleet_serving_source_sha(
     try:
         from sqlalchemy import select
 
-        from app.models import PoolVm
+        from app.models import PoolVm, Task, TaskStatus
         from app.warm_pool import LIVE_POOL_STATES
 
-        rows = (
-            await session.execute(
-                select(PoolVm.agent_source_sha).where(
-                    PoolVm.agent_source_sha.is_not(None),
-                    PoolVm.state.in_(LIVE_POOL_STATES),
-                )
-            )
-        ).all()
+        stmt = select(PoolVm.agent_source_sha).where(
+            PoolVm.agent_source_sha.is_not(None),
+            PoolVm.state.in_(LIVE_POOL_STATES),
+        )
+        if project_id is not None:
+            stmt = stmt.where(PoolVm.project_id == project_id)
+        rows = (await session.execute(stmt)).all()
         observed_shas.update(str(row[0]) for row in rows if row[0])
         if promoted_sha in observed_shas:
             return True
     except Exception as e:
         logger.debug(f"[COMPUTE] fleet_serving_source_sha DB read failed: {e}")
     # In-memory heartbeat fallback (warm before a PoolVm row is persisted).
-    observed_shas.update(sha for sha in _vm_source_shas.values() if sha)
+    # A cached source SHA alone carries no project identity, so when this is a
+    # project-scoped serving check only accept cache entries tied to a currently
+    # active task for that project. Durable warm-pool members are covered by the
+    # PoolVm query above.
+    cached_sources = {vm_id: sha for vm_id, sha in _vm_source_shas.items() if sha}
+    if project_id is None:
+        observed_shas.update(cached_sources.values())
+    elif cached_sources:
+        try:
+            task_vm_ids = (
+                await session.execute(
+                    select(Task.vm_instance_id).where(
+                        Task.vm_instance_id.in_(cached_sources),
+                        Task.project_id == project_id,
+                        Task.status.in_(
+                            (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
+                        ),
+                    )
+                )
+            ).scalars().all()
+            observed_shas.update(
+                cached_sources[vm_id]
+                for vm_id in task_vm_ids
+                if vm_id in cached_sources
+            )
+        except Exception as e:
+            logger.debug(
+                "[COMPUTE] fleet_serving_source_sha cached-task lookup failed: %s",
+                e,
+            )
     if promoted_sha in observed_shas:
         return True
     if not (allow_descendant and token and owner and repo):

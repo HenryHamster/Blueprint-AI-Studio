@@ -812,6 +812,22 @@ export interface ComputeJob {
   } | null;
   /** Placement and terminal facts reported by the execution side. */
   runtime_provenance?: Record<string, unknown> | null;
+  /** Explicit launch intent; legacy machine_type/accelerator_type are aliases. */
+  requested_hardware?: {
+    machine_type?: string | null;
+    accelerator_type?: string | null;
+    accelerator_count?: number | null;
+  } | null;
+  /** Hardware observed by the runner, absent until it reports runtime provenance. */
+  observed_hardware?: Record<string, unknown> | null;
+  /** Separates cloud-billable cost from local modeled resource telemetry. */
+  cost_accounting?: {
+    execution_mode?: string | null;
+    is_billable?: boolean | null;
+    billable_estimate_usd?: number | null;
+    billable_cost_usd?: number | null;
+    modeled_resource_cost_usd?: number | null;
+  } | null;
   // First-class exit_code and command_log promoted from polling_metadata.
   // Null when not yet available or not applicable.
   exit_code?: number | null;

@@ -800,6 +800,44 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     data["runtime_provenance"] = _redact_dict_strings(
         data.get("runtime_provenance") or {}
     )
+    # The historical top-level hardware fields are launch requests, not a
+    # statement of placement. Keep them for compatibility but publish explicit
+    # requested/observed blocks so callers cannot mistake an L40S local runner
+    # for the V100 requested by a portable launch contract.
+    data["requested_hardware"] = {
+        "machine_type": data.get("machine_type"),
+        "accelerator_type": data.get("accelerator_type"),
+        "accelerator_count": data.get("accelerator_count"),
+    }
+    runtime_provenance = data["runtime_provenance"]
+    observed = (
+        runtime_provenance.get("observed_hardware")
+        if isinstance(runtime_provenance, dict)
+        else None
+    )
+    data["observed_hardware"] = observed if isinstance(observed, dict) else None
+
+    # Local runners report modeled capacity cost for operational accounting, but
+    # it is not a cloud bill and must never imply that the job spent money.
+    monetary = metadata.get("monetary_decision") if isinstance(metadata, dict) else None
+    execution_mode = monetary.get("execution_mode") if isinstance(monetary, dict) else None
+    modeled_cost = (
+        data.get("final_cost_usd")
+        if data.get("final_cost_usd") is not None
+        else data.get("accrued_cost_usd")
+    )
+    is_local = execution_mode == "local_only"
+    data["cost_accounting"] = {
+        "execution_mode": execution_mode,
+        "is_billable": False if is_local else (None if execution_mode is None else True),
+        "billable_estimate_usd": (
+            monetary.get("billable_estimate_usd")
+            if isinstance(monetary, dict)
+            else None
+        ),
+        "billable_cost_usd": 0.0 if is_local else modeled_cost,
+        "modeled_resource_cost_usd": modeled_cost,
+    }
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level

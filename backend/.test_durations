@@ -9626,7 +9626,6 @@
   "testing/test_local_runner.py::TestReportCommandLogDropsArbitraryKeys::test_report_command_log_truncates_oversized_text": 0.35311408700090396,
   "testing/test_local_runner.py::TestReportCommandLogDropsArbitraryKeys::test_report_result_metrics_preserves_arms_block": 0.34594482899956347,
   "testing/test_local_runner.py::TestReportCommandLogDropsArbitraryKeys::test_report_result_metrics_rejects_non_finite_floats": 0.35706365599980927,
-  "testing/test_local_runner.py::TestReportCommandLogDropsArbitraryKeys::test_runner_report_drops_non_numeric_result_metric_values": 0.35938428600002226,
   "testing/test_local_runner.py::TestReportInterimProgressAndLiveOutput::test_progress_accepted_on_terminal_report": 0.35721990799902414,
   "testing/test_local_runner.py::TestReportInterimProgressAndLiveOutput::test_progress_count_delta_merge_appends_only_new_and_caps_at_50": 0.6985612069993294,
   "testing/test_local_runner.py::TestReportInterimProgressAndLiveOutput::test_progress_garbage_payloads_tolerated_without_500": 0.6304185740000321,

@@ -110,8 +110,8 @@ def test_gcp_serial_parse_garbled_marker_is_tolerated():
     assert status.command_log is None
 
 
-def test_decode_result_metrics_filters_non_numeric_and_bounds():
-    # Strings, nulls, and nested structures are dropped; numbers/bools survive.
+def test_decode_result_metrics_preserves_scalar_diagnostics_and_bounds():
+    # Strings, numbers, and bools survive; nulls and nested structures drop.
     mixed = _metrics_marker(
         {
             "accuracy": 0.5,
@@ -124,6 +124,7 @@ def test_decode_result_metrics_filters_non_numeric_and_bounds():
     )
     assert compute_backends_module._decode_result_metrics(mixed) == {
         "accuracy": 0.5,
+        "label": "high",
         "flag": 0.0,
     }
     # A non-object JSON payload (array) is rejected entirely.
@@ -131,11 +132,10 @@ def test_decode_result_metrics_filters_non_numeric_and_bounds():
         compute_backends_module._decode_result_metrics(_metrics_marker([1, 2, 3]))
         is None
     )
-    # An all-non-numeric object decodes to no metrics → None.
-    assert (
-        compute_backends_module._decode_result_metrics(_metrics_marker({"x": "y"}))
-        is None
-    )
+    # A string-only result preserves a useful diagnostic rather than vanishing.
+    assert compute_backends_module._decode_result_metrics(_metrics_marker({"x": "y"})) == {
+        "x": "y"
+    }
     # Oversized decoded payload is rejected wholesale.
     oversized = _metrics_marker({"m": list(range(10000))})
     assert compute_backends_module._decode_result_metrics(oversized) is None

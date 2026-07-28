@@ -9115,7 +9115,7 @@ if __name__ == "__main__":
 
 
 class TestParseResultMetrics(unittest.TestCase):
-    """_parse_result_metrics: tolerant JSON → numeric-only dict."""
+    """_parse_result_metrics: tolerant JSON → bounded scalar dict."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -9134,24 +9134,28 @@ class TestParseResultMetrics(unittest.TestCase):
         result = local_runner._parse_result_metrics(path)
         self.assertEqual(result, {"loss": 0.42, "accuracy": 0.95, "step": 100})
 
-    def test_non_numeric_values_filtered_out(self):
+    def test_string_and_boolean_diagnostics_are_preserved(self):
         path = self._write("result.json", '{"loss": 0.5, "name": "run1", "flag": true}')
         result = local_runner._parse_result_metrics(path)
-        # booleans and strings are excluded; only numeric float/int survives
-        self.assertEqual(result, {"loss": 0.5})
+        self.assertEqual(result, {"loss": 0.5, "name": "run1", "flag": True})
 
-    def test_bool_values_excluded(self):
+    def test_bool_values_preserved(self):
         path = self._write("result.json", '{"ok": true, "count": 7}')
         result = local_runner._parse_result_metrics(path)
-        self.assertEqual(result, {"count": 7})
+        self.assertEqual(result, {"ok": True, "count": 7})
 
     def test_empty_dict_returns_none(self):
         path = self._write("result.json", '{}')
         self.assertIsNone(local_runner._parse_result_metrics(path))
 
-    def test_all_non_numeric_returns_none(self):
+    def test_string_only_result_is_preserved(self):
         path = self._write("result.json", '{"label": "hello", "ok": false}')
-        self.assertIsNone(local_runner._parse_result_metrics(path))
+        self.assertEqual(local_runner._parse_result_metrics(path), {"label": "hello", "ok": False})
+
+    def test_string_diagnostic_is_utf8_byte_bounded(self):
+        path = self._write("result.json", '{"diagnostic": "' + ("😀" * 2000) + '"}')
+        result = local_runner._parse_result_metrics(path)
+        self.assertLessEqual(len(result["diagnostic"].encode("utf-8")), 4096)
 
     def test_missing_file_returns_none(self):
         self.assertIsNone(
