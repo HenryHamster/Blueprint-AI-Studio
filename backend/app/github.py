@@ -49,14 +49,17 @@ _github_client: httpx.AsyncClient | None = None
 _inflight_reads: dict[tuple[str, str], "asyncio.Future[httpx.Response]"] = {}
 
 # File-content cache: memoizes get_file_text_at_ref results by
-# (owner, repo, ref, path) for a short TTL.  At a fixed git ref the content is
-# immutable, so caching across calls avoids redundant GitHub API content reads
-# for the same file — the dominant cost in ci-compliance evaluation (~213 capped
-# files per new integration-branch SHA).  Bounded LRU eviction prevents unbounded
-# memory growth under sustained rollup activity.
+# (owner, repo, ref, path) for a short TTL, but only when ``ref`` is a full
+# commit SHA. Branch names are moving refs: caching ``main`` here made callers
+# that explicitly bypassed their own higher-level cache still observe an old
+# project manifest after a merge. At an immutable commit SHA, caching avoids
+# redundant GitHub API content reads for the same file — the dominant cost in
+# ci-compliance evaluation (~213 capped files per new integration-branch SHA).
+# Bounded LRU eviction prevents unbounded growth under sustained rollup activity.
 _FILE_CONTENT_CACHE_TTL_SECONDS = 600  # 10 minutes
 _FILE_CONTENT_CACHE_MAX_SIZE = 2000   # ~2000 entries ≈ ~3-5 MB at average file size
 _file_content_cache: "OrderedDict[tuple[str, str, str, str], tuple[str, float]]" = OrderedDict()
+_FULL_COMMIT_SHA_RE = _re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class StaleBranchHeadError(RuntimeError):
@@ -894,18 +897,23 @@ async def get_file_text_at_ref(
     Goes through :func:`_github_request`, so it is quota-accounted and
     rate-limit-aware like every other GitHub call.
 
-    When ``use_content_cache`` (default True), results are memoized in an
-    in-memory LRU cache keyed by ``(owner, repo, ref, path)`` with a 10-minute
-    TTL, so repeated reads of the same file at the same ref across
-    closely-spaced evaluations avoid redundant GitHub API calls.
+    When ``use_content_cache`` (default True) and *ref* is a full commit SHA,
+    results are memoized in an in-memory LRU cache keyed by
+    ``(owner, repo, ref, path)`` with a 10-minute TTL. Moving refs such as
+    branch names always perform a live read so a higher-level force refresh
+    cannot be defeated by stale file content.
 
     Returns the decoded UTF-8 text on HTTP 200, or ``None`` for any
     non-retrievable / non-decodable outcome (404, non-200, non-file payload,
     undecodable body, or transport error). Fail-safe like its read siblings:
     ``None`` never means "empty file", it means "could not read".
     """
+    # Only a full commit SHA is immutable. Branch and tag names can move, so
+    # caching them would make a caller's force-refresh contract ineffective.
+    cacheable_ref = use_content_cache and bool(_FULL_COMMIT_SHA_RE.fullmatch(ref))
+
     # Check the in-memory content cache before hitting the GitHub API.
-    if use_content_cache:
+    if cacheable_ref:
         cache_key = (owner, repo, ref, path)
         try:
             cached = _file_content_cache.get(cache_key)
@@ -953,7 +961,7 @@ async def get_file_text_at_ref(
         text = base64.b64decode(content_b64).decode()
 
         # Store in cache on success.
-        if use_content_cache and text is not None:
+        if cacheable_ref and text is not None:
             try:
                 cache_key = (owner, repo, ref, path)
                 _file_content_cache[cache_key] = (text, time.monotonic())

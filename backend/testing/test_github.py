@@ -4494,6 +4494,88 @@ async def test_get_file_text_at_ref_decodes_200(mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_file_text_at_ref_does_not_cache_moving_branch(mocker):
+    import base64
+    from app import github
+
+    github._file_content_cache.clear()
+    old_body = '{"compute":{"image":{"build":{"dockerfile":"DEN/Dockerfile"}}}}'
+    new_body = '{"compute":{"image":{"name":"external/runtime:latest"}}}'
+    request = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(
+                200,
+                {"type": "file", "content": base64.b64encode(old_body.encode()).decode()},
+            ),
+            MockResponse(
+                200,
+                {"type": "file", "content": base64.b64encode(new_body.encode()).decode()},
+            ),
+        ],
+    )
+
+    first = await github.get_file_text_at_ref(
+        ".blueprint/tools.json",
+        token="t",
+        owner="moving-owner",
+        repo="moving-repo",
+        ref="main",
+    )
+    second = await github.get_file_text_at_ref(
+        ".blueprint/tools.json",
+        token="t",
+        owner="moving-owner",
+        repo="moving-repo",
+        ref="main",
+    )
+
+    assert first == old_body
+    assert second == new_body
+    assert request.await_count == 2
+    assert not github._file_content_cache
+
+
+@pytest.mark.asyncio
+async def test_get_file_text_at_ref_caches_immutable_commit_sha(mocker):
+    import base64
+    from app import github
+
+    github._file_content_cache.clear()
+    body = '{"compute":{"image":{"name":"external/runtime:latest"}}}'
+    request = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(
+            200,
+            {"type": "file", "content": base64.b64encode(body.encode()).decode()},
+        ),
+    )
+    ref = "a" * 40
+
+    first = await github.get_file_text_at_ref(
+        ".blueprint/tools.json",
+        token="t",
+        owner="immutable-owner",
+        repo="immutable-repo",
+        ref=ref,
+    )
+    second = await github.get_file_text_at_ref(
+        ".blueprint/tools.json",
+        token="t",
+        owner="immutable-owner",
+        repo="immutable-repo",
+        ref=ref,
+    )
+
+    assert first == body
+    assert second == body
+    assert request.await_count == 1
+    github._file_content_cache.clear()
+
+
+@pytest.mark.asyncio
 async def test_get_file_text_at_ref_404_returns_none(mocker):
     from app.github import get_file_text_at_ref
 
