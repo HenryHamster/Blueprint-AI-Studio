@@ -15,6 +15,11 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
     volumes:
       - ${BLUEPRINT_LIVEKIT_RUNTIME_DIR:?set by the systemd unit}:/run/blueprint-livekit:ro
+    # Ubuntu's systemd-resolved stub (127.0.0.53) is host-only and can be
+    # inherited by bridged containers during early boot. LiveKit must resolve
+    # its Google STUN host to discover the GCE VM's public address.
+    dns:
+      - 8.8.8.8
     ports:
       - "127.0.0.1:7880:7880/tcp"
       - "127.0.0.1:6789:6789/tcp"

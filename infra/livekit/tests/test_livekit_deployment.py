@@ -17,6 +17,7 @@ class LiveKitDeploymentContractTests(unittest.TestCase):
         self.assertIn("caddy:2.10.2@sha256:", compose)
         self.assertIn("versions 1.1", caddyfile)
         self.assertNotIn("versions h1", caddyfile)
+        self.assertIn("dns:\n      - 8.8.8.8", compose)
         self.assertEqual(compose.count("network_mode: host"), 1)
         self.assertIn('"5349:${LIVEKIT_TURN_TLS_PORT:-443}/tcp"', compose)
         self.assertIn('"50000-60000:50000-60000/udp"', compose)

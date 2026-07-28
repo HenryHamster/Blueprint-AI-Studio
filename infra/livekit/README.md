@@ -244,6 +244,10 @@ the normal runner pool.
 | ingress | none for 7880 or 6789 | loopback-only signaling backend and Prometheus |
 | egress | TCP 443 plus DNS/NTP as required | Google Secret Manager, ACME, and normal service operation |
 
+The bridged LiveKit container uses Google Public DNS (`8.8.8.8`) rather than
+Ubuntu's host-only `127.0.0.53` stub so public-IP discovery through Google's
+STUN service also works during early boot.
+
 The browser and Coordinator use `wss://livekit.example.com`; do not expose
 `7880`. The browser receives `turn.example.com:443` from LiveKit. Validate a
 restrictive-network client through TURN/TLS as part of the staging call
