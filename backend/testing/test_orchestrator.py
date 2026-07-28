@@ -12969,6 +12969,20 @@ class TestPerClassCapacityGating:
         # NOT fill compute slots when max_concurrent_compute is absent.)
 
 
+def test_auto_update_draining_runner_rejects_new_work():
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _runner_accepting_new_work,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"update_draining": True},
+    )
+    assert _runner_accepting_new_work(runner) is False
+
+
 class TestAuthoritativeAgentTaskCount:
     """Signal-that-lies fix #5: agent load is derived from the AUTHORITATIVE
     ``_active_agent_task_count`` (committed Task rows) rather than the stale-prone

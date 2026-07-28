@@ -29,6 +29,8 @@ from app.models import (
     LocalRunner,
     Project,
     RunnerHeartbeatSnapshot,
+    Task,
+    TaskStatus,
     _utcnow,
 )
 from app.routers.runner import (
@@ -433,6 +435,67 @@ async def test_heartbeat_without_report_does_not_refresh_stamp(db_session):
     # Stamp is NOT refreshed and the live set is NOT zeroed by the non-report.
     assert runner.capabilities.get("active_work_reported_at") == stamp
     assert runner.capabilities.get("active_task_ids") == ["live-task"]
+
+
+@pytest.mark.asyncio
+async def test_update_drain_heartbeat_releases_unpulled_pins(db_session):
+    """A live-but-draining runner must not strand work in PROVISIONING."""
+    project, runner = await _make_runner(db_session)
+    unpulled = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        context={"runner_target_id": str(runner.id)},
+        started_at=None,
+    )
+    pulled = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        context={"runner_target_id": str(runner.id)},
+        started_at=_utcnow(),
+    )
+    db_session.add_all([unpulled, pulled])
+    await db_session.commit()
+
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    await db_session.refresh(unpulled)
+    await db_session.refresh(pulled)
+
+    assert runner.capabilities["update_draining"] is True
+    assert unpulled.status == TaskStatus.QUEUED
+    assert unpulled.vm_instance_id is None
+    assert "runner_target_id" not in unpulled.context
+    assert pulled.status == TaskStatus.PROVISIONING
+    assert pulled.vm_instance_id == f"runner:{runner.id}"
+
+    # Close the dispatcher-snapshot race: a pin created after the transition
+    # heartbeat is released by the next heartbeat while drain remains active.
+    late_pin = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        context={"runner_target_id": str(runner.id)},
+        started_at=None,
+    )
+    db_session.add(late_pin)
+    await db_session.commit()
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(late_pin)
+    assert late_pin.status == TaskStatus.QUEUED
+    assert late_pin.vm_instance_id is None
 
 
 @pytest.mark.asyncio

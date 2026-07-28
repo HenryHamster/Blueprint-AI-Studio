@@ -293,6 +293,7 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_active_compute_job_count,
     _runner_active_task_count,
     _runner_active_work_count,
+    _runner_accepting_new_work,
     _runner_agent_available,
     _runner_at_capacity,
     _runner_at_compute_capacity,
@@ -1250,7 +1251,8 @@ def _select_eligible_runner(
         out = [
             r
             for r in pool
-            if _runner_handles_task_type(r, task_type)
+            if _runner_accepting_new_work(r)
+            and _runner_handles_task_type(r, task_type)
             and (task_type == "compute_experiment" or _runner_agent_available(r))
             and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
         ]

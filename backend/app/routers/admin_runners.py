@@ -28,7 +28,6 @@ from app.models import (
     RunnerHeartbeatSnapshot,
     Task,
     TASK_OUTCOME_TERMINAL_STATUSES,
-    TaskStatus,
     _utcnow,
 )
 from app.runner_project_binding import (
@@ -38,6 +37,7 @@ from app.runner_project_binding import (
     remove_binding,
     runner_allowed_for_project,
 )
+from app.runner_pins import release_unpulled_runner_pins
 from app.runner_config import (
     GPU_INDICES_ALL,
     GPUS_PER_JOB_MAX,
@@ -1240,37 +1240,8 @@ async def _release_unpulled_runner_pins(
     session: AsyncSession,
     runner_id: uuid.UUID,
 ) -> int:
-    """Release tasks pinned to a runner before the runner pulled them.
-
-    Uses batched LIMIT queries to avoid loading thousands of pinned tasks
-    into memory at once (following the same pattern as projects.py for
-    batched task cancellation).
-    """
-    total = 0
-    _BATCH_SIZE = 500
-    while True:
-        pinned = (
-            await session.execute(
-                select(Task).where(
-                    Task.status == TaskStatus.PROVISIONING,
-                    Task.started_at.is_(None),
-                    Task.vm_instance_id == f"runner:{runner_id}",
-                ).limit(_BATCH_SIZE)
-            )
-        ).scalars().all()
-        if not pinned:
-            break
-        for task in pinned:
-            task.status = TaskStatus.QUEUED
-            task.vm_instance_id = None
-            task.vm_provisioned_at = None
-            new_ctx = dict(task.context or {})
-            new_ctx.pop("runner_target_id", None)
-            task.context = new_ctx
-            session.add(task)
-        total += len(pinned)
-        await session.flush()
-    return total
+    """Backward-compatible local name for the shared pin-release helper."""
+    return await release_unpulled_runner_pins(session, runner_id)
 
 
 @router.delete("/projects/{project_id}/runners/{runner_id}")

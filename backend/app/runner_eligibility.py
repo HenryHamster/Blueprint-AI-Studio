@@ -253,6 +253,13 @@ def _runner_agent_available(runner: LocalRunner | RunnerDispatchSnapshot) -> boo
     return available is not False
 
 
+def _runner_accepting_new_work(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> bool:
+    """False while a version-mismatched daemon drains before auto-update."""
+    return (runner.capabilities or {}).get("update_draining") is not True
+
+
 def _coerce_max_concurrent(raw) -> int | None:
     """Coerce a raw capability value to a positive int, or None if invalid."""
     if isinstance(raw, bool):
