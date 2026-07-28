@@ -88,6 +88,7 @@ from app.workbench_state import (
 
 _MAX_RUNNER_COMMAND_LOG_BYTES = 65536
 _MAX_RUNNER_RESULT_METRICS_KEYS = 256
+_MAX_RUNNER_RESULT_STRING_BYTES = 4096
 # v1 cap on durable artifact uploads (mirrors _RUNNER_ARTIFACT_MAX_BYTES on the
 # runner). The runner already gates on the uncompressed total; this caps the
 # actual uploaded tarball as a server-side defense.
@@ -367,7 +368,8 @@ def _filter_result_metrics(raw: dict) -> dict:
     - bool → float
     - finite int/float → float
     - "arms" key with a dict or non-empty list → preserved verbatim
-    - strings, None, non-finite floats, nested objects → dropped
+    - bounded strings → preserved for diagnostic labels/messages
+    - None, non-finite floats, nested objects → dropped
     - capped at _MAX_RUNNER_RESULT_METRICS_KEYS entries
     """
     out: dict[str, Any] = {}
@@ -386,7 +388,15 @@ def _filter_result_metrics(raw: dict) -> dict:
             if not math.isfinite(numeric):
                 continue
             out[key] = numeric
-        # strings, None, nested dicts/lists → dropped
+        elif isinstance(value, str):
+            encoded = value.encode("utf-8")
+            if len(encoded) <= _MAX_RUNNER_RESULT_STRING_BYTES:
+                out[key] = value
+            else:
+                out[key] = encoded[:_MAX_RUNNER_RESULT_STRING_BYTES].decode(
+                    "utf-8", errors="ignore"
+                )
+        # None and nested dicts/lists → dropped
     return out
 
 

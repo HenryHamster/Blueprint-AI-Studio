@@ -18,6 +18,8 @@ from app.models import (
     Artifact,
     ArtifactType,
     AuditFindingResolution,
+    ComputeJob,
+    ComputeJobStatus,
     MessageType,
     Project,
     ProjectMember,
@@ -31,6 +33,76 @@ from app.models import (
     UiLoadTimingSample,
 )
 from app.auth import create_agent_token
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_job_exposes_live_truth_and_cost_semantics(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_project_task(db_session, vm="agent-vm-compute-fetch")
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="n1-standard-1",
+        accelerator_type="V100",
+        accelerator_count=1,
+        accrued_cost_usd=0.22,
+        polling_metadata={
+            "monetary_decision": {
+                "execution_mode": "local_only",
+                "billable_estimate_usd": 0.0,
+            },
+            "live_output": {"text": "step=10", "truncated": False},
+            "runner_result_metrics": {"phase": "training", "loss": 0.5},
+        },
+        runtime_provenance={
+            "observed_hardware": {"gpu_names": ["NVIDIA L40S"], "gpu_count": 6},
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/compute-jobs/{job.id}",
+        headers={"x-agent-token": token},
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["live_output"]["text"] == "step=10"
+    assert data["result_metrics"] == {"phase": "training", "loss": 0.5}
+    assert data["requested_hardware"]["accelerator_type"] == "V100"
+    assert data["observed_hardware"]["gpu_names"] == ["NVIDIA L40S"]
+    assert data["cost_accounting"] == {
+        "execution_mode": "local_only",
+        "is_billable": False,
+        "billable_estimate_usd": 0.0,
+        "billable_cost_usd": 0.0,
+        "modeled_resource_cost_usd": 0.22,
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_limits_is_project_scoped_and_actionable(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_project_task(db_session, vm="agent-vm-compute-limits")
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/compute-limits",
+        headers={"x-agent-token": token},
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["deadline_seconds"]["minimum"] > 0
+    assert data["deadline_seconds"]["maximum"] >= data["deadline_seconds"]["minimum"]
+    assert data["require_local_runner"] is False
+    assert "local_only" in data["cost_semantics"]
+    assert "local_runner_status" in data
 
 
 def _assert_generated_at_iso_utc(payload: dict) -> None:

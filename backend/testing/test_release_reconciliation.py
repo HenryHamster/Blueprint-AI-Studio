@@ -4034,7 +4034,7 @@ async def test_agent_image_bake_path_confirms_with_descendant_fleet_sha(
     db_session, mocker
 ):
     """A bake-path promotion confirms when a live fleet VM reports a source SHA
-    that deterministically descends from promoted_sha."""
+    that deterministically descends from promoted_sha, ignoring other projects."""
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
         new=AsyncMock(return_value=("tok", "acme", "widget")),
@@ -4053,6 +4053,17 @@ async def test_agent_image_bake_path_confirms_with_descendant_fleet_sha(
     project, version = await _make_promoted_unconfirmed_version(
         db_session, promoted_at=promoted_at, deadline=deadline
     )
+    unrelated_project = Project(
+        name="Other serving test",
+        user_id="other-serving-user",
+        github_owner="other-acme",
+        github_repo="other-widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(unrelated_project)
+    await db_session.commit()
+    await db_session.refresh(unrelated_project)
     db_session.add(
         PoolVm(
             vm_instance_id="pool-descendant",
@@ -4061,6 +4072,22 @@ async def test_agent_image_bake_path_confirms_with_descendant_fleet_sha(
             agent_source_sha=_SHA_B,
         )
     )
+    # A matching SHA from another project must not confirm this project's
+    # agent-image artifact. Before project scoping, it could short-circuit the
+    # descendant proof below depending on query iteration order.
+    db_session.add(
+        PoolVm(
+            vm_instance_id="pool-unrelated-promoted",
+            project_id=unrelated_project.id,
+            state=PoolVmState.IDLE,
+            agent_source_sha=_SHA_A,
+        )
+    )
+    # The short-lived heartbeat cache has no project identity of its own. An
+    # unowned cached SHA must not be allowed to confirm this project's artifact.
+    from app import compute
+
+    mocker.patch.dict(compute._vm_source_shas, {"foreign-cache": _SHA_A})
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,

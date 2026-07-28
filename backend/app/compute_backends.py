@@ -433,6 +433,7 @@ _LOCAL_ARTIFACT_DIRNAME = "artifacts"
 # must be tolerated as simply ABSENT, never raise.
 _MAX_RESULT_METRICS = 64
 _MAX_RESULT_METRICS_DECODED_BYTES = 8192
+_MAX_RESULT_METRIC_STRING_BYTES = 4096
 # Defensive bounds on the command-log payload. Noisy output should be truncated
 # rather than allowed to balloon the durable result or wedge teardown.
 _MAX_COMMAND_LOG_BYTES = 32768
@@ -3632,8 +3633,9 @@ def _decode_result_metrics(raw_b64: str | None) -> dict[str, Any] | None:
 
     Defensive by contract: any decode/parse/shape error — missing, oversized,
     non-base64, non-JSON, non-object — yields ``None`` (metrics simply ABSENT).
-    Per-entry, only numeric and boolean values survive (bool coerced to a
-    number); strings, nulls, and other nested objects/arrays are dropped.
+    Per-entry, numeric and boolean values survive (bool coerced to a number),
+    as do bounded strings for diagnostic/result labels. Nulls and other nested
+    objects/arrays are dropped.
     Exception: the ``arms`` key (an A/B multi-arm comparison block — a dict or
     list) is preserved verbatim so downstream consumers can render per-arm
     results. The monitor must NEVER raise on a garbled marker, so all failure
@@ -3676,7 +3678,15 @@ def _decode_result_metrics(raw_b64: str | None) -> dict[str, Any] | None:
             if not math.isfinite(numeric):
                 continue
             metrics[key] = numeric
-        # strings, None, other nested dict/list → dropped (not numeric)
+        elif isinstance(value, str):
+            encoded = value.encode("utf-8")
+            if len(encoded) <= _MAX_RESULT_METRIC_STRING_BYTES:
+                metrics[key] = value
+            else:
+                metrics[key] = encoded[:_MAX_RESULT_METRIC_STRING_BYTES].decode(
+                    "utf-8", errors="ignore"
+                )
+        # None and other nested dict/list → dropped
     return metrics or None
 
 

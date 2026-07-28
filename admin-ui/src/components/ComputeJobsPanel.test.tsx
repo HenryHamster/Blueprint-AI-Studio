@@ -4786,6 +4786,7 @@ describe('ComputeJobsPanel evidence-tier filter + sort', () => {
       terminal_log: { source: 'runner', text: 'finished normally', truncated: false },
       execution_manifest: { capability_requirements: { machine_type: 'g2-standard-4', accelerator: 'L4' } },
       runtime_provenance: { backend: 'runner_subprocess', runner_hostname: 'gpu-box' },
+      observed_hardware: { gpu_names: ['NVIDIA L40S'], gpu_count: 6 },
     });
     fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
 
@@ -4797,5 +4798,6 @@ describe('ComputeJobsPanel evidence-tier filter + sort', () => {
     const placement = await findByTestId('compute-requested-vs-executed');
     expect(placement.textContent).toContain('requested: g2-standard-4 · L4');
     expect(placement.textContent).toContain('executed: runner_subprocess · gpu-box');
+    expect(placement.textContent).toContain('observed GPU: NVIDIA L40S x6');
   });
 });

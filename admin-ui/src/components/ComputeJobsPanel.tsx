@@ -1640,8 +1640,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     data-testid="compute-job-provenance"
                   >
                     {backendLabel}
-                    {job.machine_type ? ` · ${job.machine_type}` : ''}
-                    {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
+                    {job.machine_type ? ` · requested ${job.machine_type}` : ''}
+                    {job.accelerator_type ? ` · requested ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                     {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
                     {job.external_compute_id ? (
                       <> · <span data-testid="compute-job-vm-identity">VM {job.external_compute_id}</span></>
@@ -1652,6 +1652,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     const actual = job.runtime_provenance;
                     const actualBackend = typeof actual?.backend === 'string' ? actual.backend : null;
                     const runner = typeof actual?.runner_hostname === 'string' ? actual.runner_hostname : null;
+                    const observed = job.observed_hardware
+                      ?? (actual?.observed_hardware as Record<string, unknown> | undefined);
+                    const observedModels = Array.isArray(observed?.gpu_names)
+                      ? observed.gpu_names.filter((model): model is string => typeof model === 'string')
+                      : [];
+                    const observedCount = typeof observed?.gpu_count === 'number'
+                      ? observed.gpu_count
+                      : null;
                     if (!requested && !actual) return null;
                     const requestedMachine = typeof requested?.machine_type === 'string' ? requested.machine_type : job.machine_type;
                     const requestedAccelerator = typeof requested?.accelerator === 'string' ? requested.accelerator : job.accelerator_type;
@@ -1659,6 +1667,9 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       <div className="text-ui-sm text-neutral-500 font-mono mt-0.5" data-testid="compute-requested-vs-executed">
                         requested: {requestedMachine ?? 'default'}{requestedAccelerator ? ` · ${requestedAccelerator}` : ''}
                         {' · '}executed: {actualBackend ?? job.backend}{runner ? ` · ${runner}` : ''}
+                        {observedCount != null || observedModels.length > 0
+                          ? ` · observed GPU: ${observedModels.join(', ') || 'unknown'}${observedCount != null ? ` x${observedCount}` : ''}`
+                          : ''}
                       </div>
                     );
                   })()}

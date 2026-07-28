@@ -291,13 +291,13 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt' | 'ui-load-timing' | 'skills' | 'tools';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'compute-job' | 'compute-limits' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt' | 'ui-load-timing' | 'skills' | 'tools';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt', 'ui-load-timing', 'skills', 'tools',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'compute-job', 'compute-limits', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt', 'ui-load-timing', 'skills', 'tools',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -322,6 +322,8 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'message':       'message)    PATH_SUFFIX="messages/${ID:-open}"',
   'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
   'compute-sweeps': 'compute-sweeps) PATH_SUFFIX="compute-sweeps${ID:+/$ID}"',
+  'compute-job': 'compute-job) PATH_SUFFIX="compute-jobs/$ID"',
+  'compute-limits': 'compute-limits) PATH_SUFFIX="compute-limits"',
   'qualification': 'qualification) PATH_SUFFIX="qualification"',
   'version-phase': 'version-phase) PATH_SUFFIX="version-phase"',
   'vm-cost':            'vm-cost)              PATH_SUFFIX="vm-cost"',
@@ -387,6 +389,8 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'section':       '`./fetch section <key>` — a full design-doc section',
   'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T] [--lifecycle-status S] [--followups]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body; `--followups` is shorthand for `--lifecycle-status pending`',
   'compute-sweeps': '`./fetch compute-sweeps [sweep_id]` — list completed compute experiment sweeps, or fetch one sweep by id',
+  'compute-job': '`./fetch compute-job <job_id>` — current execution truth for one compute job: live output, result diagnostics, requested versus observed hardware, deadline, and billing semantics',
+  'compute-limits': '`./fetch compute-limits` — active compute constraints and advisory local-runner inventory: deadline range, project concurrency cap, local-runner policy, approval threshold, and spend ceiling',
   'qualification': '`./fetch qualification` — latest qualification verdict for the open version: candidate SHA, confidence, sub_scores, and full audit findings list (no id)',
   'version-phase': '`./fetch version-phase` — compact current version phase/lifecycle context, qualification state, serving/deploy status, and recent closed versions (no id)',
   'vm-cost':            '`./fetch vm-cost` — live VM cost by task type: cost_usd, task/VM count, merged count, and merge-yield per type over the last 7 days (no id)',
@@ -434,7 +438,7 @@ _load_agent_token || exit 1
 PROJECT="${projectId}"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
-# problem-model, compute-sweeps, qualification, version-phase, vm-cost, efficiency-snapshot,
+# problem-model, compute-sweeps, compute-limits, qualification, version-phase, vm-cost, efficiency-snapshot,
 # and ci-compliance take no id; everything else requires one. compute-sweeps accepts an
 # optional sweep_id. For "message" the id may be a short
 # ref (first 8+ hex chars of the message UUID — the same ref operators see in
@@ -444,7 +448,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ "$KIND" != "ui-load-timing" ] && [ "$KIND" != "skills" ] && [ "$KIND" != "tools" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "compute-limits" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ "$KIND" != "ui-load-timing" ] && [ "$KIND" != "skills" ] && [ "$KIND" != "tools" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

@@ -274,6 +274,7 @@ async def test_fleet_serving_source_sha_preserves_exact_match_without_ancestry(
         new=AsyncMock(return_value=True),
     )
 
+    # Without a project scope, the transient heartbeat cache is admissible.
     assert (
         await compute.fleet_serving_source_sha(
             _FleetSourceFakeSession(),
@@ -304,7 +305,6 @@ async def test_fleet_serving_source_sha_accepts_descendant_when_enabled(
             token="tok",
             owner="acme",
             repo="widget",
-            project_id="proj",
         )
         is True
     )
