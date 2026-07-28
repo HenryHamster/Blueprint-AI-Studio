@@ -176,15 +176,25 @@ export function StrategicCallMode({
         </p>
       )}
       {error && <p role="alert" className="mt-1.5 text-xs text-rose-300">{error}</p>}
-      {enabled && captions.length > 0 && (
-        <div aria-live="polite" data-testid="strategic-call-captions" className="mt-2 max-h-28 space-y-1 overflow-y-auto border-t border-neutral-800 pt-2 text-sm text-neutral-200">
-          {captions.map(caption => <p key={caption.id}><span className="mr-1 text-xs text-cyan-300">{caption.speaker === 'resident' ? 'Workday' : 'You'}</span>{caption.text}</p>)}
-        </div>
-      )}
-      {enabled && displayBlocks.length > 0 && (
-        <div data-testid="strategic-call-display-blocks" className="mt-2 space-y-2 border-t border-neutral-800 pt-2">
-          {displayBlocks.map(block => <div key={block.id}>{block.title && <p className="mb-1 text-xs text-neutral-400">{block.title}</p>}<DisplayBlock block={block} /></div>)}
-        </div>
+      {enabled && (captions.length > 0 || displayBlocks.length > 0) && (
+        <details className="mt-1.5 border-t border-neutral-800 pt-1.5 text-xs text-neutral-400">
+          <summary className="w-fit cursor-pointer select-none rounded px-1 py-0.5 hover:bg-neutral-800 hover:text-neutral-200">
+            Live notes · {captions.length} caption{captions.length === 1 ? '' : 's'}
+            {displayBlocks.length > 0 ? ` · ${displayBlocks.length} shared item${displayBlocks.length === 1 ? '' : 's'}` : ''}
+          </summary>
+          <div className="mt-1.5 max-h-48 overflow-y-auto pr-1">
+            {captions.length > 0 && (
+              <div aria-live="polite" data-testid="strategic-call-captions" className="space-y-1 text-sm text-neutral-200">
+                {captions.map(caption => <p key={caption.id}><span className="mr-1 text-xs text-cyan-300">{caption.speaker === 'resident' ? 'Workday' : 'You'}</span>{caption.text}</p>)}
+              </div>
+            )}
+            {displayBlocks.length > 0 && (
+              <div data-testid="strategic-call-display-blocks" className="mt-2 space-y-2 border-t border-neutral-800 pt-2">
+                {displayBlocks.map(block => <div key={block.id}>{block.title && <p className="mb-1 text-xs text-neutral-400">{block.title}</p>}<DisplayBlock block={block} /></div>)}
+              </div>
+            )}
+          </div>
+        </details>
       )}
     </section>
   );
