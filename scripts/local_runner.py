@@ -3629,7 +3629,8 @@ def _heartbeat_loop(
     version = _runner_version()
     consecutive_401 = 0
     consecutive_network_failures = 0
-    deferred_auto_update_hint: str | None = None
+    next_auto_update_attempt_at = 0.0
+    last_auto_update_failure: tuple[str, str | None] | None = None
     # Whether ANY heartbeat has ever authenticated (200/204). A token that has
     # never authenticated and gets a 401 is definitively bad (wrong/revoked, or a
     # deleted runner) — the daemon fast-fails on that first 401 rather than
@@ -3950,13 +3951,11 @@ def _heartbeat_loop(
                             else:
                                 has_compute = False
 
-                            if deferred_auto_update_hint == version_hint:
-                                # A prior update proved this exact server hint is
-                                # behind/different from origin/main. Do not
-                                # re-arm drain mode forever on every heartbeat;
-                                # wait for the server hint to change.
-                                _update_in_progress.clear()
-                            elif not has_tasks and not has_compute:
+                            if (
+                                not has_tasks
+                                and not has_compute
+                                and time.monotonic() >= next_auto_update_attempt_at
+                            ):
                                 print(
                                     f"[runner] version mismatch ({version!r} vs "
                                     f"{version_hint!r}) and runner is idle — "
@@ -3964,49 +3963,77 @@ def _heartbeat_loop(
                                     flush=True,
                                 )
                                 try:
-                                    result = br.do_update()
+                                    result = br.do_update(restart_service=False)
                                 except Exception:
-                                    _update_in_progress.clear()
                                     raise
                                 if result == 0:
                                     refreshed_version = _runner_version()
                                     refreshed_sha = _describe_sha(refreshed_version)
-                                    refreshed_matches = (
+                                    refreshed_matches_exactly = (
                                         bool(refreshed_sha)
                                         and version_hint.startswith(refreshed_sha)
                                     ) or (
                                         bool(refreshed_version)
                                         and version_hint in refreshed_version
                                     )
-                                    if refreshed_matches:
-                                        # Update succeeded and the checkout now
-                                        # matches the server. _restart_runner_service
-                                        # (called inside do_update) may already have
-                                        # killed this process; otherwise re-exec here.
+                                    checkout_converged = (
+                                        refreshed_matches_exactly
+                                        or br.checkout_contains_commit(version_hint)
+                                    )
+                                    if checkout_converged:
+                                        br.report_update_result(
+                                            orchestrator_url,
+                                            token,
+                                            status="success",
+                                            old_version=version,
+                                            new_version=refreshed_version,
+                                        )
+                                        # The daemon owns its lifecycle here:
+                                        # replace this process after convergence
+                                        # instead of trusting an unverified
+                                        # external service restart.
                                         _reexec_after_update()
                                     else:
-                                        # ``do_update`` returns 0 for a no-op when
-                                        # origin/main is already newer than the
-                                        # deployed orchestrator. Exiting here used
-                                        # to make a systemd runner hit its start
-                                        # limit even though it was healthy.
-                                        deferred_auto_update_hint = version_hint
-                                        _update_in_progress.clear()
+                                        failure = (version_hint, refreshed_version)
+                                        if last_auto_update_failure != failure:
+                                            br.report_update_result(
+                                                orchestrator_url,
+                                                token,
+                                                status="failure",
+                                                old_version=version,
+                                                new_version=refreshed_version,
+                                            )
+                                            last_auto_update_failure = failure
+                                        next_auto_update_attempt_at = (
+                                            time.monotonic() + 60.0
+                                        )
                                         print(
                                             "[runner] update completed but the runner "
-                                            "still differs from the orchestrator; "
-                                            "continuing without restart until its "
-                                            "version hint changes.",
+                                            "checkout does not contain the "
+                                            "orchestrator commit; remaining drained "
+                                            "and retrying in 60 seconds.",
                                             flush=True,
                                         )
                                 else:
+                                    failure = (version_hint, None)
+                                    if last_auto_update_failure != failure:
+                                        br.report_update_result(
+                                            orchestrator_url,
+                                            token,
+                                            status="failure",
+                                            old_version=version,
+                                            new_version=None,
+                                        )
+                                        last_auto_update_failure = failure
+                                    next_auto_update_attempt_at = (
+                                        time.monotonic() + 60.0
+                                    )
                                     print(
                                         f"[runner] auto-update failed "
-                                        f"(exit={result}) — continuing with "
-                                        "current version.",
+                                        f"(exit={result}) — remaining drained "
+                                        "and retrying in 60 seconds.",
                                         flush=True,
                                     )
-                                    _update_in_progress.clear()
                             elif has_tasks or has_compute:
                                 print(
                                     f"[runner] WARNING: runner version {version!r} "
@@ -4016,7 +4043,8 @@ def _heartbeat_loop(
                                     flush=True,
                                 )
                         else:
-                            deferred_auto_update_hint = None
+                            last_auto_update_failure = None
+                            next_auto_update_attempt_at = 0.0
                             _update_in_progress.clear()
                 _write_status_json(
                     runner_id=hostname,

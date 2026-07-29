@@ -1390,6 +1390,21 @@ class UpdateCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         restart_mock.assert_called_once()
 
+    def test_update_can_leave_restart_to_running_daemon(self):
+        """Automatic updates can make in-process re-exec authoritative."""
+        run = _git_recorder()
+        with patch.object(br, "_restart_runner_service") as restart_mock:
+            rc = br.do_update(_run=run, restart_service=False)
+        self.assertEqual(rc, 0)
+        restart_mock.assert_not_called()
+
+    def test_update_fails_when_installed_service_restart_fails(self):
+        """The CLI does not report success after a failed service restart."""
+        run = _git_recorder()
+        with patch.object(br, "_restart_runner_service", return_value=False):
+            rc = br.do_update(_run=run)
+        self.assertEqual(rc, 1)
+
     def test_update_reports_success_to_orchestrator(self):
         """_run_update_and_report POSTs the update result on success."""
         with patch.object(br, "do_update", return_value=0) as update_mock, \
@@ -1454,6 +1469,15 @@ class RestartServiceTests(unittest.TestCase):
             any("systemctl --user restart blueprint-runner.service" in j for j in joined)
         )
 
+    def test_failed_restart_is_not_reported_as_performed(self):
+        """A nonzero systemctl restart result is observable to callers."""
+        calls = []
+        run = _systemctl_recorder(fail_on={"restart": 1}, record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=True):
+            result = br._restart_runner_service(_run=run)
+        self.assertFalse(result)
+
     def test_restarts_system_service_when_no_user_unit(self):
         """When only system unit exists, restarts via systemctl (no --user)."""
         calls = []
@@ -1509,6 +1533,16 @@ class RestartServiceTests(unittest.TestCase):
             any("systemctl --user restart" in j for j in joined),
             "user scope must be checked (and restarted) first when both exist",
         )
+
+
+class CheckoutContainsCommitTests(unittest.TestCase):
+    def test_true_when_git_confirms_ancestor(self):
+        run = _git_recorder()
+        self.assertTrue(br.checkout_contains_commit("abc123", _run=run))
+
+    def test_false_when_git_rejects_ancestor(self):
+        run = MagicMock(return_value=MagicMock(returncode=1))
+        self.assertFalse(br.checkout_contains_commit("abc123", _run=run))
 
 
 class PrintNoSystemdGuidanceTests(unittest.TestCase):
