@@ -107,7 +107,9 @@ const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
 const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 30_000;
 const RESIDENT_LEGACY_ADMISSION_MAX_MS = 180_000;
+const RESIDENT_LEGACY_ADMISSION_SKEW_MS = 30_000;
 const RESIDENT_ADMISSION_TRANSPORT_MAX_MS = 60_000;
+const RESIDENT_ADMISSION_API_MAX_RETRIES = 0;
 const CONVERSATION_CLAIM_LEASE_SECONDS = 90;
 const CONVERSATION_CLAIM_RENEW_MS = 15_000;
 export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
@@ -628,8 +630,8 @@ export async function handleStrategicResident(
   // ./strategic bindings with loser-specific receipt paths/incarnation.
   let initialAuthorityAdmission: SessionHeartbeatResponse | null = null;
   let initialAuthorityAdmissionAt = 0;
-  const legacyAdmissionDeadline = Date.now() + RESIDENT_LEGACY_ADMISSION_MAX_MS;
-  let admissionTransportFailureStartedAt: number | null = null;
+  let legacyAdmissionDeadline: number | null = null;
+  let admissionTransportDeadline: number | null = null;
   const admissionPath = `/api/agent/projects/${projectId}/strategic-session/heartbeat`;
   const admissionBody = {
     session_id: sessionId,
@@ -647,15 +649,37 @@ export async function handleStrategicResident(
     try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
   };
   for (;;) {
+    if (
+      admissionTransportDeadline !== null
+      && Date.now() >= admissionTransportDeadline
+    ) {
+      cleanupUnadmittedRuntime();
+      return;
+    }
+    const admissionAttemptStartedAt = Date.now();
+    const admissionTimeout = admissionTransportDeadline === null
+      ? HEARTBEAT_API_TIMEOUT
+      : Math.max(
+        1,
+        Math.min(HEARTBEAT_API_TIMEOUT, admissionTransportDeadline - Date.now()),
+      );
     try {
       const admission = await apiPost(
         admissionPath,
         admissionBody,
-        HEARTBEAT_API_MAX_RETRIES,
-        HEARTBEAT_API_TIMEOUT,
+        RESIDENT_ADMISSION_API_MAX_RETRIES,
+        admissionTimeout,
       ) as SessionHeartbeatResponse;
-      admissionTransportFailureStartedAt = null;
+      admissionTransportDeadline = null;
       if (admission.admission_status === 'legacy_grace') {
+        if (legacyAdmissionDeadline === null) {
+          const serverLeaseExpiry = Date.parse(String(admission.leased_until ?? ''));
+          legacyAdmissionDeadline = Number.isFinite(serverLeaseExpiry)
+            ? serverLeaseExpiry + RESIDENT_LEGACY_ADMISSION_SKEW_MS
+            : Date.now()
+              + RESIDENT_LEGACY_ADMISSION_MAX_MS
+              + RESIDENT_LEGACY_ADMISSION_SKEW_MS;
+        }
         if (Date.now() >= legacyAdmissionDeadline) {
           cleanupUnadmittedRuntime();
           return;
@@ -684,11 +708,10 @@ export async function handleStrategicResident(
         cleanupUnadmittedRuntime();
         return;
       }
-      admissionTransportFailureStartedAt ??= Date.now();
-      if (
-        Date.now() - admissionTransportFailureStartedAt
-        >= RESIDENT_ADMISSION_TRANSPORT_MAX_MS
-      ) {
+      admissionTransportDeadline ??= (
+        admissionAttemptStartedAt + RESIDENT_ADMISSION_TRANSPORT_MAX_MS
+      );
+      if (Date.now() >= admissionTransportDeadline) {
         cleanupUnadmittedRuntime();
         return;
       }
@@ -1255,14 +1278,28 @@ export async function handleStrategicResident(
     )
   );
   if (launchProofNeedsRenewal) {
-    let launchAdmissionFailureStartedAt: number | null = null;
+    let launchAdmissionDeadline: number | null = null;
     for (;;) {
+      if (
+        launchAdmissionDeadline !== null
+        && Date.now() >= launchAdmissionDeadline
+      ) {
+        cleanupUnadmittedRuntime();
+        return;
+      }
+      const launchAttemptStartedAt = Date.now();
+      const launchAdmissionTimeout = launchAdmissionDeadline === null
+        ? HEARTBEAT_API_TIMEOUT
+        : Math.max(
+          1,
+          Math.min(HEARTBEAT_API_TIMEOUT, launchAdmissionDeadline - Date.now()),
+        );
       try {
         const launchAdmission = await apiPost(
           admissionPath,
           admissionBody,
-          HEARTBEAT_API_MAX_RETRIES,
-          HEARTBEAT_API_TIMEOUT,
+          RESIDENT_ADMISSION_API_MAX_RETRIES,
+          launchAdmissionTimeout,
         ) as SessionHeartbeatResponse;
         if (
           launchAdmission.resident_incarnation_held === false
@@ -1278,11 +1315,10 @@ export async function handleStrategicResident(
           cleanupUnadmittedRuntime();
           return;
         }
-        launchAdmissionFailureStartedAt ??= Date.now();
-        if (
-          Date.now() - launchAdmissionFailureStartedAt
-          >= RESIDENT_ADMISSION_TRANSPORT_MAX_MS
-        ) {
+        launchAdmissionDeadline ??= (
+          launchAttemptStartedAt + RESIDENT_ADMISSION_TRANSPORT_MAX_MS
+        );
+        if (Date.now() >= launchAdmissionDeadline) {
           cleanupUnadmittedRuntime();
           return;
         }

@@ -176,7 +176,7 @@ import {
   ATTACHMENT_FETCH_TIMEOUT_MS,
   MAX_IMAGES_PER_TURN,
 } from './strategic-resident-lib.js';
-import { HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT } from '../constants.js';
+import { HEARTBEAT_API_TIMEOUT } from '../constants.js';
 
 // The coalescing drain emits at most one frame per this window (see
 // STREAM_FLUSH_MS in strategic-resident.ts); mirrored here for the timing math.
@@ -471,7 +471,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     const heartbeat = mockApiPost.mock.calls.find(([url]) =>
       url.includes('/strategic-session/heartbeat'),
     );
-    expect(heartbeat?.[2]).toBe(HEARTBEAT_API_MAX_RETRIES);
+    expect(heartbeat?.[2]).toBe(0);
     expect(heartbeat?.[3]).toBe(HEARTBEAT_API_TIMEOUT);
   });
 
@@ -2414,6 +2414,12 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     await handling;
 
     expect(mockApiPost.mock.calls.length).toBeGreaterThan(1);
+    expect(mockApiPost.mock.calls.every(([, , retries, timeout]) => (
+      retries === 0
+      && typeof timeout === 'number'
+      && timeout > 0
+      && timeout <= HEARTBEAT_API_TIMEOUT
+    ))).toBe(true);
     expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
     expect(mockStartSession).not.toHaveBeenCalled();
   });
@@ -2513,6 +2519,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       stop_requested: false,
       admission_status: 'legacy_grace',
       retry_after_seconds: 30,
+      leased_until: new Date(Date.now() + 180_000).toISOString(),
     });
     const statusRef = { value: 'legacy owner remains active' };
     const handling = handleStrategicResident(
@@ -2528,7 +2535,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       'ghtok', 'owner', 'repo', null, statusRef,
     );
 
-    await vi.advanceTimersByTimeAsync(180_001);
+    await vi.advanceTimersByTimeAsync(210_001);
     await handling;
 
     expect(mockApiPost.mock.calls.length).toBeGreaterThan(1);
