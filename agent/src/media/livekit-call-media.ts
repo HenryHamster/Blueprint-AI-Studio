@@ -523,7 +523,6 @@ export class CallMediaSession {
 
   /** Cancel queued local audio and advance the barge-in fencing epoch. */
   cancelPlayback(): Promise<number> {
-    if (!this.lease) throw new Error('call media is not connected');
     this.playoutRevision += 1;
     this.outputSource?.clearQueue();
     return Promise.resolve(this.playoutRevision);
