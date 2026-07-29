@@ -471,7 +471,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     const heartbeat = mockApiPost.mock.calls.find(([url]) =>
       url.includes('/strategic-session/heartbeat'),
     );
-    expect(heartbeat?.[2]).toBe(0);
+    expect(heartbeat?.[2]).toBe(1);
     expect(heartbeat?.[3]).toBe(HEARTBEAT_API_TIMEOUT);
   });
 
@@ -2415,7 +2415,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
     expect(mockApiPost.mock.calls.length).toBeGreaterThan(1);
     expect(mockApiPost.mock.calls.every(([, , retries, timeout]) => (
-      retries === 0
+      retries === 1
       && typeof timeout === 'number'
       && timeout > 0
       && timeout <= HEARTBEAT_API_TIMEOUT
