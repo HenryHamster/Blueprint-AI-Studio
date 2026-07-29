@@ -1,4 +1,4 @@
-import { memo, useRef, useState, type RefObject } from 'react';
+import { memo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { Command, X, Send, Reply, Paperclip, FileText, Image, Sigma } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
@@ -56,6 +56,7 @@ export interface MessagesComposerProps {
   uploading?: boolean;
   onOpenStrategicContext?: () => void;
   onOpenCommandPalette?: () => void;
+  leadingControl?: ReactNode;
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
@@ -104,6 +105,7 @@ export const MessagesComposer = memo(function MessagesComposer({
   uploading,
   onOpenStrategicContext,
   onOpenCommandPalette,
+  leadingControl,
   onChangeType,
   onChangeContent,
   onCancelReply,
@@ -419,6 +421,7 @@ export const MessagesComposer = memo(function MessagesComposer({
         )}
         {minimal && (
           <>
+            {leadingControl}
             {onOpenCommandPalette && (
               <button
                 type="button"

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Checks both the private LiveKit listener and the public TLS/WSS proxy path.
+set -Eeuo pipefail
+
+readonly CONFIG_DIR="${BLUEPRINT_LIVEKIT_CONFIG_DIR:-/etc/blueprint-livekit}"
+readonly PUBLIC_ENV="$CONFIG_DIR/public.env"
+readonly PRIVATE_HEALTH_URL="http://127.0.0.1:7880/"
+readonly WAIT_SECONDS=45
+
+if [[ ! -r "$PUBLIC_ENV" ]]; then
+  echo "missing $PUBLIC_ENV" >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$PUBLIC_ENV"
+if [[ ! "${LIVEKIT_PUBLIC_HOST:-}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]; then
+  echo "LIVEKIT_PUBLIC_HOST is missing or invalid" >&2
+  exit 1
+fi
+if [[ ! "${LIVEKIT_TURN_HOST:-}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]; then
+  echo "LIVEKIT_TURN_HOST is missing or invalid" >&2
+  exit 1
+fi
+
+check_once() {
+  curl --fail --silent --show-error --max-time 5 "$PRIVATE_HEALTH_URL" --output /dev/null
+  # `--resolve` validates Caddy's real certificate/SNI locally without relying
+  # on public hairpin routing through the GCE firewall.
+  curl --fail --silent --show-error --max-time 5 \
+    --resolve "$LIVEKIT_PUBLIC_HOST:443:127.0.0.1" \
+    "https://$LIVEKIT_PUBLIC_HOST/" --output /dev/null
+  # The GCE TCP proxy reaches this locally mapped port. This only checks its
+  # TLS certificate/SNI; TURN is not an HTTP protocol.
+  openssl s_client -connect 127.0.0.1:5349 -servername "$LIVEKIT_TURN_HOST" \
+    -verify_return_error </dev/null 2>/dev/null | grep -q 'Verify return code: 0 (ok)'
+}
+
+if [[ "${1:-}" == "--wait" ]]; then
+  deadline=$((SECONDS + WAIT_SECONDS))
+  until check_once; do
+    if (( SECONDS >= deadline )); then
+      echo "LiveKit did not become healthy within ${WAIT_SECONDS}s" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+else
+  check_once
+fi

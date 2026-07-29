@@ -1204,7 +1204,10 @@ def _hostname() -> str | None:
         name = socket.gethostname()
     except OSError:
         return None
-    return name or None
+    if not name:
+        return None
+    instance = os.environ.get("BLUEPRINT_RUNNER_INSTANCE", "").strip()
+    return f"{name}:{instance}" if instance else name
 
 
 def _runner_version() -> str | None:
@@ -7803,6 +7806,15 @@ def main() -> None:
         # Print the module docstring (which carries the RUNNER_RUNBOOK) and exit.
         print(__doc__ or "", flush=True)
         return
+
+    if br.livekit_gateway_role_is_selected():
+        print(
+            "ERROR: this host is reserved for the Blueprint LiveKit gateway role; "
+            "refusing to start task capacity. Stop and remove the gateway role "
+            "explicitly before running local_runner.py.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     check_mode = "--check" in sys.argv[1:]
 

@@ -36,10 +36,10 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, func, or_, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -48,6 +48,15 @@ from sqlmodel import select
 from app.database import AsyncSessionLocal, get_session
 from app.failure_classification import ADMIN_CANCEL
 from app.knowledge_query import build_strategic_memory_index
+from app.livekit_tokens import (
+    LiveKitConfigurationError,
+    issue_resident_call_credentials,
+)
+from app.voice_credentials import (
+    VoiceCredentialConfigurationError,
+    resolve_resident_call_speech_credentials,
+    validate_resident_call_deployment_configuration,
+)
 from app.models import (
     Direction,
     Project,
@@ -90,6 +99,28 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 # ``_strategic_workbench`` (per-operator prefs) and ``_strategic_local_continuation``
 # (the lease marker) so the three concerns never clobber one another.
 RESIDENT_SESSION_KEY = "_resident_strategic_session"
+_RESIDENT_WORKER_INCARNATION_PROTOCOL = 1
+
+# A call is deliberately a bounded, nested lease on the existing Workday
+# session record, not a third interaction_mode or a new persistent table.  The
+# generation is the public-reply fence: every call-owned mutation must present
+# the exact id + generation recorded here.
+RESIDENT_CALL_KEY = "call"
+CALL_STATUS_ACTIVE = "active"
+CALL_STATUS_ENDED = "ended"
+CALL_STATUS_EXPIRED = "expired"
+_DEFAULT_RESIDENT_CALL_TTL_SECONDS = 300
+_RESIDENT_CALL_TTL_MIN_SECONDS = 30
+_RESIDENT_CALL_TTL_MAX_SECONDS = 900
+_RESIDENT_CALL_READY_DEADLINE_SECONDS = 30
+_RESIDENT_CALL_MAX_DURATION_SECONDS = 7200
+_RESIDENT_CALL_USAGE_LIMITS = {
+    "input_audio_ms": _RESIDENT_CALL_MAX_DURATION_SECONDS * 1000,
+    "output_audio_bytes": 2_000_000_000,
+    "output_characters": 20_000_000,
+    "provider_errors": 100_000,
+}
+_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS = 180
 
 # ``Project.vision`` key holding the reason the *last* Workday auto-start was
 # blocked or failed (surfaced by the strategic read model so the operator sees
@@ -138,6 +169,10 @@ _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 7200  # 2h
 # slack; otherwise a healthy resident is cancelled while its generic task
 # heartbeat and runner both remain live.
 _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS = 180
+# A fresh heartbeat from the exact Task can corroborate a transient lag in the
+# Resident-session projection, but it is emitted by an outer runner timer and
+# cannot prove the conversation loop is making progress forever.
+_RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS = 120
 
 # A provisional spawn-claim (an active session blob whose ``task_id`` is still
 # None because the spawn is in flight) blocks a concurrent start from spawning a
@@ -339,6 +374,512 @@ def read_resident_session(vision: dict[str, Any] | None) -> dict[str, Any] | Non
     """Return the raw session-state blob from ``Project.vision`` (or None)."""
     blob = (vision or {}).get(RESIDENT_SESSION_KEY)
     return blob if isinstance(blob, dict) else None
+
+
+def read_resident_call(vision: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the nested call lease from the canonical Resident state."""
+    session_blob = read_resident_session(vision)
+    call = (session_blob or {}).get(RESIDENT_CALL_KEY)
+    return call if isinstance(call, dict) else None
+
+
+def legacy_resident_worker_incarnation(
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+) -> uuid.UUID:
+    """Stable process identity used when a rolling-deploy peer lacks fencing."""
+    from app.conversation_coordinator import (
+        legacy_conversation_claim_incarnation,
+    )
+
+    return legacy_conversation_claim_incarnation(
+        uuid.UUID(str(task_id)),
+        worker_generation,
+    )
+
+
+def resident_worker_incarnation_is_current(
+    vision: dict[str, Any] | None,
+    *,
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+    incarnation_id: uuid.UUID | None,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether one process owns the unexpired Resident-wide authority."""
+    resident = read_resident_session(vision)
+    if not resident_session_is_active(resident):
+        return False
+    requested = incarnation_id or legacy_resident_worker_incarnation(
+        task_id,
+        worker_generation,
+    )
+    recorded = resident.get("worker_incarnation_id")
+    # Pre-fence session blobs belong only to the deterministic legacy process.
+    if recorded is None:
+        recorded = str(
+            legacy_resident_worker_incarnation(task_id, worker_generation)
+        )
+    expires_at = _parse_iso_naive(
+        resident.get("worker_incarnation_expires_at")
+    )
+    # A pre-fence blob has no process lease. It remains compatible only for the
+    # legacy identity; the next locked heartbeat/claim materializes its lease.
+    return (
+        str(recorded) == str(requested)
+        and (
+            expires_at is None
+            or expires_at > (now or _utcnow())
+        )
+    )
+
+
+def claim_resident_worker_incarnation(
+    vision: dict[str, Any],
+    *,
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+    incarnation_id: uuid.UUID | None,
+    now: datetime | None = None,
+) -> uuid.UUID | None:
+    """CAS the Resident-wide process lease while the Project row is locked."""
+    resident = read_resident_session(vision)
+    if not resident_session_is_active(resident):
+        return None
+    current_now = now or _utcnow()
+    requested = incarnation_id or legacy_resident_worker_incarnation(
+        task_id,
+        worker_generation,
+    )
+    recorded_raw = resident.get("worker_incarnation_id")
+    legacy_incarnation = legacy_resident_worker_incarnation(
+        task_id,
+        worker_generation,
+    )
+    try:
+        recorded = (
+            uuid.UUID(str(recorded_raw))
+            if recorded_raw
+            else legacy_incarnation
+        )
+    except (TypeError, ValueError, AttributeError):
+        return None
+    expires_at = _parse_iso_naive(
+        resident.get("worker_incarnation_expires_at")
+    )
+    # During a rolling deploy an old Agent can still be inside a provider turn.
+    # Materialize one bounded lease for its deterministic legacy identity before
+    # allowing a random new-process identity to take over.
+    if (
+        recorded_raw is None
+        and expires_at is None
+        and requested != legacy_incarnation
+        and resident.get("worker_incarnation_protocol")
+        != _RESIDENT_WORKER_INCARNATION_PROTOCOL
+    ):
+        updated = dict(resident)
+        updated["worker_incarnation_id"] = str(legacy_incarnation)
+        updated["worker_incarnation_expires_at"] = (
+            current_now
+            + timedelta(seconds=_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS)
+        ).isoformat()
+        vision[RESIDENT_SESSION_KEY] = updated
+        return None
+    if (
+        recorded != requested
+        and expires_at is not None
+        and expires_at > current_now
+    ):
+        return None
+    updated = dict(resident)
+    updated["worker_incarnation_id"] = str(requested)
+    updated["worker_incarnation_expires_at"] = (
+        current_now
+        + timedelta(seconds=_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = updated
+    return requested
+
+
+def resident_call_is_active(
+    call: dict[str, Any] | None, *, now: datetime | None = None
+) -> bool:
+    """True only for an unexpired active call lease."""
+    if not isinstance(call, dict) or call.get("status") != CALL_STATUS_ACTIVE:
+        return False
+    expires_at = _parse_iso_naive(call.get("expires_at"))
+    return expires_at is not None and expires_at > (now or _utcnow())
+
+
+def resident_call_snapshot(
+    vision: dict[str, Any] | None, *, now: datetime | None = None
+) -> dict[str, Any] | None:
+    """Bounded public projection; never exposes the operator or pool account."""
+    call = read_resident_call(vision)
+    if call is None:
+        return None
+    current_now = now or _utcnow()
+    status = call.get("status")
+    if status == CALL_STATUS_ACTIVE and not resident_call_is_active(call, now=current_now):
+        status = CALL_STATUS_EXPIRED
+    return {
+        "call_id": call.get("call_id"),
+        "generation": int(call.get("generation") or 1),
+        "status": status,
+        "started_at": call.get("started_at"),
+        "ready_at": call.get("ready_at"),
+        "updated_at": call.get("updated_at"),
+        "expires_at": call.get("expires_at"),
+        "last_heartbeat_at": call.get("last_heartbeat_at"),
+        "worker_task_id": call.get("worker_task_id"),
+        "worker_generation": int(call.get("worker_generation") or 1),
+        "runner_id": call.get("runner_id"),
+        "input_revision": int(call.get("input_revision") or 0),
+        "failure": call.get("failure"),
+        "usage": _bounded_resident_call_usage(call.get("usage")),
+    }
+
+
+async def bind_resident_call_input_to_locked_project(
+    session: AsyncSession,
+    project: Project,
+    *,
+    actor_user_id: str,
+    context: dict[str, Any],
+    input_source: Literal["voice", "typed", "whiteboard"],
+) -> dict[str, Any]:
+    """Stamp/increment an active call input while the caller owns Project lock.
+
+    This intentionally performs no commit: it is called from the existing
+    canonical operator-message transaction after that transaction has acquired
+    the Project row lock and before it allocates the message sequence.  Route
+    the mutation through the re-entrant ``with_vision_locked`` bridge so the
+    whole-column write remains centralized in the canonical helper.
+    """
+    result = context
+
+    def _apply(vision: dict[str, Any]) -> None:
+        nonlocal result
+        resident = read_resident_session(vision)
+        call = (resident or {}).get(RESIDENT_CALL_KEY)
+        if not resident_call_is_active(call):
+            return
+        if str((call or {}).get("actor_user_id")) != str(actor_user_id):
+            raise HTTPException(status_code=403, detail="Only the call owner may add call input")
+        revision = int((call or {}).get("input_revision") or 0) + 1
+        call["input_revision"] = revision
+        call["updated_at"] = _utcnow().isoformat()
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+        result = {
+            **context,
+            "call_id": call.get("call_id"),
+            "call_generation": int(call.get("generation") or 1),
+            "input_source": input_source,
+            "input_revision": revision,
+        }
+
+    await with_vision_locked(
+        session,
+        project.id,
+        _apply,
+        skip_locked=False,
+        _locked_project=project,
+    )
+    return result
+
+
+def _bounded_call_ttl_seconds(value: int | None) -> int:
+    try:
+        parsed = int(value or _DEFAULT_RESIDENT_CALL_TTL_SECONDS)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_RESIDENT_CALL_TTL_SECONDS
+    return min(_RESIDENT_CALL_TTL_MAX_SECONDS, max(_RESIDENT_CALL_TTL_MIN_SECONDS, parsed))
+
+
+def _bounded_resident_call_usage(value: dict[str, Any] | None) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, upper in _RESIDENT_CALL_USAGE_LIMITS.items():
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        result[key] = min(upper, max(0, parsed))
+    return result
+
+
+async def acquire_resident_call_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    operator_user_id: str,
+    account_id: str | None,
+    ttl_seconds: int | None = None,
+) -> tuple[dict[str, Any], str | None, bool]:
+    """Atomically acquire/reuse a nested call lease.
+
+    Returns the full (server-only) lease and an expired account id whose old
+    slot must be released by the caller after commit.  Capacity reservation is
+    intentionally outside this DB lock; the endpoint compensates if this write
+    loses its race.
+    """
+    now = _utcnow()
+    now_iso = now.isoformat()
+    ttl = _bounded_call_ttl_seconds(ttl_seconds)
+    holder: dict[str, Any] = {"call": None, "expired_account_id": None, "created": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        if not resident_session_is_active(resident):
+            raise HTTPException(status_code=409, detail="An active Workday Resident is required")
+        existing = resident.get(RESIDENT_CALL_KEY)
+        if resident_call_is_active(existing, now=now):
+            if str(existing.get("actor_user_id")) != str(operator_user_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only the call owner may reconnect",
+                )
+            holder["call"] = dict(existing)
+            return
+        if isinstance(existing, dict) and existing.get("status") == CALL_STATUS_ACTIVE:
+            holder["expired_account_id"] = str(existing.get("account_id") or "") or None
+        prior_generation = int(existing.get("generation") or 0) if isinstance(existing, dict) else 0
+        call = {
+            "call_id": f"call-{uuid.uuid4().hex[:16]}",
+            "generation": prior_generation + 1,
+            "status": CALL_STATUS_ACTIVE,
+            "actor_user_id": str(operator_user_id),
+            "started_at": now_iso,
+            "updated_at": now_iso,
+            "expires_at": (now + timedelta(seconds=ttl)).isoformat(),
+            "last_heartbeat_at": now_iso,
+            "worker_task_id": resident.get("task_id"),
+            "worker_generation": int(resident.get("worker_generation") or 1),
+            "worker_incarnation_id": resident.get("worker_incarnation_id"),
+            "runner_id": resident.get("runner_id"),
+            "account_id": account_id,
+            "slot_reserved": bool(account_id),
+            "input_revision": 0,
+            "failure": None,
+        }
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+        holder["call"] = dict(call)
+        holder["created"] = True
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    return dict(holder["call"]), holder["expired_account_id"], bool(holder["created"])
+
+
+async def release_resident_call_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    call_id: str | None = None,
+    generation: int | None = None,
+    task_id: uuid.UUID | str | None = None,
+    worker_generation: int | None = None,
+    incarnation_id: uuid.UUID | None = None,
+    reason: str = "ended",
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Fenced, idempotent call shutdown; returns lease, account id, changed."""
+    now_iso = _utcnow().isoformat()
+    holder: dict[str, Any] = {"call": None, "account_id": None, "changed": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        existing = (resident or {}).get(RESIDENT_CALL_KEY)
+        if not isinstance(existing, dict):
+            return
+        if call_id is not None and str(existing.get("call_id")) != str(call_id):
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        if generation is not None and int(existing.get("generation") or 0) != generation:
+            raise HTTPException(status_code=409, detail="Call generation superseded")
+        if task_id is not None and not resident_worker_incarnation_is_current(
+            vision,
+            task_id=task_id,
+            worker_generation=(
+                worker_generation
+                or int(existing.get("worker_generation") or 1)
+            ),
+            incarnation_id=incarnation_id,
+            now=_utcnow(),
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident process incarnation superseded",
+            )
+        holder["call"] = dict(existing)
+        if existing.get("status") == CALL_STATUS_ACTIVE:
+            holder["account_id"] = str(existing.get("account_id") or "") or None
+            existing["status"] = CALL_STATUS_ENDED if reason == "ended" else CALL_STATUS_EXPIRED
+            existing["ended_at"] = now_iso
+            existing["updated_at"] = now_iso
+            existing["failure"] = reason if reason != "ended" else None
+            holder["changed"] = True
+            if isinstance(resident, dict):
+                resident[RESIDENT_CALL_KEY] = existing
+                vision[RESIDENT_SESSION_KEY] = resident
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    if holder["call"] is not None:
+        await session.commit()
+        await session.refresh(project)
+    return holder["call"], holder["account_id"], bool(holder["changed"])
+
+
+async def renew_resident_call_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    task_id: str,
+    call_id: str,
+    generation: int,
+    incarnation_id: uuid.UUID | None = None,
+    ttl_seconds: int | None = None,
+    ready: bool = False,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Renew only the exact Resident-owned nested lease."""
+    now = _utcnow()
+    now_iso = now.isoformat()
+    ttl = _bounded_call_ttl_seconds(ttl_seconds)
+    holder: dict[str, Any] = {"call": None, "release_account_id": None}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        call = (resident or {}).get(RESIDENT_CALL_KEY)
+        if not resident_session_is_active(resident) or not isinstance(call, dict):
+            raise HTTPException(status_code=409, detail="No active call lease")
+        if (
+            str(call.get("call_id")) != call_id
+            or int(call.get("generation") or 0) != generation
+            or str(call.get("worker_task_id")) != str(task_id)
+            or not resident_worker_incarnation_is_current(
+                vision,
+                task_id=task_id,
+                worker_generation=int(
+                    (resident or {}).get("worker_generation") or 1
+                ),
+                incarnation_id=incarnation_id,
+                now=now,
+            )
+            or call.get("status") != CALL_STATUS_ACTIVE
+        ):
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        started_at = _parse_iso_naive(call.get("started_at"))
+        if started_at is None:
+            raise HTTPException(status_code=409, detail="Call lease has invalid start time")
+        age_seconds = max(0.0, (now - started_at).total_seconds())
+        expiry_reason: str | None = None
+        if age_seconds >= _RESIDENT_CALL_MAX_DURATION_SECONDS:
+            expiry_reason = "maximum_duration_reached"
+        elif (
+            not call.get("ready_at")
+            and not ready
+            and age_seconds >= _RESIDENT_CALL_READY_DEADLINE_SECONDS
+        ):
+            expiry_reason = "coordinator_not_ready"
+        if expiry_reason is not None:
+            call["status"] = CALL_STATUS_EXPIRED
+            call["ended_at"] = now_iso
+            call["updated_at"] = now_iso
+            call["failure"] = expiry_reason
+            holder["release_account_id"] = str(call.get("account_id") or "") or None
+            call["slot_reserved"] = False
+            resident[RESIDENT_CALL_KEY] = call
+            vision[RESIDENT_SESSION_KEY] = resident
+            holder["call"] = dict(call)
+            return
+        if ready and not call.get("ready_at"):
+            call["ready_at"] = now_iso
+        incoming_usage = _bounded_resident_call_usage(usage)
+        if incoming_usage:
+            prior_usage = _bounded_resident_call_usage(call.get("usage"))
+            merged_usage = dict(prior_usage)
+            for key, value in incoming_usage.items():
+                merged_usage[key] = max(value, prior_usage.get(key, 0))
+            call["usage"] = merged_usage
+        call["last_heartbeat_at"] = now_iso
+        call["updated_at"] = now_iso
+        absolute_expiry = started_at + timedelta(
+            seconds=_RESIDENT_CALL_MAX_DURATION_SECONDS
+        )
+        call["expires_at"] = min(
+            now + timedelta(seconds=ttl), absolute_expiry
+        ).isoformat()
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+        holder["call"] = dict(call)
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    if holder["release_account_id"]:
+        from app.max_plan_pool import release_max_plan_call_slot
+
+        await release_max_plan_call_slot(
+            holder["release_account_id"], project_id=str(project.id)
+        )
+    return resident_call_snapshot(project.vision) or {}
+
+
+async def record_resident_call_playout_receipt(
+    session: AsyncSession,
+    project: Project,
+    *,
+    actor_user_id: str,
+    call_id: str,
+    generation: int,
+    phrase_id: str,
+    event: Literal["started", "interrupted", "completed"],
+    reported_at: str | None,
+) -> tuple[dict[str, Any], bool]:
+    """Store a bounded, idempotent browser playout receipt on the call lease."""
+    now_iso = _utcnow().isoformat()
+    receipt_key = f"{phrase_id}:{event}"
+    holder: dict[str, Any] = {"duplicate": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        call = (resident or {}).get(RESIDENT_CALL_KEY)
+        if (
+            not resident_call_is_active(call)
+            or str((call or {}).get("call_id")) != call_id
+            or int((call or {}).get("generation") or 0) != generation
+            or str((call or {}).get("actor_user_id")) != str(actor_user_id)
+        ):
+            raise HTTPException(status_code=409, detail="Call lease superseded")
+        prior = call.get("playout_receipts")
+        receipts = list(prior) if isinstance(prior, list) else []
+        if any(isinstance(item, dict) and item.get("key") == receipt_key for item in receipts):
+            holder["duplicate"] = True
+            return
+        receipt = {
+            "key": receipt_key,
+            "phrase_id": phrase_id[:128],
+            "event": event,
+            "reported_at": reported_at[:80] if isinstance(reported_at, str) else None,
+            "received_at": now_iso,
+        }
+        receipts.append(receipt)
+        call["playout_receipts"] = receipts[-32:]
+        call["last_playout"] = receipt
+        call["updated_at"] = now_iso
+        resident[RESIDENT_CALL_KEY] = call
+        vision[RESIDENT_SESSION_KEY] = resident
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    return resident_call_snapshot(project.vision) or {}, bool(holder["duplicate"])
 
 
 def read_resident_session_blocked_reason(vision: dict[str, Any] | None) -> str | None:
@@ -834,13 +1375,29 @@ def _resident_worker_task_is_healthy(
         )
     worker_heartbeat = _parse_iso_naive(blob.get("worker_heartbeat_at"))
     if worker_heartbeat is not None:
-        return (
-            now - worker_heartbeat
-        ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+        worker_age = (now - worker_heartbeat).total_seconds()
+        if worker_age <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
+            return True
+        heartbeat = task.last_heartbeat
+        if heartbeat is not None:
+            if heartbeat.tzinfo is not None:
+                heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
+            task_fresh = (
+                now - heartbeat
+            ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+            return bool(
+                task_fresh
+                and worker_age
+                <= (
+                    _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+                    + _RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS
+                )
+            )
+        return False
 
-    # The generic task heartbeat can bridge startup compatibility only. It
-    # proves runner liveness, not resident-loop health, so it cannot renew a
-    # steady-state worker after the bounded startup window.
+    # During startup an absent heartbeat is expected until the resident handler
+    # makes its first lease renewal. Keep the start claim briefly even when the
+    # generic task heartbeat has not arrived yet.
     startup_seen = _parse_iso_naive(blob.get("started_at"))
     if (
         startup_seen is None
@@ -2371,6 +2928,13 @@ async def start_resident_session(
                 "session_id": session_id,
                 "task_id": str(adopt_task.id) if adopt_task is not None else None,
                 "worker_generation": worker_generation,
+                # Distinguish a session created by an incarnation-aware backend
+                # from a pre-deploy live blob. A fresh session has no possible
+                # legacy worker to protect, so its first random Agent may claim
+                # immediately; only unmarked historical blobs receive grace.
+                "worker_incarnation_protocol": (
+                    _RESIDENT_WORKER_INCARNATION_PROTOCOL
+                ),
                 "worker_state": "starting",
                 "runner_id": effective_runner_id,
                 "operator_user_id": str(operator_user_id),
@@ -3450,6 +4014,7 @@ async def renew_resident_session_lease(
     *,
     session_id: str,
     task_id: str,
+    incarnation_id: uuid.UUID | None = None,
     worker_generation: int = 1,
     progress: bool = False,
     note: str | None = None,
@@ -3623,30 +4188,17 @@ async def renew_resident_session_lease(
             "direction_grounding": direction_grounding,
         }
 
-    # Unattended cap: compare now against the last operator interaction, taking
-    # the newer of the recorded blob timestamp and any fresh operator message.
     max_unattended = runtime_config.get(
         STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
         _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS,
     )
-    last_op_dt = _parse_iso_naive(
-        blob.get("last_operator_interaction_at")
-    ) or _parse_iso_naive(blob.get("started_at"))
-    latest_msg_dt = await _latest_operator_interaction_at(
-        session, project.id, resident_session_id=session_id
-    )
-    op_reengaged = latest_msg_dt is not None and (
-        last_op_dt is None or latest_msg_dt > last_op_dt
-    )
-    effective_last_op = latest_msg_dt if op_reengaged else last_op_dt
-    unattended_exceeded = (
-        not op_reengaged
-        and effective_last_op is not None
-        and (now - effective_last_op).total_seconds() > float(max_unattended)
-    )
+    latest_msg_dt: datetime | None = None
 
     holder = {
         "authority_held": False,
+        "incarnation_held": False,
+        "legacy_grace_until": None,
+        "lease_now": None,
         "stopped": False,
         "capped": False,
         "lapsed": False,
@@ -3670,11 +4222,13 @@ async def renew_resident_session_lease(
         The agent reads ``stop_requested=True`` from the response and ends its
         loop, posting the resident task terminal so the cadence reclaims.
         """
+        ended_now = holder.get("lease_now") or now
+        ended_now_iso = ended_now.isoformat()
         ended = dict(current)
         ended["status"] = STATUS_ENDED
         ended["stop_requested"] = True
-        ended["ended_at"] = now_iso
-        ended["updated_at"] = now_iso
+        ended["ended_at"] = ended_now_iso
+        ended["updated_at"] = ended_now_iso
         ended["activity"] = {
             **(
                 ended.get("activity")
@@ -3682,7 +4236,7 @@ async def renew_resident_session_lease(
                 else {}
             ),
             "phase": "ended",
-            "phase_started_at": now_iso,
+            "phase_started_at": ended_now_iso,
             "last_action": "Session ended after reaching the idle limit",
             "next_review_at": None,
         }
@@ -3690,6 +4244,11 @@ async def renew_resident_session_lease(
         vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
 
     def _renew(vision: dict[str, Any]) -> None:
+        # Sample after acquiring the Project lock. Pre-lock reads can block
+        # longer than the remaining incarnation lease.
+        lease_now = _utcnow()
+        lease_now_iso = lease_now.isoformat()
+        holder["lease_now"] = lease_now
         fresh = read_resident_session(vision)
         if not isinstance(fresh, dict):
             # Session record vanished under us — treat as no authority.
@@ -3708,6 +4267,58 @@ async def renew_resident_session_lease(
         if bool(fresh.get("stop_requested")) or fresh.get("status") == STATUS_ENDED:
             holder["stopped"] = True
             return
+        accepted_incarnation = claim_resident_worker_incarnation(
+            vision,
+            task_id=task_id,
+            worker_generation=worker_generation,
+            incarnation_id=incarnation_id,
+            now=lease_now,
+        )
+        if accepted_incarnation is None:
+            current_after_claim = read_resident_session(vision) or {}
+            legacy_incarnation = legacy_resident_worker_incarnation(
+                task_id,
+                worker_generation,
+            )
+            legacy_expiry = _parse_iso_naive(
+                current_after_claim.get("worker_incarnation_expires_at")
+            )
+            if (
+                incarnation_id is not None
+                and incarnation_id != legacy_incarnation
+                and str(current_after_claim.get("worker_incarnation_id"))
+                == str(legacy_incarnation)
+                and legacy_expiry is not None
+                and legacy_expiry > lease_now
+            ):
+                holder["legacy_grace_until"] = legacy_expiry
+                return
+            holder["stopped"] = True
+            return
+        holder["incarnation_held"] = True
+        # The CAS replaces the nested blob; continue from that fenced copy so
+        # the ordinary heartbeat update cannot overwrite the new process lease.
+        fresh = read_resident_session(vision)
+        if not isinstance(fresh, dict):
+            holder["stopped"] = True
+            return
+        # Decide the unattended cap from the in-lock session state and a
+        # message timestamp queried only after this heartbeat acquired Project
+        # authority. Operator sends take the same Project lock for sequencing,
+        # so whichever transaction wins is observed atomically here.
+        last_op_dt = _parse_iso_naive(
+            fresh.get("last_operator_interaction_at")
+        ) or _parse_iso_naive(fresh.get("started_at"))
+        op_reengaged = latest_msg_dt is not None and (
+            last_op_dt is None or latest_msg_dt > last_op_dt
+        )
+        effective_last_op = latest_msg_dt if op_reengaged else last_op_dt
+        unattended_exceeded = (
+            not op_reengaged
+            and effective_last_op is not None
+            and (lease_now - effective_last_op).total_seconds()
+            > float(max_unattended)
+        )
         # Finding 1 (unattended cap): the session has run past the max-unattended
         # cap with no operator interaction. This is an elapsed, sustained
         # condition — END the session (release the lease, stamp ended) so the
@@ -3785,13 +4396,13 @@ async def renew_resident_session_lease(
             return
 
         updated = dict(fresh)
-        updated["updated_at"] = now_iso
+        updated["updated_at"] = lease_now_iso
         updated["worker_state"] = "ready"
         updated.pop("worker_retry_until", None)
         updated.pop("worker_retry_reason", None)
-        updated["worker_heartbeat_at"] = now_iso
+        updated["worker_heartbeat_at"] = lease_now_iso
         if progress:
-            updated["last_progress_at"] = now_iso
+            updated["last_progress_at"] = lease_now_iso
         if op_reengaged and latest_msg_dt is not None:
             updated["last_operator_interaction_at"] = latest_msg_dt.isoformat()
         # Persist the agent's serialized exam-ledger so it survives a restart.
@@ -3820,7 +4431,7 @@ async def renew_resident_session_lease(
             updated["_operator_decision_summary"] = operator_decision_summary
             # Stamp the time of the most recent valid summary so absence
             # detection can measure elapsed time on future heartbeats.
-            updated["_operator_decision_summary_at"] = now_iso
+            updated["_operator_decision_summary_at"] = lease_now_iso
             # Enforce: cross into a strategist-internal notice when the capture
             # rate is chronically low. De-dupe on a persisted flag so the notice
             # fires at most once per low-capture crossing; a genuine recovery
@@ -3856,7 +4467,7 @@ async def renew_resident_session_lease(
                 not already_absent_notified
                 and isinstance(prior_summary, dict)
                 and last_summary_at is not None
-                and (now - last_summary_at).total_seconds()
+                and (lease_now - last_summary_at).total_seconds()
                 > _OPERATOR_DECISION_SUMMARY_STALE_SECONDS
                 and isinstance(prior_summary.get("total"), int)
                 and prior_summary["total"] >= OPERATOR_DECISION_CAPTURE_MIN_SAMPLE
@@ -3876,7 +4487,7 @@ async def renew_resident_session_lease(
                 if isinstance(fresh.get("activity"), dict)
                 else None
             ),
-            now_iso=now_iso,
+            now_iso=lease_now_iso,
             pending_operator_messages=int(
                 work_state_summary.get("new_operator_messages") or 0
             ),
@@ -3887,7 +4498,46 @@ async def renew_resident_session_lease(
         )
         vision[RESIDENT_SESSION_KEY] = updated
 
-    await with_vision_locked(session, project.id, _renew, skip_locked=False)
+    async with project_lock(session, project.id, skip_locked=False) as locked_project:
+        if locked_project is None:
+            holder["stopped"] = True
+        else:
+            latest_msg_dt = await _latest_operator_interaction_at(
+                session,
+                project.id,
+                resident_session_id=session_id,
+            )
+            await with_vision_locked(
+                session,
+                project.id,
+                _renew,
+                _locked_project=locked_project,
+            )
+    if holder["legacy_grace_until"] is not None:
+        legacy_grace_until = holder["legacy_grace_until"]
+        lease_now = holder["lease_now"] or _utcnow()
+        await session.commit()
+        await session.refresh(project)
+        refreshed = read_resident_session(project.vision) or {}
+        return {
+            "authority_held": False,
+            "resident_incarnation_held": False,
+            "resident_incarnation_id": str(incarnation_id),
+            "admission_status": "legacy_grace",
+            "retry_after_seconds": max(
+                1,
+                int((legacy_grace_until - lease_now).total_seconds()) + 1,
+            ),
+            "leased_until": legacy_grace_until.isoformat(),
+            "stop_requested": False,
+            "status": refreshed.get("status") or STATUS_ACTIVE,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
+        }
     if holder["stopped"]:
         # Identity/generation changed while this heartbeat waited for the project
         # lock. Release the lock and return before mirroring context or marking any
@@ -3900,6 +4550,7 @@ async def renew_resident_session_lease(
         refreshed = read_resident_session(project.vision) or {}
         return {
             "authority_held": False,
+            "resident_incarnation_held": False,
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
@@ -4176,6 +4827,11 @@ async def renew_resident_session_lease(
         and not refreshed_stop
         and holder["authority_held"]
         and not other_strategic_active,
+        "resident_incarnation_held": holder["incarnation_held"],
+        "resident_incarnation_id": str(
+            incarnation_id
+            or legacy_resident_worker_incarnation(task_id, worker_generation)
+        ),
         "leased_until": cont.get("expires_at"),
         "stop_requested": refreshed_stop,
         "status": refreshed.get("status") or STATUS_ACTIVE,
@@ -4243,6 +4899,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     task_id: str
     progress: bool | None = None
     worker_generation: int = 1
+    resident_incarnation_id: uuid.UUID | None = None
     note: str | None = None
     message_cursor: str | None = None
     handled_message_ids: list[str] | None = None
@@ -4253,6 +4910,81 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     decisions_reg: str | None = None
     activity: dict[str, Any] | None = None
     repo_head: str | None = None
+    call_id: str | None = None
+    call_generation: int | None = None
+    call_ttl_seconds: int | None = None
+    call_ready: bool = False
+    call_usage: dict[str, Any] | None = None
+    conversation_claim_id: uuid.UUID | None = None
+    conversation_claim_incarnation: uuid.UUID | None = None
+    conversation_claim_lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
+class ResidentCallSpeechCredentialsRequest(BaseModel):
+    """One exact active-call fence for Coordinator-only speech credentials."""
+
+    task_id: str
+    resident_incarnation_id: uuid.UUID | None = None
+    call_id: str
+    call_generation: int
+
+
+@router.post("/projects/{project_id}/strategic-call/speech-credentials")
+@limiter.limit("30/minute")
+async def resident_call_speech_credentials(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ResidentCallSpeechCredentialsRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Vend speech credentials only to the Resident owning this active call.
+
+    This deliberately does not reuse runner dispatch credentials: a Workday
+    Resident can live for hours before a call begins, while provider keys are
+    needed only by its deterministic Coordinator.  The browser and Fast child
+    never call this route.  Do not log request or response bodies here: the
+    response contains provider credentials.
+    """
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    project = await _resolve_agent_project(project_id, token, session)
+    active_call = read_resident_call(project.vision)
+    if (
+        not resident_call_is_active(active_call)
+        or str((active_call or {}).get("worker_task_id")) != str(payload.task_id)
+        or str((active_call or {}).get("call_id")) != payload.call_id
+        or int((active_call or {}).get("generation") or 0)
+        != payload.call_generation
+        or not resident_worker_incarnation_is_current(
+            project.vision,
+            task_id=payload.task_id,
+            worker_generation=int(
+                (active_call or {}).get("worker_generation") or 1
+            ),
+            incarnation_id=payload.resident_incarnation_id,
+        )
+    ):
+        # Avoid exposing whether another Resident owns a call.  In particular,
+        # do not invoke Secret Manager before every server-owned fence passes.
+        raise HTTPException(
+            status_code=409,
+            detail="No active call is owned by this Resident",
+        )
+    task = await session.get(Task, uuid.UUID(payload.task_id))
+    if task is None or (task.context or {}).get("_resident_session") is not True:
+        raise HTTPException(status_code=409, detail="Call requires a Resident task")
+    try:
+        speech = await resolve_resident_call_speech_credentials(task)
+    except VoiceCredentialConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not speech:
+        raise HTTPException(status_code=503, detail="Resident call speech is not configured")
+    try:
+        qualification = validate_resident_call_deployment_configuration()
+    except VoiceCredentialConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"speech": speech, "foreground_qualification": qualification}
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -4274,11 +5006,12 @@ async def resident_session_heartbeat(
     if str(token.get("sub")) != str(payload.task_id):
         # The heartbeat must come from the resident session task's own token.
         raise HTTPException(status_code=403, detail="Token task mismatch")
-    return await renew_resident_session_lease(
+    response = await renew_resident_session_lease(
         session,
         project,
         session_id=payload.session_id,
         task_id=payload.task_id,
+        incarnation_id=payload.resident_incarnation_id,
         progress=bool(payload.progress),
         worker_generation=payload.worker_generation,
         note=payload.note,
@@ -4292,3 +5025,67 @@ async def resident_session_heartbeat(
         activity=payload.activity,
         repo_head=payload.repo_head,
     )
+    if response.get("resident_incarnation_held") is False:
+        await session.commit()
+        return response
+    if (
+        payload.conversation_claim_incarnation is not None
+        and payload.conversation_claim_id is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="conversation claim incarnation requires a claim id",
+        )
+    if payload.conversation_claim_id is not None:
+        from app.conversation_coordinator import (
+            legacy_conversation_claim_incarnation,
+            renew_conversation_claim,
+        )
+
+        response["conversation_claim_held"] = await renew_conversation_claim(
+            session,
+            project_id=project.id,
+            claim_id=payload.conversation_claim_id,
+            task_id=uuid.UUID(payload.task_id),
+            worker_generation=payload.worker_generation,
+            incarnation_id=(
+                payload.conversation_claim_incarnation
+                or legacy_conversation_claim_incarnation(
+                    uuid.UUID(payload.task_id),
+                    payload.worker_generation,
+                )
+            ),
+            lease_seconds=payload.conversation_claim_lease_seconds,
+        )
+        await session.commit()
+    if payload.call_id is not None or payload.call_generation is not None:
+        if not payload.call_id or payload.call_generation is None:
+            raise HTTPException(
+                status_code=400,
+                detail="call_id and call_generation must be supplied together",
+            )
+        response["call"] = await renew_resident_call_lease(
+            session,
+            project,
+            task_id=payload.task_id,
+            incarnation_id=payload.resident_incarnation_id,
+            call_id=payload.call_id,
+            generation=payload.call_generation,
+            ttl_seconds=payload.call_ttl_seconds,
+            ready=payload.call_ready,
+            usage=payload.call_usage,
+        )
+    else:
+        response["call"] = resident_call_snapshot(project.vision)
+    active_call = read_resident_call(project.vision)
+    if (
+        resident_call_is_active(active_call)
+        and str((active_call or {}).get("worker_task_id")) == str(payload.task_id)
+    ):
+        try:
+            response["call_transport"] = issue_resident_call_credentials(
+                call=active_call or {}, task_id=payload.task_id
+            )
+        except LiveKitConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return response

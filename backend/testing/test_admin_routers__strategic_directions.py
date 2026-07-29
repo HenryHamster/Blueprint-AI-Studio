@@ -9,6 +9,7 @@ Split from test_admin_routers.py; no behavior change."""
 
 import logging
 import uuid
+from datetime import timedelta
 from unittest.mock import (
     AsyncMock,
     patch,
@@ -16,6 +17,7 @@ from unittest.mock import (
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
@@ -197,6 +199,86 @@ async def _make_resident_message_worker(
     db_session.add(project)
     await db_session.commit()
     return project, task
+
+
+@pytest.mark.asyncio
+async def test_stale_resident_process_cannot_mutate_or_post_terminal_status(
+    client: AsyncClient, db_session
+):
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    winner = uuid.UUID("00000000-0000-0000-0000-000000000755")
+    loser = uuid.UUID("00000000-0000-0000-0000-000000000766")
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["worker_incarnation_id"] = str(winner)
+    resident["worker_incarnation_expires_at"] = (
+        _utcnow() + timedelta(minutes=5)
+    ).isoformat()
+    project.vision = {
+        **project.vision,
+        "_resident_strategic_session": resident,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    mutation = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(loser),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "stale process must not write",
+                "idempotency_key": "stale-process-mutation",
+            },
+        },
+    )
+    assert mutation.status_code == 409
+
+    terminal = await client.post(
+        "/api/agent/status",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(loser),
+            "status": "FAILED",
+            "artifact_type": "ERROR_LOG",
+            "failure_category": "claude_code_failed",
+            "logs": "stale process must not terminate winner",
+        },
+    )
+    assert terminal.status_code == 409, terminal.text
+    legacy_terminal = await client.post(
+        "/api/agent/status",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "artifact_type": "ERROR_LOG",
+            "failure_category": "claude_code_failed",
+            "logs": "old Agent must map to the fenced legacy incarnation",
+        },
+    )
+    assert legacy_terminal.status_code == 409, legacy_terminal.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.content == "stale process must not write",
+            )
+        )
+    ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -1197,6 +1279,208 @@ async def test_resident_reply_receipt_is_atomic_and_idempotent(
         )
     ).scalars().all()
     assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_resident_reply_completes_exact_live_conversation_claim(
+    client: AsyncClient, db_session
+):
+    """Only the worker holding the durable turn lease can commit its reply."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    claim_id = uuid.uuid4()
+    incarnation = uuid.uuid4()
+    inbound = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Please finish this exact durable turn.",
+        resident_session_id="resident-receipt-session",
+    )
+    db_session.add(inbound)
+    await db_session.commit()
+    await db_session.refresh(inbound)
+    # Match the production Coordinator path: claims transition an already
+    # durable pending row instead of relying on constructor values that can be
+    # replaced by PostgreSQL server defaults during INSERT.
+    inbound.handling_state = MessageHandlingState.CLAIMED
+    inbound.handled_by_task_id = task.id
+    inbound.conversation_claim_id = claim_id
+    inbound.conversation_claim_generation = 1
+    inbound.conversation_claim_incarnation = incarnation
+    inbound.conversation_claim_expires_at = _utcnow() + timedelta(minutes=10)
+    inbound.conversation_claim_attempt = 1
+    db_session.add(inbound)
+    await db_session.commit()
+    await db_session.refresh(inbound)
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+    body = {
+        "task_id": str(task.id),
+        "op": "create_message",
+        "data": {
+            "type": "NOTE",
+            "content": "The durable turn is complete.",
+            "idempotency_key": "resident-durable-claim-reply",
+            "covered_message_ids": [str(inbound.id)],
+            "conversation_claim_id": str(claim_id),
+            "conversation_claim_incarnation": str(incarnation),
+        },
+    }
+    headers = {"x-agent-token": token}
+
+    first = await client.post("/api/agent/strategic", headers=headers, json=body)
+    assert first.status_code == 200, first.text
+    await db_session.refresh(inbound)
+    assert inbound.status == "handled"
+    assert inbound.handling_state == MessageHandlingState.RESPONDED
+    assert inbound.conversation_claim_id == claim_id
+    assert inbound.conversation_claim_incarnation == incarnation
+    assert inbound.conversation_claim_expires_at is None
+
+    replay = await client.post("/api/agent/strategic", headers=headers, json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["message_id"] == first.json()["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_resident_reply_rejects_partial_conversation_claim(
+    client: AsyncClient, db_session
+):
+    """A reply must complete every row in its durable logical turn."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    claim_id = uuid.uuid4()
+    incarnation = uuid.uuid4()
+    rows = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            status="open",
+            content=f"Claimed input {index}",
+            resident_session_id="resident-receipt-session",
+        )
+        for index in (1, 2)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+    for row in rows:
+        await db_session.refresh(row)
+        row.handling_state = MessageHandlingState.CLAIMED
+        row.handled_by_task_id = task.id
+        row.conversation_claim_id = claim_id
+        row.conversation_claim_generation = 1
+        row.conversation_claim_incarnation = incarnation
+        row.conversation_claim_expires_at = _utcnow() + timedelta(minutes=10)
+        row.conversation_claim_attempt = 1
+        db_session.add(row)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Incomplete coverage must fail.",
+                "idempotency_key": "resident-partial-claim-reply",
+                "covered_message_ids": [str(rows[0].id)],
+                "conversation_claim_id": str(claim_id),
+                "conversation_claim_incarnation": str(incarnation),
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    for row in rows:
+        await db_session.refresh(row)
+        assert row.status == "open"
+        assert row.handling_state == MessageHandlingState.CLAIMED
+
+
+@pytest.mark.asyncio
+async def test_resident_claim_reply_to_must_belong_to_covered_batch(
+    client: AsyncClient, db_session
+):
+    """Claim completion cannot resolve an unrelated operator message."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    claim_id = uuid.uuid4()
+    incarnation = uuid.uuid4()
+    claimed = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Claimed input",
+        resident_session_id="resident-receipt-session",
+    )
+    unrelated = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Unrelated input",
+        resident_session_id="resident-receipt-session",
+    )
+    db_session.add_all([claimed, unrelated])
+    await db_session.commit()
+    await db_session.refresh(claimed)
+    claimed.handling_state = MessageHandlingState.CLAIMED
+    claimed.handled_by_task_id = task.id
+    claimed.conversation_claim_id = claim_id
+    claimed.conversation_claim_generation = 1
+    claimed.conversation_claim_incarnation = incarnation
+    claimed.conversation_claim_expires_at = _utcnow() + timedelta(minutes=10)
+    claimed.conversation_claim_attempt = 1
+    db_session.add(claimed)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Wrong reply target must fail.",
+                "idempotency_key": "resident-wrong-reply-target",
+                "covered_message_ids": [str(claimed.id)],
+                "conversation_claim_id": str(claim_id),
+                "conversation_claim_incarnation": str(incarnation),
+                "context": {"reply_to": str(unrelated.id)},
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    await db_session.refresh(unrelated)
+    assert unrelated.handling_state == MessageHandlingState.PENDING
+    assert unrelated.status == "open"
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,9 @@ import {
   isStrategicStateNotModified,
   STRATEGIC_STATE_NOT_MODIFIED,
   updateStrategicWorkbenchState,
+  startStrategicCall,
+  fetchStrategicCall,
+  endStrategicCall,
   type StrategicWorkbenchState,
 } from './strategicStateApi';
 
@@ -36,6 +39,53 @@ const savedWorkbench: StrategicWorkbenchState = {
   session_started_at: null,
   last_interaction_at: null,
 };
+
+describe('Strategic call contract', () => {
+  beforeEach(() => apiFetchMock.mockReset());
+
+  test('starts with the authenticated Blueprint API and preserves only opaque browser media credentials', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      call: { call_id: 'call-1', generation: 3, status: 'ready', slot_reserved: true },
+      server_url: 'wss://livekit.example',
+      participant_token: 'short-lived-participant-token',
+    }));
+
+    await expect(startStrategicCall('owner/repo')).resolves.toMatchObject({
+      call: { call_id: 'call-1', generation: 3 },
+      server_url: 'wss://livekit.example',
+    });
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/owner%2Frepo/strategic-call/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+  });
+
+  test('ends using a call id and generation fence', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      call: { call_id: 'call-1', generation: 3, status: 'ended' },
+    }));
+    await endStrategicCall('proj-1', { call_id: 'call-1', generation: 3 });
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/proj-1/strategic-call/end', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ call_id: 'call-1', generation: 3 }),
+    });
+  });
+
+  test('treats the backend empty-call response as no existing call', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ project_id: 'proj-1', call: null }));
+
+    await expect(fetchStrategicCall('proj-1')).resolves.toBeNull();
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-call',
+      undefined,
+      2,
+      30000,
+      undefined,
+    );
+  });
+});
 
 describe('fetchStrategicConversation', () => {
   beforeEach(() => {

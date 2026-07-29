@@ -14,11 +14,22 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 from starlette.requests import Request
 
 from app.auth import create_agent_token
+from app.conversation_coordinator import renew_conversation_claim
 from app.main import app
-from app.models import MessageType, Project, ProjectMessage, Task
+from app.models import (
+    MessageHandlingState,
+    MessageSurface,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
 from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_EXPECTED_PER_MINUTE,
     _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE,
@@ -27,6 +38,7 @@ from app.routers.agent_strategic_messages import (
     agent_poll_messages,
     router as _messages_router,
 )
+from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 
 # The inbound-poll router is intentionally NOT wired into app.main here — that
@@ -49,6 +61,60 @@ async def _make_project_task(db_session, *, vm="agent-vm-msgpoll"):
     await db_session.commit()
     await db_session.refresh(task)
     return project, task
+
+
+@pytest.mark.asyncio
+async def test_resident_worker_can_fence_and_release_call_after_operator_disconnect(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_project_task(db_session)
+    task.context = {"_resident_session": True}
+    project.vision = {
+        "_resident_strategic_session": {
+            "status": "active",
+            "call": {
+                "call_id": "call-empty-room",
+                "generation": 3,
+                "status": "active",
+                "worker_task_id": str(task.id),
+                "actor_user_id": "test-user-msgpoll",
+                "input_revision": 1,
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(minutes=5)
+                ).isoformat(),
+            },
+        }
+    }
+    db_session.add(task)
+    db_session.add(project)
+    await db_session.commit()
+
+    stale = await client.post(
+        f"/api/agent/projects/{project.id}/strategic-call/end",
+        headers=_headers(task),
+        json={
+            "task_id": str(task.id),
+            "call_id": "call-empty-room",
+            "call_generation": 2,
+            "reason": "operator_disconnected",
+        },
+    )
+    assert stale.status_code == 409
+
+    ended = await client.post(
+        f"/api/agent/projects/{project.id}/strategic-call/end",
+        headers=_headers(task),
+        json={
+            "task_id": str(task.id),
+            "call_id": "call-empty-room",
+            "call_generation": 3,
+            "reason": "operator_disconnected",
+        },
+    )
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "ended"
+    assert ended.json()["call"]["status"] == "expired"
+    assert ended.json()["call"]["failure"] == "operator_disconnected"
 
 
 async def _add_message(db_session, project, *, created_at=None, **kwargs):
@@ -243,6 +309,70 @@ async def test_poll_since_accepts_tz_aware_cursor(
     assert res.status_code == 200, res.text
     ids = [m["id"] for m in res.json()["messages"]]
     assert ids == [str(newer.id)]
+
+
+@pytest.mark.asyncio
+async def test_call_inputs_filter_before_limit_and_include_sequence(
+    client: AsyncClient, db_session
+):
+    """Ordinary chat cannot crowd a canonical call input out of a 20-row page."""
+    project, task = await _make_project_task(db_session)
+    call_id = "call-limit-fence"
+    call_generation = 7
+    project.vision = {
+        "_resident_strategic_session": {
+            "session_id": "call-input-session",
+            "task_id": str(task.id),
+            "worker_generation": 1,
+            "status": "active",
+            "call": {
+                "call_id": call_id,
+                "generation": call_generation,
+                "status": "active",
+                "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+                "worker_task_id": str(task.id),
+                "worker_generation": 1,
+            }
+        }
+    }
+    task.context = {"_resident_session": True}
+    db_session.add_all([project, task])
+    await db_session.commit()
+
+    # These are all newer than the canonical input.  A filter after LIMIT would
+    # return this page and then discard every row, starving the call forever.
+    for sequence in range(1, 22):
+        await _add_message(
+            db_session,
+            project,
+            from_type="user",
+            status="open",
+            surface=MessageSurface.CONVERSATION,
+            sequence=sequence,
+            content=f"ordinary-{sequence}",
+            context={"call_id": "other-call", "call_generation": 1},
+        )
+    canonical = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        surface=MessageSurface.CONVERSATION,
+        sequence=22,
+        content="canonical input",
+        context={"call_id": call_id, "call_generation": call_generation},
+    )
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-call/inputs",
+        params={"call_id": call_id, "call_generation": call_generation},
+        headers=_headers(task),
+    )
+    assert res.status_code == 200, res.text
+    messages = res.json()["messages"]
+    assert [message["id"] for message in messages] == [str(canonical.id)]
+    assert messages[0]["sequence"] == 22
+    assert isinstance(messages[0]["sequence"], int)
 
 
 @pytest.mark.asyncio
@@ -498,6 +628,7 @@ async def _make_resident_poll_worker(
         "strategic_session_id": session_id,
         "_resident_worker_generation": generation,
     }
+    task.status = TaskStatus.IN_PROGRESS
     project.vision = {
         "_resident_strategic_session": {
             "session_id": session_id,
@@ -509,6 +640,151 @@ async def _make_resident_poll_worker(
     db_session.add_all([project, task])
     await db_session.commit()
     return project, task
+
+
+async def _activate_test_call(db_session, project, task):
+    incarnation = "00000000-0000-0000-0000-000000000744"
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["worker_incarnation_id"] = incarnation
+    resident["worker_incarnation_expires_at"] = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    ).isoformat()
+    resident["call"] = {
+        "call_id": "call-commit-fence",
+        "generation": 3,
+        "status": "active",
+        "worker_task_id": str(task.id),
+        "worker_generation": 2,
+        "actor_user_id": "test-user-msgpoll",
+        "input_revision": 1,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    }
+    project.vision = {
+        **project.vision,
+        "_resident_strategic_session": resident,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    return incarnation
+
+
+@pytest.mark.asyncio
+async def test_call_completion_replay_is_exact_and_terminal_task_cannot_commit(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_test_call(db_session, project, task)
+    inbound = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="voice question",
+        resident_session_id="resident-session",
+        context={
+            "call_id": "call-commit-fence",
+            "call_generation": 3,
+            "input_revision": 1,
+            "input_source": "voice",
+        },
+    )
+    payload = {
+        "task_id": str(task.id),
+        "resident_incarnation_id": incarnation,
+        "call_id": "call-commit-fence",
+        "call_generation": 3,
+        "input_revision": 1,
+        "idempotency_key": "call-completion-exact-replay",
+        "covered_message_ids": [str(inbound.id)],
+        "content": "spoken answer",
+        "exact_text": "exact answer",
+        "display_blocks": [{"type": "latex", "content": "x^2"}],
+    }
+
+    created = await client.post(
+        f"/api/agent/projects/{project.id}/strategic-call/complete-turn",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert created.status_code == 200, created.text
+    duplicate = await client.post(
+        f"/api/agent/projects/{project.id}/strategic-call/complete-turn",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["status"] == "duplicate"
+
+    mismatched = await client.post(
+        f"/api/agent/projects/{project.id}/strategic-call/complete-turn",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**payload, "exact_text": "different exact answer"},
+    )
+    assert mismatched.status_code == 409
+
+    task.status = TaskStatus.FAILED
+    db_session.add(task)
+    await db_session.commit()
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": str(task.id),
+        "vm_instance_id": "agent-vm-resident-poll",
+        "task_type": "strategic_review",
+    }
+    try:
+        terminal = await client.post(
+            f"/api/agent/projects/{project.id}/strategic-call/complete-turn",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json={**payload, "idempotency_key": "terminal-task-must-not-reply"},
+        )
+    finally:
+        app.dependency_overrides.pop(verify_agent_token, None)
+    assert terminal.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_finalized_transcript_rejects_terminal_resident_task(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_test_call(db_session, project, task)
+    task.status = TaskStatus.CANCELLED
+    db_session.add(task)
+    await db_session.commit()
+
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": str(task.id),
+        "vm_instance_id": "agent-vm-resident-poll",
+        "task_type": "strategic_review",
+    }
+    try:
+        response = await client.post(
+            f"/api/agent/projects/{project.id}/strategic-call/finalized-transcript",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json={
+                "task_id": str(task.id),
+                "resident_incarnation_id": incarnation,
+                "call_id": "call-commit-fence",
+                "call_generation": 3,
+                "content": "must not become durable",
+                "idempotency_key": "terminal-transcript",
+                "input_source": "voice",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(verify_agent_token, None)
+    assert response.status_code == 409
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.content == "must not become durable",
+            )
+        )
+    ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -534,6 +810,379 @@ async def test_resident_poll_uses_authenticated_session_scope(
     )
     assert response.status_code == 200, response.text
     assert [row["id"] for row in response.json()["messages"]] == [str(own.id)]
+    assert response.json()["claim_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_resident_claim_is_durable_and_idempotent_for_same_generation(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    first = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="first claimed input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    second = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="second claimed input",
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=1),
+    )
+    payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": "00000000-0000-0000-0000-000000000111",
+        "message_ids": [str(first.id), str(second.id)],
+        "lease_seconds": 45,
+    }
+
+    claimed = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert claimed.status_code == 200, claimed.text
+    body = claimed.json()
+    assert body["message_ids"] == [str(first.id), str(second.id)]
+    assert body["attempt"] == 1
+
+    repeated = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["claim_id"] == body["claim_id"]
+    assert repeated.json()["attempt"] == 1
+
+    await db_session.refresh(first)
+    await db_session.refresh(second)
+    for row in (first, second):
+        assert row.handling_state == MessageHandlingState.CLAIMED
+        assert str(row.conversation_claim_id) == body["claim_id"]
+        assert row.handled_by_task_id == task.id
+        assert row.conversation_claim_generation == 2
+        assert str(row.conversation_claim_incarnation) == payload["incarnation_id"]
+        assert row.conversation_claim_attempt == 1
+        assert row.conversation_claim_expires_at is not None
+    assert not await renew_conversation_claim(
+        db_session,
+        project_id=project.id,
+        claim_id=uuid.UUID(body["claim_id"]),
+        task_id=task.id,
+        worker_generation=2,
+        incarnation_id=uuid.UUID(
+            "00000000-0000-0000-0000-000000000999"
+        ),
+        lease_seconds=90,
+    )
+    assert await renew_conversation_claim(
+        db_session,
+        project_id=project.id,
+        claim_id=uuid.UUID(body["claim_id"]),
+        task_id=task.id,
+        worker_generation=2,
+        incarnation_id=uuid.UUID(payload["incarnation_id"]),
+        lease_seconds=90,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_claim_rejects_different_process_incarnation(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="single-owner input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": "00000000-0000-0000-0000-000000000333",
+        "message_ids": [str(message.id)],
+    }
+    first = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+
+    overlapping = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **payload,
+            "incarnation_id": "00000000-0000-0000-0000-000000000444",
+        },
+    )
+    assert overlapping.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_resident_process_incarnation_fences_different_message_batches(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    first = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="first process batch",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    second = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="second process batch",
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=1),
+    )
+    first_incarnation = "00000000-0000-0000-0000-000000000611"
+    second_incarnation = "00000000-0000-0000-0000-000000000622"
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["worker_incarnation_id"] = first_incarnation
+    resident["worker_incarnation_expires_at"] = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    ).isoformat()
+    project.vision = {
+        **project.vision,
+        "_resident_strategic_session": resident,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    admitted = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "resident_incarnation_id": first_incarnation,
+            "incarnation_id": first_incarnation,
+            "message_ids": [str(first.id)],
+        },
+    )
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["resident_incarnation_id"] == first_incarnation
+
+    competing = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "resident_incarnation_id": second_incarnation,
+            "incarnation_id": second_incarnation,
+            "message_ids": [str(second.id)],
+        },
+    )
+    assert competing.status_code == 409
+    await db_session.refresh(second)
+    assert second.handling_state == MessageHandlingState.PENDING
+    assert second.conversation_claim_id is None
+
+
+@pytest.mark.asyncio
+async def test_message_claim_rejects_call_activated_after_poll(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="must wait for Fast Resident",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["call"] = {
+        "call_id": "call-activated-during-preflight",
+        "generation": 1,
+        "status": "active",
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+        "worker_task_id": str(task.id),
+        "worker_generation": 2,
+    }
+    project.vision = {"_resident_strategic_session": resident}
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "resident_incarnation_id":
+                "00000000-0000-0000-0000-000000000633",
+            "message_ids": [str(message.id)],
+        },
+    )
+    assert response.status_code == 409
+    assert "Fast Resident" in response.text
+    await db_session.refresh(message)
+    assert message.handling_state == MessageHandlingState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_legacy_resident_claim_gets_stable_rollout_incarnation(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="rolling deploy input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "message_ids": [str(message.id)],
+    }
+
+    first = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    repeated = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["incarnation_supported"] is True
+    assert first.json()["incarnation_id"]
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["claim_id"] == first.json()["claim_id"]
+    await db_session.refresh(message)
+    assert message.conversation_claim_incarnation is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_resident_task_cannot_claim_operator_batch(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="must remain pending",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    task.status = TaskStatus.CANCELLED
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "incarnation_id": "00000000-0000-0000-0000-000000000555",
+            "message_ids": [str(message.id)],
+        },
+    )
+    # Token verification rejects terminal tasks before the route's own
+    # under-lock status fence; both layers fail closed.
+    assert response.status_code == 401
+    await db_session.refresh(message)
+    assert message.handling_state == MessageHandlingState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_stale_resident_generation_cannot_claim_operator_batch(
+    client: AsyncClient, db_session
+):
+    project, stale_task = await _make_resident_poll_worker(db_session, generation=1)
+    message = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        content="generation-fenced input",
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    current_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-current-resident",
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "resident-session",
+            "_resident_worker_generation": 2,
+        },
+    )
+    db_session.add(current_task)
+    await db_session.commit()
+    await db_session.refresh(current_task)
+    project.vision = {
+        "_resident_strategic_session": {
+            "session_id": "resident-session",
+            "task_id": str(current_task.id),
+            "worker_generation": 2,
+            "status": "active",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(stale_task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(stale_task.id),
+            "session_id": "resident-session",
+            "worker_generation": 1,
+            "incarnation_id": "00000000-0000-0000-0000-000000000222",
+            "message_ids": [str(message.id)],
+        },
+    )
+    assert response.status_code == 409
+    await db_session.refresh(message)
+    assert message.handling_state == MessageHandlingState.PENDING
+    assert message.conversation_claim_id is None
 
 
 @pytest.mark.asyncio

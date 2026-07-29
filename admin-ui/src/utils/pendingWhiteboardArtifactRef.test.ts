@@ -85,6 +85,7 @@ describe('pending Whiteboard ArtifactRef operation', () => {
   test('recovers a lost ready response by replaying the same identity', async () => {
     const pending = operation();
     persistPendingWhiteboardArtifactOperation(pending);
+    vi.spyOn(Date, 'now').mockReturnValue(pending.updated_at);
     const request = vi.fn()
       .mockRejectedValueOnce(new TypeError('network response lost'))
       .mockResolvedValueOnce({ state: 'ready', artifact_ref: ARTIFACT_REF });

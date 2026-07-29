@@ -7,6 +7,7 @@ handoff, and reaper contracts directly.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from inspect import unwrap
 import uuid
@@ -33,6 +34,7 @@ from app.models import (
 )
 from app.routers.admin_project_strategic_session import (
     StrategicResidentSessionStart,
+    start_project_strategic_call,
     start_project_strategic_resident_session,
 )
 from app.reaper_orphan_classify import _classify_resident_session
@@ -47,8 +49,14 @@ from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
     _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
+    acquire_resident_call_lease,
+    claim_resident_worker_incarnation,
+    legacy_resident_worker_incarnation,
     new_session_id,
     read_resident_session,
+    resident_call_is_active,
+    resident_call_snapshot,
+    renew_resident_call_lease,
     renew_resident_session_lease,
     resident_session_is_active,
     resident_session_snapshot,
@@ -63,6 +71,64 @@ from app.workbench_state import (
 
 
 TEST_USER_ID = "resident-lifecycle-user"
+
+
+def test_new_process_waits_for_bounded_legacy_incarnation_during_rollout():
+    task_id = uuid.uuid4()
+    now = datetime(2026, 7, 28, 12, 0, 0)
+    vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "session_id": "rolling-session",
+            "task_id": str(task_id),
+            "worker_generation": 1,
+        }
+    }
+    new_incarnation = uuid.uuid4()
+
+    assert (
+        claim_resident_worker_incarnation(
+            vision,
+            task_id=task_id,
+            worker_generation=1,
+            incarnation_id=new_incarnation,
+            now=now,
+        )
+        is None
+    )
+    resident = read_resident_session(vision)
+    assert resident["worker_incarnation_id"] == str(
+        legacy_resident_worker_incarnation(task_id, 1)
+    )
+    legacy_expiry = datetime.fromisoformat(
+        resident["worker_incarnation_expires_at"]
+    )
+    assert legacy_expiry > now
+
+    assert claim_resident_worker_incarnation(
+        vision,
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=None,
+        now=now + timedelta(seconds=30),
+    ) == legacy_resident_worker_incarnation(task_id, 1)
+    assert (
+        claim_resident_worker_incarnation(
+            vision,
+            task_id=task_id,
+            worker_generation=1,
+            incarnation_id=new_incarnation,
+            now=now + timedelta(seconds=31),
+        )
+        is None
+    )
+    assert claim_resident_worker_incarnation(
+        vision,
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=new_incarnation,
+        now=now + timedelta(seconds=211),
+    ) == new_incarnation
 
 
 async def _make_project(db_session) -> Project:
@@ -106,6 +172,254 @@ async def _make_runner(db_session, project: Project) -> LocalRunner:
     return runner
 
 
+@pytest.mark.asyncio
+async def test_call_speech_credentials_require_exact_active_resident_lease(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    owner = await _make_task(db_session, project)
+    other = await _make_task(db_session, project)
+    owner.context = {"_resident_session": True}
+    other.context = {"_resident_session": True}
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "task_id": str(owner.id),
+            "worker_generation": 1,
+            "worker_incarnation_id":
+                "00000000-0000-0000-0000-000000000733",
+            "worker_incarnation_expires_at": (
+                _utcnow() + timedelta(minutes=5)
+            ).isoformat(),
+            "call": {
+                "call_id": "call-speech-1",
+                "generation": 3,
+                "status": "active",
+                "worker_task_id": str(owner.id),
+                "worker_generation": 1,
+                "expires_at": (_utcnow() + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add_all([project, owner, other])
+    await db_session.commit()
+
+    secret = "never-log-or-dispatch-this"
+    resolver = AsyncMock(return_value={"CALL_DEEPGRAM_API_KEY": secret})
+    monkeypatch.setattr(
+        resident_session_module,
+        "resolve_resident_call_speech_credentials",
+        resolver,
+    )
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
+    monkeypatch.setenv(
+        "CALL_DEEPGRAM_API_KEY_SECRET_VERSION",
+        "projects/test/secrets/deepgram/versions/7",
+    )
+    monkeypatch.setenv(
+        "CALL_CARTESIA_API_KEY_SECRET_VERSION",
+        "projects/test/secrets/cartesia/versions/3",
+    )
+    monkeypatch.setenv("CALL_DEEPGRAM_STT_MODEL", "flux-general-en")
+    monkeypatch.setenv("CALL_CARTESIA_TTS_MODEL", "sonic-3")
+    monkeypatch.setenv("CALL_CARTESIA_VOICE_ID", "voice-id")
+    payload = resident_session_module.ResidentCallSpeechCredentialsRequest(
+        task_id=str(owner.id),
+        resident_incarnation_id=uuid.UUID(
+            "00000000-0000-0000-0000-000000000733"
+        ),
+        call_id="call-speech-1",
+        call_generation=3,
+    )
+    response = await resident_session_module.resident_call_speech_credentials(
+        request=None,
+        project_id=project.id,
+        payload=payload,
+        session=db_session,
+        token={"sub": str(owner.id)},
+    )
+    assert response == {
+        "speech": {"CALL_DEEPGRAM_API_KEY": secret},
+        "foreground_qualification": "claude-warm-stream-json:phase0-v1",
+    }
+    resolver.assert_awaited_once_with(owner)
+
+    with pytest.raises(HTTPException) as wrong_incarnation:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=resident_session_module.ResidentCallSpeechCredentialsRequest(
+                task_id=str(owner.id),
+                resident_incarnation_id=uuid.UUID(
+                    "00000000-0000-0000-0000-000000000744"
+                ),
+                call_id="call-speech-1",
+                call_generation=3,
+            ),
+            session=db_session,
+            token={"sub": str(owner.id)},
+        )
+    assert wrong_incarnation.value.status_code == 409
+    resolver.assert_awaited_once()
+
+    # A valid agent token for another task in the same project still receives
+    # neither the response nor a Secret Manager lookup.
+    with pytest.raises(HTTPException) as wrong_worker:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=resident_session_module.ResidentCallSpeechCredentialsRequest(
+                task_id=str(other.id), call_id="call-speech-1", call_generation=3
+            ),
+            session=db_session,
+            token={"sub": str(other.id)},
+        )
+    assert wrong_worker.value.status_code == 409
+    assert secret not in str(wrong_worker.value.detail)
+    resolver.assert_awaited_once()
+
+    with pytest.raises(HTTPException) as stale_generation:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=resident_session_module.ResidentCallSpeechCredentialsRequest(
+                task_id=str(owner.id), call_id="call-speech-1", call_generation=2
+            ),
+            session=db_session,
+            token={"sub": str(owner.id)},
+        )
+    assert stale_generation.value.status_code == 409
+    resolver.assert_awaited_once()
+
+    # A token cannot name the owning task in the body while authenticating as
+    # another project task.
+    with pytest.raises(HTTPException) as token_mismatch:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=payload,
+            session=db_session,
+            token={"sub": str(other.id)},
+        )
+    assert token_mismatch.value.status_code == 403
+    resolver.assert_awaited_once()
+
+    project.vision[RESIDENT_SESSION_KEY]["call"]["expires_at"] = (
+        _utcnow() - timedelta(seconds=1)
+    ).isoformat()
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    with pytest.raises(HTTPException) as inactive_call:
+        await resident_session_module.resident_call_speech_credentials(
+            request=None,
+            project_id=project.id,
+            payload=payload,
+            session=db_session,
+            token={"sub": str(owner.id)},
+        )
+    assert inactive_call.value.status_code == 409
+    resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_call_lease_expires_when_coordinator_never_becomes_ready(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    now = _utcnow()
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "stop_requested": False,
+            "call": {
+                "call_id": "call-not-ready",
+                "generation": 1,
+                "status": "active",
+                "worker_task_id": str(task.id),
+                "account_id": "account-1",
+                "slot_reserved": True,
+                "started_at": (now - timedelta(seconds=31)).isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    released = AsyncMock()
+    monkeypatch.setattr("app.max_plan_pool.release_max_plan_call_slot", released)
+
+    snapshot = await renew_resident_call_lease(
+        db_session,
+        project,
+        task_id=str(task.id),
+        call_id="call-not-ready",
+        generation=1,
+        ready=False,
+    )
+
+    assert snapshot["status"] == "expired"
+    assert snapshot["failure"] == "coordinator_not_ready"
+    released.assert_awaited_once_with("account-1", project_id=str(project.id))
+
+
+@pytest.mark.asyncio
+async def test_ready_call_renewal_is_capped_at_absolute_duration(db_session):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    now = _utcnow()
+    started_at = now - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "stop_requested": False,
+            "call": {
+                "call_id": "call-ready",
+                "generation": 2,
+                "status": "active",
+                "worker_task_id": str(task.id),
+                "started_at": started_at.isoformat(),
+                "ready_at": (started_at + timedelta(seconds=5)).isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    snapshot = await renew_resident_call_lease(
+        db_session,
+        project,
+        task_id=str(task.id),
+        call_id="call-ready",
+        generation=2,
+        ttl_seconds=900,
+        ready=True,
+        usage={
+            "input_audio_ms": 12_000,
+            "output_characters": 850,
+            "provider_errors": -5,
+            "credential": "must-not-persist",
+        },
+    )
+
+    assert snapshot["status"] == "active"
+    assert datetime.fromisoformat(snapshot["expires_at"]) <= started_at + timedelta(
+        seconds=resident_session_module._RESIDENT_CALL_MAX_DURATION_SECONDS
+    )
+    assert snapshot["usage"] == {
+        "input_audio_ms": 12_000,
+        "output_characters": 850,
+        "provider_errors": 0,
+    }
+
+
 def _test_session_factory(session):
     return async_sessionmaker(
         resolve_async_engine(session),
@@ -135,6 +449,70 @@ def test_session_state_helpers_remain_table_free():
     )
     assert snapshot is not None
     assert snapshot["session_id"] == "ss-restored"
+
+
+def test_nested_call_projection_hides_actor_account_and_playout_receipts():
+    now = datetime.fromisoformat("2026-07-27T12:00:00")
+    vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "call": {
+                "call_id": "call-opaque",
+                "generation": 4,
+                "status": "active",
+                "actor_user_id": "operator-secret",
+                "account_id": "pool-secret",
+                "expires_at": "2026-07-27T12:01:00",
+                "playout_receipts": [{"phrase_id": "p", "event": "started"}],
+                "worker_task_id": "worker",
+            },
+        }
+    }
+    assert resident_call_is_active(vision[RESIDENT_SESSION_KEY]["call"], now=now)
+    snapshot = resident_call_snapshot(vision, now=now)
+    assert snapshot is not None
+    assert snapshot["call_id"] == "call-opaque"
+    assert "actor_user_id" not in snapshot
+    assert "account_id" not in snapshot
+    assert "playout_receipts" not in snapshot
+
+
+@pytest.mark.asyncio
+async def test_call_lease_reuse_rechecks_owner_under_project_lock(db_session):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "ss-call-owner-race",
+            "status": "active",
+            "stop_requested": False,
+            "call": {
+                "call_id": "call-owner-race",
+                "generation": 2,
+                "status": "active",
+                "actor_user_id": TEST_USER_ID,
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            },
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await acquire_resident_call_lease(
+            db_session,
+            project,
+            operator_user_id="different-project-member",
+            account_id="pool-account",
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Only the call owner may reconnect"
+    await db_session.refresh(project)
+    call = read_resident_session(project.vision)["call"]
+    assert call["actor_user_id"] == TEST_USER_ID
+    assert call["call_id"] == "call-owner-race"
 
 
 def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(
@@ -330,6 +708,43 @@ async def test_continuous_hydration_ensure_succeeds(db_session):
 
 
 @pytest.mark.asyncio
+async def test_call_start_rejects_provider_without_qualified_foreground_adapter(
+    db_session,
+):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    started = await unwrap(start_project_strategic_resident_session)(
+        request=None,
+        project_id=project.id,
+        payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+        session=db_session,
+        current_user={"user_id": TEST_USER_ID},
+    )
+    task = await db_session.get(Task, uuid.UUID(started["session"]["task_id"]))
+    assert task is not None
+    task.llm_account_id = "pool-openai"
+    task.context = {**(task.context or {}), "llm_provider": "openai"}
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await unwrap(start_project_strategic_call)(
+            request=None,
+            project_id=project.id,
+            payload=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+    assert exc.value.status_code == 409
+    assert "does not yet have a qualified Fast Resident adapter" in str(
+        exc.value.detail
+    )
+    await db_session.refresh(project)
+    assert resident_call_snapshot(project.vision) is None
+
+
+@pytest.mark.asyncio
 async def test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_start_works(
     db_session,
 ):
@@ -420,6 +835,231 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
     )
     assert liveness["authority_held"] is True
     assert liveness["leased_until"] == lease
+
+
+@pytest.mark.asyncio
+async def test_resident_heartbeat_fences_overlapping_process_incarnations(
+    db_session,
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    first_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000711"
+    )
+    second_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000722"
+    )
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident["worker_incarnation_id"] = str(first_incarnation)
+    resident["worker_incarnation_expires_at"] = (
+        _utcnow() + timedelta(minutes=5)
+    ).isoformat()
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    first = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=first_incarnation,
+        progress=False,
+    )
+    assert first["resident_incarnation_held"] is True
+    assert first["resident_incarnation_id"] == str(first_incarnation)
+
+    project = await db_session.get(Project, project.id)
+    competing = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=second_incarnation,
+        progress=False,
+    )
+    assert competing["resident_incarnation_held"] is False
+    assert competing["authority_held"] is False
+    assert competing["stop_requested"] is True
+
+    project = await db_session.get(Project, project.id)
+    owner = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=first_incarnation,
+        progress=False,
+    )
+    assert owner["resident_incarnation_held"] is True
+
+
+@pytest.mark.asyncio
+async def test_predeploy_legacy_grace_is_retryable_for_replacement(db_session):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident.pop("worker_incarnation_protocol", None)
+    resident.pop("worker_incarnation_id", None)
+    resident.pop("worker_incarnation_expires_at", None)
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    replacement = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=uuid.UUID(
+            "00000000-0000-0000-0000-000000000799"
+        ),
+        progress=False,
+    )
+
+    assert replacement["admission_status"] == "legacy_grace"
+    assert replacement["resident_incarnation_held"] is False
+    assert replacement["authority_held"] is False
+    assert replacement["stop_requested"] is False
+    assert replacement["retry_after_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_incarnation_takeover_uses_time_sampled_after_project_lock(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    first_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000811"
+    )
+    replacement_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000822"
+    )
+    before_lock = _utcnow()
+    after_lock = before_lock + timedelta(minutes=1)
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident["worker_incarnation_id"] = str(first_incarnation)
+    resident["worker_incarnation_expires_at"] = (
+        before_lock + timedelta(seconds=30)
+    ).isoformat()
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    calls = 0
+
+    def advancing_now():
+        nonlocal calls
+        calls += 1
+        return before_lock if calls == 1 else after_lock
+
+    monkeypatch.setattr(resident_session_module, "_utcnow", advancing_now)
+    project = await db_session.get(Project, project.id)
+    replacement = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=replacement_incarnation,
+        progress=False,
+    )
+
+    assert replacement["resident_incarnation_held"] is True
+    assert replacement["resident_incarnation_id"] == str(replacement_incarnation)
+    refreshed = await db_session.get(Project, project.id)
+    resident = refreshed.vision[RESIDENT_SESSION_KEY]
+    assert resident["worker_incarnation_id"] == str(replacement_incarnation)
+    assert datetime.fromisoformat(
+        resident["worker_incarnation_expires_at"]
+    ) > after_lock
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_samples_operator_reengagement_after_project_lock(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    now = _utcnow()
+    stale_at = now - timedelta(minutes=10)
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident["started_at"] = stale_at.isoformat()
+    resident["last_operator_interaction_at"] = stale_at.isoformat()
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    monkeypatch.setitem(
+        runtime_config,
+        STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
+        60,
+    )
+
+    original_project_lock = resident_session_module.project_lock
+    project_lock_held = False
+
+    @asynccontextmanager
+    async def observed_project_lock(*args, **kwargs):
+        nonlocal project_lock_held
+        async with original_project_lock(*args, **kwargs) as locked_project:
+            project_lock_held = True
+            try:
+                yield locked_project
+            finally:
+                project_lock_held = False
+
+    async def latest_operator_interaction(*_args, **_kwargs):
+        assert project_lock_held
+        return now
+
+    monkeypatch.setattr(
+        resident_session_module,
+        "project_lock",
+        observed_project_lock,
+    )
+    monkeypatch.setattr(
+        resident_session_module,
+        "_latest_operator_interaction_at",
+        latest_operator_interaction,
+    )
+
+    project = await db_session.get(Project, project.id)
+    renewed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        progress=False,
+    )
+
+    assert renewed["status"] == "active"
+    assert renewed["stop_requested"] is False
+    refreshed = await db_session.get(Project, project.id)
+    resident = read_resident_session(refreshed.vision)
+    assert resident["last_operator_interaction_at"] == now.isoformat()
 
 
 @pytest.mark.asyncio
@@ -623,6 +1263,47 @@ async def test_reload_ensure_keeps_worker_during_transient_heartbeat_gap(db_sess
 
 
 @pytest.mark.asyncio
+async def test_reload_ensure_does_not_supersede_fresh_task_on_stale_projection(
+    db_session,
+):
+    """The exact task heartbeat wins over a lagging resident-session mirror."""
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.IN_PROGRESS
+    old_task.last_heartbeat = _utcnow() - timedelta(seconds=8)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob["worker_heartbeat_at"] = stale_at.isoformat()
+    blob["updated_at"] = stale_at.isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    reused = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert reused["session_id"] == started["session_id"]
+    assert reused["worker_generation"] == started["worker_generation"]
+    assert reused["task_id"] == started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retry_status", [TaskStatus.QUEUED, TaskStatus.PROVISIONING])
 async def test_reload_ensure_keeps_fresh_retry_heartbeat_past_startup_window(
     db_session, retry_status
@@ -782,7 +1463,9 @@ async def test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale(db_s
 
 
 @pytest.mark.asyncio
-async def test_reload_ensure_replaces_worker_stale_past_recovery_threshold(db_session):
+async def test_reload_ensure_replaces_worker_after_task_corroboration_grace(
+    db_session,
+):
     project = await _make_project(db_session)
     old_task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
@@ -790,12 +1473,16 @@ async def test_reload_ensure_replaces_worker_stale_past_recovery_threshold(db_se
         db_session, project, operator_user_id=TEST_USER_ID
     )
     stale_at = _utcnow() - timedelta(
-        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+        seconds=(
+            resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+            + resident_session_module._RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS
+            + 1
+        )
     )
 
     old_task = await db_session.get(Task, old_task.id)
     old_task.status = TaskStatus.IN_PROGRESS
-    old_task.last_heartbeat = stale_at
+    old_task.last_heartbeat = _utcnow() - timedelta(seconds=8)
     project = await db_session.get(Project, project.id)
     vision = dict(project.vision or {})
     blob = dict(vision[RESIDENT_SESSION_KEY])
@@ -1128,6 +1815,7 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     session_id = "ss-ended"
+    durable_claim_id = uuid.uuid4()
     unanswered = ProjectMessage(
         project_id=project.id,
         message_type=MessageType.QUESTION,
@@ -1136,6 +1824,10 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
         status="open",
         handling_state=MessageHandlingState.CLAIMED,
         handled_by_task_id=task.id,
+        conversation_claim_id=durable_claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_expires_at=_utcnow() + timedelta(minutes=1),
+        conversation_claim_attempt=1,
         resident_session_id=session_id,
     )
     answered = ProjectMessage(
@@ -1170,6 +1862,8 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
     assert unanswered.resident_session_id is None
     assert unanswered.handling_state == MessageHandlingState.PENDING
     assert unanswered.handled_by_task_id is None
+    assert unanswered.conversation_claim_id == durable_claim_id
+    assert unanswered.conversation_claim_expires_at <= _utcnow()
     await db_session.refresh(answered)
     assert answered.status == "resolved"
     assert answered.handling_state == MessageHandlingState.RESPONDED
@@ -2132,6 +2826,7 @@ async def test_start_allow_no_runner_creates_session_without_task(db_session):
     assert blob["task_id"] is None
     assert blob["runner_id"] is None
     assert blob["worker_state"] == "starting"
+    assert blob["worker_incarnation_protocol"] == 1
     assert blob["status"] == "active"
 
 

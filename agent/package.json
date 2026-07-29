@@ -17,6 +17,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@livekit/rtc-node": "0.13.31",
     "ws": "^8.16.0"
   },
   "devDependencies": {

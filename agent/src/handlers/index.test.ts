@@ -37,6 +37,7 @@ vi.mock('../workspacePrep.js', () => ({
 // handleStrategicResident is stubbed so dispatchStrategic gate tests can assert
 // which branch was taken without running the real session loop.
 vi.mock('./strategic-resident.js', () => ({
+  CALL_OPERATOR_RECONNECT_GRACE_MS: 30_000,
   handleStrategicResident: vi.fn().mockResolvedValue(undefined),
   residentReplyRuntimePaths: vi.fn(),
 }));

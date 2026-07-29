@@ -14,3 +14,8 @@ backend/testing/module_size_limits.json merge=sizecap
 # (RUN line-continuations, ignore patterns) on some engines.
 agent/Dockerfile text eol=lf
 agent/.dockerignore text eol=lf
+
+# LiveKit gateway files are installed on Linux hosts, including when packaged
+# from a Windows local runner. Keep shell and service definitions free of CRLF.
+infra/livekit/bin/* text eol=lf
+scripts/blueprint-livekit-system.service text eol=lf

@@ -1259,7 +1259,7 @@ describe('writeMessagesHelper', () => {
     expect(script).toContain('this is not the Workday operator reply tool; call reply_to_operator instead');
   });
 
-  it('embeds external resident reply authority paths when provided', () => {
+  it('uses external resident reply paths as fallbacks to process-bound authority', () => {
     writeMessagesHelper('task-resident', '/tmp/resident-workspace', {
       residentReplyOnly: true,
       replyKeyPath: '/tmp/resident-runtime/reply-key',
@@ -1267,9 +1267,15 @@ describe('writeMessagesHelper', () => {
       stagedReplyPath: '/tmp/resident-runtime/staged-reply.json',
     });
     const script = capturedScripts['/tmp/resident-workspace/messages'];
-    expect(script).toContain('REPLY_KEY_PATH="/tmp/resident-runtime/reply-key"');
-    expect(script).toContain('REPLY_RECEIPT_PATH="/tmp/resident-runtime/reply-receipt.json"');
-    expect(script).toContain('STAGED_REPLY_PATH="/tmp/resident-runtime/staged-reply.json"');
+    expect(script).toContain(
+      'REPLY_KEY_PATH="${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-/tmp/resident-runtime/reply-key}"',
+    );
+    expect(script).toContain(
+      'REPLY_RECEIPT_PATH="${BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH:-/tmp/resident-runtime/reply-receipt.json}"',
+    );
+    expect(script).toContain(
+      'STAGED_REPLY_PATH="${BLUEPRINT_RESIDENT_STAGED_REPLY_PATH:-/tmp/resident-runtime/staged-reply.json}"',
+    );
   });
 
   it('reads the live token, captures stdin, retries on 401, and fails loud (live write-token fix)', async () => {

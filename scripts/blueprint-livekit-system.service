@@ -1,0 +1,62 @@
+# Blueprint LiveKit companion — systemd SYSTEM unit TEMPLATE
+#
+# Installed only by `blueprint-runner livekit-install --system`. This is a
+# sibling host-role service, never a Blueprint task: systemd owns its lifetime
+# and no runner heartbeat, dispatch, or capacity setting can start/stop it.
+#
+# The host must be an always-on Linux VM with no untrusted task workloads. The
+# root-owned service reads explicitly versioned Google Secret Manager references
+# from /etc/blueprint-livekit and mounts only rendered runtime material into the
+# containers. It does not inherit runner environment variables or credentials.
+
+[Unit]
+Description=Blueprint self-hosted LiveKit gateway
+Documentation=https://docs.livekit.io/transport/self-hosting/deployment/
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/blueprint-livekit-host-role
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@LIVEKIT_DIR@
+User=root
+Group=root
+RuntimeDirectory=blueprint-livekit
+# The containers run as 65532:65532. Allow traversal without directory
+# listing; the rendered config/cert/key files remain owner-only mode 0400.
+RuntimeDirectoryMode=0711
+StateDirectory=blueprint-livekit
+StateDirectoryMode=0700
+CacheDirectory=blueprint-livekit-gcloud
+CacheDirectoryMode=0700
+Environment=BLUEPRINT_LIVEKIT_CONFIG_DIR=/etc/blueprint-livekit
+Environment=BLUEPRINT_LIVEKIT_RUNTIME_DIR=/run/blueprint-livekit
+Environment=BLUEPRINT_LIVEKIT_STATE_DIR=/var/lib/blueprint-livekit
+Environment=BLUEPRINT_LIVEKIT_UID=65532
+Environment=BLUEPRINT_LIVEKIT_GCLOUD=@GCLOUD@
+EnvironmentFile=/etc/blueprint-livekit/public.env
+# Keep gcloud's cache outside both /root and the container-mounted runtime dir.
+Environment=CLOUDSDK_CONFIG=/var/cache/blueprint-livekit-gcloud
+ExecStartPre=@BASH@ @LIVEKIT_DIR@/bin/render-livekit-secrets
+ExecStartPre=@DOCKER@ compose --project-name blueprint-livekit --file @LIVEKIT_DIR@/compose.yaml config --quiet
+ExecStart=@DOCKER@ compose --project-name blueprint-livekit --file @LIVEKIT_DIR@/compose.yaml up --no-color --remove-orphans
+ExecStartPost=@BASH@ @LIVEKIT_DIR@/bin/livekit-healthcheck --wait
+ExecStop=@DOCKER@ compose --project-name blueprint-livekit --file @LIVEKIT_DIR@/compose.yaml down --remove-orphans
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=2min
+TimeoutStopSec=90s
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/etc/blueprint-livekit /run/blueprint-livekit /var/lib/blueprint-livekit /var/cache/blueprint-livekit-gcloud
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

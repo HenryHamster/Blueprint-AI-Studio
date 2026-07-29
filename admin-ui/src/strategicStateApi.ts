@@ -1426,6 +1426,119 @@ export class StrategicSessionMessageCreateError extends Error {
   }
 }
 
+/**
+ * Temporary call mode is layered over the existing Strategic conversation. It
+ * deliberately does not extend `interaction_mode`: the durable transcript and
+ * ordinary Workday session remain the canonical product surface.
+ */
+export interface StrategicCallState {
+  call_id: string;
+  generation: number;
+  status: 'starting' | 'ready' | 'active' | 'reconnecting' | 'ending' | 'ended' | 'failed' | string;
+  started_at?: string | null;
+  updated_at?: string | null;
+  expires_at?: string | null;
+  last_heartbeat_at?: string | null;
+  worker_task_id?: string | null;
+  worker_generation?: number | null;
+  runner_id?: string | null;
+  slot_reserved?: boolean | null;
+  input_revision?: number | null;
+  failure?: string | null;
+}
+
+export interface StrategicCallConnection {
+  /** Opaque LiveKit endpoint; no API secret is ever sent to the browser. */
+  server_url?: string | null;
+  room_url?: string | null;
+  /** Accepted aliases make rollout compatible with an initially evolving API. */
+  livekit_url?: string | null;
+  participant_token?: string | null;
+  token?: string | null;
+  /** Opaque identity of the sole trusted Coordinator/Resident participant. */
+  agent_identity?: string | null;
+}
+
+export interface StrategicCallResponse extends StrategicCallConnection {
+  call: StrategicCallState | null;
+}
+
+export interface StrategicCallEndRequest {
+  call_id?: string;
+  generation?: number;
+}
+
+export interface StrategicCallPlayoutReceipt {
+  call_id: string;
+  generation: number;
+  phrase_id: string;
+  event: 'started' | 'completed' | 'interrupted';
+  at?: string;
+}
+
+async function strategicCallResponse(
+  res: Response,
+  fallback: string,
+): Promise<StrategicCallResponse> {
+  if (!res.ok) throw new Error(await strategicSessionErrorMessage(res, `${fallback}: ${res.status}`));
+  const data = await res.json() as Partial<StrategicCallResponse> & { strategic_call?: StrategicCallState | null };
+  const call = data.call ?? data.strategic_call ?? null;
+  if (!call?.call_id || typeof call.generation !== 'number') {
+    throw new Error(`${fallback}: missing call identity`);
+  }
+  return { ...data, call } as StrategicCallResponse;
+}
+
+export async function startStrategicCall(projectId: string): Promise<StrategicCallResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-call/start`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+  );
+  return strategicCallResponse(res, 'Failed to start call');
+}
+
+export async function fetchStrategicCall(projectId: string, signal?: AbortSignal): Promise<StrategicCallResponse | null> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-call`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (res.status === 404) return null;
+  if (res.ok) {
+    const data = await res.clone().json() as {
+      call?: StrategicCallState | null;
+      strategic_call?: StrategicCallState | null;
+    };
+    if (data.call === null || data.strategic_call === null) return null;
+  }
+  return strategicCallResponse(res, 'Failed to fetch call');
+}
+
+export async function endStrategicCall(
+  projectId: string,
+  fence: StrategicCallEndRequest,
+): Promise<StrategicCallResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-call/end`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fence) },
+  );
+  return strategicCallResponse(res, 'Failed to end call');
+}
+
+/** Blueprint, rather than LiveKit, owns the durable playout trace. */
+export async function reportStrategicCallPlayout(
+  projectId: string,
+  receipt: StrategicCallPlayoutReceipt,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-call/playout`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(receipt) },
+  );
+  if (!res.ok) throw new Error(await strategicSessionErrorMessage(res, `Failed to report call playout: ${res.status}`));
+}
+
 export async function checkInStrategicSession(
   projectId: string,
   payload: StrategicSessionCheckInCreate = {},

@@ -429,17 +429,24 @@ class TestEnvAllowlist(unittest.TestCase):
     def test_compute_env_excludes_provider_creds(self):
         source = {
             "ANTHROPIC_API_KEY": "sk-ant",
+            "CALL_DEEPGRAM_API_KEY": "speech-host-secret",
             "BLUEPRINT_RUNNER_TOKEN": "SECRET",
             "LD_LIBRARY_PATH": "/usr/local/cuda/lib64",
             "PATH": "/usr/bin",
         }
         env = iso.build_compute_env(
-            {"MY_HP": "0.1"},
-            {"BLUEPRINT_RESULT_FILE": "/workspace/result.json", "HOME": "/home"},
+            {"MY_HP": "0.1", "CALL_CARTESIA_API_KEY": "attempted-injection"},
+            {
+                "BLUEPRINT_RESULT_FILE": "/workspace/result.json",
+                "CALL_DEEPGRAM_API_KEY": "attempted-injection",
+                "HOME": "/home",
+            },
             source,
         )
-        # Untrusted compute NEVER sees LLM keys or the runner token.
+        # Untrusted compute NEVER sees LLM, speech, or runner credentials.
         self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("CALL_DEEPGRAM_API_KEY", env)
+        self.assertNotIn("CALL_CARTESIA_API_KEY", env)
         self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", env)
         # CUDA discovery passes through; declared + injected present.
         self.assertEqual(env["LD_LIBRARY_PATH"], "/usr/local/cuda/lib64")
@@ -535,6 +542,47 @@ class TestEnvAllowlist(unittest.TestCase):
         )
         self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-host")
         self.assertEqual(env["LANG"], "en_US.UTF-8")
+
+    def test_speech_credentials_never_enter_agent_process_environment(self):
+        """Host and obsolete server envelopes cannot regress Coordinator isolation."""
+        source = {
+            "CALL_DEEPGRAM_API_KEY": "host-speech-secret",
+            "CALL_CARTESIA_API_KEY": "host-speech-secret",
+            "LANG": "en_US.UTF-8",
+        }
+        ordinary = iso.build_agent_env(source, {"AGENT_SECRET_TOKEN": "jwt"}, [])
+        self.assertNotIn("CALL_DEEPGRAM_API_KEY", ordinary)
+        self.assertNotIn("CALL_CARTESIA_API_KEY", ordinary)
+
+        resident = iso.build_agent_env(
+            source,
+            {"AGENT_SECRET_TOKEN": "jwt"},
+            [],
+            per_task_creds={
+                "CALL_DEEPGRAM_API_KEY": "vended-deepgram",
+                "CALL_CARTESIA_API_KEY": "vended-cartesia",
+                "CALL_DEEPGRAM_STT_MODEL": "flux-general-en",
+                "MALICIOUS_INJECTION": "dropped",
+            },
+        )
+        self.assertNotIn("CALL_DEEPGRAM_API_KEY", resident)
+        self.assertNotIn("CALL_CARTESIA_API_KEY", resident)
+        self.assertNotIn("CALL_DEEPGRAM_STT_MODEL", resident)
+        self.assertNotIn("MALICIOUS_INJECTION", resident)
+
+    def test_unapproved_injected_env_is_dropped(self):
+        env = iso.build_agent_env(
+            {},
+            {
+                "AGENT_SECRET_TOKEN": "jwt",
+                "CALL_DEEPGRAM_API_KEY": "vended-speech-key",
+                "ARBITRARY_INJECTION": "must-not-pass",
+            },
+            [],
+        )
+        # Speech credentials are fetched only after an exact active-call fence.
+        self.assertNotIn("CALL_DEEPGRAM_API_KEY", env)
+        self.assertNotIn("ARBITRARY_INJECTION", env)
 
 
 # ── bwrap argv builder ────────────────────────────────────────────────────────

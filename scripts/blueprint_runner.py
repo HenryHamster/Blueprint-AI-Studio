@@ -77,6 +77,18 @@ SERVICE_UNIT_NAME = "blueprint-runner.service"
 _USER_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner.service")
 _SYSTEM_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner-system.service")
 _SYSTEM_WANTED_BY = "multi-user.target"
+_RUNNER_INSTANCE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$")
+
+# The LiveKit gateway is a deliberately narrow companion service for a selected
+# always-on Linux host. It is not registered as runner capacity and cannot be
+# claimed as a task. The runner CLI owns only its installation/update convention;
+# systemd owns the gateway lifetime independently of runner heartbeats.
+LIVEKIT_SERVICE_UNIT_NAME = "blueprint-livekit.service"
+# Kept outside the root-only secrets directory so an unprivileged runner daemon
+# can still observe the reservation even while the media service is stopped.
+LIVEKIT_HOST_ROLE_MARKER = "/etc/blueprint-livekit-host-role"
+_LIVEKIT_DIR = os.path.join(_REPO_ROOT, "infra", "livekit")
+_LIVEKIT_SYSTEM_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-livekit-system.service")
 
 # Resource-limit env vars: (cli-flag, env-var, argparse-dest, help-text).
 # Used by the install flags and by `status` to show effective config.
@@ -663,6 +675,23 @@ def _print_docker_agent_status(result: AgentImageResult) -> None:
 # — the installer never claims success when a step failed.
 
 
+def _runner_instance() -> str | None:
+    value = os.environ.get("BLUEPRINT_RUNNER_INSTANCE", "").strip()
+    if not value:
+        return None
+    if not _RUNNER_INSTANCE_RE.fullmatch(value):
+        raise ValueError(
+            "BLUEPRINT_RUNNER_INSTANCE must use 1-48 lowercase letters, digits, "
+            "or internal hyphens"
+        )
+    return value
+
+
+def _runner_service_unit_name() -> str:
+    instance = _runner_instance()
+    return SERVICE_UNIT_NAME if instance is None else f"blueprint-runner-{instance}.service"
+
+
 def _credential_dir() -> str:
     """The Blueprint credential dir — mirrors local_runner._credential_dir().
 
@@ -670,10 +699,12 @@ def _credential_dir() -> str:
     env file the service reads lands in the same place local_runner persists the
     token to (``runner_token``).
     """
-    return (
-        os.environ.get("BLUEPRINT_CREDENTIAL_DIR", "").strip()
-        or os.path.expanduser("~/.blueprint")
-    )
+    configured = os.environ.get("BLUEPRINT_CREDENTIAL_DIR", "").strip()
+    if configured:
+        return configured
+    instance = _runner_instance()
+    suffix = "" if instance is None else f"-{instance}"
+    return os.path.expanduser(f"~/.blueprint{suffix}")
 
 
 def _env_file_path() -> str:
@@ -682,11 +713,11 @@ def _env_file_path() -> str:
 
 
 def _user_unit_path() -> str:
-    return os.path.expanduser(f"~/.config/systemd/user/{SERVICE_UNIT_NAME}")
+    return os.path.expanduser(f"~/.config/systemd/user/{_runner_service_unit_name()}")
 
 
 def _system_unit_path() -> str:
-    return f"/etc/systemd/system/{SERVICE_UNIT_NAME}"
+    return f"/etc/systemd/system/{_runner_service_unit_name()}"
 
 
 def _install_user() -> str:
@@ -821,6 +852,15 @@ def _write_env_file(
         "# Written by `blueprint-runner install`. Mode 0600 — do not commit.\n",
         f"BLUEPRINT_ORCHESTRATOR_URL={url}\n",
     ]
+    instance = _runner_instance()
+    if instance:
+        lines.extend(
+            [
+                f"BLUEPRINT_RUNNER_INSTANCE={instance}\n",
+                f"BLUEPRINT_CREDENTIAL_DIR={cred_dir}\n",
+                f"BLUEPRINT_RUNNER_WORKSPACE_ROOT=/tmp/blueprint-agent-workspaces-{instance}\n",
+            ]
+        )
     if token:
         lines.append(f"BLUEPRINT_RUNNER_TOKEN={token}\n")
     if resource_limits:
@@ -860,6 +900,7 @@ def do_install(
         return 1
 
     env_file = _env_file_path()
+    service_unit_name = _runner_service_unit_name()
     subs = {
         "@PYTHON@": sys.executable,
         "@LOCAL_RUNNER@": _LOCAL_RUNNER,
@@ -880,7 +921,7 @@ def do_install(
         print(f"[dry-run] would seed env file: {env_file}", flush=True)
         print(f"[dry-run] would write unit:    {unit_path}", flush=True)
         print(f"[dry-run] would run: systemctl {'' if system else '--user '}"
-              f"daemon-reload / enable --now {SERVICE_UNIT_NAME}", flush=True)
+              f"daemon-reload / enable --now {service_unit_name}", flush=True)
         if not system:
             print(f"[dry-run] would run: loginctl enable-linger {_install_user()}", flush=True)
         print("\n" + unit_text, flush=True)
@@ -899,7 +940,7 @@ def do_install(
 
     for args, label in (
         (["daemon-reload"], "daemon-reload"),
-        (["enable", "--now", SERVICE_UNIT_NAME], "enable --now"),
+        (["enable", "--now", service_unit_name], "enable --now"),
     ):
         result = _systemctl(args, system=system, _run=_run)
         if getattr(result, "returncode", 1) != 0:
@@ -935,20 +976,20 @@ def do_install(
             )
 
     # Verify the unit actually came up — never claim success on a dead unit.
-    active = _systemctl(["is-active", SERVICE_UNIT_NAME], system=system, _run=_run)
-    enabled = _systemctl(["is-enabled", SERVICE_UNIT_NAME], system=system, _run=_run)
+    active = _systemctl(["is-active", service_unit_name], system=system, _run=_run)
+    enabled = _systemctl(["is-enabled", service_unit_name], system=system, _run=_run)
     if getattr(active, "returncode", 1) != 0 or getattr(enabled, "returncode", 1) != 0:
         print(
             "ERROR: the unit did not come up active AND enabled after install "
             f"(is-active rc={getattr(active, 'returncode', '?')}, "
             f"is-enabled rc={getattr(enabled, 'returncode', '?')}). Inspect: "
-            f"journalctl {'' if system else '--user '}-u {SERVICE_UNIT_NAME} -n 50",
+            f"journalctl {'' if system else '--user '}-u {service_unit_name} -n 50",
             file=sys.stderr,
         )
         return 1
 
     scope = "--system" if system else "--user"
-    follow = f"journalctl {'' if system else '--user '}-u {SERVICE_UNIT_NAME} -f"
+    follow = f"journalctl {'' if system else '--user '}-u {service_unit_name} -f"
     print(
         f"[blueprint-runner] installed and started ({scope}). "
         f"The runner is active and enabled at boot.\n"
@@ -967,10 +1008,11 @@ def do_install(
 def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess.run) -> int:
     """Stop, disable, and remove the runner unit. Idempotent; credentials kept."""
     unit_path = _system_unit_path() if system else _user_unit_path()
+    service_unit_name = _runner_service_unit_name()
 
     if dry_run:
         print(f"[dry-run] would run: systemctl {'' if system else '--user '}"
-              f"disable --now {SERVICE_UNIT_NAME}", flush=True)
+              f"disable --now {service_unit_name}", flush=True)
         print(f"[dry-run] would remove unit: {unit_path}", flush=True)
         return 0
 
@@ -985,7 +1027,7 @@ def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess
     # the unit is already gone, so run it regardless; we only care that a
     # PRESENT unit is removed cleanly. Do NOT touch credential files.
     if shutil.which("systemctl") is not None:
-        _systemctl(["disable", "--now", SERVICE_UNIT_NAME], system=system, _run=_run)
+        _systemctl(["disable", "--now", service_unit_name], system=system, _run=_run)
 
     removed = False
     if unit_present:
@@ -1008,6 +1050,369 @@ def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess
     return 0
 
 
+def _livekit_system_unit_path() -> str:
+    return os.path.join("/etc", "systemd", "system", LIVEKIT_SERVICE_UNIT_NAME)
+
+
+def livekit_gateway_role_is_selected(
+    *,
+    marker_path: str = LIVEKIT_HOST_ROLE_MARKER,
+    _run=subprocess.run,
+) -> bool:
+    """Return whether this machine is reserved for the LiveKit gateway role.
+
+    The root-owned marker is the durable source of truth. The active-unit check
+    also fails closed if an operator removes the marker while the gateway is
+    still running.
+    """
+    if os.path.isfile(marker_path):
+        return True
+    if sys.platform != "linux":
+        return False
+    try:
+        active = _run(
+            ["systemctl", "is-active", "--quiet", LIVEKIT_SERVICE_UNIT_NAME],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return getattr(active, "returncode", 1) == 0
+
+
+def _is_wsl_host() -> bool:
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as fh:
+            return "microsoft" in fh.read().lower()
+    except OSError:
+        return False
+
+
+def _active_local_runner_pids() -> list[str]:
+    """Return Linux processes that still execute Blueprint's task daemon."""
+    pids: list[str] = []
+    try:
+        proc_entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in proc_entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                cmdline = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "local_runner.py" in cmdline:
+            pids.append(entry)
+    return pids
+
+
+def _livekit_host_is_supported() -> bool:
+    """Reject non-Linux and WSL public-production installs before side effects."""
+    if sys.platform != "linux":
+        print("ERROR: LiveKit requires an always-on Linux host; this host is not Linux.", file=sys.stderr)
+        return False
+    if _is_wsl_host():
+        print(
+            "ERROR: refusing a LiveKit install on WSL. WSL2 NAT is not a reliable "
+            "WebRTC/TURN host; select an always-on Linux VM instead.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _livekit_requirements() -> tuple[str, str, str, str, str] | None:
+    """Return resolved host-tool paths, or print actionable error."""
+    bash = shutil.which("bash")
+    docker = shutil.which("docker")
+    gcloud = shutil.which("gcloud")
+    curl = shutil.which("curl")
+    openssl = shutil.which("openssl")
+    missing = [
+        name for name, value in (
+            ("bash", bash), ("docker", docker), ("gcloud", gcloud),
+            ("curl", curl), ("openssl", openssl),
+        )
+        if value is None
+    ]
+    if missing:
+        print(
+            "ERROR: cannot install the LiveKit companion; missing host prerequisite(s): "
+            + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return None
+    return bash, docker, gcloud, curl, openssl
+
+
+def _render_livekit_unit() -> str:
+    requirements = _livekit_requirements()
+    if requirements is None:
+        raise RuntimeError("missing LiveKit companion prerequisites")
+    bash, docker, gcloud, _curl, _openssl = requirements
+    return render_unit(
+        _LIVEKIT_SYSTEM_SERVICE_TEMPLATE,
+        {
+            "@LIVEKIT_DIR@": _LIVEKIT_DIR,
+            "@BASH@": bash,
+            "@DOCKER@": docker,
+            "@GCLOUD@": gcloud,
+        },
+    )
+
+
+def _livekit_config_is_ready(config_dir: str = "/etc/blueprint-livekit") -> bool:
+    """Require root-owned config without parsing or displaying its secret data."""
+    missing = [
+        path for path in (
+            os.path.join(config_dir, "secret-refs"),
+            os.path.join(config_dir, "public.env"),
+        )
+        if not os.path.isfile(path)
+    ]
+    if missing:
+        print(
+            "ERROR: LiveKit configuration is incomplete. Create the root-owned "
+            "secret-refs and public.env files described in infra/livekit/README.md before enabling it. "
+            f"Missing: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        return False
+    for path in (config_dir, *[os.path.join(config_dir, name) for name in ("secret-refs", "public.env")]):
+        try:
+            details = os.stat(path)
+        except OSError as exc:
+            print(f"ERROR: could not inspect LiveKit configuration {path}: {exc}", file=sys.stderr)
+            return False
+        if details.st_uid != 0 or (details.st_mode & 0o077):
+            print(
+                f"ERROR: {path} must be root-owned and inaccessible to group/other (expected 0700 dir, 0600 files).",
+                file=sys.stderr,
+            )
+            return False
+    return True
+
+
+def do_livekit_preflight(*, system: bool, _run=subprocess.run) -> int:
+    """Check the selected host role without starting a public service."""
+    if not system:
+        print("ERROR: LiveKit preflight is defined for the root-owned system service; pass --system.", file=sys.stderr)
+        return 1
+    if not _livekit_host_is_supported():
+        return 1
+    if not _systemd_available(system=True, _run=_run):
+        _print_no_systemd_guidance(system=True)
+        return 1
+    runner_active = _systemctl(["is-active", SERVICE_UNIT_NAME], system=True, _run=_run)
+    if getattr(runner_active, "returncode", 1) == 0:
+        print(
+            "ERROR: refusing to co-host LiveKit with an active Blueprint system runner. "
+            "Choose a zero-task-capacity voice-gateway host instead.",
+            file=sys.stderr,
+        )
+        return 1
+    active_pids = _active_local_runner_pids()
+    if active_pids:
+        print(
+            "ERROR: refusing to co-host LiveKit with active Blueprint task daemon "
+            f"process(es): {', '.join(active_pids)}. Choose a zero-task-capacity voice-gateway host.",
+            file=sys.stderr,
+        )
+        return 1
+    requirements = _livekit_requirements()
+    if requirements is None:
+        return 1
+    if not _livekit_config_is_ready():
+        return 1
+    bash, docker, _gcloud, _curl, _openssl = requirements
+    try:
+        rendered = _run(
+            [bash, os.path.join(_LIVEKIT_DIR, "bin", "render-livekit-secrets"), "--check"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"ERROR: could not validate LiveKit secret material: {exc}", file=sys.stderr)
+        return 1
+    if getattr(rendered, "returncode", 1) != 0:
+        print(
+            "ERROR: LiveKit secret material or TURN host contract is invalid. "
+            "Inspect the root-owned secret references and public.env.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        result = _run([docker, "info"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"ERROR: could not verify Docker daemon: {exc}", file=sys.stderr)
+        return 1
+    if getattr(result, "returncode", 1) != 0:
+        print("ERROR: Docker daemon is not usable by root on this host.", file=sys.stderr)
+        return 1
+    print("[blueprint-runner] LiveKit preflight passed (always-on Linux host role).", flush=True)
+    return 0
+
+
+def do_livekit_install(*, system: bool, dry_run: bool = False, _run=subprocess.run) -> int:
+    """Install the independent root-owned LiveKit system service."""
+    if not system:
+        print("ERROR: LiveKit may only be installed as a root-owned system service; pass --system.", file=sys.stderr)
+        return 1
+    if not os.path.isfile(_LIVEKIT_SYSTEM_SERVICE_TEMPLATE) or not os.path.isdir(_LIVEKIT_DIR):
+        print("ERROR: LiveKit companion files are absent from this checkout.", file=sys.stderr)
+        return 1
+    if not _livekit_host_is_supported():
+        return 1
+    try:
+        unit_text = _render_livekit_unit()
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: could not render LiveKit companion unit: {exc}", file=sys.stderr)
+        return 1
+
+    unit_path = _livekit_system_unit_path()
+    if dry_run:
+        print("[dry-run] would require root-owned /etc/blueprint-livekit/{secret-refs,public.env}", flush=True)
+        print(f"[dry-run] would select host role: {LIVEKIT_HOST_ROLE_MARKER}", flush=True)
+        print(f"[dry-run] would write unit:     {unit_path}", flush=True)
+        print(f"[dry-run] would run: systemctl daemon-reload / enable --now {LIVEKIT_SERVICE_UNIT_NAME}", flush=True)
+        print("\n" + unit_text, flush=True)
+        return 0
+
+    if os.geteuid() != 0:
+        print("ERROR: LiveKit system install requires root (run with sudo).", file=sys.stderr)
+        return 1
+    if do_livekit_preflight(system=True, _run=_run) != 0:
+        return 1
+    try:
+        with open(LIVEKIT_HOST_ROLE_MARKER, "w", encoding="utf-8") as fh:
+            fh.write("blueprint-livekit-gateway-v1\n")
+        os.chmod(LIVEKIT_HOST_ROLE_MARKER, 0o444)
+        os.makedirs(os.path.dirname(unit_path), exist_ok=True)
+        with open(unit_path, "w", encoding="utf-8") as fh:
+            fh.write(unit_text)
+    except OSError as exc:
+        print(f"ERROR: could not select/install LiveKit gateway host role: {exc}", file=sys.stderr)
+        return 1
+
+    for args, label in ((["daemon-reload"], "daemon-reload"), (["enable", "--now", LIVEKIT_SERVICE_UNIT_NAME], "enable --now")):
+        result = _systemctl(args, system=True, _run=_run)
+        if getattr(result, "returncode", 1) != 0:
+            print(
+                f"ERROR: `systemctl {label}` failed "
+                f"(rc={getattr(result, 'returncode', '?')}). "
+                f"{(getattr(result, 'stderr', '') or '').strip()}",
+                file=sys.stderr,
+            )
+            return 1
+    active = _systemctl(["is-active", LIVEKIT_SERVICE_UNIT_NAME], system=True, _run=_run)
+    if getattr(active, "returncode", 1) != 0:
+        print(
+            "ERROR: LiveKit companion did not become active. Inspect: "
+            f"journalctl -u {LIVEKIT_SERVICE_UNIT_NAME} -n 100",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"[blueprint-runner] LiveKit companion active and enabled. "
+        f"Logs: journalctl -u {LIVEKIT_SERVICE_UNIT_NAME} -f",
+        flush=True,
+    )
+    return 0
+
+
+def do_livekit_reload(*, system: bool, dry_run: bool = False, _run=subprocess.run) -> int:
+    """Reload the checked-out gateway after the operator has ended active calls."""
+    if not system:
+        print("ERROR: LiveKit reload requires the root-owned system service; pass --system.", file=sys.stderr)
+        return 1
+    unit_path = _livekit_system_unit_path()
+    if not os.path.isfile(unit_path):
+        print(
+            f"ERROR: LiveKit companion is not installed at {unit_path}. Run `blueprint-runner livekit-install --system` first.",
+            file=sys.stderr,
+        )
+        return 1
+    if not _livekit_host_is_supported():
+        return 1
+    try:
+        unit_text = _render_livekit_unit()
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: could not render LiveKit companion unit: {exc}", file=sys.stderr)
+        return 1
+    if dry_run:
+        print(f"[dry-run] would rewrite unit: {unit_path}", flush=True)
+        print(f"[dry-run] would run: systemctl daemon-reload / restart {LIVEKIT_SERVICE_UNIT_NAME}", flush=True)
+        return 0
+    if os.geteuid() != 0:
+        print("ERROR: LiveKit system reload requires root (run with sudo).", file=sys.stderr)
+        return 1
+    if do_livekit_preflight(system=True, _run=_run) != 0:
+        return 1
+    try:
+        with open(unit_path, "w", encoding="utf-8") as fh:
+            fh.write(unit_text)
+    except OSError as exc:
+        print(f"ERROR: could not update LiveKit companion unit: {exc}", file=sys.stderr)
+        return 1
+    for args, label in ((["daemon-reload"], "daemon-reload"), (["restart", LIVEKIT_SERVICE_UNIT_NAME], "restart"), (["is-active", LIVEKIT_SERVICE_UNIT_NAME], "is-active")):
+        result = _systemctl(args, system=True, _run=_run)
+        if getattr(result, "returncode", 1) != 0:
+            print(
+                f"ERROR: `systemctl {label}` failed "
+                f"(rc={getattr(result, 'returncode', '?')}). "
+                f"{(getattr(result, 'stderr', '') or '').strip()}",
+                file=sys.stderr,
+            )
+            return 1
+    print("[blueprint-runner] LiveKit companion reloaded and healthy.", flush=True)
+    return 0
+
+
+def do_livekit_status(*, system: bool, _run=subprocess.run) -> int:
+    """Report the independent service state without consulting runner state."""
+    if not system:
+        print("ERROR: LiveKit status is only defined for the system service; pass --system.", file=sys.stderr)
+        return 1
+    if os.geteuid() != 0:
+        print("ERROR: LiveKit system status requires root (run with sudo).", file=sys.stderr)
+        return 1
+    if not _systemd_available(system=True, _run=_run):
+        _print_no_systemd_guidance(system=True)
+        return 1
+    active = _systemctl(["is-active", LIVEKIT_SERVICE_UNIT_NAME], system=True, _run=_run)
+    enabled = _systemctl(["is-enabled", LIVEKIT_SERVICE_UNIT_NAME], system=True, _run=_run)
+    print("blueprint-livekit status", flush=True)
+    print(f"  active  : {(getattr(active, 'stdout', '') or '').strip() or 'inactive'}", flush=True)
+    print(f"  enabled : {(getattr(enabled, 'stdout', '') or '').strip() or 'disabled'}", flush=True)
+    if getattr(active, "returncode", 1) != 0:
+        return 1
+    bash = shutil.which("bash")
+    if bash is None:
+        print("ERROR: bash is unavailable; cannot run LiveKit health check.", file=sys.stderr)
+        return 1
+    try:
+        health = _run(
+            [bash, os.path.join(_LIVEKIT_DIR, "bin", "livekit-healthcheck")],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"ERROR: could not run LiveKit health check: {exc}", file=sys.stderr)
+        return 1
+    if getattr(health, "returncode", 1) != 0:
+        print("  health  : FAILED (inspect journalctl -u blueprint-livekit.service)", flush=True)
+        return 1
+    print("  health  : OK", flush=True)
+    return 0
+
+
 def _restart_runner_service(*, _run=subprocess.run) -> bool:
     """Restart the runner systemd service if it is installed and active.
 
@@ -1020,19 +1425,20 @@ def _restart_runner_service(*, _run=subprocess.run) -> bool:
     if shutil.which("systemctl") is None:
         return False
 
+    service_unit_name = _runner_service_unit_name()
     for system in (False, True):
         unit_path = _system_unit_path() if system else _user_unit_path()
         if not os.path.isfile(unit_path):
             continue
-        result = _systemctl(["is-active", SERVICE_UNIT_NAME], system=system, _run=_run)
+        result = _systemctl(["is-active", service_unit_name], system=system, _run=_run)
         if getattr(result, "returncode", 1) == 0:
             scope_label = "system" if system else "user"
             print(
-                f"[blueprint-runner] restarting {SERVICE_UNIT_NAME} "
+                f"[blueprint-runner] restarting {service_unit_name} "
                 f"({scope_label} scope)...",
                 flush=True,
             )
-            _systemctl(["restart", SERVICE_UNIT_NAME], system=system, _run=_run)
+            _systemctl(["restart", service_unit_name], system=system, _run=_run)
             return True
     return False
 
@@ -1404,7 +1810,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(
-        dest="command", metavar="{start,check,install,uninstall,update,status}"
+        dest="command", metavar="{start,check,install,uninstall,update,status,livekit-preflight,livekit-install,livekit-reload,livekit-status}"
     )
     for name, help_text in (
         ("start", "Run the runner (blocks; Ctrl-C for graceful shutdown)."),
@@ -1418,6 +1824,10 @@ def build_parser() -> argparse.ArgumentParser:
         sub_parser.add_argument(
             "--url",
             help=f"Orchestrator base URL (default: {DEFAULT_ORCHESTRATOR_URL}).",
+        )
+        sub_parser.add_argument(
+            "--instance",
+            help="Isolated runner instance name (separate credentials, workspace, and service).",
         )
         sub_parser.add_argument(
             "--agent-image",
@@ -1475,6 +1885,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Orchestrator base URL to bake into the env file (default: {DEFAULT_ORCHESTRATOR_URL}).",
     )
     install_parser.add_argument(
+        "--instance",
+        help="Isolated runner instance name (separate credentials, workspace, and service).",
+    )
+    install_parser.add_argument(
         "--system",
         action="store_true",
         default=False,
@@ -1520,15 +1934,54 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Print the commands that would run, without touching the host.",
     )
+    uninstall_parser.add_argument(
+        "--instance",
+        help="Isolated runner instance name to uninstall.",
+    )
 
-    sub.add_parser(
+    for name, help_text in (
+        (
+            "livekit-preflight",
+            "Check the selected always-on Linux host role before installing LiveKit.",
+        ),
+        (
+            "livekit-install",
+            "Install the independent root-owned LiveKit system service (never a task).",
+        ),
+        (
+            "livekit-reload",
+            "Reload the checked-out LiveKit companion after ending active calls.",
+        ),
+        (
+            "livekit-status",
+            "Show the independent LiveKit system-service status.",
+        ),
+    ):
+        livekit_parser = sub.add_parser(name, help=help_text)
+        livekit_parser.add_argument(
+            "--system",
+            action="store_true",
+            default=False,
+            help="Operate on the root-owned system service (required for install/reload/status).",
+        )
+        livekit_parser.add_argument(
+            "--dry-run",
+            dest="dry_run",
+            action="store_true",
+            default=False,
+            help="Print the rendered unit and commands without touching the host.",
+        )
+
+    update_parser = sub.add_parser(
         "update",
         help="Update the local checkout and reinstall dependencies only when needed.",
     )
-    sub.add_parser(
+    update_parser.add_argument("--instance", help="Isolated runner instance name.")
+    status_parser = sub.add_parser(
         "status",
         help="Show runner process status from ~/.blueprint/status.json.",
     )
+    status_parser.add_argument("--instance", help="Isolated runner instance name.")
     return parser
 
 
@@ -1576,6 +2029,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
+    instance = getattr(args, "instance", None)
+    if instance:
+        os.environ["BLUEPRINT_RUNNER_INSTANCE"] = instance
+        try:
+            _runner_instance()
+        except ValueError as exc:
+            parser.error(str(exc))
+
     if args.command == "update":
         return _run_update_and_report()
 
@@ -1584,6 +2045,24 @@ def main(argv: list[str] | None = None) -> int:
             system=getattr(args, "system", False),
             dry_run=getattr(args, "dry_run", False),
         )
+
+    if args.command == "livekit-install":
+        return do_livekit_install(
+            system=getattr(args, "system", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+
+    if args.command == "livekit-reload":
+        return do_livekit_reload(
+            system=getattr(args, "system", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+
+    if args.command == "livekit-preflight":
+        return do_livekit_preflight(system=getattr(args, "system", False))
+
+    if args.command == "livekit-status":
+        return do_livekit_status(system=getattr(args, "system", False))
 
     if args.command == "status":
         return do_status()
