@@ -2233,27 +2233,40 @@ async def next_compute_job(
     if (job.polling_metadata or {}).get("container_image"):
         from app.orchestrator_runner_dispatch import (
             _container_image_min_free_disk_bytes,
+            _container_workspace_min_free_disk_bytes,
         )
         from app.runner_eligibility import (
             _runner_container_image_storage,
+            _runner_effective_workspace_disk_floor,
             _runner_has_free_disk,
         )
 
-        disk_floor = _container_image_min_free_disk_bytes()
-        if not _runner_has_free_disk(runner, disk_floor):
+        image_store_floor = _container_image_min_free_disk_bytes()
+        workspace_floor = _container_workspace_min_free_disk_bytes()
+        if not _runner_has_free_disk(
+            runner,
+            image_store_floor,
+            workspace_required_bytes=workspace_floor,
+        ):
             storage = _runner_container_image_storage(runner)
+            effective_workspace_floor = _runner_effective_workspace_disk_floor(
+                runner,
+                image_store_floor,
+                workspace_required_bytes=workspace_floor,
+            )
             logger.warning(
                 "[RUNNERS] Not dispatching container-image compute job %s to runner "
                 "%s: workspace_free_bytes=%s, image_store_free_bytes=%s, "
-                "runtime=%s, path=%s; below the %s-byte fit floor; leaving STARTING "
-                "for re-dispatch",
+                "runtime=%s, path=%s; required workspace=%s bytes and image "
+                "store=%s bytes; leaving STARTING for re-dispatch",
                 job.id,
                 runner.id,
                 storage["workspace_free_bytes"],
                 storage["image_store_free_bytes"],
                 storage["image_store_runtime"],
                 storage["image_store_path"],
-                disk_floor,
+                effective_workspace_floor,
+                image_store_floor,
             )
             response.status_code = status.HTTP_204_NO_CONTENT
             return response

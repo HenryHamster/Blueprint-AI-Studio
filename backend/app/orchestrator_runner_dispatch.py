@@ -384,12 +384,13 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_agent_available,
     _runner_at_capacity,
     _runner_at_compute_capacity,
+    _runner_container_image_storage,
+    _runner_effective_workspace_disk_floor,
     _runner_gpu_capable,
     _runner_gpu_in_container_capable,
     _runner_gpu_passthrough_blocker,
     _runner_handles_task_type,
     _runner_has_container_capability,
-    _runner_container_image_storage,
     _runner_has_free_disk,
     _runner_has_free_vram,
     _runner_has_project_verification,
@@ -405,10 +406,12 @@ from app.runner_eligibility import (  # noqa: F401
 # wasting the claim. This is a DISPATCH-FIT floor distinct from the (smaller)
 # ``_RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT`` alert threshold — the alert warns
 # an operator, this gate keeps a doomed job from ever being claimed. Overridable
-# via runtime_config ``container_image_min_free_disk_bytes``. Absent
+# via runtime_config ``container_image_min_free_disk_bytes``.
 # Missing workspace/image-store telemetry is treated as eligible (backward
-# compatible); when reported, both filesystems must satisfy the floor.
+# compatible). When reported, the image store must clear the pull floor while
+# the workspace clears its smaller checkout/artifact reserve.
 _CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT = 10_737_418_240  # 10 GiB
+_CONTAINER_WORKSPACE_MIN_FREE_DISK_BYTES_DEFAULT = 2_147_483_648  # 2 GiB
 
 
 def _container_image_min_free_disk_bytes() -> int:
@@ -422,6 +425,27 @@ def _container_image_min_free_disk_bytes() -> int:
         )
     except (TypeError, ValueError):
         return _CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT
+
+
+def _container_workspace_min_free_disk_bytes() -> int:
+    """Workspace reserve, preserving the legacy single-floor override."""
+    try:
+        if "container_workspace_min_free_disk_bytes" not in _runtime_config:
+            # Before split-volume telemetry, the image floor governed the only
+            # known filesystem. Preserve an explicitly configured legacy value
+            # (including zero) until an operator sets the new workspace key.
+            if "container_image_min_free_disk_bytes" in _runtime_config:
+                return max(
+                    0,
+                    int(_runtime_config["container_image_min_free_disk_bytes"]),
+                )
+            return _CONTAINER_WORKSPACE_MIN_FREE_DISK_BYTES_DEFAULT
+        return max(
+            0,
+            int(_runtime_config["container_workspace_min_free_disk_bytes"]),
+        )
+    except (TypeError, ValueError):
+        return _CONTAINER_WORKSPACE_MIN_FREE_DISK_BYTES_DEFAULT
 
 
 async def _load_active_runners_cache(
@@ -1149,19 +1173,37 @@ async def _diagnose_strict_runner_pin_hold(
                 "runner advertises no container isolation backend",
             )
         if container_image:
-            disk_floor = _container_image_min_free_disk_bytes()
-            if not _runner_has_free_disk(snapshot, disk_floor):
+            image_store_floor = _container_image_min_free_disk_bytes()
+            workspace_floor = _container_workspace_min_free_disk_bytes()
+            if not _runner_has_free_disk(
+                snapshot,
+                image_store_floor,
+                workspace_required_bytes=workspace_floor,
+            ):
                 storage = _runner_container_image_storage(snapshot)
+                effective_workspace_floor = _runner_effective_workspace_disk_floor(
+                    snapshot,
+                    image_store_floor,
+                    workspace_required_bytes=workspace_floor,
+                )
                 runtime = storage["image_store_runtime"] or "container"
                 image_path = storage["image_store_path"] or "unknown path"
+                legacy_detail = (
+                    "; no separate image-store telemetry is available, so the "
+                    "legacy workspace/disk measurement must also clear the "
+                    f"{image_store_floor}-byte image-pull floor"
+                    if storage["image_store_free_bytes"] is None
+                    else ""
+                )
                 return (
                     "insufficient_disk",
                     f"job declares container_image {container_image!r} (a multi-GB "
                     "image pull) but the runner has "
                     f"workspace_free_bytes={storage['workspace_free_bytes']} and "
                     f"{runtime}_image_store_free_bytes="
-                    f"{storage['image_store_free_bytes']} at {image_path}; both known "
-                    f"filesystems must clear the {disk_floor}-byte fit floor",
+                    f"{storage['image_store_free_bytes']} at {image_path}; workspace "
+                    f"must clear {effective_workspace_floor} bytes and image store "
+                    f"must clear {image_store_floor} bytes{legacy_detail}",
                 )
         if min_compute_capability and not _runner_meets_min_compute_capability(
             snapshot, min_compute_capability
@@ -1373,8 +1415,17 @@ def _select_eligible_runner(
             # the job holds for a runner that can fit it (or the cloud backend)
             # instead of dying mid-pull. Runners that do not report
             # disk_free_bytes are not gated (backward compatible).
-            disk_floor = _container_image_min_free_disk_bytes()
-            out = [r for r in out if _runner_has_free_disk(r, disk_floor)]
+            image_store_floor = _container_image_min_free_disk_bytes()
+            workspace_floor = _container_workspace_min_free_disk_bytes()
+            out = [
+                r
+                for r in out
+                if _runner_has_free_disk(
+                    r,
+                    image_store_floor,
+                    workspace_required_bytes=workspace_floor,
+                )
+            ]
         if _job_requires_gpu_in_container(accelerator, container_image, vram_gb):
             # Combined gate: when a container image is required AND the job asks
             # for a GPU (an explicit accelerator OR a positive vram_gb GPU-memory
@@ -2211,10 +2262,15 @@ async def _dispatch_compute_experiment_directly(
     # container-runner hold stamp so the existing bounded-wait sweep covers it.
     if runner is None and container_image:
         project_runners = active_runners_cache.get(task.project_id) or []
-        disk_floor = _container_image_min_free_disk_bytes()
+        image_store_floor = _container_image_min_free_disk_bytes()
+        workspace_floor = _container_workspace_min_free_disk_bytes()
         disk_blocked = any(
             _runner_has_container_capability(r)
-            and not _runner_has_free_disk(r, disk_floor)
+            and not _runner_has_free_disk(
+                r,
+                image_store_floor,
+                workspace_required_bytes=workspace_floor,
+            )
             for r in project_runners
         )
         if disk_blocked:
@@ -2222,10 +2278,14 @@ async def _dispatch_compute_experiment_directly(
                 "Waiting for a runner with enough capacity: job declares "
                 f"container_image={container_image!r} (a multi-GB image pull) but "
                 "every container-capable runner reports workspace or container "
-                "image-store capacity below the "
-                f"{disk_floor}-byte fit floor. A low Docker image store triggers "
+                "image-store capacity below its reserve "
+                f"(workspace={workspace_floor} bytes, "
+                f"image_store={image_store_floor} bytes). "
+                "Without separate image-store telemetry, the legacy workspace/disk "
+                "measurement must clear the image-store floor. "
+                "A low Docker image store triggers "
                 "stale-image cleanup on the runner; the job will claim after both "
-                "known filesystems clear the floor."
+                "known filesystems clear their respective floors."
             )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None
@@ -2272,7 +2332,8 @@ async def _dispatch_compute_experiment_directly(
         # _select_eligible_runner; the passthrough and later VRAM/architecture
         # gates remain outside this subset because this branch diagnoses the
         # missing passthrough prerequisite specifically.
-        disk_floor = _container_image_min_free_disk_bytes()
+        image_store_floor = _container_image_min_free_disk_bytes()
+        workspace_floor = _container_workspace_min_free_disk_bytes()
         pre_passthrough_eligible = [
             r
             for r in project_runners
@@ -2282,7 +2343,11 @@ async def _dispatch_compute_experiment_directly(
             )
             and (not accelerator or _runner_gpu_capable(r))
             and _runner_has_container_capability(r)
-            and _runner_has_free_disk(r, disk_floor)
+            and _runner_has_free_disk(
+                r,
+                image_store_floor,
+                workspace_required_bytes=workspace_floor,
+            )
         ]
         # Capacity is deliberately excluded from this companion subset. A full
         # runner with functional proof demonstrates that the fleet CAN satisfy
@@ -2296,7 +2361,11 @@ async def _dispatch_compute_experiment_directly(
             if _runner_handles_task_type(r, "compute_experiment")
             and (not accelerator or _runner_gpu_capable(r))
             and _runner_has_container_capability(r)
-            and _runner_has_free_disk(r, disk_floor)
+            and _runner_has_free_disk(
+                r,
+                image_store_floor,
+                workspace_required_bytes=workspace_floor,
+            )
         ]
         gpu_in_container_blocked = any(
             not _runner_gpu_in_container_capable(r)
