@@ -57,6 +57,18 @@ describe('writeStrategicHelpers', () => {
     expect(fs.existsSync(`${testWorkspace}/compute-image`)).toBe(true);
   });
 
+  it('binds every Resident strategic mutation to its process incarnation', () => {
+    const incarnation = '00000000-0000-0000-0000-000000000733';
+    writeStrategicHelpers('task', 'project', testWorkspace, {
+      residentIncarnationId: incarnation,
+    });
+    const script = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+
+    expect(script).toContain(
+      `,"resident_incarnation_id":"${incarnation}"`,
+    );
+  });
+
   it('keeps compute-image build requests short and non-polling', () => {
     writeStrategicHelpers('task', 'project', testWorkspace);
     const script = fs.readFileSync(`${testWorkspace}/compute-image`, 'utf-8');

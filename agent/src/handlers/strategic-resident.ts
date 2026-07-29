@@ -105,7 +105,7 @@ const MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES = 2;
 const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
-const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 60_000;
+const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 30_000;
 const CONVERSATION_CLAIM_LEASE_SECONDS = 90;
 const CONVERSATION_CLAIM_RENEW_MS = 15_000;
 export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
@@ -653,6 +653,7 @@ export async function handleStrategicResident(
     replyKeyPath: RESIDENT_REPLY_KEY_PATH,
     replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+    residentIncarnationId: residentProcessIncarnation,
   });
   provisionAmbientHelpers(taskId, WORKSPACE);
 
@@ -1492,6 +1493,7 @@ export async function handleStrategicResident(
     try {
       await apiPost('/api/agent/strategic', {
         task_id: taskId,
+        resident_incarnation_id: residentProcessIncarnation,
         op: 'create_message',
         data: {
           type: stagedReply.type,
@@ -1653,8 +1655,9 @@ export async function handleStrategicResident(
       if (exactExistingBatch) {
         const renewed = await heartbeat(false);
         if (renewed?.conversation_claim_held === true) return true;
-        rollbackPendingOperatorAdmission();
-        return false;
+        activeConversationClaimId = null;
+        activeConversationClaimMessageIds = [];
+        activeConversationClaimIncarnation = null;
       }
     }
     try {
@@ -2093,7 +2096,7 @@ export async function handleStrategicResident(
   };
   const livenessHeartbeat = async (): Promise<SessionHeartbeatResponse | null> => {
     const hb = await heartbeat(false);
-    lastLivenessHeartbeatAt = Date.now();
+    if (hb !== null) lastLivenessHeartbeatAt = Date.now();
     return hb;
   };
 
@@ -2792,6 +2795,7 @@ export async function handleStrategicResident(
             : `On it — working on ${msgs.length} messages (this may take a moment).`;
           apiPost('/api/agent/strategic', {
             task_id: taskId,
+            resident_incarnation_id: residentProcessIncarnation,
             op: 'create_message',
             data: {
               type: 'NOTE',
@@ -2819,7 +2823,10 @@ export async function handleStrategicResident(
           session.close();
         }
         await turnPromise;
-        if (stopReason !== 'conversation_claim_lost') {
+        if (
+          stopReason !== 'conversation_claim_lost'
+          && stopReason !== 'resident_incarnation_lost'
+        ) {
           stopReason = 'operator_turn_interrupted';
         }
         return 'stop';
@@ -2954,8 +2961,16 @@ export async function handleStrategicResident(
   };
 
   // ── Two-speed loop ──────────────────────────────────────────────────────────
+  // Do not start provider work or public-call dispatch until this exact process
+  // has won the backend incarnation CAS. A transport failure retries quickly;
+  // it is never treated as proof of authority.
+  while (authorityHeld) {
+    const initialHeartbeat = await livenessHeartbeat();
+    if (initialHeartbeat !== null) break;
+    await sleep(Math.min(cfg.messagePollMs, 1_000));
+  }
   try {
-    for (;;) {
+    for (; authorityHeld;) {
       // Guard: verify the workspace is still present before each turn. An
       // external event (OOM-kill, /tmp cleaner) can delete it mid-session.
       //
@@ -2988,6 +3003,7 @@ export async function handleStrategicResident(
             replyKeyPath: RESIDENT_REPLY_KEY_PATH,
             replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
             stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+            residentIncarnationId: residentProcessIncarnation,
           });
           provisionAmbientHelpers(taskId, WORKSPACE);
           residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
@@ -3486,8 +3502,10 @@ export async function handleStrategicResident(
       .join('; ') || null
     : null;
   try {
+    if (stopReason === 'resident_incarnation_lost') return;
     await persistAndPostStatus(taskId, {
       task_id: taskId,
+      resident_incarnation_id: residentProcessIncarnation,
       status,
       artifact_type: status === 'FAILED' ? 'ERROR_LOG' : 'RESEARCH_FINDINGS',
       ...(failureCategory ? { failure_category: failureCategory } : {}),

@@ -17,6 +17,7 @@ from unittest.mock import (
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
@@ -198,6 +199,74 @@ async def _make_resident_message_worker(
     db_session.add(project)
     await db_session.commit()
     return project, task
+
+
+@pytest.mark.asyncio
+async def test_stale_resident_process_cannot_mutate_or_post_terminal_status(
+    client: AsyncClient, db_session
+):
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    winner = uuid.UUID("00000000-0000-0000-0000-000000000755")
+    loser = uuid.UUID("00000000-0000-0000-0000-000000000766")
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["worker_incarnation_id"] = str(winner)
+    resident["worker_incarnation_expires_at"] = (
+        _utcnow() + timedelta(minutes=5)
+    ).isoformat()
+    project.vision = {
+        **project.vision,
+        "_resident_strategic_session": resident,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    mutation = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(loser),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "stale process must not write",
+                "idempotency_key": "stale-process-mutation",
+            },
+        },
+    )
+    assert mutation.status_code == 409
+
+    terminal = await client.post(
+        "/api/agent/status",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(loser),
+            "status": "FAILED",
+            "artifact_type": "ERROR_LOG",
+            "failure_category": "claude_code_failed",
+            "logs": "stale process must not terminate winner",
+        },
+    )
+    assert terminal.status_code == 409, terminal.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.content == "stale process must not write",
+            )
+        )
+    ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio

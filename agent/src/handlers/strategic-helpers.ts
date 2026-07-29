@@ -86,6 +86,7 @@ function generateStrategicScript(
     replyKeyPath?: string;
     replyReceiptPath?: string;
     stagedReplyPath?: string;
+    residentIncarnationId?: string;
   } = {},
 ): string {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
@@ -101,6 +102,12 @@ function generateStrategicScript(
     (replyPaths.stagedReplyPath
       ?? path.resolve(helperDir, '.resident-reply-staged-message.json')).replace(/\\/g, '/'),
   );
+  const residentIncarnationId = replyPaths.residentIncarnationId
+    ? shellEscapeDoubleQuoted(replyPaths.residentIncarnationId)
+    : '';
+  const residentIncarnationJson = residentIncarnationId
+    ? `,"resident_incarnation_id":"${residentIncarnationId}"`
+    : '';
   const caseBody = renderStrategicCaseBody();
   const helpText = renderStrategicHelp();
   const schemaCase = renderStrategicSchemaCase();
@@ -224,7 +231,7 @@ _call() {
     # write-token-expiry fix.
     _load_agent_token || return 1
     dump=$(mktemp)
-    response=$(printf '{"task_id":"%s","op":"%s","data":%s}' "$TASK" "$1" "$DATA" | \\
+    response=$(printf '{"task_id":"%s","op":"%s"${residentIncarnationJson},"data":%s}' "$TASK" "$1" "$DATA" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
         -X POST "$API/api/agent/strategic" \\
         -H "Content-Type: application/json" \\
@@ -1057,6 +1064,7 @@ export function writeStrategicHelpers(
     replyKeyPath?: string;
     replyReceiptPath?: string;
     stagedReplyPath?: string;
+    residentIncarnationId?: string;
   } = {},
 ): void {
   const strategicScript = generateStrategicScript(taskId, workspace, replyPaths);

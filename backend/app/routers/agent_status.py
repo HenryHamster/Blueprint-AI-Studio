@@ -1180,14 +1180,36 @@ async def update_agent_status(
     #   - the lock holder (post-commit) commits before its long GitHub calls
     #     (early-commit pattern at line ~1635), so the contention window is
     #     bounded to the few-ms early-commit phase, not the full post-commit
-    stmt = (
-        select(Task)
-        .where(
-            Task.id == payload.task_id,
-            Task.vm_instance_id == token.get("vm_instance_id"),
-        )
-        .with_for_update(skip_locked=True)
+    locked_resident_project: Project | None = None
+    if payload.resident_incarnation_id is not None:
+        resident_task = (
+            await session.execute(
+                select(Task).where(
+                    Task.id == payload.task_id,
+                    Task.vm_instance_id == token.get("vm_instance_id"),
+                )
+            )
+        ).scalars().first()
+        if (
+            resident_task is not None
+            and (resident_task.context or {}).get("_resident_session") is True
+        ):
+            # Resident terminal updates share the same authority boundary as
+            # heartbeats and strategic mutations. Lock Project before Task so a
+            # displaced process cannot race the winner's shared Task outcome.
+            locked_resident_project = (
+                await session.execute(
+                    select(Project)
+                    .where(Project.id == resident_task.project_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+    stmt = select(Task).where(
+        Task.id == payload.task_id,
+        Task.vm_instance_id == token.get("vm_instance_id"),
     )
+    stmt = stmt.with_for_update(skip_locked=locked_resident_project is None)
     result = await session.execute(stmt)
     task = result.scalars().first()
 
@@ -1238,6 +1260,29 @@ async def update_agent_status(
             detail="Task row locked, retry",
             headers={"Retry-After": "5"},
         )
+
+    if locked_resident_project is not None:
+        from app.strategic_resident_session import (
+            resident_worker_incarnation_is_current,
+        )
+
+        resident_context = task.context or {}
+        try:
+            worker_generation = int(
+                resident_context.get("_resident_worker_generation") or 1
+            )
+        except (TypeError, ValueError):
+            worker_generation = -1
+        if not resident_worker_incarnation_is_current(
+            locked_resident_project.vision,
+            task_id=task.id,
+            worker_generation=worker_generation,
+            incarnation_id=payload.resident_incarnation_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident process incarnation superseded",
+            )
 
     # F11: this handler holds a row lock until the early commit below, but it
     # also performs several SELECTs while preparing artifacts/retry metadata.

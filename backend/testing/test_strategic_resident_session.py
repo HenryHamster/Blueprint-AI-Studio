@@ -49,6 +49,8 @@ from app.strategic_resident_session import (
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
     _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
     acquire_resident_call_lease,
+    claim_resident_worker_incarnation,
+    legacy_resident_worker_incarnation,
     new_session_id,
     read_resident_session,
     resident_call_is_active,
@@ -68,6 +70,64 @@ from app.workbench_state import (
 
 
 TEST_USER_ID = "resident-lifecycle-user"
+
+
+def test_new_process_waits_for_bounded_legacy_incarnation_during_rollout():
+    task_id = uuid.uuid4()
+    now = datetime(2026, 7, 28, 12, 0, 0)
+    vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "session_id": "rolling-session",
+            "task_id": str(task_id),
+            "worker_generation": 1,
+        }
+    }
+    new_incarnation = uuid.uuid4()
+
+    assert (
+        claim_resident_worker_incarnation(
+            vision,
+            task_id=task_id,
+            worker_generation=1,
+            incarnation_id=new_incarnation,
+            now=now,
+        )
+        is None
+    )
+    resident = read_resident_session(vision)
+    assert resident["worker_incarnation_id"] == str(
+        legacy_resident_worker_incarnation(task_id, 1)
+    )
+    legacy_expiry = datetime.fromisoformat(
+        resident["worker_incarnation_expires_at"]
+    )
+    assert legacy_expiry > now
+
+    assert claim_resident_worker_incarnation(
+        vision,
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=None,
+        now=now + timedelta(seconds=30),
+    ) == legacy_resident_worker_incarnation(task_id, 1)
+    assert (
+        claim_resident_worker_incarnation(
+            vision,
+            task_id=task_id,
+            worker_generation=1,
+            incarnation_id=new_incarnation,
+            now=now + timedelta(seconds=31),
+        )
+        is None
+    )
+    assert claim_resident_worker_incarnation(
+        vision,
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=new_incarnation,
+        now=now + timedelta(seconds=211),
+    ) == new_incarnation
 
 
 async def _make_project(db_session) -> Project:
@@ -792,6 +852,15 @@ async def test_resident_heartbeat_fences_overlapping_process_incarnations(
     second_incarnation = uuid.UUID(
         "00000000-0000-0000-0000-000000000722"
     )
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident["worker_incarnation_id"] = str(first_incarnation)
+    resident["worker_incarnation_expires_at"] = (
+        _utcnow() + timedelta(minutes=5)
+    ).isoformat()
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
 
     project = await db_session.get(Project, project.id)
     first = await renew_resident_session_lease(

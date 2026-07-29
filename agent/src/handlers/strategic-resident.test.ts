@@ -1372,10 +1372,15 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
       return Promise.resolve(null);
     });
     const postOrder: string[] = [];
+    let heartbeatCount = 0;
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('heartbeat')) {
         postOrder.push('heartbeat');
-        return Promise.resolve({ authority_held: true, stop_requested: true });
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatCount > 1,
+        });
       }
       if (url.includes('strategic')) {
         if (body?.op === 'create_message') {
@@ -1405,7 +1410,11 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
     expect(heartbeatCalls.every(([, body]) =>
       !body || !('handled_message_ids' in body))).toBe(true);
     expect(recordOperatorDecisionCapture).toHaveBeenCalledWith('captured');
-    expect(postOrder.slice(0, 2)).toEqual(['create_message', 'heartbeat']);
+    expect(postOrder.slice(0, 3)).toEqual([
+      'heartbeat',
+      'create_message',
+      'heartbeat',
+    ]);
     const createCall = mockApiPost.mock.calls.find(([, body]) => body?.op === 'create_message');
     const replyData = createCall?.[1]?.data as Record<string, unknown> | undefined;
     const turnState = replyData?.resident_turn_state as Record<string, unknown> | undefined;
@@ -2763,9 +2772,14 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       }
       return Promise.resolve(null);
     });
+    let heartbeatCount = 0;
     mockApiPost.mockImplementation((url: string) => {
       if (url.includes('/heartbeat')) {
-        return Promise.resolve({ authority_held: false, stop_requested: true });
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: heartbeatCount === 1,
+          stop_requested: heartbeatCount > 1,
+        });
       }
       return Promise.resolve({});
     });
@@ -2790,6 +2804,78 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(session.sendTurn).toHaveBeenCalledTimes(1);
     expect(typeof input).toBe('string');
     expect(input).toEqual(expect.stringContaining(message.content));
+  });
+
+  it('retries a failed initial heartbeat before polling or starting provider work', async () => {
+    const events: string[] = [];
+    let delivered = false;
+    let heartbeatCount = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        events.push('poll');
+        if (!delivered) {
+          delivered = true;
+          return Promise.resolve({
+            messages: [{
+              id: 'msg-after-authority',
+              content: 'only answer after authority is proven',
+              created_at: new Date().toISOString(),
+              from_type: 'user',
+            }],
+          });
+        }
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/heartbeat')) {
+        heartbeatCount += 1;
+        events.push(`heartbeat-${heartbeatCount}`);
+        if (heartbeatCount === 1) {
+          return Promise.reject(new Error('transient admission failure'));
+        }
+        return Promise.resolve({
+          authority_held: heartbeatCount === 2,
+          stop_requested: heartbeatCount > 2,
+        });
+      }
+      if (body?.op === 'create_message') {
+        events.push('reply');
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => {
+        events.push('provider');
+        return Promise.resolve(turnResult({
+          sentOperatorMessage: true,
+          resultText: 'authority-gated reply',
+        }));
+      },
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-initial-authority',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-initial-authority' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(events.slice(0, 3)).toEqual([
+      'heartbeat-1',
+      'heartbeat-2',
+      'poll',
+    ]);
+    expect(events.indexOf('provider')).toBeGreaterThan(
+      events.indexOf('heartbeat-2'),
+    );
   });
 
   it('uses distinct immutable receipts when M2 arrives after atomic M1 reply', async () => {
@@ -2827,6 +2913,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       heartbeatResult: 'fail' | 'stop',
     ): Promise<MockSession> => {
       let delivered = false;
+      let heartbeatCount = 0;
       mockApiGet.mockImplementation((url: string) => {
         if (url.includes('/messages?') && !delivered) {
           delivered = true;
@@ -2837,6 +2924,10 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       });
       mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
         if (url.includes('/heartbeat')) {
+          heartbeatCount += 1;
+          if (heartbeatCount === 1) {
+            return Promise.resolve({ authority_held: true, stop_requested: false });
+          }
           heartbeatBodies.push(body ?? {});
           return heartbeatResult === 'fail'
             ? Promise.reject(new Error('heartbeat transport dropped after durable reply'))
@@ -2905,6 +2996,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       }
       return Promise.resolve(null);
     });
+    let heartbeatCount = 0;
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/messages/claim')) {
         claimBodies.push(body ?? {});
@@ -2923,7 +3015,11 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         return Promise.resolve({});
       }
       if (url.includes('/heartbeat')) {
-        return Promise.resolve({ authority_held: false, stop_requested: true });
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: heartbeatCount === 1,
+          stop_requested: heartbeatCount > 1,
+        });
       }
       return Promise.resolve({});
     });
@@ -3232,7 +3328,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       from_type: 'user',
     };
     let alive = true;
-    let claimCreated = false;
+    let claimCalls = 0;
     let claimRenewals = 0;
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/messages?')) {
@@ -3245,25 +3341,31 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     });
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/messages/claim')) {
-        claimCreated = true;
+        claimCalls += 1;
         return Promise.resolve({
-          claim_id: 'claim-expired-before-retry',
+          claim_id: `claim-expired-before-retry-${claimCalls}`,
           message_ids: [operatorMessage.id],
           lease_expires_at: '2026-07-21T20:01:30.000Z',
           attempt: 1,
+          incarnation_supported: true,
+          incarnation_id: body?.resident_incarnation_id,
         });
       }
       if (
         url.includes('/heartbeat')
-        && body?.conversation_claim_id === 'claim-expired-before-retry'
+        && body?.conversation_claim_id === 'claim-expired-before-retry-1'
       ) {
         claimRenewals += 1;
-        alive = false;
         return Promise.resolve({
-          authority_held: false,
-          stop_requested: true,
+          authority_held: true,
+          stop_requested: false,
           conversation_claim_held: false,
         });
+      }
+      if (body?.op === 'create_message') return Promise.resolve({});
+      if (url.includes('/heartbeat') && claimCalls >= 2) {
+        alive = false;
+        return Promise.resolve({ authority_held: false, stop_requested: true });
       }
       return Promise.resolve({ authority_held: true, stop_requested: false });
     });
@@ -3279,7 +3381,10 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     const replacementSession = makeSession(
       () => {
         replacementTurns += 1;
-        return Promise.resolve(turnResult({ sentOperatorMessage: false }));
+        return Promise.resolve(turnResult({
+          sentOperatorMessage: true,
+          resultText: 'reply after exact claim reacquisition',
+        }));
       },
       () => alive,
     );
@@ -3315,11 +3420,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       vi.useRealTimers();
     }
 
-    expect(claimCreated).toBe(true);
+    expect(claimCalls).toBe(2);
     expect(claimRenewals).toBe(1);
-    // The operator retry is withheld after the backend rejects the expired
-    // claim; no replacement provider turn is allowed to start.
-    expect(replacementTurns).toBe(0);
+    expect(replacementTurns).toBe(1);
   });
 
   it('preserves conversation_claim_lost as the terminal replacement cause', async () => {
@@ -3366,7 +3469,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
             sentOperatorMessage: true,
             resultText: 'must not be persisted',
           }));
-        }, 5_000);
+        }, 20_000);
       }),
       () => true,
     );
@@ -3385,7 +3488,12 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         { project_metadata: { project_id: 'proj-lost-durable-claim' }, context: {} },
         'ghtok', 'owner', 'repo', null, { value: '' },
       );
-      await vi.advanceTimersByTimeAsync(6_000);
+      let settled = false;
+      void handling.finally(() => { settled = true; });
+      for (let step = 0; step < 50 && !settled; step += 1) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      expect(settled).toBe(true);
       await handling;
     } finally {
       vi.clearAllTimers();
@@ -3430,7 +3538,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         heartbeatCount += 1;
         return Promise.resolve({
           authority_held: true,
-          stop_requested: heartbeatCount >= 11,
+          stop_requested: heartbeatCount >= 12,
         });
       }
       return Promise.resolve({});

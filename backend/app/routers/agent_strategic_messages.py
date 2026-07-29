@@ -234,6 +234,27 @@ async def create_finalized_call_transcript(
         ).scalar_one_or_none()
         if locked_project is None or _lease_actor(locked_project.vision) != actor_user_id:
             raise HTTPException(status_code=409, detail="Call lease superseded")
+        locked_task = (
+            await locked_session.execute(
+                select(Task)
+                .where(Task.id == payload.task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        locked_context = locked_task.context if locked_task is not None else {}
+        if (
+            locked_task is None
+            or locked_task.status != TaskStatus.IN_PROGRESS
+            or locked_context.get("_resident_session") is not True
+            or str(locked_context.get("strategic_session_id"))
+            != str(
+                (locked_project.vision or {})
+                .get("_resident_strategic_session", {})
+                .get("session_id")
+            )
+        ):
+            raise HTTPException(status_code=409, detail="Resident task is no longer live")
         return await bind_resident_call_input_to_locked_project(
             locked_session,
             locked_project,
@@ -473,6 +494,14 @@ async def complete_call_turn(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
+    locked_task = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == payload.task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     from app.strategic_resident_session import (
         read_resident_call,
         resident_call_is_active,
@@ -482,6 +511,9 @@ async def complete_call_turn(
     call = read_resident_call(locked_project.vision if locked_project else None)
     if (
         locked_project is None
+        or locked_task is None
+        or locked_task.status != TaskStatus.IN_PROGRESS
+        or (locked_task.context or {}).get("_resident_session") is not True
         or not resident_call_is_active(call)
         or str((call or {}).get("call_id")) != payload.call_id
         or int((call or {}).get("generation") or 0) != payload.call_generation
@@ -508,6 +540,9 @@ async def complete_call_turn(
     ).scalar_one_or_none()
     if existing is not None:
         context = existing.context if isinstance(existing.context, dict) else {}
+        expected_covered_ids = sorted(
+            str(message_id) for message_id in payload.covered_message_ids
+        )
         if (
             existing.from_type != "strategic"
             or existing.from_task_id != payload.task_id
@@ -515,6 +550,10 @@ async def complete_call_turn(
             or context.get("call_id") != payload.call_id
             or int(context.get("call_generation") or 0) != payload.call_generation
             or int(context.get("input_revision") or 0) != payload.input_revision
+            or context.get("_resident_reply_covered_message_ids")
+            != expected_covered_ids
+            or context.get("exact_text") != (payload.exact_text or None)
+            or (context.get("display_blocks") or []) != normalized_blocks
         ):
             raise HTTPException(status_code=409, detail="idempotency_key already belongs to a different message")
         return {"id": str(existing.id), "status": "duplicate", "input_revision": payload.input_revision}

@@ -1080,6 +1080,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
+    resident_incarnation_id: uuid.UUID | None = None
     # The accepted op vocabulary is the canonical registry mirrored in
     # app/strategic_ops_manifest.json (single source of truth for the ./strategic
     # CLI and this dispatch chain). test_strategic_ops_registry.py
@@ -1181,6 +1182,21 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=409,
                 detail="Resident worker generation superseded",
+            )
+
+        from app.strategic_resident_session import (
+            resident_worker_incarnation_is_current,
+        )
+
+        if not resident_worker_incarnation_is_current(
+            project.vision,
+            task_id=task.id,
+            worker_generation=task_generation,
+            incarnation_id=payload.resident_incarnation_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Resident process incarnation superseded",
             )
 
         await _enforce_resident_mutation_fence(session, project, task, payload.op)

@@ -119,7 +119,7 @@ _RESIDENT_CALL_USAGE_LIMITS = {
     "output_characters": 20_000_000,
     "provider_errors": 100_000,
 }
-_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS = 90
+_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS = 180
 
 # ``Project.vision`` key holding the reason the *last* Workday auto-start was
 # blocked or failed (surfaced by the strategic read model so the operator sees
@@ -451,20 +451,33 @@ def claim_resident_worker_incarnation(
         worker_generation,
     )
     recorded_raw = resident.get("worker_incarnation_id")
+    legacy_incarnation = legacy_resident_worker_incarnation(
+        task_id,
+        worker_generation,
+    )
     try:
         recorded = (
             uuid.UUID(str(recorded_raw))
             if recorded_raw
-            else legacy_resident_worker_incarnation(
-                task_id,
-                worker_generation,
-            )
+            else legacy_incarnation
         )
     except (TypeError, ValueError, AttributeError):
         return None
     expires_at = _parse_iso_naive(
         resident.get("worker_incarnation_expires_at")
     )
+    # During a rolling deploy an old Agent can still be inside a provider turn.
+    # Materialize one bounded lease for its deterministic legacy identity before
+    # allowing a random new-process identity to take over.
+    if recorded_raw is None and expires_at is None and requested != legacy_incarnation:
+        updated = dict(resident)
+        updated["worker_incarnation_id"] = str(legacy_incarnation)
+        updated["worker_incarnation_expires_at"] = (
+            current_now
+            + timedelta(seconds=_RESIDENT_WORKER_INCARNATION_LEASE_SECONDS)
+        ).isoformat()
+        vision[RESIDENT_SESSION_KEY] = updated
+        return None
     if (
         recorded != requested
         and expires_at is not None
