@@ -107,6 +107,7 @@ const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
 const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 30_000;
 const RESIDENT_LEGACY_ADMISSION_MAX_MS = 180_000;
+const RESIDENT_ADMISSION_TRANSPORT_MAX_MS = 60_000;
 const CONVERSATION_CLAIM_LEASE_SECONDS = 90;
 const CONVERSATION_CLAIM_RENEW_MS = 15_000;
 export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
@@ -626,24 +627,37 @@ export async function handleStrategicResident(
   // this early CAS, a losing overlap can overwrite the winner's ./messages and
   // ./strategic bindings with loser-specific receipt paths/incarnation.
   let initialAuthorityAdmission: SessionHeartbeatResponse | null = null;
+  let initialAuthorityAdmissionAt = 0;
   const legacyAdmissionDeadline = Date.now() + RESIDENT_LEGACY_ADMISSION_MAX_MS;
+  let admissionTransportFailureStartedAt: number | null = null;
+  const admissionPath = `/api/agent/projects/${projectId}/strategic-session/heartbeat`;
+  const admissionBody = {
+    session_id: sessionId,
+    task_id: taskId,
+    progress: false,
+    worker_generation: workerGeneration,
+    resident_incarnation_id: residentProcessIncarnation,
+  };
+  const admissionErrorIsTerminal = (error: unknown): boolean => {
+    const message = String(error);
+    return /\((401|409)\)/.test(message)
+      || /no longer active|session\/task\/generation mismatch/i.test(message);
+  };
+  const cleanupUnadmittedRuntime = (): void => {
+    try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
+  };
   for (;;) {
     try {
       const admission = await apiPost(
-        `/api/agent/projects/${projectId}/strategic-session/heartbeat`,
-        {
-          session_id: sessionId,
-          task_id: taskId,
-          progress: false,
-          worker_generation: workerGeneration,
-          resident_incarnation_id: residentProcessIncarnation,
-        },
+        admissionPath,
+        admissionBody,
         HEARTBEAT_API_MAX_RETRIES,
         HEARTBEAT_API_TIMEOUT,
       ) as SessionHeartbeatResponse;
+      admissionTransportFailureStartedAt = null;
       if (admission.admission_status === 'legacy_grace') {
         if (Date.now() >= legacyAdmissionDeadline) {
-          try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
+          cleanupUnadmittedRuntime();
           return;
         }
         const retryMs = typeof admission.retry_after_seconds === 'number'
@@ -659,12 +673,25 @@ export async function handleStrategicResident(
         admission.resident_incarnation_held === false
         || admission.stop_requested
       ) {
-        try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
+        cleanupUnadmittedRuntime();
         return;
       }
       initialAuthorityAdmission = admission;
+      initialAuthorityAdmissionAt = Date.now();
       break;
-    } catch {
+    } catch (error) {
+      if (admissionErrorIsTerminal(error)) {
+        cleanupUnadmittedRuntime();
+        return;
+      }
+      admissionTransportFailureStartedAt ??= Date.now();
+      if (
+        Date.now() - admissionTransportFailureStartedAt
+        >= RESIDENT_ADMISSION_TRANSPORT_MAX_MS
+      ) {
+        cleanupUnadmittedRuntime();
+        return;
+      }
       await sleep(1_000);
     }
   }
@@ -1214,6 +1241,55 @@ export async function handleStrategicResident(
       allowedTools: [RESIDENT_REPLY_TOOL_NAME, 'mcp__call__emit_call_packet'],
     },
   });
+
+  // Clone/tool setup can exceed the process lease. Re-CAS immediately before
+  // provider launch so an expired starter cannot race a replacement process.
+  const initialLeaseExpiry = Date.parse(
+    String(initialAuthorityAdmission?.leased_until ?? ''),
+  );
+  const launchProofNeedsRenewal = (
+    Date.now() - initialAuthorityAdmissionAt >= RESIDENT_LIVENESS_HEARTBEAT_MAX_MS
+    || (
+      Number.isFinite(initialLeaseExpiry)
+      && initialLeaseExpiry - Date.now() <= RESIDENT_LIVENESS_HEARTBEAT_MAX_MS
+    )
+  );
+  if (launchProofNeedsRenewal) {
+    let launchAdmissionFailureStartedAt: number | null = null;
+    for (;;) {
+      try {
+        const launchAdmission = await apiPost(
+          admissionPath,
+          admissionBody,
+          HEARTBEAT_API_MAX_RETRIES,
+          HEARTBEAT_API_TIMEOUT,
+        ) as SessionHeartbeatResponse;
+        if (
+          launchAdmission.resident_incarnation_held === false
+          || launchAdmission.stop_requested
+        ) {
+          cleanupUnadmittedRuntime();
+          return;
+        }
+        initialAuthorityAdmission = launchAdmission;
+        break;
+      } catch (error) {
+        if (admissionErrorIsTerminal(error)) {
+          cleanupUnadmittedRuntime();
+          return;
+        }
+        launchAdmissionFailureStartedAt ??= Date.now();
+        if (
+          Date.now() - launchAdmissionFailureStartedAt
+          >= RESIDENT_ADMISSION_TRANSPORT_MAX_MS
+        ) {
+          cleanupUnadmittedRuntime();
+          return;
+        }
+        await sleep(1_000);
+      }
+    }
+  }
   let session: ResidentSession = startResidentClaudeSession({
     ...residentSessionOptions(),
   });

@@ -2365,6 +2365,100 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       String(message).includes('ended'))).toBe(false);
   });
 
+  it.each([
+    'heartbeat failed (401): task no longer active',
+    'heartbeat failed (409): Heartbeat session/task/generation mismatch',
+  ])('exits silently on terminal initial admission error: %s', async (errorMessage) => {
+    mockWriteMessagesHelper.mockClear();
+    mockWriteStrategicHelpers.mockClear();
+    mockPrepareWorkspaceForRole.mockClear();
+    vi.mocked(persistAndPostStatus).mockClear();
+    mockApiPost.mockRejectedValue(new Error(errorMessage));
+    const statusRef = { value: 'replacement remains active' };
+
+    await handleStrategicResident(
+      'task-terminal-admission',
+      { strategic_session_id: 'terminal-admission-session' },
+      {
+        project_metadata: { project_id: 'proj-terminal-admission' },
+        context: {
+          strategic_session_id: 'terminal-admission-session',
+          _resident_worker_generation: 1,
+        },
+      },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+
+    expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
+    expect(mockWriteMessagesHelper).not.toHaveBeenCalled();
+    expect(mockWriteStrategicHelpers).not.toHaveBeenCalled();
+    expect(mockStartSession).not.toHaveBeenCalled();
+    expect(persistAndPostStatus).not.toHaveBeenCalled();
+    expect(statusRef.value).toBe('replacement remains active');
+  });
+
+  it('bounds repeated transport failures during initial admission', async () => {
+    vi.useFakeTimers();
+    mockApiPost.mockRejectedValue(new Error('temporary gateway outage'));
+    const handling = handleStrategicResident(
+      'task-admission-outage',
+      { strategic_session_id: 'admission-outage-session' },
+      {
+        project_metadata: { project_id: 'proj-admission-outage' },
+        context: { strategic_session_id: 'admission-outage-session' },
+      },
+      'ghtok', 'owner', 'repo', null, { value: 'not admitted' },
+    );
+
+    await vi.advanceTimersByTimeAsync(60_001);
+    await handling;
+
+    expect(mockApiPost.mock.calls.length).toBeGreaterThan(1);
+    expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
+    expect(mockStartSession).not.toHaveBeenCalled();
+  });
+
+  it('revalidates an authority proof that ages out during workspace preparation', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T12:00:00Z'));
+    vi.mocked(persistAndPostStatus).mockClear();
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation(() => {
+      heartbeatCount += 1;
+      if (heartbeatCount === 1) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+          stop_requested: false,
+        });
+      }
+      return Promise.resolve({
+        authority_held: false,
+        resident_incarnation_held: false,
+        stop_requested: true,
+      });
+    });
+    mockPrepareWorkspaceForRole.mockImplementationOnce(async () => {
+      vi.setSystemTime(new Date(Date.now() + 181_000));
+    });
+    const statusRef = { value: 'preparing' };
+
+    await handleStrategicResident(
+      'task-slow-provision',
+      { strategic_session_id: 'slow-provision-session' },
+      {
+        project_metadata: { project_id: 'proj-slow-provision' },
+        context: { strategic_session_id: 'slow-provision-session' },
+      },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+
+    expect(heartbeatCount).toBe(2);
+    expect(mockStartSession).not.toHaveBeenCalled();
+    expect(persistAndPostStatus).not.toHaveBeenCalled();
+    expect(statusRef.value).not.toBe('Resident strategic session ended');
+  });
+
   it('waits through retryable legacy grace without publishing loser helpers', async () => {
     vi.useFakeTimers();
     mockWriteMessagesHelper.mockClear();
