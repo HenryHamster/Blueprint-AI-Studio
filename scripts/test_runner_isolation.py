@@ -1388,9 +1388,15 @@ class TestProjectVerificationProbe(unittest.TestCase):
         self.assertEqual(report["probes"]["ruff"]["exit_code"], 0)
         self.assertEqual(report["probes"]["docker_postgres"]["exit_code"], 0)
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            plan.env["PATH"].split(":")[0],
+            os.path.join(iso.PROJECT_VERIFICATION_VENV, "bin"),
+        )
         for call in run.call_args_list:
             argv = call.args[0]
             self.assertIn(iso.PROJECT_VERIFICATION_VENV, argv)
+            self.assertIn("/etc/passwd", argv)
+            self.assertIn("/etc/group", argv)
             self.assertNotIn("/var/run/docker.sock", argv)
             self.assertNotIn("/run/docker.sock", argv)
 
