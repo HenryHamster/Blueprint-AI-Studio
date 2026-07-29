@@ -101,6 +101,8 @@ export interface SessionHeartbeatResponse {
   conversation_claim_held?: boolean;
   resident_incarnation_held?: boolean;
   resident_incarnation_id?: string;
+  admission_status?: 'legacy_grace';
+  retry_after_seconds?: number;
   /** Monotonic marker over strategist-relevant change sources (task transitions,
    *  operator messages, direction/cycle mutations). State-gated pacing fires an
    *  autonomous turn when this differs from the rev recorded at the last turn.

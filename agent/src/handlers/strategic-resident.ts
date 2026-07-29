@@ -596,6 +596,78 @@ export async function handleStrategicResident(
   } = replyRuntime;
   fs.mkdirSync(replyRuntime.runtimeDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(replyRuntime.runtimeDir, 0o700);
+  const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
+  const projectId = strVal(projectMetadata?.project_id);
+  const ctx = task.context && typeof task.context === 'object'
+    ? task.context as Record<string, unknown>
+    : {};
+  const sessionId = strVal(ctx.strategic_session_id)
+    || strVal(payload.strategic_session_id)
+    || taskId;
+  const workerGenerationRaw = Number(ctx._resident_worker_generation);
+  const workerGeneration = Number.isSafeInteger(workerGenerationRaw) && workerGenerationRaw > 0
+    ? workerGenerationRaw : 1;
+
+  if (!projectId) {
+    sendLog(ws, '[resident] ERROR: no project_id in task.project_metadata — cannot poll/heartbeat.\n');
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      resident_incarnation_id: residentProcessIncarnation,
+      status: 'FAILED',
+      artifact_type: 'ERROR_LOG',
+      failure_category: 'claude_code_failed',
+      logs: 'Resident strategic session could not resolve project_id.',
+    });
+    return;
+  }
+
+  // Win process authority before touching any shared-workspace helper. Without
+  // this early CAS, a losing overlap can overwrite the winner's ./messages and
+  // ./strategic bindings with loser-specific receipt paths/incarnation.
+  let initialAuthorityAdmission: SessionHeartbeatResponse | null = null;
+  for (;;) {
+    try {
+      const admission = await apiPost(
+        `/api/agent/projects/${projectId}/strategic-session/heartbeat`,
+        {
+          session_id: sessionId,
+          task_id: taskId,
+          progress: false,
+          worker_generation: workerGeneration,
+          resident_incarnation_id: residentProcessIncarnation,
+        },
+        HEARTBEAT_API_MAX_RETRIES,
+        HEARTBEAT_API_TIMEOUT,
+      ) as SessionHeartbeatResponse;
+      if (admission.admission_status === 'legacy_grace') {
+        const retryMs = typeof admission.retry_after_seconds === 'number'
+          ? Math.min(
+            30_000,
+            Math.max(1_000, admission.retry_after_seconds * 1_000),
+          )
+          : 5_000;
+        await sleep(retryMs);
+        continue;
+      }
+      if (
+        admission.resident_incarnation_held === false
+        || admission.stop_requested
+        || admission.authority_held === false
+      ) {
+        try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
+        return;
+      }
+      initialAuthorityAdmission = admission;
+      break;
+    } catch (error) {
+      sendLog(
+        ws,
+        `[resident] initial authority check failed; retrying: ${sanitize(String(error))}\n`,
+      );
+      await sleep(1_000);
+    }
+  }
+
   statusRef.value = 'Starting resident strategic session...';
   sendLog(ws, 'Resident strategic session starting...\n');
 
@@ -647,8 +719,6 @@ export async function handleStrategicResident(
   const disallowedTools = configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
   const contextPrefix = buildContextPrefix(task);
 
-  const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
-  const projectId = strVal(projectMetadata?.project_id);
   writeStrategicHelpers(taskId, projectId, WORKSPACE, {
     replyKeyPath: RESIDENT_REPLY_KEY_PATH,
     replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
@@ -656,26 +726,6 @@ export async function handleStrategicResident(
     residentIncarnationId: residentProcessIncarnation,
   });
   provisionAmbientHelpers(taskId, WORKSPACE);
-
-  const ctx = task.context && typeof task.context === 'object'
-    ? task.context as Record<string, unknown>
-    : {};
-  const sessionId = strVal(ctx.strategic_session_id)
-    || strVal(payload.strategic_session_id)
-    || taskId;
-  const workerGenerationRaw = Number(ctx._resident_worker_generation);
-  const workerGeneration = Number.isSafeInteger(workerGenerationRaw) && workerGenerationRaw > 0
-    ? workerGenerationRaw : 1;
-
-  if (!projectId) {
-    sendLog(ws, '[resident] ERROR: no project_id in task.project_metadata — cannot poll/heartbeat.\n');
-    await persistAndPostStatus(taskId, {
-      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-      failure_category: 'claude_code_failed',
-      logs: 'Resident strategic session could not resolve project_id.',
-    });
-    return;
-  }
 
   // ── Bootstrap context (delivered on the FIRST turn, retained in-session) ────
   const vision = payload.vision as Record<string, unknown> | undefined;
@@ -1813,6 +1863,46 @@ export async function handleStrategicResident(
     return 'continue';
   };
 
+  const applyHeartbeatResponse = (resp: SessionHeartbeatResponse): void => {
+    if (resp.resident_incarnation_id === residentProcessIncarnation) {
+      conversationIncarnationSupported = true;
+    }
+    if (resp.resident_incarnation_held === false) {
+      stopReason = 'resident_incarnation_lost';
+      authorityHeld = false;
+    }
+    if (Object.prototype.hasOwnProperty.call(resp, 'call')) {
+      const callControl = resp as SessionHeartbeatResponse & {
+        call?: unknown;
+        call_transport?: unknown;
+      };
+      callCoordinator.updateControlProjection(
+        parseCallLeaseProjection(callControl.call),
+        parseCallTransportProjection(callControl.call_transport),
+      );
+      reconcileCallLifecycle();
+    }
+    authorityHeld = nextAuthorityHeld(authorityHeld, resp);
+    if (typeof resp.work_state_rev === 'string') {
+      currentWorkStateRev = resp.work_state_rev;
+    }
+    if (Array.isArray(resp.fired_watches)) {
+      firedStrategicWatches = resp.fired_watches.filter(
+        (watch): watch is StrategicWatchReceipt => typeof watch.id === 'string',
+      );
+    }
+    if (Array.isArray(resp.active_direction_ids)) {
+      surfaceCatalog = refreshSurfaceCatalog(
+        surfaceCatalog,
+        resp.active_direction_ids,
+        payload,
+      );
+    }
+    if (Array.isArray(resp.direction_grounding)) {
+      refreshedDirectionGrounding = resp.direction_grounding;
+    }
+  };
+
   // progress=true renews the authority lease (applied op / operator interaction);
   // progress=false is bare liveness (keeps the session fresh for the reaper only).
   // handledIds: message ids consumed by the resident turn — marked handled on the
@@ -1906,43 +1996,7 @@ export async function handleStrategicResident(
         HEARTBEAT_API_MAX_RETRIES,
         HEARTBEAT_API_TIMEOUT,
       ) as SessionHeartbeatResponse;
-      if (resp.resident_incarnation_id === residentProcessIncarnation) {
-        conversationIncarnationSupported = true;
-      }
-      if (resp.resident_incarnation_held === false) {
-        stopReason = 'resident_incarnation_lost';
-        authorityHeld = false;
-      }
-      if (Object.prototype.hasOwnProperty.call(resp, 'call')) {
-        const callControl = resp as SessionHeartbeatResponse & { call?: unknown; call_transport?: unknown };
-        callCoordinator.updateControlProjection(
-          parseCallLeaseProjection(callControl.call),
-          parseCallTransportProjection(callControl.call_transport),
-        );
-        reconcileCallLifecycle();
-      }
-      // Fold the lease state so the loop's autonomous gate tracks the backend.
-      authorityHeld = nextAuthorityHeld(authorityHeld, resp);
-      // Track the work-state revision (when the backend ships it) so state-gated
-      // pacing can fire on a real world change; absence leaves it null (floor tick).
-      if (typeof resp.work_state_rev === 'string') currentWorkStateRev = resp.work_state_rev;
-      if (Array.isArray(resp.fired_watches)) {
-        firedStrategicWatches = resp.fired_watches.filter(
-          (watch): watch is StrategicWatchReceipt =>
-            typeof watch.id === 'string',
-        );
-      }
-      // Refresh the surface catalog from the backend's live direction list so
-      // newly created or retired directions enter/leave the rotation mid-session.
-      if (Array.isArray(resp.active_direction_ids)) {
-        surfaceCatalog = refreshSurfaceCatalog(surfaceCatalog, resp.active_direction_ids, payload);
-      }
-      // Refresh direction grounding from the heartbeat so compaction
-      // checkpoints receive live direction text/status rather than the
-      // session-start snapshot baked into directionsSummary.
-      if (Array.isArray(resp.direction_grounding)) {
-        refreshedDirectionGrounding = resp.direction_grounding;
-      }
+      applyHeartbeatResponse(resp);
       return resp;
     } catch (e) {
       const msg = String(e);
@@ -2964,10 +3018,9 @@ export async function handleStrategicResident(
   // Do not start provider work or public-call dispatch until this exact process
   // has won the backend incarnation CAS. A transport failure retries quickly;
   // it is never treated as proof of authority.
-  while (authorityHeld) {
-    const initialHeartbeat = await livenessHeartbeat();
-    if (initialHeartbeat !== null) break;
-    await sleep(Math.min(cfg.messagePollMs, 1_000));
+  if (initialAuthorityAdmission !== null) {
+    applyHeartbeatResponse(initialAuthorityAdmission);
+    lastLivenessHeartbeatAt = Date.now();
   }
   try {
     for (; authorityHeld;) {
@@ -3486,6 +3539,7 @@ export async function handleStrategicResident(
   // Consult the ACTUAL stop reason + process exit code: a crash / wedge is a
   // FAILED terminal, COMPLETED only on a clean operator/task-driven stop. A
   // session that limped or died must not report success.
+  if (stopReason === 'resident_incarnation_lost') return;
   statusRef.value = 'Resident strategic session ended';
   sendLog(ws, `Resident strategic session ${sessionId} ended (${stopReason}).\n`);
 
@@ -3502,7 +3556,6 @@ export async function handleStrategicResident(
       .join('; ') || null
     : null;
   try {
-    if (stopReason === 'resident_incarnation_lost') return;
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       resident_incarnation_id: residentProcessIncarnation,

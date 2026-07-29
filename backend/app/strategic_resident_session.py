@@ -99,6 +99,7 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 # ``_strategic_workbench`` (per-operator prefs) and ``_strategic_local_continuation``
 # (the lease marker) so the three concerns never clobber one another.
 RESIDENT_SESSION_KEY = "_resident_strategic_session"
+_RESIDENT_WORKER_INCARNATION_PROTOCOL = 1
 
 # A call is deliberately a bounded, nested lease on the existing Workday
 # session record, not a third interaction_mode or a new persistent table.  The
@@ -469,7 +470,13 @@ def claim_resident_worker_incarnation(
     # During a rolling deploy an old Agent can still be inside a provider turn.
     # Materialize one bounded lease for its deterministic legacy identity before
     # allowing a random new-process identity to take over.
-    if recorded_raw is None and expires_at is None and requested != legacy_incarnation:
+    if (
+        recorded_raw is None
+        and expires_at is None
+        and requested != legacy_incarnation
+        and resident.get("worker_incarnation_protocol")
+        != _RESIDENT_WORKER_INCARNATION_PROTOCOL
+    ):
         updated = dict(resident)
         updated["worker_incarnation_id"] = str(legacy_incarnation)
         updated["worker_incarnation_expires_at"] = (
@@ -2921,6 +2928,13 @@ async def start_resident_session(
                 "session_id": session_id,
                 "task_id": str(adopt_task.id) if adopt_task is not None else None,
                 "worker_generation": worker_generation,
+                # Distinguish a session created by an incarnation-aware backend
+                # from a pre-deploy live blob. A fresh session has no possible
+                # legacy worker to protect, so its first random Agent may claim
+                # immediately; only unmarked historical blobs receive grace.
+                "worker_incarnation_protocol": (
+                    _RESIDENT_WORKER_INCARNATION_PROTOCOL
+                ),
                 "worker_state": "starting",
                 "runner_id": effective_runner_id,
                 "operator_user_id": str(operator_user_id),
@@ -4199,6 +4213,7 @@ async def renew_resident_session_lease(
     holder = {
         "authority_held": False,
         "incarnation_held": False,
+        "legacy_grace_until": None,
         "stopped": False,
         "capped": False,
         "lapsed": False,
@@ -4268,6 +4283,24 @@ async def renew_resident_session_lease(
             now=now,
         )
         if accepted_incarnation is None:
+            current_after_claim = read_resident_session(vision) or {}
+            legacy_incarnation = legacy_resident_worker_incarnation(
+                task_id,
+                worker_generation,
+            )
+            legacy_expiry = _parse_iso_naive(
+                current_after_claim.get("worker_incarnation_expires_at")
+            )
+            if (
+                incarnation_id is not None
+                and incarnation_id != legacy_incarnation
+                and str(current_after_claim.get("worker_incarnation_id"))
+                == str(legacy_incarnation)
+                and legacy_expiry is not None
+                and legacy_expiry > now
+            ):
+                holder["legacy_grace_until"] = legacy_expiry
+                return
             holder["stopped"] = True
             return
         holder["incarnation_held"] = True
@@ -4457,6 +4490,30 @@ async def renew_resident_session_lease(
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
+    if holder["legacy_grace_until"] is not None:
+        legacy_grace_until = holder["legacy_grace_until"]
+        await session.commit()
+        await session.refresh(project)
+        refreshed = read_resident_session(project.vision) or {}
+        return {
+            "authority_held": False,
+            "resident_incarnation_held": False,
+            "resident_incarnation_id": str(incarnation_id),
+            "admission_status": "legacy_grace",
+            "retry_after_seconds": max(
+                1,
+                int((legacy_grace_until - now).total_seconds()) + 1,
+            ),
+            "leased_until": legacy_grace_until.isoformat(),
+            "stop_requested": False,
+            "status": refreshed.get("status") or STATUS_ACTIVE,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
+        }
     if holder["stopped"]:
         # Identity/generation changed while this heartbeat waited for the project
         # lock. Release the lock and return before mirroring context or marking any

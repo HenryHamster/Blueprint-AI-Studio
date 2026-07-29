@@ -900,6 +900,43 @@ async def test_resident_heartbeat_fences_overlapping_process_incarnations(
 
 
 @pytest.mark.asyncio
+async def test_predeploy_legacy_grace_is_retryable_for_replacement(db_session):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident.pop("worker_incarnation_protocol", None)
+    resident.pop("worker_incarnation_id", None)
+    resident.pop("worker_incarnation_expires_at", None)
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    replacement = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=uuid.UUID(
+            "00000000-0000-0000-0000-000000000799"
+        ),
+        progress=False,
+    )
+
+    assert replacement["admission_status"] == "legacy_grace"
+    assert replacement["resident_incarnation_held"] is False
+    assert replacement["authority_held"] is False
+    assert replacement["stop_requested"] is False
+    assert replacement["retry_after_seconds"] > 0
+
+
+@pytest.mark.asyncio
 async def test_new_resident_start_repairs_stale_message_ownership_without_cadence(
     db_session, monkeypatch
 ):
@@ -2663,6 +2700,7 @@ async def test_start_allow_no_runner_creates_session_without_task(db_session):
     assert blob["task_id"] is None
     assert blob["runner_id"] is None
     assert blob["worker_state"] == "starting"
+    assert blob["worker_incarnation_protocol"] == 1
     assert blob["status"] == "active"
 
 

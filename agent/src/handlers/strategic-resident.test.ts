@@ -2084,11 +2084,18 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
     });
 
     const strategicPosts: Array<Record<string, unknown>> = [];
+    let heartbeatCount = 0;
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
         strategicPosts.push(body);
       }
-      if (url.includes('heartbeat')) return Promise.resolve({ authority_held: true, stop_requested: true });
+      if (url.includes('heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatCount > 1,
+        });
+      }
       return Promise.resolve({});
     });
 
@@ -2323,6 +2330,85 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     vi.useRealTimers();
   });
 
+  it('does not publish shared helpers or terminal state when initial authority is lost', async () => {
+    mockWriteMessagesHelper.mockClear();
+    mockWriteStrategicHelpers.mockClear();
+    mockPrepareWorkspaceForRole.mockClear();
+    vi.mocked(persistAndPostStatus).mockClear();
+    mockApiPost.mockResolvedValue({
+      authority_held: false,
+      resident_incarnation_held: false,
+      stop_requested: true,
+    });
+    const statusRef = { value: 'winner remains active' };
+
+    await handleStrategicResident(
+      'task-overlap-loser',
+      { strategic_session_id: 'overlap-session' },
+      {
+        project_metadata: { project_id: 'proj-overlap-loser' },
+        context: {
+          strategic_session_id: 'overlap-session',
+          _resident_worker_generation: 1,
+        },
+      },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+
+    expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
+    expect(mockWriteMessagesHelper).not.toHaveBeenCalled();
+    expect(mockWriteStrategicHelpers).not.toHaveBeenCalled();
+    expect(mockStartSession).not.toHaveBeenCalled();
+    expect(persistAndPostStatus).not.toHaveBeenCalled();
+    expect(statusRef.value).toBe('winner remains active');
+    expect(mockSendLog.mock.calls.some(([message]) =>
+      String(message).includes('ended'))).toBe(false);
+  });
+
+  it('waits through retryable legacy grace without publishing loser helpers', async () => {
+    vi.useFakeTimers();
+    mockWriteMessagesHelper.mockClear();
+    mockWriteStrategicHelpers.mockClear();
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation(() => {
+      heartbeatCount += 1;
+      if (heartbeatCount === 1) {
+        return Promise.resolve({
+          authority_held: false,
+          resident_incarnation_held: false,
+          stop_requested: false,
+          admission_status: 'legacy_grace',
+          retry_after_seconds: 1,
+        });
+      }
+      return Promise.resolve({
+        authority_held: false,
+        resident_incarnation_held: false,
+        stop_requested: true,
+      });
+    });
+    const statusRef = { value: 'waiting replacement' };
+    const handling = handleStrategicResident(
+      'task-legacy-grace',
+      { strategic_session_id: 'legacy-session' },
+      {
+        project_metadata: { project_id: 'proj-legacy-grace' },
+        context: {
+          strategic_session_id: 'legacy-session',
+          _resident_worker_generation: 1,
+        },
+      },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    await handling;
+
+    expect(heartbeatCount).toBe(2);
+    expect(mockWriteMessagesHelper).not.toHaveBeenCalled();
+    expect(mockWriteStrategicHelpers).not.toHaveBeenCalled();
+    expect(statusRef.value).toBe('waiting replacement');
+  });
+
   it('does not persist or mark an operator message handled after a provider error', async () => {
     const operatorMessage = {
       id: 'msg-rate-limited',
@@ -2394,9 +2480,14 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       }
       return Promise.resolve(null);
     });
+    let heartbeatCount = 0;
     mockApiPost.mockImplementation((url: string) => {
       if (url.includes('heartbeat')) {
-        return Promise.resolve({ authority_held: true, stop_requested: true });
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatCount > 1,
+        });
       }
       return Promise.resolve({});
     });
