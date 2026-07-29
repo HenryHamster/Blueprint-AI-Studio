@@ -375,24 +375,64 @@ def _runner_container_image_storage(
 
 def _runner_has_free_disk(
     runner: LocalRunner | RunnerDispatchSnapshot,
-    required_bytes: int,
+    image_store_required_bytes: int,
+    *,
+    workspace_required_bytes: int | None = None,
 ) -> bool:
-    """Whether a container-image job fits every known required filesystem.
+    """Whether a container-image job fits each known required filesystem.
 
     A container image is written to its runtime data-root, which can differ
-    from the runner workspace. Gate on the *limiting known* capacity while
-    retaining absence/malformed-telemetry compatibility for older runners.
-    This predicate is only used for container-image jobs; bwrap/imageless jobs
-    continue to use their workspace guard on the runner itself.
+    from the runner workspace. Pulling the image needs a multi-GB image-store
+    reserve, while checkout/artifact scratch only needs the smaller workspace
+    reserve. Applying the image-pull floor to both filesystems unnecessarily
+    strands runners whose container store lives on a large separate volume.
+
+    ``workspace_required_bytes=None`` preserves the historical equal-floor
+    behavior for direct callers. Production container dispatch passes both
+    floors explicitly. Missing/malformed telemetry remains backward-compatible
+    eligible, matching the other runner-capability predicates.
     """
-    if required_bytes <= 0:
+    image_floor = max(0, image_store_required_bytes)
+    workspace_floor = (
+        image_floor
+        if workspace_required_bytes is None
+        else max(0, workspace_required_bytes)
+    )
+    if image_floor <= 0 and workspace_floor <= 0:
         return True
     storage = _runner_container_image_storage(runner)
-    known = (
-        storage["workspace_free_bytes"],
-        storage["image_store_free_bytes"],
+    image_store_free = storage["image_store_free_bytes"]
+    effective_workspace_floor = _runner_effective_workspace_disk_floor(
+        runner,
+        image_floor,
+        workspace_required_bytes=workspace_floor,
     )
-    return all(value is None or value >= required_bytes for value in known)
+    known_with_floors = (
+        (storage["workspace_free_bytes"], effective_workspace_floor),
+        (image_store_free, image_floor),
+    )
+    return all(
+        value is None or value >= floor
+        for value, floor in known_with_floors
+    )
+
+
+def _runner_effective_workspace_disk_floor(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    image_store_required_bytes: int,
+    *,
+    workspace_required_bytes: int,
+) -> int:
+    """Workspace floor after accounting for legacy single-volume telemetry."""
+    image_floor = max(0, image_store_required_bytes)
+    workspace_floor = max(0, workspace_required_bytes)
+    storage = _runner_container_image_storage(runner)
+    # Without separate image-store telemetry, the legacy workspace/disk field
+    # may also back the container runtime. Preserve the historical full pull
+    # floor on that single known filesystem instead of assuming it is split.
+    if storage["image_store_free_bytes"] is None:
+        return max(workspace_floor, image_floor)
+    return workspace_floor
 
 
 def _runner_meets_min_compute_capability(

@@ -1231,6 +1231,44 @@ def _disk_floor_bytes():
     return _container_image_min_free_disk_bytes()
 
 
+def _workspace_floor_bytes():
+    from app.orchestrator_runner_dispatch import (
+        _container_workspace_min_free_disk_bytes,
+    )
+
+    return _container_workspace_min_free_disk_bytes()
+
+
+def test_workspace_floor_preserves_explicit_legacy_image_floor(monkeypatch):
+    from app import orchestrator_runner_dispatch as dispatch
+
+    monkeypatch.delitem(
+        dispatch._runtime_config,
+        "container_workspace_min_free_disk_bytes",
+        raising=False,
+    )
+    monkeypatch.setitem(
+        dispatch._runtime_config,
+        "container_image_min_free_disk_bytes",
+        0,
+    )
+    assert dispatch._container_workspace_min_free_disk_bytes() == 0
+
+    monkeypatch.setitem(
+        dispatch._runtime_config,
+        "container_image_min_free_disk_bytes",
+        1_000_000_000,
+    )
+    assert dispatch._container_workspace_min_free_disk_bytes() == 1_000_000_000
+
+    monkeypatch.setitem(
+        dispatch._runtime_config,
+        "container_workspace_min_free_disk_bytes",
+        500_000_000,
+    )
+    assert dispatch._container_workspace_min_free_disk_bytes() == 500_000_000
+
+
 def test_runner_has_free_disk_present_absent_malformed():
     """_runner_has_free_disk gates only on real, sufficient disk data."""
     from app.runner_eligibility import _runner_has_free_disk, RunnerDispatchSnapshot
@@ -1280,6 +1318,42 @@ def test_runner_has_free_disk_present_absent_malformed():
     assert _runner_has_free_disk(full, 0) is True
 
 
+def test_runner_has_free_disk_uses_distinct_workspace_and_image_store_floors():
+    """A roomy image store must not inherit its multi-GB pull floor onto scratch."""
+    from app.runner_eligibility import _runner_has_free_disk, RunnerDispatchSnapshot
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={
+            "workspace_free_bytes": 8_000,
+            "container_image_store_free_bytes": 20_000,
+        },
+    )
+
+    assert _runner_has_free_disk(
+        runner,
+        10_000,
+        workspace_required_bytes=2_000,
+    ) is True
+    assert _runner_has_free_disk(
+        runner,
+        10_000,
+        workspace_required_bytes=9_000,
+    ) is False
+
+    legacy_single_volume = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"disk_free_bytes": 8_000},
+    )
+    assert _runner_has_free_disk(
+        legacy_single_volume,
+        10_000,
+        workspace_required_bytes=2_000,
+    ) is False
+
+
 def test_select_eligible_runner_disk_filter_excludes_full_runner():
     """A container-image job is NOT dispatched when Docker's data-root is full.
 
@@ -1292,14 +1366,15 @@ def test_select_eligible_runner_disk_filter_excludes_full_runner():
     )
 
     project_id = uuid.uuid4()
+    workspace_floor = _workspace_floor_bytes()
     full_runner = RunnerDispatchSnapshot(
         id=uuid.uuid4(),
         project_id=project_id,
         capabilities={
             "task_types": "all",
             "isolation_backends": {"docker_usable": True},
-            "disk_free_bytes": 20_000_000,
-            "workspace_free_bytes": 20_000_000,
+            "disk_free_bytes": workspace_floor + 1,
+            "workspace_free_bytes": workspace_floor + 1,
             "container_image_store_runtime": "docker",
             "container_image_store_path": "/var/lib/docker",
             "container_image_store_free_bytes": 1_000_000,  # ~1 MB free — below the multi-GB floor
@@ -1320,6 +1395,43 @@ def test_select_eligible_runner_disk_filter_excludes_full_runner():
     )
 
 
+def test_select_eligible_runner_accepts_split_volume_dgx_shape():
+    """A large image store remains eligible with scratch below its pull floor."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    image_store_floor = _disk_floor_bytes()
+    workspace_floor = _workspace_floor_bytes()
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": workspace_floor + 1,
+            "workspace_free_bytes": workspace_floor + 1,
+            "container_image_store_runtime": "docker",
+            "container_image_store_path": "/raid/docker",
+            "container_image_store_free_bytes": image_store_floor + 1,
+        },
+    )
+
+    selected = _select_eligible_runner(
+        active_runners_cache={project_id: [runner]},
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+
+    assert selected is not None
+    assert selected.id == runner.id
+
+
 def test_select_eligible_runner_disk_filter_selects_roomy_runner():
     """Between a full and a roomy container-capable runner, the roomy one wins."""
     from app.orchestrator_runner_dispatch import (
@@ -1329,14 +1441,15 @@ def test_select_eligible_runner_disk_filter_selects_roomy_runner():
 
     project_id = uuid.uuid4()
     floor = _disk_floor_bytes()
+    workspace_floor = _workspace_floor_bytes()
     full_runner = RunnerDispatchSnapshot(
         id=uuid.uuid4(),
         project_id=project_id,
         capabilities={
             "task_types": "all",
             "isolation_backends": {"docker_usable": True},
-            "disk_free_bytes": 20_000_000,
-            "workspace_free_bytes": 20_000_000,
+            "disk_free_bytes": workspace_floor + 1,
+            "workspace_free_bytes": workspace_floor + 1,
             "container_image_store_runtime": "docker",
             "container_image_store_path": "/var/lib/docker",
             "container_image_store_free_bytes": 1_000_000,
@@ -1436,14 +1549,15 @@ def test_diagnose_strict_pin_hold_reports_insufficient_disk():
 
     project_id = uuid.uuid4()
     runner_id = uuid.uuid4()
+    workspace_floor = _workspace_floor_bytes()
     full_runner = RunnerDispatchSnapshot(
         id=runner_id,
         project_id=project_id,
         capabilities={
             "task_types": "all",
             "isolation_backends": {"docker_usable": True},
-            "disk_free_bytes": 20_000_000,
-            "workspace_free_bytes": 20_000_000,
+            "disk_free_bytes": workspace_floor + 1,
+            "workspace_free_bytes": workspace_floor + 1,
             "container_image_store_runtime": "docker",
             "container_image_store_path": "/var/lib/docker",
             "container_image_store_free_bytes": 1_000_000,
@@ -1467,6 +1581,41 @@ def test_diagnose_strict_pin_hold_reports_insufficient_disk():
     )
     assert "docker_image_store_free_bytes=1000000" in detail
     assert "/var/lib/docker" in detail
+
+
+def test_diagnose_strict_pin_hold_reports_legacy_single_volume_floor():
+    from app.orchestrator_runner_dispatch import (
+        _diagnose_strict_runner_pin_hold,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner_id = uuid.uuid4()
+    image_floor = _disk_floor_bytes()
+    legacy_runner = RunnerDispatchSnapshot(
+        id=runner_id,
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": image_floor - 1,
+        },
+    )
+    reason, detail = asyncio.run(
+        _diagnose_strict_runner_pin_hold(
+            session=None,
+            active_runners_cache={project_id: [legacy_runner]},
+            project_id=project_id,
+            pinned_runner_id=str(runner_id),
+            task_type="compute_experiment",
+            accelerator=None,
+            container_image="my-image:latest",
+            runner_pins_this_cycle={},
+        )
+    )
+    assert reason == "insufficient_disk"
+    assert f"workspace must clear {image_floor} bytes" in detail
+    assert "legacy workspace/disk measurement" in detail
 
 
 # ── GPU-in-container-capability gating (image + accelerator) ──────────────────

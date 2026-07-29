@@ -5802,6 +5802,51 @@ class TestNextComputeJobDiskFit:
         assert resp.json()["project_id"] == str(project.id)
 
     @pytest.mark.asyncio
+    async def test_container_image_job_claimed_with_split_volume_headroom(
+        self, client: AsyncClient, db_session
+    ):
+        """Claim succeeds when scratch clears its smaller reserve and image storage
+        independently clears the image-pull floor."""
+        from app.orchestrator_runner_dispatch import (
+            _container_image_min_free_disk_bytes,
+            _container_workspace_min_free_disk_bytes,
+        )
+
+        project = await _make_project(db_session)
+        image_store_floor = _container_image_min_free_disk_bytes()
+        workspace_floor = _container_workspace_min_free_disk_bytes()
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True},
+                "disk_free_bytes": workspace_floor + 1,
+                "workspace_free_bytes": workspace_floor + 1,
+                "container_image_store_runtime": "docker",
+                "container_image_store_path": "/raid/docker",
+                "container_image_store_free_bytes": image_store_floor + 1,
+            },
+        )
+        job = await self._make_starting_job(
+            db_session,
+            project.id,
+            runner.id,
+            metadata={"container_image": "my-image:latest", "command": "run.sh"},
+        )
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["job_id"] == str(job.id)
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.RUNNING
+
+    @pytest.mark.asyncio
     async def test_non_image_job_claimed_despite_low_disk(
         self, client: AsyncClient, db_session
     ):
