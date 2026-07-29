@@ -222,6 +222,8 @@ _BASE_RO_BINDS: tuple[str, ...] = (
     "/etc/ca-certificates.conf",
     "/etc/resolv.conf",
     "/etc/hosts",
+    "/etc/passwd",
+    "/etc/group",
     "/etc/nsswitch.conf",
     "/etc/gai.conf",
 )
@@ -1801,7 +1803,7 @@ def plan_agent_execution(
             "AGENT_WORKSPACE": SANDBOX_WORKSPACE + "/agent",
             "HOME": SANDBOX_HOME,
         },
-        tool_dirs_for(tools),
+        [os.path.join(PROJECT_VERIFICATION_VENV, "bin"), *tool_dirs_for(tools)],
         per_task_creds=per_task_creds,
     )
 
