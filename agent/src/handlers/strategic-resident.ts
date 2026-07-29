@@ -109,7 +109,10 @@ const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 30_000;
 const RESIDENT_LEGACY_ADMISSION_MAX_MS = 180_000;
 const RESIDENT_LEGACY_ADMISSION_SKEW_MS = 30_000;
 const RESIDENT_ADMISSION_TRANSPORT_MAX_MS = 60_000;
-const RESIDENT_ADMISSION_API_MAX_RETRIES = 0;
+// apiRequest interprets this value as total attempts, not additional retries.
+// Zero silently performs no request at all, so keep one bounded transport
+// attempt here and let the outer admission loop own retry timing.
+const RESIDENT_ADMISSION_API_MAX_RETRIES = 1;
 const CONVERSATION_CLAIM_LEASE_SECONDS = 90;
 const CONVERSATION_CLAIM_RENEW_MS = 15_000;
 export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
