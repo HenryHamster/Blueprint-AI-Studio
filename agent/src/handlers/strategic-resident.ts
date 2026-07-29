@@ -648,20 +648,23 @@ export async function handleStrategicResident(
   const cleanupUnadmittedRuntime = (): void => {
     try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
   };
+  const activeAdmissionDeadline = (): number | null => {
+    const deadlines = [legacyAdmissionDeadline, admissionTransportDeadline]
+      .filter((deadline): deadline is number => deadline !== null);
+    return deadlines.length > 0 ? Math.min(...deadlines) : null;
+  };
   for (;;) {
-    if (
-      admissionTransportDeadline !== null
-      && Date.now() >= admissionTransportDeadline
-    ) {
+    const activeDeadline = activeAdmissionDeadline();
+    if (activeDeadline !== null && Date.now() >= activeDeadline) {
       cleanupUnadmittedRuntime();
       return;
     }
     const admissionAttemptStartedAt = Date.now();
-    const admissionTimeout = admissionTransportDeadline === null
+    const admissionTimeout = activeDeadline === null
       ? HEARTBEAT_API_TIMEOUT
       : Math.max(
         1,
-        Math.min(HEARTBEAT_API_TIMEOUT, admissionTransportDeadline - Date.now()),
+        Math.min(HEARTBEAT_API_TIMEOUT, activeDeadline - Date.now()),
       );
     try {
       const admission = await apiPost(
@@ -711,11 +714,12 @@ export async function handleStrategicResident(
       admissionTransportDeadline ??= (
         admissionAttemptStartedAt + RESIDENT_ADMISSION_TRANSPORT_MAX_MS
       );
-      if (Date.now() >= admissionTransportDeadline) {
+      const retryDeadline = activeAdmissionDeadline();
+      if (retryDeadline !== null && Date.now() >= retryDeadline) {
         cleanupUnadmittedRuntime();
         return;
       }
-      await sleep(1_000);
+      await sleep(Math.min(1_000, Math.max(1, (retryDeadline ?? Infinity) - Date.now())));
     }
   }
 

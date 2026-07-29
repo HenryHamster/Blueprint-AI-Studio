@@ -2545,6 +2545,42 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(statusRef.value).toBe('legacy owner remains active');
   });
 
+  it('does not let a transport outage extend the active legacy-grace deadline', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T12:00:00Z'));
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation(() => {
+      heartbeatCount += 1;
+      if (heartbeatCount === 1) {
+        return Promise.resolve({
+          authority_held: false,
+          resident_incarnation_held: false,
+          stop_requested: false,
+          admission_status: 'legacy_grace',
+          retry_after_seconds: 1,
+          leased_until: new Date(Date.now() + 180_000).toISOString(),
+        });
+      }
+      return Promise.reject(new Error('backend unavailable during legacy grace'));
+    });
+    const handling = handleStrategicResident(
+      'task-grace-outage',
+      { strategic_session_id: 'grace-outage-session' },
+      {
+        project_metadata: { project_id: 'proj-grace-outage' },
+        context: { strategic_session_id: 'grace-outage-session' },
+      },
+      'ghtok', 'owner', 'repo', null, { value: 'legacy owner active' },
+    );
+
+    await vi.advanceTimersByTimeAsync(210_001);
+    await handling;
+
+    expect(heartbeatCount).toBeGreaterThan(1);
+    expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
+    expect(mockStartSession).not.toHaveBeenCalled();
+  });
+
   it('keeps chat alive without autonomous authority when process incarnation is held', async () => {
     const message = {
       id: 'msg-chat-only-authority',
