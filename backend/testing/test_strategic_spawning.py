@@ -8253,9 +8253,11 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
     assert "Token baked into VM image" in suffix
     assert "recommended_mode='audit'" in suffix
     # The project has no active audit/fundamentals-mode direction, so the hint
-    # must demand the agent CREATE one rather than merely "update" (a status
-    # note had been satisfying the old phrasing).
-    assert "MUST create a new direction" in suffix
+    # must demand durable executable ownership without making creation itself
+    # the goal.
+    assert "Ensure one durable direction owns the outcome" in suffix
+    assert "otherwise create one" in suffix
+    assert "MUST create a new direction" not in suffix
     assert "does NOT count" in suffix
 
     vp = payload.get("version_phase")
@@ -8562,9 +8564,11 @@ async def test_stabilize_hint_requalify_only_when_readiness_signaled(
     assert "UNRESOLVED" in notready_suffix
     assert "fix-first work" in notready_suffix
     assert "trigger is MET" not in notready_suffix
-    # The carried finding still needs fixing, so the create-a-direction escalation
-    # fires (there is no active audit/fundamentals-mode direction on this project).
-    assert "MUST create a new direction" in notready_suffix
+    # The carried finding still needs fixing, so the prompt requires durable
+    # ownership without assuming that a new direction is always necessary.
+    assert "Ensure one durable direction owns the outcome" in notready_suffix
+    assert "otherwise create one" in notready_suffix
+    assert "MUST create a new direction" not in notready_suffix
 
 
 @pytest.mark.asyncio
@@ -8572,8 +8576,8 @@ async def test_stabilize_carried_findings_live_when_candidate_equals_head(
     db_session, mocker, _lts_split_active
 ):
     """When the candidate commit equals the live HEAD, the findings are presented
-    live exactly as before — binding-constraint framing + create-a-direction
-    escalation — with no POSSIBLY-STALE wording."""
+    live with binding-constraint and durable-ownership framing, with no
+    POSSIBLY-STALE wording."""
     await _ensure_releaseversion_table(db_session)
     project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
     db_session.add(project)
@@ -8594,7 +8598,9 @@ async def test_stabilize_carried_findings_live_when_candidate_equals_head(
 
     assert "POSSIBLY-STALE" not in suffix
     assert "the audit sub-score is the binding constraint on promotion" in suffix
-    assert "MUST create a new direction" in suffix
+    assert "Ensure one durable direction owns the outcome" in suffix
+    assert "otherwise create one" in suffix
+    assert "MUST create a new direction" not in suffix
     assert "Could not confirm" not in suffix
 
 
@@ -15603,86 +15609,45 @@ async def test_open_message_counts_ship_when_inbox_dropped(db_session):
         )
 
 
-class TestParallelismHint:
-    """_build_parallelism_hint nudges toward enough INDEPENDENT direction lanes.
+class TestPortfolioCoherenceHint:
+    """Capacity is context for task execution, never a direction-count target."""
 
-    Target = min(max_active_directions, max_concurrent_vms) — derived from config,
-    never hardcoded. The hint fires below that target and goes quiet at/above it.
-    """
+    def test_capacity_is_explicitly_a_ceiling(self):
+        from app.strategic_spawning import _build_portfolio_coherence_hint
 
-    def test_at_or_above_target_returns_empty(self):
-        from app.strategic_spawning import _build_parallelism_hint
-
-        # At the target (min(max_active, vms)): no nag.
-        assert (
-            _build_parallelism_hint(8, max_concurrent_vms=8, max_active_directions=10)
-            == ""
-        )
-        # max_active_directions is the target even when the fleet could run more VMs.
-        assert (
-            _build_parallelism_hint(10, max_concurrent_vms=15, max_active_directions=10)
-            == ""
-        )
-        # Above the VM-clamped target also no nag.
-        assert (
-            _build_parallelism_hint(10, max_concurrent_vms=8, max_active_directions=10)
-            == ""
-        )
-
-    def test_below_target_nags_above_the_old_floor(self):
-        from app.strategic_spawning import _build_parallelism_hint
-
-        # Core behavior change: the old gate went silent at 3 directions. Now 4 on
-        # a 15-VM fleet (target 10) still nags, and 5 of 8 (target 8) still nags.
-        assert _build_parallelism_hint(
-            4, max_concurrent_vms=15, max_active_directions=10
-        )
-        assert _build_parallelism_hint(
-            5, max_concurrent_vms=8, max_active_directions=10
-        )
-
-    def test_below_target_emits_independence_framed_hint(self):
-        from app.strategic_spawning import _build_parallelism_hint
-
-        hint = _build_parallelism_hint(
+        hint = _build_portfolio_coherence_hint(
             1, max_concurrent_vms=8, max_active_directions=10
         )
-        assert hint  # non-empty
-        assert "PARALLELISM" in hint
-        assert "1 active direction" in hint
+        assert "PORTFOLIO COHERENCE" in hint
+        assert "1/10 active direction slots" in hint
         assert "8 VMs" in hint
-        # Frames it as decomposing into INDEPENDENT, non-conflicting lanes (not a quota).
-        assert "INDEPENDENT" in hint
-        assert "conflicts_with" in hint
-        assert "load-bearing" in hint
+        assert "capacity is a ceiling" in hint
+        assert "never a target for direction count" in hint
 
-    def test_capacity_is_the_limit_does_not_nag(self):
-        from app.strategic_spawning import _build_parallelism_hint
+    def test_parallel_execution_uses_tasks_under_a_direction(self):
+        from app.strategic_spawning import _build_portfolio_coherence_hint
 
-        # Fleet can only run 2 VMs, so 2 active directions is NOT underutilized.
+        hint = _build_portfolio_coherence_hint(
+            4, max_concurrent_vms=15, max_active_directions=10
+        )
+        assert "multiple tasks under the existing direction" in hint
+        assert "genuinely distinct durable outcome" in hint
         assert (
-            _build_parallelism_hint(2, max_concurrent_vms=2, max_active_directions=10)
-            == ""
+            "never to divide files, subsystems, implementation stages, or workers"
+            in hint
         )
-        # But 1 active on a 2-VM fleet still leaves a lane idle.
-        assert _build_parallelism_hint(
-            1, max_concurrent_vms=2, max_active_directions=10
-        )
+        assert "open a direction for each" not in hint
+        assert "capacity is idle" not in hint
 
-    def test_unknown_capacity_targets_max_active_and_omits_vm_clause(self):
-        from app.strategic_spawning import _build_parallelism_hint
+    def test_unknown_capacity_omits_a_concrete_vm_count(self):
+        from app.strategic_spawning import _build_portfolio_coherence_hint
 
-        # No capacity signal → target falls back to max_active_directions; no VM clause.
-        hint = _build_parallelism_hint(
-            1, max_concurrent_vms=0, max_active_directions=10
+        hint = _build_portfolio_coherence_hint(
+            10, max_concurrent_vms=0, max_active_directions=10
         )
         assert hint
-        assert "VMs at once" not in hint  # no concrete VM count when capacity unknown
-        # At the max_active_directions target with unknown capacity: no nag.
-        assert (
-            _build_parallelism_hint(10, max_concurrent_vms=0, max_active_directions=10)
-            == ""
-        )
+        assert "VMs concurrently" not in hint
+        assert "Available execution capacity" in hint
 
 
 # ── Deploy-model framing (integration-branch landing ≠ deployment) ────────────

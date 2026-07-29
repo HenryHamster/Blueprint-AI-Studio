@@ -59,14 +59,22 @@ def test_manifest_is_wellformed():
     assert isinstance(manifest, list) and manifest, "manifest must be a non-empty list"
     seen: set[str] = set()
     for entry in manifest:
-        assert set(entry) == {
+        assert set(entry) in ({
             "op",
             "alias",
             "description",
             "cli",
             "prompt",
             "internal_reason",
-        }, f"unexpected manifest entry keys: {sorted(entry)}"
+        }, {
+            "op",
+            "alias",
+            "description",
+            "cli",
+            "prompt",
+            "internal_reason",
+            "input",
+        }), f"unexpected manifest entry keys: {sorted(entry)}"
         op = entry["op"]
         assert isinstance(op, str) and re.fullmatch(r"[a-z][a-z_]*", op), op
         assert op not in seen, f"duplicate op in manifest: {op}"
@@ -78,6 +86,26 @@ def test_manifest_is_wellformed():
         else:
             assert entry["alias"] is None, op
             assert entry["internal_reason"], f"{op} must state why it is excluded"
+
+
+def test_create_direction_manifest_matches_backend_contract():
+    """The agent's generated help and the backend validator share one envelope."""
+    from app.strategic_op_contracts import CREATE_DIRECTION_FIELDS
+
+    manifest = _load_manifest()
+    create = next(entry for entry in manifest if entry["op"] == "create_direction")
+    contract = create["input"]
+    assert contract["kind"] == "json"
+    assert set(contract["required"]) == {
+        "text",
+        "success_evidence",
+        "retirement_condition",
+    }
+    assert set(contract["fields"]) == CREATE_DIRECTION_FIELDS
+    assert any(
+        "category is product|structural|mixed" in note
+        for note in contract["notes"]
+    )
 
 
 def test_dispatch_accepts_exactly_the_manifest_ops():

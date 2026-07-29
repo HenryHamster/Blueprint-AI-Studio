@@ -1187,6 +1187,9 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     expect(executorPrompt).toContain('./messages send --stdin <<\'EOF\'');
     // Steers AWAY from the old create-then-stage sequence for new ideas.
     expect(executorPrompt).toContain('Do NOT create-then-stage');
+    expect(executorPrompt).toContain('first update the active or staged direction that already owns the durable outcome');
+    expect(executorPrompt).toContain('only when no existing direction owns that genuinely distinct durable outcome');
+    expect(executorPrompt).not.toContain("If there's an obvious gap, open it");
   });
 
   it('treats problem_model reconstruction as the last resort after bounded repair', async () => {

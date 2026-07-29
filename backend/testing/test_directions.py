@@ -4920,20 +4920,20 @@ async def _retire_one_direction(db_session, mocker, active_ids):
 
 
 @pytest.mark.asyncio
-async def test_retire_direction_warns_when_dropping_below_parallelism_floor(
+async def test_retire_direction_does_not_treat_direction_count_as_parallelism_floor(
     db_session, mocker
 ):
-    """Retiring down to 2 active directions surfaces a non-blocking parallelism
-    warning (the retire still succeeds)."""
+    """Direction retirement never manufactures replacement lanes for capacity."""
     body = await _retire_one_direction(db_session, mocker, ["d-a", "d-b", "d-c"])
-    assert body["status"] == "ok"  # retire is not blocked
+    assert body["status"] == "ok"
     warnings = body.get("warnings") or []
-    assert any("parallel" in w.lower() and "2 active" in w for w in warnings), warnings
+    assert not any("parallel" in w.lower() for w in warnings), warnings
+    assert not any("replacement direction" in w.lower() for w in warnings), warnings
 
 
 @pytest.mark.asyncio
-async def test_retire_direction_no_warning_when_floor_preserved(db_session, mocker):
-    """Retiring while 3 active directions remain emits no parallelism warning."""
+async def test_retire_direction_count_never_emits_capacity_warning(db_session, mocker):
+    """The same contract holds at larger portfolio sizes."""
     body = await _retire_one_direction(db_session, mocker, ["d-a", "d-b", "d-c", "d-d"])
     assert body["status"] == "ok"
     warnings = body.get("warnings") or []
@@ -5225,8 +5225,10 @@ async def test_strategic_api_create_direction_rejects_missing_structured_fields(
                 },
             )
             assert resp_no_evidence.status_code == 400, resp_no_evidence.text
-            msg_no_ev = resp_no_evidence.json().get("error", {}).get("message", "")
-            assert "success_evidence" in msg_no_ev
+            detail_no_ev = (
+                resp_no_evidence.json().get("error", {}).get("message", {})
+            )
+            assert detail_no_ev.get("field") == "success_evidence"
 
             # Missing retirement_condition
             resp_no_retirement = await ac.post(
@@ -5242,8 +5244,10 @@ async def test_strategic_api_create_direction_rejects_missing_structured_fields(
                 },
             )
             assert resp_no_retirement.status_code == 400, resp_no_retirement.text
-            msg_no_ret = resp_no_retirement.json().get("error", {}).get("message", "")
-            assert "retirement_condition" in msg_no_ret
+            detail_no_ret = (
+                resp_no_retirement.json().get("error", {}).get("message", {})
+            )
+            assert detail_no_ret.get("field") == "retirement_condition"
 
         # Neither direction should have been created
         await db_session.refresh(project)

@@ -3587,37 +3587,36 @@ def _retired_grounding_note(grounding: dict, block_reason: str) -> str:
 async def _check_direction_starvation(
     project: Any, dirs_created: int, session: AsyncSession, task: Any = None
 ) -> None:
-    """Detect consecutive strategic cycles with no direction creation despite active gaps.
+    """Detect repeated cycles that leave concrete problem-model gaps uncovered.
 
-    Increments vision['_direction_starvation_count'] each cycle where dirs_created == 0
-    and at least one gap exists (active_count < 3, no product directions, or all saturated).
-
-    When starvation_count >= 2:
-      - Creates a strategic alert describing the gap.
-      - Sets vision['_strategic_frequency_override'] = 2 to boost cycle frequency.
-
-    When starvation_count >= 5:
-      - Auto-creates a fallback direction targeting the detected gap.
-      - Resets the starvation counter and clears frequency override.
-
-    Resets both counter and override when dirs_created > 0 (starvation resolved).
+    Direction count, category mix, saturation, and fleet capacity are not gaps.
+    Only an active problem-model gap with no staffing move and no explicit
+    deferral contributes to this signal. Repeated misses raise an alert and
+    increase strategic review frequency; this guard never creates directions.
     """
     from app.alert_dispatch import _create_strategic_alert
 
-    directions = project.directions or []
-    active_count = sum(1 for d in directions if d.get("status") == "active")
-    product_count = sum(
-        1
-        for d in directions
-        if d.get("status") == "active" and d.get("category") == "product"
-    )
-    all_saturated = active_count > 0 and all(
-        d.get("possibly_saturated") for d in directions if d.get("status") == "active"
-    )
-    has_gaps = active_count < 3 or product_count == 0 or all_saturated
+    raw_model = project.problem_model if isinstance(project.problem_model, dict) else {}
+    raw_gaps = raw_model.get("gaps")
+    uncovered_gaps: list[dict[str, Any]] = []
+    if isinstance(raw_gaps, list):
+        for gap in raw_gaps:
+            if not isinstance(gap, dict) or gap.get("status", "active") != "active":
+                continue
+            # Require a concrete durable object, not a malformed placeholder.
+            if not str(gap.get("id") or "").strip():
+                continue
+            if not str(gap.get("name") or gap.get("description") or "").strip():
+                continue
+            active_moves = gap.get("active_moves")
+            if isinstance(active_moves, list) and active_moves:
+                continue
+            if gap.get("deferral"):
+                continue
+            uncovered_gaps.append(gap)
 
     vision = dict(project.vision or {})
-    if dirs_created == 0 and has_gaps:
+    if uncovered_gaps:
         task_id_str = str(task.id) if task is not None else None
         if task_id_str and vision.get("_direction_starvation_last_task_id") == task_id_str:
             # Already processed this cycle on a prior run — skip to avoid double-counting.
@@ -3627,154 +3626,33 @@ async def _check_direction_starvation(
         if task_id_str:
             vision["_direction_starvation_last_task_id"] = task_id_str
 
-        if starvation_count >= 5:
-            # Auto-create a fallback direction as last resort
-            max_active = _runtime_config.get("max_active_directions", 10)
-            if active_count < max_active:
-                if product_count == 0:
-                    gap_type = "NO_PRODUCT_DIRECTIONS"
-                    fallback_text = "Deliver user-visible product improvements"
-                    fallback_category = "product"
-                elif active_count < 3:
-                    gap_type = "BELOW_MINIMUM"
-                    fallback_text = (
-                        "Expand system capabilities beyond current directions"
-                    )
-                    fallback_category = None
-                else:
-                    gap_type = "ALL_SATURATED"
-                    fallback_text = (
-                        "Explore and improve underserved areas of the system"
-                    )
-                    fallback_category = None
-
-                # Audit W2/D8: dedup the fallback against existing directions,
-                # recently-rejected proposals, AND the durable retired-directions
-                # memory before creating. The previous version skipped the retired
-                # memory, so a direction retired a cycle ago could be recreated.
-                rejected_proposals = list(
-                    (vision or {}).get("rejected_proposals") or []
-                )
-                retired_memory = list(
-                    (vision or {}).get("_recently_retired_directions") or []
-                )
-                is_dup = _is_direction_duplicate(
-                    fallback_text,
-                    directions,
-                    rejected_proposals,
-                ) or bool(
-                    _check_gap_respawn_block(
-                        fallback_text,
-                        None,
-                        retired_memory,
-                        cooldown_days=30,
-                    )
-                )
-                if is_dup:
-                    logger.warning(
-                        f"[STRATEGIC] Starvation fallback dedup'd for project {project.id}: "
-                        f"text '{fallback_text}' overlaps with existing/rejected direction. "
-                        f"Resetting starvation counter and alerting operator instead of auto-creating duplicate."
-                    )
-                    vision["_direction_starvation_count"] = 0
-                    project.vision = vision
-                    flag_modified(project, "vision")
-                    session.add(project)
-                    await _create_strategic_alert(
-                        project.id,
-                        session,
-                        f"Direction starvation reached {starvation_count} cycles but the fallback "
-                        f"direction '{fallback_text}' would duplicate an existing or recently-rejected "
-                        f"direction (gap: {gap_type}). Manual intervention required — review "
-                        f"existing directions and propose distinct work, or expand "
-                        f"max_active_directions.",
-                    )
-                    return
-
-                fallback_dir: Dict[str, Any] = {
-                    "id": f"d-{uuid.uuid4().hex[:8]}",
-                    "text": fallback_text,
-                    "status": "active",
-                    "priority": "medium",
-                    "notes": [
-                        {
-                            "text": (
-                                f"Auto-created by starvation handler after {starvation_count} "
-                                f"consecutive cycles with no direction creation"
-                            ),
-                            "added_at": _utcnow().isoformat(),
-                        }
-                    ],
-                    "research_history": [],
-                }
-                if fallback_category:
-                    fallback_dir["category"] = fallback_category
-
-                from app.task_locking import with_directions_locked
-
-                _fd = fallback_dir
-                await with_directions_locked(
-                    session, project.id, lambda dirs: dirs.append(_fd)
-                )
-
-                vision["_direction_starvation_count"] = 0
-                vision.pop("_strategic_frequency_override", None)
-                project.vision = vision
-                flag_modified(project, "vision")
-                session.add(project)
-
-                logger.warning(
-                    f"[STRATEGIC] Starvation fallback: auto-created direction for project "
-                    f"{project.id} after {starvation_count} consecutive empty cycles. "
-                    f"gap_type={gap_type}, dir_id={fallback_dir['id']}"
-                )
-                await _create_strategic_alert(
-                    project.id,
-                    session,
-                    f"Direction starvation fallback: auto-created direction '{fallback_text}' "
-                    f"after {starvation_count} consecutive cycles with 0 new directions "
-                    f"(gap: {gap_type}).",
-                )
-            else:
-                # Cap reached — cannot auto-create, just log and keep alerting
-                project.vision = vision
-                flag_modified(project, "vision")
-                session.add(project)
-                logger.warning(
-                    f"[STRATEGIC] Direction starvation for project {project.id}: "
-                    f"{starvation_count} cycles, but direction cap ({max_active}) reached — "
-                    f"cannot auto-create fallback."
-                )
-        elif starvation_count >= 2:
-            gap_parts = []
-            if active_count < 3:
-                gap_parts.append(
-                    f"only {active_count} active directions (min 3 needed)"
-                )
-            if product_count == 0:
-                gap_parts.append("no product-category directions")
-            if all_saturated:
-                gap_parts.append("all active directions are saturated")
-            gap_desc = "; ".join(gap_parts) or "unspecified gap"
+        if starvation_count >= 2:
+            gap_ids = [str(gap["id"]) for gap in uncovered_gaps]
+            gap_desc = ", ".join(gap_ids[:5])
+            if len(gap_ids) > 5:
+                gap_desc += f" (+{len(gap_ids) - 5} more)"
             vision["_strategic_frequency_override"] = 2
             project.vision = vision
             flag_modified(project, "vision")
+            session.add(project)
             await _create_strategic_alert(
                 project.id,
                 session,
-                f"Direction starvation: {starvation_count} consecutive cycles with 0 new "
-                f"directions ({gap_desc}). Boosting strategic frequency.",
+                f"Uncovered strategic gaps: {starvation_count} consecutive cycles left "
+                f"active, non-deferred problem-model gap(s) unstaffed ({gap_desc}). "
+                f"Boosting strategic frequency; no direction was auto-created.",
             )
             logger.warning(
-                f"[STRATEGIC] Direction starvation for project {project.id}: "
-                f"{starvation_count} cycles, gap: {gap_desc}. Frequency override → 2."
+                f"[STRATEGIC] Uncovered gaps for project {project.id}: "
+                f"{starvation_count} cycles, gaps: {gap_desc}. Frequency override → 2."
             )
         else:
             project.vision = vision
             flag_modified(project, "vision")
+            session.add(project)
             logger.info(
-                f"[STRATEGIC] Direction starvation cycle {starvation_count}/2 "
-                f"for project {project.id} (has_gaps=True, dirs_created=0)"
+                f"[STRATEGIC] Uncovered-gap cycle {starvation_count}/2 "
+                f"for project {project.id}"
             )
     else:
         starvation_count = vision.get("_direction_starvation_count", 0)
@@ -3785,8 +3663,8 @@ async def _check_direction_starvation(
             project.vision = vision
             flag_modified(project, "vision")
             logger.info(
-                f"[STRATEGIC] Direction starvation resolved for project {project.id}: "
-                f"{dirs_created} direction(s) created. Counter and override cleared."
+                f"[STRATEGIC] Uncovered-gap signal resolved for project {project.id}: "
+                f"no concrete unstaffed gap remains. Counter and override cleared."
             )
 
 
@@ -5278,6 +5156,128 @@ async def _handle_strategic_completion(
                     if raw_priority in ("high", "medium", "low")
                     else "medium"
                 )
+                raw_staged = op_entry.get("staged", False)
+                if not isinstance(raw_staged, bool):
+                    logger.warning(
+                        "[STRATEGIC] Task %s: direction create '%s' rejected — "
+                        "staged must be a boolean",
+                        task.id,
+                        text[:60],
+                    )
+                    continue
+                staged_create = raw_staged
+                staged_for_version: int | None = None
+                if staged_create:
+                    from app.release_version import current_open_version
+
+                    open_version = await current_open_version(session, project.id)
+                    if open_version is None:
+                        logger.warning(
+                            "[STRATEGIC] Task %s: fallback staged create '%s' skipped "
+                            "because no open version exists",
+                            task.id,
+                            text[:60],
+                        )
+                        continue
+                    staged_for_version = open_version.version_number
+
+                criterion_keys_supplied = "criterion_keys" in op_entry
+                criterion_keys: list[str] = []
+                criterion_release_version_id = None
+                if criterion_keys_supplied:
+                    raw_criterion_keys = op_entry.get("criterion_keys")
+                    if not isinstance(raw_criterion_keys, list) or not all(
+                        isinstance(key, str) and key.strip()
+                        for key in raw_criterion_keys
+                    ):
+                        logger.warning(
+                            "[STRATEGIC] Task %s: direction create '%s' rejected — "
+                            "criterion_keys must be a list of non-empty strings",
+                            task.id,
+                            text[:60],
+                        )
+                        continue
+                    criterion_keys = list(
+                        dict.fromkeys(key.strip() for key in raw_criterion_keys)
+                    )
+                    if criterion_keys:
+                        from app.direction_referential_guard import (
+                            check_criterion_key_write,
+                            load_version_criterion_key_sets,
+                        )
+                        from app.release_version import current_open_version
+
+                        criterion_version = (
+                            open_version
+                            if staged_create
+                            else await current_open_version(session, project.id)
+                        )
+                        if criterion_version is None:
+                            logger.warning(
+                                "[STRATEGIC] Task %s: direction create '%s' rejected — "
+                                "criterion_keys require an open version",
+                                task.id,
+                                text[:60],
+                            )
+                            continue
+                        active_keys, inactive_keys = (
+                            await load_version_criterion_key_sets(
+                                session, project.id, criterion_version.id
+                            )
+                        )
+                        invalid_criterion_keys = [
+                            key
+                            for key in criterion_keys
+                            if check_criterion_key_write(
+                                key, active_keys, inactive_keys
+                            )[0]
+                            is not None
+                        ]
+                        if invalid_criterion_keys:
+                            logger.warning(
+                                "[STRATEGIC] Task %s: direction create '%s' rejected — "
+                                "invalid criterion_keys: %s",
+                                task.id,
+                                text[:60],
+                                invalid_criterion_keys,
+                            )
+                            continue
+                        criterion_release_version_id = criterion_version.id
+
+                raw_conflicts_with = op_entry.get("conflicts_with")
+                conflicts_with: list[str] | None = None
+                if raw_conflicts_with is not None:
+                    if not isinstance(raw_conflicts_with, list) or not all(
+                        isinstance(direction_id, str)
+                        for direction_id in raw_conflicts_with
+                    ):
+                        logger.warning(
+                            "[STRATEGIC] Task %s: direction create '%s' rejected — "
+                            "conflicts_with must be a list of direction IDs",
+                            task.id,
+                            text[:60],
+                        )
+                        continue
+                    existing_direction_ids = {
+                        str(direction.get("id"))
+                        for direction in directions
+                        if direction.get("id")
+                    }
+                    invalid_conflicts = [
+                        direction_id
+                        for direction_id in raw_conflicts_with
+                        if direction_id not in existing_direction_ids
+                    ]
+                    if invalid_conflicts:
+                        logger.warning(
+                            "[STRATEGIC] Task %s: direction create '%s' rejected — "
+                            "unknown conflicts_with IDs: %s",
+                            task.id,
+                            text[:60],
+                            invalid_conflicts,
+                        )
+                        continue
+                    conflicts_with = list(raw_conflicts_with)
                 _DIR_FIELD_MAX = 500
                 # Deterministic ID: same task + same text always produces the same
                 # direction ID, so a post-commit replay that re-parses direction_ops
@@ -5294,7 +5294,7 @@ async def _handle_strategic_completion(
                 new_dir = {
                     "id": _dir_id,
                     "text": text,
-                    "status": "active",
+                    "status": "staged" if staged_create else "active",
                     "priority": priority,
                     "notes": (
                         [
@@ -5340,6 +5340,17 @@ async def _handle_strategic_completion(
                         "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
                     },
                 }
+                if criterion_keys_supplied:
+                    new_dir["criterion_keys"] = criterion_keys
+                    if criterion_release_version_id is not None:
+                        new_dir["criterion_release_version_id"] = str(
+                            criterion_release_version_id
+                        )
+                if conflicts_with is not None:
+                    new_dir["conflicts_with"] = conflicts_with
+                if staged_create:
+                    new_dir["staged_for_version"] = staged_for_version
+                    new_dir["staged_at"] = _utcnow().isoformat()
                 if _retired_grounding:
                     new_dir["context"]["retired_direction_grounding"] = (
                         _retired_grounding
@@ -5418,17 +5429,20 @@ async def _handle_strategic_completion(
                             or ""
                         ),
                     }
-                current_active = sum(
-                    1 for d in directions if d.get("status") == "active"
-                )
-                if current_active >= _runtime_config.get("max_active_directions", 10):
-                    logger.warning(
-                        f"[STRATEGIC] Skipping direction create: active count {current_active} >= cap"
+                if not staged_create:
+                    current_active = sum(
+                        1 for d in directions if d.get("status") == "active"
                     )
-                    continue
+                    if current_active >= _runtime_config.get(
+                        "max_active_directions", 10
+                    ):
+                        logger.warning(
+                            f"[STRATEGIC] Skipping direction create: active count {current_active} >= cap"
+                        )
+                        continue
                 # Translate recommended_mode='pause' to paused status so the
                 # existing spawn-skip (status != 'active') mechanism handles it.
-                if rec_mode == "pause":
+                if rec_mode == "pause" and not staged_create:
                     new_dir["status"] = "paused"
                     new_dir["auto_paused"] = True
                     new_dir["paused_reason"] = (

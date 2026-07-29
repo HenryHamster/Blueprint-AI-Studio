@@ -4859,7 +4859,7 @@ async def test_spawn_task_persists_durable_request(strategic_db):
 
 @pytest.mark.asyncio
 async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker):
-    """First cycle with 0 dirs_created and active_count < 3 increments starvation counter to 1."""
+    """An uncovered non-deferred problem-model gap increments the signal."""
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
@@ -4867,6 +4867,16 @@ async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker)
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-uncovered",
+                    "name": "Uncovered reliability gap",
+                    "status": "active",
+                    "active_moves": [],
+                }
+            ]
+        },
     )
     strategic_db.add(project)
     await strategic_db.commit()
@@ -4890,7 +4900,7 @@ async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker)
 async def test_starvation_triggers_alert_and_override_after_two_cycles(
     strategic_db, mocker
 ):
-    """Two consecutive cycles with 0 dirs and active_count < 3 triggers alert and sets override."""
+    """Two consecutive cycles leaving a concrete gap uncovered alert and accelerate."""
     alert_mock = mocker.patch(
         "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
     )
@@ -4901,6 +4911,16 @@ async def test_starvation_triggers_alert_and_override_after_two_cycles(
         user_id="u1",
         vision={"purpose": "test", "revision": 1, "_direction_starvation_count": 1},
         directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-uncovered",
+                    "name": "Uncovered reliability gap",
+                    "status": "active",
+                    "active_moves": [],
+                }
+            ]
+        },
     )
     strategic_db.add(project)
     await strategic_db.commit()
@@ -4918,15 +4938,19 @@ async def test_starvation_triggers_alert_and_override_after_two_cycles(
     assert project.vision.get("_direction_starvation_count") == 2
     assert project.vision.get("_strategic_frequency_override") == 2
     alert_mock.assert_called_once()
-    # Alert message should mention starvation
+    # Alert names the concrete uncovered gap.
     alert_msg = alert_mock.call_args[0][2]
-    assert "starvation" in alert_msg.lower()
+    assert "g-uncovered" in alert_msg
 
 
 @pytest.mark.asyncio
-async def test_starvation_counter_resets_on_direction_creation(strategic_db, mocker):
-    """When dirs_created > 0, starvation counter and frequency override are cleared."""
-    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+async def test_starvation_persists_when_created_direction_does_not_cover_gap(
+    strategic_db, mocker
+):
+    """An unrelated direction create must not hide a concrete uncovered gap."""
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
+    )
 
     project = Project(
         name="P",
@@ -4938,6 +4962,16 @@ async def test_starvation_counter_resets_on_direction_creation(strategic_db, moc
             "_strategic_frequency_override": 2,
         },
         directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-unrelated",
+                    "name": "Unrelated uncovered gap",
+                    "status": "active",
+                    "active_moves": [],
+                }
+            ]
+        },
     )
     strategic_db.add(project)
     await strategic_db.commit()
@@ -4952,8 +4986,9 @@ async def test_starvation_counter_resets_on_direction_creation(strategic_db, moc
     await _handle_strategic_completion(task, "", strategic_db)
 
     await strategic_db.refresh(project)
-    assert project.vision.get("_direction_starvation_count") == 0
-    assert "_strategic_frequency_override" not in project.vision
+    assert project.vision.get("_direction_starvation_count") == 3
+    assert project.vision.get("_strategic_frequency_override") == 2
+    assert "g-unrelated" in alert_mock.call_args.args[2]
 
 
 @pytest.mark.asyncio
@@ -4989,10 +5024,10 @@ async def test_starvation_no_gap_no_increment(strategic_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_starvation_auto_creates_direction_after_five_cycles(
+async def test_starvation_never_auto_creates_direction_after_five_cycles(
     strategic_db, mocker
 ):
-    """After 5 consecutive empty cycles with no product direction, auto-creates a product direction."""
+    """Persistent uncovered gaps keep alerting but never manufacture a direction."""
     alert_mock = mocker.patch(
         "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
     )
@@ -5008,6 +5043,16 @@ async def test_starvation_auto_creates_direction_after_five_cycles(
             "_strategic_frequency_override": 2,
         },
         directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-uncovered",
+                    "name": "Uncovered product gap",
+                    "status": "active",
+                    "active_moves": [],
+                }
+            ]
+        },
     )
     strategic_db.add(project)
     await strategic_db.commit()
@@ -5027,46 +5072,33 @@ async def test_starvation_auto_creates_direction_after_five_cycles(
     await strategic_db.execute(
         _select(Project).where(Project.id == project.id).execution_options(populate_existing=True)
     )
-    # Counter should be reset to 0 and override cleared
-    assert project.vision.get("_direction_starvation_count") == 0
-    assert "_strategic_frequency_override" not in project.vision
-    # A new direction should have been auto-created
-    assert len(project.directions) == 2
-    new_dir = project.directions[-1]
-    assert new_dir["status"] == "active"
-    assert new_dir["priority"] == "medium"
-    assert new_dir["category"] == "product"
-    assert "Deliver user-visible product improvements" in new_dir["text"]
-    assert len(new_dir["notes"]) == 1
-    assert "starvation handler" in new_dir["notes"][0]["text"]
-    assert new_dir["research_history"] == []
-    # Alert should be fired
+    assert project.vision.get("_direction_starvation_count") == 5
+    assert project.vision.get("_strategic_frequency_override") == 2
+    assert len(project.directions) == 1
     alert_mock.assert_called_once()
     alert_msg = alert_mock.call_args[0][2]
-    assert "fallback" in alert_msg.lower()
+    assert "g-uncovered" in alert_msg
+    assert "no direction was auto-created" in alert_msg
 
 
 @pytest.mark.asyncio
-async def test_starvation_auto_create_respects_direction_cap(strategic_db, mocker):
-    """Auto-creation does NOT exceed max_active_directions when cap is reached."""
-    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._runtime_config", {"max_active_directions": 2}
+async def test_direction_count_without_problem_model_gap_does_not_starve(
+    strategic_db, mocker
+):
+    """Low direction count alone is not an uncovered strategic gap."""
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
     )
-
-    # Two active directions already at cap
     project = Project(
         name="P",
         user_id="u1",
         vision={
             "purpose": "test",
             "revision": 1,
-            "_direction_starvation_count": 4,
+            "_direction_starvation_count": 1,
+            "_strategic_frequency_override": 2,
         },
-        directions=[
-            {"id": "d-aaa", "status": "active", "text": "Dir A"},
-            {"id": "d-bbb", "status": "active", "text": "Dir B"},
-        ],
+        directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
     )
     strategic_db.add(project)
     await strategic_db.commit()
@@ -5081,10 +5113,10 @@ async def test_starvation_auto_create_respects_direction_cap(strategic_db, mocke
     await _handle_strategic_completion(task, "", strategic_db)
 
     await strategic_db.refresh(project)
-    # No new direction should be added — cap is at 2, already at 2
-    assert len(project.directions) == 2
-    # Starvation counter increments (no reset since no direction was created)
-    assert project.vision.get("_direction_starvation_count") == 5
+    assert len(project.directions) == 1
+    assert project.vision.get("_direction_starvation_count") == 0
+    assert "_strategic_frequency_override" not in project.vision
+    alert_mock.assert_not_called()
 
 
 # ── Structural Refactor Pipeline Relaxations ──────────────────────────────────

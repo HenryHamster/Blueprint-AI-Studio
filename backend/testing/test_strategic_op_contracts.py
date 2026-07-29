@@ -4,9 +4,82 @@ import pytest
 from fastapi import HTTPException
 
 from app.strategic_op_contracts import (
+    normalize_create_direction,
     normalize_problem_model_envelope,
     normalize_update_direction,
 )
+
+
+def test_create_direction_requires_durable_outcome_contract_and_normalizes_text():
+    assert normalize_create_direction(
+        {
+            "text": "  Deliver a reproducible evaluation artifact. ",
+            "success_evidence": " Clean-clone run produces validated output. ",
+            "retirement_condition": " Artifact is merged or the bet is invalidated. ",
+            "priority": "high",
+            "staged": False,
+            "conflicts_with": ["d-other"],
+        }
+    ) == {
+        "text": "Deliver a reproducible evaluation artifact.",
+        "success_evidence": "Clean-clone run produces validated output.",
+        "retirement_condition": "Artifact is merged or the bet is invalidated.",
+        "priority": "high",
+        "staged": False,
+        "conflicts_with": ["d-other"],
+    }
+
+
+def test_create_direction_accepts_existing_mixed_category():
+    normalized = normalize_create_direction(
+        {
+            "text": "Unify product and structural reliability outcomes",
+            "success_evidence": "The combined outcome is observable",
+            "retirement_condition": "The combined gap is closed",
+            "category": "mixed",
+        }
+    )
+    assert normalized["category"] == "mixed"
+
+
+@pytest.mark.parametrize(
+    ("data", "field"),
+    [
+        ({}, "text"),
+        (
+            {
+                "text": "outcome",
+                "success_evidence": "",
+                "retirement_condition": "done",
+            },
+            "success_evidence",
+        ),
+        (
+            {
+                "text": "outcome",
+                "success_evidence": "observed",
+                "retirement_condition": "done",
+                "staged": "yes",
+            },
+            "staged",
+        ),
+        (
+            {
+                "text": "outcome",
+                "success_evidence": "observed",
+                "retirement_condition": "done",
+                "surprise": True,
+            },
+            "surprise",
+        ),
+    ],
+)
+def test_create_direction_returns_stable_structural_errors(data, field):
+    with pytest.raises(HTTPException) as rejected:
+        normalize_create_direction(data)
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail["code"] == "invalid_strategic_input"
+    assert rejected.value.detail["field"] == field
 
 
 def test_update_direction_accepts_canonical_direct_fields():

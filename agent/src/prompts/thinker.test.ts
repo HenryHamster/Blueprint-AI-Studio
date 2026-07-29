@@ -170,6 +170,40 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## 8. Acceptance criteria');
   });
 
+  it('distinguishes durable directions from bounded tasks and live state', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain(
+      'A **direction** is a durable strategic outcome or bet that may require multiple cycles',
+    );
+    expect(prompt).toContain('A **task** is a bounded unit of implementation');
+    expect(prompt).toContain('A **running update** holds replaceable live state');
+    expect(prompt).toContain('Fleet capacity is a ceiling, never a target for direction count');
+  });
+
+  it('parallelizes execution with tasks instead of file-sharded directions', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('multiple bounded tasks under the existing direction');
+    expect(prompt).toContain(
+      'the default for bounded implementation, investigation, design, QA, or compute',
+    );
+    expect(prompt).toContain('multiple tasks carrying the same owning `direction_id`');
+    expect(prompt).toContain(
+      'reserve for genuinely standalone operational work with no owning strategic outcome',
+    );
+    expect(prompt).toContain('A stabilize cycle may legitimately open zero directions');
+    expect(prompt).toContain(
+      'never because work touches different files, can use another worker, or represents a later implementation stage',
+    );
+    expect(prompt).not.toContain('Three bold directions moving in parallel almost always beats one');
+    expect(prompt).not.toContain('create/dispatch BOTH now');
+    expect(prompt).not.toContain('No cap on moves');
+    expect(prompt).not.toContain('a healthy portfolio of several genuine ones is expected');
+    expect(prompt).not.toContain('A stabilize cycle with zero opened directions is the failure mode');
+    expect(prompt).not.toContain(
+      'with a `direction_id`** (research/plan/`web_research`/`design`/`compute_experiment`)',
+    );
+  });
+
   it('includes sweep synthesis guidance for reading back completed experiments', () => {
     const prompt = buildThinkerPrompt(base);
     expect(prompt).toContain('Sweep synthesis');
@@ -1681,9 +1715,10 @@ describe('buildThinkerPrompt stabilize-hardening guidance', () => {
     const prompt = buildThinkerPrompt(base);
     // Stabilize must be framed as active hardening, not idling.
     expect(prompt).toContain('Stabilize is hardening time, not idle time');
-    expect(prompt).toContain('NOT license to stop opening directions');
-    // The fix steers the strategist to go find work via an audit instead of holding.
-    expect(prompt).toContain('Commission an audit');
-    expect(prompt).toContain('do not manufacture lanes');
+    expect(prompt).toContain('A stabilize cycle may legitimately open zero directions');
+    // Unknown hardening work triggers an audit, whose tasks stay under an owning outcome.
+    expect(prompt).toContain('commission an audit');
+    expect(prompt).toContain('attach the resulting tasks to an owning direction');
+    expect(prompt).not.toContain('NOT license to stop opening directions');
   });
 });

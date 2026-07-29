@@ -51,6 +51,28 @@ UPDATE_DIRECTION_METADATA_FIELDS = frozenset(
     }
 )
 
+CREATE_DIRECTION_FIELDS = frozenset(
+    {
+        "text",
+        "success_evidence",
+        "retirement_condition",
+        "rationale",
+        "priority",
+        "gap_id",
+        "implementation_constraints",
+        "criterion_keys",
+        "recommended_mode",
+        "system_id",
+        "conflicts_with",
+        "staged",
+        "dedup_reasoning",
+        # Retained compatibility fields. New callers should keep file routing
+        # and implementation decomposition in spawn_task instead.
+        "category",
+        "paths",
+    }
+)
+
 PROBLEM_MODEL_PATCH_FIELDS = frozenset(
     {"base_revision", "patch", "transient_actions", "dry_run"}
 )
@@ -80,6 +102,55 @@ def _check_unknown(data: dict[str, Any], allowed: frozenset[str]) -> None:
             unknown[0],
             f"unknown field(s): {', '.join(unknown)}; accepted fields: {', '.join(sorted(allowed))}",
         )
+
+
+def normalize_create_direction(data: Any) -> dict[str, Any]:
+    """Validate and normalize the structural create-direction envelope.
+
+    This intentionally does not attempt to judge whether prose is "strategic".
+    The prompt/challenge own that semantic judgment; this boundary owns stable
+    errors, accepted fields, and unambiguous scalar/list shapes.
+    """
+    raw = _object(data, "data")
+    _check_unknown(raw, CREATE_DIRECTION_FIELDS)
+    for field in ("text", "success_evidence", "retirement_condition"):
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise _field_error(field, "is required and must be a non-empty string")
+        raw[field] = value.strip()
+
+    for field in (
+        "rationale",
+        "gap_id",
+        "implementation_constraints",
+        "recommended_mode",
+        "system_id",
+    ):
+        if field in raw and raw[field] is not None and not isinstance(raw[field], str):
+            raise _field_error(field, "must be a string")
+
+    if "priority" in raw and raw["priority"] not in {"high", "medium", "low"}:
+        raise _field_error("priority", "must be one of: high, medium, low")
+    if "staged" in raw and not isinstance(raw["staged"], bool):
+        raise _field_error("staged", "must be a boolean")
+    if "category" in raw and raw["category"] not in {
+        "product",
+        "structural",
+        "mixed",
+    }:
+        raise _field_error(
+            "category", "must be one of: product, structural, mixed"
+        )
+
+    for field in ("criterion_keys", "conflicts_with", "paths"):
+        if field not in raw:
+            continue
+        value = raw[field]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise _field_error(field, "must be a list of strings")
+    if "dedup_reasoning" in raw and not isinstance(raw["dedup_reasoning"], Mapping):
+        raise _field_error("dedup_reasoning", "must be an object")
+    return raw
 
 
 def normalize_update_direction(data: Any) -> dict[str, Any]:

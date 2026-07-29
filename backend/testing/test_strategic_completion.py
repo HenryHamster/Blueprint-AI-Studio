@@ -2164,8 +2164,12 @@ class TestCheckDirectionStarvation:
         assert "_strategic_frequency_override" not in project.vision
 
     @pytest.mark.asyncio
-    async def test_dirs_created_resets_counter(self, strat_fail_db, mocker):
-        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
+    async def test_unrelated_direction_creation_does_not_cover_gap(
+        self, strat_fail_db, mocker
+    ):
+        alert_mock = mocker.patch(
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
+        )
         project = Project(
             name="P",
             user_id="u1",
@@ -2174,20 +2178,31 @@ class TestCheckDirectionStarvation:
                 "_strategic_frequency_override": 2,
             },
             directions=[_active_dir(id="1", category="product")],
+            problem_model={
+                "gaps": [
+                    {
+                        "id": "g-still-uncovered",
+                        "name": "Still uncovered",
+                        "status": "active",
+                        "active_moves": [],
+                    }
+                ]
+            },
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
 
-        # dirs_created > 0 → reset even though has_gaps is True
+        # Creating an unrelated direction is not evidence that this gap is staffed.
         await _check_direction_starvation(
             project, dirs_created=1, session=strat_fail_db
         )
 
-        assert project.vision.get("_direction_starvation_count") == 0
-        assert "_strategic_frequency_override" not in project.vision
+        assert project.vision.get("_direction_starvation_count") == 5
+        assert project.vision.get("_strategic_frequency_override") == 2
+        assert "g-still-uncovered" in alert_mock.call_args.args[2]
 
     @pytest.mark.asyncio
-    async def test_below_minimum_increments_counter(self, strat_fail_db, mocker):
+    async def test_uncovered_gap_increments_counter(self, strat_fail_db, mocker):
         alert_mock = mocker.patch(
             "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
         )
@@ -2196,6 +2211,16 @@ class TestCheckDirectionStarvation:
             user_id="u1",
             vision={},
             directions=[_active_dir(id="1", category="product")],
+            problem_model={
+                "gaps": [
+                    {
+                        "id": "g-uncovered",
+                        "name": "Uncovered reliability gap",
+                        "status": "active",
+                        "active_moves": [],
+                    }
+                ]
+            },
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
@@ -2221,6 +2246,16 @@ class TestCheckDirectionStarvation:
             user_id="u1",
             vision={"_direction_starvation_count": 1},
             directions=[_active_dir(id="1", category="product")],
+            problem_model={
+                "gaps": [
+                    {
+                        "id": "g-uncovered",
+                        "name": "Uncovered reliability gap",
+                        "status": "active",
+                        "active_moves": [],
+                    }
+                ]
+            },
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
@@ -2232,15 +2267,14 @@ class TestCheckDirectionStarvation:
         assert project.vision.get("_direction_starvation_count") == 2
         assert project.vision.get("_strategic_frequency_override") == 2
         alert_mock.assert_called_once()
+        assert "g-uncovered" in alert_mock.call_args.args[2]
+        assert "no direction was auto-created" in alert_mock.call_args.args[2]
 
     @pytest.mark.asyncio
-    async def test_level_5_auto_creates_no_product_fallback(
-        self, strat_fail_db, mocker
-    ):
+    async def test_level_5_keeps_alerting_without_auto_create(self, strat_fail_db, mocker):
         alert_mock = mocker.patch(
             "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
         )
-        # Active directions but NONE are product → gap_type=NO_PRODUCT_DIRECTIONS
         project = Project(
             name="P",
             user_id="u1",
@@ -2253,6 +2287,16 @@ class TestCheckDirectionStarvation:
                 _active_dir(id="2", category="structural"),
                 _active_dir(id="3", category="structural"),
             ],
+            problem_model={
+                "gaps": [
+                    {
+                        "id": "g-uncovered",
+                        "name": "Uncovered product gap",
+                        "status": "active",
+                        "active_moves": [],
+                    }
+                ]
+            },
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
@@ -2261,207 +2305,53 @@ class TestCheckDirectionStarvation:
             project, dirs_created=0, session=strat_fail_db
         )
 
-        # Fallback direction appended with product category
-        assert len(project.directions) == 4
-        new_dir = project.directions[-1]
-        assert new_dir["category"] == "product"
-        assert new_dir["status"] == "active"
-        assert new_dir["priority"] == "medium"
-        assert new_dir["id"].startswith("d-")
-        # Counter and override cleared
+        assert len(project.directions) == 3
+        assert project.vision.get("_direction_starvation_count") == 5
+        assert project.vision.get("_strategic_frequency_override") == 2
+        alert_mock.assert_called_once()
+        assert "g-uncovered" in alert_mock.call_args.args[2]
+
+    @pytest.mark.asyncio
+    async def test_staffed_or_deferred_gaps_do_not_trigger(self, strat_fail_db, mocker):
+        alert_mock = mocker.patch(
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
+        )
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 3,
+                "_strategic_frequency_override": 2,
+            },
+            directions=[_active_dir(id="1", category="product")],
+            problem_model={
+                "gaps": [
+                    {
+                        "id": "g-staffed",
+                        "name": "Staffed",
+                        "status": "active",
+                        "active_moves": ["d-1"],
+                    },
+                    {
+                        "id": "g-deferred",
+                        "name": "Deferred",
+                        "status": "active",
+                        "active_moves": [],
+                        "deferral": {"rationale": "intentional hold"},
+                    },
+                ]
+            },
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
+
         assert project.vision.get("_direction_starvation_count") == 0
         assert "_strategic_frequency_override" not in project.vision
-        alert_mock.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_level_5_below_minimum_fallback_no_category(
-        self, strat_fail_db, mocker
-    ):
-        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
-        # 1 active product direction; product_count > 0 but active_count < 3
-        project = Project(
-            name="P",
-            user_id="u1",
-            vision={"_direction_starvation_count": 4},
-            directions=[_active_dir(id="1", category="product")],
-        )
-        strat_fail_db.add(project)
-        await strat_fail_db.commit()
-
-        await _check_direction_starvation(
-            project, dirs_created=0, session=strat_fail_db
-        )
-
-        assert len(project.directions) == 2
-        new_dir = project.directions[-1]
-        # BELOW_MINIMUM → no category set
-        assert "category" not in new_dir
-
-    @pytest.mark.asyncio
-    async def test_level_5_all_saturated_fallback(self, strat_fail_db, mocker):
-        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
-        # 3 active product directions, all saturated → gap_type=ALL_SATURATED
-        project = Project(
-            name="P",
-            user_id="u1",
-            vision={"_direction_starvation_count": 4},
-            directions=[
-                _active_dir(id="1", category="product", possibly_saturated=True),
-                _active_dir(id="2", category="product", possibly_saturated=True),
-                _active_dir(id="3", category="product", possibly_saturated=True),
-            ],
-        )
-        strat_fail_db.add(project)
-        await strat_fail_db.commit()
-
-        await _check_direction_starvation(
-            project, dirs_created=0, session=strat_fail_db
-        )
-
-        assert len(project.directions) == 4
-        new_dir = project.directions[-1]
-        assert "category" not in new_dir
-
-    @pytest.mark.asyncio
-    async def test_level_5_cap_reached_skips_creation(self, strat_fail_db, mocker):
-        alert_mock = mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
-        )
-        mocker.patch.dict(
-            "app.strategic_completion._runtime_config",
-            {"max_active_directions": 2},
-            clear=False,
-        )
-        project = Project(
-            name="P",
-            user_id="u1",
-            vision={"_direction_starvation_count": 4},
-            directions=[
-                _active_dir(id="1", category="structural"),
-                _active_dir(id="2", category="structural"),
-            ],
-        )
-        strat_fail_db.add(project)
-        await strat_fail_db.commit()
-
-        await _check_direction_starvation(
-            project, dirs_created=0, session=strat_fail_db
-        )
-
-        # No fallback added, counter NOT reset (kept incrementing)
-        assert len(project.directions) == 2
-        assert project.vision.get("_direction_starvation_count") == 5
         alert_mock.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_starvation_fallback_dedups_against_persisted_rejected_memory(
-        self, strat_fail_db, mocker
-    ):
-        """Starvation fallback deduplicates against vision['rejected_proposals'].
-
-        The directions list contains no active product directions (triggering
-        NO_PRODUCT_DIRECTIONS gap).  The fallback text is "Deliver user-visible
-        product improvements".  We pre-seed vision['rejected_proposals'] with a
-        recent entry whose text overlaps enough (>=4 shared non-stopword tokens)
-        to trigger the duplicate guard — simulating the scenario where the
-        matching direction was pruned from the directions list but its rejection
-        was persisted in vision memory.  The fallback must NOT create a new
-        direction; instead it resets the counter and fires an alert.
-        """
-        alert_mock = mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
-        )
-        from datetime import timezone
-
-        recent_ts = (
-            __import__("datetime").datetime.now(timezone.utc).isoformat()
-        )
-        project = Project(
-            name="P",
-            user_id="u1",
-            vision={
-                "_direction_starvation_count": 4,
-                "rejected_proposals": [
-                    {
-                        # >=4 shared non-stopword tokens with fallback text
-                        # "Deliver user-visible product improvements"
-                        "text": "Deliver user-visible product improvements for users",
-                        "rejected_at": recent_ts,
-                    }
-                ],
-            },
-            directions=[
-                _active_dir(id="1", category="structural"),
-                _active_dir(id="2", category="structural"),
-                _active_dir(id="3", category="structural"),
-            ],
-        )
-        strat_fail_db.add(project)
-        await strat_fail_db.commit()
-
-        await _check_direction_starvation(
-            project, dirs_created=0, session=strat_fail_db
-        )
-
-        # No new direction created — dedup matched persisted rejected memory
-        assert len(project.directions) == 3
-        # Counter reset (dedup path resets and alerts instead of creating)
-        assert project.vision.get("_direction_starvation_count") == 0
-        # Alert fired to prompt manual intervention
-        alert_mock.assert_called_once()
-
-    async def test_starvation_fallback_dedups_against_retired_memory(
-        self, strat_fail_db, mocker
-    ):
-        """Starvation fallback is suppressed when its text overlaps a recently-retired direction.
-
-        Proof: counter reset + operator alert fired, no direction created.
-        """
-        alert_mock = mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
-        )
-        from datetime import timezone
-
-        recent_ts = (
-            __import__("datetime").datetime.now(timezone.utc).isoformat()
-        )
-        # Pre-seed retired memory with tokens that overlap the fallback
-        # "Deliver user-visible product improvements" (NO_PRODUCT_DIRECTIONS gap).
-        project = Project(
-            name="P",
-            user_id="u1",
-            vision={
-                "_direction_starvation_count": 4,
-                "_recently_retired_directions": [
-                    {
-                        "id": "d-retired1",
-                        "text_tokens": list(
-                            {"deliver", "user-visible", "product", "improvements"}
-                        ),
-                        "retired_at": recent_ts,
-                        "reason": "strategic_retire",
-                    }
-                ],
-            },
-            directions=[
-                _active_dir(id="1", category="structural"),
-                _active_dir(id="2", category="structural"),
-                _active_dir(id="3", category="structural"),
-            ],
-        )
-        strat_fail_db.add(project)
-        await strat_fail_db.commit()
-
-        await _check_direction_starvation(
-            project, dirs_created=0, session=strat_fail_db
-        )
-
-        # No new direction created — dedup matched retired memory
-        assert len(project.directions) == 3
-        # Counter reset (dedup path resets and alerts instead of creating)
-        assert project.vision.get("_direction_starvation_count") == 0
-        # Alert fired to prompt manual intervention
-        alert_mock.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_starvation_and_bootstrap_counters_idempotent_on_replay(
@@ -2486,7 +2376,17 @@ class TestCheckDirectionStarvation:
             name="StarveP",
             user_id="u1",
             vision={},
-            directions=[_active_dir(id="1", category="structural")],  # <3 active → gap
+            directions=[_active_dir(id="1", category="structural")],
+            problem_model={
+                "gaps": [
+                    {
+                        "id": "g-uncovered",
+                        "name": "Uncovered reliability gap",
+                        "status": "active",
+                        "active_moves": [],
+                    }
+                ]
+            },
         )
         strat_fail_db.add(project)
         await strat_fail_db.commit()
@@ -13723,6 +13623,89 @@ async def test_fallback_direction_ops_accept_http_style_create_direction(
     ]
     assert len(created) == 1
     assert created[0].get("status") == "active"
+
+
+@pytest.mark.asyncio
+async def test_fallback_create_preserves_staged_contract_and_ignores_active_cap(
+    db_session, mocker
+):
+    """Fallback creates must preserve the same inert/metadata semantics as HTTP."""
+    from unittest.mock import AsyncMock
+
+    from app import release_version as rv
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    existing = [
+        {
+            "id": f"d-active-{idx}",
+            "text": f"Active direction {idx}",
+            "status": "active",
+            "priority": "medium",
+            "research_history": [],
+            "notes": [],
+        }
+        for idx in range(10)
+    ]
+    project = Project(
+        name="FallbackStagedCreateContract",
+        user_id="u-fallback-staged-contract",
+        vision={"purpose": "test", "revision": 0},
+        directions=existing,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await rv.open_version(db_session, project.id, version_number=9)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Stage a mixed reliability outcome",
+                    "priority": "medium",
+                    "success_evidence": "The staged outcome is verified",
+                    "retirement_condition": "The combined gap is closed",
+                    "staged": True,
+                    "category": "mixed",
+                    "criterion_keys": [],
+                    "conflicts_with": ["d-active-0"],
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = next(
+        direction
+        for direction in project.directions
+        if direction.get("text") == "Stage a mixed reliability outcome"
+    )
+    assert created["status"] == "staged"
+    assert created["staged_for_version"] == 9
+    assert created.get("staged_at")
+    assert created["category"] == "mixed"
+    assert created["criterion_keys"] == []
+    assert created["conflicts_with"] == ["d-active-0"]
 
 
 @pytest.mark.asyncio

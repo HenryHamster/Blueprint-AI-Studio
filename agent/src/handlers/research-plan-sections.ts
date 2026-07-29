@@ -808,7 +808,7 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
   if ('fleet_utilization' in axes) {
     lines.push('');
     lines.push(
-      '_Fleet slot utilization is the share of max-plan account slots in use (now + short trailing average) across the whole fleet. Chronically low utilization WITH verified non-clashing backlog means throughput is being left on the table — parallelize existing work or open more non-clashing directions. But distinguish idle headroom from cooled accounts (shown only when present): cooldowns are a rate-limit problem, not a reason to manufacture work. Near capacity is healthy, not a deficit._',
+      '_Fleet slot utilization is the share of max-plan account slots in use (now + short trailing average) across the whole fleet. Chronically low utilization WITH a verified non-clashing task backlog means throughput may be left on the table — increase bounded task dispatch within the directions that own those outcomes. Capacity is never a reason to create or retain a direction. Distinguish idle headroom from cooled accounts (shown only when present): cooldowns are a rate-limit problem, not a reason to manufacture work. Near capacity is healthy, not a deficit._',
     );
   }
 

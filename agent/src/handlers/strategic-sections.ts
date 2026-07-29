@@ -1316,17 +1316,11 @@ export function buildDirectionPortfolioSection(
   const shippedPaused = directionsSummary.filter(d => strVal(d.status) === 'paused');
   const activeCount = authoritativeActiveCount ?? shippedActiveCount;
   const pausedCount = authoritativePausedCount ?? shippedPaused.length;
-  const detailComplete = authoritativeActiveCount === undefined || shippedActiveCount >= activeCount;
   const autoPausedCount = shippedPaused.filter(d => d.auto_paused === true).length;
   const userPausedCount = Math.max(0, pausedCount - autoPausedCount);
   const saturatedCount = shippedActiveDirections.filter(d => d.possibly_saturated === true).length;
   const productCount = shippedActiveDirections.filter(d => strVal(d.category) === 'product').length;
   const availableSlots = Math.max(0, maxActiveDirections - activeCount);
-
-  const gaps: string[] = [];
-  if (detailComplete && productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
-  if (detailComplete && saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
-  if (activeCount < 3) gaps.push('BELOW_MINIMUM');
 
   const pausedNote = pausedCount > 0
     ? ` Paused: ${pausedCount} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
@@ -1337,7 +1331,7 @@ export function buildDirectionPortfolioSection(
 
   const healthHeader = [
     `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}${trimNote}`,
-    gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
+    'Portfolio counts, categories, saturation, and available slots are descriptive state, not targets or evidence that another direction is required.',
   ].join('\n');
 
   // ── Direction listing ──
@@ -1497,9 +1491,9 @@ export function buildPendingFollowupsSection(followups: unknown): string {
       lines.push(`    Direction: ${dirId}`);
     }
   }
-  lines.push('\n_To consume (acted on / direction spawned): `./strategic consume-knowledge-followup \'{"document_id":"<id>","reason":"<what was done / which direction was spawned>"}\'`_');
+  lines.push('\n_To consume (acted on / attached to an owning outcome): `./strategic consume-knowledge-followup \'{"document_id":"<id>","reason":"<what was done / owning direction or task>"}\'`_');
   lines.push('_To dismiss (not actionable): `./strategic dismiss-knowledge-followup \'{"document_id":"<id>","reason":"<why not actionable>"}\'`_');
-  lines.push('_Consider spawning a direction to act on pending knowledge, or consuming it if already addressed._');
+  lines.push('_Act on pending knowledge with bounded tasks under the direction that owns the outcome. Create a direction only when the knowledge establishes a genuinely distinct durable outcome; otherwise consume it if already addressed._');
   return lines.join('\n');
 }
 
@@ -1511,25 +1505,16 @@ export function buildDirHealthSummary(
   const shippedActiveDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
   const shippedActiveCount = shippedActiveDirections.length;
   const shippedPaused = directionsSummary.filter(d => strVal(d.status) === 'paused');
-  // Anchor the headline count, slots math, and BELOW_MINIMUM flag on the
-  // trim-proof authoritative count when the backend shipped it; fall back to the
+  // Anchor the headline count and slots math on the trim-proof authoritative
+  // count when the backend shipped it; fall back to the
   // (possibly trimmed) shipped list only for old payloads/tests that omit it.
   const activeCount = authoritative ? authoritative.active : shippedActiveCount;
   const pausedCount = authoritative ? authoritative.paused : shippedPaused.length;
-  // Whether the shipped detail list covers the FULL active slate. Saturation /
-  // product-ratio gap flags require the complete list — a trimmed/dropped list
-  // cannot prove absence of a product direction or universal saturation, so we
-  // suppress those flags (but never BELOW_MINIMUM, which the count proves).
-  const detailComplete = !authoritative || shippedActiveCount >= activeCount;
   const autoPausedCount = shippedPaused.filter(d => d.auto_paused === true).length;
   const userPausedCount = Math.max(0, pausedCount - autoPausedCount);
   const saturatedCount = shippedActiveDirections.filter(d => d.possibly_saturated === true).length;
   const productCount = shippedActiveDirections.filter(d => strVal(d.category) === 'product').length;
   const availableSlots = Math.max(0, maxActiveDirections - activeCount);
-  const gaps: string[] = [];
-  if (detailComplete && productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
-  if (detailComplete && saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
-  if (activeCount < 3) gaps.push('BELOW_MINIMUM');
   const pausedNote = pausedCount > 0
     ? ` Paused: ${pausedCount} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
     : '';
@@ -1538,7 +1523,7 @@ export function buildDirHealthSummary(
     : '';
   return [
     `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}${trimNote}`,
-    gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
+    'Portfolio counts, categories, saturation, and available slots are descriptive state, not targets or evidence that another direction is required.',
   ].join('\n');
 }
 
