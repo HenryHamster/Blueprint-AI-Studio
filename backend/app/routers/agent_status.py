@@ -1181,30 +1181,31 @@ async def update_agent_status(
     #     (early-commit pattern at line ~1635), so the contention window is
     #     bounded to the few-ms early-commit phase, not the full post-commit
     locked_resident_project: Project | None = None
-    if payload.resident_incarnation_id is not None:
-        resident_task = (
-            await session.execute(
-                select(Task).where(
-                    Task.id == payload.task_id,
-                    Task.vm_instance_id == token.get("vm_instance_id"),
-                )
+    resident_task = (
+        await session.execute(
+            select(Task).where(
+                Task.id == payload.task_id,
+                Task.vm_instance_id == token.get("vm_instance_id"),
             )
-        ).scalars().first()
-        if (
-            resident_task is not None
-            and (resident_task.context or {}).get("_resident_session") is True
-        ):
-            # Resident terminal updates share the same authority boundary as
-            # heartbeats and strategic mutations. Lock Project before Task so a
-            # displaced process cannot race the winner's shared Task outcome.
-            locked_resident_project = (
-                await session.execute(
-                    select(Project)
-                    .where(Project.id == resident_task.project_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            ).scalar_one_or_none()
+        )
+    ).scalars().first()
+    if (
+        resident_task is not None
+        and (resident_task.context or {}).get("_resident_session") is True
+    ):
+        # Resident terminal updates share the same authority boundary as
+        # heartbeats and strategic mutations. Lock Project before Task so a
+        # displaced process cannot race the winner's shared Task outcome.
+        # Missing incarnation is the deterministic legacy identity, not an
+        # opt-out: an old Agent must be fenced after a new process takes over.
+        locked_resident_project = (
+            await session.execute(
+                select(Project)
+                .where(Project.id == resident_task.project_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
     stmt = select(Task).where(
         Task.id == payload.task_id,
         Task.vm_instance_id == token.get("vm_instance_id"),

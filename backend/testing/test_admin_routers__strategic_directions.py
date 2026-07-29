@@ -256,6 +256,18 @@ async def test_stale_resident_process_cannot_mutate_or_post_terminal_status(
         },
     )
     assert terminal.status_code == 409, terminal.text
+    legacy_terminal = await client.post(
+        "/api/agent/status",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "artifact_type": "ERROR_LOG",
+            "failure_category": "claude_code_failed",
+            "logs": "old Agent must map to the fenced legacy incarnation",
+        },
+    )
+    assert legacy_terminal.status_code == 409, legacy_terminal.text
     await db_session.refresh(task)
     assert task.status == TaskStatus.IN_PROGRESS
     rows = (
