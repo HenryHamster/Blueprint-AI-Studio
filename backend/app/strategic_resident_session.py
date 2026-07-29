@@ -4214,6 +4214,7 @@ async def renew_resident_session_lease(
         "authority_held": False,
         "incarnation_held": False,
         "legacy_grace_until": None,
+        "lease_now": None,
         "stopped": False,
         "capped": False,
         "lapsed": False,
@@ -4237,11 +4238,13 @@ async def renew_resident_session_lease(
         The agent reads ``stop_requested=True`` from the response and ends its
         loop, posting the resident task terminal so the cadence reclaims.
         """
+        ended_now = holder.get("lease_now") or now
+        ended_now_iso = ended_now.isoformat()
         ended = dict(current)
         ended["status"] = STATUS_ENDED
         ended["stop_requested"] = True
-        ended["ended_at"] = now_iso
-        ended["updated_at"] = now_iso
+        ended["ended_at"] = ended_now_iso
+        ended["updated_at"] = ended_now_iso
         ended["activity"] = {
             **(
                 ended.get("activity")
@@ -4249,7 +4252,7 @@ async def renew_resident_session_lease(
                 else {}
             ),
             "phase": "ended",
-            "phase_started_at": now_iso,
+            "phase_started_at": ended_now_iso,
             "last_action": "Session ended after reaching the idle limit",
             "next_review_at": None,
         }
@@ -4257,6 +4260,11 @@ async def renew_resident_session_lease(
         vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
 
     def _renew(vision: dict[str, Any]) -> None:
+        # Sample after acquiring the Project lock. Pre-lock reads can block
+        # longer than the remaining incarnation lease.
+        lease_now = _utcnow()
+        lease_now_iso = lease_now.isoformat()
+        holder["lease_now"] = lease_now
         fresh = read_resident_session(vision)
         if not isinstance(fresh, dict):
             # Session record vanished under us — treat as no authority.
@@ -4280,7 +4288,7 @@ async def renew_resident_session_lease(
             task_id=task_id,
             worker_generation=worker_generation,
             incarnation_id=incarnation_id,
-            now=now,
+            now=lease_now,
         )
         if accepted_incarnation is None:
             current_after_claim = read_resident_session(vision) or {}
@@ -4297,7 +4305,7 @@ async def renew_resident_session_lease(
                 and str(current_after_claim.get("worker_incarnation_id"))
                 == str(legacy_incarnation)
                 and legacy_expiry is not None
-                and legacy_expiry > now
+                and legacy_expiry > lease_now
             ):
                 holder["legacy_grace_until"] = legacy_expiry
                 return
@@ -4387,13 +4395,13 @@ async def renew_resident_session_lease(
             return
 
         updated = dict(fresh)
-        updated["updated_at"] = now_iso
+        updated["updated_at"] = lease_now_iso
         updated["worker_state"] = "ready"
         updated.pop("worker_retry_until", None)
         updated.pop("worker_retry_reason", None)
-        updated["worker_heartbeat_at"] = now_iso
+        updated["worker_heartbeat_at"] = lease_now_iso
         if progress:
-            updated["last_progress_at"] = now_iso
+            updated["last_progress_at"] = lease_now_iso
         if op_reengaged and latest_msg_dt is not None:
             updated["last_operator_interaction_at"] = latest_msg_dt.isoformat()
         # Persist the agent's serialized exam-ledger so it survives a restart.
@@ -4422,7 +4430,7 @@ async def renew_resident_session_lease(
             updated["_operator_decision_summary"] = operator_decision_summary
             # Stamp the time of the most recent valid summary so absence
             # detection can measure elapsed time on future heartbeats.
-            updated["_operator_decision_summary_at"] = now_iso
+            updated["_operator_decision_summary_at"] = lease_now_iso
             # Enforce: cross into a strategist-internal notice when the capture
             # rate is chronically low. De-dupe on a persisted flag so the notice
             # fires at most once per low-capture crossing; a genuine recovery
@@ -4458,7 +4466,7 @@ async def renew_resident_session_lease(
                 not already_absent_notified
                 and isinstance(prior_summary, dict)
                 and last_summary_at is not None
-                and (now - last_summary_at).total_seconds()
+                and (lease_now - last_summary_at).total_seconds()
                 > _OPERATOR_DECISION_SUMMARY_STALE_SECONDS
                 and isinstance(prior_summary.get("total"), int)
                 and prior_summary["total"] >= OPERATOR_DECISION_CAPTURE_MIN_SAMPLE
@@ -4478,7 +4486,7 @@ async def renew_resident_session_lease(
                 if isinstance(fresh.get("activity"), dict)
                 else None
             ),
-            now_iso=now_iso,
+            now_iso=lease_now_iso,
             pending_operator_messages=int(
                 work_state_summary.get("new_operator_messages") or 0
             ),
@@ -4492,6 +4500,7 @@ async def renew_resident_session_lease(
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
     if holder["legacy_grace_until"] is not None:
         legacy_grace_until = holder["legacy_grace_until"]
+        lease_now = holder["lease_now"] or _utcnow()
         await session.commit()
         await session.refresh(project)
         refreshed = read_resident_session(project.vision) or {}
@@ -4502,7 +4511,7 @@ async def renew_resident_session_lease(
             "admission_status": "legacy_grace",
             "retry_after_seconds": max(
                 1,
-                int((legacy_grace_until - now).total_seconds()) + 1,
+                int((legacy_grace_until - lease_now).total_seconds()) + 1,
             ),
             "leased_until": legacy_grace_until.isoformat(),
             "stop_requested": False,

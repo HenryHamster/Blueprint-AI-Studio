@@ -172,6 +172,8 @@ export interface ResidentSessionOptions {
   effort?: string;
   disallowedTools?: string[];
   workspace?: string;
+  /** Per-process capability bindings inherited by helper subprocesses. */
+  env?: NodeJS.ProcessEnv;
   /** per-active-turn stall budget (ms); default 120s */
   turnTimeoutMs?: number;
   /** ABSOLUTE per-turn hard ceiling (ms), never reset by output; default 15m */
@@ -312,7 +314,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
 
   const child = spawn(base.command, args, {
     cwd: opts.foregroundLaunch?.cwd ?? workspace,
-    env: base.env,
+    env: { ...base.env, ...opts.env },
     detached: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });

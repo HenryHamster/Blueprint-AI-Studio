@@ -106,6 +106,7 @@ const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
 const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 30_000;
+const RESIDENT_LEGACY_ADMISSION_MAX_MS = 180_000;
 const CONVERSATION_CLAIM_LEASE_SECONDS = 90;
 const CONVERSATION_CLAIM_RENEW_MS = 15_000;
 export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
@@ -625,6 +626,7 @@ export async function handleStrategicResident(
   // this early CAS, a losing overlap can overwrite the winner's ./messages and
   // ./strategic bindings with loser-specific receipt paths/incarnation.
   let initialAuthorityAdmission: SessionHeartbeatResponse | null = null;
+  const legacyAdmissionDeadline = Date.now() + RESIDENT_LEGACY_ADMISSION_MAX_MS;
   for (;;) {
     try {
       const admission = await apiPost(
@@ -640,30 +642,29 @@ export async function handleStrategicResident(
         HEARTBEAT_API_TIMEOUT,
       ) as SessionHeartbeatResponse;
       if (admission.admission_status === 'legacy_grace') {
+        if (Date.now() >= legacyAdmissionDeadline) {
+          try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
+          return;
+        }
         const retryMs = typeof admission.retry_after_seconds === 'number'
           ? Math.min(
             30_000,
             Math.max(1_000, admission.retry_after_seconds * 1_000),
           )
           : 5_000;
-        await sleep(retryMs);
+        await sleep(Math.min(retryMs, Math.max(1, legacyAdmissionDeadline - Date.now())));
         continue;
       }
       if (
         admission.resident_incarnation_held === false
         || admission.stop_requested
-        || admission.authority_held === false
       ) {
         try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
         return;
       }
       initialAuthorityAdmission = admission;
       break;
-    } catch (error) {
-      sendLog(
-        ws,
-        `[resident] initial authority check failed; retrying: ${sanitize(String(error))}\n`,
-      );
+    } catch {
       await sleep(1_000);
     }
   }
@@ -1198,6 +1199,12 @@ export async function handleStrategicResident(
     effort,
     disallowedTools,
     workspace: WORKSPACE,
+    env: {
+      BLUEPRINT_RESIDENT_INCARNATION_ID: residentProcessIncarnation,
+      BLUEPRINT_RESIDENT_REPLY_KEY_PATH: RESIDENT_REPLY_KEY_PATH,
+      BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH: RESIDENT_REPLY_RECEIPT_PATH,
+      BLUEPRINT_RESIDENT_STAGED_REPLY_PATH: RESIDENT_STAGED_REPLY_PATH,
+    },
     turnTimeoutMs: sessionBaseStallTimeoutMs,
     replyTool: {
       mcpConfigPath: residentCallMcpConfigPath,
@@ -1231,6 +1238,7 @@ export async function handleStrategicResident(
   // writer alongside the resumed cloud strategist. Losing authority NEVER ends
   // the session; only stop_requested / 401 does.
   let authorityHeld = true;
+  let residentIncarnationHeld = true;
 
   /**
    * Convert ContentBlock[] to Array<Record<string, unknown>> for the session layer.
@@ -1869,6 +1877,7 @@ export async function handleStrategicResident(
     }
     if (resp.resident_incarnation_held === false) {
       stopReason = 'resident_incarnation_lost';
+      residentIncarnationHeld = false;
       authorityHeld = false;
     }
     if (Object.prototype.hasOwnProperty.call(resp, 'call')) {
@@ -3023,7 +3032,7 @@ export async function handleStrategicResident(
     lastLivenessHeartbeatAt = Date.now();
   }
   try {
-    for (; authorityHeld;) {
+    for (; residentIncarnationHeld;) {
       // Guard: verify the workspace is still present before each turn. An
       // external event (OOM-kill, /tmp cleaner) can delete it mid-session.
       //
@@ -3540,9 +3549,6 @@ export async function handleStrategicResident(
   // FAILED terminal, COMPLETED only on a clean operator/task-driven stop. A
   // session that limped or died must not report success.
   if (stopReason === 'resident_incarnation_lost') return;
-  statusRef.value = 'Resident strategic session ended';
-  sendLog(ws, `Resident strategic session ${sessionId} ended (${stopReason}).\n`);
-
   const { status, failureCategory } = resolveTerminalStatus(
     stopReason,
     session.exitCode(),
@@ -3564,7 +3570,10 @@ export async function handleStrategicResident(
       ...(failureCategory ? { failure_category: failureCategory } : {}),
       logs: `Resident strategic session ${sessionId} ended (${stopReason}).${exitDiagnostic ? ` ${exitDiagnostic}` : ''}`,
     });
-  } catch (e) {
-    sendLog(ws, `[ERROR] Failed to post resident terminal status: ${String(e)}\n`);
+    statusRef.value = 'Resident strategic session ended';
+    sendLog(ws, `Resident strategic session ${sessionId} ended (${stopReason}).\n`);
+  } catch {
+    // The backend is the authority boundary. In particular, a stale process
+    // whose lease was taken over must remain completely silent here.
   }
 }

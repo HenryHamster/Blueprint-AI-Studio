@@ -57,7 +57,7 @@ describe('writeStrategicHelpers', () => {
     expect(fs.existsSync(`${testWorkspace}/compute-image`)).toBe(true);
   });
 
-  it('binds every Resident strategic mutation to its process incarnation', () => {
+  it('binds every Resident mutation to the launching process environment', () => {
     const incarnation = '00000000-0000-0000-0000-000000000733';
     writeStrategicHelpers('task', 'project', testWorkspace, {
       residentIncarnationId: incarnation,
@@ -65,7 +65,13 @@ describe('writeStrategicHelpers', () => {
     const script = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
 
     expect(script).toContain(
-      `,"resident_incarnation_id":"${incarnation}"`,
+      `RESIDENT_INCARNATION_ID="\${BLUEPRINT_RESIDENT_INCARNATION_ID:-${incarnation}}"`,
+    );
+    expect(script).toContain(
+      'RESIDENT_REPLY_KEY_PATH="${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-',
+    );
+    expect(script).toContain(
+      'RESIDENT_INCARNATION_JSON=$(printf \',\"resident_incarnation_id\":%s\'',
     );
   });
 
@@ -331,6 +337,26 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('spawn-task)');
     expect(content).toContain('_call "spawn_task"');
     expect(content).not.toContain('spawn-fix)');
+  });
+
+  it('lets the launching process pin messages receipt paths despite helper replacement', () => {
+    writeMessagesHelper('task-process-bound-messages', testWorkspace, {
+      residentReplyOnly: true,
+      replyKeyPath: '/tmp/replacement/key',
+      replyReceiptPath: '/tmp/replacement/receipt',
+      stagedReplyPath: '/tmp/replacement/staged',
+    });
+    const script = fs.readFileSync(`${testWorkspace}/messages`, 'utf-8');
+
+    expect(script).toContain(
+      'REPLY_KEY_PATH="${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-/tmp/replacement/key}"',
+    );
+    expect(script).toContain(
+      'REPLY_RECEIPT_PATH="${BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH:-/tmp/replacement/receipt}"',
+    );
+    expect(script).toContain(
+      'STAGED_REPLY_PATH="${BLUEPRINT_RESIDENT_STAGED_REPLY_PATH:-/tmp/replacement/staged}"',
+    );
   });
 
   it('routes acceptance-criteria authoring to the set_acceptance_criteria backend operation', () => {

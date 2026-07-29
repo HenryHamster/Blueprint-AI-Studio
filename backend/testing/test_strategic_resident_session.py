@@ -937,6 +937,62 @@ async def test_predeploy_legacy_grace_is_retryable_for_replacement(db_session):
 
 
 @pytest.mark.asyncio
+async def test_incarnation_takeover_uses_time_sampled_after_project_lock(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    first_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000811"
+    )
+    replacement_incarnation = uuid.UUID(
+        "00000000-0000-0000-0000-000000000822"
+    )
+    before_lock = _utcnow()
+    after_lock = before_lock + timedelta(minutes=1)
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident["worker_incarnation_id"] = str(first_incarnation)
+    resident["worker_incarnation_expires_at"] = (
+        before_lock + timedelta(seconds=30)
+    ).isoformat()
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    calls = 0
+
+    def advancing_now():
+        nonlocal calls
+        calls += 1
+        return before_lock if calls == 1 else after_lock
+
+    monkeypatch.setattr(resident_session_module, "_utcnow", advancing_now)
+    project = await db_session.get(Project, project.id)
+    replacement = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        incarnation_id=replacement_incarnation,
+        progress=False,
+    )
+
+    assert replacement["resident_incarnation_held"] is True
+    assert replacement["resident_incarnation_id"] == str(replacement_incarnation)
+    refreshed = await db_session.get(Project, project.id)
+    resident = refreshed.vision[RESIDENT_SESSION_KEY]
+    assert resident["worker_incarnation_id"] == str(replacement_incarnation)
+    assert datetime.fromisoformat(
+        resident["worker_incarnation_expires_at"]
+    ) > after_lock
+
+
+@pytest.mark.asyncio
 async def test_new_resident_start_repairs_stale_message_ownership_without_cadence(
     db_session, monkeypatch
 ):

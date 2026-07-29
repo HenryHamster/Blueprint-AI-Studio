@@ -2409,6 +2409,126 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(statusRef.value).toBe('waiting replacement');
   });
 
+  it('bounds legacy grace when the legacy owner keeps renewing', async () => {
+    vi.useFakeTimers();
+    mockWriteMessagesHelper.mockClear();
+    mockWriteStrategicHelpers.mockClear();
+    mockApiPost.mockResolvedValue({
+      authority_held: false,
+      resident_incarnation_held: false,
+      stop_requested: false,
+      admission_status: 'legacy_grace',
+      retry_after_seconds: 30,
+    });
+    const statusRef = { value: 'legacy owner remains active' };
+    const handling = handleStrategicResident(
+      'task-renewing-legacy-grace',
+      { strategic_session_id: 'renewing-legacy-session' },
+      {
+        project_metadata: { project_id: 'proj-renewing-legacy-grace' },
+        context: {
+          strategic_session_id: 'renewing-legacy-session',
+          _resident_worker_generation: 1,
+        },
+      },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+
+    await vi.advanceTimersByTimeAsync(180_001);
+    await handling;
+
+    expect(mockApiPost.mock.calls.length).toBeGreaterThan(1);
+    expect(mockWriteMessagesHelper).not.toHaveBeenCalled();
+    expect(mockWriteStrategicHelpers).not.toHaveBeenCalled();
+    expect(mockStartSession).not.toHaveBeenCalled();
+    expect(statusRef.value).toBe('legacy owner remains active');
+  });
+
+  it('keeps chat alive without autonomous authority when process incarnation is held', async () => {
+    const message = {
+      id: 'msg-chat-only-authority',
+      content: 'Please answer while the batch strategist owns the write lane.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      if (delivered) return Promise.resolve({ messages: [] });
+      delivered = true;
+      return Promise.resolve({ messages: [message] });
+    });
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation((url: string) => {
+      if (!url.includes('/heartbeat')) return Promise.resolve({});
+      heartbeatCount += 1;
+      return Promise.resolve({
+        authority_held: false,
+        resident_incarnation_held: true,
+        stop_requested: heartbeatCount > 1,
+      });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        sentOperatorMessage: true,
+        resultText: 'chat remains responsive',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-chat-only-authority',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-chat-only-authority' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(session.sendTurn).toHaveBeenCalledTimes(1);
+    expect(session.sendTurn.mock.calls[0]?.[0]).toEqual(
+      expect.stringContaining(message.content),
+    );
+    expect(mockStartSession).toHaveBeenCalledWith(expect.objectContaining({
+      env: expect.objectContaining({
+        BLUEPRINT_RESIDENT_INCARNATION_ID: expect.any(String),
+        BLUEPRINT_RESIDENT_REPLY_KEY_PATH: expect.any(String),
+      }),
+    }));
+    expect(heartbeatCount).toBeGreaterThan(1);
+  });
+
+  it('keeps local terminal state silent when the fenced terminal post is rejected', async () => {
+    mockApiPost.mockResolvedValue({
+      authority_held: true,
+      resident_incarnation_held: true,
+      stop_requested: false,
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult()),
+      () => false,
+    );
+    mockStartSession.mockReturnValue(session);
+    vi.mocked(persistAndPostStatus).mockRejectedValueOnce(new Error('HTTP 409 stale incarnation'));
+    const statusRef = { value: 'starting' };
+
+    await handleStrategicResident(
+      'task-stale-terminal',
+      { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: 'proj-stale-terminal' }, context: {} },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+
+    expect(statusRef.value).not.toBe('Resident strategic session ended');
+    expect(mockSendLog.mock.calls.some(([message]) =>
+      String(message).includes('ended ('))).toBe(false);
+    expect(mockSendLog.mock.calls.some(([message]) =>
+      String(message).includes('Failed to post resident terminal status'))).toBe(false);
+  });
+
   it('does not persist or mark an operator message handled after a provider error', async () => {
     const operatorMessage = {
       id: 'msg-rate-limited',
@@ -2967,6 +3087,8 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(events.indexOf('provider')).toBeGreaterThan(
       events.indexOf('heartbeat-2'),
     );
+    expect(mockSendLog.mock.calls.some(([message]) =>
+      String(message).includes('initial authority check failed'))).toBe(false);
   });
 
   it('uses distinct immutable receipts when M2 arrives after atomic M1 reply', async () => {

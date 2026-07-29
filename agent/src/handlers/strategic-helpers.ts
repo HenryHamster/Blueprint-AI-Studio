@@ -105,9 +105,6 @@ function generateStrategicScript(
   const residentIncarnationId = replyPaths.residentIncarnationId
     ? shellEscapeDoubleQuoted(replyPaths.residentIncarnationId)
     : '';
-  const residentIncarnationJson = residentIncarnationId
-    ? `,"resident_incarnation_id":"${residentIncarnationId}"`
-    : '';
   const caseBody = renderStrategicCaseBody();
   const helpText = renderStrategicHelp();
   const schemaCase = renderStrategicSchemaCase();
@@ -154,9 +151,10 @@ ${agentTokenShellFn()}
 ${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
-RESIDENT_REPLY_KEY_PATH="${replyKeyPath}"
-RESIDENT_REPLY_RECEIPT_PATH="${replyReceiptPath}"
-RESIDENT_STAGED_REPLY_PATH="${stagedReplyPath}"
+RESIDENT_REPLY_KEY_PATH="\${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-${replyKeyPath}}"
+RESIDENT_REPLY_RECEIPT_PATH="\${BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH:-${replyReceiptPath}}"
+RESIDENT_STAGED_REPLY_PATH="\${BLUEPRINT_RESIDENT_STAGED_REPLY_PATH:-${stagedReplyPath}}"
+RESIDENT_INCARNATION_ID="\${BLUEPRINT_RESIDENT_INCARNATION_ID:-${residentIncarnationId}}"
 NODE_BIN="\${NODE_BINARY:-node}"
 ${boundedRegularReadShellFn()}
 
@@ -231,7 +229,11 @@ _call() {
     # write-token-expiry fix.
     _load_agent_token || return 1
     dump=$(mktemp)
-    response=$(printf '{"task_id":"%s","op":"%s"${residentIncarnationJson},"data":%s}' "$TASK" "$1" "$DATA" | \\
+    RESIDENT_INCARNATION_JSON=""
+    if [ -n "$RESIDENT_INCARNATION_ID" ]; then
+      RESIDENT_INCARNATION_JSON=$(printf ',"resident_incarnation_id":%s' "$(_json_str "$RESIDENT_INCARNATION_ID")")
+    fi
+    response=$(printf '{"task_id":"%s","op":"%s"%s,"data":%s}' "$TASK" "$1" "$RESIDENT_INCARNATION_JSON" "$DATA" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
         -X POST "$API/api/agent/strategic" \\
         -H "Content-Type: application/json" \\
