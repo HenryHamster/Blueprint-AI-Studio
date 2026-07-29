@@ -1190,7 +1190,7 @@ Only escalate when you literally cannot proceed without the user:
 
 Use \`./strategic pending-confirm\` for those — it's the structured channel for blocking asks. Use \`./messages send\` for general conversation or observations, and \`./messages send --stdin\` for quote-heavy or multiline replies. NEVER \`./messages send\` to ask "should I do X?" for coding decisions — those you make.
 
-If a direction is dead, retire it. If there's an obvious gap, open it. If a user asked for something, create a direction with a source citation on the gap.
+If a direction is dead, retire it. For an obvious gap or user request, first update the active or staged direction that already owns the durable outcome and commission bounded tasks beneath it. Create a direction, with a source citation on the gap, only when no existing direction owns that genuinely distinct durable outcome.
 
 Do NOT analyze code. Do NOT explore the codebase. Think briefly about each operation, then run the commands.
 

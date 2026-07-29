@@ -12,6 +12,7 @@ import {
   PLAN_FETCH_VERBS,
   DESIGN_DOC_FETCH_VERBS,
   STRATEGIC_FETCH_VERBS,
+  FETCH_VERB_HELP,
   parseStrategicChallengeRecord,
   buildStrategicChallengePrompt,
   buildStrategicChallengeExecutorSection,
@@ -961,6 +962,29 @@ describe('buildFetchGuidance', () => {
   });
 });
 
+describe('generated ./fetch help', () => {
+  it('derives offline overview and per-verb help from the canonical help map', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'fetch-help-'));
+    try {
+      writeFetchHelper('t', 'proj-help', workspace, {
+        verbs: ['direction', 'task'],
+      });
+      const content = fs.readFileSync(`${workspace}/fetch`, 'utf-8');
+      expect(content).toContain('fetch help [verb]');
+      expect(content).toContain('direction) printf');
+      expect(content).toContain(FETCH_VERB_HELP.direction);
+      expect(content).toContain('task) printf');
+      expect(content).toContain('./fetch task <task_id>');
+      expect(content).not.toContain(FETCH_VERB_HELP['problem-model']);
+      expect(content.indexOf('if [ "$KIND" = "help" ]')).toBeLessThan(
+        content.indexOf('_load_agent_token || exit 1'),
+      );
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('renderStrategicFetchVerbHelpLines', () => {
   it('lists every verb in STRATEGIC_FETCH_VERBS with its description', () => {
     const lines = renderStrategicFetchVerbHelpLines();
@@ -1400,6 +1424,20 @@ describe('buildStrategicChallengePrompt', () => {
     expect(prompt).toContain('EVERY direction the thinker proposes to retire');
     // Fail-closed instruction present.
     expect(prompt).toContain('When in doubt, REJECT');
+  });
+
+  it('rejects task-shaped direction shards and judges net portfolio coherence', () => {
+    const prompt = buildStrategicChallengePrompt({
+      analysisText: 'create two file-owned directions',
+      dirSummaryText: 'dirs',
+      pastRetirementCritiquesSection: '',
+      portfolioCompositionText: 'portfolio',
+    });
+    expect(prompt).toContain('active direction opens a recurring autonomous research lane');
+    expect(prompt).toContain('File, PR, phase, checklist, or one-shot implementation shards are tasks');
+    expect(prompt).toContain('REJECT create/update proposals that split one durable outcome');
+    expect(prompt).toContain('prefer bounded tasks under an existing direction');
+    expect(prompt).toContain('NET effect on portfolio coherence');
   });
 
   it('retains early grounding and late portfolio operations when bounding long analysis', () => {

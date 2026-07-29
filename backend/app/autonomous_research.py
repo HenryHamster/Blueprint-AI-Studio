@@ -1128,7 +1128,8 @@ async def _spawn_research_task_inner(
         now,
         expected_legacy_generation=legacy_generation,
     )
-    # Allow strategic cycles to proceed even without active directions (they create directions).
+    # Allow strategic cycles to proceed without active directions so they can
+    # assess the portfolio and any concrete uncovered problem-model gaps.
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
     vision_data = project.vision or {}
     strategic_failures = vision_data.get("_strategic_failures", 0)
@@ -1250,8 +1251,8 @@ async def _spawn_research_task_inner(
                     force_strategic = True
     if not active_directions and not force_strategic:
         # When every active direction is held in refractory (none eligible this
-        # cycle), fire a coalesced strategic refresh so the strategist can
-        # replenish the portfolio or explicitly re-open a held direction.
+        # cycle), request a coalesced strategic coverage refresh so the
+        # strategist can explicitly reconsider a held direction.
         # The strategist may clear refractory_until on a direction to bypass.
         # The 180-min wall-clock backstop above remains the safety net.
         _any_refractory = any(
@@ -1268,7 +1269,7 @@ async def _spawn_research_task_inner(
             await _req_strat(
                 session,
                 project.id,
-                reason="all active directions in refractory — strategist replenishment needed",
+                reason="all active directions in refractory — strategic coverage review needed",
                 origin=_OQ,
             )
             force_strategic = True

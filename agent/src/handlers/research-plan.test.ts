@@ -2465,8 +2465,11 @@ describe('buildEfficiencySnapshotSection', () => {
     expect(result).toContain('Fleet slot utilization');
     expect(result).toContain('now 6/15 (40%), 24h-avg 38%');
     // Interpretation note is appended only when the fleet axis is present.
-    expect(result).toContain('throughput is being left on the table');
-    expect(result).toContain('distinguish idle headroom from cooled accounts');
+    expect(result).toContain('throughput may be left on the table');
+    expect(result).toContain('increase bounded task dispatch within the directions that own those outcomes');
+    expect(result).toContain('Capacity is never a reason to create or retain a direction');
+    expect(result).not.toContain('open more non-clashing directions');
+    expect(result).toContain('Distinguish idle headroom from cooled accounts');
   });
 
   it('omits the fleet interpretation note when no fleet_utilization axis is present', () => {

@@ -247,12 +247,18 @@ async def test_strategic_api_output_update_events_include_live_linkage(
                 "rationale": "operator steering requested billing reliability",
                 "success_evidence": "Webhook retries are verified",
                 "retirement_condition": "No open webhook incidents",
+                "category": "mixed",
             },
         },
         headers=headers,
     )
     assert create_resp.status_code == 200, create_resp.text
     created_id = create_resp.json()["direction_id"]
+    await db_session.refresh(project)
+    created_direction = next(
+        direction for direction in project.directions if direction["id"] == created_id
+    )
+    assert created_direction["category"] == "mixed"
 
     pm_resp = await client.post(
         "/api/agent/strategic",
