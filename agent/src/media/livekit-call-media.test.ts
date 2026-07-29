@@ -122,6 +122,14 @@ function participant(identity: string): RtcRemoteParticipant {
 function data(value: unknown): Uint8Array { return new TextEncoder().encode(JSON.stringify(value)); }
 
 describe('CallMediaSession', () => {
+  it('allows playback cancellation before call media connects', async () => {
+    const f = fixture();
+    const session = new CallMediaSession({ bindings: f.bindings });
+
+    await expect(session.cancelPlayback()).resolves.toBe(1);
+    expect(f.sources).toHaveLength(0);
+  });
+
   it('accepts only committed-message ID wake hints from the exact browser and active generation', async () => {
     const f = fixture();
     const hints: unknown[] = [];
