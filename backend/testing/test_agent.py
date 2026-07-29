@@ -3166,7 +3166,7 @@ async def test_agent_status_locked_blocked_task_returns_already_terminal():
     second_result.scalars.return_value.first.return_value = blocked_task
 
     session = AsyncMock()
-    session.execute = AsyncMock(side_effect=[first_result, second_result])
+    session.execute = AsyncMock(side_effect=[first_result, first_result, second_result])
 
     request = Request(
         {
@@ -3178,7 +3178,6 @@ async def test_agent_status_locked_blocked_task_returns_already_terminal():
     )
     payload = AgentStatusPayload(task_id=task_id, status=TaskStatus.COMPLETED)
     token = {"sub": str(task_id), "vm_instance_id": "agent-vm-status-locked"}
-
     result = await update_agent_status(
         request=request,
         payload=payload,
@@ -3188,7 +3187,8 @@ async def test_agent_status_locked_blocked_task_returns_already_terminal():
     )
 
     assert result == {"status": "already_terminal", "task_id": str(task_id)}
-
+    locked_query = session.execute.await_args_list[1].args[0]
+    assert locked_query.get_execution_options()["populate_existing"]
 
 @pytest.mark.asyncio
 async def test_agent_token_rejected_for_terminated_task(

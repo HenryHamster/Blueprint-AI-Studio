@@ -89,10 +89,20 @@ AGENT_ENV_ALLOWLIST: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
     # Z.ai
     "ZAI_API_KEY",
     "ZAI_ANTHROPIC_BASE_URL",
     "ZAI_BASE_URL",
+    # DeepSeek's Claude-compatible adapter. These are server-vended for a
+    # pooled DeepSeek task; retaining them here preserves the same local-runner
+    # materialization behavior after injected values became allowlist-bound.
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_ANTHROPIC_BASE_URL",
     # OpenAI / Codex
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
@@ -122,6 +132,51 @@ AGENT_ENV_ALLOWLIST: tuple[str, ...] = (
     "GIT_REFERENCE_CACHE_ROOT",
 )
 
+# Speech credentials are never process-environment inputs. The active Resident
+# fetches them through an exact call-scoped agent endpoint and retains them only
+# in Coordinator memory. Keep the names solely as an explicit compute/runner
+# deny-list so an obsolete host config or backend envelope cannot regress that
+# boundary.
+CALL_SPEECH_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "CALL_DEEPGRAM_API_KEY",
+        "CALL_CARTESIA_API_KEY",
+        "CALL_DEEPGRAM_STT_MODEL",
+        "CALL_CARTESIA_TTS_MODEL",
+        "CALL_CARTESIA_VOICE_ID",
+        "CALL_DEEPGRAM_STT_ENDPOINT",
+        "CALL_DEEPGRAM_SAMPLE_RATE_HZ",
+        "CALL_DEEPGRAM_EOT_THRESHOLD",
+        "CALL_DEEPGRAM_EAGER_EOT_THRESHOLD",
+        "CALL_DEEPGRAM_EOT_TIMEOUT_MS",
+        "CALL_CARTESIA_TTS_ENDPOINT",
+        "CALL_CARTESIA_API_VERSION",
+        "CALL_CARTESIA_SAMPLE_RATE_HZ",
+        "CALL_SPEECH_CONNECT_TIMEOUT_MS",
+    }
+)
+
+# The backend may vend only ordinary LLM credentials into an agent process.
+# Call speech credentials use the Coordinator endpoint above.
+SERVER_VENDED_AGENT_ENV_ALLOWLIST: frozenset[str] = AGENT_ENV_ALLOWLIST
+
+# Identity values originate in the local runner, not in the task response.  They
+# are the only non-provider values permitted in the injected map.
+_AGENT_IDENTITY_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "AGENT_SECRET_TOKEN",
+        "ORCHESTRATOR_URL",
+        "TASK_ID",
+        "VM_INSTANCE_ID",
+        "PROJECT_ID",
+        "AGENT_WORKSPACE",
+        "HOME",
+    }
+)
+_AGENT_INJECTED_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    (*AGENT_ENV_ALLOWLIST, *_AGENT_IDENTITY_ENV_KEYS)
+)
+
 # Host env a COMPUTE job may inherit. Deliberately EXCLUDES all provider creds —
 # untrusted experiment code has no business seeing LLM keys. Only toolchain/CUDA
 # discovery vars pass through; the job's own declared env and the injected
@@ -139,6 +194,12 @@ COMPUTE_ENV_PASSTHROUGH: tuple[str, ...] = (
 # target; they are simply absent from the allowlists above).
 FORBIDDEN_ENV_KEYS: frozenset[str] = frozenset(
     {"BLUEPRINT_RUNNER_TOKEN", "BLUEPRINT_ORCHESTRATOR_URL"}
+)
+# A compute job may declare its own arbitrary non-secret configuration, but it
+# must never receive Resident speech credentials even if a future caller tries
+# to inject them through job_env.
+COMPUTE_FORBIDDEN_ENV_KEYS: frozenset[str] = frozenset(
+    (*FORBIDDEN_ENV_KEYS, *CALL_SPEECH_ENV_KEYS)
 )
 
 # Standard PATH inside a sandbox (host $HOME-relative dirs like nvm are gone, so
@@ -984,12 +1045,12 @@ def build_agent_env(
     home. BLUEPRINT_RUNNER_TOKEN / BLUEPRINT_ORCHESTRATOR_URL are structurally
     excluded (absent from AGENT_ENV_ALLOWLIST).
 
-    When ``per_task_creds`` is provided (server-vended per-task credentials), the
-    LLM credential keys from per_task_creds REPLACE any matching keys from
-    source_env.  This is the SINGLE credential code path: no fallback to static
-    host env vars for credential keys.  Non-credential keys (LANG, TERM, PATH,
-    NODE_EXTRA_CA_CERTS, etc.) still flow from source_env.  per_task_creds values
-    are still filtered through AGENT_ENV_ALLOWLIST for defense-in-depth.
+    When ``per_task_creds`` is provided (server-vended per-task credentials), it
+    replaces matching keys from source_env. This is the single credential path:
+    no fallback to static host env vars for vended credential keys. Speech keys
+    are intentionally *not* in ``AGENT_ENV_ALLOWLIST``, so they can arrive only
+    in ``per_task_creds`` and never flow from a long-lived runner environment.
+    Both injected and vended values are filtered through fixed allowlists.
     """
     env: dict[str, str] = {}
     for key in AGENT_ENV_ALLOWLIST:
@@ -1002,10 +1063,22 @@ def build_agent_env(
     # to a static host value but per_task_creds carries the true per-task value).
     # Only keys in AGENT_ENV_ALLOWLIST pass through; everything else is dropped
     # (defense-in-depth).
-    env.update({k: v for k, v in injected.items() if v is not None})
+    env.update(
+        {
+            key: value
+            for key, value in injected.items()
+            if key in _AGENT_INJECTED_ENV_ALLOWLIST
+            and isinstance(value, str)
+            and value
+        }
+    )
     if per_task_creds:
         for key, val in per_task_creds.items():
-            if key in AGENT_ENV_ALLOWLIST and val:
+            if (
+                key in SERVER_VENDED_AGENT_ENV_ALLOWLIST
+                and isinstance(val, str)
+                and val
+            ):
                 env[key] = val
     env["PATH"] = _sandbox_path(tool_dirs or [])
     env.setdefault("HOME", SANDBOX_HOME)
@@ -1022,10 +1095,10 @@ def build_compute_env(
 ) -> dict[str, str]:
     """Build a compute job's env: passthrough allowlist + declared env + injected.
 
-    No provider creds (untrusted experiment code never sees LLM keys) and never a
-    full os.environ copy. ``injected`` = BLUEPRINT_RESULT_FILE, BLUEPRINT_ARTIFACT_DIR,
-    BLUEPRINT_PROGRESS_FILE, CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES, PYTHONPATH,
-    HOME.
+    No provider or Resident speech credentials (untrusted experiment code never
+    sees those keys) and never a full os.environ copy. ``injected`` =
+    BLUEPRINT_RESULT_FILE, BLUEPRINT_ARTIFACT_DIR, BLUEPRINT_PROGRESS_FILE,
+    CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES, PYTHONPATH, HOME.
     """
     env: dict[str, str] = {}
     for key in COMPUTE_ENV_PASSTHROUGH:
@@ -1036,7 +1109,7 @@ def build_compute_env(
     env.update({k: v for k, v in injected.items() if v is not None})
     env.setdefault("PATH", _DEFAULT_SANDBOX_PATH)
     env.setdefault("HOME", SANDBOX_HOME)
-    for forbidden in FORBIDDEN_ENV_KEYS:
+    for forbidden in COMPUTE_FORBIDDEN_ENV_KEYS:
         env.pop(forbidden, None)
     return env
 
@@ -1602,11 +1675,11 @@ def plan_agent_execution(
     ``injected_env`` = the runner-set identity vars (AGENT_SECRET_TOKEN,
     ORCHESTRATOR_URL, TASK_ID, VM_INSTANCE_ID).
 
-    ``per_task_creds`` = server-vended per-task LLM credential env vars (optional).
-    When provided, these REPLACE any matching credential keys from source_env AND
-    injected_env — this is the SINGLE credential code path with no fallback to
-    static host env vars.  Non-credential keys (LANG, TERM, PATH,
-    NODE_EXTRA_CA_CERTS, etc.) still flow from source_env.  Applied to both bwrap
+    ``per_task_creds`` = server-vended per-task credential env vars (optional).
+    It may include the Resident-only speech keys; those keys cannot come from
+    ``source_env``. When provided, these replace matching keys from source_env
+    AND injected_env. Non-credential keys (LANG, TERM, PATH,
+    NODE_EXTRA_CA_CERTS, etc.) still flow from source_env. Applied to both bwrap
     and docker backends.
 
     When ``agent_image`` is supplied and docker is usable for an eligible
@@ -1647,10 +1720,22 @@ def plan_agent_execution(
         # server-vended per-task credentials so per_task_creds REPLACES any
         # matching keys from both source_env and injected_env.  Mirrors the
         # bwrap path in build_agent_env.
-        forwarded.update({k: v for k, v in injected_env.items() if v is not None})
+        forwarded.update(
+            {
+                key: value
+                for key, value in injected_env.items()
+                if key in _AGENT_INJECTED_ENV_ALLOWLIST
+                and isinstance(value, str)
+                and value
+            }
+        )
         if per_task_creds:
             for key, val in per_task_creds.items():
-                if key in AGENT_ENV_ALLOWLIST and val:
+                if (
+                    key in SERVER_VENDED_AGENT_ENV_ALLOWLIST
+                    and isinstance(val, str)
+                    and val
+                ):
                     forwarded[key] = val
         for forbidden in FORBIDDEN_ENV_KEYS:
             forwarded.pop(forbidden, None)

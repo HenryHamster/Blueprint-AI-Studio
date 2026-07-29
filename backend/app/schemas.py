@@ -188,6 +188,7 @@ class TaskParkRequest(BaseModel):
 class AgentStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
+    resident_incarnation_id: uuid.UUID | None = None
     status: TaskStatus
     artifact_type: ArtifactType | None = None
     commit_hash: str | None = None

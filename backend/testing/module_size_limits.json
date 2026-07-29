@@ -31,8 +31,9 @@
     "routers/admin_release_version.py": 2250,
     "routers/admin_pipeline_observability.py": 2350,
     "routers/admin_agent_ops.py": 7450,
+    "routers/agent_strategic_messages.py": 1950,
     "routers/admin_pool_accounts.py": 1950,
-    "max_plan_pool.py": 6150,
+    "max_plan_pool.py": 6250,
     "anomaly_detection.py": 2100,
     "routers/agent.py": 6450,
     "services.py": 1378,
@@ -154,7 +155,7 @@
     "migration_apply_gate.py": 2150,
     "capability_registry.py": 1750,
     "storage.py": 1750,
-    "strategic_resident_session.py": 4900,
+    "strategic_resident_session.py": 5850,
     "release_qualifier_audit.py": 1800
   },
   "agent": {
@@ -170,7 +171,7 @@
     "handlers/research-plan.ts": 3000,
     "handlers/strategic.ts": 1900,
     "handlers/strategic-resident-lib.ts": 3050,
-    "handlers/strategic-resident.ts": 2750,
+    "handlers/strategic-resident.ts": 3700,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 1150,
     "handlers/standard.ts": 1900,
@@ -383,8 +384,9 @@
     "test_compute__experiments.py": 1600,
     "test_release_qualifier__retry_episode_cap.py": 750,
     "test_compute_park_wake.py": 2000,
-    "test_strategic_resident_session.py": 2500,
+    "test_strategic_resident_session.py": 3000,
     "test_conversational_workday_protection.py": 1800,
-    "test_admin_routers__projects.py": 4100
+    "test_admin_routers__projects.py": 4100,
+    "test_admin_routers__strategic_directions.py": 1800
   }
 }

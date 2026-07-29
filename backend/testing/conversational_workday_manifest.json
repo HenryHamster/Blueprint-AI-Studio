@@ -218,7 +218,13 @@
         "test_reload_ensure_keeps_retry_wait_during_post_deadline_claim_grace",
         "test_reload_ensure_replaces_retry_wait_after_claim_grace_expires",
         "test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale",
-        "test_reload_ensure_replaces_worker_stale_past_recovery_threshold",
+        "test_reload_ensure_does_not_supersede_fresh_task_on_stale_projection",
+        "test_reload_ensure_replaces_worker_after_task_corroboration_grace",
+        "test_incarnation_takeover_uses_time_sampled_after_project_lock",
+        "test_heartbeat_samples_operator_reengagement_after_project_lock",
+        "test_new_process_waits_for_bounded_legacy_incarnation_during_rollout",
+        "test_predeploy_legacy_grace_is_retryable_for_replacement",
+        "test_resident_heartbeat_fences_overlapping_process_incarnations",
         "test_stop_ends_task_releases_continuation_and_hands_off_messages",
         "test_stop_handoff_is_atomic_with_session_end",
         "test_unattended_cap_persists_message_handoff",
@@ -243,6 +249,12 @@
         "test_allow_no_runner_default_false_blocks_without_device",
         "test_start_allow_no_runner_creates_session_without_task",
         "test_stop_cleans_up_no_runner_session_without_error",
+        "test_call_lease_expires_when_coordinator_never_becomes_ready",
+        "test_call_lease_reuse_rechecks_owner_under_project_lock",
+        "test_call_speech_credentials_require_exact_active_resident_lease",
+        "test_call_start_rejects_provider_without_qualified_foreground_adapter",
+        "test_nested_call_projection_hides_actor_account_and_playout_receipts",
+        "test_ready_call_renewal_is_capped_at_absolute_duration",
         "test_recovery_carries_rate_limit_denylist_but_not_failed_runtime_identity"
       ]
     },
@@ -303,7 +315,23 @@
         "re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
         "retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects",
         "splits an aggregate required-image overflow into bounded same-timestamp model turns",
-        "retries a generic provider error in place and re-delivers the operator turn"
+        "retries a generic provider error in place and re-delivers the operator turn",
+        "bounds legacy grace when the legacy owner keeps renewing",
+        "bounds repeated transport failures during initial admission",
+        "claims after preflight and renews a slow turn independently of idle pacing",
+        "claims the exact polled batch and fences its persisted reply",
+        "does not let a transport outage extend the active legacy-grace deadline",
+        "does not publish shared helpers or terminal state when initial authority is lost",
+        "exits silently on terminal initial admission error: %s",
+        "extends a legacy claim after backend upgrade when a retry batch grows",
+        "keeps chat alive without autonomous authority when process incarnation is held",
+        "keeps local terminal state silent when the fenced terminal post is rejected",
+        "preserves conversation_claim_lost as the terminal replacement cause",
+        "replaces the worker after the native reply protocol fails twice",
+        "retries a failed initial heartbeat before polling or starting provider work",
+        "revalidates an authority proof that ages out during workspace preparation",
+        "revalidates an existing claim before retrying the provider turn",
+        "waits through retryable legacy grace without publishing loser helpers"
       ]
     },
     {
@@ -627,7 +655,8 @@
         "rejects a required ArtifactRef checksum mismatch",
         "caps aggregate ordinary images while preserving required images across a combined batch",
         "bounds a required ArtifactRef download when %s never resolves",
-        "degrades an ordinary image to an unavailable block when %s never resolves"
+        "degrades an ordinary image to an unavailable block when %s never resolves",
+        "uses a conservative context limit for routed DeepSeek residents"
       ]
     },
     {

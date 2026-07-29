@@ -6,34 +6,8 @@ import { fetchStrategicStateWithRevision, STRATEGIC_STATE_NOT_MODIFIED } from '.
 import type { StrategicSessionResponse, StrategicStateResponse } from '../strategicStateApi';
 
 vi.mock('../strategicStateApi', async () => {
-  const NOT_MODIFIED = { notModified: true } as const;
-  const CONVERSATION_NOT_MODIFIED = { notModified: true } as const;
-  return {
-  STRATEGIC_STATE_NOT_MODIFIED: NOT_MODIFIED,
-  isStrategicStateNotModified: (r: unknown) => r === NOT_MODIFIED,
-  STRATEGIC_CONVERSATION_NOT_MODIFIED: CONVERSATION_NOT_MODIFIED,
-  isStrategicConversationNotModified: (r: unknown) => r === CONVERSATION_NOT_MODIFIED,
-  fetchStrategicStateWithRevision: vi.fn(),
-  fetchStrategicWorkbenchState: vi.fn(),
-  updateStrategicWorkbenchState: vi.fn(),
-  fetchStrategicSession: vi.fn(),
-  startStrategicSession: vi.fn(),
-  stopStrategicSession: vi.fn(),
-  fetchStrategicConversation: vi.fn(),
-  createStrategicSessionMessage: vi.fn(),
-  checkInStrategicSession: vi.fn(),
-  executeStrategicWorkSessionCommand: vi.fn(),
-  getMessageAttachmentUploadUrl: vi.fn(),
-  deleteMessageAttachmentUpload: vi.fn(),
-  getMessageAttachmentDownloadUrl: vi.fn(),
-  invalidateMessageAttachmentDownloadUrl: vi.fn(),
-  findStrategicMessageByClientIdentity: vi.fn(),
-  StrategicSessionMessageCreateError: class StrategicSessionMessageCreateError extends Error {
-    readonly status = 500;
-  },
-  fetchStrategicState: vi.fn(),
-  fetchStrategicLiveness: vi.fn(),
-  };
+  const { createStrategicStateApiMock } = await import('../test/strategic-state-api-mock-complete');
+  return createStrategicStateApiMock();
 });
 
 // Disable the poller so tests drive fetches via result.current.refresh().

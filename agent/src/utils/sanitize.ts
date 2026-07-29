@@ -55,7 +55,7 @@ export function sanitize(text: string): string {
     // Known secret env-var names and HTTP header names — redact the value regardless of format
     // Covers cases where the value is not a recognized token pattern (e.g. non-JWT AGENT_SECRET_TOKEN)
     .replace(
-      /(['"]?\b(?:AGENT_SECRET_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY|GEMINI_API_KEY|ZAI_API_KEY|DEEPSEEK_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|X-Agent-Token)\b['"]?\s*[:=]\s*)(?:(['"])(?:[^'"\\]|\\.)+\2|[^\s,'";&\])\n]{4,})/gi,
+      /(['"]?\b(?:AGENT_SECRET_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY|GEMINI_API_KEY|ZAI_API_KEY|DEEPSEEK_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|CALL_DEEPGRAM_API_KEY|CALL_CARTESIA_API_KEY|X-Agent-Token|X-API-Key)\b['"]?\s*[:=]\s*)(?:(['"])(?:[^'"\\]|\\.)+\2|[^\s,'";&\])\n]{4,})/gi,
       '$1***',
     );
 }

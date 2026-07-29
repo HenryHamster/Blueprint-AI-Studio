@@ -907,9 +907,9 @@ ${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
 RESIDENT_REPLY_ONLY="${residentReplyOnly ? '1' : '0'}"
-REPLY_KEY_PATH="${replyKeyPath}"
-REPLY_RECEIPT_PATH="${replyReceiptPath}"
-STAGED_REPLY_PATH="${stagedReplyPath}"
+  REPLY_KEY_PATH="\${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-${replyKeyPath}}"
+  REPLY_RECEIPT_PATH="\${BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH:-${replyReceiptPath}}"
+  STAGED_REPLY_PATH="\${BLUEPRINT_RESIDENT_STAGED_REPLY_PATH:-${stagedReplyPath}}"
 NODE_BIN="\${NODE_BINARY:-node}"
 ${boundedRegularReadShellFn()}
 ${retryPostShellFn()}

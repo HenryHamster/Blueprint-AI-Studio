@@ -28,6 +28,7 @@ pytest-rerunfailures==14.0
 aiosqlite==0.22.1
 alembic==1.18.5
 PyJWT==2.13.0
+livekit-api==1.2.0
 slowapi==0.1.10
 redis[hiredis]>=5.0.0
 websockets==12.0
