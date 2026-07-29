@@ -157,6 +157,8 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
     if success_many is not None:
         contract["success_criteria"] = success_many
     for opt_key in (
+        "work_class",
+        "stop_or_pivot_condition",
         "machine_type",
         "experiment",
         "benchmark",
@@ -189,6 +191,10 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
     ):
         val = _pick(opt_key)
         if val is not None:
+            if opt_key in {"work_class", "stop_or_pivot_condition"} and isinstance(
+                val, str
+            ):
+                val = val.strip()
             contract[opt_key] = val
     return contract
 
@@ -250,6 +256,27 @@ def _validate_compute_launch_contract(
     but no longer blocks the contract.  Operator-triggered launches may pass
     ``require_smoke=False`` to silence even the advisory log.
     """
+    work_class = contract.get("work_class")
+    if work_class is not None and (
+        not isinstance(work_class, str)
+        or work_class
+        not in {
+            "exploratory",
+            "confirmatory",
+            "productization",
+        }
+    ):
+        return False, (
+            "work_class must be one of exploratory, confirmatory, productization"
+        )
+
+    stop_or_pivot = contract.get("stop_or_pivot_condition")
+    if stop_or_pivot is not None:
+        if not (isinstance(stop_or_pivot, str) and stop_or_pivot.strip()):
+            return False, "stop_or_pivot_condition must be a non-empty string"
+        if len(stop_or_pivot) > 4000:
+            return False, "stop_or_pivot_condition must be at most 4000 characters"
+
     arms = contract.get("arms")
     command = contract.get("command")
 

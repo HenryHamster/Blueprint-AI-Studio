@@ -132,6 +132,36 @@ class BasePayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Empirical work contract — only mixed into evidence-producing task types
+# ---------------------------------------------------------------------------
+
+
+class _EmpiricalWorkContractMixin(BaseModel):
+    """Small planning contract for research and benchmark work.
+
+    These fields deliberately do not live on ``BasePayload``: ordinary code,
+    review, and maintenance tasks should not acquire research-process
+    boilerplate.  They are optional for compatibility with already queued
+    payloads, but typed so new authors cannot persist ambiguous values.
+    """
+
+    work_class: Literal["exploratory", "confirmatory", "productization"] | None = None
+    stop_or_pivot_condition: str | None = Field(
+        default=None, min_length=1, max_length=4000
+    )
+
+    @field_validator("work_class", "stop_or_pivot_condition", mode="before")
+    @classmethod
+    def _normalize_empirical_text(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            normalized = v.strip()
+            if not normalized:
+                raise ValueError("must not be blank")
+            return normalized
+        return v
+
+
+# ---------------------------------------------------------------------------
 # Acceptance evidence — the general declaration contract
 # ---------------------------------------------------------------------------
 
@@ -593,7 +623,7 @@ class _SystemPopulated(BasePayload):
     """Backend populates required fields; no extra constraints at ingestion."""
 
 
-class ResearchPayload(_SystemPopulated):
+class ResearchPayload(_EmpiricalWorkContractMixin, _SystemPopulated):
     directions: list[dict[str, Any]] | None = None
     research_mode: str | None = None
     current_direction_id: str | None = None
@@ -1011,7 +1041,9 @@ def parse_acceptance_evidence(raw: Any) -> dict | None:
     return result
 
 
-class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
+class ComputeExperimentPayload(
+    _EmpiricalWorkContractMixin, _AcceptanceEvidenceMixin, _SystemPopulated
+):
     """Reference compute-heavy task (benchmark/evaluation style).
 
     The agent forwards the launch fields below to ``POST /api/agent/compute-jobs``
@@ -1116,7 +1148,7 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # ``extra='allow'`` keeps any legacy payload still carrying the key valid.
 
 
-class WebResearchPayload(BasePayload):
+class WebResearchPayload(_EmpiricalWorkContractMixin, BasePayload):
     """Payload for a web-first research task that produces a knowledge document.
 
     The task runs read-only with web access and emits a structured document

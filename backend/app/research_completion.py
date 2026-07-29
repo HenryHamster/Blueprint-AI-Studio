@@ -5076,6 +5076,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "cwd",
                             "env",
                             "accelerator",
+                            "work_class",
+                            "stop_or_pivot_condition",
                             "provisioning_model",
                             "live_proof",
                             "live_proof_marker",
@@ -5128,6 +5130,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     **({"model": finding_model} if finding_model else {}),
                     **({"effort": finding_effort} if finding_effort else {}),
                     **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
+                    **(
+                        {
+                            key: finding[key]
+                            for key in ("work_class", "stop_or_pivot_condition")
+                            if task_type in ("research", "web_research")
+                            and finding.get(key) is not None
+                        }
+                    ),
                     **(
                         {"acceptance_evidence": _payload_acceptance_evidence}
                         if _payload_acceptance_evidence

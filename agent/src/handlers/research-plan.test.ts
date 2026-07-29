@@ -2705,6 +2705,19 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('"subtasks"');
   });
 
+  it('empirical producer prompts require work class and stop conditions', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const planPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(planPrompt).toContain('work_class');
+    expect(planPrompt).toContain('stop_or_pivot_condition');
+
+    vi.mocked(runClaudeCode).mockClear();
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const researchPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(researchPrompt).toContain('work_class');
+    expect(researchPrompt).toContain('stop_or_pivot_condition');
+  });
+
   it('handlePlan prompt contains related_files (subtask schema field)', async () => {
     await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
@@ -3472,6 +3485,12 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     const thinker = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(thinker).toContain('Evidence-progress assessment');
     expect(thinker).toContain('advancing | stalled | met');
+    expect(thinker).toContain('stall_advisory_version: 1');
+    expect(thinker).toContain('blocking_invariant:');
+    expect(thinker).toContain('new_evidence_since_previous_cycle:');
+    expect(thinker).toContain('recommendation: continue | pivot');
+    expect(thinker).toContain('continuation_pivot_rationale:');
+    expect(thinker).toContain('Every stalled assessment MUST include all five');
     // It must point the executor at the persistence command.
     expect(thinker).toContain('set-evidence-progress');
   });

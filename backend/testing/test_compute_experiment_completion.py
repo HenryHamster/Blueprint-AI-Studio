@@ -2199,6 +2199,47 @@ async def test_prerequisite_measured_negative_completes_and_delivers_while_broke
     assert (broken_dependent.context or {}).get(KNOWLEDGE_PREREQUISITES_KEY) is None
 
 
+@pytest.mark.asyncio
+async def test_prerequisite_unmeasured_declared_metric_fails_without_knowledge(
+    db_session, _quiet_compute_io
+):
+    """Advisory prerequisite mode accepts measured negatives, not missing data.
+
+    A terminal SUCCESS plus cost is substrate truth, but without the declared
+    metric it is not a measured verdict and must not become consumable knowledge.
+    """
+    task = await _make_compute_task_with_identity(
+        db_session, metric="accuracy", op=">=", threshold=0.9
+    )
+    task.context = {
+        **(task.context or {}),
+        COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY: (
+            COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
+        ),
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(),  # terminal and costed, but no ``accuracy`` value
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["failure_category"] == "compute_unmeasured_criterion"
+    assert (
+        task.context["evaluation_gate"]["strategy"]
+        == "compute-unmeasured-criterion"
+    )
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["metric"] == "accuracy"
+    assert criterion["observation_status"] == "UNMEASURED"
+    assert criterion["reason_code"] == "METRIC_KEY_ABSENT"
+    assert await _knowledge_docs_for(db_session, task) == []
+
+
 # ── Full lifecycle: substrate kill → task completion ────────────────────────
 
 

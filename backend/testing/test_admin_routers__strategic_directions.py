@@ -282,6 +282,125 @@ async def test_stale_resident_process_cannot_mutate_or_post_terminal_status(
 
 
 @pytest.mark.asyncio
+async def test_create_direction_rejects_oversized_contract_without_truncating(
+    client: AsyncClient, db_session
+):
+    from app import strategic_cycle
+    from app.auth import create_agent_token
+
+    project = Project(
+        name="Strategic Contract Limits",
+        user_id=TEST_USER_ID,
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-strategic-contract-limits",
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(
+        str(task.id),
+        "vm-strategic-contract-limits",
+        task_type="strategic_review",
+        project_id=str(project.id),
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Preserve the complete evidence contract",
+                "success_evidence": "e" * 501,
+                "retirement_condition": "A valid retirement condition",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "success_evidence exceeds the 500 character limit "
+        "(501 supplied); no changes were applied"
+    )
+    await db_session.refresh(project)
+    assert project.directions == []
+
+
+@pytest.mark.asyncio
+async def test_update_direction_contract_is_atomic_and_persists_constraints(
+    client: AsyncClient, db_session
+):
+    from app.auth import create_agent_token
+
+    project, task = await _make_strategic_retire_task(
+        db_session,
+        name="Strategic Contract Update Limits",
+        vm="vm-strategic-contract-update",
+        direction_id="d-contract-update",
+    )
+    token = create_agent_token(
+        str(task.id),
+        "vm-strategic-contract-update",
+        task_type="strategic_review",
+        project_id=str(project.id),
+    )
+    headers = {"x-agent-token": token}
+
+    rejected = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-contract-update",
+                "changes": {
+                    "success_evidence": "e" * 501,
+                    "implementation_constraints": "must remain unchanged",
+                },
+            },
+        },
+    )
+    assert rejected.status_code == 400
+    await db_session.refresh(project)
+    assert project.directions[0].get("context") is None
+
+    accepted = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-contract-update",
+                "changes": {
+                    "success_evidence": "e" * 500,
+                    "implementation_constraints": "use the existing evidence path",
+                },
+            },
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    await db_session.refresh(project)
+    context = project.directions[0]["context"]
+    assert context["success_evidence"] == "e" * 500
+    assert context["implementation_constraints"] == "use the existing evidence path"
+
+
+@pytest.mark.asyncio
 async def test_strategic_api_output_update_events_include_live_linkage(
     client: AsyncClient, db_session, mocker
 ):

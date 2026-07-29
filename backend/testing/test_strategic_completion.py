@@ -3308,7 +3308,18 @@ async def test_strategic_update_persists_implementation_constraints(db_session, 
                 "priority": "medium",
                 "notes": [],
                 "research_history": [],
-                "context": {"success_evidence": "prior evidence"},
+                "context": {
+                    "success_evidence": "prior evidence",
+                    "implementation_constraints": "old constraint",
+                },
+                "outcome_progress_ever_met": True,
+                "outcome_progress_history": [{"progress": 3, "cycle_index": 7}],
+                "evidence_progress": {
+                    "status": "advancing",
+                    "rationale": "judged under the old constraint",
+                },
+                "outcome_scaffolding_flagged": True,
+                "outcome_scaffolding_evidence": {"reason": "old constraint"},
             },
         ],
     )
@@ -3351,6 +3362,162 @@ async def test_strategic_update_persists_implementation_constraints(db_session, 
     assert ctx.get("implementation_constraints") == "Must not modify public API surface"
     # Existing context field should be preserved
     assert ctx.get("success_evidence") == "prior evidence"
+    assert "outcome_progress_ever_met" not in target
+    assert not target.get("outcome_progress_history")
+    assert "evidence_progress" not in target
+    assert "outcome_scaffolding_flagged" not in target
+    assert "outcome_scaffolding_evidence" not in target
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_create_rejects_oversized_contract_fields(
+    db_session, mocker
+):
+    """Completion-interpreted creates reject, rather than truncate, each contract."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    project = Project(
+        name="P-create-contract-limits",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    common = {
+        "op": "create",
+        "success_evidence": "valid evidence",
+        "retirement_condition": "valid retirement",
+    }
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {**common, "text": "Oversized evidence", "success_evidence": "e" * 501},
+                {
+                    **common,
+                    "text": "Oversized retirement",
+                    "retirement_condition": "r" * 501,
+                },
+                {
+                    **common,
+                    "text": "Oversized constraints",
+                    "implementation_constraints": "c" * 501,
+                },
+                {
+                    **common,
+                    "text": "Valid boundary",
+                    "implementation_constraints": "c" * 500,
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    assert [direction["text"] for direction in project.directions] == [
+        "Valid boundary"
+    ]
+    assert (
+        project.directions[0]["context"]["implementation_constraints"] == "c" * 500
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_update_rejects_oversized_contract_atomically(
+    db_session, mocker
+):
+    """An invalid completion update skips the whole direction mutation."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    directions = [
+        {
+            "id": f"d-contract-{index}",
+            "text": f"Original {index}",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+            "context": {
+                "success_evidence": "old evidence",
+                "retirement_condition": "old retirement",
+                "implementation_constraints": "old constraints",
+            },
+        }
+        for index in range(3)
+    ]
+    project = Project(
+        name="P-update-contract-limits",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=directions,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": f"d-contract-{index}",
+                    "changes": {
+                        "text": f"Must not persist {index}",
+                        field: value * 501,
+                    },
+                }
+                for index, (field, value) in enumerate(
+                    (
+                        ("success_evidence", "e"),
+                        ("retirement_condition", "r"),
+                        ("implementation_constraints", "c"),
+                    )
+                )
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    for index, direction in enumerate(project.directions):
+        assert direction["text"] == f"Original {index}"
+        assert direction["context"] == {
+            "success_evidence": "old evidence",
+            "retirement_condition": "old retirement",
+            "implementation_constraints": "old constraints",
+        }
 
 
 @pytest.mark.asyncio
@@ -3423,8 +3590,10 @@ async def test_strategic_update_clears_context_fields_when_none(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_strategic_update_caps_context_fields_at_500(db_session, mocker):
-    """Direction-op `update` truncates oversized context field values to 500 chars."""
+async def test_strategic_update_rejects_oversized_context_fields_atomically(
+    db_session, mocker
+):
+    """Direction-op `update` rejects oversized contract fields without mutation."""
     import json
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
@@ -3485,8 +3654,8 @@ async def test_strategic_update_caps_context_fields_at_500(db_session, mocker):
     await db_session.refresh(project)
     target = next(d for d in (project.directions or []) if d.get("id") == "d-cap1")
     ctx = target.get("context") or {}
-    assert len(ctx.get("success_evidence", "")) == 500
-    assert len(ctx.get("retirement_condition", "")) == 500
+    assert "success_evidence" not in ctx
+    assert "retirement_condition" not in ctx
 
 
 @pytest.mark.asyncio
@@ -6214,7 +6383,10 @@ async def test_set_evidence_progress_list_via_http(client, db_session):
 
     await db_session.refresh(task)
     stored = (task.context or {}).get(EVIDENCE_PROGRESS_CONTEXT_KEY)
-    assert stored == verdicts
+    assert stored == [
+        verdicts[0],
+        {**verdicts[1], "stall_advisory_legacy": True},
+    ]
     assert (task.context or {}).get("_strategic_api_called") is True
 
 
@@ -6232,6 +6404,83 @@ async def test_set_evidence_progress_invalid_status_returns_400(client, db_sessi
             "op": "set_evidence_progress",
             "data": [
                 {"direction_id": "d-1", "status": "progressing", "rationale": "x"}
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    await db_session.refresh(task)
+    assert EVIDENCE_PROGRESS_CONTEXT_KEY not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_structured_stall_is_normalized(client, db_session):
+    """Structured stall evidence is bounded and canonical before task persistence."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(
+        db_session, name="EP-STALL-ADVISORY", vm="vm-ep-advisory"
+    )
+    token = create_agent_token(
+        str(task.id), "vm-ep-advisory", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": [
+                {
+                    "direction_id": "d-1",
+                    "status": "stalled",
+                    "rationale": "capacity unchanged",
+                    "stall_advisory_version": 1,
+                    "blocking_invariant": "  Runner   Cannot Allocate GPU ",
+                    "new_evidence_since_previous_cycle": [],
+                    "recommendation": "PIVOT",
+                    "continuation_pivot_rationale": " Use a smaller model. ",
+                }
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(task)
+    advisory = (task.context or {})[EVIDENCE_PROGRESS_CONTEXT_KEY][0][
+        "stall_advisory"
+    ]
+    assert advisory["blocking_invariant"] == "Runner Cannot Allocate GPU"
+    assert advisory["recommendation"] == "pivot"
+    assert len(advisory["invariant_fingerprint"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_partial_stall_advisory_is_atomic_400(
+    client, db_session
+):
+    """A partial structured advisory cannot persist alongside otherwise valid rows."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(
+        db_session, name="EP-STALL-PARTIAL", vm="vm-ep-partial"
+    )
+    token = create_agent_token(
+        str(task.id), "vm-ep-partial", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": [
+                {"direction_id": "d-ok", "status": "advancing", "rationale": "x"},
+                {
+                    "direction_id": "d-bad",
+                    "status": "stalled",
+                    "rationale": "x",
+                    "stall_advisory_version": 1,
+                    "blocking_invariant": "same blocker",
+                },
             ],
         },
         headers={"x-agent-token": token},
@@ -7733,8 +7982,15 @@ async def test_strategic_http_update_direction_user_paused_reactivation_blocked(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("contract_field", "new_value"),
+    [
+        ("success_evidence", "New goal: zero P0 incidents"),
+        ("implementation_constraints", "Preserve public API compatibility"),
+    ],
+)
 async def test_strategic_http_update_direction_clears_scaffolding_state_on_outcome_change(
-    client, db_session, mocker
+    client, db_session, mocker, contract_field, new_value
 ):
     """HTTP update_direction resets stale scaffolding state when outcome fields change."""
     from app.auth import create_agent_token
@@ -7742,7 +7998,7 @@ async def test_strategic_http_update_direction_clears_scaffolding_state_on_outco
     from app import strategic_cycle
 
     project = Project(
-        name="SCAFFOLD-HTTP",
+        name=f"SCAFFOLD-HTTP-{contract_field}",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
@@ -7756,6 +8012,7 @@ async def test_strategic_http_update_direction_clears_scaffolding_state_on_outco
                 "context": {
                     "success_evidence": "Existing goal",
                     "retirement_condition": "Existing exit",
+                    "implementation_constraints": "Existing constraints",
                 },
                 "outcome_progress_ever_met": True,
                 "outcome_progress_history": [{"progress": 4, "cycle_index": 9}],
@@ -7797,7 +8054,7 @@ async def test_strategic_http_update_direction_clears_scaffolding_state_on_outco
             "op": "update_direction",
             "data": {
                 "direction_id": "d-http-scaffold",
-                "changes": {"success_evidence": "New goal: zero P0 incidents"},
+                "changes": {contract_field: new_value},
             },
         },
         headers={"x-agent-token": token},
@@ -7808,7 +8065,7 @@ async def test_strategic_http_update_direction_clears_scaffolding_state_on_outco
     target = next(
         d for d in (project.directions or []) if d.get("id") == "d-http-scaffold"
     )
-    assert target["context"]["success_evidence"] == "New goal: zero P0 incidents"
+    assert target["context"][contract_field] == new_value
     assert target["context"]["retirement_condition"] == "Existing exit"
     assert "outcome_progress_ever_met" not in target
     # Either popped (scaffolding reset) or reset to [] (outcome-detection reset).

@@ -29,6 +29,11 @@ from app.direction_referential_guard import (
     classify_retired_direction_outcome,
 )
 from app.direction_grounding import validate_create_direction_grounding
+from app.direction_contract import (
+    DIRECTION_CONTRACT_FIELD_MAX,
+    normalize_direction_contract_changes,
+    normalize_direction_contract_field,
+)
 
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
@@ -2958,10 +2963,8 @@ def already_built_completion_suggestion(direction: dict) -> str | None:
 # with a HEALTHY merge rate that keeps shipping refactor/scaffolding PRs while
 # never advancing its stated success_evidence. Such a direction scores high on
 # quality_score and looks 'stable' on merge-rate trend, so it can burn dozens of
-# cycles unnoticed. The flag drives a persistence-pressure ladder (in
-# direction_lifecycle): it never adds a 7th auto-PAUSE rule, but escalates over
-# consecutive flagged cycles — surfacing to the strategic agent / operator and,
-# if the flag persists to max_flagged_cycles, auto-RETIRING the direction.
+# cycles unnoticed. The flag is advisory evidence surfaced to the strategic
+# agent/operator; it never pauses or retires a direction by itself.
 
 _OUTCOME_PROGRESS_HISTORY_HARD_CAP = 20
 
@@ -2996,7 +2999,6 @@ def _outcome_progress_config() -> dict:
             _OUTCOME_PROGRESS_HISTORY_HARD_CAP,
         ),
         "escalation_cycles": _int("direction_outcome_progress_escalation_cycles", 3),
-        "max_flagged_cycles": _int("direction_outcome_progress_max_flagged_cycles", 6),
     }
 
 
@@ -3146,6 +3148,7 @@ _OUTCOME_RESET_FIELDS: tuple[str, ...] = (
     "outcome_progress_ever_met",
     "outcome_progress_history",
     "evidence_progress",
+    "stall_advisory",
     "outcome_scaffolding_flagged",
     "outcome_scaffolding_flagged_at",
     "outcome_scaffolding_flagged_cycles",
@@ -3706,6 +3709,8 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
         else "enforce"
     )
     now_iso = _utcnow().isoformat()
+    from app.stall_advisory import apply_stall_advisory, clear_current_stall_advisory
+
     applied = 0
     for d in project.directions or []:
         if d.get("status") != "active":
@@ -3737,6 +3742,20 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
             "gate_mode": gate_mode,
             "gate_would_block": gate_would_block,
         }
+        if status == "stalled" and isinstance(verdict.get("stall_advisory"), dict):
+            apply_stall_advisory(
+                d,
+                verdict["stall_advisory"],
+                recorded_at=now_iso,
+                cycle_index=cycle_index,
+                cycle_task_id=str(task.id),
+            )
+        elif status in _EVIDENCE_PROGRESS_SUPPRESSING and (
+            challenge_approved or gate_mode in {"observe", "advisory"}
+        ):
+            # Progress clears only the current warning/advisory. Historical
+            # observations remain available for later policy evaluation.
+            clear_current_stall_advisory(d)
         applied += 1
     if applied:
         flag_modified(project, "directions")
@@ -5140,10 +5159,28 @@ async def _handle_strategic_completion(
                         )
                     if _gap_block_mode == "enforce":
                         continue
-                success_evidence = str(op_entry.get("success_evidence", "")).strip()
-                retirement_condition = str(
-                    op_entry.get("retirement_condition", "")
-                ).strip()
+                try:
+                    success_evidence = normalize_direction_contract_field(
+                        op_entry.get("success_evidence", ""), "success_evidence"
+                    )
+                    retirement_condition = normalize_direction_contract_field(
+                        op_entry.get("retirement_condition", ""),
+                        "retirement_condition",
+                    )
+                    implementation_constraints = (
+                        normalize_direction_contract_field(
+                            op_entry.get("implementation_constraints", ""),
+                            "implementation_constraints",
+                        )
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "[STRATEGIC] Task %s: direction create '%s' rejected — %s",
+                        task.id,
+                        text[:60],
+                        exc,
+                    )
+                    continue
                 if not success_evidence or not retirement_condition:
                     logger.warning(
                         f"[STRATEGIC] Task {task.id}: direction create '{text[:60]}' rejected — "
@@ -5278,7 +5315,6 @@ async def _handle_strategic_completion(
                         )
                         continue
                     conflicts_with = list(raw_conflicts_with)
-                _DIR_FIELD_MAX = 500
                 # Deterministic ID: same task + same text always produces the same
                 # direction ID, so a post-commit replay that re-parses direction_ops
                 # from agent stdout will find the already-committed direction and skip
@@ -5336,8 +5372,8 @@ async def _handle_strategic_completion(
                     ),
                     "research_history": [],
                     "context": {
-                        "success_evidence": success_evidence[:_DIR_FIELD_MAX],
-                        "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
+                        "success_evidence": success_evidence,
+                        "retirement_condition": retirement_condition,
                     },
                 }
                 if criterion_keys_supplied:
@@ -5355,13 +5391,10 @@ async def _handle_strategic_completion(
                     new_dir["context"]["retired_direction_grounding"] = (
                         _retired_grounding
                     )
-                impl_constraints = str(
-                    op_entry.get("implementation_constraints", "")
-                ).strip()
-                if impl_constraints:
-                    new_dir["context"]["implementation_constraints"] = impl_constraints[
-                        :_DIR_FIELD_MAX
-                    ]
+                if implementation_constraints:
+                    new_dir["context"]["implementation_constraints"] = (
+                        implementation_constraints
+                    )
                 if isinstance(raw_dedup_reasoning, dict):
                     dr: dict = {}
                     closest = raw_dedup_reasoning.get("closest_directions")
@@ -5371,7 +5404,9 @@ async def _handle_strategic_completion(
                         raw_dedup_reasoning.get("distinction") or ""
                     ).strip()
                     if distinction:
-                        dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                        dr["distinction"] = distinction[
+                            :DIRECTION_CONTRACT_FIELD_MAX
+                        ]
                     if dr:
                         new_dir["context"]["dedup_reasoning"] = dr
                         new_dir["context"]["grounding_verdict"] = validate_create_direction_grounding(
@@ -5478,6 +5513,18 @@ async def _handle_strategic_completion(
                 raw_dedup_reasoning = op_entry.get("dedup_reasoning")
                 if not dir_id or not changes:
                     continue
+                try:
+                    changes = normalize_direction_contract_changes(
+                        changes, field_prefix="changes."
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "[STRATEGIC] Task %s: skipped update_direction for %s — %s",
+                        task.id,
+                        dir_id,
+                        exc,
+                    )
+                    continue
                 blocked, why = challenge_rejects_portfolio_op(
                     fallback_challenge_record,
                     op,
@@ -5529,6 +5576,9 @@ async def _handle_strategic_completion(
                         _pre_ctx = d.get("context") or {}
                         _pre_se = _pre_ctx.get("success_evidence")
                         _pre_rc = _pre_ctx.get("retirement_condition")
+                        _pre_constraints = _pre_ctx.get(
+                            "implementation_constraints"
+                        )
                         # Prior gap_id captured before the change, for re-ground
                         # reconciliation (prune old gap, stage the new one).
                         _pre_gap_id_fb = d.get("gap_id")
@@ -5673,7 +5723,6 @@ async def _handle_strategic_completion(
                                         "outcome": _fb_term_outcome,
                                     }
                                 )
-                        _DIR_FIELD_MAX = 500
                         if isinstance(raw_dedup_reasoning, dict):
                             dr: dict = {}
                             closest = raw_dedup_reasoning.get("closest_directions")
@@ -5683,7 +5732,9 @@ async def _handle_strategic_completion(
                                 raw_dedup_reasoning.get("distinction") or ""
                             ).strip()
                             if distinction:
-                                dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                                dr["distinction"] = distinction[
+                                    :DIRECTION_CONTRACT_FIELD_MAX
+                                ]
                             if dr:
                                 ctx = dict(d.get("context") or {})
                                 ctx["dedup_reasoning"] = dr
@@ -5756,24 +5807,26 @@ async def _handle_strategic_completion(
                             )
                             d["paused_at"] = _utcnow().isoformat()
                         # Persist context-structured fields (same cap as CREATE path)
-                        _DIR_FIELD_MAX = 500
                         ctx = d.get("context") or {}
                         _old_se = ctx.get("success_evidence")
                         _old_rc = ctx.get("retirement_condition")
+                        _old_constraints = ctx.get("implementation_constraints")
                         for _ctx_field in (
                             "success_evidence",
                             "retirement_condition",
                             "implementation_constraints",
                         ):
                             if _ctx_field in changes:
-                                val = str(changes[_ctx_field] or "").strip()
+                                val = changes[_ctx_field]
                                 if val:
-                                    ctx[_ctx_field] = val[:_DIR_FIELD_MAX]
+                                    ctx[_ctx_field] = val
                                 else:
                                     ctx.pop(_ctx_field, None)
                         if (
                             ctx.get("success_evidence") != _old_se
                             or ctx.get("retirement_condition") != _old_rc
+                            or ctx.get("implementation_constraints")
+                            != _old_constraints
                         ):
                             _reset_scaffolding_state_on_outcome_change(d)
                         d["context"] = ctx
@@ -5784,6 +5837,8 @@ async def _handle_strategic_completion(
                             or list(d.get("paths") or []) != _pre_paths
                             or _new_ctx.get("success_evidence") != _pre_se
                             or _new_ctx.get("retirement_condition") != _pre_rc
+                            or _new_ctx.get("implementation_constraints")
+                            != _pre_constraints
                         ):
                             from app.direction_lifecycle import (
                                 _reset_outcome_detection_state,

@@ -34,6 +34,11 @@ from app.capability_trial_verdict import (
     record_trial_verdict,
 )
 from app.direction_referential_guard import build_retired_direction_grounding
+from app.direction_contract import (
+    DIRECTION_CONTRACT_FIELD_MAX,
+    normalize_direction_contract_changes,
+    normalize_direction_contract_field,
+)
 from app.database import get_session
 from app.knowledge_query import fetch_retirement_memo, get_knowledge_document
 from app.strategic_events import (
@@ -1502,8 +1507,19 @@ async def strategic_operation(
                 ),
                 project.id,
             )
-        success_evidence = str(data.get("success_evidence", "")).strip()
-        retirement_condition = str(data.get("retirement_condition", "")).strip()
+        try:
+            success_evidence = normalize_direction_contract_field(
+                data.get("success_evidence", ""), "success_evidence"
+            )
+            retirement_condition = normalize_direction_contract_field(
+                data.get("retirement_condition", ""), "retirement_condition"
+            )
+            implementation_constraints = normalize_direction_contract_field(
+                data.get("implementation_constraints", ""),
+                "implementation_constraints",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not success_evidence or not retirement_condition:
             raise HTTPException(
                 status_code=400,
@@ -1565,7 +1581,6 @@ async def strategic_operation(
                     ),
                     status_code=409,
                 )
-        _DIR_FIELD_MAX = 500
         criterion_keys_supplied = "criterion_keys" in data
         criterion_keys = (
             await _validate_criterion_keys_payload(
@@ -1626,8 +1641,8 @@ async def strategic_operation(
             ),
             "research_history": [],
             "context": {
-                "success_evidence": success_evidence[:_DIR_FIELD_MAX],
-                "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
+                "success_evidence": success_evidence,
+                "retirement_condition": retirement_condition,
             },
         }
         if criterion_keys_supplied:
@@ -1639,11 +1654,10 @@ async def strategic_operation(
         if staged_create:
             new_dir["staged_for_version"] = staged_for_version
             new_dir["staged_at"] = _utcnow().isoformat()
-        impl_constraints = str(data.get("implementation_constraints", "")).strip()
-        if impl_constraints:
-            new_dir["context"]["implementation_constraints"] = impl_constraints[
-                :_DIR_FIELD_MAX
-            ]
+        if implementation_constraints:
+            new_dir["context"]["implementation_constraints"] = (
+                implementation_constraints
+            )
         if isinstance(raw_dedup_reasoning, dict):
             dr: dict = {}
             closest = raw_dedup_reasoning.get("closest_directions")
@@ -1651,7 +1665,7 @@ async def strategic_operation(
                 dr["closest_directions"] = closest[:3]
             distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
             if distinction:
-                dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                dr["distinction"] = distinction[:DIRECTION_CONTRACT_FIELD_MAX]
             if dr:
                 new_dir["context"]["dedup_reasoning"] = dr
                 new_dir["context"]["grounding_verdict"] = validate_create_direction_grounding(
@@ -1815,6 +1829,12 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail="direction_id and changes required"
             )
+        try:
+            changes = normalize_direction_contract_changes(
+                changes, field_prefix="changes."
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         now_iso = _utcnow().isoformat()
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
@@ -1861,6 +1881,9 @@ async def strategic_operation(
                 _pre_text = d.get("text")
                 _pre_se = (d.get("context") or {}).get("success_evidence")
                 _pre_rc = (d.get("context") or {}).get("retirement_condition")
+                _pre_constraints = (d.get("context") or {}).get(
+                    "implementation_constraints"
+                )
                 _pre_gap_id = d.get("gap_id")
                 _pre_status = d.get("status")
                 requested_status = changes.get("status")
@@ -2021,11 +2044,18 @@ async def strategic_operation(
                     else:
                         d.pop("criterion_release_version_id", None)
                 # Handle success_evidence and retirement_condition in context
-                _DIR_FIELD_MAX = 500
-                if "success_evidence" in changes or "retirement_condition" in changes:
+                if any(
+                    field in changes
+                    for field in (
+                        "success_evidence",
+                        "retirement_condition",
+                        "implementation_constraints",
+                    )
+                ):
                     ctx = dict(d.get("context") or {})
                     old_success_evidence = ctx.get("success_evidence")
                     old_retirement_condition = ctx.get("retirement_condition")
+                    old_constraints = ctx.get("implementation_constraints")
                     if "success_evidence" in changes:
                         se = changes["success_evidence"]
                         if se is None or se == "":
@@ -2033,7 +2063,7 @@ async def strategic_operation(
                         else:
                             ctx["success_evidence"] = _cap_str(
                                 se,
-                                _DIR_FIELD_MAX,
+                                DIRECTION_CONTRACT_FIELD_MAX,
                                 "changes.success_evidence",
                                 warnings,
                             )
@@ -2044,13 +2074,20 @@ async def strategic_operation(
                         else:
                             ctx["retirement_condition"] = _cap_str(
                                 rc,
-                                _DIR_FIELD_MAX,
+                                DIRECTION_CONTRACT_FIELD_MAX,
                                 "changes.retirement_condition",
                                 warnings,
                             )
+                    if "implementation_constraints" in changes:
+                        constraints = changes["implementation_constraints"]
+                        if constraints is None or constraints == "":
+                            ctx.pop("implementation_constraints", None)
+                        else:
+                            ctx["implementation_constraints"] = constraints.strip()
                     if (
                         ctx.get("success_evidence") != old_success_evidence
                         or ctx.get("retirement_condition") != old_retirement_condition
+                        or ctx.get("implementation_constraints") != old_constraints
                     ):
                         _reset_scaffolding_state_on_outcome_change(d)
                     d["context"] = ctx
@@ -2074,7 +2111,9 @@ async def strategic_operation(
                         dr["closest_directions"] = closest[:3]
                     distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
                     if distinction:
-                        dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                        dr["distinction"] = distinction[
+                            :DIRECTION_CONTRACT_FIELD_MAX
+                        ]
                     if dr:
                         ctx = dict(d.get("context") or {})
                         ctx["dedup_reasoning"] = dr
@@ -2086,6 +2125,8 @@ async def strategic_operation(
                     d.get("text") != _pre_text
                     or (d.get("context") or {}).get("success_evidence") != _pre_se
                     or (d.get("context") or {}).get("retirement_condition") != _pre_rc
+                    or (d.get("context") or {}).get("implementation_constraints")
+                    != _pre_constraints
                 ):
                     _reset_outcome_detection_state(d)
                 updated = True
@@ -4959,6 +5000,7 @@ async def strategic_operation(
             _EVIDENCE_PROGRESS_RATIONALE_MAX,
             _VALID_EVIDENCE_PROGRESS,
         )
+        from app.stall_advisory import normalize_stall_advisory_fields
 
         if not isinstance(data, list):
             raise HTTPException(
@@ -4979,13 +5021,32 @@ async def strategic_operation(
                     status_code=400,
                     detail=f"set_evidence_progress: invalid status '{status}' (must be one of: advancing, stalled, met)",
                 )
-            cleaned_ep.append(
-                {
-                    "direction_id": direction_id[:64],
-                    "status": status,
-                    "rationale": rationale[:_EVIDENCE_PROGRESS_RATIONALE_MAX],
-                }
-            )
+            cleaned_item = {
+                "direction_id": direction_id[:64],
+                "status": status,
+                "rationale": rationale[:_EVIDENCE_PROGRESS_RATIONALE_MAX],
+            }
+            if status == "stalled":
+                try:
+                    stall_advisory = normalize_stall_advisory_fields(item)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"set_evidence_progress: {exc}",
+                    ) from exc
+                if stall_advisory is not None:
+                    cleaned_item["stall_advisory"] = stall_advisory
+                else:
+                    # Explicitly label compatibility traffic so a missing
+                    # structured record is visible rather than silently lost.
+                    cleaned_item["stall_advisory_legacy"] = True
+                    logger.warning(
+                        "[STRATEGIC API] Accepted legacy unstructured stalled "
+                        "verdict for task %s direction %s",
+                        task.id,
+                        direction_id,
+                    )
+            cleaned_ep.append(cleaned_item)
         ctx = task.context or {}
         task.context = {
             **ctx,

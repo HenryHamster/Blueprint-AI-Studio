@@ -4810,6 +4810,52 @@ def _bound_retired_direction_grounding(
     return out or None
 
 
+def _bound_stall_advisory(
+    advisory: Any, *, field_max: int = 500, evidence_max: int = 10
+) -> dict[str, Any] | None:
+    """Return the latest durable stall judgment in a prompt-safe shape.
+
+    Stall advisories are qualitative decision records, not a score.  Keep only
+    the fields the next Strategic cycle needs to revisit the call, and bound
+    every value independently so one verbose rationale cannot crowd direction
+    evidence out of the packed payload.
+    """
+    if not isinstance(advisory, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in (
+        "blocking_invariant",
+        "continuation_pivot_rationale",
+        "recorded_at",
+        "cycle_task_id",
+        "invariant_fingerprint",
+    ):
+        value = advisory.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            out[key] = text[:field_max]
+    recommendation = str(advisory.get("recommendation") or "").strip().lower()
+    if recommendation in {"continue", "pivot"}:
+        out["recommendation"] = recommendation
+    evidence = advisory.get("new_evidence_since_previous_cycle")
+    if isinstance(evidence, list):
+        bounded_evidence = [
+            str(item).strip()[:field_max]
+            for item in evidence[:evidence_max]
+            if str(item).strip()
+        ]
+        out["new_evidence_since_previous_cycle"] = bounded_evidence
+    for key in ("version", "repeat_without_evidence_count", "cycle_index"):
+        value = advisory.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[key] = value
+    if isinstance(advisory.get("warning"), bool):
+        out["warning"] = advisory["warning"]
+    return out or None
+
+
 def _build_direction_stats(
     project: Project,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -5024,6 +5070,15 @@ def _build_direction_stats(
         )
         if _grounding:
             stat_entry["retired_direction_grounding"] = _grounding
+        # The latest advisory stall call is durable decision context for the
+        # next Strategic cycle.  Surface it next to the direction's evidence
+        # contract so the agent must reconcile what remained blocked, what new
+        # evidence arrived, and whether the recommendation was continue/pivot.
+        # This remains qualitative and advisory: no numeric information-gain
+        # score is synthesized here.
+        _stall_advisory = _bound_stall_advisory(d.get("stall_advisory"))
+        if _stall_advisory:
+            stat_entry["stall_advisory"] = _stall_advisory
         # Advisory outcome-less-scaffolding flag: surfaces a long-running direction
         # that keeps merging PRs but never advances its success_evidence, so the
         # strategic agent sees it as a first-class signal (not just merge/cost metrics).
