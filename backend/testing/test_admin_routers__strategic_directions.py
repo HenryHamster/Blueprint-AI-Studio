@@ -1290,22 +1290,30 @@ async def test_resident_reply_completes_exact_live_conversation_claim(
 
     project, task = await _make_resident_message_worker(db_session)
     claim_id = uuid.uuid4()
+    incarnation = uuid.uuid4()
     inbound = ProjectMessage(
         project_id=project.id,
         sequence=1,
         surface=MessageSurface.CONVERSATION,
-        handling_state=MessageHandlingState.CLAIMED,
-        handled_by_task_id=task.id,
-        conversation_claim_id=claim_id,
-        conversation_claim_generation=1,
-        conversation_claim_expires_at=_utcnow() + timedelta(minutes=10),
-        conversation_claim_attempt=1,
         message_type=MessageType.NOTE,
         from_type="user",
         status="open",
         content="Please finish this exact durable turn.",
         resident_session_id="resident-receipt-session",
     )
+    db_session.add(inbound)
+    await db_session.commit()
+    await db_session.refresh(inbound)
+    # Match the production Coordinator path: claims transition an already
+    # durable pending row instead of relying on constructor values that can be
+    # replaced by PostgreSQL server defaults during INSERT.
+    inbound.handling_state = MessageHandlingState.CLAIMED
+    inbound.handled_by_task_id = task.id
+    inbound.conversation_claim_id = claim_id
+    inbound.conversation_claim_generation = 1
+    inbound.conversation_claim_incarnation = incarnation
+    inbound.conversation_claim_expires_at = _utcnow() + timedelta(minutes=10)
+    inbound.conversation_claim_attempt = 1
     db_session.add(inbound)
     await db_session.commit()
     await db_session.refresh(inbound)
@@ -1321,6 +1329,7 @@ async def test_resident_reply_completes_exact_live_conversation_claim(
             "idempotency_key": "resident-durable-claim-reply",
             "covered_message_ids": [str(inbound.id)],
             "conversation_claim_id": str(claim_id),
+            "conversation_claim_incarnation": str(incarnation),
         },
     }
     headers = {"x-agent-token": token}
@@ -1331,7 +1340,7 @@ async def test_resident_reply_completes_exact_live_conversation_claim(
     assert inbound.status == "handled"
     assert inbound.handling_state == MessageHandlingState.RESPONDED
     assert inbound.conversation_claim_id == claim_id
-    assert inbound.conversation_claim_incarnation is not None
+    assert inbound.conversation_claim_incarnation == incarnation
     assert inbound.conversation_claim_expires_at is None
 
     replay = await client.post("/api/agent/strategic", headers=headers, json=body)
@@ -1354,13 +1363,6 @@ async def test_resident_reply_rejects_partial_conversation_claim(
             project_id=project.id,
             sequence=index,
             surface=MessageSurface.CONVERSATION,
-            handling_state=MessageHandlingState.CLAIMED,
-            handled_by_task_id=task.id,
-            conversation_claim_id=claim_id,
-            conversation_claim_generation=1,
-            conversation_claim_incarnation=incarnation,
-            conversation_claim_expires_at=_utcnow() + timedelta(minutes=10),
-            conversation_claim_attempt=1,
             message_type=MessageType.NOTE,
             from_type="user",
             status="open",
@@ -1370,6 +1372,17 @@ async def test_resident_reply_rejects_partial_conversation_claim(
         for index in (1, 2)
     ]
     db_session.add_all(rows)
+    await db_session.commit()
+    for row in rows:
+        await db_session.refresh(row)
+        row.handling_state = MessageHandlingState.CLAIMED
+        row.handled_by_task_id = task.id
+        row.conversation_claim_id = claim_id
+        row.conversation_claim_generation = 1
+        row.conversation_claim_incarnation = incarnation
+        row.conversation_claim_expires_at = _utcnow() + timedelta(minutes=10)
+        row.conversation_claim_attempt = 1
+        db_session.add(row)
     await db_session.commit()
     token = create_agent_token(
         str(task.id), "vm-resident-receipt", task_type="strategic_review"
@@ -1413,13 +1426,6 @@ async def test_resident_claim_reply_to_must_belong_to_covered_batch(
         project_id=project.id,
         sequence=1,
         surface=MessageSurface.CONVERSATION,
-        handling_state=MessageHandlingState.CLAIMED,
-        handled_by_task_id=task.id,
-        conversation_claim_id=claim_id,
-        conversation_claim_generation=1,
-        conversation_claim_incarnation=incarnation,
-        conversation_claim_expires_at=_utcnow() + timedelta(minutes=10),
-        conversation_claim_attempt=1,
         message_type=MessageType.NOTE,
         from_type="user",
         status="open",
@@ -1438,6 +1444,16 @@ async def test_resident_claim_reply_to_must_belong_to_covered_batch(
         resident_session_id="resident-receipt-session",
     )
     db_session.add_all([claimed, unrelated])
+    await db_session.commit()
+    await db_session.refresh(claimed)
+    claimed.handling_state = MessageHandlingState.CLAIMED
+    claimed.handled_by_task_id = task.id
+    claimed.conversation_claim_id = claim_id
+    claimed.conversation_claim_generation = 1
+    claimed.conversation_claim_incarnation = incarnation
+    claimed.conversation_claim_expires_at = _utcnow() + timedelta(minutes=10)
+    claimed.conversation_claim_attempt = 1
+    db_session.add(claimed)
     await db_session.commit()
     token = create_agent_token(
         str(task.id), "vm-resident-receipt", task_type="strategic_review"
