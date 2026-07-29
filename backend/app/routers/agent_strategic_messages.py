@@ -1253,20 +1253,30 @@ async def claim_resident_messages(
             status_code=409,
             detail="Fast Resident owns public replies while a call is active",
         )
-    updated_vision = dict(project.vision or {})
-    accepted_resident_incarnation = claim_resident_worker_incarnation(
-        updated_vision,
-        task_id=payload.task_id,
-        worker_generation=payload.worker_generation,
-        incarnation_id=payload.resident_incarnation_id,
-    )
-    if accepted_resident_incarnation is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Resident process incarnation superseded",
+    from app.task_locking import with_vision_locked
+
+    accepted_resident_incarnation: uuid.UUID | None = None
+
+    def _claim_process_incarnation(vision: dict) -> None:
+        nonlocal accepted_resident_incarnation
+        accepted_resident_incarnation = claim_resident_worker_incarnation(
+            vision,
+            task_id=payload.task_id,
+            worker_generation=payload.worker_generation,
+            incarnation_id=payload.resident_incarnation_id,
         )
-    project.vision = updated_vision
-    session.add(project)
+        if accepted_resident_incarnation is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Resident process incarnation superseded",
+            )
+
+    await with_vision_locked(
+        session,
+        project_id,
+        _claim_process_incarnation,
+        _locked_project=project,
+    )
 
     from app.conversation_coordinator import (
         claim_operator_messages,

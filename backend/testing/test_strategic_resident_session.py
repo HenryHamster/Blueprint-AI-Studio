@@ -7,6 +7,7 @@ handoff, and reaper contracts directly.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from inspect import unwrap
 import uuid
@@ -990,6 +991,75 @@ async def test_incarnation_takeover_uses_time_sampled_after_project_lock(
     assert datetime.fromisoformat(
         resident["worker_incarnation_expires_at"]
     ) > after_lock
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_samples_operator_reengagement_after_project_lock(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    now = _utcnow()
+    stale_at = now - timedelta(minutes=10)
+    resident = dict(project.vision[RESIDENT_SESSION_KEY])
+    resident["started_at"] = stale_at.isoformat()
+    resident["last_operator_interaction_at"] = stale_at.isoformat()
+    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    monkeypatch.setitem(
+        runtime_config,
+        STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
+        60,
+    )
+
+    original_project_lock = resident_session_module.project_lock
+    project_lock_held = False
+
+    @asynccontextmanager
+    async def observed_project_lock(*args, **kwargs):
+        nonlocal project_lock_held
+        async with original_project_lock(*args, **kwargs) as locked_project:
+            project_lock_held = True
+            try:
+                yield locked_project
+            finally:
+                project_lock_held = False
+
+    async def latest_operator_interaction(*_args, **_kwargs):
+        assert project_lock_held
+        return now
+
+    monkeypatch.setattr(
+        resident_session_module,
+        "project_lock",
+        observed_project_lock,
+    )
+    monkeypatch.setattr(
+        resident_session_module,
+        "_latest_operator_interaction_at",
+        latest_operator_interaction,
+    )
+
+    project = await db_session.get(Project, project.id)
+    renewed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        progress=False,
+    )
+
+    assert renewed["status"] == "active"
+    assert renewed["stop_requested"] is False
+    refreshed = await db_session.get(Project, project.id)
+    resident = read_resident_session(refreshed.vision)
+    assert resident["last_operator_interaction_at"] == now.isoformat()
 
 
 @pytest.mark.asyncio

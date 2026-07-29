@@ -1211,6 +1211,7 @@ async def update_agent_status(
         Task.vm_instance_id == token.get("vm_instance_id"),
     )
     stmt = stmt.with_for_update(skip_locked=locked_resident_project is None)
+    stmt = stmt.execution_options(populate_existing=True)
     result = await session.execute(stmt)
     task = result.scalars().first()
 

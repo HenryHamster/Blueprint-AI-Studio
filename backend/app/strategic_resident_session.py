@@ -4188,27 +4188,11 @@ async def renew_resident_session_lease(
             "direction_grounding": direction_grounding,
         }
 
-    # Unattended cap: compare now against the last operator interaction, taking
-    # the newer of the recorded blob timestamp and any fresh operator message.
     max_unattended = runtime_config.get(
         STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
         _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS,
     )
-    last_op_dt = _parse_iso_naive(
-        blob.get("last_operator_interaction_at")
-    ) or _parse_iso_naive(blob.get("started_at"))
-    latest_msg_dt = await _latest_operator_interaction_at(
-        session, project.id, resident_session_id=session_id
-    )
-    op_reengaged = latest_msg_dt is not None and (
-        last_op_dt is None or latest_msg_dt > last_op_dt
-    )
-    effective_last_op = latest_msg_dt if op_reengaged else last_op_dt
-    unattended_exceeded = (
-        not op_reengaged
-        and effective_last_op is not None
-        and (now - effective_last_op).total_seconds() > float(max_unattended)
-    )
+    latest_msg_dt: datetime | None = None
 
     holder = {
         "authority_held": False,
@@ -4318,6 +4302,23 @@ async def renew_resident_session_lease(
         if not isinstance(fresh, dict):
             holder["stopped"] = True
             return
+        # Decide the unattended cap from the in-lock session state and a
+        # message timestamp queried only after this heartbeat acquired Project
+        # authority. Operator sends take the same Project lock for sequencing,
+        # so whichever transaction wins is observed atomically here.
+        last_op_dt = _parse_iso_naive(
+            fresh.get("last_operator_interaction_at")
+        ) or _parse_iso_naive(fresh.get("started_at"))
+        op_reengaged = latest_msg_dt is not None and (
+            last_op_dt is None or latest_msg_dt > last_op_dt
+        )
+        effective_last_op = latest_msg_dt if op_reengaged else last_op_dt
+        unattended_exceeded = (
+            not op_reengaged
+            and effective_last_op is not None
+            and (lease_now - effective_last_op).total_seconds()
+            > float(max_unattended)
+        )
         # Finding 1 (unattended cap): the session has run past the max-unattended
         # cap with no operator interaction. This is an elapsed, sustained
         # condition — END the session (release the lease, stamp ended) so the
@@ -4497,7 +4498,21 @@ async def renew_resident_session_lease(
         )
         vision[RESIDENT_SESSION_KEY] = updated
 
-    await with_vision_locked(session, project.id, _renew, skip_locked=False)
+    async with project_lock(session, project.id, skip_locked=False) as locked_project:
+        if locked_project is None:
+            holder["stopped"] = True
+        else:
+            latest_msg_dt = await _latest_operator_interaction_at(
+                session,
+                project.id,
+                resident_session_id=session_id,
+            )
+            await with_vision_locked(
+                session,
+                project.id,
+                _renew,
+                _locked_project=locked_project,
+            )
     if holder["legacy_grace_until"] is not None:
         legacy_grace_until = holder["legacy_grace_until"]
         lease_now = holder["lease_now"] or _utcnow()

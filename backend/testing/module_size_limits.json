@@ -31,6 +31,7 @@
     "routers/admin_release_version.py": 2250,
     "routers/admin_pipeline_observability.py": 2350,
     "routers/admin_agent_ops.py": 7450,
+    "routers/agent_strategic_messages.py": 1950,
     "routers/admin_pool_accounts.py": 1950,
     "max_plan_pool.py": 6250,
     "anomaly_detection.py": 2100,
@@ -154,7 +155,7 @@
     "migration_apply_gate.py": 2150,
     "capability_registry.py": 1750,
     "storage.py": 1750,
-    "strategic_resident_session.py": 4900,
+    "strategic_resident_session.py": 5850,
     "release_qualifier_audit.py": 1800
   },
   "agent": {
