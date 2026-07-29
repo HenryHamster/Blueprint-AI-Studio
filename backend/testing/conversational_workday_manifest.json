@@ -161,6 +161,15 @@
       ]
     },
     {
+      "path": "agent/src/handlers/strategic-resident-prompt.test.ts",
+      "reason": "Protects the canonical process-level Strategic Resident identity, its strategic object model, implementation boundary, direction coherence rules, and native operator reply protocol.",
+      "test_ids": [
+        "defines the Resident identity and strategic object model compactly",
+        "commissions implementation and forbids direction sharding",
+        "preserves the native reply protocol"
+      ]
+    },
+    {
       "path": "agent/src/providers/resident-stream.test.ts",
       "reason": "Covers the stream utility functions (isStrategicMutation, isMessageSend) that classify events during a conversational Workday session turn. Removing these tests leaves the event classification contract unguarded.",
       "test_ids": [
@@ -435,10 +444,11 @@
         "text attachment content reaches the model via GCS URL fetch",
         "text attachment URL fetch failure degrades to a notice without throwing",
         "text attachment content is truncated when it exceeds MAX_TEXT_ATTACHMENT_BYTES",
-        "includes the role framing, tools, and grounding sections",
-        "bootstrap_prompt_uses_native_workday_reply_tool",
-        "bootstrap_prompt_states_dispatched_work_runs_concurrently",
-        "includes canonical fetch guidance when provided",
+        "includes session capabilities and grounding without duplicating identity",
+        "bootstrap identifies the native reply capability without repeating its protocol",
+        "bootstrap does not treat direction creation as dispatch parallelism",
+        "points to on-demand fetch help instead of embedding the verb catalog",
+        "includes compute artifact retrieval only when that helper was provisioned",
         "renders an empty-problem-model note when none is present",
         "includes the optional retired and prior-decision sections when provided",
         "omits optional sections that are blank",
@@ -462,7 +472,7 @@
         "renders the work-unit contract and the TICK-VERDICT vocabulary",
         "opens with the corrective examine-before-CLEAR instruction when flagged",
         "restates recent records and open FOUND leads",
-        "includes pipeline-parallelism reminder: dispatched work runs concurrently",
+        "parallelizes bounded tasks without direction sharding",
         "test_decisions_register_rendered_in_prompt_and_checkpoint",
         "includes the explicit operator-decision review protocol when a review is pending",
         "omits OPERATOR-DECISION CORRECTIVE section when operatorDecisionMissing is false (default)",
@@ -489,7 +499,7 @@
         "classifies valid ordinary and explicit overflow outcomes",
         "deduplicates the same streamed marker across final and accumulated text",
         "retains an interrupted review even when the output contains a valid marker",
-        "instructs the strategist to emit an OPERATOR-DECISION marker on a settlement",
+        "keeps the operator-decision protocol out of the state-only bootstrap",
         "test_decisions_reg_roundtrip_restores_entries_across_restart",
         "test_decisions_reg_restore_returns_null_on_bad_input",
         "test_decisions_reg_serialize_empty_register_restores_to_empty_array",

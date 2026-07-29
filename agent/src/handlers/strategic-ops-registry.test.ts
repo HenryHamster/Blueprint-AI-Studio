@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import {
   STRATEGIC_OPS_REGISTRY,
   cliOps,
+  cliOpInput,
   allBackendOps,
   strategicOpsManifest,
 } from './strategic-ops-registry.js';
@@ -90,6 +91,25 @@ describe('generated ./strategic CLI derives from the registry', () => {
     for (const entry of cliOps()) {
       expect(script).toContain(`operation":"${entry.alias}`);
     }
+  });
+
+  it('teaches the complete direction/task structural contract', () => {
+    const create = cliOpInput('create-direction');
+    expect(create?.required).toEqual([
+      'text',
+      'success_evidence',
+      'retirement_condition',
+    ]);
+    expect(create?.fields).toContain('staged');
+    expect(create?.fields).toContain('gap_id');
+    expect(create?.notes?.join('\n')).toContain('recurring autonomous research lane');
+    expect(create?.notes?.join('\n')).toContain('multiple spawn-task calls under one direction');
+    const spawn = cliOpInput('spawn-task');
+    expect(spawn?.example).toMatchObject({ direction_id: 'd-pipeline-reliability' });
+    expect(spawn?.notes?.join('\n')).toContain(
+      'bounded implementation, research, plan, design, and compute work under an existing strategic outcome',
+    );
+    expect(script).toContain('"required":["text","success_evidence","retirement_condition"]');
   });
 
   it('every CLI-flagged op has a case arm routing its alias to _call "<op>"', () => {

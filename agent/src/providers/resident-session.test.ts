@@ -165,6 +165,28 @@ describe('startResidentClaudeSession', () => {
     expect(args).toContain('--input-format');
     session.close();
   });
+  it('appends the Resident identity without replacing Claude built-in instructions', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({
+      appendSystemPrompt: 'canonical resident identity',
+    });
+    const [, args] = vi.mocked(spawn).mock.calls[0] as unknown as [string, string[]];
+    expect(args).toEqual(expect.arrayContaining([
+      '--append-system-prompt', 'canonical resident identity',
+    ]));
+    expect(args).not.toContain('--system-prompt');
+    session.close();
+  });
+
+  it('refuses a known Claude CLI without append-system-prompt support', () => {
+    vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(new Set(['--input-format']));
+    expect(() => startResidentClaudeSession({
+      appendSystemPrompt: 'canonical resident identity',
+    })).toThrow(/--append-system-prompt/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it('launches the receipt-bound Workday reply tool through MCP when configured', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);

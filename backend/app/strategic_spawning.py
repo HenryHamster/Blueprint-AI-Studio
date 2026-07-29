@@ -323,46 +323,24 @@ async def _strategic_recent_version_entry(
     }
 
 
-def _build_parallelism_hint(
+def _build_portfolio_coherence_hint(
     active_count: int, max_concurrent_vms: int, max_active_directions: int
 ) -> str:
-    """Advisory prompt hint nudging the strategist to keep enough INDEPENDENT
-    direction lanes open to use the fleet.
-
-    Each active direction is one parallel work-lane (research/plan dispatch fans
-    out per-direction), so the active-direction count — not the VM cap — is the
-    real ceiling on how much of the fleet works at once. The target is derived
-    from existing config, never hardcoded: aim for the operator's own
-    ``max_active_directions`` ceiling, clamped by ``max_concurrent_vms`` so a
-    small fleet is never told to open lanes it cannot run. Returns "" once the
-    lane count reaches that target. Quality-framed: it asks the agent to
-    decompose the version goal into independent, non-overlapping workstreams —
-    so the added lanes are *more parallelism, not more conflict* — rather than to
-    hit a number.
-    """
-    target = max_active_directions
-    if max_concurrent_vms:
-        target = min(target, max_concurrent_vms)
-    if active_count >= target:
-        return ""
+    """Describe direction/task semantics without turning capacity into a quota."""
     cap_clause = (
-        f" the fleet can run ~{max_concurrent_vms} VMs at once and"
+        f"The fleet can run about {max_concurrent_vms} VMs concurrently, but that capacity"
         if max_concurrent_vms
-        else ""
+        else "Available execution capacity"
     )
     return (
-        f"PARALLELISM: You have {active_count} active direction(s);{cap_clause} "
-        f"each active direction is an independent work-lane, so most of that "
-        f"capacity is idle right now. Decompose the version goal into as many "
-        f"INDEPENDENT, non-overlapping workstreams as genuinely exist — each "
-        f"touching different subsystems/files so their work lands without "
-        f"colliding — and open a direction for each. Lean toward opening more "
-        f"lanes than fewer. Keep them disjoint: if two directions would touch the "
-        f"same code, mark them conflicts_with (to sequence) or merge them; retire "
-        f"stale ones. Only stay narrow if there is genuinely no further "
-        f"independent valuable work, or the rest depends on a load-bearing "
-        f"direction landing first (room for up to {max_active_directions} active "
-        f"directions)."
+        f"PORTFOLIO COHERENCE: {active_count}/{max_active_directions} active "
+        f"direction slots are in use. {cap_clause} is a ceiling, "
+        f"never a target for direction count. Keep directions as a small set of "
+        f"durable, distinct outcomes. Parallelize bounded implementation, "
+        f"research, design, or compute with multiple tasks under the existing "
+        f"direction. Create another direction only for a genuinely distinct "
+        f"durable outcome, never to divide files, subsystems, implementation "
+        f"stages, or workers."
     )
 
 
@@ -6706,11 +6684,12 @@ async def _spawn_strategic_review(
                 f"`version_phase.last_qualification` on v{_cur_n} means this "
                 f"fresh version has not yet begun its OWN qualification (expected "
                 f"for a just-opened version) — it does NOT mean v{_prior_n}'s "
-                f"promotion is pending or failed. Open two concurrent "
-                f"workstreams this cycle: (a) complete next-version setup: "
-                f"{_setup_instruction}; (b) retire directions v{_prior_n} "
-                f"already satisfied — these are independent and can run in "
-                f"parallel. Once setup is complete, propose the directions "
+                f"promotion is pending or failed. Perform two independent "
+                f"control-plane actions this cycle: (a) complete next-version "
+                f"setup: {_setup_instruction}; (b) retire directions v{_prior_n} "
+                f"already satisfied. These actions may proceed in parallel; "
+                f"they are not separate strategic directions. Once setup is "
+                f"complete, propose the directions "
                 f"the next milestone needs."
             )
         prompt_suffix = (
@@ -7041,12 +7020,12 @@ async def _spawn_strategic_review(
                     _stabilize_hint += (
                         " There is currently NO active direction in audit or "
                         "fundamentals mode, so nothing is set up to FIX these "
-                        "findings. You MUST create a new direction "
-                        "(recommended_mode='audit') whose stated work is resolving "
-                        "them — adding a status note to an existing ship/pause "
-                        "direction does NOT count and will not move the audit "
-                        "score. Creating this direction is the highest-leverage "
-                        "action available this cycle."
+                        "findings. Ensure one durable direction owns the outcome "
+                        "and uses recommended_mode='audit': update an existing "
+                        "direction when it already owns these findings, otherwise "
+                        "create one. A status note alone does NOT count and will "
+                        "not move the audit score. Establishing that executable "
+                        "ownership is the highest-leverage action this cycle."
                     )
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
@@ -7226,19 +7205,18 @@ async def _spawn_strategic_review(
     _direction_counts = _build_direction_counts(project)
     _active_directions_count = _direction_counts["active"]
     _max_active_directions = _direction_counts["max_active"]
-    # Advisory: when too few directions are active the fleet's per-direction
-    # fan-out leaves most VM capacity idle. Surface that cost so the agent can
-    # weigh opening more lanes for worthwhile parallel work.
-    _parallelism_hint = _build_parallelism_hint(
+    # Keep runtime capacity subordinate to portfolio coherence. Directions are
+    # durable outcomes; bounded parallel work belongs in tasks beneath them.
+    _portfolio_coherence_hint = _build_portfolio_coherence_hint(
         _active_directions_count,
         _runtime_config.get("max_concurrent_vms", 0),
         _max_active_directions,
     )
-    if _parallelism_hint:
+    if _portfolio_coherence_hint:
         prompt_suffix = (
-            f"{prompt_suffix}\n{_parallelism_hint}"
+            f"{prompt_suffix}\n{_portfolio_coherence_hint}"
             if prompt_suffix
-            else _parallelism_hint
+            else _portfolio_coherence_hint
         )
     # If this cycle was woken by operator steering, lead the prompt_suffix with
     # a high-priority steering directive so the operator's message reaches and

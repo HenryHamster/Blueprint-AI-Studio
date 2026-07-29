@@ -43,6 +43,7 @@ from app.strategic_events import (
     emit_strategic_updated,
 )
 from app.strategic_op_contracts import (
+    normalize_create_direction,
     normalize_problem_model_envelope,
     normalize_update_direction,
 )
@@ -126,7 +127,6 @@ from app.workbench_state import (
     strategic_local_continuation_status_from_vision,
 )
 from app.strategic_constants import (
-    MIN_HEALTHY_ACTIVE_DIRECTIONS,
     STRATEGIC_DIRECTION_TEXT_MAX,
     STRATEGIC_MESSAGE_CONTENT_MAX,
     STRATEGIC_NOTES_HISTORY_MAX,
@@ -1229,7 +1229,9 @@ async def strategic_operation(
     # Normalize the few historically surprising envelopes before their domain
     # handlers run.  Keeping this at the API boundary makes field errors
     # consistent for CLI, direct API, and future non-shell clients.
-    if payload.op == "update_direction":
+    if payload.op == "create_direction":
+        data = normalize_create_direction(data)
+    elif payload.op == "update_direction":
         data = normalize_update_direction(data)
 
     problem_model_dry_run = False
@@ -1676,7 +1678,11 @@ async def strategic_operation(
             new_dir["gap_id"] = _gid
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
-        if data.get("category") and data["category"] in ("product", "structural"):
+        if data.get("category") and data["category"] in (
+            "product",
+            "structural",
+            "mixed",
+        ):
             new_dir["category"] = data["category"]
         if data.get("recommended_mode"):
             mode = _normalize_recommended_mode(data["recommended_mode"])
@@ -2328,20 +2334,6 @@ async def strategic_operation(
             session, project, task, [dir_id], {dir_id: rationale}
         )
         await session.commit()
-        # Advisory (non-blocking): each active direction is one parallel work-lane
-        # the fleet fans out across, so retiring below the healthy floor caps max
-        # parallelism and leaves VM capacity idle. ``directions`` already reflects
-        # this retire (the row was flipped to "expired" above).
-        _active_after = sum(1 for d in directions if d.get("status") == "active")
-        if _active_after < MIN_HEALTHY_ACTIVE_DIRECTIONS:
-            warnings.append(
-                f"Only {_active_after} active direction(s) remain after this "
-                f"retire. Active directions are the fleet's parallel work-lanes, "
-                f"so this caps max parallelism and leaves VM capacity idle. If "
-                f"there is worthwhile parallel work, consider opening a "
-                f"replacement direction (aim for at least "
-                f"{MIN_HEALTHY_ACTIVE_DIRECTIONS} active)."
-            )
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
 
     elif payload.op == "decide_churn_retirement":

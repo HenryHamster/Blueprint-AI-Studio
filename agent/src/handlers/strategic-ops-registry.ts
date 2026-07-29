@@ -99,6 +99,29 @@ const INPUTS = {
       'A terminal status update follows the same rationale and terminal_reason contract as retire_direction.',
     ],
   },
+  create_direction: {
+    kind: 'json' as const,
+    required: ['text', 'success_evidence', 'retirement_condition'],
+    fields: [
+      'text', 'success_evidence', 'retirement_condition', 'rationale',
+      'priority', 'gap_id', 'implementation_constraints', 'criterion_keys',
+      'recommended_mode', 'system_id', 'conflicts_with', 'staged',
+      'dedup_reasoning', 'category', 'paths',
+    ],
+    example: {
+      text: 'Deliver a reproducible CPU-scale behavior sweep with a self-contained comparison artifact.',
+      success_evidence: 'A clean-clone run produces validated results and an offline comparison artifact.',
+      retirement_condition: 'The reproducible sweep and artifact are merged, or two sound trials invalidate the bet.',
+      gap_id: 'g-evaluation',
+    },
+    notes: [
+      'A direction is a durable strategic outcome or bet, not a task, file/PR shard, implementation checklist, or live status update.',
+      'Creating an active direction opens a recurring autonomous research lane. Use staged=true when it must not begin yet.',
+      'priority is high|medium|low; category is product|structural|mixed; recommended_mode is audit|fundamentals|ship|pause.',
+      'Before creating, inspect existing and recently retired directions. Prefer updating an existing outcome and dispatch bounded one-shot work with spawn-task.',
+      'Use multiple spawn-task calls under one direction to parallelize independent implementation.',
+    ],
+  },
   spawn_task: {
     kind: 'json' as const,
     required: ['type', 'title'],
@@ -115,10 +138,12 @@ const INPUTS = {
       type: 'create',
       title: 'Implement the verified pipeline repair',
       prompt: 'Apply the scoped fix and add regression coverage.',
+      direction_id: 'd-pipeline-reliability',
       idempotency_key: 'pipeline-repair-v1',
     },
     notes: [
-      'Use this operation for implementation, research, plan, design, and compute tasks.',
+      'Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.',
+      'Parallelize independent implementation with multiple tasks under one direction; do not create file-, PR-, or phase-sharded directions.',
       'type=fix additionally requires pr_number and branch.',
       'Spawned tasks are watched by default; set watch=false to opt out.',
       'Exceptional project bursts return a durable deferred request instead of HTTP 429.',
@@ -161,7 +186,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'replace_problem_model', alias: 'replace-problem-model', cli: true, prompt: true, internalReason: null,
     description: 'Guardedly replace a problem model for bootstrap or recovery.', input: inputFor('replace_problem_model') },
   { op: 'set_running_update', alias: 'set-running-update', cli: true, prompt: true, internalReason: null,
-    description: 'Update the operator-facing running-update snapshot.', input: inputFor('set_running_update') },
+    description: 'Replace the operator-facing live-status snapshot for task, PR, blocker, HEAD, and next-step state.', input: inputFor('set_running_update') },
   { op: 'reflect', alias: 'reflect', cli: true, prompt: true, internalReason: null,
     description: 'Record a strategic self-reflection note for the cycle.' },
   { op: 'pending_confirm', alias: 'pending-confirm', cli: true, prompt: true, internalReason: null,
@@ -171,7 +196,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'set_vision', alias: 'set-vision', cli: true, prompt: true, internalReason: null,
     description: 'Update the project vision (purpose, systems, priorities, context).' },
   { op: 'create_direction', alias: 'create-direction', cli: true, prompt: true, internalReason: null,
-    description: 'Open a new strategic direction (optionally staged for the next version).' },
+    description: 'Open a distinct durable strategic outcome lane (optionally staged); use spawn-task for bounded or parallel execution.', input: inputFor('create_direction') },
   { op: 'update_direction', alias: 'update-direction', cli: true, prompt: true, internalReason: null,
     description: "Update an existing direction's fields, status, or gap linkage. Terminal status updates require the same outcome or typed zero-attempt reason as retire_direction.", input: inputFor('update_direction') },
   { op: 'retire_direction', alias: 'retire-direction', cli: true, prompt: true, internalReason: null,
@@ -189,7 +214,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'resolve_message', alias: 'resolve-message', cli: true, prompt: false, internalReason: null,
     description: 'Resolve an addressed operator message (available to all agent types).' },
   { op: 'spawn_task', alias: 'spawn-task', cli: true, prompt: true, internalReason: null,
-    description: 'Durably dispatch an implementation, research, plan, design, or compute task.', input: inputFor('spawn_task') },
+    description: 'Durably dispatch bounded implementation, research, plan, design, or compute work under a strategic outcome.', input: inputFor('spawn_task') },
   { op: 'spawn_fix', alias: null, cli: false, prompt: false,
     internalReason: 'Deprecated compatibility alias; use spawn-task.',
     description: 'Deprecated compatibility alias for spawn-task.' },
@@ -277,6 +302,7 @@ export interface StrategicOpManifestEntry {
   cli: boolean;
   prompt: boolean;
   internal_reason: string | null;
+  input?: StrategicOpInputContract;
 }
 
 /**
@@ -284,15 +310,21 @@ export interface StrategicOpManifestEntry {
  * (`backend/app/strategic_ops_manifest.json`). The manifest is the
  * cross-language contract: the agent test asserts this equals the JSON file,
  * and the backend test asserts the dispatch chain accepts exactly these `op`s.
- * Rendering-only details (CLI case bodies) are deliberately excluded.
+ * Rendering-only details (CLI case bodies) are deliberately excluded. Declared
+ * input contracts are included so backend drift guards can compare their
+ * accepted envelopes with the same metadata that renders CLI help.
  */
 export function strategicOpsManifest(): StrategicOpManifestEntry[] {
-  return STRATEGIC_OPS_REGISTRY.map(e => ({
-    op: e.op,
-    alias: e.alias,
-    description: e.description,
-    cli: e.cli,
-    prompt: e.prompt,
-    internal_reason: e.internalReason,
-  }));
+  return STRATEGIC_OPS_REGISTRY.map(e => {
+    const entry: StrategicOpManifestEntry = {
+      op: e.op,
+      alias: e.alias,
+      description: e.description,
+      cli: e.cli,
+      prompt: e.prompt,
+      internal_reason: e.internalReason,
+    };
+    if (e.input) entry.input = e.input;
+    return entry;
+  });
 }

@@ -5,7 +5,13 @@
         "description": "Compatibility alias for patching the project's problem model.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "notes": [
+                "Legacy alias for patch-problem-model. Omitted fields are preserved; use replace-problem-model only for bootstrap/recovery."
+            ]
+        }
     },
     {
         "op": "patch_problem_model",
@@ -13,7 +19,29 @@
         "description": "Patch the project's problem model without clobbering omitted fields.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "base_revision",
+                "patch"
+            ],
+            "fields": [
+                "base_revision",
+                "patch",
+                "transient_actions",
+                "dry_run"
+            ],
+            "example": {
+                "base_revision": 4,
+                "patch": {
+                    "current_focus": "Validate the local runner"
+                }
+            },
+            "notes": [
+                "Patch preserves omitted fields. Set dry_run=true to inspect the diff without writing."
+            ]
+        }
     },
     {
         "op": "replace_problem_model",
@@ -21,15 +49,51 @@
         "description": "Guardedly replace a problem model for bootstrap or recovery.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "base_revision",
+                "model",
+                "confirm_replace"
+            ],
+            "fields": [
+                "base_revision",
+                "model",
+                "confirm_replace",
+                "dry_run"
+            ],
+            "example": {
+                "base_revision": 4,
+                "model": {
+                    "current_focus": "Bootstrap model"
+                },
+                "confirm_replace": true
+            },
+            "notes": [
+                "Reserved for bootstrap/recovery. confirm_replace must be true."
+            ]
+        }
     },
     {
         "op": "set_running_update",
         "alias": "set-running-update",
-        "description": "Update the operator-facing running-update snapshot.",
+        "description": "Replace the operator-facing live-status snapshot for task, PR, blocker, HEAD, and next-step state.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "markdown",
+            "fields": [
+                "markdown"
+            ],
+            "example": {
+                "markdown": "# Current status\n..."
+            },
+            "notes": [
+                "Use --file for markdown. --stdin accepts raw markdown. --json accepts {\"markdown\":\"...\"}."
+            ]
+        }
     },
     {
         "op": "reflect",
@@ -66,10 +130,48 @@
     {
         "op": "create_direction",
         "alias": "create-direction",
-        "description": "Open a new strategic direction (optionally staged for the next version).",
+        "description": "Open a distinct durable strategic outcome lane (optionally staged); use spawn-task for bounded or parallel execution.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "text",
+                "success_evidence",
+                "retirement_condition"
+            ],
+            "fields": [
+                "text",
+                "success_evidence",
+                "retirement_condition",
+                "rationale",
+                "priority",
+                "gap_id",
+                "implementation_constraints",
+                "criterion_keys",
+                "recommended_mode",
+                "system_id",
+                "conflicts_with",
+                "staged",
+                "dedup_reasoning",
+                "category",
+                "paths"
+            ],
+            "example": {
+                "text": "Deliver a reproducible CPU-scale behavior sweep with a self-contained comparison artifact.",
+                "success_evidence": "A clean-clone run produces validated results and an offline comparison artifact.",
+                "retirement_condition": "The reproducible sweep and artifact are merged, or two sound trials invalidate the bet.",
+                "gap_id": "g-evaluation"
+            },
+            "notes": [
+                "A direction is a durable strategic outcome or bet, not a task, file/PR shard, implementation checklist, or live status update.",
+                "Creating an active direction opens a recurring autonomous research lane. Use staged=true when it must not begin yet.",
+                "priority is high|medium|low; category is product|structural|mixed; recommended_mode is audit|fundamentals|ship|pause.",
+                "Before creating, inspect existing and recently retired directions. Prefer updating an existing outcome and dispatch bounded one-shot work with spawn-task.",
+                "Use multiple spawn-task calls under one direction to parallelize independent implementation."
+            ]
+        }
     },
     {
         "op": "update_direction",
@@ -77,7 +179,37 @@
         "description": "Update an existing direction's fields, status, or gap linkage. Terminal status updates require the same outcome or typed zero-attempt reason as retire_direction.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "direction_id"
+            ],
+            "fields": [
+                "direction_id",
+                "text",
+                "priority",
+                "status",
+                "gap_id",
+                "success_evidence",
+                "retirement_condition",
+                "rationale",
+                "terminal_reason",
+                "criterion_keys",
+                "recommended_mode",
+                "system_id",
+                "conflicts_with"
+            ],
+            "example": {
+                "direction_id": "d-123",
+                "priority": "high",
+                "gap_id": "g-4"
+            },
+            "notes": [
+                "Pass fields directly. The legacy {direction_id, changes:{...}} wrapper remains temporarily supported.",
+                "A terminal status update follows the same rationale and terminal_reason contract as retire_direction."
+            ]
+        }
     },
     {
         "op": "retire_direction",
@@ -138,10 +270,66 @@
     {
         "op": "spawn_task",
         "alias": "spawn-task",
-        "description": "Durably dispatch an implementation, research, plan, design, or compute task.",
+        "description": "Durably dispatch bounded implementation, research, plan, design, or compute work under a strategic outcome.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "type",
+                "title"
+            ],
+            "fields": [
+                "type",
+                "title",
+                "prompt",
+                "direction_id",
+                "criterion_ids",
+                "acceptance_evidence",
+                "debt_id",
+                "idempotency_key",
+                "watch",
+                "watch_purpose",
+                "preview_only",
+                "pr_number",
+                "branch",
+                "original_task_id",
+                "original_prompt",
+                "command",
+                "hypothesis",
+                "spend_cap_usd",
+                "deadline_seconds",
+                "success_criterion",
+                "success_criteria",
+                "machine_type",
+                "runner_target",
+                "accelerator",
+                "vram_gb",
+                "min_compute_capability",
+                "cwd",
+                "env",
+                "container_image",
+                "allow_host_fallback"
+            ],
+            "example": {
+                "type": "create",
+                "title": "Implement the verified pipeline repair",
+                "prompt": "Apply the scoped fix and add regression coverage.",
+                "direction_id": "d-pipeline-reliability",
+                "idempotency_key": "pipeline-repair-v1"
+            },
+            "notes": [
+                "Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.",
+                "Parallelize independent implementation with multiple tasks under one direction; do not create file-, PR-, or phase-sharded directions.",
+                "type=fix additionally requires pr_number and branch.",
+                "Spawned tasks are watched by default; set watch=false to opt out.",
+                "Exceptional project bursts return a durable deferred request instead of HTTP 429.",
+                "For compute_experiment, set preview_only=true to validate and inspect the normalized launch without dispatching.",
+                "Omit accelerator for a CPU-only job. Preview reports the selected resource and estimated billable cost.",
+                "Use success_criteria for simple all-required (AND) measurement contracts; success_criterion remains supported."
+            ]
+        }
     },
     {
         "op": "spawn_fix",
@@ -157,7 +345,26 @@
         "description": "Cancel a spawned QUEUED/PROVISIONING task or deferred spawn request.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "reason"
+            ],
+            "fields": [
+                "target_task_id",
+                "request_id",
+                "reason"
+            ],
+            "example": {
+                "request_id": "7b48ce0f-55c6-4f62-904f-ec624bc32763",
+                "reason": "This deferred request is no longer needed."
+            },
+            "notes": [
+                "Pass exactly one of target_task_id or request_id.",
+                "request_id cancels durable work only while it remains deferred."
+            ]
+        }
     },
     {
         "op": "watch_task",

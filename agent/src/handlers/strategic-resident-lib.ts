@@ -9,8 +9,6 @@
 
 import { createHash } from 'crypto';
 
-import { promptOps } from './strategic-ops-registry.js';
-
 /**
  * Maximum base64-encoded image data length accepted in a message turn
  * (~10 MB encoded corresponds to ~7.5 MB raw). Longer payloads are silently
@@ -610,8 +608,8 @@ export function resolveCheckpointGrounding(
 }
 
 export interface CompactionCheckpointContext {
-  /** Condensed role identity section (from the original bootstrap). */
-  roleIdentity: string;
+  /** @deprecated Identity is process-level; accepted only for old callers and never rendered. */
+  roleIdentity?: string;
   /** Current exam ledger serialized as JSON. */
   examLedgerJson: string;
   /** Human-readable summary of recent operator interactions and key decisions. */
@@ -678,26 +676,23 @@ export interface CompactionCheckpointContext {
  * delivered to a FRESH subprocess so the session continues coherently
  * after a context-window compaction restart.
  *
- * This is NOT the full bootstrap prompt. It preserves high-signal content:
- * (i) resident role identity and tool descriptions, (ii) the current exam
- * ledger state, (iii) a brief summary of recent operator interactions and
- * key decisions made, (iv) the current autonomous state.
+ * This is NOT the full bootstrap prompt. The canonical role is supplied again
+ * through the fresh subprocess's system prompt; this user turn carries state
+ * only so identity is neither duplicated nor weakened after compaction.
  *
  * Pure and unit-testable — no imports from index.js.
  */
 export function buildCompactionCheckpoint(ctx: CompactionCheckpointContext): string {
   const sections: string[] = [];
 
-  // (i) Condensed role identity — the session is resuming, not starting fresh.
+  // The fresh subprocess already has the canonical process-level identity.
   sections.push(`# Session checkpoint — compaction restart
 
 The resident session's Claude subprocess was restarted because the context
 window approached its limit. This is a CHECKPOINT restore, not a fresh start.
 Your previous session was compacted. Continue operating exactly where you left off.
 This internal restore turn is not an operator message. Do not call reply_to_operator
-or send any user-facing message while absorbing this checkpoint.
-
-${ctx.roleIdentity}`);
+or send any user-facing message while absorbing this checkpoint.`);
 
   // (ii) Exam ledger state.
   if (ctx.examLedgerJson.trim()) {
@@ -1476,6 +1471,9 @@ export interface BootstrapContext {
    *  omitted defaults to ''. */
   recentHandledConversationText?: string;
   sessionId: string;
+  /** Conditional guidance for the provisioned compute-artifact helper. */
+  computeArtifactGuidanceText?: string;
+  /** @deprecated Fetch help is now discovered on demand via `./fetch help`. */
   fetchGuidanceText?: string;
   priorSessionContextText?: string;
   /** Formatted project skills text from `.blueprint/tools.json`. Rendered as a
@@ -1494,88 +1492,31 @@ export interface BootstrapContext {
 }
 
 /**
- * Assemble the persistent role framing + grounding context delivered on the
- * FIRST turn of the session (prepended to that turn's text). The session retains
- * this in its conversation memory for the rest of its life, so subsequent turns
- * stay lean. Describes the resident role, the two operating speeds, and the
- * `./strategic` / `./fetch` / `./design-doc` / `./messages` tools.
+ * Assemble project state and live capability grounding delivered on the FIRST
+ * turn. Stable identity and behavior live in STRATEGIC_RESIDENT_SYSTEM_PROMPT,
+ * so this prompt stays state-oriented and can be refreshed independently.
  */
 export function buildBootstrapPrompt(ctx: BootstrapContext): string {
   const sections: string[] = [];
   if (ctx.contextPrefix.trim()) sections.push(ctx.contextPrefix.trim());
 
-  sections.push(`# You are the resident strategist for ${ctx.projectName || 'this project'}
+  sections.push(`# Resident session state — ${ctx.projectName || 'this project'}
 
-You are a STANDING, long-lived strategic agent — not a one-shot cycle. This
-process stays warm across many turns and holds the project's context and your
-conversation with the operator in memory. You operate at two speeds:
+Session id: ${ctx.sessionId}
 
-- **Interactive (operator chat):** when the operator sends a message, answer it
-  directly and conversationally, take a quick action if they ask, and keep it
-  tight. You may do small fact-finding needed for accuracy, but before any
-  foreground command, schema probe, polling loop, or wait likely to take longer
-  than a quick inspection, send the operator a substantive answer, decision, or
-  concrete plan. First priority is always a live operator message. You MUST call
-  the native \`reply_to_operator\` tool exactly once with your complete
-  conversational answer. The live stream is a transcript only: normal assistant
-  text does not deliver a Workday reply. Do not use \`./messages send\` or
-  \`./strategic create-message\` as an operator reply; those are generic project
-  helpers and will be rejected during an operator turn. The Resident runtime
-  atomically commits the native tool's receipt-bound reply and marks the
-  operator message handled. NEVER call \`./messages resolve\` for an operator
-  message and never create a “Feedback addressed” receipt yourself: doing so
-  closes the message before its reply can be committed and interrupts the
-  conversation.
-  Launch long-running work asynchronously; never sit in a foreground sleep or
-  polling loop waiting for it. Report again only for a meaningful lifecycle event:
-  launch accepted, material blocker, run started, material result/progress, or a
-  failure that needs operator intervention — never heartbeat or timer chatter.
-  When the operator's message SETTLES or CORRECTS a course — rejects an option,
-  reverses a call, fixes a fact, or gives a standing instruction — end your turn
-  with one trailing marker line \`OPERATOR-DECISION: <the settled fact, stated as
-  a durable rule>\`. This is captured into your durable decisions register so a
-  restarted session does NOT re-propose what the operator already settled. Emit
-  it ONLY for genuine settlements, never for routine Q&A.
-- **Autonomous (between messages):** when no operator input is pending you are
-  handed a turn to advance the project. Complete ONE meaningful unit of progress —
-  refine the problem model, open/refine/retire a direction, spawn needed work,
-  refine the running update, OR examine one project surface for work worth doing.
-  An examination that ends CLEAR (the one surface you looked at holds nothing
-  actionable right now) is a fully successful turn — looking is real progress.
-  Busy-work means unneeded MUTATION; examination is never busy-work. Then stop so
-  the loop can check for operator input again. Your autonomous turn can be
-  interrupted the moment the operator speaks.
-
-Dispatched work runs concurrently and independently of your own turn-by-turn
-reasoning: once you \`spawn_task\`, \`spawn_fix\`, or \`create_direction\` (and the
-autonomous research pipeline behind each active direction), that work executes
-in the pipeline regardless of your cadence — you do NOT have to finish or watch
-one before opening the next. When two pieces of intended work are genuinely
-independent (no shared files, no logical dependency, no real conflict risk),
-dispatching BOTH now is the DEFAULT — do not stage one behind the other merely
-to avoid context-switching, since there is no context to switch: the pipeline
-carries them in parallel. Sequence work only when there is a real dependency or
-conflict (the \`conflicts_with\` field marks that case).
-
-Never wait on the operator to proceed. Never claim the session is "done" — it
-ends only when the operator stops it.
-
-## Your tools (bash helpers already provisioned in this workspace)
-- \`./strategic <op> <json|file>\` — apply strategic operations (${promptOps().map(e => e.alias).join(', ')}).
-  These are your MUTATING actions on the cloud source of truth.
-- \`./fetch <kind> <id>\` — pull full detail when context was trimmed. The
-  canonical verb list and per-verb guidance are below.
+## Provisioned capabilities
+- \`./strategic\` mutates the problem model, portfolio, tasks, watches, status,
+  and durable memory. Run \`./strategic help\` or \`./strategic schema <op>\`
+  before using an unfamiliar operation.
+- \`./fetch\` reads project, portfolio, task, pipeline, message, and knowledge
+  state. Run \`./fetch help\` or \`./fetch help <verb>\` for the live catalog.
 - \`./design-doc <get|list|set|delete> <key>\` — read/update design-doc sections.
-- \`reply_to_operator\` — the native Workday MCP tool. Use it exactly once for
-  every interactive operator response, with the full user-facing answer in
-  \`content\`. It is the only tool that sends a Workday reply.
-- \`./messages send\` — send a generic project message outside an active
-  operator reply. It is not a substitute for \`reply_to_operator\`.
+- \`reply_to_operator\` — native interactive reply path.
+- \`./messages send\` — generic project messages outside an active reply.`);
 
-${ctx.fetchGuidanceText?.trim() ? `${ctx.fetchGuidanceText.trim()}\n\n` : ''}
-
-All strategic state you write describes the MANAGED project (see CLAUDE.md) —
-never this execution environment, this prompt, or the helper commands.`);
+  if (ctx.computeArtifactGuidanceText?.trim()) {
+    sections.push(ctx.computeArtifactGuidanceText.trim());
+  }
 
   if (ctx.problemModelJson.trim()) {
     sections.push(`## Current problem model\n\`\`\`json\n${ctx.problemModelJson.trim()}\n\`\`\``);
@@ -2180,7 +2121,7 @@ export function parseTickVerdict(
 
 /**
  * Parse the trailing OPERATOR-DECISION marker line from an operator-turn's
- * result text. The resident strategist is instructed (bootstrap prompt) to end a
+ * result text. The Resident system prompt instructs it to end a
  * reply with `OPERATOR-DECISION: <settled fact>` whenever the operator corrects
  * or settles a course in live chat. Scans from the LAST line so a mid-reply
  * mention cannot be mistaken for the marker. Markdown decoration around the
@@ -2525,10 +2466,10 @@ export function buildAutonomousPrompt(
     'welcome: read code, task outcomes, a direction, or the qualification findings',
     'before deciding — do not stop at revision numbers or counts.',
     '',
-    'Dispatched work runs concurrently: once you spawn_task, spawn_fix, or',
-    'create_direction, that work executes in the pipeline regardless of your cadence.',
-    'When two pieces of work are genuinely independent (no shared files, no logical',
-    'dependency), dispatch BOTH now rather than staging one behind the other.',
+    'Tasks run concurrently after spawn_task or spawn_fix. When bounded work is',
+    'genuinely independent, dispatch parallel TASKS under the owning direction.',
+    'Do not create directions to parallelize implementation or consume capacity;',
+    'a direction is a durable outcome lane, and activating one creates recurring attention.',
     'When a specific result matters in a later turn, register it once with',
     '`./strategic watch-task --json \'{"target_task_id":"<task-id>","purpose":"<what to do when it finishes>"}\'`.',
     'Do not spend turns polling it: its terminal receipt will be placed ahead of normal',

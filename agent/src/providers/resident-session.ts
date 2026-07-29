@@ -171,6 +171,8 @@ export interface ResidentSessionOptions {
   model?: string;
   effort?: string;
   disallowedTools?: string[];
+  /** Stable process-level identity appended to Claude's built-in system prompt. */
+  appendSystemPrompt?: string;
   workspace?: string;
   /** Per-process capability bindings inherited by helper subprocesses. */
   env?: NodeJS.ProcessEnv;
@@ -289,6 +291,12 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   const args = opts.foregroundLaunch || compatibleBaseArgs.includes('--input-format')
     ? compatibleBaseArgs
     : [...compatibleBaseArgs, '--input-format', 'stream-json'];
+  if (opts.appendSystemPrompt) {
+    if (capabilities && !capabilities.has('--append-system-prompt')) {
+      throw new Error('resident identity requires Claude --append-system-prompt support');
+    }
+    args.push('--append-system-prompt', opts.appendSystemPrompt);
+  }
   if (opts.replyTool) {
     if (capabilities && (
       !capabilities.has('--mcp-config')

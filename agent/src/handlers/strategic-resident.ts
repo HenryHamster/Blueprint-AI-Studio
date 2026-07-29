@@ -60,7 +60,6 @@ import {
   type CheckpointGrounding, type CheckpointStateResponse,
   type StrategicWatchReceipt, type ResidentActivityUpdate,
 } from './strategic-resident-lib.js';
-import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 import {
   formatResidentRepoSnapshot,
   syncResidentRepository,
@@ -83,6 +82,7 @@ import {
   loadCallSpeechConfig,
   parseCallSpeechCredentialEnvelope,
 } from '../call-speech/config.js';
+import { STRATEGIC_RESIDENT_SYSTEM_PROMPT } from './strategic-resident-prompt.js';
 
 const _RESIDENT_STRATEGIC_TASK_TYPE = 'strategic_review' as const;
 
@@ -899,8 +899,9 @@ export async function handleStrategicResident(
     openMessagesText: buildOpenMessagesText(openMessages),
     recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
     sessionId,
-    fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS)
-      + (artifactsHelperAvailable ? `\n${COMPUTE_ARTIFACT_GUIDANCE}` : ''),
+    computeArtifactGuidanceText: artifactsHelperAvailable
+      ? COMPUTE_ARTIFACT_GUIDANCE
+      : undefined,
     priorSessionContextText,
     skillsText,
     toolContentText,
@@ -1049,7 +1050,6 @@ export async function handleStrategicResident(
   // model's context limit is reached.
   let compactionCount = 0;
   let lastCompactionAt = 0;
-  const projectName = strVal(payload.project_name, 'this project');
 
   // Refreshable direction grounding from the heartbeat. Initialized as null
   // (degrading to the bootstrap directionsSummary) and updated on every
@@ -1067,14 +1067,6 @@ export async function handleStrategicResident(
 
   /** Build the compaction checkpoint context from current handler state. */
   const buildCheckpointContext = (): CompactionCheckpointContext => {
-    const roleIdentity = [
-      `You are the resident strategist for ${projectName}.`,
-      'You operate at two speeds — interactive (operator chat) and autonomous',
-      '(between messages). Your tools: ./strategic, ./fetch, ./design-doc,',
-      './messages send. All strategic state you write describes the MANAGED',
-      'project — never this execution environment or this prompt.',
-    ].join(' ');
-
     const examLedgerJson = serializeLedger(
       examRecords,
       examTick,
@@ -1124,7 +1116,7 @@ export async function handleStrategicResident(
       refreshedGrounding,
     );
     return {
-      roleIdentity, examLedgerJson, recentInteractions, autonomousState,
+      examLedgerJson, recentInteractions, autonomousState,
       problemModelJson: grounding.problemModelJson,
       visionJson: grounding.visionJson,
       strategicMemoryNotesText: grounding.strategicMemoryNotesText,
@@ -1260,6 +1252,7 @@ export async function handleStrategicResident(
       BLUEPRINT_RESIDENT_STAGED_REPLY_PATH: RESIDENT_STAGED_REPLY_PATH,
     },
     turnTimeoutMs: sessionBaseStallTimeoutMs,
+    appendSystemPrompt: STRATEGIC_RESIDENT_SYSTEM_PROMPT,
     replyTool: {
       mcpConfigPath: residentCallMcpConfigPath,
       toolName: RESIDENT_REPLY_TOOL_NAME,
@@ -1702,7 +1695,7 @@ export async function handleStrategicResident(
   // them; without this, a correction the operator makes in live chat drops out of
   // open_messages once handled and survives nowhere durable — so a restarted
   // session re-proposes exactly what the operator already settled. The strategist
-  // is instructed (bootstrap prompt) to end such a turn with an OPERATOR-DECISION
+  // is instructed (system prompt) to end such a turn with an OPERATOR-DECISION
   // marker; when present we record it here BEFORE the operator-turn heartbeat so
   // it is serialized into task.context._decisions_reg on that same heartbeat.
   const recordOperatorDecision = (

@@ -33,7 +33,6 @@ import {
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
   type PendingOperatorDecisionReview,
 } from './strategic-resident-lib.js';
-import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
 describe('residentConfig', () => {
   it('uses contract defaults when the payload omits the knobs', () => {
@@ -1112,47 +1111,51 @@ describe('buildBootstrapPrompt', () => {
     fetchGuidanceText: '',
   };
 
-  it('includes the role framing, tools, and grounding sections', () => {
+  it('includes session capabilities and grounding without duplicating identity', () => {
     const p = buildBootstrapPrompt(base);
-    expect(p).toContain('resident strategist for Acme');
+    expect(p).toContain('Resident session state — Acme');
+    expect(p).toContain('Session id: ss-1');
     expect(p).toContain('./strategic');
     expect(p).toContain('Current problem model');
     expect(p).toContain('{"gaps":[]}');
     expect(p).toContain('all good');
     expect(p).toContain('- d1 active');
     expect(p).toContain('CTX');
-    expect(p).toContain('substantive answer, decision, or');
-    expect(p).toContain('Launch long-running work asynchronously');
-    expect(p).toContain('meaningful lifecycle event');
-    expect(p).toContain('never heartbeat or timer chatter');
+    expect(p).not.toContain('long-lived strategic steward');
+    expect(p).not.toContain('A direction is a durable strategic outcome');
   });
 
-  it('bootstrap_prompt_uses_native_workday_reply_tool', () => {
+  it('bootstrap identifies the native reply capability without repeating its protocol', () => {
     const p = buildBootstrapPrompt(base);
-    expect(p).toContain('native `reply_to_operator` tool exactly once');
-    expect(p).toMatch(/normal assistant\s+text does not deliver a Workday reply/);
-    expect(p).toMatch(/Do not use `\.\/messages send` or\s+`\.\/strategic create-message` as an operator reply/);
-    expect(p).toMatch(/full user-facing answer in\s+`content`/);
-    expect(p).toContain('NEVER call `./messages resolve` for an operator');
-    expect(p).toContain("atomically commits the native tool's receipt-bound reply");
+    expect(p).toContain('`reply_to_operator` — native interactive reply path');
+    expect(p).not.toContain('exactly once');
   });
 
-  it('bootstrap_prompt_states_dispatched_work_runs_concurrently', () => {
+  it('bootstrap does not treat direction creation as dispatch parallelism', () => {
     const p = buildBootstrapPrompt(base);
-    expect(p).toContain('Dispatched work runs concurrently and independently');
-    expect(p).toContain('dispatching BOTH now is the DEFAULT');
-    expect(p).toContain('do not stage one behind the other');
-    expect(p).toContain('conflicts_with');
+    expect(p).not.toContain('dispatching BOTH');
+    expect(p).not.toContain('create_direction');
   });
 
-  it('includes canonical fetch guidance when provided', () => {
+  it('points to on-demand fetch help instead of embedding the verb catalog', () => {
     const p = buildBootstrapPrompt({
       ...base,
-      fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
+      fetchGuidanceText: 'MID-RUN FETCH (./fetch)\n`./fetch task <task_id>`',
     });
-    expect(p).toContain('MID-RUN FETCH (./fetch)');
-    expect(p).toContain('`./fetch task <task_id>`');
-    expect(p).toContain('`./fetch tasks`');
+    expect(p).toContain('`./fetch help`');
+    expect(p).toContain('`./fetch help <verb>`');
+    expect(p).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(p).not.toContain('`./fetch task <task_id>`');
+  });
+
+  it('includes compute artifact retrieval only when that helper was provisioned', () => {
+    const withoutHelper = buildBootstrapPrompt(base);
+    const withHelper = buildBootstrapPrompt({
+      ...base,
+      computeArtifactGuidanceText: '## Compute job artifacts\nRun `./artifacts fetch <compute-job-id>`.',
+    });
+    expect(withoutHelper).not.toContain('./artifacts fetch');
+    expect(withHelper).toContain('./artifacts fetch <compute-job-id>');
   });
 
   it('renders an empty-problem-model note when none is present', () => {
@@ -1467,15 +1470,13 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     expect(p).toContain('code:backend: hardcoded model id');
   });
 
-  it('includes pipeline-parallelism reminder: dispatched work runs concurrently', () => {
+  it('parallelizes bounded tasks without direction sharding', () => {
     const p = buildAutonomousPrompt(focus, [], [], false);
-    // Reminder that dispatched work runs concurrently and independent work should be dispatched together
-    expect(p).toContain('Dispatched work runs concurrently');
-    expect(p).toContain('spawn_task, spawn_fix, or');
-    expect(p).toContain('pipeline regardless of your cadence');
-    expect(p).toContain('genuinely independent');
-    expect(p).toContain('dispatch BOTH now');
-    expect(p).toContain('staging one behind the other');
+    expect(p).toContain('Tasks run concurrently after spawn_task or spawn_fix');
+    expect(p).toContain('parallel TASKS under the owning direction');
+    expect(p).toContain('Do not create directions to parallelize implementation');
+    expect(p).toContain('activating one creates recurring attention');
+    expect(p).not.toContain('dispatch BOTH');
     expect(p).toContain('./strategic watch-task');
     expect(p).toContain('Do not spend turns polling it');
   });
@@ -2013,10 +2014,10 @@ describe('buildBootstrapPrompt operator-decision instruction', () => {
     sessionId: 's-1', fetchGuidanceText: '', priorSessionContextText: '',
     skillsText: '', decisionsRegisterText: '',
   };
-  it('instructs the strategist to emit an OPERATOR-DECISION marker on a settlement', () => {
+  it('keeps the operator-decision protocol out of the state-only bootstrap', () => {
     const p = buildBootstrapPrompt(base);
-    expect(p).toContain('OPERATOR-DECISION:');
-    expect(p).toContain('durable decisions register');
+    expect(p).not.toContain('OPERATOR-DECISION:');
+    expect(p).not.toContain('durable decisions register');
   });
 });
 
@@ -2963,7 +2964,7 @@ describe('buildCompactionCheckpoint', () => {
     const result = buildCompactionCheckpoint(fullCtx);
     expect(result).toContain('Session checkpoint');
     expect(result).toContain('compaction restart');
-    expect(result).toContain('You are the resident strategist for TestProject');
+    expect(result).not.toContain('You are the resident strategist for TestProject');
     expect(result).toContain('Examination ledger (carried forward)');
     expect(result).toContain('direction:d-1');
     expect(result).toContain('Recent context (carried forward)');
@@ -2979,7 +2980,7 @@ describe('buildCompactionCheckpoint', () => {
       recentInteractions: '',
       autonomousState: '',
     });
-    expect(result).toContain('role only');
+    expect(result).not.toContain('role only');
     expect(result).not.toContain('Examination ledger');
     expect(result).not.toContain('Recent context');
     expect(result).not.toContain('Current state');
@@ -2993,7 +2994,7 @@ describe('buildCompactionCheckpoint', () => {
       autonomousState: '',
     });
     expect(result.length).toBeGreaterThan(0);
-    expect(result).toContain('minimal role');
+    expect(result).not.toContain('minimal role');
     expect(result).toContain('Session checkpoint');
   });
 
@@ -3037,8 +3038,8 @@ describe('buildCompactionCheckpoint', () => {
     expect(result).toContain('### Running update');
     expect(result).toContain('12%');
 
-    // Existing sections (role identity, ledger, interactions, state) are untouched.
-    expect(result).toContain('You are the resident strategist for Acme');
+    // State sections remain; process-level identity is deliberately not duplicated.
+    expect(result).not.toContain('You are the resident strategist for Acme');
     expect(result).toContain('Examination ledger (carried forward)');
     expect(result).toContain('Examination tick: 0');
   });

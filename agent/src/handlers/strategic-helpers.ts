@@ -415,6 +415,32 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'tools':               '`./fetch tools` — content of the project\'s ENABLED built-in tools (operator\'s notes markdown text, whiteboard presence/stroke-count summary): slug, title, kind, and text for each; empty content is skipped and an empty array means no enabled tool has content (no id)',
 };
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function renderFetchHelp(granted: FetchVerb[]): string {
+  const overview = granted
+    .map(verb => `    printf '%s\\n' ${shellSingleQuote(FETCH_VERB_HELP[verb])}`)
+    .join('\n');
+  const cases = granted
+    .map(verb => `    ${verb}) printf '%s\\n' ${shellSingleQuote(FETCH_VERB_HELP[verb])} ;;`)
+    .join('\n');
+  return `_fetch_help() {
+  case "\${1:-}" in
+    "")
+      echo "Usage: fetch help [verb]"
+      echo "       fetch ${granted.join('|')} [id]"
+      echo ""
+      echo "Available read-only verbs:"
+${overview}
+      ;;
+${cases}
+    *) echo "Unknown fetch verb for help: $1 (allowed: ${granted.join('|')})" >&2; return 1 ;;
+  esac
+}`;
+}
+
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
   const projectId = shellEscapeDoubleQuoted(projectIdRaw);
   // Partition the full vocabulary against the granted subset in canonical order
@@ -422,6 +448,7 @@ function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
   const granted = STRATEGIC_FETCH_VERBS.filter(v => verbs.includes(v));
   const rejected = STRATEGIC_FETCH_VERBS.filter(v => !verbs.includes(v));
   const verbList = granted.join('|');
+  const fetchHelp = renderFetchHelp(granted);
   const caseBody = [
     ...granted.map(v => v === 'knowledge'
       ? KNOWLEDGE_FETCH_CASE
@@ -439,7 +466,12 @@ function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
 # Read-only context fetch tool — pull full detail for items shipped trimmed,
 # summarized, or only by reference. Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from
 # env. project_id is baked in. All endpoints are GET (strictly read-only).
+${fetchHelp}
 KIND="\${1:?Usage: fetch ${verbList} [id]}"
+if [ "$KIND" = "help" ]; then
+  _fetch_help "\${2:-}"
+  exit $?
+fi
 ID="\${2:-}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
@@ -911,8 +943,8 @@ You are an INDEPENDENT adversarial reviewer. A strategist ("thinker") just produ
 1. **evidence_progress** — the thinker's claims that a long-running direction is "advancing" or "met". These are self-serving by construction. APPROVE an advancing/met claim ONLY when the analysis presents concrete, observable evidence that the direction's own success_evidence is actually being met. If the evidence is thin, assumed, or absent, REJECT (a stalled reality must not be dressed up as progress). When in doubt, REJECT — approving a false "advancing" is the costly error.
 2. **retirement_approvals** — for EVERY direction the thinker proposes to retire, judge whether the retirement reasoning names a real, evidenced pattern (approve) or is shallow/boilerplate/unsupported (reject). When in doubt, REJECT — approving an unsupported retirement is the costly error. If the thinker proposes no retirements, emit an empty array.
 3. **retirement_critique_quality** — whether the thinker's retirement critiques name a real pattern + lesson (solid) or are shallow/boilerplate.
-4. **portfolio_shape_risk** — whether the resulting active-direction portfolio is over-concentrated, has coverage gaps, or is over capacity.
-5. **portfolio_operations** — each concrete portfolio MUTATION the thinker proposed: create / update / retire / stage / approve / reject / activate of a direction. Judge each one and its NET effect on the active portfolio (capacity, concentration, fan-out, coverage). Be STRICT on destructive or fan-out-sensitive moves: REJECT a retire / stage / approve / reject / activate / lane-removing update when the analysis does NOT present a real, evidenced reason. A create can also be rejected when it is genuinely unsafe to commit. Use "warned"/"uncertain" for advisory, subjective concerns that should NOT block; reserve "rejected" for moves that are genuinely unsafe to commit.
+4. **portfolio_shape_risk** — whether the resulting active-direction portfolio is coherent, over-concentrated, duplicative, missing coverage, or over capacity. A direction is a durable strategic outcome/bet and an active direction opens a recurring autonomous research lane. File, PR, phase, checklist, or one-shot implementation shards are tasks, not directions.
+5. **portfolio_operations** — each concrete portfolio MUTATION the thinker proposed: create / update / retire / stage / approve / reject / activate of a direction. Judge each one and its NET effect on portfolio coherence (capacity, concentration, overlap, fan-out, coverage). REJECT create/update proposals that split one durable outcome into task/file/PR shards; prefer bounded tasks under an existing direction. Be STRICT on destructive or fan-out-sensitive moves: REJECT a retire / stage / approve / reject / activate / lane-removing update when the analysis does NOT present a real, evidenced reason. A create can also be rejected when it is genuinely unsafe to commit. Use "warned"/"uncertain" for advisory, subjective concerns that should NOT block; reserve "rejected" for moves that are genuinely unsafe to commit.
 
 You do NOT commit anything. You ONLY emit a verdict record. Be terse and skeptical.
 
