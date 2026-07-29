@@ -247,7 +247,11 @@ async def test_merge_retry_succeeds_on_second_attempt_poll(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project)
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"head_sha": "reviewed-head-sha"},
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -259,6 +263,10 @@ async def test_merge_retry_succeeds_on_second_attempt_poll(db_session, mocker):
     assert task.status == TaskStatus.COMPLETED
     assert merge_mock.call_count == 2, (
         "Should have called merge twice (initial + 1 retry)"
+    )
+    assert all(
+        call.kwargs["expected_head_sha"] == "reviewed-head-sha"
+        for call in merge_mock.call_args_list
     )
     # sleep called once for attempt=0 → 5*(3^0)=5 seconds
     sleep_mock.assert_called_once_with(5)

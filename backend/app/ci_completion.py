@@ -516,7 +516,14 @@ async def _attempt_merge_with_retry_and_escalation(
     # operation auto-acquires (audit H6 — no
     # connection held during the GitHub window).
 
-    merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
+    expected_merge_head_sha = ci_loop.get("head_sha") or None
+    merge_result = await merge_pull_request(
+        gh_token,
+        owner,
+        repo,
+        ci_pr_number,
+        expected_head_sha=expected_merge_head_sha,
+    )
     if (
         not merge_result.get("merged")
         and not merge_result.get("conflict")
@@ -527,7 +534,13 @@ async def _attempt_merge_with_retry_and_escalation(
         # Skip retries on conflict: 409 means the diff can't merge until code changes.
         for attempt in range(3):
             await asyncio.sleep(5 * (3**attempt))
-            merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
+            merge_result = await merge_pull_request(
+                gh_token,
+                owner,
+                repo,
+                ci_pr_number,
+                expected_head_sha=expected_merge_head_sha,
+            )
             if merge_result.get("merged") or merge_result.get("conflict"):
                 break
 

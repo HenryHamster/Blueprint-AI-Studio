@@ -369,6 +369,19 @@ async def _apply_status_mutation(
             # entering fresh-PR creation.
             changes["_check_merged_rollup_parent_now"] = True
 
+    if (
+        new_status == TaskStatus.QUEUED
+        and prior_status in _TERMINAL_STATUSES
+        and task.parent_task_id is not None
+    ):
+        from app.rollup_lineage_fence import invalidate_ancestor_rollups_for_requeue
+
+        invalidated_ancestors = await invalidate_ancestor_rollups_for_requeue(
+            task, session
+        )
+        if invalidated_ancestors:
+            changes["invalidated_ancestor_rollups"] = invalidated_ancestors
+
     task.status = new_status
     changes["status"] = new_status.value
 

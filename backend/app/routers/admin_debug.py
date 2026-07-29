@@ -317,9 +317,9 @@ async def _build_stuck_tasks(
 
     # Parent age alone is not a liveness signal. Research/rollup parents stay
     # EVALUATING while their pipeline children run, and some of those children
-    # can legitimately be BLOCKED waiting for an external prerequisite. The
-    # scheduler uses this same status set to decide that a stale-looking parent
-    # is still progressing; diagnostics must not contradict it.
+    # can legitimately be BLOCKED waiting for an external prerequisite. A child
+    # held for operator approval is not progress-capable, however, and must not
+    # hide a stale ancestor indefinitely.
     evaluating_parent_ids = {
         task.id for task in tasks if task.status == TaskStatus.EVALUATING
     }
@@ -346,6 +346,7 @@ async def _build_stuck_tasks(
             select(
                 Task.id,
                 Task.parent_task_id,
+                Task.requires_approval,
                 payload_original_id,
                 context_original_id,
             ).where(
@@ -367,9 +368,17 @@ async def _build_stuck_tasks(
                 ),
             )
         )
-        for child_id, parent_id, payload_original, context_original in (
+        for (
+            child_id,
+            parent_id,
+            requires_approval,
+            payload_original,
+            context_original,
+        ) in (
             active_child_rows.all()
         ):
+            if requires_approval:
+                continue
             if parent_id in evaluating_parent_ids:
                 parents_with_active_children.add(parent_id)
 

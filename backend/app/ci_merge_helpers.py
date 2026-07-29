@@ -261,6 +261,8 @@ def _capture_merge_snapshot(task: Task) -> dict:
         in-flight reset) DURING the merge's unlocked GitHub window
         invalidates the snapshot, so _relock_merge_task defers rather than
         reaching the closed-state branch on a PR we deliberately closed.
+      - _rollup_lineage_generation: advanced whenever descendant work is
+        requeued, invalidating review/CI proof captured for an older child set.
     Heartbeat-only updates (last_heartbeat, last_metrics_json,
     heartbeat_count) do NOT touch any of these, so they don't trip the
     validator under heartbeat overlap.
@@ -274,6 +276,7 @@ def _capture_merge_snapshot(task: Task) -> dict:
         "review_loop_verdict": review_loop.get("verdict"),
         "review_loop_ci_passed": review_loop.get("ci_passed"),
         "review_loop_pending_reopen": bool(review_loop.get("pending_reopen")),
+        "rollup_lineage_generation": ctx.get("_rollup_lineage_generation", 0),
     }
 
 
