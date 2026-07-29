@@ -42,7 +42,7 @@ permissions:
 jobs:
   detect:
     name: Detect changes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     timeout-minutes: 5
     outputs:
       frontend: ${{ steps.result.outputs.frontend }}
@@ -100,7 +100,7 @@ jobs:
   # directly.
   frontend-build:
     name: CI / Frontend (build + lint)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     timeout-minutes: 15
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
@@ -110,14 +110,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: admin-ui/package-lock.json
 
       - name: Install dependencies
         working-directory: ./admin-ui
         run: |
-          # --prefer-offline serves already-cached tarballs from the warm
-          # setup-node npm cache instead of re-hitting the registry, so a
+          # --prefer-offline serves already-cached tarballs from the runner's
+          # warm npm cache instead of re-hitting the registry, so a
           # registry blip can't flake a warm run ("npm ERR! registry
           # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
           # race and transient registry degradation on a cold cache.
@@ -144,7 +142,7 @@ jobs:
 
   frontend-unit:
     name: CI / Frontend (unit shard ${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     timeout-minutes: 10
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
@@ -161,14 +159,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: admin-ui/package-lock.json
 
       - name: Install dependencies
         working-directory: ./admin-ui
         run: |
-          # --prefer-offline serves already-cached tarballs from the warm
-          # setup-node npm cache instead of re-hitting the registry, so a
+          # --prefer-offline serves already-cached tarballs from the runner's
+          # warm npm cache instead of re-hitting the registry, so a
           # registry blip can't flake a warm run ("npm ERR! registry
           # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
           # race and transient registry degradation on a cold cache.
@@ -186,6 +182,9 @@ jobs:
 
   frontend-viewport:
     name: CI / Frontend (viewport)
+    # Keep this leg hosted until Playwright's privileged Linux dependencies are
+    # provisioned on the persistent runner. `playwright install-deps` invokes
+    # apt via sudo, which the unprivileged self-hosted service cannot do.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: detect
@@ -202,8 +201,8 @@ jobs:
       - name: Install dependencies
         working-directory: ./admin-ui
         run: |
-          # --prefer-offline serves already-cached tarballs from the warm
-          # setup-node npm cache instead of re-hitting the registry, so a
+          # --prefer-offline serves already-cached tarballs from the runner's
+          # warm npm cache instead of re-hitting the registry, so a
           # registry blip can't flake a warm run ("npm ERR! registry
           # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
           # race and transient registry degradation on a cold cache.
@@ -306,7 +305,7 @@ jobs:
   # admin-ui (detect=false), which must still satisfy the required check.
   frontend-gate:
     name: CI / Frontend
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     timeout-minutes: 5
     needs: [frontend-build, frontend-unit, frontend-viewport]
     if: always()
@@ -336,7 +335,7 @@ jobs:
   # error surfaces in the shards instead.
   backend-deps:
     name: CI / Backend deps image
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     timeout-minutes: 15
     needs: detect
     if: needs.detect.outputs.backend == 'true'
@@ -394,7 +393,7 @@ jobs:
 
   backend:
     name: CI / Backend (shard ${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     # Hard ceiling: catches a hung test instead of letting GH Actions' 360-min
     # default stall the runner for 6h and wedge the rollup. Raised 10 -> 20
     # (2026-07-23), then 20 -> 30 (2026-07-24): shards are balanced by even test
@@ -404,7 +403,9 @@ jobs:
     # ceiling killed it. At 20 min shard 2 got all the way to 94%, still passing,
     # and was killed with ~2 min of work left (run 30062720109); the other seven
     # shards finished in 4:37-8:38, so 30 leaves real headroom on the one slow leg
-    # without meaningfully delaying detection of a genuine hang.
+    # without meaningfully delaying detection of a genuine hang. On the initial
+    # single self-hosted worker a hung shard also holds up queued siblings, so
+    # retaining this ceiling is especially important.
     # A ceiling that kills a *passing* shard silently drops its remaining tests
     # from the merge gate, which is worse than catching a hang 10 min later
     # (fail-fast is false, so a hung shard never blocks its siblings). The real
@@ -416,15 +417,14 @@ jobs:
     timeout-minutes: 30
     needs: [detect, backend-deps]
     if: needs.detect.outputs.backend == 'true'
-    # Sharded: the suite (~7k tests, ~11.5 min serial) is split into 8 parallel
-    # legs via pytest-split (--splits 8 --group N). Each leg is an ordinary
-    # SERIAL pytest run on its OWN runner + postgres service, so there is no
-    # parallel DB-isolation problem and the count isn't core-bound — wall-clock
-    # ≈ the slowest shard. Splits are by even test count (deterministic — no
-    # pytest-randomly); if a backend/.test_durations file is committed,
-    # pytest-split auto-detects it and balances by time instead. The testmon
-    # cache refresh (needs the whole suite in one process) is a separate
-    # main-only job.
+    # Sharded: the suite (~7k tests) is split into 8 legs via pytest-split
+    # (--splits 8 --group N). Each leg is an ordinary SERIAL pytest run with its
+    # own PostgreSQL lifecycle. GitHub can distribute these jobs when additional
+    # matching runners are added; the initial single hamsterwheel worker executes
+    # them one at a time. Splits are deterministic and use even test counts unless
+    # backend/.test_durations is committed, in which case pytest-split balances
+    # by time. The testmon cache refresh (needs the whole suite in one process) is
+    # a separate main-only job.
     strategy:
       fail-fast: false
       matrix:
@@ -439,12 +439,20 @@ jobs:
     # (registry-1.docker.io connection timeouts) lasting longer than that fails
     # the whole shard during job-setup, before any step runs — a pure-infra
     # flake that the orchestrator used to misread as a code failure and burn a
-    # cold fix-VM on. The retry loop below absorbs it. Connectivity is identical:
-    # postgres binds host :5432 via --network host and tests reach localhost:5432.
+    # cold fix-VM on. The retry loop below absorbs it. The disposable database
+    # publishes container :5432 on host loopback :55432 so it cannot collide with
+    # hamsterwheel's own PostgreSQL service; host-networked test containers reach
+    # it at localhost:55432.
     env:
-      TEST_DB_URL: postgresql+asyncpg://test:test@localhost:5432/test_blueprint
+      TEST_DB_URL: postgresql+asyncpg://test:test@localhost:55432/test_blueprint
     steps:
       - uses: actions/checkout@v4
+
+      # GitHub-hosted runners are discarded after every job; this persistent
+      # runner is not. Remove a container left by a cancelled or interrupted
+      # shard before trying to reuse the fixed name and host port.
+      - name: Clean stale PostgreSQL container
+        run: docker rm -f postgres >/dev/null 2>&1 || true
 
       - name: Start PostgreSQL (pull with retry + mirror fallback)
         run: |
@@ -479,7 +487,7 @@ jobs:
             echo "::error::could not pull postgres:15 from Docker Hub, mirror.gcr.io, or public.ecr.aws"
             exit 1
           fi
-          docker run -d --name postgres --network host \
+          docker run -d --name postgres -p 127.0.0.1:55432:5432 \
             -e POSTGRES_USER=test \
             -e POSTGRES_PASSWORD=test \
             -e POSTGRES_DB=test_blueprint \
@@ -530,7 +538,8 @@ jobs:
 
       - name: Verify app imports
         run: |
-          docker run --rm -v "$PWD/backend:/app" \
+          docker run --rm -v "$PWD/backend:/app:ro" \
+            -e PYTHONDONTWRITEBYTECODE=1 \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
             -e WS_TICKET_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
@@ -539,7 +548,8 @@ jobs:
 
       - name: Run migrations on test DB
         run: |
-          docker run --rm --network host -v "$PWD/backend:/app" \
+          docker run --rm --network host -v "$PWD/backend:/app:ro" \
+            -e PYTHONDONTWRITEBYTECODE=1 \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             ${{ steps.deps.outputs.image }} \
             alembic upgrade head
@@ -558,12 +568,18 @@ jobs:
           # failure-extraction below; we propagate the code via $pytest_status.
           set +e
           run_shard() {
+            # Fail Google Auth's non-GCE metadata probes immediately. On a
+            # residential network the default metadata IP can linger long
+            # enough to trip otherwise healthy tests' 30-second timeout.
             # /repo mount + CI env: the runner-script invariant tests
             # (backend/testing/test_local_runner_terminal_log.py etc.) resolve
             # scripts/ via /repo and HARD-FAIL (not skip) when CI is set, so
             # they enforce in the promotion gate instead of silently skipping.
-            docker run --rm --network host -v "$PWD/backend:/app" \
+            docker run --rm --network host -v "$PWD/backend:/app:ro" \
               -v "$PWD:/repo:ro" \
+              -e PYTHONDONTWRITEBYTECODE=1 \
+              -e GCE_METADATA_IP=127.0.0.1 \
+              -e GCE_METADATA_HOST=127.0.0.1:9 \
               -e CI=true \
               -e DATABASE_URL=${{ env.TEST_DB_URL }} \
               -e USE_TEST_POSTGRES=true \
@@ -619,6 +635,7 @@ jobs:
         if: matrix.shard == 1
         run: |
           docker run --rm -v "$PWD:/repo:ro" -w /repo/scripts \
+            -e PYTHONDONTWRITEBYTECODE=1 \
             -e CI=true \
             ${{ steps.deps.outputs.image }} \
             python -m pytest test_runner_isolation.py \
@@ -710,6 +727,10 @@ jobs:
           fi
           echo "Migration linter passed"
 
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker rm -f postgres >/dev/null 2>&1 || true
+
   # Required-status-check gate: the "mainProtection" ruleset requires a check
   # named exactly "CI / Backend". The matrix legs above report as "CI / Backend
   # (shard N)", so this aggregator carries the canonical name and passes iff
@@ -717,7 +738,7 @@ jobs:
   # it (detect=false), which must still satisfy the required check.
   backend-gate:
     name: CI / Backend
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     timeout-minutes: 5
     needs: backend
     if: always()
@@ -734,7 +755,7 @@ jobs:
 
   agent:
     name: CI / Agent
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
     timeout-minutes: 15
     needs: detect
     if: needs.detect.outputs.agent == 'true'
@@ -744,14 +765,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: agent/package-lock.json
 
       - name: Install dependencies
         working-directory: ./agent
         run: |
-          # --prefer-offline serves already-cached tarballs from the warm
-          # setup-node npm cache instead of re-hitting the registry, so a
+          # --prefer-offline serves already-cached tarballs from the runner's
+          # warm npm cache instead of re-hitting the registry, so a
           # registry blip can't flake a warm run ("npm ERR! registry
           # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
           # race and transient registry degradation on a cold cache.
