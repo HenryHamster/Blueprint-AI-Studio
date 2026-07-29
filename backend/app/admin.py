@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, R
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Literal
 import os
 import uuid
 import json
@@ -2293,6 +2293,22 @@ class CreateTaskPayload(BaseModel):
     # is injected into the spawned task's context + prompt so the investigating
     # agent discounts a stale report. Ignored for all other task types.
     source_message_id: uuid.UUID | None = None
+    # Research-only empirical planning envelope. Ordinary task types reject
+    # these fields instead of silently carrying research-process boilerplate.
+    work_class: Literal["exploratory", "confirmatory", "productization"] | None = None
+    stop_or_pivot_condition: str | None = Field(
+        default=None, min_length=1, max_length=4000
+    )
+
+    @field_validator("work_class", "stop_or_pivot_condition", mode="before")
+    @classmethod
+    def normalize_empirical_text(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            normalized = v.strip()
+            if not normalized:
+                raise ValueError("must not be blank")
+            return normalized
+        return v
 
     @field_validator("base_branch", "branch")
     @classmethod
@@ -2310,6 +2326,21 @@ class CreateTaskPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_pr_metadata_required_for_pr_tasks(self) -> "CreateTaskPayload":
+        empirical_fields_present = any(
+            value is not None
+            for value in (
+                self.work_class,
+                self.stop_or_pivot_condition,
+            )
+        )
+        if empirical_fields_present and self.task_type not in (
+            TaskType.research,
+            TaskType.web_research,
+        ):
+            raise ValueError(
+                "empirical work contract fields are only supported for research "
+                "and web_research tasks"
+            )
         if (
             self.task_type
             in (
@@ -2381,6 +2412,20 @@ class ComputeExperimentTaskPayload(BaseModel):
     benchmark: str | None = None
     hypothesis: str | None = None
     metric: str | None = None
+    work_class: Literal["exploratory", "confirmatory", "productization"] | None = None
+    stop_or_pivot_condition: str | None = Field(
+        default=None, min_length=1, max_length=4000
+    )
+
+    @field_validator("work_class", "stop_or_pivot_condition", mode="before")
+    @classmethod
+    def normalize_empirical_text(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            normalized = v.strip()
+            if not normalized:
+                raise ValueError("must not be blank")
+            return normalized
+        return v
     success_criterion: ComputeSuccessCriterion | None = None
     require_live_release: bool = False
     require_durable_artifact: bool = False
@@ -2599,7 +2644,15 @@ async def create_task_manually(
     # and easily blow past validate_task_payload's 190 KB cap on projects
     # with many fat directions. The agent can fetch full direction state
     # via ``./fetch direction <id>`` when it needs it.
-    if payload.task_type == "research":
+    if payload.task_type in (TaskType.research, TaskType.web_research):
+        for empirical_key in (
+            "work_class",
+            "stop_or_pivot_condition",
+        ):
+            empirical_value = getattr(payload, empirical_key)
+            if empirical_value is not None:
+                task_payload[empirical_key] = empirical_value
+    if payload.task_type == TaskType.research:
         active_directions = [
             d for d in (project.directions or []) if d.get("status") == "active"
         ]
@@ -3371,6 +3424,8 @@ async def create_compute_experiment_task(
     if provenance:
         launch_contract["provenance"] = provenance
     for opt_key in (
+        "work_class",
+        "stop_or_pivot_condition",
         "accelerator",
         "machine_type",
         "cwd",
@@ -3483,6 +3538,8 @@ async def create_compute_experiment_task(
             k: launch_contract[k]
             for k in (
                 "accelerator",
+                "work_class",
+                "stop_or_pivot_condition",
                 "machine_type",
                 "cwd",
                 "env",

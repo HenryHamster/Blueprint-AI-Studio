@@ -3029,6 +3029,51 @@ def test_author_contract_omits_container_fields_when_absent():
     assert "container_registry_auth" not in contract
 
 
+def test_author_contract_normalizes_empirical_work_fields():
+    contract = _author_compute_launch_contract(
+        {
+            "command": "python run.py",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 60,
+            "work_class": " confirmatory ",
+            "stop_or_pivot_condition": " stop after two failed replications ",
+        }
+    )
+    assert contract["work_class"] == "confirmatory"
+    assert (
+        contract["stop_or_pivot_condition"] == "stop after two failed replications"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        (
+            "work_class",
+            [],
+            "work_class must be one of exploratory, confirmatory, productization",
+        ),
+        (
+            "stop_or_pivot_condition",
+            "x" * 4001,
+            "stop_or_pivot_condition must be at most 4000 characters",
+        ),
+    ],
+)
+def test_validate_contract_rejects_malformed_empirical_work_fields(
+    field, value, expected_reason
+):
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 60,
+        field: value,
+    }
+    valid, reason = _validate_compute_launch_contract(contract)
+    assert valid is False
+    assert reason == expected_reason
+
+
 def test_validate_contract_accepts_valid_container_image():
     """_validate_compute_launch_contract accepts a non-empty container_image string."""
     contract = {

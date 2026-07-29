@@ -48,6 +48,13 @@ from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.task_direction_refs import task_primary_direction_ids_shallow
 from app.onboarding_proof import build_onboarding_proof_block
+from app.project_outcome_projection import build_project_outcome_projection
+from app.release_models import (
+    CriterionEvidence,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
+    VersionAcceptanceCriterion,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -92,6 +99,93 @@ def _build_capability_proof_summary(proof_records: Dict[str, Any]) -> Dict[str, 
             "latest_commit_sha": latest.get("commit_sha"),
         }
     return summary
+
+
+@router.get("/projects/{project_id}/outcome-projection")
+@limiter.limit("30/minute")
+async def get_project_outcome_projection(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return separate delivery, integration, deployment, and evidence facts."""
+    project = await _get_user_project(project_id, current_user["user_id"], session)
+
+    current_version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .where(ReleaseVersion.project_id == project_id)
+            .order_by(ReleaseVersion.version_number.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    promoted_version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.status == "promoted",
+            )
+            .order_by(ReleaseVersion.version_number.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    task_facts = (
+        await session.execute(
+            select(Task.status, func.count(Task.id), func.max(Task.updated_at))
+            .where(Task.project_id == project_id, Task.archived.is_(False))
+            .group_by(Task.status)
+        )
+    ).all()
+    criteria = []
+    evidence = []
+    artifacts = []
+    if current_version is not None:
+        criteria = list(
+            (
+                await session.execute(
+                    select(VersionAcceptanceCriterion).where(
+                        VersionAcceptanceCriterion.release_version_id
+                        == current_version.id
+                    )
+                )
+            ).scalars()
+        )
+        evidence = list(
+            (
+                await session.execute(
+                    select(CriterionEvidence).where(
+                        CriterionEvidence.project_id == project_id,
+                        CriterionEvidence.criterion_id.in_(
+                            [criterion.id for criterion in criteria]
+                        ),
+                    )
+                )
+            ).scalars()
+        ) if criteria else []
+    if promoted_version is not None:
+        artifacts = list(
+            (
+                await session.execute(
+                    select(ReleaseDeployArtifact).where(
+                        ReleaseDeployArtifact.version_id == promoted_version.id
+                    )
+                )
+            ).scalars()
+        )
+
+    return build_project_outcome_projection(
+        project_id=str(project_id),
+        task_facts=task_facts,
+        current_version=current_version,
+        promoted_version=promoted_version,
+        project=project,
+        criteria=criteria,
+        evidence=evidence,
+        deploy_artifacts=artifacts,
+        now=_utcnow(),
+    )
 
 
 

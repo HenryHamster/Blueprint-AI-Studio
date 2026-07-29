@@ -496,11 +496,17 @@ For each ACTIVE direction that is long-running — well past its early cycles (h
 direction_id: d-xxx
 status: advancing | stalled | met
 rationale: 1 sentence — the observable evidence behind this verdict
+# REQUIRED when status is stalled:
+stall_advisory_version: 1
+blocking_invariant: the specific unchanged condition preventing success_evidence
+new_evidence_since_previous_cycle: [only genuinely new observations; [] when none]
+recommendation: continue | pivot
+continuation_pivot_rationale: why that recommendation follows from the evidence delta
 \`\`\`
 
 - **advancing** — landing real progress toward \`success_evidence\` (suppresses the advisory scaffolding flag — the agent confirms genuine movement). Look for increasing cumulative confirmed findings or an "improving" trend across recent cycles.
 - **met** — \`success_evidence\` is satisfied; the direction is effectively done (suppresses the flag; consider retiring it).
-- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag). Flat or declining cumulative confirmed findings, or "declining" trend despite ongoing work, signals stalled progress.
+- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag). Flat or declining cumulative confirmed findings, or "declining" trend despite ongoing work, signals stalled progress. Every stalled assessment MUST include all five version-1 advisory fields shown above; do not leave the Executor to invent them.
 
 Each direction in the "Direction outcomes" section above lists its cumulative confirmed-finding count and recent trend (improving/stable/declining) — use these signals when assessing whether a direction is advancing. A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
 

@@ -86,6 +86,7 @@ _OUTCOME_DETECTION_KEYS = (
     "outcome_progress_history",
     "outcome_progress_ever_met",
     "evidence_progress",
+    "stall_advisory",
     "possibly_complete",
     "completion_suggestion",
     "outcome_scaffolding_flagged",
@@ -925,6 +926,33 @@ async def _process_direction_lifecycle_locked(
             continue
         _retire_did = _d.get("id")
         _retire_reason = _d.get("auto_retire_pending_reason", "")
+        # Outcome-scaffolding is an advisory detector, not retirement
+        # authority.  Older releases persisted a two-tick retirement flag for
+        # this reason; consume that legacy state by clearing the flag without
+        # changing the direction's current status. Terminal directions are
+        # left terminal because their status may reflect a subsequent explicit
+        # strategist/operator decision rather than the legacy detector.
+        if _retire_reason == "scaffolding":
+            _current_status = _d.get("status")
+            _d.pop("auto_retire_pending", None)
+            _d.pop("auto_retire_pending_reason", None)
+            _d.pop("auto_retire_pending_at", None)
+            if _current_status in ("active", "paused", "proposed", "staged"):
+                logger.info(
+                    "[LIFECYCLE] Cleared legacy scaffolding retirement flag for "
+                    "live direction %s without changing status=%r",
+                    _retire_did,
+                    _current_status,
+                )
+            else:
+                logger.info(
+                    "[LIFECYCLE] Cleared legacy scaffolding retirement flag for "
+                    "terminal direction %s without changing status=%r",
+                    _retire_did,
+                    _current_status,
+                )
+            directions_modified = True
+            continue
         # Coherence guard: skip (and clear) the flag when the direction is no
         # longer in the state that produced it.  This collapses two failure modes:
         # (a) operator reactivated the direction between the flag tick and this
@@ -949,57 +977,6 @@ async def _process_direction_lifecycle_locked(
         if _retire_reason == "lifetime_burn":
             _lb_count = _d.get("lifetime_burn_pause_count", _MAX_LIFETIME_BURN_PAUSE_CYCLES)
             await _retire_lifetime_burn(_d, _retire_did, _lb_count)
-        elif _retire_reason == "scaffolding":
-            _sc_flag_cycles = _d.get("outcome_scaffolding_flagged_cycles", 0)
-            _d["status"] = "completed"
-            _d["auto_completed"] = True
-            _d["auto_completed_reason"] = (
-                f"Auto-retired: outcome-less scaffolding flag unresolved "
-                f"for {_sc_flag_cycles} consecutive cycles. Direction kept "
-                f"shipping merges but never advanced its success_evidence."
-            )
-            _d["completed_at"] = _utcnow().isoformat()
-            logger.info(
-                f"[AUTONOMOUS] Auto-retired direction {_retire_did} after "
-                f"{_sc_flag_cycles} scaffolding-flagged cycles (designated pass): "
-                f"{_d.get('text', '')[:60]}"
-            )
-            from app.models import Alert, AlertSeverity
-
-            session.add(
-                Alert(
-                    project_id=project.id,
-                    event_type="research.direction_auto_completed",
-                    severity=AlertSeverity.INFO,
-                    title="Direction auto-retired (outcome scaffolding)",
-                    message=(
-                        f"Direction '{_d.get('text', '')[:80]}' was auto-retired after "
-                        f"{_sc_flag_cycles} cycles with outcome-less scaffolding flag "
-                        f"unresolved. Slot freed for strategic agent to create a replacement."
-                    ),
-                )
-            )
-            try:
-                from app.notification_dispatch import (
-                    post_direction_milestone_message,
-                )
-
-                await post_direction_milestone_message(
-                    session,
-                    project.id,
-                    direction_text=_d.get("text", ""),
-                    milestone="auto-retired-scaffolding",
-                    reason=_d["auto_completed_reason"],
-                    direction_id=_retire_did,
-                )
-            except Exception as _sc_notify_exc:  # noqa: BLE001
-                logger.warning(
-                    f"[NOTIFY] Failed to post scaffolding auto-retire milestone: {_sc_notify_exc}"
-                )
-            _reconcile_retired_gap(_retire_did)
-            _record_auto_retired_memory(
-                pending_retired_memory, _d, "auto_retired_scaffolding"
-            )
         else:
             logger.warning(
                 f"[LIFECYCLE] Unknown auto_retire_pending_reason {_retire_reason!r} "
@@ -1896,14 +1873,11 @@ async def _process_direction_lifecycle_locked(
                 d.pop("possibly_complete", None)
                 d.pop("completion_suggestion", None)
                 directions_modified = True
-        # Outcome-progress (scaffolding) detection — persistence-pressure ladder.
+        # Outcome-progress (scaffolding) detection — advisory signal.
         # Flags a long-running healthy-merge direction whose outcome signal has
-        # stalled. The flag never triggers the 6 auto-PAUSE rules above; instead it
-        # escalates over consecutive flagged cycles: notify on entry, escalation
-        # notification at escalation_cycles, and auto-RETIRE at max_flagged_cycles
-        # (an advancing/met evidence_progress verdict suppresses the counter). This
-        # surfaces outcome-less scaffolding to the strategic agent / operator and,
-        # if it persists, frees the slot. Notify once per transition into flagged.
+        # stalled. It records evidence and notifies on entry/escalation, but it
+        # never changes status, suppresses research, or authorizes retirement.
+        # An advancing/met evidence_progress verdict suppresses the counter.
         scaffolding_ev = _check_outcome_scaffolding(d)
         if scaffolding_ev:
             if not d.get("outcome_scaffolding_flagged"):
@@ -1993,10 +1967,9 @@ async def _process_direction_lifecycle_locked(
             else:
                 # Keep the evidence fresh while the flag remains set.
                 d["outcome_scaffolding_evidence"] = scaffolding_ev
-                # Persistence-pressure ladder: increment each cycle the flag holds.
+                # Advisory persistence counter: increment each cycle the flag holds.
                 _scaffolding_cfg = _outcome_progress_config()
                 _esc_threshold = _scaffolding_cfg["escalation_cycles"]
-                _retire_threshold = _scaffolding_cfg["max_flagged_cycles"]
                 # A RECENT advancing/met evidence_progress verdict suppresses the
                 # counter increment — uses the same recency-aware helper as the
                 # detector so stale verdicts grant no credit (consistent semantics).
@@ -2028,20 +2001,7 @@ async def _process_direction_lifecycle_locked(
                         _advanced_flag_cycle = True
                         directions_modified = True
                     _flag_cycles = d.get("outcome_scaffolding_flagged_cycles", 0)
-                    if _flag_cycles >= _retire_threshold:
-                        # Flag for retirement rather than executing immediately.
-                        # The designated retire pass (above the prune loop) will
-                        # complete the retirement on the next lifecycle tick so
-                        # the direction remains visible in the strategist payload
-                        # for at least one tick before it is pruned away.
-                        d["auto_retire_pending"] = True
-                        d["auto_retire_pending_reason"] = "scaffolding"
-                        d["auto_retire_pending_at"] = now.isoformat()
-                        directions_modified = True
-                        # Terminal decision: skip the active_directions append so
-                        # no research cycle is spawned on a flagged direction.
-                        continue
-                    elif _advanced_flag_cycle and _flag_cycles == _esc_threshold:
+                    if _advanced_flag_cycle and _flag_cycles == _esc_threshold:
                         # Escalation notification at mid-threshold.
                         try:
                             from app.notification_dispatch import (

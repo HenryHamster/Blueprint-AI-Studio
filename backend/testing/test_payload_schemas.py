@@ -35,6 +35,54 @@ def _invalid(raw: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Empirical work envelope — scoped to research/benchmark task types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("task_type", ["research", "web_research", "compute_experiment"])
+def test_empirical_work_contract_round_trips_on_evidence_tasks(task_type):
+    payload = {
+        "type": task_type,
+        "work_class": " confirmatory ",
+        "stop_or_pivot_condition": " Stop after two failed replications. ",
+    }
+    if task_type == "compute_experiment":
+        payload.update(
+            command="python run.py",
+            spend_cap_usd=5,
+            deadline_seconds=600,
+        )
+    result = _valid(payload)
+    assert result["work_class"] == "confirmatory"
+    assert result["stop_or_pivot_condition"] == "Stop after two failed replications."
+
+
+@pytest.mark.parametrize("task_type", ["research", "web_research", "compute_experiment"])
+def test_empirical_work_contract_rejects_unknown_work_class(task_type):
+    payload = {"type": task_type, "work_class": "implementation"}
+    if task_type == "compute_experiment":
+        payload.update(
+            command="python run.py",
+            spend_cap_usd=5,
+            deadline_seconds=600,
+        )
+    assert "work_class" in _invalid(payload)
+
+
+@pytest.mark.parametrize("field", ["work_class", "stop_or_pivot_condition"])
+def test_empirical_work_contract_rejects_blank_text(field):
+    assert field in _invalid({"type": "research", field: "   "})
+
+
+def test_ordinary_tasks_do_not_gain_empirical_contract_schema():
+    # BasePayload remains extra-tolerant for compatibility, but the field is
+    # intentionally not part of the typed model/schema for ordinary code work.
+    from app.payload_schemas import CreatePayload
+
+    assert "work_class" not in CreatePayload.model_fields
+
+
+# ---------------------------------------------------------------------------
 # parse_acceptance_evidence — the closed-vocabulary acceptance-evidence helper
 # ---------------------------------------------------------------------------
 

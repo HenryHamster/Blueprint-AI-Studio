@@ -2649,6 +2649,12 @@ async def _persist_compute_experiment_knowledge_best_effort(
     there was no measurement to record), ``False`` when persistence failed and a
     bounded retry through the wake sweep is warranted.
     """
+    if (task.context or {}).get("failure_category") == "compute_unmeasured_criterion":
+        # A terminal outcome and cost describe substrate execution, but a
+        # missing/invalid declared metric is not a measured experimental
+        # verdict. Never publish it as reusable knowledge, including through
+        # the deferred wake post-commit path.
+        return True
     measurement = _extract_compute_measurement(logs)
     if measurement is None:
         # No measured verdict (crash / no terminal outcome) — nothing durable to record.
@@ -2994,6 +3000,44 @@ def _unmeasured_declared_metric_names(
         if isinstance(metric, str) and metric:
             missing.append(metric)
     return missing
+
+
+def _record_unmeasured_compute_criterion_failure(
+    task: Task,
+    *,
+    outcome: str,
+    logs: str,
+    criteria_verdict: dict | None,
+) -> str | None:
+    """Fail loudly when a successful run never measured its declared metric.
+
+    Both ordinary and prerequisite-mode compute completions use this helper.
+    Advisory prerequisite mode makes a *measured negative* consumable evidence;
+    it must not turn an absent/invalid observation into a measured verdict.
+    Intentional terminal kills retain their historical completion semantics.
+    """
+    unmeasured_metrics = _unmeasured_declared_metric_names(task, criteria_verdict)
+    if not unmeasured_metrics or outcome in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
+        return None
+
+    from app.failure_classification import (
+        COMPUTE_UNMEASURED_CRITERION,
+        persist_failure_category,
+    )
+
+    emitted_diag = describe_emitted_compute_metric_keys(logs)
+    miss_reason = (
+        f"compute_unmeasured_criterion: declared metric(s) "
+        f"{unmeasured_metrics!r} "
+        f"produced no numeric value (outcome={outcome}); the experiment "
+        f"ran but the declared hypothesis was never measured — {emitted_diag}"
+    )
+    record_failed_gate(
+        task,
+        EvaluationVerdict(False, miss_reason, "compute-unmeasured-criterion"),
+    )
+    persist_failure_category(task, COMPUTE_UNMEASURED_CRITERION)
+    return miss_reason
 
 
 # Context key stamped on a spawned reason-and-ship follow-on identifying its
@@ -4534,6 +4578,33 @@ async def _handle_compute_experiment_completion(
                 owns_commit=owns_commit,
             )
             return
+        # "Advisory" means a measured negative result remains useful to the
+        # dependent. It does not mean a missing/invalid declared observation is
+        # evidence. Previously this path only checked terminal outcome + cost,
+        # allowing SUCCESS with no declared metric to complete and unblock its
+        # dependent even though ordinary compute completion failed the same run.
+        unmeasured_reason = _record_unmeasured_compute_criterion_failure(
+            task,
+            outcome=outcome,
+            logs=logs,
+            criteria_verdict=criteria_verdict,
+        )
+        if unmeasured_reason is not None:
+            logger.info(
+                "[COMPUTE] Prerequisite-mode task %s failed loud "
+                "(unmeasured declared metric): %s",
+                task.id,
+                unmeasured_reason,
+            )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
         task.latest_status_message = (
             f"Compute prerequisite measured: outcome={outcome}, final_cost=${cost}"
             f", artifact_delivery={delivery['durability']}"
@@ -4664,25 +4735,13 @@ async def _handle_compute_experiment_completion(
         # kind=artifact_produced (gated on durable_file_count) and intentional
         # budget/deadline/cancel kills (those stay exactly as today). A
         # measured-but-missed criterion is evidence, not this failure.
-        unmeasured_metrics = _unmeasured_declared_metric_names(task, criteria_verdict)
-        if unmeasured_metrics and outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
-            from app.failure_classification import (
-                COMPUTE_UNMEASURED_CRITERION,
-                persist_failure_category,
-            )
-
-            emitted_diag = describe_emitted_compute_metric_keys(logs)
-            miss_reason = (
-                f"compute_unmeasured_criterion: declared metric(s) "
-                f"{unmeasured_metrics!r} "
-                f"produced no numeric value (outcome={outcome}); the experiment "
-                f"ran but the declared hypothesis was never measured — {emitted_diag}"
-            )
-            record_failed_gate(
-                task,
-                EvaluationVerdict(False, miss_reason, "compute-unmeasured-criterion"),
-            )
-            persist_failure_category(task, COMPUTE_UNMEASURED_CRITERION)
+        miss_reason = _record_unmeasured_compute_criterion_failure(
+            task,
+            outcome=outcome,
+            logs=logs,
+            criteria_verdict=criteria_verdict,
+        )
+        if miss_reason is not None:
             logger.info(
                 "[COMPUTE] Task %s failed loud (unmeasured declared metric): %s",
                 task.id,

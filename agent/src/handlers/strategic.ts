@@ -73,6 +73,7 @@ import {
   buildPendingFollowupsSection,
   buildPayloadStalenessSection,
 } from './strategic-sections.js';
+import { buildStallAdvisorySection } from './strategic-stall-advisory.js';
 
 /**
  * Render the backend-supplied `prompt_suffix` as an "Additional instructions"
@@ -555,6 +556,7 @@ export async function handleStrategic(
     const openMessagesText = buildOpenMessagesText(openMessages);
 
     const dirSummaryText = buildDirSummaryText(directionsSummary, authoritativeActive);
+    const stallAdvisorySection = buildStallAdvisorySection(directionsSummary);
 
     // Directions already staged for the next version (inert until their target
     // version promotes). Surfaced so the strategist does not re-propose them.
@@ -964,7 +966,8 @@ prompts, schemas, tools, or orchestration.` : '';
     };
 
     const thinkerPrompt = buildThinkerPrompt(thinkerParams);
-    const promptSuffix = renderStrategicPromptSuffix(payload);
+    const promptSuffix = renderStrategicPromptSuffix(payload)
+      + (stallAdvisorySection ? `\n\n${stallAdvisorySection}` : '');
     const promptFingerprint = computeStrategicPromptFingerprint(
       thinkerParams,
       promptSuffix,
@@ -1249,7 +1252,11 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # active directions. status ∈ advancing|stalled|met; advancing/met suppress the
 # advisory scaffolding flag, stalled reinforces it. Omit entirely if Section 3.6
 # assessed no directions — it's an optional precision refinement, never required.
-./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing","rationale":"..."}]'
+# A stalled item MUST also carry stall_advisory_version: 1, blocking_invariant,
+# new_evidence_since_previous_cycle (array; [] when none), recommendation
+# (continue|pivot), and continuation_pivot_rationale. Keep the judgment
+# qualitative; do not invent a numeric information-gain score.
+./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"stalled","rationale":"...","stall_advisory_version":1,"blocking_invariant":"...","new_evidence_since_previous_cycle":[],"recommendation":"continue","continuation_pivot_rationale":"..."}]'
 
 # CONDITIONAL: Submit acceptance criteria proposed by the Thinker, only when the
 # /tmp/proposed_criteria_${taskId}.json file exists and is non-empty.
@@ -1414,6 +1421,7 @@ EOF
 # Existing directions (for update/retire operations)
 ${dirSummaryText}
 
+${stallAdvisorySection ? `${stallAdvisorySection}\n\n` : ''}
 ${questionSection}${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : openMessageCount > 0 ? `# Open Messages (inbox not shipped — ${openMessageCount} message${openMessageCount === 1 ? '' : 's'} available)\nThe open-message inbox was dropped under byte-budget pressure this cycle. Run \`./fetch message\` to retrieve the ${openMessageCount} unresolved message${openMessageCount === 1 ? '' : 's'} before responding to or resolving any operator requests.\n` : ''}
 # Strategic analysis to execute
 
@@ -1453,7 +1461,7 @@ ${proposedCriteriaBlock}
 
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
 
-   *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call. **Challenge gate:** submit an \`advancing\` or \`met\` status ONLY for a (direction_id, status) pair the independent challenge APPROVED (see the "Independent strategic challenge" section above). For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid — submit \`stalled\` (advisory, always allowed) or omit it.
+   *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. A \`stalled\` item MUST also include \`stall_advisory_version: 1\`, \`blocking_invariant\`, \`new_evidence_since_previous_cycle\` (array; use \`[]\` when none), \`recommendation\` (\`continue|pivot\`), and \`continuation_pivot_rationale\`. Keep this a qualitative advisory judgment; do not invent a numeric information-gain score. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call. **Challenge gate:** submit an \`advancing\` or \`met\` status ONLY for a (direction_id, status) pair the independent challenge APPROVED (see the "Independent strategic challenge" section above). For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid — submit \`stalled\` (advisory, always allowed) or omit it.
 
 4.5. **Acceptance criteria (conditional).** If the proposed criteria block above is non-empty, call \`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"\`. If the file is absent or empty, SKIP — do not fabricate a criteria list.
 

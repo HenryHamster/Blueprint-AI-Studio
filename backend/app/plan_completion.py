@@ -1030,6 +1030,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "cwd",
                             "env",
                             "accelerator",
+                            "work_class",
+                            "stop_or_pivot_condition",
                             "provisioning_model",
                             "live_proof",
                             "live_proof_marker",
@@ -1070,6 +1072,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     **({"effort": subtask_effort} if subtask_effort else {}),
                     **({"prompt_suffix": create_suffix} if create_suffix else {}),
                     **({"hotfix": True} if parent_hotfix else {}),
+                    **(
+                        {
+                            key: subtask_def[key]
+                            for key in ("work_class", "stop_or_pivot_condition")
+                            if subtask_type == "web_research"
+                            and subtask_def.get(key) is not None
+                        }
+                    ),
                     **(
                         {"acceptance_evidence": subtask_acceptance_evidence}
                         if subtask_acceptance_evidence

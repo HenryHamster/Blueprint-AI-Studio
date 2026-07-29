@@ -1907,12 +1907,10 @@ async def test_scaffolding_escalation_does_not_refire_without_new_cycle(
 
 
 @pytest.mark.asyncio
-async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
-    """Direction is auto-retired when flagged_cycles reaches max_flagged_cycles (default 6).
-
-    Two-tick model: tick 1 sets auto_retire_pending=True (flag-not-execute contract);
-    tick 2 designated retire pass executes the retirement and fires the milestone.
-    """
+async def test_scaffolding_remains_advisory_past_former_retire_threshold(
+    db_session, mocker
+):
+    """Crossing the former max_flagged_cycles threshold remains non-terminal."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -1926,12 +1924,12 @@ async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
         new_callable=AsyncMock,
     )
 
-    # max_flagged_cycles default = 6; preset counter to 5 so next pass hits 6
+    # max_flagged_cycles historically defaulted to 6; preset to 5 so this pass
+    # crosses the former terminal threshold.
     direction = _already_flagged_direction(flagged_cycles=5)
     did = direction["id"]
     project = await _make_cost_project(db_session, direction)
 
-    # --- Tick 1: flag-not-execute — sets auto_retire_pending, does NOT retire yet.
     active_directions = await _process_direction_lifecycle(
         project,
         db_session,
@@ -1941,21 +1939,16 @@ async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d.get("auto_retire_pending") is True, (
-        "tick 1 must set auto_retire_pending=True rather than retiring immediately"
-    )
-    assert d.get("auto_retire_pending_reason") == "scaffolding"
-    assert d["status"] != "completed", (
-        "direction must NOT be retired on the flag tick — retirement deferred to next tick"
-    )
+    assert d.get("outcome_scaffolding_flagged_cycles") == 6
+    assert d.get("auto_retire_pending") is None
+    assert d["status"] == "active"
     milestone_notify.assert_not_awaited()
-    # Flagged direction must NOT be returned in active_directions (skip-the-append contract).
-    assert did not in {ad.get("id") for ad in active_directions}, (
-        "flagged direction must be excluded from active_directions even before retirement"
+    assert did in {ad.get("id") for ad in active_directions}, (
+        "the advisory detector must not suppress the next research cycle"
     )
 
-    # --- Tick 2: designated retire pass executes the retirement.
-    await _process_direction_lifecycle(
+    # A later lifecycle tick must not execute any delayed retirement.
+    active_directions = await _process_direction_lifecycle(
         project,
         db_session,
         busy_direction_ids=set(),
@@ -1963,22 +1956,11 @@ async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
     )
     await db_session.refresh(project)
 
-    # The direction is retired (status=completed) and immediately pruned from
-    # project.directions in the same tick — verify via the gap and milestone.
-    remaining_ids = {d["id"] for d in (project.directions or [])}
-    assert did not in remaining_ids, (
-        "retired direction must be pruned from project.directions after the designated retire pass"
-    )
-    milestone_notify.assert_awaited_once()
-    kwargs = milestone_notify.call_args.kwargs
-    assert kwargs.get("milestone") == "auto-retired-scaffolding"
-    # Vision memory records the retirement.
+    assert project.directions[0]["status"] == "active"
+    assert did in {ad.get("id") for ad in active_directions}
+    milestone_notify.assert_not_awaited()
     retired_mem = (project.vision or {}).get("_recently_retired_directions") or []
-    mem_entry = next((m for m in retired_mem if m.get("id") == did), None)
-    assert mem_entry is not None, "retired direction must appear in vision memory"
-    assert mem_entry.get("reason") == "auto_retired_scaffolding", (
-        f"vision memory reason should be 'auto_retired_scaffolding', got: {mem_entry.get('reason')!r}"
-    )
+    assert did not in {m.get("id") for m in retired_mem}
 
 
 @pytest.mark.asyncio
@@ -2684,15 +2666,10 @@ async def test_code_failure_auto_retire_reconciles_gap(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_scaffolding_auto_retire_reconciles_gap_and_persists(db_session, mocker):
-    """The outcome-scaffolding auto-retire branch must (a) prune the completed
-    direction out of its gap's active_moves AND (b) persist the auto_retire_pending
-    flag across a session refresh — even on a tick where the flagged-cycles counter
-    does NOT advance (the flag-not-execute persistence contract).
-
-    Two-tick model: tick 1 sets auto_retire_pending=True (persisted); tick 2
-    designated retire pass reconciles the gap and removes the direction.
-    """
+async def test_scaffolding_advisory_does_not_reconcile_or_unstaff_gap(
+    db_session, mocker
+):
+    """A persistent scaffolding advisory leaves its direction and gap staffed."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -2705,10 +2682,7 @@ async def test_scaffolding_auto_retire_reconciles_gap_and_persists(db_session, m
         "app.notification_dispatch.post_direction_milestone_message",
         new_callable=AsyncMock,
     )
-    # flagged_cycles already at the default retire threshold (6) and a watermark
-    # far above total_cycles so the counter does NOT advance this tick. The key
-    # invariant: even when the counter doesn't increment, auto_retire_pending is
-    # set and persisted (directions_modified=True on the flag tick).
+    # Counter is already at the former retirement threshold and does not advance.
     direction = _already_flagged_direction(
         flagged_cycles=6,
         outcome_scaffolding_last_cycle_count=999,
@@ -2728,41 +2702,20 @@ async def test_scaffolding_auto_retire_reconciles_gap_and_persists(db_session, m
     }
     project = await _make_gap_project(db_session, direction, problem_model)
 
-    # --- Tick 1: sets auto_retire_pending=True, persisted via directions_modified.
-    await _process_direction_lifecycle(
+    active_directions = await _process_direction_lifecycle(
         project, db_session, busy_direction_ids=set(), now=_utcnow()
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d.get("auto_retire_pending") is True, (
-        "scaffolding retire must persist auto_retire_pending=True flag across refresh "
-        "(even when the counter did not advance this tick)"
-    )
-    assert d["status"] != "completed", (
-        "retirement must be deferred to the next tick via the designated retire pass"
-    )
-
-    # --- Tick 2: designated retire pass executes the retirement and reconciles the gap.
-    await _process_direction_lifecycle(
-        project, db_session, busy_direction_ids=set(), now=_utcnow()
-    )
-    await db_session.refresh(project)
-
-    # Direction retired and pruned; verify via gap and vision memory.
-    remaining_ids = {d["id"] for d in (project.directions or [])}
-    assert did not in remaining_ids, (
-        "retired direction must be pruned from project.directions after the designated retire pass"
-    )
-
-    # (a) Gap reconciled out of active_moves and archived in past_moves.
+    assert d.get("auto_retire_pending") is None
+    assert d["status"] == "active"
+    assert did in {active.get("id") for active in active_directions}
     gap = project.problem_model["gaps"][0]
-    assert did not in gap["active_moves"], (
-        "retired direction must be pruned from the gap's active_moves"
-    )
-    assert did in gap["past_moves"], (
-        "retired direction must be archived in the gap's past_moves"
-    )
+    assert did in gap["active_moves"]
+    assert did not in gap["past_moves"]
+    retired_mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert did not in {entry.get("id") for entry in retired_mem}
 
 
 @pytest.mark.asyncio
@@ -3987,12 +3940,10 @@ async def test_paused_extend_burn_sets_pending_flag_not_executes(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_scaffolding_sets_pending_flag_not_executes(db_session, mocker):
-    """Scaffolding path sets auto_retire_pending=True without retiring on the same tick.
-
-    A direction that hits max_flagged_cycles in the active-directions loop must set
-    auto_retire_pending rather than immediately executing status=completed.
-    """
+async def test_legacy_scaffolding_pending_flag_is_cleared_without_reactivation(
+    db_session, mocker
+):
+    """Persisted scaffolding retirement state is migrated back to active."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -4006,32 +3957,37 @@ async def test_scaffolding_sets_pending_flag_not_executes(db_session, mocker):
         new_callable=AsyncMock,
     )
 
-    # flagged_cycles=5 → next pass increments to 6 (= max_flagged_cycles default).
-    direction = _already_flagged_direction(flagged_cycles=5)
+    direction = _already_flagged_direction(flagged_cycles=6)
+    direction["status"] = "paused"
+    direction["paused_reason"] = "Legacy scaffolding retirement hold"
+    direction["paused_at"] = (_utcnow() - timedelta(hours=1)).isoformat()
+    direction["auto_paused"] = True
+    direction["auto_retire_pending"] = True
+    direction["auto_retire_pending_reason"] = "scaffolding"
+    direction["auto_retire_pending_at"] = (_utcnow() - timedelta(hours=1)).isoformat()
+    did = direction["id"]
     project = await _make_cost_project(db_session, direction)
 
-    await _process_direction_lifecycle(
+    active_directions = await _process_direction_lifecycle(
         project, db_session, busy_direction_ids=set(), now=_utcnow()
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d.get("auto_retire_pending") is True, (
-        "scaffolding path must set auto_retire_pending=True rather than retiring immediately"
-    )
-    assert d.get("auto_retire_pending_reason") == "scaffolding"
-    assert d["status"] != "completed", (
-        "direction must NOT be retired on the same tick the pending flag is set"
-    )
+    assert d["status"] == "paused"
+    assert "auto_retire_pending" not in d
+    assert "auto_retire_pending_reason" not in d
+    assert "auto_retire_pending_at" not in d
+    assert d["paused_reason"] == "Legacy scaffolding retirement hold"
+    assert did not in {active.get("id") for active in active_directions}
     milestone_notify.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_designated_retire_pass_consumes_pending_flag(db_session, mocker):
-    """Designated retire pass converts auto_retire_pending=True to status=completed.
+    """Designated pass retires lifetime burn but recovers scaffolding state.
 
-    Pre-stamp both reason variants ("lifetime_burn" and "scaffolding") on separate
-    directions and verify the designated pass retires each correctly on the next tick.
+    Scaffolding is advisory; unrelated deterministic retirement remains unchanged.
     """
     mocker.patch(
         "app.notification_dispatch.post_direction_milestone_message",
@@ -4098,31 +4054,28 @@ async def test_designated_retire_pass_consumes_pending_flag(db_session, mocker):
     )
     await db_session.refresh(project)
 
-    # Both directions are retired (status=completed) and pruned in the same tick.
+    # Lifetime burn is retired; legacy scaffolding pending state is recovered.
     remaining_ids = {d["id"] for d in (project.directions or [])}
     assert "d-pending-burn" not in remaining_ids, (
         "designated retire pass must retire and prune the lifetime_burn-pending direction"
     )
-    assert "d-pending-sc" not in remaining_ids, (
-        "designated retire pass must retire and prune the scaffolding-pending direction"
-    )
+    assert "d-pending-sc" in remaining_ids
+    recovered_sc = next(d for d in project.directions if d["id"] == "d-pending-sc")
+    assert recovered_sc["status"] == "active"
+    assert "auto_retire_pending" not in recovered_sc
+    assert "auto_retire_pending_reason" not in recovered_sc
+    assert "auto_retire_pending_at" not in recovered_sc
 
-    # Vision memory records both retirements.
+    # Vision memory records only the still-authoritative lifetime-burn retirement.
     retired_mem = (project.vision or {}).get("_recently_retired_directions") or []
     retired_ids = {m.get("id") for m in retired_mem}
     assert "d-pending-burn" in retired_ids, "lifetime-burn direction must appear in vision memory"
-    assert "d-pending-sc" in retired_ids, "scaffolding direction must appear in vision memory"
+    assert "d-pending-sc" not in retired_ids
 
     burn_mem = next((m for m in retired_mem if m.get("id") == "d-pending-burn"), None)
     assert burn_mem is not None
     assert burn_mem.get("reason") == "auto_retired_lifetime_burn", (
         f"lifetime-burn reason should be 'auto_retired_lifetime_burn', got: {burn_mem.get('reason')!r}"
-    )
-
-    sc_mem = next((m for m in retired_mem if m.get("id") == "d-pending-sc"), None)
-    assert sc_mem is not None
-    assert sc_mem.get("reason") == "auto_retired_scaffolding", (
-        f"scaffolding reason should be 'auto_retired_scaffolding', got: {sc_mem.get('reason')!r}"
     )
 
     # Gap reconciled for lifetime-burn direction.

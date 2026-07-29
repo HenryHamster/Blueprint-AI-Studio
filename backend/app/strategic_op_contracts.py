@@ -25,6 +25,7 @@ UPDATE_DIRECTION_FIELDS = frozenset(
         "gap_id",
         "success_evidence",
         "retirement_condition",
+        "implementation_constraints",
         "rationale",
         "terminal_reason",
         "dedup_reasoning",
