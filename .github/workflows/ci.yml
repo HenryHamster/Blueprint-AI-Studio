@@ -419,14 +419,16 @@ jobs:
     if: needs.detect.outputs.backend == 'true'
     # Sharded: the suite (~7k tests) is split into 8 legs via pytest-split
     # (--splits 8 --group N). Each leg is an ordinary SERIAL pytest run with its
-    # own PostgreSQL lifecycle. GitHub can distribute these jobs when additional
-    # matching runners are added; the initial single hamsterwheel worker executes
-    # them one at a time. Splits are deterministic and use even test counts unless
-    # backend/.test_durations is committed, in which case pytest-split balances
-    # by time. The testmon cache refresh (needs the whole suite in one process) is
-    # a separate main-only job.
+    # own PostgreSQL lifecycle. GitHub distributes them across hamsterwheel's
+    # matching runner instances. Splits are deterministic and use even test
+    # counts unless backend/.test_durations is committed, in which case
+    # pytest-split balances by time. The testmon cache refresh (needs the whole
+    # suite in one process) is a separate main-only job.
     strategy:
       fail-fast: false
+      # Match the four-worker hamsterwheel pool. This keeps a future larger
+      # fleet from letting one PR consume more than the host's intended share.
+      max-parallel: 4
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     permissions:
@@ -439,23 +441,27 @@ jobs:
     # (registry-1.docker.io connection timeouts) lasting longer than that fails
     # the whole shard during job-setup, before any step runs — a pure-infra
     # flake that the orchestrator used to misread as a code failure and burn a
-    # cold fix-VM on. The retry loop below absorbs it. The disposable database
-    # publishes container :5432 on host loopback :55432 so it cannot collide with
-    # hamsterwheel's own PostgreSQL service; host-networked test containers reach
-    # it at localhost:55432.
+    # cold fix-VM on. The retry loop below absorbs it. Every shard gets a private
+    # Docker network and uniquely named PostgreSQL container, so shards from this
+    # run, reruns, and separate PRs can execute concurrently without sharing a
+    # host port or colliding with hamsterwheel's own PostgreSQL service.
     env:
-      TEST_DB_URL: postgresql+asyncpg://test:test@localhost:55432/test_blueprint
+      CI_NETWORK: blueprint-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+      POSTGRES_CONTAINER: blueprint-ci-postgres-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+      TEST_DB_URL: postgresql+asyncpg://test:test@postgres:5432/test_blueprint
     steps:
       - uses: actions/checkout@v4
 
-      # GitHub-hosted runners are discarded after every job; this persistent
-      # runner is not. Remove a container left by a cancelled or interrupted
-      # shard before trying to reuse the fixed name and host port.
-      - name: Clean stale PostgreSQL container
-        run: docker rm -f postgres >/dev/null 2>&1 || true
+      # Persistent runners are not discarded after every job. Remove only this
+      # shard's namespaced resources if a cancelled prior attempt left them.
+      - name: Clean stale PostgreSQL resources
+        run: |
+          docker rm -f "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+          docker network rm "$CI_NETWORK" >/dev/null 2>&1 || true
 
       - name: Start PostgreSQL (pull with retry + mirror fallback)
         run: |
+          docker network create "$CI_NETWORK"
           # registry-1.docker.io (Docker Hub) intermittently times out from GH
           # runners ("context deadline exceeded" on the /v2/ handshake) — a
           # connectivity blip, not a rate limit. When it outlasts the retry
@@ -487,21 +493,22 @@ jobs:
             echo "::error::could not pull postgres:15 from Docker Hub, mirror.gcr.io, or public.ecr.aws"
             exit 1
           fi
-          docker run -d --name postgres -p 127.0.0.1:55432:5432 \
+          docker run -d --name "$POSTGRES_CONTAINER" \
+            --network "$CI_NETWORK" --network-alias postgres \
             -e POSTGRES_USER=test \
             -e POSTGRES_PASSWORD=test \
             -e POSTGRES_DB=test_blueprint \
             postgres:15
           for i in $(seq 1 30); do
-            if docker exec postgres pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
+            if docker exec "$POSTGRES_CONTAINER" pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
               echo "PostgreSQL ready after $i check(s)"
               break
             fi
             sleep 2
           done
-          if ! docker exec postgres pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
+          if ! docker exec "$POSTGRES_CONTAINER" pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
             echo "::error::PostgreSQL did not become ready"
-            docker logs postgres || true
+            docker logs "$POSTGRES_CONTAINER" || true
             exit 1
           fi
 
@@ -538,7 +545,7 @@ jobs:
 
       - name: Verify app imports
         run: |
-          docker run --rm -v "$PWD/backend:/app:ro" \
+          docker run --rm --network "$CI_NETWORK" -v "$PWD/backend:/app:ro" \
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
@@ -548,7 +555,7 @@ jobs:
 
       - name: Run migrations on test DB
         run: |
-          docker run --rm --network host -v "$PWD/backend:/app:ro" \
+          docker run --rm --network "$CI_NETWORK" -v "$PWD/backend:/app:ro" \
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             ${{ steps.deps.outputs.image }} \
@@ -575,7 +582,7 @@ jobs:
             # (backend/testing/test_local_runner_terminal_log.py etc.) resolve
             # scripts/ via /repo and HARD-FAIL (not skip) when CI is set, so
             # they enforce in the promotion gate instead of silently skipping.
-            docker run --rm --network host -v "$PWD/backend:/app:ro" \
+            docker run --rm --network "$CI_NETWORK" -v "$PWD/backend:/app:ro" \
               -v "$PWD:/repo:ro" \
               -e PYTHONDONTWRITEBYTECODE=1 \
               -e GCE_METADATA_IP=127.0.0.1 \
@@ -727,9 +734,11 @@ jobs:
           fi
           echo "Migration linter passed"
 
-      - name: Stop PostgreSQL
+      - name: Stop PostgreSQL resources
         if: always()
-        run: docker rm -f postgres >/dev/null 2>&1 || true
+        run: |
+          docker rm -f "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+          docker network rm "$CI_NETWORK" >/dev/null 2>&1 || true
 
   # Required-status-check gate: the "mainProtection" ruleset requires a check
   # named exactly "CI / Backend". The matrix legs above report as "CI / Backend
