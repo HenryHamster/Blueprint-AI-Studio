@@ -5490,6 +5490,16 @@ async def _process_post_commit(
                             )
                             if not _is_transient:
                                 task.requires_approval = True
+                                from app.rollup_lineage_fence import (
+                                    mark_ancestor_rollups_awaiting_operator,
+                                )
+
+                                await mark_ancestor_rollups_awaiting_operator(
+                                    task,
+                                    session,
+                                    reason=f"review spawn failed ({_sr})",
+                                    pr_number=pr_number,
+                                )
                             session.add(task)
 
                             # Always create a WARNING alert with the specific spawn

@@ -86,7 +86,13 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
         new_callable=AsyncMock,
         side_effect=[
             {"merged": False, "state": "open"},
-            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "head": {"sha": "reviewed-rollup-head"},
+            },
         ],
     )
     mock_merge = mocker.patch(
@@ -208,6 +214,10 @@ async def test_clean_single_head_migration_rollup_auto_merges(cleanup_db, mocker
     await _check_and_trigger_rollup(child, cleanup_db)
 
     mock_merge.assert_awaited_once()
+    assert (
+        mock_merge.await_args.kwargs["expected_head_sha"]
+        == "reviewed-rollup-head"
+    )
     mock_spawn.assert_not_called()
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is False

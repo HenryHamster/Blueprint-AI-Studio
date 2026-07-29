@@ -3956,7 +3956,14 @@ async def _check_and_trigger_rollup(
                     # post-merge at the `_ms == "behind"` branch below — GitHub's
                     # mergeable_state distinguishes real behind from
                     # head-ahead-of-base. Removed 2026-05-26 (PR #6096 incident).
-                    merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
+                    merge_result = await merge_pull_request(
+                        gh_token,
+                        owner,
+                        repo,
+                        rollup_pr_number,
+                        project_id=str(parent.project_id),
+                        expected_head_sha=(pr_detail.get("head") or {}).get("sha"),
+                    )
                     parent = await _relock_parent(
                         session,
                         parent_id_local,

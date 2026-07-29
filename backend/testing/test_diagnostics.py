@@ -757,6 +757,40 @@ class TestBuildStuckTasks:
         assert result[0]["stuck_reason"] == "evaluation_timeout"
 
     @pytest.mark.asyncio
+    async def test_approval_gated_child_does_not_hide_stale_parent(
+        self, db_session
+    ):
+        """Operator-gated descendants cannot make an ancestor look live."""
+        project = Project(name="diag-eval-gated", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+
+        parent = _make_task(
+            project.id,
+            TaskStatus.EVALUATING,
+            created_ago_secs=4 * 3600,
+            started_ago_secs=4 * 3600,
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+        db_session.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent.id,
+                title="operator-gated pipeline child",
+                payloads=[{"type": "fix"}],
+                status=TaskStatus.BLOCKED,
+                requires_approval=True,
+            )
+        )
+        await db_session.commit()
+
+        result = await _build_stuck_tasks([parent], _utc_now(), db_session)
+        assert len(result) == 1
+        assert result[0]["stuck_reason"] == "evaluation_timeout"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "sibling_status, expected_stuck",
         [

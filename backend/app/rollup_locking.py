@@ -274,6 +274,7 @@ def _capture_rollup_parent_snapshot(parent: Task) -> dict:
         "rollup_pr_number": ctx.get("rollup_pr_number"),
         "rollup_pr_url": ctx.get("rollup_pr_url"),
         "pr_merged": ctx.get("pr_merged"),
+        "rollup_lineage_generation": ctx.get("_rollup_lineage_generation", 0),
     }
 
 
