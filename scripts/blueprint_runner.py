@@ -1413,17 +1413,18 @@ def do_livekit_status(*, system: bool, _run=subprocess.run) -> int:
     return 0
 
 
-def _restart_runner_service(*, _run=subprocess.run) -> bool:
+def _restart_runner_service(*, _run=subprocess.run) -> bool | None:
     """Restart the runner systemd service if it is installed and active.
 
     Checks both user and system scopes, restarting the first active unit
     found. User scope is checked first (the common case for a local runner
     installed by a non-root operator).
 
-    Returns True if a restart was performed, False otherwise.
+    Returns True when restart succeeds, False when an active unit's restart
+    fails, and None when there is no active installed service to restart.
     """
     if shutil.which("systemctl") is None:
-        return False
+        return None
 
     service_unit_name = _runner_service_unit_name()
     for system in (False, True):
@@ -1438,9 +1439,19 @@ def _restart_runner_service(*, _run=subprocess.run) -> bool:
                 f"({scope_label} scope)...",
                 flush=True,
             )
-            _systemctl(["restart", service_unit_name], system=system, _run=_run)
-            return True
-    return False
+            restart = _systemctl(
+                ["restart", service_unit_name], system=system, _run=_run
+            )
+            if getattr(restart, "returncode", 1) == 0:
+                return True
+            print(
+                f"ERROR: failed to restart {service_unit_name} "
+                f"({scope_label} scope).",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+    return None
 
 
 # ── agent deps bootstrap (install-time npm ci) ─────────────────────────────────
@@ -1546,6 +1557,7 @@ def _git(args: list[str], *, cwd: str, _run=subprocess.run) -> subprocess.Comple
 def do_update(
     *,
     repo_root: str = _REPO_ROOT,
+    restart_service: bool = True,
     _run=subprocess.run,
 ) -> int:
     """Update the local checkout: fetch, fast-forward, reinstall deps if needed.
@@ -1652,10 +1664,35 @@ def do_update(
                         file=sys.stderr, flush=True,
                     )
 
-    _restart_runner_service(_run=_run)
+    if restart_service:
+        restart_result = _restart_runner_service(_run=_run)
+        if restart_result is False:
+            return 1
 
     print("[blueprint-runner] update complete.", flush=True)
     return 0
+
+
+def checkout_contains_commit(
+    commit: str,
+    *,
+    repo_root: str = _REPO_ROOT,
+    _run=subprocess.run,
+) -> bool:
+    """Return whether the checkout's HEAD contains ``commit`` in its history.
+
+    A deployed orchestrator can legitimately advertise a commit slightly behind
+    the tracked branch tip.  Exact SHA comparison would misclassify that newer
+    checkout as stale, so auto-update convergence is ancestry-based.
+    """
+    if not commit:
+        return False
+    result = _git(
+        ["merge-base", "--is-ancestor", commit, "HEAD"],
+        cwd=repo_root,
+        _run=_run,
+    )
+    return result is not None and result.returncode == 0
 
 
 def do_status() -> int:
@@ -1799,6 +1836,27 @@ def _post_update_result(
             resp.read()
     except (urllib.error.HTTPError, urllib.error.URLError, OSError):
         pass  # Best-effort — never fail the update CLI over a notification
+
+
+def report_update_result(
+    url: str,
+    token: str,
+    *,
+    status: str,
+    old_version: str | None = None,
+    new_version: str | None = None,
+) -> None:
+    """Public best-effort update reporter shared by CLI and daemon paths."""
+    try:
+        _post_update_result(
+            url,
+            token,
+            status=status,
+            old_version=old_version,
+            new_version=new_version,
+        )
+    except Exception:
+        pass
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -5545,6 +5545,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner, "_container_image_store", return_value=None), \
                  patch.object(local_runner.br, "do_update",
                               return_value=0) as update_mock, \
+                 patch.object(local_runner.br, "report_update_result") as report_mock, \
                  patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -5560,18 +5561,17 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             combined,
             "Expected auto-update message when runner is idle and version differs",
         )
-        update_mock.assert_called_once()
+        update_mock.assert_called_once_with(restart_service=False)
+        report_mock.assert_called_once()
+        self.assertEqual(report_mock.call_args.kwargs["status"], "success")
         reexec_mock.assert_called_once()
 
-    def test_noop_auto_update_keeps_healthy_runner_alive(self):
-        """A no-op update must not restart-loop against a lagging server SHA."""
+    def test_noop_auto_update_reexecs_when_checkout_is_newer_than_hint(self):
+        """A newer checkout converges by ancestry and replaces the old process."""
         output_lines = []
-        post_count = {"value": 0}
 
         def fake_post(url, token, body, **kwargs):
-            post_count["value"] += 1
-            if post_count["value"] >= 2:
-                local_runner._shutdown_event.set()
+            local_runner._shutdown_event.set()
             return 200, {
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
@@ -5594,8 +5594,10 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner, "_disk_free_bytes", return_value=None), \
                  patch.object(local_runner, "_container_image_store", return_value=None), \
                  patch.object(local_runner.br, "do_update", return_value=0) as update_mock, \
+                 patch.object(local_runner.br, "checkout_contains_commit",
+                              return_value=True) as contains_mock, \
+                 patch.object(local_runner.br, "report_update_result") as report_mock, \
                  patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
-                 patch.object(local_runner.time, "sleep", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", {}, threading.Lock(),
@@ -5604,13 +5606,57 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         finally:
             local_runner._shutdown_event.clear()
 
-        update_mock.assert_called_once()
-        reexec_mock.assert_not_called()
-        self.assertFalse(local_runner._update_in_progress.is_set())
-        self.assertIn(
-            "continuing without restart",
-            " ".join(output_lines).lower(),
+        update_mock.assert_called_once_with(restart_service=False)
+        contains_mock.assert_called_once_with(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
         )
+        report_mock.assert_called_once()
+        self.assertEqual(report_mock.call_args.kwargs["status"], "success")
+        reexec_mock.assert_called_once()
+
+    def test_failed_auto_update_stays_drained_and_reports_failure(self):
+        """A failed update cannot silently resume claims on the old process."""
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            }
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes", return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes", return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
+                 patch.object(local_runner.br,
+                              "report_update_result") as report_mock, \
+                 patch.object(local_runner,
+                              "_reexec_after_update") as reexec_mock:
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        update_mock.assert_called_once_with(restart_service=False)
+        self.assertEqual(report_mock.call_args.kwargs["status"], "failure")
+        reexec_mock.assert_not_called()
+        self.assertTrue(local_runner._update_in_progress.is_set())
 
     def test_version_hint_mismatch_skips_auto_update_when_compute_busy(self):
         """When version_hint differs but compute jobs are active, no auto-update."""
