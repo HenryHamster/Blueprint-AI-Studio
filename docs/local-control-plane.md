@@ -112,13 +112,41 @@ worker fails closed before its production secrets enter a container.
 5. Confirm the local worker acquires leadership and that dispatch/reaper
    heartbeats remain current.
 
-Rollback is deliberately small: restore Cloud Run to
-`BLUEPRINT_PROCESS_ROLE=all`. After it acquires the advisory lock, stop the
-local worker with:
+Rollback is deliberately small. First create a warm Cloud Run `all` revision
+and keep production traffic on `LATEST`:
+
+```bash
+gcloud run services update blueprint-orchestrator \
+  --project blueprint-orchestrator \
+  --region us-central1 \
+  --update-env-vars BLUEPRINT_PROCESS_ROLE=all \
+  --min 1 \
+  --max 1 \
+  --concurrency 120
+gcloud run services update-traffic blueprint-orchestrator \
+  --project blueprint-orchestrator \
+  --region us-central1 \
+  --to-latest
+```
+
+The new revision initially remains a follower because the local worker still
+owns the advisory lock. Stop the local worker, then wait for Cloud Run's
+non-leader watchdog to acquire the released lock and restart through the leader
+startup path:
 
 ```bash
 python3 scripts/blueprint_node.py stop --role worker
+until curl -fsS https://blueprint-orchestrator-mmtfi5aysa-uc.a.run.app/health \
+  | jq -e '.status == "healthy" and .is_leader == true' >/dev/null; do
+  sleep 5
+done
+gcloud run services describe blueprint-orchestrator \
+  --project blueprint-orchestrator \
+  --region us-central1 \
+  --format='yaml(status.latestReadyRevisionName,status.traffic)'
 ```
 
-Do not disable the database proxy until Cloud Run leadership and task dispatch
-are healthy.
+Verify a current orchestrator cycle and reaper heartbeat before disabling the
+database proxy. If `call-staging` must remain tagged, also verify it is present
+in `status.traffic`; `gcloud run services update-traffic --to-latest` can remove
+tags and they must be restored explicitly with `--update-tags`.

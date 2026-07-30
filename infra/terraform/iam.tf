@@ -50,6 +50,25 @@ resource "google_project_iam_custom_role" "secret_creator" {
   permissions = ["secretmanager.secrets.create"]
 }
 
+# Secret reconciliation must enumerate managed secret metadata before it can
+# compare labels against live VM IDs. This project-level list permission does
+# not grant payload access, IAM access, or mutation.
+resource "google_project_iam_custom_role" "secret_inventory" {
+  role_id     = "blueprintSecretInventory"
+  title       = "Blueprint Secret Inventory"
+  description = "List Secret Manager metadata without accessing values or IAM policies"
+  permissions = ["secretmanager.secrets.list"]
+}
+
+# Deletion is kept separate from inventory so it can be resource-conditioned
+# to the ephemeral per-agent namespace. User-managed secrets are excluded.
+resource "google_project_iam_custom_role" "agent_secret_deleter" {
+  role_id     = "blueprintAgentSecretDeleter"
+  title       = "Blueprint Agent Secret Deleter"
+  description = "Delete only condition-scoped ephemeral agent credential secrets"
+  permissions = ["secretmanager.secrets.delete"]
+}
+
 resource "google_project_iam_member" "orchestrator_secret_creator" {
   project = var.project_id
   role    = google_project_iam_custom_role.secret_creator.id
@@ -160,6 +179,12 @@ resource "google_project_iam_member" "local_worker_secret_creator" {
   member  = "serviceAccount:${google_service_account.local_worker_sa.email}"
 }
 
+resource "google_project_iam_member" "local_worker_secret_inventory" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.secret_inventory.id
+  member  = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
 locals {
   local_worker_managed_secret_condition = <<-EOT
     resource.name.startsWith("projects/${var.project_id}/secrets/agent-creds-") ||
@@ -167,6 +192,23 @@ locals {
     resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/agent-creds-") ||
     resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/user-")
   EOT
+
+  local_worker_agent_secret_condition = <<-EOT
+    resource.name.startsWith("projects/${var.project_id}/secrets/agent-creds-") ||
+    resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/agent-creds-")
+  EOT
+}
+
+resource "google_project_iam_member" "local_worker_agent_secret_deleter" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.agent_secret_deleter.id
+  member  = "serviceAccount:${google_service_account.local_worker_sa.email}"
+
+  condition {
+    title       = "BlueprintLocalWorkerAgentSecrets"
+    description = "Delete only ephemeral per-agent credential secrets"
+    expression  = local.local_worker_agent_secret_condition
+  }
 }
 
 resource "google_project_iam_member" "local_worker_managed_secret_accessor" {
