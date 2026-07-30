@@ -35,17 +35,24 @@ resource "google_project_iam_member" "orchestrator_secret_version_adder" {
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
-# Grant Orchestrator SA permission to create new secret resources.
+# Grant the single permission needed to create new secret resources.
 # Runtime paths: backend/app/compute.py (_store_agent_secret) and
 # backend/app/secrets_manager.py (store_user_secret) call create_secret
 # to provision per-agent credential secrets and user token secrets dynamically.
-# Excludes secretmanager.admin: delete calls are best-effort (logged on failure,
-# not fatal) and per-agent IAM grants (secretAccessor on agent-creds-* secrets
-# for agent VMs) should be managed via google_secret_manager_secret_iam_member
-# bindings per secret rather than project-wide IAM-management authority.
+# The former roles/secretmanager.secretCreator declaration is no longer a
+# supported predefined role. Do not replace it with Secret Manager Admin or
+# Editor: both add destructive version/secret capabilities the runtime does not
+# need. This project role preserves the original one-permission boundary.
+resource "google_project_iam_custom_role" "secret_creator" {
+  role_id     = "blueprintSecretCreator"
+  title       = "Blueprint Secret Creator"
+  description = "Create Secret Manager secret resources without delete, update, access, or IAM permissions"
+  permissions = ["secretmanager.secrets.create"]
+}
+
 resource "google_project_iam_member" "orchestrator_secret_creator" {
   project = var.project_id
-  role    = "roles/secretmanager.secretCreator"
+  role    = google_project_iam_custom_role.secret_creator.id
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
@@ -90,6 +97,132 @@ resource "google_service_account_iam_member" "orchestrator_sa_token_creator" {
   service_account_id = google_service_account.orchestrator_sa.name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# ------------------------------------------------------------------------------
+# Local background worker identity
+# ------------------------------------------------------------------------------
+data "google_project" "local_worker_project" {
+  project_id = var.project_id
+}
+
+# The Auth Proxy receives its own single-purpose identity. Compromise of the
+# proxy process or key cannot create VMs, access application secrets, or submit
+# builds.
+resource "google_service_account" "local_cloudsql_proxy_sa" {
+  account_id   = "blueprint-local-worker"
+  display_name = "Blueprint local worker Cloud SQL proxy"
+  description  = "External Cloud SQL Auth Proxy identity; database connectivity only"
+}
+
+resource "google_project_iam_member" "local_cloudsql_proxy_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.local_cloudsql_proxy_sa.email}"
+}
+
+# This identity is intentionally separate from both:
+#   * orchestrator_sa, whose self-tokenCreator grant is needed by public API
+#     signed-URL endpoints but must not be exported to a physical host; and
+#   * the Cloud-SQL-proxy-only identity installed on the host.
+#
+# The local worker runs the same leader-only background paths as Cloud Run:
+# compute lifecycle, per-agent secret creation, build submission, artifact
+# staging, log inspection, and Cloud Run Job execution.  Its grants mirror only
+# those worker paths.  It does NOT receive service-account token creation,
+# project IAM administration, Artifact Registry administration, or Cloud Run
+# service mutation.
+resource "google_service_account" "local_worker_sa" {
+  account_id   = "blueprint-local-worker-runtime"
+  display_name = "Blueprint local background worker"
+  description  = "External worker identity; no API signing or project IAM administration"
+}
+
+locals {
+  local_worker_project_roles = toset([
+    "roles/cloudbuild.builds.editor",
+    "roles/compute.instanceAdmin.v1",
+    "roles/logging.viewer",
+    "roles/run.viewer",
+  ])
+}
+
+resource "google_project_iam_member" "local_worker_project_roles" {
+  for_each = local.local_worker_project_roles
+  project  = var.project_id
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
+resource "google_project_iam_member" "local_worker_secret_creator" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.secret_creator.id
+  member  = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
+locals {
+  local_worker_managed_secret_condition = <<-EOT
+    resource.name.startsWith("projects/${var.project_id}/secrets/agent-creds-") ||
+    resource.name.startsWith("projects/${var.project_id}/secrets/user-") ||
+    resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/agent-creds-") ||
+    resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/user-")
+  EOT
+}
+
+resource "google_project_iam_member" "local_worker_managed_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.local_worker_sa.email}"
+
+  condition {
+    title       = "BlueprintLocalWorkerManagedSecrets"
+    description = "Read only per-agent and user-managed runtime secrets"
+    expression  = local.local_worker_managed_secret_condition
+  }
+}
+
+resource "google_project_iam_member" "local_worker_managed_secret_version_adder" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretVersionAdder"
+  member  = "serviceAccount:${google_service_account.local_worker_sa.email}"
+
+  condition {
+    title       = "BlueprintLocalWorkerManagedSecretVersions"
+    description = "Add versions only to per-agent and user-managed runtime secrets"
+    expression  = local.local_worker_managed_secret_condition
+  }
+}
+
+resource "google_service_account_iam_member" "local_worker_act_as_agent" {
+  service_account_id = google_service_account.agent_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
+resource "google_service_account_iam_member" "local_worker_act_as_image_builder" {
+  service_account_id = google_service_account.image_builder_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
+resource "google_storage_bucket_iam_member" "local_worker_artifact_bucket_admin" {
+  bucket = google_storage_bucket.artifacts.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
+resource "google_storage_bucket_iam_member" "local_worker_compute_build_source_admin" {
+  bucket = google_storage_bucket.compute_build_source.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
+resource "google_cloud_run_v2_job_iam_member" "local_worker_runs_agent_job" {
+  location = google_cloud_run_v2_job.blueprint_agent_job.location
+  project  = google_cloud_run_v2_job.blueprint_agent_job.project
+  name     = google_cloud_run_v2_job.blueprint_agent_job.name
+  role     = "roles/run.jobsExecutorWithOverrides"
+  member   = "serviceAccount:${google_service_account.local_worker_sa.email}"
 }
 
 # ------------------------------------------------------------------------------

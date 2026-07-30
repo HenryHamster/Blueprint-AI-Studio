@@ -39,6 +39,31 @@ resource "google_service_account" "github_actions_sa" {
   display_name = "GitHub Actions Service Account"
 }
 
+# Terraform refreshes every managed resource before producing a plan. Keep the
+# planning identity read-only outside its existing, explicit deployment roles;
+# Viewer covers resource metadata, Security Reviewer covers IAM policies, and
+# Service Usage Consumer permits authenticated reads against enabled APIs.
+resource "google_project_iam_member" "github_actions_plan_viewer" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/viewer"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
+resource "google_project_iam_member" "github_actions_plan_security_reviewer" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/iam.securityReviewer"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
+resource "google_project_iam_member" "github_actions_plan_service_usage" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/serviceusage.serviceUsageConsumer"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
 resource "google_service_account_iam_member" "github_actions_impersonation" {
   count              = var.enable_cicd ? 1 : 0
   service_account_id = google_service_account.github_actions_sa[0].name

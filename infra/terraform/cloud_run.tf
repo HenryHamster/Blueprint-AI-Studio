@@ -26,7 +26,9 @@ resource "google_cloud_run_v2_service" "orchestrator" {
     # respawns), and the 4Gi/2vCPU revert was sized for a singleton. Validate
     # per-instance memory headroom before enabling multi-instance scaling.
     scaling {
-      min_instance_count = 1
+      # The off-cloud worker owns all always-on background services. Cloud Run
+      # is now the public API surface and may safely cold-start on demand.
+      min_instance_count = 0
       max_instance_count = 1
     }
     # Per-instance concurrency (default is 80). Bumped so the admin UI polling

@@ -9,14 +9,7 @@ on:
     paths:
       - 'infra/terraform/**'
   workflow_dispatch:
-    inputs:
-      action:
-        description: 'Terraform action'
-        type: choice
-        options:
-          - plan
-          - apply
-        default: plan
+    # Plan-only by design. Production applies remain an explicit local operation.
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -26,10 +19,13 @@ env:
   TF_VAR_github_repository: ${{ github.repository }}
   TF_VAR_enable_cicd: "true"
   TF_VAR_orchestrator_url: ${{ secrets.ORCHESTRATOR_URL }}
+  TF_VAR_alert_email: ${{ secrets.GCP_ALERT_EMAIL }}
+  TF_VAR_billing_account_id: ${{ secrets.GCP_BILLING_ACCOUNT_ID }}
+  TF_VAR_monthly_budget_usd: "200"
 
 jobs:
   terraform:
-    name: ${{ github.event_name == 'pull_request' && 'Plan' || (github.event.inputs.action == 'apply' && 'Apply' || 'Plan + Apply') }}
+    name: Plan
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,17 +49,38 @@ jobs:
         with:
           terraform_version: 1.9.x
 
+      - name: Validate production plan inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_inputs=(
+            PROJECT_ID
+            TF_VAR_alert_email
+            TF_VAR_billing_account_id
+            TF_VAR_orchestrator_url
+          )
+          for input_name in "${required_inputs[@]}"; do
+            if [[ -z "${!input_name:-}" ]]; then
+              echo "::error::Required Terraform plan input is missing: ${input_name}"
+              exit 1
+            fi
+          done
+
       - name: Terraform Init
         run: terraform init
 
       - name: Terraform Plan
         id: plan
         run: |
+          set +e
+          set -o pipefail
           terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
-          echo "plan_exit_code=$?" >> "$GITHUB_OUTPUT"
+          plan_exit_code=$?
+          echo "plan_exit_code=$plan_exit_code" >> "$GITHUB_OUTPUT"
+          exit "$plan_exit_code"
 
       - name: Comment plan on PR
-        if: github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |

@@ -23,7 +23,6 @@ import getpass
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -41,6 +40,8 @@ import blueprint_runner as runner
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _LOCAL_RUNNER = _SCRIPT_DIR / "local_runner.py"
+_CLOUD_SQL_PROXY_SERVICE = _SCRIPT_DIR / "cloud_sql_proxy_service.py"
+_LOCAL_WORKER_SERVICE = _SCRIPT_DIR / "local_worker_service.py"
 _USER_TEMPLATE = _SCRIPT_DIR / "blueprint-node.service"
 _SYSTEM_TEMPLATE = _SCRIPT_DIR / "blueprint-node-system.service"
 _MANIFEST_VERSION = 1
@@ -54,6 +55,9 @@ class RoleSpec:
     unit_name: str
     executable: bool
     description: str
+    entrypoint: Path | None = None
+    requires: tuple[str, ...] = ()
+    env_required: bool = False
 
 
 ROLE_SPECS: dict[str, RoleSpec] = {
@@ -64,6 +68,7 @@ ROLE_SPECS: dict[str, RoleSpec] = {
     "executor": RoleSpec(
         "executor", "blueprint-executor.service", True,
         "Blueprint agent and compute lanes (current local_runner implementation)",
+        entrypoint=_LOCAL_RUNNER,
     ),
     "github-actions": RoleSpec(
         "github-actions", "blueprint-actions.service", False,
@@ -72,9 +77,20 @@ ROLE_SPECS: dict[str, RoleSpec] = {
     "api": RoleSpec(
         "api", "blueprint-api.service", False, "local Blueprint HTTP API",
     ),
+    "database-proxy": RoleSpec(
+        "database-proxy",
+        "blueprint-database-proxy.service",
+        True,
+        "Cloud SQL Auth Proxy bound only to the local control-plane Docker bridge",
+        entrypoint=_CLOUD_SQL_PROXY_SERVICE,
+        env_required=True,
+    ),
     "worker": RoleSpec(
-        "worker", "blueprint-worker.service", False,
+        "worker", "blueprint-worker.service", True,
         "scheduler, dispatch, reapers, and background loops",
+        entrypoint=_LOCAL_WORKER_SERVICE,
+        requires=("blueprint-database-proxy.service",),
+        env_required=True,
     ),
     "edge": RoleSpec(
         "edge", "blueprint-edge.service", False,
@@ -83,14 +99,23 @@ ROLE_SPECS: dict[str, RoleSpec] = {
 }
 
 PROFILE_ROLES: dict[str, tuple[str, ...]] = {
-    "primary": ("node-agent", "executor", "github-actions", "api", "worker", "edge"),
+    "primary": (
+        "node-agent",
+        "executor",
+        "api",
+        "database-proxy",
+        "worker",
+        "edge",
+    ),
     "worker": ("node-agent", "executor", "github-actions"),
     "gpu-worker": ("node-agent", "executor"),
+    "control-plane": ("database-proxy", "worker"),
 }
 
 PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
     "primary": {},
     "worker": {},
+    "control-plane": {},
     "gpu-worker": {
         "BLUEPRINT_RUNNER_MAX_CONCURRENT_COMPUTE_JOBS": "1",
         "BLUEPRINT_RUNNER_GPUS_PER_JOB": "1",
@@ -326,11 +351,23 @@ def _render_unit(role: str, *, system: bool, env_file: Path) -> str:
         raise ValueError(f"role {role!r} is planned but not installable yet")
     template = _SYSTEM_TEMPLATE if system else _USER_TEMPLATE
     env_file_text = _require_safe_path(str(env_file), field="EnvironmentFile path")
+    if spec.entrypoint is None:
+        raise ValueError(f"role {role!r} has no executable entrypoint")
     substitutions = {
         "@ROLE@": role,
         "@PYTHON@": sys.executable,
-        "@EXECUTABLE@": str(_LOCAL_RUNNER),
+        "@EXECUTABLE@": str(spec.entrypoint),
+        "@EXEC_START_PRE@": (
+            f"ExecStartPre={sys.executable} {spec.entrypoint} --check"
+            if role != "executor"
+            else ""
+        ),
         "@ENV_FILE@": env_file_text,
+        "@ENV_FILE_PREFIX@": "" if spec.env_required else "-",
+        "@UNIT_REQUIRES@": (
+            f"Requires={' '.join(spec.requires)}" if spec.requires else ""
+        ),
+        "@UNIT_AFTER@": f"After={' '.join(spec.requires)}" if spec.requires else "",
     }
     if system:
         substitutions.update({"@USER@": _system_install_user(), "@WANTED_BY@": "multi-user.target"})
@@ -370,8 +407,49 @@ def _role_env_text(
     return "".join(lines)
 
 
+def _service_role_env_text(role: str, values: dict[str, str]) -> str:
+    """Render non-secret service configuration for proxy and worker roles."""
+    required = {
+        "database-proxy": {
+            "BLUEPRINT_CLOUDSQL_PROXY_BINARY",
+            "BLUEPRINT_CLOUDSQL_PROXY_SHA256",
+            "BLUEPRINT_CLOUDSQL_CREDENTIALS_FILE",
+            "BLUEPRINT_CLOUDSQL_INSTANCE",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK",
+        },
+        "worker": {
+            "BLUEPRINT_WORKER_IMAGE_ID",
+            "BLUEPRINT_WORKER_SECRETS_FILE",
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK",
+        },
+    }.get(role)
+    if required is None:
+        raise ValueError(f"role {role!r} has no service configuration contract")
+    missing = required - set(values)
+    if missing:
+        raise ValueError(f"{role} configuration missing: {', '.join(sorted(missing))}")
+    unexpected = set(values) - required
+    if unexpected:
+        raise ValueError(f"{role} configuration has unsupported keys")
+    for key, value in values.items():
+        _require_safe_path(value, field=key)
+    return "".join(
+        [
+            "# Written by blueprint-node install. Mode 0600; contains paths and identifiers only.\n",
+            *(f"{key}={values[key]}\n" for key in sorted(values)),
+        ]
+    )
+
+
 def _manifest(profile: str, *, system: bool, user: str | None = None) -> dict:
     roles = _require_profile(profile)
+    def role_payload(role: str) -> dict:
+        payload = asdict(ROLE_SPECS[role])
+        if payload["entrypoint"] is not None:
+            payload["entrypoint"] = str(payload["entrypoint"])
+        return payload
+
     return {
         "schema_version": _MANIFEST_VERSION,
         "profile": profile,
@@ -380,7 +458,7 @@ def _manifest(profile: str, *, system: bool, user: str | None = None) -> dict:
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "roles": [
             {
-                **asdict(ROLE_SPECS[role]),
+                **role_payload(role),
                 "env_file": str(role_env_path(role, system=system, user=user)),
                 "unit_path": str(unit_path(role, system=system)),
                 "state": "installable" if ROLE_SPECS[role].executable else "planned",
@@ -429,6 +507,7 @@ def do_install(
     url: str,
     dry_run: bool,
     resource_limits: dict[str, str] | None = None,
+    role_configs: dict[str, dict[str, str]] | None = None,
     _run=subprocess.run,
 ) -> int:
     """Install currently executable roles and persist the full node manifest.
@@ -454,9 +533,17 @@ def do_install(
     # not start a second claimant on a host that is still running the old unit.
     # Dry-run remains side-effect-free and useful for checking profiles before
     # the operator performs the explicit migration.
-    legacy_scopes = _active_legacy_runner_scopes(_run=_run) if not dry_run else ()
+    adopts_executor = "executor" in roles
+    legacy_scopes = (
+        _active_legacy_runner_scopes(_run=_run)
+        if adopts_executor and not dry_run
+        else ()
+    )
     legacy_user_unit = bool(
-        system and system_user and _legacy_user_unit_exists(system_user)
+        adopts_executor
+        and system
+        and system_user
+        and _legacy_user_unit_exists(system_user)
     )
     if legacy_scopes or legacy_user_unit:
         active_scopes = ", ".join(
@@ -472,11 +559,14 @@ def do_install(
         )
         return 1
     limits = {**PROFILE_DEFAULTS[profile], **(resource_limits or {})}
+    role_configs = role_configs or {}
     executable_roles = [role for role in roles if ROLE_SPECS[role].executable]
     planned_roles = [role for role in roles if not ROLE_SPECS[role].executable]
     rendered: dict[str, str] = {}
     try:
         for role in executable_roles:
+            if role != "executor":
+                _service_role_env_text(role, role_configs.get(role, {}))
             rendered[role] = _render_unit(
                 role,
                 system=system,
@@ -504,15 +594,20 @@ def do_install(
                 credential_path, uid=credential_uid, gid=credential_gid
             )
         for role in executable_roles:
-            _atomic_write(
-                role_env_path(role, system=system, user=system_user),
+            env_text = (
                 _role_env_text(
                     profile=profile,
                     url=url,
                     token=token,
                     limits=limits,
                     credential_dir=credential_dir,
-                ),
+                )
+                if role == "executor"
+                else _service_role_env_text(role, role_configs.get(role, {}))
+            )
+            _atomic_write(
+                role_env_path(role, system=system, user=system_user),
+                env_text,
             )
             _atomic_write(unit_path(role, system=system), rendered[role], mode=0o644)
         _atomic_write(
@@ -632,6 +727,16 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--system", action="store_true")
     install.add_argument("--url")
     install.add_argument("--dry-run", action="store_true")
+    install.add_argument("--cloudsql-instance")
+    install.add_argument("--cloudsql-proxy-binary")
+    install.add_argument("--cloudsql-proxy-sha256")
+    install.add_argument("--cloudsql-credentials-file")
+    install.add_argument("--worker-image-id")
+    install.add_argument("--worker-secrets-file")
+    install.add_argument("--worker-google-credentials-file")
+    install.add_argument(
+        "--control-plane-network", default="blueprint-control-plane"
+    )
     for flag, _env, dest, help_text in runner._RESOURCE_LIMIT_VARS:
         install.add_argument(flag, dest=dest, default=None, help=help_text)
     status = sub.add_parser("status", help="Show all roles in a node profile.")
@@ -657,6 +762,31 @@ def main(argv: list[str] | None = None) -> int:
             for _flag, env, dest, _help in runner._RESOURCE_LIMIT_VARS
             if getattr(args, dest) is not None
         }
+        role_configs: dict[str, dict[str, str]] = {}
+        if args.profile in {"primary", "control-plane"}:
+            role_configs = {
+                "database-proxy": {
+                    key: value
+                    for key, value in {
+                        "BLUEPRINT_CLOUDSQL_PROXY_BINARY": args.cloudsql_proxy_binary,
+                        "BLUEPRINT_CLOUDSQL_PROXY_SHA256": args.cloudsql_proxy_sha256,
+                        "BLUEPRINT_CLOUDSQL_CREDENTIALS_FILE": args.cloudsql_credentials_file,
+                        "BLUEPRINT_CLOUDSQL_INSTANCE": args.cloudsql_instance,
+                        "BLUEPRINT_CONTROL_PLANE_NETWORK": args.control_plane_network,
+                    }.items()
+                    if value
+                },
+                "worker": {
+                    key: value
+                    for key, value in {
+                        "BLUEPRINT_WORKER_IMAGE_ID": args.worker_image_id,
+                        "BLUEPRINT_WORKER_SECRETS_FILE": args.worker_secrets_file,
+                        "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": args.worker_google_credentials_file,
+                        "BLUEPRINT_CONTROL_PLANE_NETWORK": args.control_plane_network,
+                    }.items()
+                    if value
+                },
+            }
         return do_install(
             profile=args.profile,
             system=args.system,
@@ -664,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
             url=runner.resolve_url(args.url),
             dry_run=args.dry_run,
             resource_limits=limits,
+            role_configs=role_configs,
         )
     if args.command == "status":
         return do_status(profile=args.profile, system=args.system)
