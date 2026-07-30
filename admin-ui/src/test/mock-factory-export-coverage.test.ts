@@ -1019,7 +1019,11 @@ describe('mock-factory-export-coverage', () => {
     }
 
     expect(failures, `\n${failures.join('\n')}`).toHaveLength(0);
-  }, 15_000);
+  // This repository-wide export scan imports several large barrels. Four
+  // concurrent self-hosted jobs can make the valid scan exceed 15 seconds even
+  // though it completes consistently; retain a hard bound without turning
+  // scheduler contention into a false failure.
+  }, 30_000);
 });
 
 describe('mock-factory-export-coverage helpers', () => {

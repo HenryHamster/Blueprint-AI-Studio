@@ -25,7 +25,7 @@ import {
   ChildTasksSection,
   ViewportScreenshotsPanel,
 } from './TaskDetailDrawerSections';
-import { fetchComputeJobs } from '../api';
+import { fetchComputeJobs, fetchKnowledgeDocument } from '../api';
 import type { ComputeJob } from '../api';
 import type { Task, AdversarialGateDiagnostic, TaskEvaluationSummary } from '../types/task';
 
@@ -369,6 +369,11 @@ describe('KnowledgeDocumentSection', () => {
   });
 
   test('toggles document body on click', async () => {
+    let resolveDocument!: (document: { id: string; body: string }) => void;
+    const fullDocument = new Promise<{ id: string; body: string }>((resolve) => {
+      resolveDocument = resolve;
+    });
+    vi.mocked(fetchKnowledgeDocument).mockReturnValueOnce(fullDocument as never);
     const task = makeTask({
       project_id: 'proj-1',
       plan_output: {
@@ -381,8 +386,14 @@ describe('KnowledgeDocumentSection', () => {
     expect(btn).not.toBeNull();
     expect(host.textContent).toContain('View document');
     act(() => { btn!.click(); });
-    // Wait for async loading
-    await vi.waitFor(() => { expect(host.textContent).toContain('Document body content'); });
+    await act(async () => {
+      resolveDocument({ id: 'doc-body', body: 'Document body content' });
+      await fullDocument;
+    });
+    expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-body');
+    await vi.waitFor(() => {
+      expect(host.textContent).toContain('Document body content');
+    });
     expect(host.textContent).toContain('Hide document');
   });
 });

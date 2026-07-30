@@ -13540,7 +13540,7 @@ class TestProblemModelWritePathInvariants:
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
         ("task_locking.py", 1064): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
-        ("lifecycle.py", 435): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
+        ("lifecycle.py", 501): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
         ("direction_lifecycle.py", 813): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
