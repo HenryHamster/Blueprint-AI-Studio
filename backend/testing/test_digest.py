@@ -5174,6 +5174,45 @@ async def test_compute_remediation_funnel_helper_direct(db_session):
 
 
 @pytest.mark.asyncio
+async def test_remediation_funnel_projects_failed_task_classifier_fields(db_session):
+    """Failed remediation classification must work after ORM state is expired."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    project_id = project.id
+
+    now = _utcnow()
+    failed = make_task(
+        project_id=project_id,
+        title="failed remediation",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=1),
+        latest_status_message="BLOCKER: repository permission is missing",
+        context={"diagnosis_task_id": "diagnosis-1"},
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    # Ensure compute_remediation_funnel cannot reuse a fully-loaded identity-map
+    # instance and must rely only on its explicit load_only projection.
+    db_session.expire_all()
+
+    funnel, _ = await compute_remediation_funnel(
+        db_session,
+        project_id=project_id,
+        window_start=now - timedelta(hours=24),
+        residual_remediation_funnel={},
+    )
+
+    assert funnel["remediations_failed"] == 1
+    assert funnel["failed_remediations_by_class"] == {
+        "BLOCKED_PRECONDITION": 1
+    }
+
+
+@pytest.mark.asyncio
 async def test_compute_remediation_and_patterns_helper_direct(db_session):
     """compute_remediation_and_patterns returns all four expected top-level keys.
 

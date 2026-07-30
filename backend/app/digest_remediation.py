@@ -387,6 +387,18 @@ async def compute_remediation_funnel(
         _funnel_filters.append(Task.project_id == project_id)
     _inv_result = await session.execute(
         select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.plan_output,
+                Task.context,
+                Task.created_at,
+                Task.completed_at,
+                Task.status_log,
+                raiseload=True,
+            )
+        )
         .where(
             *_funnel_filters,
             Task.payloads[0]["type"].as_string() == "investigate",
@@ -406,6 +418,22 @@ async def compute_remediation_funnel(
         ).isnot(None)
     _rem_result = await session.execute(
         select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+                Task.started_at,
+                Task.completed_at,
+                Task.last_heartbeat,
+                Task.latest_status_message,
+                Task.status_log,
+                Task.payloads,
+                Task.api_call_summary,
+                raiseload=True,
+            )
+        )
         .where(
             *_funnel_filters,
             _diagnosis_present,
@@ -633,7 +661,16 @@ async def compute_remediation_funnel(
         )
 
     _ci_rem_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.context,
+                raiseload=True,
+            )
+        )
+        .where(
             *_funnel_filters,
             Task.auto_remediation.is_(True),  # promoted column (audit W1)
         )
@@ -703,7 +740,16 @@ async def compute_remediation_funnel(
         _cum_filters.append(Task.project_id == project_id)
     _CUM_TASK_CAP = 10000
     _cum_result = await session.execute(
-        select(Task).where(*_cum_filters).limit(_CUM_TASK_CAP)
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.context,
+                raiseload=True,
+            )
+        )
+        .where(*_cum_filters)
+        .limit(_CUM_TASK_CAP)
     )
     cumulative_merged_by_trigger_class: Dict[str, int] = {}
     _cum_rows = _cum_result.scalars().all()

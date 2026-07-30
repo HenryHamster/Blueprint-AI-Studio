@@ -804,6 +804,58 @@ async def _leader_lock_keepalive_tick(leader_conn) -> str:
     return "reacquired" if reacquired else "lost"
 
 
+async def _leader_lock_keepalive(
+    leader_conn, *, interval_seconds: float | None = None
+) -> None:
+    """Refresh the pinned leader connection until shutdown."""
+    keepalive_seconds = (
+        float(os.getenv("LEADER_KEEPALIVE_SECONDS", "30"))
+        if interval_seconds is None
+        else interval_seconds
+    )
+    while True:
+        await asyncio.sleep(keepalive_seconds)
+        outcome = await _leader_lock_keepalive_tick(leader_conn)
+        if outcome in ("lost", "error"):
+            logger.warning(
+                "[MONITOR] Leader advisory lock %s; hard-exiting so Cloud Run "
+                "respawns through clean leader election",
+                "lost to a peer" if outcome == "lost" else "unrecoverable",
+            )
+            os._exit(0)
+
+
+async def _start_leader_keepalive_and_run_maintenance(
+    *,
+    leader_conn,
+    is_leader: bool,
+    keepalive_seconds: float | None = None,
+):
+    """Start lock refresh before leader-only bootstrap work."""
+    keepalive_task = (
+        asyncio.create_task(
+            _leader_lock_keepalive(
+                leader_conn, interval_seconds=keepalive_seconds
+            )
+        )
+        if is_leader and leader_conn is not None
+        else None
+    )
+    try:
+        await _run_leader_bootstrap_maintenance(is_leader=is_leader)
+    except BaseException:
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        if leader_conn is not None:
+            try:
+                await leader_conn.close()
+            except Exception as close_exc:
+                logger.debug("[STARTUP] Leader close after bootstrap: %s", close_exc)
+        raise
+    return keepalive_task
+
+
 async def _reap_stale_leader_lock_holder(
     probe_session, stale_secs: float = _LEADER_STALE_REAP_SECONDS
 ) -> int:
@@ -932,6 +984,23 @@ async def _shutdown_background_task_registry(
         registry.clear()
 
 
+async def _restore_worker_routing_state(*, worker_services_permitted: bool) -> None:
+    if worker_services_permitted:
+        await _seed_routing_verdict_from_snapshot()
+
+
+async def _run_leader_bootstrap_maintenance(*, is_leader: bool) -> None:
+    """Run project-wide maintenance once, after leadership is known."""
+    if not is_leader:
+        return
+
+    await _seed_completion_debt_inventory()
+    await _reconcile_dormant_knob_debts()
+    await _seed_completion_debt_design_doc()
+    await _heal_poisoned_problem_models()
+    await _seed_deploy_project_futility_verdicts()
+
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan context manager — startup and shutdown hooks."""
@@ -1043,33 +1112,11 @@ async def lifespan(app):
     # Seed initial admin if AllowedUser table is empty
     await _seed_initial_admin()
 
-    # Load persisted Max plan accounts into in-memory pool
     await load_max_plan_pool()
-
-    # Seed provider_routing_verdict_state from the latest persisted snapshot
-    # so DeepSeek preference is restored immediately on restart, not gated on
-    # the next periodic snapshot write (up to ~1h delay).
-    await _seed_routing_verdict_from_snapshot()
-
-    # Check deployment state (detect new deploy, rollback, or normal restart)
+    await _restore_worker_routing_state(
+        worker_services_permitted=leader_election_enabled
+    )
     await _init_deployment_state()
-
-    # Seed the completion-debt ledger from the standing HEAD dormant-state
-    # inventory (idempotent: dedupe_key upserts, so restarts never duplicate).
-    await _seed_completion_debt_inventory()
-
-    # Reconcile dormant-knob debt rows against the current runtime config so
-    # env-var/redeploy graduations and live demotions converge immediately.
-    await _reconcile_dormant_knob_debts()
-
-    # Seed the completion-debt design-doc section for all projects (idempotent:
-    # absent sections are seeded, existing sections only refresh code fields).
-    await _seed_completion_debt_design_doc()
-
-    # Strip packer-marker keys (e.g. ``truncated``) that leaked into durable
-    # problem_model rows before the apply_agent_update self-heal guard was added.
-    # Idempotent: only touches rows that carry a marker key.
-    await _heal_poisoned_problem_models()
 
     # Log the resolved deploy-level identity so operators can confirm that
     # deploy-level serving confirmation (backend_revision, agent_image) is
@@ -1078,11 +1125,6 @@ async def lifespan(app):
     # operators know to set runtime_config['deploy_repo_identity'] via
     # PATCH /api/admin/settings.
     _log_startup_deploy_identity()
-
-    # Seed futility verdicts on the deploy project for five context-injection
-    # blocks that reached futility_bound_reached (global trial, 2026-07-11).
-    # Best-effort; a seed failure must never abort startup.
-    await _seed_deploy_project_futility_verdicts()
 
     # --- Leader election via pg_try_advisory_lock (session-scoped) ---
     # Only one Cloud Run instance should run the leader-only background services.
@@ -1119,6 +1161,10 @@ async def lifespan(app):
     _shared_state.is_leader = is_leader
     app.state.process_role_status = process_role_status(
         process_role, is_leader=is_leader
+    )
+    leader_keepalive_task = await _start_leader_keepalive_and_run_maintenance(
+        leader_conn=leader_conn,
+        is_leader=is_leader,
     )
 
     if not is_leader:
@@ -1344,7 +1390,8 @@ async def lifespan(app):
         await close_redis()
         return
 
-    # This instance owns the background-leader lock — start all background services.
+    # This instance owns the background-leader lock. Maintenance bootstrap has
+    # completed above; start all background services.
 
     # Backfill NULL integration_branch / promotion_target from GitHub defaults.
     # Runs once per startup on the leader only; wrapped so an exception here does
@@ -2045,29 +2092,6 @@ async def lifespan(app):
                     f"[MONITOR] Monitor itself hit exception: {mon_exc}", exc_info=True
                 )
                 await asyncio.sleep(10)  # Brief pause before retrying
-
-    # Leader-lock keepalive: re-assert ownership of the session-scoped advisory
-    # lock so a dropped connection can't silently hand leadership to a peer (the
-    # "prior leader died" respawn loop). See _leader_lock_keepalive_tick.
-    _LEADER_KEEPALIVE_SECONDS = float(os.getenv("LEADER_KEEPALIVE_SECONDS", "30"))
-
-    async def _leader_lock_keepalive():
-        while True:
-            await asyncio.sleep(_LEADER_KEEPALIVE_SECONDS)
-            outcome = await _leader_lock_keepalive_tick(leader_conn)
-            if outcome in ("lost", "error"):
-                logger.warning(
-                    "[MONITOR] Leader advisory lock %s; hard-exiting so Cloud Run "
-                    "respawns through clean leader election",
-                    "lost to a peer" if outcome == "lost" else "unrecoverable",
-                )
-                os._exit(0)
-
-    leader_keepalive_task = (
-        asyncio.create_task(_leader_lock_keepalive())
-        if leader_conn is not None
-        else None
-    )
 
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
