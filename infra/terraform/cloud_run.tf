@@ -8,23 +8,11 @@ resource "google_cloud_run_v2_service" "orchestrator" {
     service_account = google_service_account.orchestrator_sa.email
 
     # Pin the min/max instance scaling so redeploys don't drift back to defaults.
-    # Reaper + orchestrator background loops need min=1 to stay warm.
+    # Cloud Run is API-only; the off-cloud worker owns always-on background loops.
     #
-    # R6-W2-CRIT (audit 2026-04-30): max=1 is intentional. The lifespan in
-    # backend/app/lifecycle.py spawns 9 background services (reaper,
-    # orchestrator_worker, gcp_cleanup, gcp_image_cleanup, secret_reconciliation,
-    # stale_branch_cleanup, auto_archive, config_sync, availability_refresh).
-    # Leader election IS implemented via pg_try_advisory_lock(_BACKGROUND_LOCK_ID)
-    # in lifecycle.py (_leader_lock_keepalive_tick maintains the lock; the
-    # _reap_stale_leader_lock_holder watchdog evicts crashed leaders). N>1
-    # instances is architecturally safe for correctness — per-row safety still
-    # holds via task_lock(skip_locked=True) and the advisory lock ensures only
-    # one instance runs the background loops. However, bumping max above 1
-    # STILL requires a memory-sizing review: the 2026-05-29 incident showed that
-    # OOM at 2Gi triggers a leader-respawn loop (OOM drops the DB connection →
-    # releases the advisory lock → watchdog hard-exits the prior leader and
-    # respawns), and the 4Gi/2vCPU revert was sized for a singleton. Validate
-    # per-instance memory headroom before enabling multi-instance scaling.
+    # max=1 keeps the API footprint bounded while local capacity owns execution.
+    # Bumping it still requires a memory-sizing review; 4Gi/2vCPU remains sized
+    # conservatively for one API instance.
     scaling {
       # The off-cloud worker owns all always-on background services. Cloud Run
       # is now the public API surface and may safely cold-start on demand.
@@ -32,8 +20,8 @@ resource "google_cloud_run_v2_service" "orchestrator" {
       max_instance_count = 1
     }
     # Per-instance concurrency (default is 80). Bumped so the admin UI polling
-    # + background loops don't hit "no available instance" 429s during cold
-    # starts or scale-up lag. Cloud Run's 429 response bypasses our CORS
+    # does not hit "no available instance" 429s during cold starts or scale-up
+    # lag. Cloud Run's 429 response bypasses our CORS
     # middleware, so the frontend sees CORS errors instead of a retryable 429.
     max_instance_request_concurrency = 120
 
@@ -66,6 +54,10 @@ resource "google_cloud_run_v2_service" "orchestrator" {
       env {
         name  = "GCP_PROJECT_ID"
         value = var.project_id
+      }
+      env {
+        name  = "BLUEPRINT_PROCESS_ROLE"
+        value = "api"
       }
       env {
         name  = "GCP_ZONE"
@@ -157,6 +149,10 @@ resource "google_cloud_run_v2_service" "orchestrator" {
   # ============================================================
   lifecycle {
     ignore_changes = [
+      # gcloud stamps these informational fields on every deploy. They do not
+      # affect the serving revision and should not create perpetual drift.
+      client,
+      client_version,
       template[0].containers[0].image,
       # See WARNING block above — env-var changes in this file are silently
       # ignored. The authoritative source is cloudbuild.yaml's --set-env-vars.

@@ -173,7 +173,7 @@ jobs:
             --min-instances 0 \
             --max-instances 1 \
             --concurrency 120 \
-            --update-env-vars DEPLOY_SHA=${{ github.sha }}
+            --update-env-vars DEPLOY_SHA=${{ github.sha }},BLUEPRINT_PROCESS_ROLE=api
 
   run-migrations:
     name: Migrations

@@ -37,13 +37,19 @@ locals {
   budget_enabled = var.billing_account_id != "" && local.alerting_enabled
 }
 
+data "google_project" "budget_project" {
+  project_id = var.project_id
+}
+
 resource "google_billing_budget" "monthly" {
   count           = local.budget_enabled ? 1 : 0
   billing_account = var.billing_account_id
   display_name    = "Blueprint monthly budget"
 
   budget_filter {
-    projects = ["projects/${var.project_id}"]
+    # The Billing API canonicalizes project IDs to project numbers. Use the
+    # canonical form up front so every post-apply plan stays drift-free.
+    projects = ["projects/${data.google_project.budget_project.number}"]
   }
 
   amount {

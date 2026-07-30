@@ -323,8 +323,18 @@ class TerraformIdentityContractTests(unittest.TestCase):
         self.assertNotIn("compute.instanceAdmin", proxy_section)
 
         self.assertIn('permissions = ["secretmanager.secrets.create"]', terraform)
+        self.assertIn('permissions = ["secretmanager.secrets.list"]', terraform)
+        self.assertIn('permissions = ["secretmanager.secrets.delete"]', terraform)
         self.assertIn('"roles/secretmanager.secretAccessor"', worker_section)
         self.assertIn('"roles/secretmanager.secretVersionAdder"', worker_section)
+        self.assertIn(
+            '"google_project_iam_member" "local_worker_secret_inventory"',
+            worker_section,
+        )
+        self.assertIn(
+            '"google_project_iam_member" "local_worker_agent_secret_deleter"',
+            worker_section,
+        )
         self.assertIn(
             'resource.name.startsWith("projects/${var.project_id}/secrets/agent-creds-")',
             worker_section,
@@ -346,6 +356,28 @@ class TerraformIdentityContractTests(unittest.TestCase):
                 'local_worker_project.number}/secrets/user-")'
             ),
             worker_section,
+        )
+        agent_delete_condition_start = worker_section.index(
+            "local_worker_agent_secret_condition"
+        )
+        agent_delete_condition_end = worker_section.index(
+            '"google_project_iam_member" "local_worker_agent_secret_deleter"'
+        )
+        agent_delete_condition = worker_section[
+            agent_delete_condition_start:agent_delete_condition_end
+        ]
+        self.assertIn("/secrets/agent-creds-", agent_delete_condition)
+        self.assertNotIn("/secrets/user-", agent_delete_condition)
+        agent_delete_binding_start = agent_delete_condition_end
+        agent_delete_binding_end = worker_section.index(
+            '"google_project_iam_member" "local_worker_managed_secret_accessor"'
+        )
+        agent_delete_binding = worker_section[
+            agent_delete_binding_start:agent_delete_binding_end
+        ]
+        self.assertIn(
+            "expression  = local.local_worker_agent_secret_condition",
+            agent_delete_binding,
         )
         self.assertNotIn("roles/secretmanager.admin", worker_section)
         self.assertNotIn("roles/iam.serviceAccountTokenCreator", worker_section)
@@ -417,6 +449,36 @@ class TerraformIdentityContractTests(unittest.TestCase):
         self.assertIn("min_instance_count = 0", cloud_run)
         self.assertIn("max_instance_count = 1", cloud_run)
         self.assertIn("max_instance_request_concurrency = 120", cloud_run)
+
+    def test_cloud_run_deploy_authorities_keep_api_role(self):
+        root = Path(__file__).parents[1]
+        cloud_run = (root / "infra" / "terraform" / "cloud_run.tf").read_text(
+            encoding="utf-8"
+        )
+        cloudbuild = (root / "backend" / "cloudbuild.yaml").read_text(
+            encoding="utf-8"
+        )
+        deploy_workflow = (root / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('name  = "BLUEPRINT_PROCESS_ROLE"', cloud_run)
+        self.assertIn('value = "api"', cloud_run)
+        self.assertIn("BLUEPRINT_PROCESS_ROLE=api", cloudbuild)
+        self.assertIn(
+            "--update-env-vars "
+            "DEPLOY_SHA=${{ github.sha }},BLUEPRINT_PROCESS_ROLE=api",
+            deploy_workflow,
+        )
+
+    def test_monthly_gcp_budget_defaults_to_cost_target(self):
+        variables = (
+            Path(__file__).parents[1] / "infra" / "terraform" / "variables.tf"
+        ).read_text(encoding="utf-8")
+        budget_start = variables.index('variable "monthly_budget_usd"')
+        budget_block = variables[budget_start : budget_start + 400]
+        self.assertIn("default     = 200", budget_block)
+        self.assertNotIn("default     = 5000", budget_block)
 
 
 if __name__ == "__main__":
