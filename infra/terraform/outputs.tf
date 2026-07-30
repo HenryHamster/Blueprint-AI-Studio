@@ -68,3 +68,18 @@ output "artifact_bucket_name" {
   value       = google_storage_bucket.artifacts.name
   description = "The GCS bucket for agent payloads and credentials"
 }
+
+output "local_cloudsql_proxy_service_account" {
+  value       = google_service_account.local_cloudsql_proxy_sa.email
+  description = "Dedicated Cloud SQL Auth Proxy identity for an external control-plane host"
+}
+
+output "local_worker_service_account" {
+  value       = google_service_account.local_worker_sa.email
+  description = "Dedicated background-worker runtime identity for an external control-plane host"
+}
+
+output "local_api_service_account" {
+  value       = google_service_account.local_api_sa.email
+  description = "Dedicated public-API runtime identity for an external control-plane host"
+}

@@ -695,12 +695,11 @@ jobs:
 
           exit $pytest_status
 
-      # The runner scripts (scripts/local_runner.py, scripts/runner_isolation.py)
-      # ship STANDALONE to runner hosts, so their tests live in scripts/ and the
-      # `pytest testing/` shards above never collect them. Without this step the
-      # GPU arch gate, the probe/real container-name isolation, and the pre-probe
-      # image pull have ZERO CI coverage — a regression there ships green.
-      # Runs once (shard 1) since it is not sharded and takes ~1s.
+      # Standalone host services and installers live outside backend/testing, so
+      # the sharded suite above never collects them. Run their pure unit suites
+      # once from the read-only repository mount. This covers runner isolation,
+      # the transactional local-control-plane installer and role generators, and
+      # the recovery restore verifier without needing Docker or cloud access.
       - name: Runner-script suite (scripts/)
         if: matrix.shard == 1
         run: |
@@ -708,7 +707,15 @@ jobs:
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e CI=true \
             ${{ steps.deps.outputs.image }} \
-            python -m pytest test_runner_isolation.py \
+            python -m pytest \
+              test_runner_isolation.py \
+              test_blueprint_node.py \
+              test_local_api_service.py \
+              test_local_control_plane_services.py \
+              test_local_postgres_backup_service.py \
+              test_local_postgres_service.py \
+              test_tailscale_funnel_service.py \
+              ../infra/recovery/restore_verifier/test_verify_restore.py \
               -v --tb=short --noconftest -p no:cacheprovider
 
       - name: Save test failures baseline (main only)

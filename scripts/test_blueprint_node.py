@@ -6,14 +6,17 @@ state files only; no test starts a real service or touches a real credential.
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import blueprint_node as node
+
+_TEMP_PARENT = Path(__file__).parent if os.name == "nt" else None
 
 
 def _run_ok(record):
@@ -44,12 +47,20 @@ class ProfileManifestTests(unittest.TestCase):
         self.assertEqual(
             node.PROFILE_ROLES["control-plane"], ("database-proxy", "worker")
         )
+        self.assertEqual(
+            node.PROFILE_ROLES["local-control-plane"],
+            ("database", "database-backup", "api", "worker", "edge"),
+        )
         for roles in node.PROFILE_ROLES.values():
             if "worker" in roles:
                 self.assertNotIn("github-actions", roles)
         self.assertTrue(node.ROLE_SPECS["executor"].executable)
-        self.assertFalse(node.ROLE_SPECS["api"].executable)
+        self.assertTrue(node.ROLE_SPECS["api"].executable)
+        self.assertTrue(node.ROLE_SPECS["database"].executable)
+        self.assertTrue(node.ROLE_SPECS["database-backup"].executable)
+        self.assertTrue(node.ROLE_SPECS["edge"].executable)
         self.assertTrue(node.ROLE_SPECS["worker"].executable)
+        self.assertFalse(node._profile_role_executable("primary", "api"))
 
     def test_role_paths_are_separate(self):
         with patch.dict(os.environ, {"BLUEPRINT_NODE_DIR": "/tmp/bp-node-test"}, clear=True):
@@ -70,10 +81,90 @@ class ProfileManifestTests(unittest.TestCase):
         self.assertEqual(defaults["BLUEPRINT_RUNNER_GPUS_PER_JOB"], "1")
 
 
+class LocalPostgresOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=_TEMP_PARENT)
+        self.allowed_root = Path(self.temp.name) / "srv-blueprint"
+        self.allowed_root.mkdir()
+        self.data_dir = self.allowed_root / "postgres"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_empty_data_dir_is_mode_0700_and_chowned_to_image_identity(self):
+        with patch.object(node, "_LOCAL_DATABASE_ROOTS", (self.allowed_root,)), \
+             patch.object(node, "_require_trusted_directory_fd"), \
+             patch.object(node.os, "chown", create=True) as chown, \
+             patch.object(node.os, "fchown", create=True) as fchown:
+            prepared = node._prepare_local_postgres_data_dir(str(self.data_dir))
+        self.assertEqual(prepared, self.data_dir)
+        if os.name != "nt":
+            self.assertEqual(self.data_dir.stat().st_mode & 0o777, 0o700)
+        if os.name == "nt":
+            chown.assert_called_once_with(
+                self.data_dir,
+                node._POSTGRES_CONTAINER_UID,
+                node._POSTGRES_CONTAINER_GID,
+            )
+        else:
+            fchown.assert_called_once_with(
+                ANY,
+                node._POSTGRES_CONTAINER_UID,
+                node._POSTGRES_CONTAINER_GID,
+            )
+
+    def test_nonempty_uninitialized_data_dir_is_never_chowned(self):
+        self.data_dir.mkdir()
+        (self.data_dir / "unexpected").write_text("do not overwrite", encoding="utf-8")
+        with patch.object(node, "_LOCAL_DATABASE_ROOTS", (self.allowed_root,)), \
+             patch.object(node, "_require_trusted_directory_fd"), \
+             patch.object(node.os, "chown", create=True) as chown:
+            with self.assertRaisesRegex(ValueError, "ambiguous non-empty"):
+                node._prepare_local_postgres_data_dir(str(self.data_dir))
+        chown.assert_not_called()
+
+    def test_initialized_data_with_foreign_owner_is_refused_not_rechowned(self):
+        self.data_dir.mkdir(mode=0o700)
+        (self.data_dir / "PG_VERSION").write_text("15\n", encoding="ascii")
+        with patch.object(node, "_LOCAL_DATABASE_ROOTS", (self.allowed_root,)), \
+             patch.object(node, "_require_trusted_directory_fd"), \
+             patch.object(node, "_POSTGRES_CONTAINER_UID", 424242), \
+             patch.object(node, "_POSTGRES_CONTAINER_GID", 424242), \
+             patch.object(node.os, "chown", create=True) as chown:
+            with self.assertRaisesRegex(ValueError, "already be owned"):
+                node._prepare_local_postgres_data_dir(str(self.data_dir))
+        chown.assert_not_called()
+
+    def test_path_outside_narrow_database_roots_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "below /var/lib/blueprint"):
+            node._prepare_local_postgres_data_dir(str(Path(self.temp.name) / "db"))
+
+    def test_symlinked_data_path_component_is_refused(self):
+        target = self.allowed_root / "target"
+        target.mkdir()
+        try:
+            self.data_dir.symlink_to(target, target_is_directory=True)
+        except OSError:
+            self.skipTest("host does not permit test symlink creation")
+        with patch.object(node, "_LOCAL_DATABASE_ROOTS", (self.allowed_root,)), \
+             patch.object(node, "_require_trusted_directory_fd"):
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                node._prepare_local_postgres_data_dir(str(self.data_dir / "pgdata"))
+
+    def test_trusted_ancestor_rejects_group_writable_directory(self):
+        info = MagicMock(st_mode=stat.S_IFDIR | 0o775, st_uid=node._TRUSTED_PATH_UID)
+        with patch.object(node.os, "fstat", return_value=info):
+            with self.assertRaisesRegex(ValueError, "not group/world-writable"):
+                node._require_trusted_directory_fd(123)
+
+
 class RenderTests(unittest.TestCase):
     def test_executor_unit_has_real_paths_and_role_specific_env(self):
         rendered = node._render_unit(
-            "executor", system=False, env_file=Path("/tmp/roles/executor/role.env")
+            "executor",
+            profile="worker",
+            system=False,
+            env_file=Path("/tmp/roles/executor/role.env"),
         )
         self.assertIn("Description=Blueprint node role: executor", rendered)
         self.assertIn(f"ExecStart={sys.executable} {node._LOCAL_RUNNER}", rendered)
@@ -84,20 +175,28 @@ class RenderTests(unittest.TestCase):
 
     def test_planned_role_cannot_render_a_fake_service(self):
         with self.assertRaisesRegex(ValueError, "planned"):
-            node._render_unit("api", system=False, env_file=Path("/tmp/api.env"))
+            node._render_unit(
+                "api",
+                profile="primary",
+                system=False,
+                env_file=Path("/tmp/api.env"),
+            )
 
     def test_worker_requires_proxy_and_mandatory_env_file(self):
         rendered = node._render_unit(
-            "worker", system=False, env_file=Path("/tmp/roles/worker/role.env")
+            "worker",
+            profile="control-plane",
+            system=False,
+            env_file=Path("/tmp/roles/worker/role.env"),
         )
         self.assertIn("Requires=blueprint-database-proxy.service", rendered)
         self.assertIn("After=blueprint-database-proxy.service", rendered)
         self.assertIn(
-            "EnvironmentFile=/tmp/roles/worker/role.env",
+            f"EnvironmentFile={Path('/tmp/roles/worker/role.env')}",
             rendered,
         )
         self.assertIn(
-            "ExecStartPre=/usr/bin/python3 "
+            f"ExecStartPre={sys.executable} "
             f"{node._LOCAL_WORKER_SERVICE} --check",
             rendered,
         )
@@ -105,12 +204,91 @@ class RenderTests(unittest.TestCase):
         self.assertIn("NoNewPrivileges=true", rendered)
         self.assertIn("RestrictSUIDSGID=true", rendered)
         self.assertIn("LockPersonality=true", rendered)
-        self.assertNotIn("EnvironmentFile=-/tmp/roles/worker/role.env", rendered)
+        self.assertNotIn(
+            f"EnvironmentFile=-{Path('/tmp/roles/worker/role.env')}", rendered
+        )
+
+    def test_local_worker_requires_database_not_cloud_sql_proxy(self):
+        rendered = node._render_unit(
+            "worker",
+            profile="local-control-plane",
+            system=False,
+            env_file=Path("/tmp/roles/worker/role.env"),
+        )
+        self.assertIn("Requires=blueprint-database.service", rendered)
+        self.assertIn("After=blueprint-database.service", rendered)
+        self.assertNotIn("blueprint-database-proxy.service", rendered)
+
+    def test_edge_uses_dedicated_oneshot_unit_bound_to_api(self):
+        with patch.object(node, "_system_install_user", return_value="blueprint-control"):
+            rendered = node._render_unit(
+                "edge",
+                profile="local-control-plane",
+                system=True,
+                env_file=Path("/tmp/roles/edge/role.env"),
+            )
+        self.assertIn("Type=oneshot", rendered)
+        self.assertIn("RemainAfterExit=yes", rendered)
+        self.assertIn("BindsTo=blueprint-api.service", rendered)
+        self.assertIn("Requires=tailscaled.service", rendered)
+        self.assertIn(
+            "WantedBy=multi-user.target blueprint-api.service tailscaled.service",
+            rendered,
+        )
+        self.assertIn(
+            f"ExecStart={sys.executable} {node._TAILSCALE_FUNNEL_SERVICE} start",
+            rendered,
+        )
+        self.assertNotRegex(rendered, r"@[A-Z_]+@")
+
+    def test_database_uses_explicit_oneshot_controller_lifecycle(self):
+        with patch.object(node, "_system_install_user", return_value="blueprint-control"):
+            rendered = node._render_unit(
+                "database",
+                profile="local-control-plane",
+                system=True,
+                env_file=Path("/etc/blueprint/database.env"),
+            )
+        self.assertIn("Type=oneshot", rendered)
+        self.assertIn("RemainAfterExit=yes", rendered)
+        self.assertIn(
+            f"ExecStart={sys.executable} {node._LOCAL_POSTGRES_SERVICE} start",
+            rendered,
+        )
+        self.assertIn(
+            f"ExecStop={sys.executable} {node._LOCAL_POSTGRES_SERVICE} stop",
+            rendered,
+        )
+        self.assertNotIn("--check", rendered)
+
+    def test_database_backup_has_twice_daily_randomized_system_timer(self):
+        with patch.object(node, "_system_install_user", return_value="blueprint-control"):
+            timer = node._render_unit(
+                "database-backup",
+                profile="local-control-plane",
+                system=True,
+                env_file=Path("/etc/blueprint/database-backup.env"),
+            )
+            service = node._render_database_backup_service(
+                profile="local-control-plane",
+                system=True,
+                env_file=Path("/etc/blueprint/database-backup.env"),
+            )
+        self.assertIn("OnCalendar=*-*-* 00,12:00:00", timer)
+        self.assertIn("RandomizedDelaySec=30m", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Requires=blueprint-database.service", timer)
+        self.assertIn("Requires=blueprint-database.service", service)
+        self.assertIn(
+            f"ExecStart={sys.executable} {node._LOCAL_POSTGRES_BACKUP_SERVICE}",
+            service,
+        )
 
     def test_system_unit_adds_host_process_sandboxing(self):
         with patch.object(node, "_system_install_user", return_value="blueprint-control"):
             rendered = node._render_unit(
                 "worker",
+                profile="control-plane",
                 system=True,
                 env_file=Path("/etc/blueprint/nodes/blueprint-control/worker.env"),
             )
@@ -123,7 +301,12 @@ class RenderTests(unittest.TestCase):
     def test_system_unit_rejects_an_untrusted_user_name(self):
         with patch.dict(os.environ, {"SUDO_USER": "runner\nUser=root"}, clear=True):
             with self.assertRaisesRegex(ValueError, "POSIX account"):
-                node._render_unit("executor", system=True, env_file=Path("/etc/blueprint/role.env"))
+                node._render_unit(
+                    "executor",
+                    profile="worker",
+                    system=True,
+                    env_file=Path("/etc/blueprint/role.env"),
+                )
 
     def test_system_install_rejects_root_service_account(self):
         with patch.object(node, "_install_user", return_value="root"), \
@@ -143,7 +326,7 @@ class InstallTests(unittest.TestCase):
     def setUp(self):
         # Keep test writes inside the repository. Some Windows sandbox hosts do
         # not grant Python permission to create under the user's global temp dir.
-        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.temp = tempfile.TemporaryDirectory(dir=_TEMP_PARENT)
         self.root = Path(self.temp.name) / "node"
         self.units = Path(self.temp.name) / "units"
 
@@ -154,7 +337,21 @@ class InstallTests(unittest.TestCase):
         return [
             patch.object(node, "node_root", return_value=self.root),
             patch.object(node, "unit_path", side_effect=lambda role, system: self.units / node.ROLE_SPECS[role].unit_name),
+            patch.object(
+                node,
+                "_database_backup_service_unit_path",
+                return_value=self.units / "blueprint-database-backup.service",
+            ),
             patch.object(node, "_systemd_available", return_value=True),
+            patch.object(node, "_system_install_user", return_value="blueprint-control"),
+            patch.object(
+                node,
+                "_system_credential_dir",
+                return_value=(self.root / "credentials", 1000, 1000),
+            ),
+            patch.object(node, "_prepare_system_node_root"),
+            patch.object(node, "_prepare_system_credential_dir"),
+            patch.object(node, "_prepare_local_postgres_data_dir"),
         ]
 
     @staticmethod
@@ -174,6 +371,254 @@ class InstallTests(unittest.TestCase):
                 "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
             },
         }
+
+    @staticmethod
+    def _local_control_plane_config(*, api_image=None, worker_image=None):
+        shared_image = f"sha256:{'b' * 64}"
+        return {
+            "database": {
+                "BLUEPRINT_POSTGRES_IMAGE_ID": f"sha256:{'c' * 64}",
+                "BLUEPRINT_POSTGRES_DATA_DIR": "/srv/blueprint/postgres",
+                "BLUEPRINT_POSTGRES_SECRETS_FILE": "/etc/blueprint/postgres.env",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            },
+            "database-backup": {
+                "BLUEPRINT_POSTGRES_IMAGE_ID": f"sha256:{'c' * 64}",
+                "BLUEPRINT_POSTGRES_SECRETS_FILE": "/etc/blueprint/postgres.env",
+                "BLUEPRINT_POSTGRES_BACKUP_PROJECT_ID": "recovery-project-123",
+                "BLUEPRINT_POSTGRES_BACKUP_BUCKET": "gs://blueprint-recovery",
+                "BLUEPRINT_POSTGRES_BACKUP_CREDENTIALS_FILE": "/etc/blueprint/backup-gcp.json",
+                "BLUEPRINT_POSTGRES_BACKUP_IMAGE_ID": f"sha256:{'f' * 64}",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            },
+            "api": {
+                "BLUEPRINT_API_IMAGE_ID": api_image or shared_image,
+                "BLUEPRINT_API_SECRETS_FILE": "/etc/blueprint/api-secrets.json",
+                "BLUEPRINT_API_GOOGLE_CREDENTIALS_FILE": "/etc/blueprint/api-gcp.json",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+                "BLUEPRINT_API_PORT": "8080",
+                "BLUEPRINT_DATABASE_MODE": "local-postgres",
+            },
+            "worker": {
+                "BLUEPRINT_WORKER_IMAGE_ID": worker_image or shared_image,
+                "BLUEPRINT_WORKER_SECRETS_FILE": "/etc/blueprint/worker-secrets.json",
+                "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": "/etc/blueprint/worker-gcp.json",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+                "BLUEPRINT_DATABASE_MODE": "local-postgres",
+            },
+            "edge": {
+                "BLUEPRINT_TAILSCALE_BINARY": "/usr/bin/tailscale",
+                "BLUEPRINT_EDGE_API_PORT": "8080",
+            },
+        }
+
+    def test_local_control_plane_installs_in_dependency_order_without_proxy(self):
+        calls = []
+        patches = self._patches()
+        started = []
+        for item in patches:
+            started.append(item.start())
+        try:
+            rc = node.do_install(
+                profile="local-control-plane",
+                system=True,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                role_configs=self._local_control_plane_config(),
+                _run=_run_ok(calls),
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertEqual(rc, 0)
+        started[-1].assert_called_once_with("/srv/blueprint/postgres")
+        enables = [
+            call[-1]
+            for call in calls
+            if "enable" in call and "--now" in call
+        ]
+        self.assertEqual(
+            enables,
+            [
+                "blueprint-database.service",
+                "blueprint-database-backup.timer",
+                "blueprint-api.service",
+                "blueprint-worker.service",
+                "blueprint-edge.service",
+            ],
+        )
+        restarts = [
+            call[-1]
+            for call in calls
+            if "restart" in call
+        ]
+        self.assertEqual(restarts, enables)
+        self.assertFalse((self.units / "blueprint-database-proxy.service").exists())
+        worker_env = (self.root / "roles/worker/role.env").read_text()
+        self.assertIn("BLUEPRINT_DATABASE_MODE=local-postgres", worker_env)
+        edge_unit = (self.units / "blueprint-edge.service").read_text()
+        database_unit = (self.units / "blueprint-database.service").read_text()
+        backup_timer = (self.units / "blueprint-database-backup.timer").read_text()
+        backup_service = (self.units / "blueprint-database-backup.service").read_text()
+        self.assertIn("User=root", database_unit)
+        self.assertIn("ExecStart=", backup_service)
+        self.assertIn(
+            "RuntimeDirectory=blueprint-local-postgres-backup",
+            backup_service,
+        )
+        self.assertIn("RuntimeDirectoryMode=0700", backup_service)
+        self.assertIn("RandomizedDelaySec=30m", backup_timer)
+        self.assertIn("Type=oneshot", edge_unit)
+        self.assertIn("RemainAfterExit=yes", edge_unit)
+        self.assertIn("BindsTo=blueprint-api.service", edge_unit)
+        self.assertIn(
+            f"ExecStop={sys.executable} {node._TAILSCALE_FUNNEL_SERVICE} stop",
+            edge_unit,
+        )
+
+    def test_local_control_plane_refuses_user_scope_before_writes(self):
+        calls = []
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="local-control-plane",
+                system=False,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                role_configs=self._local_control_plane_config(),
+                _run=_run_ok(calls),
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.units.exists())
+        self.assertEqual(calls, [])
+
+    def test_local_control_plane_rejects_different_api_worker_images_before_writes(self):
+        calls = []
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="local-control-plane",
+                system=True,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                role_configs=self._local_control_plane_config(
+                    api_image=f"sha256:{'d' * 64}",
+                    worker_image=f"sha256:{'e' * 64}",
+                ),
+                _run=_run_ok(calls),
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.units.exists())
+
+    def test_failed_role_start_restores_files_and_prior_unit_states(self):
+        calls = []
+        started_by_install = set()
+        old_manifest = '{"profile":"previous"}\n'
+        old_database_unit = "old database unit\n"
+        (self.root).mkdir(parents=True)
+        (self.units).mkdir(parents=True)
+        (self.root / "manifest.json").write_text(old_manifest, encoding="utf-8")
+        (self.units / "blueprint-database.service").write_text(
+            old_database_unit, encoding="utf-8"
+        )
+
+        def fail_worker_start(argv, **kwargs):
+            calls.append(list(argv))
+            unit = argv[-1]
+            if unit == node._LEGACY_RUNNER_UNIT and "is-active" in argv:
+                return MagicMock(returncode=3, stdout="inactive\n", stderr="")
+            if "is-enabled" in argv:
+                return MagicMock(
+                    returncode=0
+                    if unit in {
+                        "blueprint-database.service",
+                        "blueprint-api.service",
+                    }
+                    else 1,
+                    stdout="",
+                    stderr="",
+                )
+            if "is-active" in argv:
+                return MagicMock(
+                    returncode=0
+                    if unit in started_by_install
+                    or unit in {
+                        "blueprint-database.service",
+                        "blueprint-api.service",
+                    }
+                    else 3,
+                    stdout="",
+                    stderr="",
+                )
+            if "restart" in argv and unit == "blueprint-api.service":
+                return MagicMock(returncode=1, stdout="", stderr="restart failed")
+            if "enable" in argv and "--now" in argv:
+                started_by_install.add(unit)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="local-control-plane",
+                system=True,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                role_configs=self._local_control_plane_config(),
+                _run=fail_worker_start,
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            (self.root / "manifest.json").read_text(encoding="utf-8"),
+            old_manifest,
+        )
+        self.assertEqual(
+            (self.units / "blueprint-database.service").read_text(
+                encoding="utf-8"
+            ),
+            old_database_unit,
+        )
+        self.assertFalse((self.units / "blueprint-database-backup.timer").exists())
+        self.assertFalse((self.units / "blueprint-database-backup.service").exists())
+        commands = [" ".join(call) for call in calls]
+        self.assertTrue(
+            any(
+                "disable --now blueprint-edge.service" in command
+                for command in commands
+            )
+        )
+        self.assertTrue(
+            any(
+                "enable blueprint-database.service" in command
+                for command in commands
+            )
+        )
+        self.assertTrue(
+            any(
+                "start blueprint-api.service" in command for command in commands
+            )
+        )
 
     def test_primary_installs_executor_and_control_plane_but_not_planned_roles(self):
         calls = []
@@ -236,6 +681,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         worker_env = (self.root / "roles/worker/role.env").read_text()
         self.assertIn("BLUEPRINT_WORKER_SECRETS_FILE=", worker_env)
+        self.assertIn("BLUEPRINT_DATABASE_MODE=cloudsql-proxy", worker_env)
         self.assertNotIn("DATABASE_URL", worker_env)
         self.assertNotIn("GITHUB_PRIVATE_KEY", worker_env)
         self.assertFalse((self.units / "blueprint-executor.service").exists())
@@ -396,7 +842,7 @@ class InstallTests(unittest.TestCase):
 
 class DrainAndStatusTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.temp = tempfile.TemporaryDirectory(dir=_TEMP_PARENT)
         self.root = Path(self.temp.name) / "node"
 
     def tearDown(self):

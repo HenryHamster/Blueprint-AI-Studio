@@ -43,10 +43,38 @@ resource "terraform_data" "recovery_configuration" {
 resource "google_project_service" "required" {
   for_each = local.recovery_enabled ? toset([
     "cloudkms.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "run.googleapis.com",
+    "sqladmin.googleapis.com",
     "storage.googleapis.com",
   ]) : toset([])
 
   project            = var.recovery_project_id
   service            = each.value
   disable_on_destroy = false
+}
+
+resource "terraform_data" "restore_verifier_configuration" {
+  count = local.recovery_enabled && var.enable_restore_verifier ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition = (
+        var.restore_verifier_image != "" &&
+        var.restore_verifier_private_network != "" &&
+        var.restore_verifier_private_subnetwork != "" &&
+        var.restore_verifier_expected_revision != ""
+      )
+      error_message = "restore verifier image, network, subnetwork, and expected revision are required."
+    }
+  }
+}
+
+resource "google_project_service_identity" "cloud_sql" {
+  provider = google-beta
+  count    = local.recovery_enabled ? 1 : 0
+  project  = var.recovery_project_id
+  service  = "sqladmin.googleapis.com"
+
+  depends_on = [google_project_service.required]
 }

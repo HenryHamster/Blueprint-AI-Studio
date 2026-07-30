@@ -1,0 +1,29 @@
+# Blueprint local PostgreSQL off-host backup — systemd SYSTEM unit TEMPLATE
+
+[Unit]
+Description=Blueprint local PostgreSQL off-host backup
+Requires=blueprint-database.service
+After=network-online.target blueprint-database.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+RuntimeDirectory=blueprint-local-postgres-backup
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+PrivateDevices=true
+EnvironmentFile=@ENV_FILE@
+ExecStart=@PYTHON@ @EXECUTABLE@
+TimeoutStartSec=3700
+StandardOutput=journal
+StandardError=journal

@@ -46,6 +46,12 @@ variable "source_cloud_sql_service_account_email" {
   default     = ""
 }
 
+variable "enable_local_postgres_backup_writer" {
+  description = "Create the dedicated writer-only identity used for post-cutover local PostgreSQL exports. Disabled until the local database backup path is ready."
+  type        = bool
+  default     = false
+}
+
 variable "recovery_admin_member" {
   description = "Recovery-admin Google Group in IAM member form, e.g. group:db-recovery@example.com. This group alone receives archive-view and KMS-decrypt access."
   type        = string
@@ -68,4 +74,51 @@ variable "lock_retention_policy" {
   description = "Permanently lock bucket retention. Leave false until a successful independent restore drill is recorded."
   type        = bool
   default     = false
+}
+
+variable "enable_restore_verifier" {
+  description = "Deploy scheduled restore-drill and janitor Cloud Run jobs in the recovery project."
+  type        = bool
+  default     = false
+}
+
+variable "restore_verifier_image" {
+  description = "Immutable restore-verifier container image, including an @sha256 digest."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.restore_verifier_image == "" || can(regex("@sha256:[0-9a-f]{64}$", var.restore_verifier_image))
+    error_message = "restore_verifier_image must be empty or pinned by @sha256 digest."
+  }
+}
+
+variable "restore_verifier_private_network" {
+  description = "Recovery-project VPC network name used by the private Cloud SQL drill."
+  type        = string
+  default     = ""
+}
+
+variable "restore_verifier_private_subnetwork" {
+  description = "Recovery-project subnetwork name used for Direct VPC egress."
+  type        = string
+  default     = ""
+}
+
+variable "restore_verifier_expected_revision" {
+  description = "Exact Alembic revision required by successful restore drills."
+  type        = string
+  default     = ""
+}
+
+variable "restore_drill_schedule" {
+  description = "Cloud Scheduler cron for full restore drills."
+  type        = string
+  default     = "0 9 * * 0"
+}
+
+variable "restore_janitor_schedule" {
+  description = "Cloud Scheduler cron for abandoned-drill reconciliation."
+  type        = string
+  default     = "*/30 * * * *"
 }
