@@ -402,9 +402,43 @@ _STATEMENT_TIMEOUT_MS = 120_000
 _COMMAND_TIMEOUT_SECONDS = 150
 
 
+def _database_pool_settings() -> tuple[int, int]:
+    """Return role-aware main-pool limits, with explicit env overrides.
+
+    API and worker processes now run as separate services. Keeping the former
+    fleet-era 10+15 pool on each process left dozens of idle Cloud SQL
+    connections and made a future small/local Postgres instance needlessly hard
+    to size. The defaults still leave burst headroom, while operators can raise
+    either value without a code deploy when measured concurrency warrants it.
+    """
+    role = os.getenv("BLUEPRINT_PROCESS_ROLE", "all").strip().lower()
+    defaults = {
+        "api": (5, 5),
+        "worker": (8, 8),
+        "all": (10, 15),
+    }
+    pool_size, max_overflow = defaults.get(role, defaults["all"])
+
+    raw_pool_size = os.getenv("BLUEPRINT_DB_POOL_SIZE")
+    raw_max_overflow = os.getenv("BLUEPRINT_DB_MAX_OVERFLOW")
+    if raw_pool_size is not None:
+        pool_size = int(raw_pool_size)
+    if raw_max_overflow is not None:
+        max_overflow = int(raw_max_overflow)
+    if pool_size < 1:
+        raise ValueError("BLUEPRINT_DB_POOL_SIZE must be at least 1")
+    if max_overflow < 0:
+        raise ValueError("BLUEPRINT_DB_MAX_OVERFLOW must be non-negative")
+    return pool_size, max_overflow
+
+
 def _engine_connect_args() -> dict:
     """asyncpg ``connect_args`` for the main pool. Extracted so the timeout
     hardening is unit-testable without standing up a live engine."""
+    role = os.getenv("BLUEPRINT_PROCESS_ROLE", "all").strip().lower()
+    application_name = (
+        f"blueprint-{role}" if role in {"api", "worker", "all"} else "blueprint"
+    )
     return {
         # CLIENT-side per-query deadline — backstop for dead / protocol-wedged
         # connections that server_settings.statement_timeout cannot bound.
@@ -414,6 +448,9 @@ def _engine_connect_args() -> dict:
             "timezone": "UTC",  # Ensure naive timestamps are interpreted as UTC
             "idle_in_transaction_session_timeout": "60000",  # 60s - auto-rollback leaked transactions
             "statement_timeout": str(_STATEMENT_TIMEOUT_MS),  # kill runaway queries server-side
+            # Makes role attribution available in pg_stat_activity and query
+            # telemetry without embedding identifiers in every SQL statement.
+            "application_name": application_name,
         },
     }
 
@@ -445,13 +482,13 @@ def _install_pool_keepalive(engine: AsyncEngine) -> None:
 def _make_engine():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is required")
+    pool_size, max_overflow = _database_pool_settings()
     eng = create_async_engine(
         DATABASE_URL,
         echo=os.getenv("SQL_ECHO", "false").lower() == "true",
         future=True,
-        # Sized for Cloud SQL max_connections=200 cap across the Cloud Run fleet; bump when the tier upgrades.
-        pool_size=10,
-        max_overflow=15,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
         pool_timeout=30,
         pool_recycle=540,
         pool_pre_ping=True,

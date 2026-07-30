@@ -19,6 +19,7 @@ import app.database as db_module
 from app.database import (
     _COMMAND_TIMEOUT_SECONDS,
     _STATEMENT_TIMEOUT_MS,
+    _database_pool_settings,
     _engine_connect_args,
     _install_disconnect_invalidation,
     _install_pool_keepalive,
@@ -333,6 +334,53 @@ def test_engine_connect_args_sets_command_timeout_above_statement_timeout():
     # command_timeout is seconds; statement_timeout is milliseconds.
     assert _COMMAND_TIMEOUT_SECONDS * 1000 > _STATEMENT_TIMEOUT_MS
     assert args["server_settings"]["statement_timeout"] == str(_STATEMENT_TIMEOUT_MS)
+
+
+@pytest.mark.parametrize(
+    ("role", "expected"),
+    [
+        ("api", (5, 5)),
+        ("worker", (8, 8)),
+        ("all", (10, 15)),
+        ("unknown", (10, 15)),
+    ],
+)
+def test_database_pool_settings_are_role_aware(monkeypatch, role, expected):
+    monkeypatch.setenv("BLUEPRINT_PROCESS_ROLE", role)
+    monkeypatch.delenv("BLUEPRINT_DB_POOL_SIZE", raising=False)
+    monkeypatch.delenv("BLUEPRINT_DB_MAX_OVERFLOW", raising=False)
+    assert _database_pool_settings() == expected
+
+
+def test_database_pool_settings_allow_valid_overrides(monkeypatch):
+    monkeypatch.setenv("BLUEPRINT_PROCESS_ROLE", "api")
+    monkeypatch.setenv("BLUEPRINT_DB_POOL_SIZE", "12")
+    monkeypatch.setenv("BLUEPRINT_DB_MAX_OVERFLOW", "3")
+    assert _database_pool_settings() == (12, 3)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("BLUEPRINT_DB_POOL_SIZE", "0", "at least 1"),
+        ("BLUEPRINT_DB_MAX_OVERFLOW", "-1", "non-negative"),
+    ],
+)
+def test_database_pool_settings_reject_invalid_limits(
+    monkeypatch, name, value, message
+):
+    monkeypatch.setenv("BLUEPRINT_PROCESS_ROLE", "worker")
+    monkeypatch.delenv("BLUEPRINT_DB_POOL_SIZE", raising=False)
+    monkeypatch.delenv("BLUEPRINT_DB_MAX_OVERFLOW", raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=message):
+        _database_pool_settings()
+
+
+def test_engine_connect_args_tags_connections_with_process_role(monkeypatch):
+    monkeypatch.setenv("BLUEPRINT_PROCESS_ROLE", "worker")
+    args = _engine_connect_args()
+    assert args["server_settings"]["application_name"] == "blueprint-worker"
 
 
 def test_pool_keepalive_registered_on_connect_event_and_applies_to_raw_conn(

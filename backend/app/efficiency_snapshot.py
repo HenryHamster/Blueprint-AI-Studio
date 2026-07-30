@@ -35,7 +35,7 @@ from sqlmodel import select
 
 from app.admin_helpers import _get_user_project_with_role
 from app.auth import get_current_user
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.landed_signal import (
     has_merge_unblock_signal,
     is_merged_completion,
@@ -520,8 +520,48 @@ async def _load_recent_tasks(
     inflating the merge count.
     """
     cutoff = _utcnow() - timedelta(days=window_days)
+    use_payload_projection = resolve_dialect_name(session) == "postgresql"
+    projected_columns = [
+        Task.id,
+        Task.status,
+        Task.context,
+        # started_at: presence marks a task that actually reached execution —
+        # the AGENT_TIMEOUT-rate measure's denominator.
+        Task.started_at,
+        Task.vm_spot,
+        Task.vm_machine_type,
+        Task.vm_provisioned_at,
+        Task.vm_stopped_at,
+        # Banked retry attribution must stay loaded so pricing and alerting see
+        # the full attempt history after projection.
+        Task.vm_runtime_cost_banked_db,
+        Task.llm_input_tokens_banked_db,
+        Task.llm_output_tokens_banked_db,
+        Task.llm_call_count_banked_db,
+        Task.attempt_history_db,
+        Task.vm_cold_start_ms,
+        Task.vm_warm_start,
+        Task.api_call_summary,
+        Task.vm_dispatched_at,
+        Task.provider,
+        Task.model,
+        Task.llm_account_id,
+        Task.format_compliance_summary,
+        Task.parent_task_id,
+        Task.strategic_cycle_id,
+        Task.updated_at,
+    ]
+    if not use_payload_projection:
+        # SQLite test/dev databases do not support the PostgreSQL JSONB array
+        # projection below.
+        projected_columns.append(Task.payloads)
+
     stmt = (
-        select(Task)
+        (
+            select(Task, Task.payloads[0].label("_projected_first_payload"))
+            if use_payload_projection
+            else select(Task)
+        )
         .where(
             Task.project_id == project_id,
             Task.status.in_(
@@ -531,54 +571,22 @@ async def _load_recent_tasks(
         )
         .options(
             load_only(
-                Task.id,
-                Task.status,
-                Task.context,
-                # started_at: presence marks a task that actually reached
-                # execution — the AGENT_TIMEOUT-rate measure's denominator.
-                Task.started_at,
-                Task.vm_spot,
-                Task.vm_machine_type,
-                Task.vm_provisioned_at,
-                Task.vm_stopped_at,
-                # Banked retry attribution must stay loaded so pricing and
-                # alerting see the full attempt history after projection.
-                Task.vm_runtime_cost_banked_db,
-                Task.llm_input_tokens_banked_db,
-                Task.llm_output_tokens_banked_db,
-                Task.llm_call_count_banked_db,
-                Task.attempt_history_db,
-                Task.vm_cold_start_ms,
-                Task.vm_warm_start,
-                Task.api_call_summary,
-                Task.vm_dispatched_at,
-                Task.provider,
-                Task.model,
-                # Read by estimate_pool_hit_rate via get_task_llm_account_id,
-                # which prefers this promoted column over the context fallback;
-                # must be loaded so the access doesn't trip raiseload=True.
-                Task.llm_account_id,
-                Task.format_compliance_summary,
-                # parent_task_id: read by _rollup_parent_ids so merged-PR
-                # metrics can exclude rollup parents without tripping
-                # raiseload=True.
-                Task.parent_task_id,
-                # payloads: required so task.first_payload can be read without
-                # triggering an async lazy-load (used by compute_llm_cost_by_task_type
-                # and compute_effort_model_efficiency when called from this path).
-                Task.payloads,
-                # strategic_cycle_id: required for strategic_cycle_cost_per_event
-                # aggregation in _compact_llm_cost_attribution.
-                Task.strategic_cycle_id,
-                # updated_at: used for ordering and windowed filtering.
-                Task.updated_at,
+                *projected_columns,
                 raiseload=True,
             )
         )
         .order_by(Task.updated_at.desc())
         .limit(5000)
     )
-    return list((await session.execute(stmt)).scalars().all())
+    result = await session.execute(stmt)
+    if not use_payload_projection:
+        return list(result.scalars().all())
+
+    tasks: list[Task] = []
+    for task, first_payload in result.all():
+        object.__setattr__(task, "_projected_first_payload", first_payload or {})
+        tasks.append(task)
+    return tasks
 
 
 async def _compute_blocked_vm_spend(

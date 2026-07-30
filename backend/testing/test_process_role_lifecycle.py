@@ -1,9 +1,12 @@
 """Role-split safety tests for the application lifespan."""
 
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+import app.lifecycle as lifecycle_module
 from app.lifecycle import (
     PROCESS_ROLE_ALL,
     PROCESS_ROLE_API,
@@ -11,6 +14,9 @@ from app.lifecycle import (
     PROCESS_ROLE_WORKER,
     _acquire_background_leadership,
     _commit_background_leadership,
+    _restore_worker_routing_state,
+    _run_leader_bootstrap_maintenance,
+    _start_leader_keepalive_and_run_maintenance,
     process_role_is_activated,
     process_role_status,
     process_role_uses_leader_election,
@@ -42,6 +48,137 @@ class TestProcessRoleResolution:
 
 
 class TestProcessRoleBackgroundSafety:
+    _MAINTENANCE_FUNCTIONS = (
+        "_seed_completion_debt_inventory",
+        "_reconcile_dormant_knob_debts",
+        "_seed_completion_debt_design_doc",
+        "_heal_poisoned_problem_models",
+        "_seed_deploy_project_futility_verdicts",
+    )
+
+    @pytest.mark.asyncio
+    async def test_api_role_skips_worker_routing_hydration(self, monkeypatch):
+        seed = AsyncMock()
+        monkeypatch.setattr(
+            lifecycle_module, "_seed_routing_verdict_from_snapshot", seed
+        )
+        await _restore_worker_routing_state(worker_services_permitted=False)
+        seed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_worker_role_hydrates_routing_before_dispatch(self, monkeypatch):
+        seed = AsyncMock()
+        monkeypatch.setattr(
+            lifecycle_module, "_seed_routing_verdict_from_snapshot", seed
+        )
+        await _restore_worker_routing_state(worker_services_permitted=True)
+        seed.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_nonleader_skips_project_wide_bootstrap_scans(self, monkeypatch):
+        mocks = []
+        for name in self._MAINTENANCE_FUNCTIONS:
+            mock = AsyncMock()
+            monkeypatch.setattr(lifecycle_module, name, mock)
+            mocks.append(mock)
+
+        await _run_leader_bootstrap_maintenance(is_leader=False)
+
+        for mock in mocks:
+            mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_leader_runs_each_bootstrap_maintenance_step(self, monkeypatch):
+        mocks = []
+        for name in self._MAINTENANCE_FUNCTIONS:
+            mock = AsyncMock()
+            monkeypatch.setattr(lifecycle_module, name, mock)
+            mocks.append(mock)
+
+        await _run_leader_bootstrap_maintenance(is_leader=True)
+
+        for mock in mocks:
+            mock.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_leader_keepalive_starts_before_slow_bootstrap(self, monkeypatch):
+        keepalive_ran = asyncio.Event()
+        release_maintenance = asyncio.Event()
+
+        async def tick(_connection):
+            keepalive_ran.set()
+            return "held"
+
+        async def slow_maintenance(*, is_leader):
+            assert is_leader is True
+            await release_maintenance.wait()
+
+        monkeypatch.setattr(lifecycle_module, "_leader_lock_keepalive_tick", tick)
+        monkeypatch.setattr(
+            lifecycle_module, "_run_leader_bootstrap_maintenance", slow_maintenance
+        )
+
+        startup = asyncio.create_task(
+            _start_leader_keepalive_and_run_maintenance(
+                leader_conn=object(),
+                is_leader=True,
+                keepalive_seconds=0,
+            )
+        )
+        await asyncio.wait_for(keepalive_ran.wait(), timeout=1)
+        assert not startup.done()
+
+        release_maintenance.set()
+        keepalive_task = await startup
+        keepalive_task.cancel()
+        await asyncio.gather(keepalive_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_failure_releases_leadership(self, monkeypatch):
+        class Connection:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        async def failed_maintenance(*, is_leader):
+            assert is_leader is True
+            raise RuntimeError("bootstrap failed")
+
+        connection = Connection()
+        monkeypatch.setattr(
+            lifecycle_module,
+            "_run_leader_bootstrap_maintenance",
+            failed_maintenance,
+        )
+
+        with pytest.raises(RuntimeError, match="bootstrap failed"):
+            await _start_leader_keepalive_and_run_maintenance(
+                leader_conn=connection,
+                is_leader=True,
+                keepalive_seconds=60,
+            )
+        assert connection.closed is True
+
+    @pytest.mark.asyncio
+    async def test_nonleader_does_not_start_lock_keepalive(self, monkeypatch):
+        tick = AsyncMock(return_value="held")
+        maintenance = AsyncMock()
+        monkeypatch.setattr(lifecycle_module, "_leader_lock_keepalive_tick", tick)
+        monkeypatch.setattr(
+            lifecycle_module, "_run_leader_bootstrap_maintenance", maintenance
+        )
+
+        keepalive_task = await _start_leader_keepalive_and_run_maintenance(
+            leader_conn=object(),
+            is_leader=False,
+            keepalive_seconds=0,
+        )
+
+        assert keepalive_task is None
+        tick.assert_not_awaited()
+        maintenance.assert_awaited_once_with(is_leader=False)
+
     @pytest.mark.parametrize(
         "role", [PROCESS_ROLE_API, PROCESS_ROLE_WORKER, PROCESS_ROLE_ALL]
     )

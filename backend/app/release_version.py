@@ -321,13 +321,32 @@ async def count_merged_since(
     (promoted/abandoned) versions to their own span so tasks that merged in
     later versions are not double-counted.
     """
-    filters = [
+    common_filters = [
         Task.project_id == project_id,
         Task.status == TaskStatus.COMPLETED,
         landed_signal_predicate(session),
         Task.updated_at >= since,
     ]
-    stmt = (
+    modern_filters = [
+        *common_filters,
+        Task.completed_at.isnot(None),
+        Task.completed_at >= since,
+    ]
+    if until is not None:
+        modern_filters.append(Task.completed_at <= until)
+    modern_count = int(
+        (
+            await session.execute(
+                select(func.count(Task.id)).where(*modern_filters)
+            )
+        ).scalar_one()
+    )
+
+    # completed_at has been stamped centrally since migration 0223 and is
+    # covered by (project_id, status, completed_at). Keep the JSON status-log
+    # fallback isolated to genuinely legacy rows instead of transferring every
+    # landed task's full audit history to Python on every version poll.
+    legacy_stmt = (
         select(Task)
         .options(
             load_only(
@@ -338,15 +357,16 @@ async def count_merged_since(
                 raiseload=True,
             )
         )
-        .where(*filters)
+        .where(*common_filters, Task.completed_at.is_(None))
     )
-    rows = (await session.execute(stmt)).scalars().all()
-    return sum(
+    legacy_rows = (await session.execute(legacy_stmt)).scalars().all()
+    legacy_count = sum(
         1
-        for task in rows
+        for task in legacy_rows
         if _task_completed_at(task) >= since
         and (until is None or _task_completed_at(task) <= until)
     )
+    return modern_count + legacy_count
 
 
 async def list_merged_tasks_for_version(
@@ -365,13 +385,36 @@ async def list_merged_tasks_for_version(
     Returns a list of dicts with ``task_type``, ``title``, and ``pr_number``
     per landed task.  Empty when no tasks have merged in the window.
     """
-    filters = [
+    common_filters = [
         Task.project_id == project_id,
         Task.status == TaskStatus.COMPLETED,
         landed_signal_predicate(session),
         Task.updated_at >= since,
     ]
-    stmt = (
+    modern_filters = [
+        *common_filters,
+        Task.completed_at.isnot(None),
+        Task.completed_at >= since,
+    ]
+    if until is not None:
+        modern_filters.append(Task.completed_at <= until)
+    modern_stmt = (
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.payloads,
+                Task.created_at,
+                Task.completed_at,
+                raiseload=True,
+            )
+        )
+        .where(*modern_filters)
+    )
+    modern_rows = (await session.execute(modern_stmt)).scalars().all()
+
+    legacy_stmt = (
         select(Task)
         .options(
             load_only(
@@ -384,14 +427,14 @@ async def list_merged_tasks_for_version(
                 raiseload=True,
             )
         )
-        .where(*filters)
+        .where(*common_filters, Task.completed_at.is_(None))
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    legacy_rows = (await session.execute(legacy_stmt)).scalars().all()
 
     # Filter to the version window first so the artifact query is scoped to
     # only the tasks that will appear in the changelog.
     windowed: list[tuple[datetime, Task]] = []
-    for task in rows:
+    for task in [*modern_rows, *legacy_rows]:
         completed_at = _task_completed_at(task)
         if completed_at < since:
             continue

@@ -1,3 +1,4 @@
+import copy
 import os
 import uuid
 import pytest
@@ -315,7 +316,6 @@ def reset_runtime_config():
     env-preflight gate (promotion_policy.yaml env_preflight_enabled: true)
     does not affect tests that don't explicitly opt into it.
     """
-    import copy
     from app import shared_state
 
     snapshot = copy.deepcopy(shared_state.runtime_config)
@@ -331,6 +331,29 @@ def reset_runtime_config():
     yield
     shared_state.runtime_config.clear()
     shared_state.runtime_config.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def reset_anomaly_adjustments():
+    """Keep anomaly throttling state from leaking between tests."""
+    from app import shared_state
+
+    defaults = {
+        "active": False,
+        "adjusted_at": None,
+        "trigger_anomalies": [],
+        "pre_adjustment_max_vms": None,
+        "pre_adjustment_failure_gate": None,
+        "failure_gate_threshold": 0.8,
+        "forced_restoration_count": 0,
+        "forced_restored_at": None,
+        "adjusted_max_vms": None,
+    }
+    shared_state.anomaly_adjustments.clear()
+    shared_state.anomaly_adjustments.update(copy.deepcopy(defaults))
+    yield
+    shared_state.anomaly_adjustments.clear()
+    shared_state.anomaly_adjustments.update(copy.deepcopy(defaults))
 
 
 @pytest.fixture(autouse=True)
