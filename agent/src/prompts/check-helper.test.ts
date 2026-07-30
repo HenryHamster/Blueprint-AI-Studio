@@ -120,7 +120,7 @@ describe('writeCheckHelper — direct invocation', () => {
     // appears verbatim in the helper's explanatory NOTE comment, by design.)
     expect(script).not.toContain('( cd admin-ui && [ -d node_modules ] || npm ci )');
     expect(script).not.toContain('( cd agent && [ -d node_modules ] || npm ci )');
-  });
+  }, 15_000);
 
   it('emits a generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
@@ -1076,19 +1076,31 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
   const runRequiredCheck = async (
-    script: string,
+    renderedScript: string,
     scenario: {
       ruffExit: number; docker: boolean; harnessExit: number; skipped?: number;
       changedPath?: string; changedPaths?: string[]; missingPaths?: string[];
       harnessPath?: string;
     },
-  ): Promise<{ status: number; stdout: string; log: string; receipt?: Record<string, unknown> }> => {
+  ): Promise<{
+    status: number;
+    stdout: string;
+    log: string;
+    taskId: string;
+    receipt?: Record<string, unknown>;
+  }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const realPath = await vi.importActual<typeof import('node:path')>('node:path');
     const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'required-verification-'));
-    const receiptPath = '/tmp/project_verification_receipt_verify-authoring-1.json';
+    // Multiple self-hosted runners execute this suite on the same host. Give
+    // the runtime fixture a process-unique task ID so one runner cannot remove
+    // another runner's fixed /tmp receipt. Static render assertions above keep
+    // covering the production task-ID contract byte-for-byte.
+    const runtimeTaskId = `verify-authoring-1-${process.pid}`;
+    const script = renderedScript.replaceAll('verify-authoring-1', runtimeTaskId);
+    const receiptPath = `/tmp/project_verification_receipt_${runtimeTaskId}.json`;
     const posix = (p: string): string =>
       p.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (_m, d: string) => `/${d.toLowerCase()}/`);
     try {
@@ -1179,7 +1191,13 @@ exit ${scenario.harnessExit}
       const receipt = realFs.existsSync(receiptPath)
         ? JSON.parse(realFs.readFileSync(receiptPath, 'utf8')) as Record<string, unknown>
         : undefined;
-      return { status, stdout, log: realFs.readFileSync(logPath, 'utf8'), receipt };
+      return {
+        status,
+        stdout,
+        log: realFs.readFileSync(logPath, 'utf8'),
+        taskId: runtimeTaskId,
+        receipt,
+      };
     } finally {
       try { realFs.unlinkSync(receiptPath); } catch { /* absent */ }
       realFs.rmSync(dir, { recursive: true, force: true });
@@ -1193,7 +1211,7 @@ exit ${scenario.harnessExit}
     expect(result.log).toContain('ruff -m ruff check');
     expect(result.log).toContain('harness USE_TEST_POSTGRES=true --sandbox-postgres testing/test_x.py');
     expect(result.receipt).toMatchObject({
-      task_id: 'verify-authoring-1',
+      task_id: result.taskId,
       ruff: { exit_code: 0 },
       pytest: {
         selectors: ['testing/test_x.py'],

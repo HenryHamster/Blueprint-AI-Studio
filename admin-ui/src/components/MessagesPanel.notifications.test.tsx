@@ -872,8 +872,10 @@ describe('MessagesPanel mute window', () => {
 
     // BLOCKERs are never muted; the mute banner annotates the routine section
     // but the critical blocker content remains visible.
-    expect(el.textContent).toContain('critical blocker');
-    expect(el.textContent).toContain('Mute active');
+    await waitFor(() => {
+      expect(el.textContent).toContain('critical blocker');
+      expect(el.textContent).toContain('Mute active');
+    });
   });
 
   test('mute window persists across re-renders via localStorage', async () => {

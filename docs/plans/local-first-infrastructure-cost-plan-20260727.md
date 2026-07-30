@@ -29,6 +29,39 @@ This plan addresses GCP infrastructure. Moving GitHub Actions to self-hosted
 runners is a parallel savings track and is included below, but its savings do
 not count toward the $200 GCP target.
 
+## Continuation snapshot — 2026-07-29
+
+The July 1-29 billing report now attributes **$815.30** as follows:
+
+| Service | July 1-29 cost |
+| --- | ---: |
+| Compute Engine | $310.54 |
+| Cloud Run | $253.01 |
+| Cloud SQL | $185.54 |
+| Networking | $59.32 |
+| Other | $6.89 |
+
+The cost-stop and placement stages are live:
+
+- global managed compute is disabled;
+- every active project has explicit `execution_placement_policy=local_only`;
+- the legacy `require_local_runner` flag is false on every project;
+- warm-pool execution remains disabled;
+- two leaked Packer builders created July 24 are stopped pending deletion;
+- hamsterwheel has one enrolled Blueprint executor and four online
+  `hamsterwheel`/`blueprint` GitHub Actions runners.
+
+The remaining critical path is intentionally narrow:
+
+1. activate the already-founded `api`/`worker` process roles;
+2. connect hamsterwheel to Cloud SQL through Cloud SQL Auth Proxy plus a
+   dedicated IAM identity (never password-only public PostgreSQL);
+3. start and soak the local worker;
+4. switch Cloud Run to `BLUEPRINT_PROCESS_ROLE=api` with min instances 0;
+5. verify zero managed launches, worker continuity, and the new daily bill.
+
+Cloud SQL capacity remains unchanged throughout this milestone.
+
 ## Measured baseline
 
 Google Cloud Billing, July 1-27:

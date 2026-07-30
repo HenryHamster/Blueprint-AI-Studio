@@ -1,4 +1,11 @@
 import '@testing-library/jest-dom/vitest';
+import { configure } from '@testing-library/dom';
+
+// The self-hosted CI machine runs multiple isolated shards concurrently. Under
+// legitimate CPU pressure, React/Suspense updates can exceed Testing Library's
+// 1s default even though the component settles correctly. Keep retries disabled
+// and give asynchronous UI assertions a bounded, realistic scheduling window.
+configure({ asyncUtilTimeout: 5_000 });
 
 // jsdom does not implement Element.scrollTo — components that auto-scroll
 // otherwise throw "el.scrollTo is not a function" inside requestAnimationFrame

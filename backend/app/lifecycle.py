@@ -65,9 +65,8 @@ logger = logging.getLogger("blueprint")
 
 
 # Process placement is deliberately resolved in the backend rather than only in
-# deployment manifests: a mis-routed API process must fail closed instead of
-# quietly starting billable/side-effecting worker loops. ``all`` preserves the
-# historical single-service deployment while the split is rolled out.
+# deployment manifests. ``api`` is never eligible for background leadership;
+# ``worker`` and legacy ``all`` retain the proven advisory-lock ownership path.
 PROCESS_ROLE_ENV = "BLUEPRINT_PROCESS_ROLE"
 PROCESS_ROLE_API = "api"
 PROCESS_ROLE_WORKER = "worker"
@@ -99,35 +98,102 @@ def resolve_process_role(raw_role: str | None = None) -> str:
 
 
 def process_role_is_activated(role: str) -> bool:
-    """Whether this foundation currently activates *role* in the lifespan.
-
-    ``api`` and ``worker`` are recognised deployment targets but deliberately
-    fail closed until durable bootstrap ownership has been split.  Keeping this
-    predicate identical to the real lifespan gate avoids a prospective helper
-    accidentally being mistaken for active behavior.
-    """
+    """Whether *role* is a supported, active lifespan target."""
     if role not in _PROCESS_ROLES:
         raise ValueError(f"unknown process role: {role!r}")
-    return role == PROCESS_ROLE_ALL
+    return True
+
+
+def process_role_uses_leader_election(role: str) -> bool:
+    """Whether *role* may acquire and supervise background leadership."""
+    if role not in _PROCESS_ROLES:
+        raise ValueError(f"unknown process role: {role!r}")
+    return role in {PROCESS_ROLE_WORKER, PROCESS_ROLE_ALL}
 
 
 def process_role_status(role: str, *, is_leader: bool) -> dict[str, object]:
     """Non-sensitive lifecycle status attached to ``app.state`` for operators.
 
-    Until the persistent bootstrap/ownership contract is split, only legacy
-    ``all`` is activatable. The other values remain visible as recognized but
-    intentionally disabled groundwork rather than claiming they run workers.
+    API instances are deliberately ineligible for background leadership.
+    Worker and combined instances report worker services as running only after
+    they actually acquire the advisory lock.
     """
     activated = process_role_is_activated(role)
-    worker_services_permitted = role in {PROCESS_ROLE_WORKER, PROCESS_ROLE_ALL}
+    leader_election_enabled = process_role_uses_leader_election(role)
     return {
         "role": role,
         "lifecycle_activation": "active" if activated else "not_activated",
-        "worker_services_permitted": worker_services_permitted,
-        "worker_services_running": activated and is_leader,
-        "leader_election_enabled": activated,
+        "worker_services_permitted": leader_election_enabled,
+        "worker_services_running": (
+            activated and leader_election_enabled and is_leader
+        ),
+        "leader_election_enabled": leader_election_enabled,
         "is_leader": is_leader,
     }
+
+
+async def _acquire_background_leadership(
+    role: str, *, db_engine=None
+) -> tuple[object | None, bool]:
+    """Acquire the session advisory lock only for worker-capable roles.
+
+    Returning ``(None, False)`` for API is the hard fencing boundary: no
+    connection is opened and the caller therefore cannot accidentally probe or
+    hold the background lock. SQLite/non-Postgres test deployments preserve the
+    legacy behavior of acting as the sole leader.
+    """
+    if not process_role_uses_leader_election(role):
+        return None, False
+
+    selected_engine = engine if db_engine is None else db_engine
+    dialect_name = selected_engine.dialect.name
+    leader_conn = None
+    try:
+        leader_conn = await selected_engine.connect()
+        result = await leader_conn.execute(
+            _text("SELECT pg_try_advisory_lock(:lock_id)"),
+            {"lock_id": _BACKGROUND_LOCK_ID},
+        )
+        return leader_conn, bool(result.scalar())
+    except Exception:
+        if leader_conn is not None:
+            try:
+                await leader_conn.close()
+            except Exception as conn_close_exc:
+                logger.debug(
+                    "[STARTUP] Leader connection close (non-Postgres) no-op: %s",
+                    conn_close_exc,
+                )
+        # Advisory locks are PostgreSQL's single-owner safety boundary. A
+        # connection/query failure must never turn into un-fenced leadership:
+        # that would let Cloud Run and a local worker dispatch concurrently.
+        # SQLite and other non-Postgres test/development engines cannot execute
+        # pg_try_advisory_lock, so they retain the historical sole-leader
+        # fallback.
+        if dialect_name == "postgresql":
+            raise
+        return None, True
+
+
+async def _commit_background_leadership(leader_conn) -> bool:
+    """End the lock-acquisition transaction without risking split leadership."""
+    try:
+        await leader_conn.commit()
+        return True
+    except Exception as lock_commit_exc:
+        logger.warning(
+            "[STARTUP] Leader lock-connection commit failed; staying "
+            "non-leader until a clean acquisition: %s",
+            lock_commit_exc,
+        )
+        try:
+            await leader_conn.close()
+        except Exception as lock_close_exc:
+            logger.debug(
+                "[STARTUP] Failed lock connection close after commit error: %s",
+                lock_close_exc,
+            )
+        return False
 
 
 def _record_crash_and_count(
@@ -869,16 +935,11 @@ async def _shutdown_background_task_registry(
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan context manager — startup and shutdown hooks."""
-    # Resolve/reject this first: a recognised-but-not-yet-activated role must
-    # fail before mutating global logging/warning handlers, app.state, the DB,
-    # the advisory lock, or any task registry.
+    # Resolve/reject this before mutating global logging/warning handlers,
+    # app.state, the DB, the advisory lock, or any task registry.
     process_role = resolve_process_role()
-    if not process_role_is_activated(process_role):
-        raise RuntimeError(
-            f"{PROCESS_ROLE_ENV}={process_role!r} is recognized but not yet "
-            "activated; use BLUEPRINT_PROCESS_ROLE=all until the control-plane "
-            "bootstrap split is deployed"
-        )
+    process_role_is_activated(process_role)
+    leader_election_enabled = process_role_uses_leader_election(process_role)
 
     # Root logger was never configured — named loggers propagated to a root with
     # no handlers, so every [ORCHESTRATOR]/[DEPLOY]/[HEALTH]/[MONITOR] line
@@ -952,9 +1013,10 @@ async def lifespan(app):
     )
     from app.shared_state import runtime_config_sync_service
 
-    # Legacy ``all`` startup follows unchanged below. A future activated API
-    # role will need its own bounded read-only readiness sequence; it must not
-    # inherit these durable initialization and repair steps by accident.
+    # All roles use the same bounded, idempotent readiness/bootstrap sequence.
+    # This preserves request-serving cache hydration during rollout. The safety
+    # boundary is explicit below: only worker/all roles can touch the background
+    # leader lock or start leader-only services.
     # Startup: Initialize DB tables
     await init_db()
 
@@ -1031,26 +1093,12 @@ async def lifespan(app):
     # lock-holding connection idle and vulnerable to _reap_stale_leader_lock_holder
     # terminating it as "stale" (false positive). AsyncConnection keeps the
     # connection checked out until close(), so commit() never changes the PID.
-    leader_conn = None
-    try:
-        leader_conn = await engine.connect()
-        _result = await leader_conn.execute(
-            _text("SELECT pg_try_advisory_lock(:lock_id)"),
-            {"lock_id": _BACKGROUND_LOCK_ID},
+    leader_conn, is_leader = await _acquire_background_leadership(process_role)
+    if not leader_election_enabled:
+        logger.info(
+            "[STARTUP] API role is ineligible for background leadership; "
+            "serving HTTP and per-instance coordination only"
         )
-        is_leader = bool(_result.scalar())
-    except Exception:
-        # Non-Postgres dialect (SQLite in tests) — default to leader so all
-        # services start normally; close the dummy connection immediately.
-        is_leader = True
-        try:
-            await leader_conn.close()
-        except Exception as _conn_close_exc:
-            logger.debug(
-                "[STARTUP] Leader connection close (non-Postgres) no-op: %s",
-                _conn_close_exc,
-            )
-        leader_conn = None
 
     if leader_conn is not None:
         # pg_try_advisory_lock is SESSION-scoped (not the _xact_ variant), so the
@@ -1064,13 +1112,9 @@ async def lifespan(app):
         # from that timeout, so the lock stays held. The keepalive task (started
         # below on the leader) keeps the connection warm and recovers the lock if
         # the connection is ever dropped anyway.
-        try:
-            await leader_conn.commit()
-        except Exception as _lock_commit_exc:  # keepalive recovers a bad connection
-            logger.warning(
-                "[STARTUP] Leader lock-connection commit failed (continuing): %s",
-                _lock_commit_exc,
-            )
+        if not await _commit_background_leadership(leader_conn):
+            leader_conn = None
+            is_leader = False
 
     _shared_state.is_leader = is_leader
     app.state.process_role_status = process_role_status(
@@ -1090,7 +1134,9 @@ async def lifespan(app):
                 )
             leader_conn = None
         logger.info(
-            "[STARTUP] Not background-leader; skipping leader-only services (serving HTTP only)"
+            "[STARTUP] Skipping leader-only services (role=%s, leader_election=%s)",
+            process_role,
+            leader_election_enabled,
         )
         # Per-instance services still run on non-leader instances.
         from app.jwt_revocation import jwt_revocation_service
@@ -1202,6 +1248,13 @@ async def lifespan(app):
                         _bg_tasks_nl["notification_retry_drain"] = asyncio.create_task(
                             notification_retry_drain_service()
                         )
+
+                    # API-only instances are permanently fenced out of worker
+                    # leadership. They supervise request-serving coordination
+                    # tasks above, but never probe, reap, acquire, or release
+                    # the background advisory lock.
+                    if not leader_election_enabled:
+                        continue
 
                     # Leader-lock probe. Try to acquire on a fresh session;
                     # if we win, the previous leader's session has closed and
