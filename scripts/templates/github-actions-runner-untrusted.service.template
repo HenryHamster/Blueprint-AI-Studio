@@ -5,6 +5,7 @@
 
 [Unit]
 Description=Blueprint GitHub Actions runner (@ROLE@, untrusted ephemeral)
+ConditionPathExists=/var/lib/blueprint-actions/BOOTSTRAP_COMPLETE
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60

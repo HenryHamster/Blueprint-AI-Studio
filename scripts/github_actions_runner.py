@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan a hardened GitHub Actions runner role for a Blueprint node.
+"""Plan a hardened GitHub Actions runner role inside a Blueprint KVM guest.
 
 This module deliberately does *not* download, register, or start a GitHub
 runner.  ``blueprint-node`` can call it later to obtain deterministic paths,
@@ -8,13 +8,13 @@ on an argv or in a unit file.
 
 Two safety profiles are supported:
 
-* ``trusted``: persistent or ephemeral internal-workflow runner. Docker is
-  disabled by default; a caller may opt into a dedicated socket, never the
-  host's shared ``/var/run/docker.sock``.
+* ``trusted``: persistent or ephemeral internal-workflow runner inside the
+  dedicated Actions VM. Docker is disabled by default; a caller may opt into a
+  dedicated *guest* socket, never the physical host's Docker socket.
 * ``untrusted``: ephemeral-only fork/public-workflow runner. It receives a
   dedicated Unix user, no production credentials, and an explicit systemd deny
   for both conventional Docker socket paths. It is still an initial local
-  isolation profile, not a substitute for a disposable VM for hostile code.
+  isolation profile inside the mandatory KVM boundary.
 
 Run ``python3 scripts/github_actions_runner.py plan ...`` to print JSON.  The
 installer owns all privileged writes and token exchange.
@@ -274,6 +274,7 @@ def lifecycle_plan(role: GitHubActionsRunnerRole) -> dict[str, list[str]]:
 
     labels = ",".join(role.labels)
     registration = [
+        "test -f /var/lib/blueprint-actions/BOOTSTRAP_COMPLETE",
         f"getent group {shlex.quote(role.runner_group)} >/dev/null || groupadd --system {shlex.quote(role.runner_group)}",
         f"id -u {shlex.quote(role.runner_user)} >/dev/null 2>&1 || useradd --system --gid {shlex.quote(role.runner_group)} --home-dir {shlex.quote(role.state_root)} --create-home --shell /usr/sbin/nologin {shlex.quote(role.runner_user)}",
         f"test \"$(id -gn {shlex.quote(role.runner_user)})\" = {shlex.quote(role.runner_group)}",

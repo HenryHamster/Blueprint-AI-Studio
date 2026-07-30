@@ -19,7 +19,9 @@ env:
 jobs:
   validate-packer:
     name: Packer Validate
-    runs-on: ubuntu-latest
+    # Validation receives no GCP credentials and is safe on the KVM-isolated
+    # persistent CI pool. The credential-bearing image bake remains hosted.
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     permissions:
       contents: read
     steps:
