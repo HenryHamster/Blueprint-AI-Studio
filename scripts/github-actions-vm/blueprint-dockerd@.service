@@ -1,0 +1,36 @@
+[Unit]
+Description=Blueprint dedicated Docker daemon for Actions runner %i
+Requires=blueprint-runner-network@%i.service
+After=network-online.target blueprint-runner-network@%i.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NetworkNamespacePath=/run/netns/blueprint-actions-%i
+BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
+ExecStartPre=/usr/bin/install -d -m 0710 -o root -g blueprint-actions-%i /run/blueprint-actions/%i
+ExecStartPre=/usr/bin/install -d -m 0710 -o root -g blueprint-actions-%i /var/lib/blueprint-actions/docker-%i
+ExecStart=/usr/bin/dockerd \
+  --host=unix:///run/blueprint-actions/%i/docker.sock \
+  --pidfile=/run/blueprint-actions/%i/docker.pid \
+  --data-root=/var/lib/blueprint-actions/docker-%i \
+  --exec-root=/run/blueprint-actions/%i/exec \
+  --bip=172.31.%i.1/24 \
+  --group=blueprint-actions-%i \
+  --iptables=true \
+  --ip-forward=true \
+  --ip-masq=true \
+  --live-restore=false \
+  --userland-proxy=false \
+  --log-driver=json-file \
+  --log-opt=max-size=50m \
+  --log-opt=max-file=2
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=3
+TimeoutStartSec=0
+LimitNOFILE=1048576
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

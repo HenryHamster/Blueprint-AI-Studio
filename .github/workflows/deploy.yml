@@ -35,7 +35,9 @@ env:
 jobs:
   detect:
     name: Detect changes
-    runs-on: ubuntu-latest
+    # This job handles repository metadata only. Credential-bearing build,
+    # migration, and deploy jobs remain on fresh GitHub-hosted runners.
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     outputs:
       backend: ${{ steps.result.outputs.backend }}
       frontend: ${{ steps.result.outputs.frontend }}
@@ -168,9 +170,9 @@ jobs:
           gcloud run deploy blueprint-orchestrator \
             --image "${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}:${{ github.sha }}" \
             --region ${{ env.REGION }} \
-            --min-instances 1 \
-            --max-instances 12 \
-            --concurrency 20 \
+            --min-instances 0 \
+            --max-instances 1 \
+            --concurrency 120 \
             --update-env-vars DEPLOY_SHA=${{ github.sha }}
 
   run-migrations:

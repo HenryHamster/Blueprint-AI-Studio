@@ -1,12 +1,17 @@
 # Local GitHub Actions runner role
 
-`scripts/github_actions_runner.py` is the configuration layer for a future
-optional GitHub Actions role on a Blueprint node. It only creates a reviewable
-plan; it does not download a runner, contact GitHub, accept a token, or change
-workflow routing. The current `blueprint-node` facade records the Actions role
-as planned and does not install it yet.
+GitHub workflow code is not a safe peer of the Blueprint worker or host Docker
+daemon. A workflow with Docker access is effectively root on the Docker host.
+Blueprint therefore runs Actions only inside the KVM boundary managed by
+`scripts/install-github-actions-vm.sh`.
 
-Generate a trusted internal-CI plan:
+`scripts/github_actions_runner.py` is the guest-side role planner. It only
+creates a reviewable plan; it does not download a runner, contact GitHub,
+accept a token, or change workflow routing. Its rendered units contain a
+`ConditionPathExists` gate for the KVM guest bootstrap marker, so they cannot be
+started directly on an ordinary Blueprint node.
+
+Generate a trusted internal-CI plan inside the guest:
 
 ```bash
 python3 scripts/github_actions_runner.py plan \
@@ -15,28 +20,85 @@ python3 scripts/github_actions_runner.py plan \
 
 The output contains the role-specific Unix user, state path, environment path,
 systemd unit, and install/status/drain/uninstall instructions. Its install plan
-first creates or verifies that role-scoped Unix user and group; do not substitute
-an existing shared CI account. Registration
+first verifies the guest marker, then creates or verifies the role-scoped Unix
+user and group; do not substitute an existing shared CI account. Registration
 tokens are read from a root-owned file only while `config.sh` is run; they are
-never emitted in the plan, environment file, unit, or command-line arguments
-produced by this tool.
+never emitted in the plan, environment file, or unit.
 
 ## Safety profiles
 
-`trusted` is for repositories and workflows that are allowed to use the
-machine's explicitly granted CI credentials. It can be persistent or ephemeral.
-Docker is disabled by default. If a workflow genuinely needs Docker, configure a
-dedicated socket for this role; the tool rejects `/var/run/docker.sock` and
-`/run/docker.sock`.
+`trusted` is for repositories and workflows allowed to use the guest's
+explicitly granted CI credentials. It can be persistent or ephemeral. Docker is
+disabled by default. If a workflow needs Docker, configure a dedicated socket
+inside the guest; the tool rejects `/var/run/docker.sock` and
+`/run/docker.sock`. The production VM profile provides four isolated guest
+Docker daemons so concurrent jobs do not share names, networks, caches, or
+cleanup.
 
 `untrusted` is for fork/public work and is ephemeral-only. It gets a separate
 Unix account, state root, env file, and systemd unit. The rendered unit denies
 both conventional Docker sockets and removes access to homes, devices, kernel
 controls, capabilities, production-like credentials, and common cloud
-metadata-service addresses. Do not put production
-secrets in its role environment. This is a local hardening profile, not a claim
-that arbitrary public code is equivalent to a disposable VM; keep fork PRs on
-GitHub-hosted runners until the node has a disposable-worker isolation backend.
+metadata-service addresses. Do not put production secrets in its role
+environment. This is defense in depth inside the VM. Fork PRs remain excluded
+from the persistent internal runner pool unless the repository explicitly
+adopts ephemeral disposable guests.
+
+## KVM host lifecycle
+
+The host runtime uses two containers:
+
+- a small network namespace sidecar with only `NET_ADMIN`, no host mounts or
+  devices, and deny rules for host, LAN, link-local, metadata, multicast, and
+  IPv6 destinations;
+- a capability-free QEMU process with access only to `/dev/kvm` and the
+  role-scoped VM disk directory.
+
+The guest SSH port is published only on host loopback. The Ubuntu cloud image
+and host container base are digest-pinned, and the built host image identity is
+recorded before start.
+
+```bash
+export BLUEPRINT_ACTIONS_VM_STATE="$HOME/.blueprint/github-actions-vm"
+./scripts/install-github-actions-vm.sh plan
+./scripts/install-github-actions-vm.sh prepare
+./scripts/install-github-actions-vm.sh start
+./scripts/install-github-actions-vm.sh status
+./scripts/install-github-actions-vm.sh guest-status
+```
+
+Runner registration is a separate cutover step using a short-lived GitHub
+registration token in a mode-0600 file:
+
+```bash
+export BLUEPRINT_GITHUB_URL=https://github.com/example-org/example-repo
+export BLUEPRINT_ACTIONS_REGISTRATION_TOKEN_FILE=/secure/path/registration-token
+./scripts/install-github-actions-vm.sh register
+```
+
+The installer pins the official runner release and SHA-256. The registration
+token is streamed into a root-only guest file and both copies are shredded
+after successful enrollment. Keep the existing host runners online until all guest
+runners are registered, online, and have completed representative CI. Drain
+host runners before stopping them; never cancel active jobs as part of the
+migration.
+
+## Workflow routing and credentials
+
+Repository CI targets the complete label set
+`[self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]`. The `kvm` label is a
+hard routing fence: an old host registration must never receive repository
+code even if it is accidentally re-enabled. Browser tests run in the
+version-pinned Playwright container through the runner's isolated Docker
+daemon, so the persistent guest account does not need sudo or browser packages
+installed on the guest.
+
+Only credential-free deploy detection and Packer validation move to this
+persistent pool. Terraform plans, image baking, migrations, and production
+deployments continue on fresh GitHub-hosted runners because they receive GCP
+credentials. Do not route credential-bearing workflows to a persistent runner
+that also executes pull-request code until a disposable or cryptographically
+reset trusted-runner boundary exists.
 
 ## Draining
 

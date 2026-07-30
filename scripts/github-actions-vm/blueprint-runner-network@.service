@@ -1,0 +1,12 @@
+[Unit]
+Description=Blueprint private network namespace for Actions runner %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/blueprint/github-actions-vm/prepare-runner-network.sh %i
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

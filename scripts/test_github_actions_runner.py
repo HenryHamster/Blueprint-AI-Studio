@@ -68,6 +68,10 @@ class RenderTests(unittest.TestCase):
             ephemeral=True,
         )
         unit = gar.render_systemd_unit(role)
+        self.assertIn(
+            "ConditionPathExists=/var/lib/blueprint-actions/BOOTSTRAP_COMPLETE",
+            unit,
+        )
         self.assertIn(f"User={role.runner_user}", unit)
         self.assertIn("Restart=no", unit)
         self.assertIn("InaccessiblePaths=/var/run/docker.sock /run/docker.sock", unit)
@@ -84,6 +88,10 @@ class RenderTests(unittest.TestCase):
             docker_socket="/run/blueprint-actions/ci.sock",
         )
         unit = gar.render_systemd_unit(role)
+        self.assertIn(
+            "ConditionPathExists=/var/lib/blueprint-actions/BOOTSTRAP_COMPLETE",
+            unit,
+        )
         self.assertIn("BindReadOnlyPaths=/run/blueprint-actions/ci.sock", unit)
         self.assertIn("Restart=always", unit)
         self.assertNotIn("/var/run/docker.sock", unit)
@@ -115,6 +123,10 @@ class RenderTests(unittest.TestCase):
         serialized = str(plan)
         self.assertNotIn("<token>", serialized)
         self.assertIn("registration-token", serialized)
+        self.assertIn(
+            "test -f /var/lib/blueprint-actions/BOOTSTRAP_COMPLETE",
+            "\n".join(plan["lifecycle"]["install"]),
+        )
         self.assertIn("systemctl stop", "\n".join(plan["lifecycle"]["drain"]))
         self.assertIn("useradd --system", "\n".join(plan["lifecycle"]["install"]))
 

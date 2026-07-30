@@ -1,0 +1,32 @@
+[Unit]
+Description=Blueprint GitHub Actions runner %i (inside KVM guest)
+Requires=blueprint-runner-network@%i.service blueprint-dockerd@%i.service
+After=network-online.target blueprint-runner-network@%i.service blueprint-dockerd@%i.service
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+NetworkNamespacePath=/run/netns/blueprint-actions-%i
+BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
+User=blueprint-actions-%i
+Group=blueprint-actions-%i
+WorkingDirectory=/var/lib/blueprint-actions/runner-%i
+Environment=HOME=/var/lib/blueprint-actions/home-%i
+Environment=DOCKER_HOST=unix:///run/blueprint-actions/%i/docker.sock
+Environment=DOCKER_CONFIG=/var/lib/blueprint-actions/home-%i/.docker
+Environment=RUNNER_ALLOW_RUNASROOT=0
+ExecStart=/var/lib/blueprint-actions/runner-%i/run.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=7200
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

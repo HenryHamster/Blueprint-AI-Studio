@@ -42,7 +42,7 @@ permissions:
 jobs:
   detect:
     name: Detect changes
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     timeout-minutes: 5
     outputs:
       frontend: ${{ steps.result.outputs.frontend }}
@@ -100,7 +100,7 @@ jobs:
   # directly.
   frontend-build:
     name: CI / Frontend (build + lint)
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     timeout-minutes: 15
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
@@ -142,7 +142,7 @@ jobs:
 
   frontend-unit:
     name: CI / Frontend (unit shard ${{ matrix.shard }})
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     timeout-minutes: 10
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
@@ -181,22 +181,34 @@ jobs:
         run: npx vitest run --shard=${{ matrix.shard }}/2
 
   frontend-viewport:
-    name: CI / Frontend (viewport)
-    # Keep this leg hosted until Playwright's privileged Linux dependencies are
-    # provisioned on the persistent runner. `playwright install-deps` invokes
-    # apt via sudo, which the unprivileged self-hosted service cannot do.
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: CI / Frontend (viewport shard ${{ matrix.shard }}/4)
+    # Browser dependencies stay inside the version-pinned Playwright container,
+    # but checkout and npm run as the unprivileged runner user. A job-level
+    # container runs actions/checkout as root and can leave a persistent
+    # self-hosted workspace unwritable for the next job.
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
+    # A first run on one of the isolated per-runner Docker daemons may need to
+    # pull the pinned Playwright image. Keep that cold-cache budget separate
+    # from the bounded browser test runtime below.
+    timeout-minutes: 30
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: admin-ui/package-lock.json
+          # Each self-hosted runner already keeps its own npm cache and the
+          # install below prefers it. Avoid four concurrent setup-node cache
+          # save hooks: they serialize matrix completion after the browser
+          # process has already exited and prevent the next viewport shards
+          # from being scheduled.
 
       - name: Install dependencies
         working-directory: ./admin-ui
@@ -214,49 +226,6 @@ jobs:
           echo "::error::npm ci failed after 3 attempts"
           exit 1
 
-      - name: Resolve Playwright version
-        id: pw
-        working-directory: ./admin-ui
-        # Browser binaries are tied to the playwright package version, not the
-        # whole lockfile — keying the cache on the version keeps it a HIT across
-        # unrelated dependency bumps, so the ~100 MB Chromium download (the
-        # "playwright install failed" flake) only runs on a real version change.
-        run: |
-          V=$(node -p "require('playwright/package.json').version" 2>/dev/null || echo "unknown")
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "playwright version: $V"
-
-      - name: Cache Playwright Chromium browser
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ steps.pw.outputs.version }}
-          # restore-keys lets a prior browser cache restore even when the exact
-          # version key misses (e.g. first run after a playwright bump), so we
-          # never throw away a usable Chromium and force a full CDN re-download.
-          restore-keys: |
-            playwright-chromium-
-
-      - name: Install Playwright Chromium browser
-        # Downloads the ~100 MB binary only on a cache miss; served from
-        # ~/.cache/ms-playwright on a hit. Retry absorbs transient blips.
-        working-directory: ./admin-ui
-        run: |
-          for i in 1 2 3; do
-            npx playwright install chromium && exit 0
-            echo "::warning::playwright install failed (attempt $i/3) — retrying"
-            sleep $((i * 10))
-          done
-          echo "::error::playwright install failed after 3 attempts"
-          exit 1
-
-      - name: Install Playwright system dependencies
-        # libatk/libnss/libxkbcommon, etc. — these live in apt, not in
-        # ~/.cache/ms-playwright, so they must be installed every run (cannot
-        # be cached); without them chromium fails to launch even on a cache hit.
-        working-directory: ./admin-ui
-        run: npx playwright install-deps chromium
-
       - name: Viewport coverage invariants
         # Static guard (no browser): every operator component has a viewport
         # test, required assertions present, escape-hatch budget within limit.
@@ -267,13 +236,87 @@ jobs:
       - name: Viewport tests (browser mode)
         id: viewport
         continue-on-error: true
-        working-directory: ./admin-ui
-        env:
-          VITE_API_URL: http://localhost:8080
-          VITE_FIREBASE_API_KEY: ci-placeholder
-          VITE_FIREBASE_AUTH_DOMAIN: ci-placeholder.firebaseapp.com
-          VITE_FIREBASE_PROJECT_ID: ci-placeholder
-        run: npx vitest run --config vitest.viewport.config.ts
+        # Use only this runner's isolated Docker daemon. Matching the host
+        # UID/GID keeps failure screenshots and all other bind-mounted output
+        # writable by later jobs on this persistent runner.
+        run: |
+          playwright_version="$(
+            node -p "require('playwright-core/package.json').version"
+          )"
+          if [[ ! "$playwright_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected Playwright version: ${playwright_version}"
+            exit 1
+          fi
+          playwright_image="mcr.microsoft.com/playwright:v${playwright_version}-noble"
+          container_name="blueprint-viewport-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}-${{ matrix.shard }}"
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          if [[ ! -x "$node_root/bin/node" ]]; then
+            echo "::error::Node tool root is not executable: ${node_root}"
+            exit 1
+          fi
+
+          # A hard job timeout kills the Docker CLI, not necessarily its
+          # container. Remove only our labelled leftovers on this runner's
+          # isolated daemon before starting, and trap every normal/timeout exit.
+          mapfile -t stale_ids < <(
+            docker ps -aq --filter label=com.blueprint.ci=viewport
+          )
+          if (( ${#stale_ids[@]} > 0 )); then
+            docker rm -f "${stale_ids[@]}"
+          fi
+          cleanup_viewport() {
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+          }
+          trap cleanup_viewport EXIT INT TERM
+
+          # Pull explicitly so a cold daemon gets a bounded image-download
+          # budget without consuming the browser suite's own timeout.
+          if ! docker image inspect "$playwright_image" >/dev/null 2>&1; then
+            timeout --signal=TERM --kill-after=30s 20m \
+              docker pull "$playwright_image"
+          fi
+
+          timeout --signal=TERM --kill-after=30s 10m \
+          docker run --init \
+            --name "$container_name" \
+            --label com.blueprint.ci=viewport \
+            --user "$(id -u):$(id -g)" \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --network=none \
+            --pids-limit=512 \
+            --memory=8g \
+            --cpus=6 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --shm-size=2g \
+            --env HOME=/tmp \
+            --env CI=true \
+            --env PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+            --env PATH=/opt/ci-node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            --env VITE_API_URL=http://localhost:8080 \
+            --env VITE_FIREBASE_API_KEY=ci-placeholder \
+            --env VITE_FIREBASE_AUTH_DOMAIN=ci-placeholder.firebaseapp.com \
+            --env VITE_FIREBASE_PROJECT_ID=ci-placeholder \
+            --mount type=bind,src="$GITHUB_WORKSPACE",dst=/work \
+            --mount type=bind,src="$node_root",dst=/opt/ci-node,readonly \
+            --workdir /work/admin-ui \
+            "$playwright_image" \
+            bash -euo pipefail -c '
+              # The image bundles Node 24, while this workflow and dependency
+              # tree are pinned to Node 20. Use the read-only setup-node
+              # toolchain. Each matrix job gets a fresh browser provider and a
+              # bounded quarter of the suite; this prevents a provider teardown
+              # stall from stranding the other shards.
+              node --version
+              npx --no-install vitest run --config vitest.viewport.config.ts --shard=${{ matrix.shard }}/4
+            '
+
+      - name: Clean viewport container
+        if: always()
+        run: |
+          container_name="blueprint-viewport-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}-${{ matrix.shard }}"
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
 
       # Failure screenshots are visual regressions; the stack trace alone
       # rarely makes the issue diagnosable. screenshotFailures=true in
@@ -284,7 +327,7 @@ jobs:
         if: steps.viewport.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: viewport-failure-screenshots
+          name: viewport-failure-screenshots-shard-${{ matrix.shard }}
           path: |
             admin-ui/**/__screenshots__/**/*.png
             admin-ui/.vitest/**/*.png
@@ -305,7 +348,7 @@ jobs:
   # admin-ui (detect=false), which must still satisfy the required check.
   frontend-gate:
     name: CI / Frontend
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     timeout-minutes: 5
     needs: [frontend-build, frontend-unit, frontend-viewport]
     if: always()
@@ -335,7 +378,7 @@ jobs:
   # error surfaces in the shards instead.
   backend-deps:
     name: CI / Backend deps image
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     timeout-minutes: 15
     needs: detect
     if: needs.detect.outputs.backend == 'true'
@@ -393,7 +436,7 @@ jobs:
 
   backend:
     name: CI / Backend (shard ${{ matrix.shard }})
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     # Hard ceiling: catches a hung test instead of letting GH Actions' 360-min
     # default stall the runner for 6h and wedge the rollup. Raised 10 -> 20
     # (2026-07-23), then 20 -> 30 (2026-07-24): shards are balanced by even test
@@ -452,12 +495,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Persistent runners are not discarded after every job. Remove only this
-      # shard's namespaced resources if a cancelled prior attempt left them.
+      # Persistent runners are not discarded after every job. Each runner owns
+      # a dedicated Docker daemon and executes one job at a time, so any
+      # matching resources already present on that daemon are stale leftovers
+      # from a cancelled or interrupted job (possibly with a different run ID).
       - name: Clean stale PostgreSQL resources
         run: |
-          docker rm -f "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
-          docker network rm "$CI_NETWORK" >/dev/null 2>&1 || true
+          mapfile -t stale_networks < <(
+            docker network ls --format '{{.Name}}' |
+              sed -n '/^blueprint-ci-/p'
+          )
+          for network in "${stale_networks[@]}"; do
+            mapfile -t attached_containers < <(
+              docker ps -aq --filter "network=$network"
+            )
+            if (( ${#attached_containers[@]} )); then
+              docker rm -f "${attached_containers[@]}"
+            fi
+            docker network rm "$network"
+          done
+
+          mapfile -t stale_containers < <(
+            docker ps -aq --filter "name=blueprint-ci-postgres-"
+          )
+          if (( ${#stale_containers[@]} )); then
+            docker rm -f "${stale_containers[@]}"
+          fi
 
       - name: Start PostgreSQL (pull with retry + mirror fallback)
         run: |
@@ -747,7 +810,7 @@ jobs:
   # it (detect=false), which must still satisfy the required check.
   backend-gate:
     name: CI / Backend
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     timeout-minutes: 5
     needs: backend
     if: always()
@@ -764,7 +827,7 @@ jobs:
 
   agent:
     name: CI / Agent
-    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint]
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
     timeout-minutes: 15
     needs: detect
     if: needs.detect.outputs.agent == 'true'

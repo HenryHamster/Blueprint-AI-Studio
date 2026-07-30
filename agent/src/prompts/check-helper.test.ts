@@ -1094,15 +1094,30 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const realPath = await vi.importActual<typeof import('node:path')>('node:path');
     const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'required-verification-'));
-    // Multiple self-hosted runners execute this suite on the same host. Give
-    // the runtime fixture a process-unique task ID so one runner cannot remove
-    // another runner's fixed /tmp receipt. Static render assertions above keep
-    // covering the production task-ID contract byte-for-byte.
-    const runtimeTaskId = `verify-authoring-1-${process.pid}`;
-    const script = renderedScript.replaceAll('verify-authoring-1', runtimeTaskId);
-    const receiptPath = `/tmp/project_verification_receipt_${runtimeTaskId}.json`;
     const posix = (p: string): string =>
       p.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (_m, d: string) => `/${d.toLowerCase()}/`);
+    // A process ID is not unique across reboots. Persistent self-hosted runners
+    // can therefore inherit a same-named /tmp receipt owned by another runner
+    // user, which the sticky directory correctly prevents this fixture from
+    // deleting. Reuse mkdtemp's random suffix so every invocation has a
+    // collision-proof task ID. Static assertions above still cover the
+    // production task-ID contract byte-for-byte.
+    const runtimeNonce = realPath.basename(dir).replace(/[^A-Za-z0-9_-]/g, '-');
+    const runtimeTaskId = `verify-authoring-1-${process.pid}-${runtimeNonce}`;
+    const runtimeTmp = realPath.join(dir, 'tmp');
+    realFs.mkdirSync(runtimeTmp, { recursive: true });
+    // The production helper intentionally uses host /tmp. Redirect every
+    // runtime-fixture artifact into this invocation's private directory:
+    // Vitest workers and persistent runner users must never contend for the
+    // helper's fixed lint lists, logs, worktrees, or receipts. Static render
+    // assertions continue to verify the real /tmp paths above.
+    const script = renderedScript
+      .replaceAll('verify-authoring-1', runtimeTaskId)
+      .replaceAll('/tmp/', `${posix(runtimeTmp)}/`);
+    const receiptPath = realPath.join(
+      runtimeTmp,
+      `project_verification_receipt_${runtimeTaskId}.json`,
+    );
     try {
       try { realFs.unlinkSync(receiptPath); } catch { /* absent */ }
       const bin = realPath.join(dir, 'bin');
@@ -1137,6 +1152,9 @@ if [ "$1" = "-m" ] && [ "$2" = "ruff" ]; then
   exit ${scenario.ruffExit}
 fi
 if [ "$1" = "backend/testing/impacted_tests.py" ]; then
+  # Match the real resolver's stdin contract. Exiting before the producer has
+  # drained is racy under pipefail and can make printf report SIGPIPE (141).
+  cat >/dev/null
   echo backend/testing/test_x.py
   exit 0
 fi
@@ -1207,7 +1225,7 @@ exit ${scenario.harnessExit}
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0, docker: true, harnessExit: 0,
     });
-    expect(result.status).toBe(0);
+    expect(result.status, result.stdout).toBe(0);
     expect(result.log).toContain('ruff -m ruff check');
     expect(result.log).toContain('harness USE_TEST_POSTGRES=true --sandbox-postgres testing/test_x.py');
     expect(result.receipt).toMatchObject({
@@ -1236,7 +1254,7 @@ exit ${scenario.harnessExit}
       ],
       missingPaths: ['backend/testing/test_deleted.py'],
     });
-    expect(result.status).toBe(0);
+    expect(result.status, result.stdout).toBe(0);
     expect(result.log).toContain(
       'harness USE_TEST_POSTGRES=true --sandbox-postgres testing/test_bar.py testing/test_x.py',
     );
@@ -1252,7 +1270,7 @@ exit ${scenario.harnessExit}
       harnessExit: 0,
       changedPath: 'backend/Dockerfile',
     });
-    expect(result.status).toBe(0);
+    expect(result.status, result.stdout).toBe(0);
     expect(result.log).not.toContain('ruff -m ruff check');
     expect(result.stdout).not.toContain('no Python target');
     expect(result.receipt).toBeUndefined();
@@ -1283,7 +1301,7 @@ exit ${scenario.harnessExit}
       harnessPath: 'tools/verified-postgres-tests.sh',
     });
     expect(result.log).toContain('ruff -m ruff check');
-    expect(result.status).not.toBe(0);
+    expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
     expect(result.receipt).toBeUndefined();
   });
@@ -1309,7 +1327,7 @@ exit ${scenario.harnessExit}
       ruffExit: 0, docker: false, harnessExit: 0, changedPath: 'backend/x.py',
     });
     expect(result.log).toContain('ruff -m ruff check');
-    expect(result.status).not.toBe(0);
+    expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
     expect(result.receipt).toBeUndefined();
   });
@@ -1320,7 +1338,7 @@ exit ${scenario.harnessExit}
     ['all tests skipped', { ruffExit: 0, docker: true, harnessExit: 0, skipped: 1 }],
   ])('runtime: %s fails closed and cannot mint a green receipt', async (_label, scenario) => {
     const result = await runRequiredCheck(await render(), scenario);
-    expect(result.status).not.toBe(0);
+    expect(result.status, result.stdout).not.toBe(0);
     expect(result.receipt).toBeUndefined();
     expect(result.stdout).toContain('FAIL');
   });
