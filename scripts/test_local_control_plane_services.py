@@ -1,0 +1,423 @@
+"""Security and command-boundary tests for the local control-plane services."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent))
+import cloud_sql_proxy_service as proxy
+import local_worker_service as worker
+
+
+class WorkerServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.root = Path(self.temp.name)
+        self.secrets = self.root / "worker-secrets.json"
+        self.google_credentials = self.root / "worker-gcp.json"
+        self.payload = {
+            "DATABASE_URL": "postgresql+asyncpg://user:p%40ss@10.0.0.2:5432/blueprint",
+            "AGENT_JWT_SECRET": "a" * 32,
+            "WS_TICKET_SECRET": "w" * 32,
+            "GITHUB_APP_ID": "12345",
+            "GITHUB_PRIVATE_KEY": (
+                "-----BEGIN PRIVATE KEY-----\nkey-material\n"
+                "-----END PRIVATE KEY-----"
+            ),
+            "GITHUB_PAT_ENCRYPTION_KEY": "fernet-key",
+            "GCP_PROJECT_ID": "project-123",
+            "GCP_ZONE": "us-central1-a",
+            "VPC_NETWORK": "agent-sandbox-vpc",
+            "VPC_SUBNET": "agent-sandbox-subnet",
+            "AGENT_SERVICE_ACCOUNT_EMAIL": "agent-naked-sa@project-123.iam.gserviceaccount.com",
+            "ARTIFACT_BUCKET_NAME": "project-123-agent-artifacts",
+            "ORCHESTRATOR_URL": "https://orchestrator.example",
+            "LOCAL_MODE": "false",
+            "MAX_CONCURRENT_VMS": "10",
+            "MAX_PROVISION_SLOTS": "2",
+            "MACHINE_TYPE": "n2-standard-2",
+            "VM_PROVISIONING_MODEL": "STANDARD",
+            "DISABLED_REGIONS": "us-east4;us-west1",
+            "CLOUD_RUN_JOB_NAME": "projects/project-123/locations/us-central1/jobs/blueprint-agent-job",
+        }
+        self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
+        self.google_credentials.write_text(
+            json.dumps(
+                {
+                    "type": "service_account",
+                    "project_id": "project-123",
+                    "client_email": (
+                        "blueprint-local-worker-runtime@project-123."
+                        "iam.gserviceaccount.com"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+        if os.name != "nt":
+            self.secrets.chmod(0o600)
+            self.google_credentials.chmod(0o600)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_database_url_is_rewritten_to_unpublished_host_gateway(self):
+        rewritten = worker._database_url_for_container(self.payload["DATABASE_URL"])
+        self.assertEqual(
+            rewritten,
+            (
+                "postgresql+asyncpg://user:p%40ss@"
+                "host.docker.internal:5433/blueprint?ssl=disable"
+            ),
+        )
+        self.assertNotIn("10.0.0.2", rewritten)
+
+    def test_database_url_disables_client_tls_for_cloud_sql_proxy(self):
+        rewritten = worker._database_url_for_container(
+            "postgresql+asyncpg://user:pass@10.0.0.2:5432/blueprint"
+            "?application_name=worker&ssl=require&sslmode=verify-full"
+        )
+        self.assertEqual(
+            rewritten,
+            (
+                "postgresql+asyncpg://user:pass@host.docker.internal:5433/"
+                "blueprint?application_name=worker&ssl=disable"
+            ),
+        )
+        self.assertNotIn("require", rewritten)
+        self.assertNotIn("verify-full", rewritten)
+
+    def test_secret_bundle_rejects_unknown_key(self):
+        self.payload["ADMIN_API_KEY"] = "must-not-enter-worker"
+        self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unsupported keys"):
+            worker._load_secrets(str(self.secrets))
+
+    def test_secret_bundle_rejects_missing_production_runtime_config(self):
+        del self.payload["GCP_PROJECT_ID"]
+        self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "GCP_PROJECT_ID"):
+            worker._load_secrets(str(self.secrets))
+
+    def test_worker_rejects_credentials_for_another_service_account(self):
+        self.google_credentials.write_text(
+            json.dumps(
+                {
+                    "type": "service_account",
+                    "project_id": "project-123",
+                    "client_email": "orchestrator-sa@project-123.iam.gserviceaccount.com",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "dedicated runtime"):
+            worker._secure_credentials_file(
+                str(self.google_credentials), project_id="project-123"
+            )
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership and mode contract")
+    def test_secret_bundle_rejects_group_readability(self):
+        self.secrets.chmod(0o640)
+        with self.assertRaisesRegex(ValueError, "0600"):
+            worker._load_secrets(str(self.secrets))
+
+    @patch.object(worker, "_network_gateway", return_value="172.20.0.1")
+    @patch.object(worker, "_assert_proxy_reachable_from_network")
+    @patch.object(worker, "_wait_for_proxy")
+    @patch.object(worker, "_assert_no_host_ci_runner")
+    def test_container_has_no_published_ports_and_is_hardened(
+        self, _ci_guard, _wait, _network_probe, _gateway
+    ):
+        env = {
+            "BLUEPRINT_WORKER_IMAGE_ID": f"sha256:{'a' * 64}",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
+        }
+        with patch.dict(os.environ, env, clear=True):
+            argv, child_env = worker.command()
+        self.assertNotIn("--publish", argv)
+        self.assertNotIn("-p", argv)
+        self.assertIn("host.docker.internal:172.20.0.1", argv)
+        self.assertNotIn("host-gateway", argv)
+        self.assertIn("--read-only", argv)
+        self.assertIn("no-new-privileges", argv)
+        self.assertIn(f"{os.getuid()}:{os.getgid()}", argv)
+        self.assertTrue(
+            any(
+                item.endswith(",dst=/var/run/blueprint/gcp.json,readonly")
+                for item in argv
+            )
+        )
+        self.assertEqual(
+            child_env["GOOGLE_APPLICATION_CREDENTIALS"],
+            "/var/run/blueprint/gcp.json",
+        )
+        self.assertEqual(child_env["BLUEPRINT_PROCESS_ROLE"], "worker")
+        self.assertEqual(child_env["BLUEPRINT_DEPLOYMENT_MODE"], "local-production")
+        self.assertEqual(child_env["GCP_PROJECT_ID"], "project-123")
+        self.assertEqual(child_env["MAX_CONCURRENT_VMS"], "10")
+        self.assertNotIn("ALLOW_PLAINTEXT_CREDENTIALS", child_env)
+        self.assertNotIn(self.payload["GITHUB_PRIVATE_KEY"], " ".join(argv))
+        self.assertNotIn(self.payload["DATABASE_URL"], " ".join(argv))
+
+    @patch.object(worker.subprocess, "run")
+    def test_network_probe_fails_closed_when_host_firewall_blocks_bridge(self, run):
+        run.return_value.returncode = 1
+        with self.assertRaisesRegex(RuntimeError, "host firewall"):
+            worker._assert_proxy_reachable_from_network(
+                f"sha256:{'a' * 64}",
+                "blueprint-control-plane",
+                "172.20.0.1",
+            )
+        argv = run.call_args.args[0]
+        self.assertIn("blueprint-control-plane", argv)
+        self.assertIn("host.docker.internal:172.20.0.1", argv)
+        self.assertNotIn(str(self.secrets), argv)
+        self.assertNotIn(str(self.google_credentials), argv)
+
+    def test_mutable_image_tag_is_rejected(self):
+        env = {
+            "BLUEPRINT_WORKER_IMAGE_ID": "blueprint-worker:latest",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(worker, "_assert_no_host_ci_runner"),
+        ):
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                worker.command()
+
+    def test_host_ci_runner_is_a_hard_security_gate(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as proc:
+            process = Path(proc) / "123"
+            process.mkdir()
+            (process / "cmdline").write_bytes(
+                b"/home/runner/actions-runner/bin/Runner.Listener\x00run"
+            )
+            with (
+                patch.object(worker, "Path", wraps=Path) as path_type,
+                self.assertRaisesRegex(RuntimeError, "move CI into a VM"),
+            ):
+                path_type.return_value = Path(proc)
+                worker._assert_no_host_ci_runner()
+
+
+class ProxyServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.root = Path(self.temp.name)
+        self.binary = self.root / "cloud-sql-proxy"
+        self.credentials = self.root / "cloudsql.json"
+        self.binary.write_text("binary", encoding="utf-8")
+        self.credentials.write_text("{}", encoding="utf-8")
+        self.credentials.write_text(
+            json.dumps(
+                {
+                    "type": "service_account",
+                    "project_id": "project-123",
+                    "client_email": (
+                        "blueprint-local-worker@project-123.iam.gserviceaccount.com"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+        if os.name != "nt":
+            self.binary.chmod(0o700)
+            self.credentials.chmod(0o600)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @patch.object(proxy, "_docker_network_gateway", return_value="172.20.0.1")
+    def test_proxy_binds_only_private_bridge_gateway(self, _gateway):
+        env = {
+            "BLUEPRINT_CLOUDSQL_PROXY_BINARY": str(self.binary),
+            "BLUEPRINT_CLOUDSQL_PROXY_SHA256": __import__("hashlib").sha256(
+                self.binary.read_bytes()
+            ).hexdigest(),
+            "BLUEPRINT_CLOUDSQL_CREDENTIALS_FILE": str(self.credentials),
+            "BLUEPRINT_CLOUDSQL_INSTANCE": "project-123:us-central1:database-1",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            argv = proxy.command()
+        self.assertEqual(argv[argv.index("--address") + 1], "172.20.0.1")
+        self.assertNotIn("0.0.0.0", argv)
+        self.assertNotIn("127.0.0.1", argv)
+        self.assertEqual(argv[argv.index("--port") + 1], "5433")
+
+    @unittest.skipIf(os.name == "nt", "POSIX credential mode contract")
+    def test_proxy_rejects_world_readable_credentials(self):
+        self.credentials.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "group or other"):
+            proxy._secure_file(str(self.credentials), executable=False)
+
+    def test_proxy_rejects_credentials_for_a_broader_identity(self):
+        self.credentials.write_text(
+            json.dumps(
+                {
+                    "type": "service_account",
+                    "project_id": "project-123",
+                    "client_email": "orchestrator-sa@project-123.iam.gserviceaccount.com",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "proxy-only"):
+            proxy._validate_credentials(self.credentials, project_id="project-123")
+
+    def test_proxy_rejects_unpinned_binary_content(self):
+        with self.assertRaisesRegex(ValueError, "pinned digest"):
+            proxy._validate_binary_digest(self.binary, "0" * 64)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable mode contract")
+    def test_proxy_rejects_group_writable_binary(self):
+        self.binary.chmod(0o720)
+        with self.assertRaisesRegex(ValueError, "writable by group"):
+            proxy._secure_file(str(self.binary), executable=True)
+
+    @patch.object(proxy.subprocess, "run")
+    def test_proxy_rejects_preexisting_unowned_network(self, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps(
+            [
+                {
+                    "Labels": {},
+                    "IPAM": {"Config": [{"Gateway": "172.20.0.1"}]},
+                }
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "not owned"):
+            proxy._docker_network_gateway("blueprint-control-plane")
+
+
+class TerraformIdentityContractTests(unittest.TestCase):
+    def test_local_identities_remain_separate_and_least_privilege(self):
+        terraform = (
+            Path(__file__).parents[1] / "infra" / "terraform" / "iam.tf"
+        ).read_text(encoding="utf-8")
+        proxy_start = terraform.index(
+            'resource "google_service_account" "local_cloudsql_proxy_sa"'
+        )
+        worker_start = terraform.index(
+            'resource "google_service_account" "local_worker_sa"'
+        )
+        agent_start = terraform.index(
+            '# Agent "Naked" Service Account'
+        )
+        proxy_section = terraform[proxy_start:worker_start]
+        worker_section = terraform[worker_start:agent_start]
+
+        self.assertIn('"roles/cloudsql.client"', proxy_section)
+        self.assertNotIn("secretmanager", proxy_section)
+        self.assertNotIn("compute.instanceAdmin", proxy_section)
+
+        self.assertIn('permissions = ["secretmanager.secrets.create"]', terraform)
+        self.assertIn('"roles/secretmanager.secretAccessor"', worker_section)
+        self.assertIn('"roles/secretmanager.secretVersionAdder"', worker_section)
+        self.assertIn(
+            'resource.name.startsWith("projects/${var.project_id}/secrets/agent-creds-")',
+            worker_section,
+        )
+        self.assertIn(
+            'resource.name.startsWith("projects/${var.project_id}/secrets/user-")',
+            worker_section,
+        )
+        self.assertIn(
+            (
+                'resource.name.startsWith("projects/${data.google_project.'
+                'local_worker_project.number}/secrets/agent-creds-")'
+            ),
+            worker_section,
+        )
+        self.assertIn(
+            (
+                'resource.name.startsWith("projects/${data.google_project.'
+                'local_worker_project.number}/secrets/user-")'
+            ),
+            worker_section,
+        )
+        self.assertNotIn("roles/secretmanager.admin", worker_section)
+        self.assertNotIn("roles/iam.serviceAccountTokenCreator", worker_section)
+        self.assertNotIn("roles/run.admin", worker_section)
+
+    def test_terraform_plan_gate_propagates_pipeline_failure(self):
+        workflow = (
+            Path(__file__).parents[1] / ".github" / "workflows" / "terraform.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("set -o pipefail", workflow)
+        self.assertIn("plan_exit_code=$?", workflow)
+        self.assertIn('exit "$plan_exit_code"', workflow)
+        self.assertIn("if: always() && github.event_name == 'pull_request'", workflow)
+        self.assertIn(
+            "TF_VAR_alert_email: ${{ secrets.GCP_ALERT_EMAIL }}", workflow
+        )
+        self.assertIn(
+            "TF_VAR_billing_account_id: ${{ secrets.GCP_BILLING_ACCOUNT_ID }}",
+            workflow,
+        )
+        self.assertIn('TF_VAR_monthly_budget_usd: "200"', workflow)
+        self.assertIn("Validate production plan inputs", workflow)
+        self.assertIn('if [[ -z "${!input_name:-}" ]]', workflow)
+        self.assertNotIn("- apply", workflow)
+
+    def test_terraform_plan_identity_has_read_only_refresh_permissions(self):
+        workload_identity = (
+            Path(__file__).parents[1]
+            / "infra"
+            / "terraform"
+            / "workload_identity.tf"
+        ).read_text(encoding="utf-8")
+        plan_start = workload_identity.index(
+            'resource "google_project_iam_member" "github_actions_plan_viewer"'
+        )
+        impersonation_start = workload_identity.index(
+            'resource "google_service_account_iam_member" '
+            '"github_actions_impersonation"'
+        )
+        plan_section = workload_identity[plan_start:impersonation_start]
+
+        self.assertIn('"roles/viewer"', plan_section)
+        self.assertIn('"roles/iam.securityReviewer"', plan_section)
+        self.assertIn('"roles/serviceusage.serviceUsageConsumer"', plan_section)
+        self.assertNotIn(".admin", plan_section)
+        self.assertNotIn("secretAccessor", plan_section)
+
+    def test_artifact_registry_uses_provider_cleanup_policy_schema(self):
+        registry = (
+            Path(__file__).parents[1] / "infra" / "terraform" / "registry.tf"
+        ).read_text(encoding="utf-8")
+        self.assertIn("cleanup_policies {", registry)
+        self.assertNotIn("cleanup_policy {", registry)
+
+    def test_local_worker_cutover_preserves_production_database_capacity(self):
+        cloud_sql = (
+            Path(__file__).parents[1] / "infra" / "terraform" / "cloud_sql.tf"
+        ).read_text(encoding="utf-8")
+        self.assertIn('tier                        = "db-custom-4-15360"', cloud_sql)
+        self.assertIn("retained_backups = 7", cloud_sql)
+        self.assertIn("ipv4_enabled                                  = true", cloud_sql)
+        self.assertIn('value = "400"', cloud_sql)
+        self.assertNotIn('tier                        = "db-g1-small"', cloud_sql)
+
+    def test_local_worker_cutover_allows_cloud_run_api_to_scale_to_zero(self):
+        cloud_run = (
+            Path(__file__).parents[1] / "infra" / "terraform" / "cloud_run.tf"
+        ).read_text(encoding="utf-8")
+        self.assertIn("min_instance_count = 0", cloud_run)
+        self.assertIn("max_instance_count = 1", cloud_run)
+        self.assertIn("max_instance_request_concurrency = 120", cloud_run)
+
+
+if __name__ == "__main__":
+    unittest.main()

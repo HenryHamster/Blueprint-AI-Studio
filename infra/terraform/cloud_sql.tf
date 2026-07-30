@@ -39,7 +39,10 @@ resource "google_sql_database_instance" "default" {
   deletion_protection = true
 
   settings {
-    tier                        = "db-g1-small" # 1 shared vCPU, 1.7GB. Bump to db-custom-1-3840 (~$55/mo) when CPU steal shows up.
+    # Preserve the proven production shape during the local-worker cutover.
+    # Database right-sizing is a separate, metrics-gated change: applying a
+    # speculative shared-core tier here previously saturated immediately.
+    tier                        = "db-custom-4-15360"
     edition                     = "ENTERPRISE"
     availability_type           = "ZONAL" # single-zone, no HA. Flip to "REGIONAL" to add HA (~2x cost).
     disk_size                   = 20      # GB. autoresize will grow it; this is the floor.
@@ -54,13 +57,16 @@ resource "google_sql_database_instance" "default" {
       start_time                     = "03:00" # UTC
       transaction_log_retention_days = 7
       backup_retention_settings {
-        retained_backups = 3 # down from 7; saves ~57% of backup storage ($0.11/GB-month × backup size × 4 fewer copies)
+        retained_backups = 7
         retention_unit   = "COUNT"
       }
     }
 
     ip_configuration {
-      ipv4_enabled                                  = false # private IP only
+      # The off-cloud worker reaches Cloud SQL through the authenticated proxy,
+      # which still needs the instance's public endpoint. TLS and IAM constrain
+      # access; disabling this endpoint would strand the local worker.
+      ipv4_enabled                                  = true
       private_network                               = google_compute_network.agent_vpc.id
       enable_private_path_for_google_cloud_services = true
       ssl_mode                                      = "ENCRYPTED_ONLY" # require TLS on every connection
@@ -88,7 +94,7 @@ resource "google_sql_database_instance" "default" {
     # in backend/app/database.py — defense in depth so a misconfigured pool can't exhaust the DB.
     database_flags {
       name  = "max_connections"
-      value = "200"
+      value = "400"
     }
     # Enables IAM-based DB auth so future code can connect with the orchestrator SA token
     # instead of a long-lived password. The password path still works; this just unlocks

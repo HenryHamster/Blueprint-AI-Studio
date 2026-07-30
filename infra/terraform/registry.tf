@@ -9,14 +9,14 @@ resource "google_artifact_registry_repository" "orchestrator_repo" {
   # Real saving scales with repo size — a 100 GB estate saves $10/mo; 400 GB saves $40/mo.
   # KEEP policy runs before DELETE, so the 5 most recent tagged images are always preserved.
   cleanup_policy_dry_run = false
-  cleanup_policy {
+  cleanup_policies {
     id     = "keep-recent-tagged"
     action = "KEEP"
     most_recent_versions {
       keep_count = 5
     }
   }
-  cleanup_policy {
+  cleanup_policies {
     id     = "delete-untagged"
     action = "DELETE"
     condition {
@@ -24,7 +24,7 @@ resource "google_artifact_registry_repository" "orchestrator_repo" {
       older_than = "604800s" # 7 days
     }
   }
-  cleanup_policy {
+  cleanup_policies {
     id     = "delete-old-tagged"
     action = "DELETE"
     condition {
@@ -72,7 +72,7 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
   # wrong delete is an unrunnable dep_hash and destroyed result provenance.
   cleanup_policy_dry_run = true
 
-  cleanup_policy {
+  cleanup_policies {
     id     = "keep-recent-tagged"
     action = "KEEP"
     most_recent_versions {
@@ -87,7 +87,7 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
   # so a running experiment's (or a recent result's provenance) image is never
   # reclaimed out from under it. The reaper prunes `inuse-` tags once the digest
   # is no longer referenced, letting delete-old-tagged reclaim it normally.
-  cleanup_policy {
+  cleanup_policies {
     id     = "keep-inuse-tagged"
     action = "KEEP"
     condition {
@@ -95,7 +95,7 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
       tag_prefixes = ["inuse-"]
     }
   }
-  cleanup_policy {
+  cleanup_policies {
     id     = "delete-untagged"
     action = "DELETE"
     condition {
@@ -113,7 +113,7 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
       older_than = "2592000s" # 30 days — keep in sync with _COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS
     }
   }
-  cleanup_policy {
+  cleanup_policies {
     id     = "delete-old-tagged"
     action = "DELETE"
     condition {
@@ -139,14 +139,14 @@ resource "google_artifact_registry_repository" "agent_images_repo" {
   # Bound image-storage growth: $0.10/GB-month reclaimed on stale/untagged layers.
   # Agent VM images are less frequent; keep 3 most recent tagged to allow rollback.
   cleanup_policy_dry_run = false
-  cleanup_policy {
+  cleanup_policies {
     id     = "keep-recent-tagged"
     action = "KEEP"
     most_recent_versions {
       keep_count = 3
     }
   }
-  cleanup_policy {
+  cleanup_policies {
     id     = "delete-untagged"
     action = "DELETE"
     condition {
@@ -154,7 +154,7 @@ resource "google_artifact_registry_repository" "agent_images_repo" {
       older_than = "604800s" # 7 days
     }
   }
-  cleanup_policy {
+  cleanup_policies {
     id     = "delete-old-tagged"
     action = "DELETE"
     condition {

@@ -30,12 +30,26 @@ class ProfileManifestTests(unittest.TestCase):
     def test_profiles_cover_expected_roles(self):
         self.assertEqual(
             node.PROFILE_ROLES["primary"],
-            ("node-agent", "executor", "github-actions", "api", "worker", "edge"),
+            (
+                "node-agent",
+                "executor",
+                "api",
+                "database-proxy",
+                "worker",
+                "edge",
+            ),
         )
         self.assertEqual(node.PROFILE_ROLES["worker"], ("node-agent", "executor", "github-actions"))
         self.assertEqual(node.PROFILE_ROLES["gpu-worker"], ("node-agent", "executor"))
+        self.assertEqual(
+            node.PROFILE_ROLES["control-plane"], ("database-proxy", "worker")
+        )
+        for roles in node.PROFILE_ROLES.values():
+            if "worker" in roles:
+                self.assertNotIn("github-actions", roles)
         self.assertTrue(node.ROLE_SPECS["executor"].executable)
         self.assertFalse(node.ROLE_SPECS["api"].executable)
+        self.assertTrue(node.ROLE_SPECS["worker"].executable)
 
     def test_role_paths_are_separate(self):
         with patch.dict(os.environ, {"BLUEPRINT_NODE_DIR": "/tmp/bp-node-test"}, clear=True):
@@ -71,6 +85,40 @@ class RenderTests(unittest.TestCase):
     def test_planned_role_cannot_render_a_fake_service(self):
         with self.assertRaisesRegex(ValueError, "planned"):
             node._render_unit("api", system=False, env_file=Path("/tmp/api.env"))
+
+    def test_worker_requires_proxy_and_mandatory_env_file(self):
+        rendered = node._render_unit(
+            "worker", system=False, env_file=Path("/tmp/roles/worker/role.env")
+        )
+        self.assertIn("Requires=blueprint-database-proxy.service", rendered)
+        self.assertIn("After=blueprint-database-proxy.service", rendered)
+        self.assertIn(
+            "EnvironmentFile=/tmp/roles/worker/role.env",
+            rendered,
+        )
+        self.assertIn(
+            "ExecStartPre=/usr/bin/python3 "
+            f"{node._LOCAL_WORKER_SERVICE} --check",
+            rendered,
+        )
+        self.assertIn("UMask=0077", rendered)
+        self.assertIn("NoNewPrivileges=true", rendered)
+        self.assertIn("RestrictSUIDSGID=true", rendered)
+        self.assertIn("LockPersonality=true", rendered)
+        self.assertNotIn("EnvironmentFile=-/tmp/roles/worker/role.env", rendered)
+
+    def test_system_unit_adds_host_process_sandboxing(self):
+        with patch.object(node, "_system_install_user", return_value="blueprint-control"):
+            rendered = node._render_unit(
+                "worker",
+                system=True,
+                env_file=Path("/etc/blueprint/nodes/blueprint-control/worker.env"),
+            )
+        self.assertIn("User=blueprint-control", rendered)
+        self.assertIn("ProtectSystem=strict", rendered)
+        self.assertIn("ProtectHome=read-only", rendered)
+        self.assertIn("ProtectKernelModules=true", rendered)
+        self.assertIn("PrivateDevices=true", rendered)
 
     def test_system_unit_rejects_an_untrusted_user_name(self):
         with patch.dict(os.environ, {"SUDO_USER": "runner\nUser=root"}, clear=True):
@@ -109,7 +157,25 @@ class InstallTests(unittest.TestCase):
             patch.object(node, "_systemd_available", return_value=True),
         ]
 
-    def test_primary_installs_only_executor_and_records_planned_roles(self):
+    @staticmethod
+    def _control_plane_config():
+        return {
+            "database-proxy": {
+                "BLUEPRINT_CLOUDSQL_PROXY_BINARY": "/home/runner/.local/bin/cloud-sql-proxy",
+                "BLUEPRINT_CLOUDSQL_PROXY_SHA256": "a" * 64,
+                "BLUEPRINT_CLOUDSQL_CREDENTIALS_FILE": "/home/runner/.blueprint/cloudsql.json",
+                "BLUEPRINT_CLOUDSQL_INSTANCE": "project-123:us-central1:database-1",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            },
+            "worker": {
+                "BLUEPRINT_WORKER_IMAGE_ID": f"sha256:{'a' * 64}",
+                "BLUEPRINT_WORKER_SECRETS_FILE": "/home/runner/.blueprint/worker-secrets.json",
+                "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": "/home/runner/.blueprint/worker-gcp.json",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            },
+        }
+
+    def test_primary_installs_executor_and_control_plane_but_not_planned_roles(self):
         calls = []
         patches = self._patches()
         for item in patches:
@@ -117,7 +183,9 @@ class InstallTests(unittest.TestCase):
         try:
             rc = node.do_install(
                 profile="primary", system=False, token="secret", url="https://orch.example",
-                dry_run=False, _run=_run_ok(calls),
+                dry_run=False,
+                role_configs=self._control_plane_config(),
+                _run=_run_ok(calls),
             )
         finally:
             for item in reversed(patches):
@@ -126,6 +194,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         executor_unit = self.units / "blueprint-executor.service"
         self.assertTrue(executor_unit.is_file())
+        self.assertTrue((self.units / "blueprint-database-proxy.service").is_file())
+        self.assertTrue((self.units / "blueprint-worker.service").is_file())
         self.assertFalse((self.units / "blueprint-api.service").exists())
         unit_text = executor_unit.read_text()
         self.assertNotIn("secret", unit_text)
@@ -140,9 +210,88 @@ class InstallTests(unittest.TestCase):
         roles = {item["name"]: item for item in manifest["roles"]}
         self.assertEqual(roles["executor"]["state"], "installable")
         self.assertEqual(roles["api"]["state"], "planned")
+        self.assertEqual(roles["worker"]["state"], "installable")
         commands = [" ".join(call) for call in calls]
         self.assertTrue(any("enable --now blueprint-executor.service" in command for command in commands))
         self.assertFalse(any("blueprint-api.service" in command for command in commands))
+
+    def test_control_plane_writes_only_non_secret_role_configuration(self):
+        calls = []
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="control-plane",
+                system=False,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                role_configs=self._control_plane_config(),
+                _run=_run_ok(calls),
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertEqual(rc, 0)
+        worker_env = (self.root / "roles/worker/role.env").read_text()
+        self.assertIn("BLUEPRINT_WORKER_SECRETS_FILE=", worker_env)
+        self.assertNotIn("DATABASE_URL", worker_env)
+        self.assertNotIn("GITHUB_PRIVATE_KEY", worker_env)
+        self.assertFalse((self.units / "blueprint-executor.service").exists())
+
+    def test_control_plane_can_coexist_with_legacy_executor(self):
+        calls = []
+
+        def active_legacy(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[-1] == node._LEGACY_RUNNER_UNIT:
+                return MagicMock(returncode=0, stdout="active\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="control-plane",
+                system=False,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                role_configs=self._control_plane_config(),
+                _run=active_legacy,
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertEqual(rc, 0)
+        self.assertFalse(
+            any(call[-1] == node._LEGACY_RUNNER_UNIT for call in calls)
+        )
+        self.assertFalse((self.units / "blueprint-executor.service").exists())
+
+    def test_control_plane_fails_before_writes_when_config_is_incomplete(self):
+        calls = []
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="control-plane",
+                system=False,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                role_configs={},
+                _run=_run_ok(calls),
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.units.exists())
 
     def test_gpu_worker_writes_gpu_defaults_without_overriding_explicit_limit(self):
         calls = []
