@@ -54,6 +54,11 @@ output "cloud_sql_instance_name" {
   description = "The Cloud SQL instance name (used by gcloud sql commands)"
 }
 
+output "cloud_sql_service_account_email" {
+  value       = var.use_cloud_sql ? "serviceAccount:${google_sql_database_instance.default[0].service_account_email_address}" : ""
+  description = "Cloud SQL instance service account in IAM member form. Pass this to infra/recovery for writer-only archive access."
+}
+
 output "compute_images_repository_url" {
   value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.compute_images_repo.repository_id}"
   description = "The Artifact Registry URL for the project-baked compute images repository"

@@ -1635,6 +1635,18 @@ class Task(SQLModel, table=True):
         # H-S2). Don't reintroduce without confirming a query needs only the
         # narrower prefix.
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
+        Index(
+            "ix_task_queued_created_at",
+            "created_at",
+            postgresql_where=text("status = 'QUEUED'"),
+            sqlite_where=text("status = 'QUEUED'"),
+        ),
+        Index(
+            "ix_task_completed_created_at",
+            "created_at",
+            postgresql_where=text("status = 'COMPLETED'"),
+            sqlite_where=text("status = 'COMPLETED'"),
+        ),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
         Index("ix_task_project_status_updated", "project_id", "status", "updated_at"),
         Index(
@@ -4565,6 +4577,12 @@ class Artifact(SQLModel, table=True):
         Index("ix_artifact_artifact_type", "artifact_type"),
         Index("ix_artifact_task_type", "task_id", "artifact_type"),
         Index("ix_artifact_created_at", "created_at"),
+        Index(
+            "ix_artifact_pull_request_created_at",
+            "created_at",
+            postgresql_where=text("artifact_type = 'PULL_REQUEST'"),
+            sqlite_where=text("artifact_type = 'PULL_REQUEST'"),
+        ),
     )
 
     # Git-based outputs

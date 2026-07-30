@@ -269,6 +269,7 @@ async def sweep_queued_age_alerts(
     from app import pause_clock
     from app.models import Alert, AlertSeverity, DeploymentState
     from app.broadcast import broadcast_to_project as _bcast
+    from sqlalchemy.orm import load_only
     import app.shared_state as _shared_state
 
     _queued_threshold_hours = runtime_config.get("queued_age_alert_hours", 2)
@@ -278,6 +279,21 @@ async def sweep_queued_age_alerts(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.project_id,
+                        Task.title,
+                        Task.created_at,
+                        Task.context,
+                        Task.payloads,
+                        Task.retry_after_until,
+                        Task.requires_approval,
+                        Task.latest_status_message,
+                        raiseload=True,
+                    )
+                )
                 .where(
                     Task.status == TaskStatus.QUEUED,
                     Task.created_at <= _queued_cutoff,

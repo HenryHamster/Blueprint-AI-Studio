@@ -493,7 +493,7 @@ async def reaper_service():
                 pr_artifacts = (
                     (
                         await session.execute(
-                            select(Artifact).where(
+                            select(Artifact.task_id).where(
                                 Artifact.task_id.in_(task_ids_to_check),
                                 Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             )
@@ -504,7 +504,7 @@ async def reaper_service():
                     if task_ids_to_check
                     else []
                 )
-                tasks_with_pr = {a.task_id for a in pr_artifacts}
+                tasks_with_pr = set(pr_artifacts)
 
                 # Heartbeat false-reap fix (option B): batch-fetch the
                 # uncontended ``vmcontact`` liveness rows for THIS sweep's

@@ -281,6 +281,160 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
   }
 }
 
+# ------------------------------------------------------------------------------
+# Independent off-host database export — failure and missing-success alerts.
+# Both resources are disabled unless the opt-in backup system and an alert
+# email are configured. The job emits structured JSON only after the Cloud SQL
+# operation is terminal; a scheduler HTTP 2xx alone is not backup evidence.
+# ------------------------------------------------------------------------------
+resource "google_logging_metric" "offhost_db_backup_success" {
+  count       = local.alerting_enabled && var.enable_offhost_db_backup ? 1 : 0
+  name        = "offhost_db_backup_success"
+  description = "Completed independent Cloud SQL export operations. Absence for 23 hours pages operations."
+  filter      = <<-EOT
+    resource.type="cloud_run_job"
+    AND resource.labels.job_name="blueprint-db-offhost-backup"
+    AND jsonPayload.event="db_offhost_backup"
+    AND jsonPayload.outcome="success"
+  EOT
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+}
+
+resource "google_logging_metric" "offhost_db_backup_failure" {
+  count       = local.alerting_enabled && var.enable_offhost_db_backup ? 1 : 0
+  name        = "offhost_db_backup_failure"
+  description = "Failed independent Cloud SQL export operations."
+  filter      = <<-EOT
+    resource.type="cloud_run_job"
+    AND resource.labels.job_name="blueprint-db-offhost-backup"
+    AND jsonPayload.event="db_offhost_backup"
+    AND jsonPayload.outcome="failure"
+  EOT
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+}
+
+resource "google_logging_metric" "offhost_db_backup_runtime_error" {
+  count       = local.alerting_enabled && var.enable_offhost_db_backup ? 1 : 0
+  name        = "offhost_db_backup_runtime_error"
+  description = "Cloud Run backup job errors, including failures before export.sh can emit its structured event."
+  filter      = <<-EOT
+    resource.type="cloud_run_job"
+    AND resource.labels.job_name="blueprint-db-offhost-backup"
+    AND severity>=ERROR
+  EOT
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+}
+
+resource "google_logging_metric" "offhost_db_backup_scheduler_error" {
+  count       = local.alerting_enabled && var.enable_offhost_db_backup ? 1 : 0
+  name        = "offhost_db_backup_scheduler_error"
+  description = "Cloud Scheduler invocation failures for the independent database backup job."
+  filter      = <<-EOT
+    resource.type="cloud_scheduler_job"
+    AND resource.labels.job_id="blueprint-db-offhost-backup"
+    AND severity>=ERROR
+  EOT
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+}
+
+resource "google_monitoring_alert_policy" "offhost_db_backup_failure" {
+  count        = local.alerting_enabled && var.enable_offhost_db_backup ? 1 : 0
+  display_name = "Database: independent backup export failed"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "Structured export failure in 15 min"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.offhost_db_backup_failure[0].name}\" AND resource.type=\"cloud_run_job\""
+      duration        = "0s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+
+      aggregations {
+        alignment_period   = "900s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  conditions {
+    display_name = "Backup job runtime error in 15 min"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.offhost_db_backup_runtime_error[0].name}\" AND resource.type=\"cloud_run_job\""
+      duration        = "0s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+
+      aggregations {
+        alignment_period   = "900s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  conditions {
+    display_name = "Backup scheduler error in 15 min"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.offhost_db_backup_scheduler_error[0].name}\" AND resource.type=\"cloud_scheduler_job\""
+      duration        = "0s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+
+      aggregations {
+        alignment_period   = "900s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "The independent recovery-project Cloud SQL export failed or refused to overlap another Cloud SQL operation. Check the `blueprint-db-offhost-backup` Cloud Run Job logs and the Cloud SQL operation. Do not grant the source runner Storage-reader or KMS-decrypt access as a workaround."
+    mime_type = "text/markdown"
+  }
+}
+
+resource "google_monitoring_alert_policy" "offhost_db_backup_missing" {
+  count        = local.alerting_enabled && var.enable_offhost_db_backup ? 1 : 0
+  display_name = "Database: independent backup missing for 23 hours"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "No completed off-host export for 23 hours"
+    condition_absent {
+      filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.offhost_db_backup_success[0].name}\" AND resource.type=\"cloud_run_job\""
+      duration = "82800s"
+
+      aggregations {
+        alignment_period   = "3600s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "No successful independent recovery-project export was recorded for 23 hours. The default schedule runs twice daily; verify Scheduler execution, Cloud Run Job logs, the Cloud SQL operation, and the recovery bucket writer-only IAM binding. Immediate Scheduler and Cloud Run error conditions cover failures before the first success metric exists. Native Cloud SQL PITR remains the short-window recovery tier."
+    mime_type = "text/markdown"
+  }
+}
+
 # AlloyDB CPU alert was removed when alloydb.tf was archived (Cloud SQL CPU
 # alert above remains the active DB CPU monitor). To restore, mirror the
 # cloudsql_cpu block above and target resource.type

@@ -992,6 +992,7 @@ async def check_landed_vs_reported_merges(ctx: SweepContext) -> List[CheckResult
     """
     from app.landed_signal import has_landed_signal
     from app.models import Artifact, ArtifactType, Task, TaskStatus
+    from sqlalchemy.orm import load_only
 
     # Bounded: newest PR-artifact task ids first, capped at the sample limit.
     pr_task_id_rows = (
@@ -1015,7 +1016,17 @@ async def check_landed_vs_reported_merges(ctx: SweepContext) -> List[CheckResult
 
     tasks = (
         await ctx.session.execute(
-            select(Task).where(
+            select(Task)
+            .options(
+                load_only(
+                    Task.id,
+                    Task.project_id,
+                    Task.status,
+                    Task.context,
+                    raiseload=True,
+                )
+            )
+            .where(
                 Task.id.in_(pr_task_ids),
                 Task.status == TaskStatus.COMPLETED,
             )
@@ -1896,10 +1907,20 @@ async def check_rollup_child_landing_credit(ctx: SweepContext) -> List[CheckResu
         has_merge_unblock_signal,
     )
     from app.models import Task, TaskStatus
+    from sqlalchemy.orm import load_only
 
     tasks = (
         await ctx.session.execute(
             select(Task)
+            .options(
+                load_only(
+                    Task.id,
+                    Task.project_id,
+                    Task.status,
+                    Task.context,
+                    raiseload=True,
+                )
+            )
             .where(Task.status == TaskStatus.COMPLETED)
             # Order by created_at, NOT Task.id: task ids are uuid4 (non-monotonic),
             # so id.desc() yields a quasi-static RANDOM subset instead of the most
@@ -2459,6 +2480,7 @@ async def check_first_attempt_rate_denominator_coverage(
     than ``_FA_MIN_SAMPLE`` eligible tasks.
     """
     from app.models import Project, Task, TaskStatus
+    from sqlalchemy.orm import load_only
 
     cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
     projects = (
@@ -2481,6 +2503,14 @@ async def check_first_attempt_rate_denominator_coverage(
         tasks = (
             await ctx.session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.context,
+                        Task.payloads,
+                        raiseload=True,
+                    )
+                )
                 .where(
                     Task.project_id == project_id,
                     Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED)),
@@ -2698,6 +2728,7 @@ async def check_undeclared_test_cochange_coverage_split(
     )
     from app.landed_signal import has_landed_signal
     from app.models import Artifact, ArtifactType, Task, TaskStatus
+    from sqlalchemy.orm import load_only
 
     # Bounded: newest PR-artifact task ids first, capped at the sample limit.
     pr_task_id_rows = (
@@ -2721,7 +2752,17 @@ async def check_undeclared_test_cochange_coverage_split(
 
     tasks = (
         await ctx.session.execute(
-            select(Task).where(
+            select(Task)
+            .options(
+                load_only(
+                    Task.id,
+                    Task.project_id,
+                    Task.status,
+                    Task.context,
+                    raiseload=True,
+                )
+            )
+            .where(
                 Task.id.in_(pr_task_ids),
                 Task.status == TaskStatus.COMPLETED,
             )
@@ -3541,10 +3582,21 @@ async def check_merged_pr_count_consistency(ctx: SweepContext) -> List[CheckResu
     from app.efficiency_snapshot import _rollup_parent_ids
     from app.landed_signal import is_merged_completion
     from app.models import Task, TaskStatus
+    from sqlalchemy.orm import load_only
 
     tasks = (
         await ctx.session.execute(
             select(Task)
+            .options(
+                load_only(
+                    Task.id,
+                    Task.project_id,
+                    Task.parent_task_id,
+                    Task.status,
+                    Task.context,
+                    raiseload=True,
+                )
+            )
             .where(Task.status == TaskStatus.COMPLETED)
             # Order by created_at, NOT Task.id: task ids are uuid4 (non-monotonic),
             # so id.desc() yields a quasi-random subset instead of the most recent
@@ -5366,6 +5418,7 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
     Bounded to ``ctx.max_projects`` projects and ``ctx.sample_limit`` trial tasks.
     """
     from app.models import Project, Task, TaskStatus
+    from sqlalchemy.orm import load_only
 
     cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
 
@@ -5392,6 +5445,14 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
         trial_tasks = (
             await ctx.session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.context,
+                        Task.payloads,
+                        raiseload=True,
+                    )
+                )
                 .where(
                     Task.project_id == project_id,
                     Task.status == TaskStatus.COMPLETED,
