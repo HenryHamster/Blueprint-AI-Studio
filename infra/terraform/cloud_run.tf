@@ -161,8 +161,16 @@ resource "google_cloud_run_v2_service" "orchestrator" {
   }
 }
 
-# Allow unauthenticated access to the Cloud Run service (for webhooks and public API endpoints)
+# Allow unauthenticated access for webhooks and public API endpoints. During a
+# local-control-plane cutover, explicitly setting the variable false removes
+# this binding without destroying the service, preserving a rollback target.
+moved {
+  from = google_cloud_run_service_iam_member.public_access
+  to   = google_cloud_run_service_iam_member.public_access[0]
+}
+
 resource "google_cloud_run_service_iam_member" "public_access" {
+  count    = var.enable_public_orchestrator_access ? 1 : 0
   location = google_cloud_run_v2_service.orchestrator.location
   project  = google_cloud_run_v2_service.orchestrator.project
   service  = google_cloud_run_v2_service.orchestrator.name
@@ -312,7 +320,8 @@ resource "google_cloud_run_v2_job_iam_member" "orchestrator_runs_agent_job" {
 # ==============================================================================
 # Cloud Armor — rate limiting and adaptive DDoS protection
 # ==============================================================================
-# The orchestrator Cloud Run service is publicly accessible (allUsers invoker)
+# The orchestrator Cloud Run service is publicly accessible only while
+# enable_public_orchestrator_access=true (the backward-compatible default).
 # for GitHub webhooks and agent callbacks. Cloud Armor sits in front of the
 # service via a Global HTTPS Load Balancer with a Serverless NEG backend to
 # enforce per-IP rate limits and Adaptive Protection layer-7 DDoS defense.

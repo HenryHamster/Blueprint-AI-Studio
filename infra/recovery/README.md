@@ -57,6 +57,16 @@ Set `enable_restore_verifier=true` only after supplying:
 - the recovery VPC network and subnetwork;
 - the exact expected Alembic revision.
 
+The network names alone are not sufficient. Before enabling the verifier,
+enable both `compute.googleapis.com` and `servicenetworking.googleapis.com` in
+the recovery project, reserve an internal peering range for Google managed
+services, and create Private Services Access from the recovery VPC to
+`servicenetworking.googleapis.com`. Confirm that a private-IP-only PostgreSQL
+15 Cloud SQL instance can be created on that network and reached from the
+selected Cloud Run Direct VPC egress subnet. This Terraform root deliberately
+does not create the VPC, reserved range, or private service connection.
+Keep `enable_restore_verifier=false` until all of those prerequisites exist.
+
 Terraform then creates two recovery-project Cloud Run jobs. A weekly drill
 integrity-checks the newest manifest/archive pair, creates a private
 PostgreSQL 15 Cloud SQL instance, imports and probes it, writes evidence, and

@@ -212,10 +212,9 @@ locals {
     resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/user-")
   EOT
 
-  local_worker_agent_secret_condition = <<-EOT
-    resource.name.startsWith("projects/${var.project_id}/secrets/agent-creds-") ||
-    resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/agent-creds-")
-  EOT
+  # Keep the IAM condition byte-stable across Windows and Linux Terraform
+  # clients. A CRLF-only heredoc drift otherwise forces replacement.
+  local_worker_agent_secret_condition = "resource.name.startsWith(\"projects/${var.project_id}/secrets/agent-creds-\") ||\nresource.name.startsWith(\"projects/${data.google_project.local_worker_project.number}/secrets/agent-creds-\")\n"
 }
 
 resource "google_project_iam_member" "local_worker_agent_secret_deleter" {

@@ -13,6 +13,11 @@ output "orchestrator_url" {
   description = "The public URL of the Orchestrator Cloud Run service"
 }
 
+output "public_orchestrator_access_enabled" {
+  value       = var.enable_public_orchestrator_access
+  description = "Whether Terraform grants allUsers the Cloud Run invoker role. Set false as the explicit public Cloud Run cutover fence."
+}
+
 output "orchestrator_service_account" {
   value       = google_service_account.orchestrator_sa.email
   description = "The Service Account email used by the Orchestrator"

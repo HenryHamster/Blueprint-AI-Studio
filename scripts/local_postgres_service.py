@@ -11,11 +11,15 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from pathlib import PurePosixPath
+from typing import Any, Mapping
 
 _CONTAINER_NAME = "blueprint-local-postgres"
 _NETWORK_ALIAS = "blueprint-postgres"
@@ -34,6 +38,21 @@ _IMAGE_DIGEST_RE = re.compile(
     r"^(?:(?:docker\.io/)?library/)?postgres:15@sha256:[0-9a-f]{64}$"
 )
 _NETWORK_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$")
+_DEFAULT_CPU_LIMIT = "4"
+_DEFAULT_MEMORY_BYTES = 12 * 1024**3
+_DEFAULT_MAX_CONNECTIONS = 200
+_DEFAULT_MIN_FREE_DISK_BYTES = 20 * 1024**3
+_DEFAULT_PGDATA = _DATA_TARGET
+
+
+@dataclass(frozen=True)
+class PostgresRuntime:
+    cpu_limit: str
+    nano_cpus: int
+    memory_bytes: int
+    max_connections: int
+    min_free_disk_bytes: int
+    pgdata: str
 
 
 def _required_env(name: str) -> str:
@@ -43,6 +62,129 @@ def _required_env(name: str) -> str:
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ValueError(f"{name} contains control characters")
     return value
+
+
+def _config_or_default(
+    values: Mapping[str, str], name: str, default: str
+) -> str:
+    value = values.get(name, default).strip()
+    if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{name} contains invalid characters")
+    if any(char.isspace() for char in value):
+        raise ValueError(f"{name} must not contain whitespace")
+    return value
+
+
+def _bounded_integer(
+    values: Mapping[str, str],
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = _config_or_default(values, name, str(default))
+    if not raw.isdigit() or raw.startswith("0"):
+        raise ValueError(f"{name} must be a positive decimal integer")
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def parse_runtime_config(values: Mapping[str, str]) -> PostgresRuntime:
+    """Parse the Docker/PostgreSQL runtime contract without host side effects."""
+    cpu_limit = _config_or_default(
+        values,
+        "BLUEPRINT_POSTGRES_CPU_LIMIT", _DEFAULT_CPU_LIMIT
+    )
+    if not re.fullmatch(
+        r"(?:[1-9][0-9]*(?:\.[0-9]{1,3})?|0\.[0-9]{1,3})",
+        cpu_limit,
+    ):
+        raise ValueError(
+            "BLUEPRINT_POSTGRES_CPU_LIMIT must be a positive decimal number"
+        )
+    try:
+        cpu_decimal = Decimal(cpu_limit)
+    except InvalidOperation as exc:
+        raise ValueError(
+            "BLUEPRINT_POSTGRES_CPU_LIMIT must be a positive decimal number"
+        ) from exc
+    nano_cpus_decimal = cpu_decimal * Decimal(1_000_000_000)
+    if (
+        cpu_decimal < Decimal("0.001")
+        or cpu_decimal > 256
+        or nano_cpus_decimal != nano_cpus_decimal.to_integral_value()
+    ):
+        raise ValueError(
+            "BLUEPRINT_POSTGRES_CPU_LIMIT must be from 0.001 to 256 CPUs "
+            "at nanocpu precision"
+        )
+
+    memory_bytes = _bounded_integer(
+        values,
+        "BLUEPRINT_POSTGRES_MEMORY_BYTES",
+        _DEFAULT_MEMORY_BYTES,
+        1024**3,
+        1024**4,
+    )
+    max_connections = _bounded_integer(
+        values,
+        "BLUEPRINT_POSTGRES_MAX_CONNECTIONS",
+        _DEFAULT_MAX_CONNECTIONS,
+        20,
+        10_000,
+    )
+    min_free_disk_bytes = _bounded_integer(
+        values,
+        "BLUEPRINT_POSTGRES_MIN_FREE_DISK_BYTES",
+        _DEFAULT_MIN_FREE_DISK_BYTES,
+        1024**3,
+        1024**5,
+    )
+
+    pgdata = _config_or_default(
+        values, "BLUEPRINT_POSTGRES_PGDATA", _DEFAULT_PGDATA
+    )
+    parsed_pgdata = PurePosixPath(pgdata)
+    postgres_root = PurePosixPath("/var/lib/postgresql")
+    if (
+        not parsed_pgdata.is_absolute()
+        or pgdata != str(parsed_pgdata)
+        or "," in pgdata
+        or parsed_pgdata == postgres_root
+        or postgres_root not in parsed_pgdata.parents
+        or ".." in pgdata.split("/")
+        or pgdata == _PASSWORD_TARGET
+    ):
+        raise ValueError(
+            "BLUEPRINT_POSTGRES_PGDATA must be a child of /var/lib/postgresql"
+        )
+    return PostgresRuntime(
+        cpu_limit=cpu_limit,
+        nano_cpus=int(nano_cpus_decimal),
+        memory_bytes=memory_bytes,
+        max_connections=max_connections,
+        min_free_disk_bytes=min_free_disk_bytes,
+        pgdata=pgdata,
+    )
+
+
+def _runtime() -> PostgresRuntime:
+    return parse_runtime_config(os.environ)
+
+
+def _free_disk_bytes(path: Path) -> int:
+    return int(shutil.disk_usage(path).free)
+
+
+def _require_disk_headroom(path: Path, runtime: PostgresRuntime) -> None:
+    free = _free_disk_bytes(path)
+    if free < runtime.min_free_disk_bytes:
+        raise RuntimeError(
+            f"PostgreSQL data filesystem has {free} bytes free; "
+            f"requires at least {runtime.min_free_disk_bytes}"
+        )
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -329,7 +471,9 @@ def _assert_matching_container(
     network: str,
     data_dir: Path,
     password_file: Path,
+    runtime: PostgresRuntime | None = None,
 ) -> None:
+    runtime = runtime or _runtime()
     config = payload.get("Config") or {}
     host = payload.get("HostConfig") or {}
     state = payload.get("State") or {}
@@ -348,7 +492,7 @@ def _assert_matching_container(
         raise RuntimeError("existing PostgreSQL container publishes host ports")
 
     mounts = _mount_map(payload)
-    data_mount = mounts.get(_DATA_TARGET) or {}
+    data_mount = mounts.get(runtime.pgdata) or {}
     password_mount = mounts.get(_PASSWORD_TARGET) or {}
     if (
         data_mount.get("Type") != "bind"
@@ -362,7 +506,7 @@ def _assert_matching_container(
         or password_mount.get("RW") is not False
     ):
         raise RuntimeError("existing PostgreSQL container has a mismatched password mount")
-    if set(mounts) != {_DATA_TARGET, _PASSWORD_TARGET}:
+    if set(mounts) != {runtime.pgdata, _PASSWORD_TARGET}:
         raise RuntimeError("existing PostgreSQL container has unexpected mounts")
 
     container_env = {}
@@ -371,6 +515,7 @@ def _assert_matching_container(
             key, value = item.split("=", 1)
             container_env[key] = value
     expected_env = {
+        "PGDATA": runtime.pgdata,
         "POSTGRES_PASSWORD_FILE": _PASSWORD_TARGET,
         "POSTGRES_USER": _POSTGRES_USER,
         "POSTGRES_DB": _POSTGRES_DB,
@@ -388,8 +533,8 @@ def _assert_matching_container(
         raise RuntimeError("existing PostgreSQL container has mismatched configuration")
     log_config = host.get("LogConfig") or {}
     if (
-        host.get("Memory") != 2 * 1024**3
-        or host.get("NanoCpus") != 2_000_000_000
+        host.get("Memory") != runtime.memory_bytes
+        or host.get("NanoCpus") != runtime.nano_cpus
         or host.get("PidsLimit") != 256
         or host.get("ShmSize") != 256 * 1024**2
         or log_config.get("Type") != "json-file"
@@ -398,6 +543,12 @@ def _assert_matching_container(
         or (host.get("RestartPolicy") or {}).get("Name") != "unless-stopped"
     ):
         raise RuntimeError("existing PostgreSQL container has mismatched resource limits")
+    if config.get("Cmd") != [
+        "postgres",
+        "-c",
+        f"max_connections={runtime.max_connections}",
+    ]:
+        raise RuntimeError("existing PostgreSQL container has mismatched max_connections")
     if "no-new-privileges" not in (host.get("SecurityOpt") or []):
         raise RuntimeError("existing PostgreSQL container lacks no-new-privileges")
     if state.get("Dead") is True:
@@ -410,6 +561,7 @@ def _run_command(
     network: str,
     data_dir: Path,
     password_file: Path,
+    runtime: PostgresRuntime,
 ) -> list[str]:
     return [
         "docker",
@@ -426,9 +578,11 @@ def _run_command(
         "--network-alias",
         _NETWORK_ALIAS,
         "--mount",
-        f"type=bind,src={data_dir},dst={_DATA_TARGET}",
+        f"type=bind,src={data_dir},dst={runtime.pgdata}",
         "--mount",
         f"type=bind,src={password_file},dst={_PASSWORD_TARGET},readonly",
+        "--env",
+        f"PGDATA={runtime.pgdata}",
         "--env",
         f"POSTGRES_PASSWORD_FILE={_PASSWORD_TARGET}",
         "--env",
@@ -436,9 +590,9 @@ def _run_command(
         "--env",
         f"POSTGRES_DB={_POSTGRES_DB}",
         "--memory",
-        "2g",
+        str(runtime.memory_bytes),
         "--cpus",
-        "2",
+        runtime.cpu_limit,
         "--pids-limit",
         "256",
         "--shm-size",
@@ -462,12 +616,19 @@ def _run_command(
         "--health-retries",
         "6",
         image,
+        "postgres",
+        "-c",
+        f"max_connections={runtime.max_connections}",
     ]
 
 
 def _configuration(
-    *, inspect_contents: bool, create_resources: bool
-) -> tuple[str, str, Path, Path, str]:
+    *,
+    inspect_contents: bool,
+    create_resources: bool,
+    require_headroom: bool,
+) -> tuple[str, str, Path, Path, str, PostgresRuntime]:
+    runtime = _runtime()
     image = _required_env("BLUEPRINT_POSTGRES_IMAGE_ID")
     image_id = _inspect_image(image)
     network = _required_env("BLUEPRINT_CONTROL_PLANE_NETWORK")
@@ -484,13 +645,16 @@ def _configuration(
         # create a root-owned substitute after an operator path mistake.
         create=False,
     )
-    return image, image_id, data_dir, password_file, state
+    if require_headroom:
+        _require_disk_headroom(data_dir, runtime)
+    return image, image_id, data_dir, password_file, state, runtime
 
 
 def start() -> int:
-    image, image_id, data_dir, password_file, _ = _configuration(
+    image, image_id, data_dir, password_file, _, runtime = _configuration(
         inspect_contents=False,
         create_resources=True,
+        require_headroom=True,
     )
     network = _required_env("BLUEPRINT_CONTROL_PLANE_NETWORK")
     existing = _inspect_container()
@@ -501,6 +665,7 @@ def start() -> int:
             network=network,
             data_dir=data_dir,
             password_file=password_file,
+            runtime=runtime,
         )
         if (existing.get("State") or {}).get("Running") is True:
             print("PostgreSQL container is already running.")
@@ -525,6 +690,7 @@ def start() -> int:
                 network=network,
                 data_dir=data_dir,
                 password_file=password_file,
+                runtime=runtime,
             )
         )
     if result.returncode != 0:
@@ -538,9 +704,10 @@ def stop() -> int:
     if existing is None:
         print("PostgreSQL container is already absent.")
         return 0
-    _, image_id, data_dir, password_file, _ = _configuration(
+    _, image_id, data_dir, password_file, _, runtime = _configuration(
         inspect_contents=False,
         create_resources=False,
+        require_headroom=False,
     )
     network = _required_env("BLUEPRINT_CONTROL_PLANE_NETWORK")
     _assert_matching_container(
@@ -549,6 +716,7 @@ def stop() -> int:
         network=network,
         data_dir=data_dir,
         password_file=password_file,
+        runtime=runtime,
     )
     if (existing.get("State") or {}).get("Running") is not True:
         print("PostgreSQL container is already stopped.")
@@ -565,9 +733,10 @@ def status() -> int:
     if existing is None:
         print("absent")
         return 3
-    _, image_id, data_dir, password_file, _ = _configuration(
+    _, image_id, data_dir, password_file, _, runtime = _configuration(
         inspect_contents=False,
         create_resources=False,
+        require_headroom=False,
     )
     network = _required_env("BLUEPRINT_CONTROL_PLANE_NETWORK")
     _assert_matching_container(
@@ -576,6 +745,7 @@ def status() -> int:
         network=network,
         data_dir=data_dir,
         password_file=password_file,
+        runtime=runtime,
     )
     state = existing.get("State") or {}
     if state.get("Running") is True:
@@ -586,13 +756,31 @@ def status() -> int:
     return 3
 
 
+def check() -> int:
+    _configuration(
+        inspect_contents=True,
+        create_resources=True,
+        require_headroom=True,
+    )
+    print("PostgreSQL configuration is ready.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
-    if len(args) != 1 or args[0] not in {"start", "stop", "status"}:
-        print("usage: local_postgres_service.py {start|stop|status}", file=sys.stderr)
+    if len(args) != 1 or args[0] not in {"check", "start", "stop", "status"}:
+        print(
+            "usage: local_postgres_service.py {check|start|stop|status}",
+            file=sys.stderr,
+        )
         return 2
     try:
-        return {"start": start, "stop": stop, "status": status}[args[0]]()
+        return {
+            "check": check,
+            "start": start,
+            "stop": stop,
+            "status": status,
+        }[args[0]]()
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: PostgreSQL service preflight failed: {exc}", file=sys.stderr)
         return 1

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import errno
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -36,12 +37,14 @@ except ImportError:  # pragma: no cover - Windows has no systemd either.
     pwd = None  # type: ignore[assignment]
 
 import blueprint_runner as runner
+import local_postgres_service as postgres_service
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _LOCAL_RUNNER = _SCRIPT_DIR / "local_runner.py"
 _CLOUD_SQL_PROXY_SERVICE = _SCRIPT_DIR / "cloud_sql_proxy_service.py"
 _LOCAL_POSTGRES_SERVICE = _SCRIPT_DIR / "local_postgres_service.py"
 _LOCAL_POSTGRES_BACKUP_SERVICE = _SCRIPT_DIR / "local_postgres_backup_service.py"
+_LOCAL_POSTGRES_CUTOVER = _SCRIPT_DIR / "local_postgres_cutover.py"
 _LOCAL_API_SERVICE = _SCRIPT_DIR / "local_api_service.py"
 _LOCAL_WORKER_SERVICE = _SCRIPT_DIR / "local_worker_service.py"
 _TAILSCALE_FUNNEL_SERVICE = _SCRIPT_DIR / "tailscale_funnel_service.py"
@@ -58,11 +61,21 @@ _DATABASE_BACKUP_TIMER_TEMPLATE = (
 )
 _MANIFEST_VERSION = 1
 _SYSTEM_NODE_ROOT = Path("/etc/blueprint/nodes")
+_SYSTEM_SCRIPT_ROOT = Path("/usr/local/lib/blueprint-node")
 _SYSTEM_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _POSTGRES_CONTAINER_UID = 999
 _POSTGRES_CONTAINER_GID = 999
 _LOCAL_DATABASE_ROOTS = (Path("/var/lib/blueprint"), Path("/srv/blueprint"))
 _TRUSTED_PATH_UID = 0
+
+_LOCAL_CONTROL_PLANE_SCRIPT_SOURCES = (
+    _LOCAL_POSTGRES_SERVICE,
+    _LOCAL_POSTGRES_BACKUP_SERVICE,
+    _LOCAL_POSTGRES_CUTOVER,
+    _LOCAL_API_SERVICE,
+    _LOCAL_WORKER_SERVICE,
+    _TAILSCALE_FUNNEL_SERVICE,
+)
 
 
 @dataclass(frozen=True)
@@ -348,6 +361,107 @@ def _prepare_system_node_root(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
+def _system_script_bundle() -> tuple[dict[Path, Path], dict[Path, bytes]]:
+    """Return content-addressed install targets for local control-plane scripts."""
+    payloads = {
+        source: source.read_bytes()
+        for source in _LOCAL_CONTROL_PLANE_SCRIPT_SOURCES
+    }
+    digest = hashlib.sha256()
+    for source in sorted(payloads, key=lambda item: item.name):
+        name = source.name.encode("utf-8")
+        payload = payloads[source]
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    bundle_dir = _SYSTEM_SCRIPT_ROOT / digest.hexdigest()
+    targets = {source: bundle_dir / source.name for source in payloads}
+    return targets, {targets[source]: payload for source, payload in payloads.items()}
+
+
+def _prepare_system_script_bundle_dir(bundle_dir: Path) -> None:
+    """Create a root-owned immutable-script directory without following symlinks."""
+    if bundle_dir.parent != _SYSTEM_SCRIPT_ROOT:
+        raise ValueError("system script bundle must be directly below the trusted root")
+    for directory in (_SYSTEM_SCRIPT_ROOT, bundle_dir):
+        if directory.is_symlink():
+            raise ValueError(f"refusing symlinked system script directory {directory}")
+        directory.mkdir(parents=True, mode=0o755, exist_ok=True)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"system script directory {directory} is not a real directory")
+        if os.name != "nt" and (
+            info.st_uid != _TRUSTED_PATH_UID or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise ValueError(
+                f"system script directory {directory} must be root-owned and "
+                "not group/world-writable"
+            )
+
+
+def _validate_installed_system_script(path: Path, expected: bytes) -> None:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"installed system script {path} is not a regular file")
+    if path.read_bytes() != expected:
+        raise ValueError(f"installed system script {path} does not match its digest")
+    if os.name != "nt" and (
+        info.st_uid != _TRUSTED_PATH_UID or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise ValueError(
+            f"installed system script {path} must be root-owned and "
+            "not group/world-writable"
+        )
+
+
+def _trusted_system_python(value: str | None = None) -> Path:
+    """Resolve the persistent system interpreter through a trusted path."""
+    raw = Path(value or sys.executable)
+    if not raw.is_absolute():
+        raise ValueError("system Python interpreter must be an absolute path")
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("system Python interpreter is not accessible") from exc
+    info = resolved.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("system Python interpreter must resolve to a regular file")
+    if not stat.S_IMODE(info.st_mode) & 0o111:
+        raise ValueError("system Python interpreter must be executable")
+    if os.name != "nt" and (
+        info.st_uid != _TRUSTED_PATH_UID or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise ValueError(
+            "system Python interpreter must be root-owned and not "
+            "group/world-writable"
+        )
+    if os.name != "nt":
+        current = resolved.parent
+        while True:
+            ancestor = current.lstat()
+            if (
+                not stat.S_ISDIR(ancestor.st_mode)
+                or stat.S_ISLNK(ancestor.st_mode)
+                or ancestor.st_uid != _TRUSTED_PATH_UID
+                or stat.S_IMODE(ancestor.st_mode) & 0o022
+            ):
+                raise ValueError(
+                    "system Python interpreter ancestors must be root-owned "
+                    "directories and not group/world-writable"
+                )
+            if current == current.parent:
+                break
+            current = current.parent
+    return resolved
+
+
+def _python_for_unit(*, profile: str, system: bool) -> Path:
+    if profile == "local-control-plane" and system:
+        return _trusted_system_python()
+    return Path(sys.executable)
+
+
 def _portable_prepare_local_postgres_data_dir(path: Path) -> Path:
     """Windows-only test fallback; production uses descriptor-relative traversal."""
     current = path
@@ -565,12 +679,18 @@ def _atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
 
 
-def _atomic_write_bytes(path: Path, payload: bytes, *, mode: int) -> None:
+def _atomic_write_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    mode: int,
+    parent_mode: int | None = 0o700,
+) -> None:
     """Atomically replace a file while retaining an explicit reviewed mode."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
+    if os.name != "nt" and parent_mode is not None:
         try:
-            os.chmod(path.parent, 0o700)
+            os.chmod(path.parent, parent_mode)
         except OSError:
             pass
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -596,6 +716,7 @@ class _FileSnapshot:
     existed: bool
     payload: bytes = b""
     mode: int = 0
+    parent_mode: int | None = None
 
 
 def _snapshot_file(path: Path) -> _FileSnapshot:
@@ -605,7 +726,12 @@ def _snapshot_file(path: Path) -> _FileSnapshot:
         return _FileSnapshot(False)
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise ValueError(f"refusing to replace non-regular install target {path}")
-    return _FileSnapshot(True, path.read_bytes(), stat.S_IMODE(info.st_mode))
+    return _FileSnapshot(
+        True,
+        path.read_bytes(),
+        stat.S_IMODE(info.st_mode),
+        stat.S_IMODE(path.parent.lstat().st_mode),
+    )
 
 
 def _restore_files(snapshots: dict[Path, _FileSnapshot]) -> list[str]:
@@ -613,7 +739,12 @@ def _restore_files(snapshots: dict[Path, _FileSnapshot]) -> list[str]:
     for path, snapshot in reversed(tuple(snapshots.items())):
         try:
             if snapshot.existed:
-                _atomic_write_bytes(path, snapshot.payload, mode=snapshot.mode)
+                _atomic_write_bytes(
+                    path,
+                    snapshot.payload,
+                    mode=snapshot.mode,
+                    parent_mode=snapshot.parent_mode,
+                )
             else:
                 path.unlink(missing_ok=True)
         except OSError as exc:
@@ -636,6 +767,7 @@ def _unit_state(
 def _rollback_install(
     *,
     units: list[str],
+    stop_only_units: list[str] | None = None,
     prior_states: dict[str, tuple[bool, bool]],
     snapshots: dict[Path, _FileSnapshot],
     system: bool,
@@ -644,6 +776,7 @@ def _rollback_install(
 ) -> None:
     """Restore both on-disk configuration and pre-install unit state."""
     failures: list[str] = []
+    stop_only_units = stop_only_units or []
     if services_mutated:
         for unit in reversed(units):
             result = _systemctl(
@@ -651,6 +784,10 @@ def _rollback_install(
             )
             if result.returncode != 0:
                 failures.append(f"stop/disable {unit}")
+        for unit in reversed(stop_only_units):
+            result = _systemctl(["stop", unit], system=system, _run=_run)
+            if result.returncode != 0:
+                failures.append(f"stop {unit}")
     failures.extend(_restore_files(snapshots))
     if _systemctl(["daemon-reload"], system=system, _run=_run).returncode != 0:
         failures.append("daemon-reload")
@@ -669,6 +806,13 @@ def _rollback_install(
                     != 0
                 ):
                     failures.append(f"restart {unit}")
+        for unit in stop_only_units:
+            _enabled, active = prior_states[unit]
+            if active and (
+                _systemctl(["start", unit], system=system, _run=_run).returncode
+                != 0
+            ):
+                failures.append(f"restart {unit}")
     if failures:
         print(
             "ERROR: install rollback was incomplete: " + ", ".join(failures),
@@ -709,7 +853,14 @@ def _active_legacy_runner_scopes(*, _run=subprocess.run) -> tuple[bool, ...]:
     )
 
 
-def _render_unit(role: str, *, profile: str, system: bool, env_file: Path) -> str:
+def _render_unit(
+    role: str,
+    *,
+    profile: str,
+    system: bool,
+    env_file: Path,
+    entrypoint: Path | None = None,
+) -> str:
     spec = _require_role(role)
     if not _profile_role_executable(profile, role):
         raise ValueError(f"role {role!r} is planned but not installable yet")
@@ -729,15 +880,27 @@ def _render_unit(role: str, *, profile: str, system: bool, env_file: Path) -> st
         else _USER_TEMPLATE
     )
     env_file_text = _require_safe_path(str(env_file), field="EnvironmentFile path")
-    if spec.entrypoint is None:
+    selected_entrypoint = entrypoint or spec.entrypoint
+    if selected_entrypoint is None:
         raise ValueError(f"role {role!r} has no executable entrypoint")
+    if profile == "local-control-plane" and system:
+        expected_entrypoints, _payloads = _system_script_bundle()
+        expected_entrypoint = expected_entrypoints.get(spec.entrypoint)
+        if expected_entrypoint is None:
+            raise ValueError(f"role {role!r} is missing from the immutable script bundle")
+        if entrypoint is not None and entrypoint != expected_entrypoint:
+            raise ValueError(
+                f"role {role!r} must execute its content-addressed system copy"
+            )
+        selected_entrypoint = expected_entrypoint
     requires = _profile_role_requires(profile, role)
+    selected_python = _python_for_unit(profile=profile, system=system)
     substitutions = {
         "@ROLE@": role,
-        "@PYTHON@": sys.executable,
-        "@EXECUTABLE@": str(spec.entrypoint),
+        "@PYTHON@": str(selected_python),
+        "@EXECUTABLE@": str(selected_entrypoint),
         "@EXEC_START_PRE@": (
-            f"ExecStartPre={sys.executable} {spec.entrypoint} --check"
+            f"ExecStartPre={selected_python} {selected_entrypoint} --check"
             if role != "executor"
             else ""
         ),
@@ -753,16 +916,28 @@ def _render_unit(role: str, *, profile: str, system: bool, env_file: Path) -> st
     return runner.render_unit(str(template), substitutions)
 
 
-def _render_database_backup_service(*, profile: str, system: bool, env_file: Path) -> str:
+def _render_database_backup_service(
+    *,
+    profile: str,
+    system: bool,
+    env_file: Path,
+    entrypoint: Path | None = None,
+) -> str:
     if profile != "local-control-plane" or not system:
         raise ValueError(
             "database backup service belongs only to the system local-control-plane"
         )
+    expected_entrypoints, _payloads = _system_script_bundle()
+    expected_entrypoint = expected_entrypoints[_LOCAL_POSTGRES_BACKUP_SERVICE]
+    if entrypoint is not None and entrypoint != expected_entrypoint:
+        raise ValueError(
+            "database backup must execute its content-addressed system copy"
+        )
     return runner.render_unit(
         str(_DATABASE_BACKUP_SYSTEM_TEMPLATE),
         {
-            "@PYTHON@": sys.executable,
-            "@EXECUTABLE@": str(_LOCAL_POSTGRES_BACKUP_SERVICE),
+            "@PYTHON@": str(_python_for_unit(profile=profile, system=system)),
+            "@EXECUTABLE@": str(expected_entrypoint),
             "@ENV_FILE@": _require_safe_path(
                 str(env_file), field="EnvironmentFile path"
             ),
@@ -810,8 +985,13 @@ def _service_role_env_text(
     values = dict(values)
     required = {
         "database": {
+            "BLUEPRINT_POSTGRES_CPU_LIMIT",
             "BLUEPRINT_POSTGRES_DATA_DIR",
             "BLUEPRINT_POSTGRES_IMAGE_ID",
+            "BLUEPRINT_POSTGRES_MAX_CONNECTIONS",
+            "BLUEPRINT_POSTGRES_MEMORY_BYTES",
+            "BLUEPRINT_POSTGRES_MIN_FREE_DISK_BYTES",
+            "BLUEPRINT_POSTGRES_PGDATA",
             "BLUEPRINT_POSTGRES_SECRETS_FILE",
             "BLUEPRINT_CONTROL_PLANE_NETWORK",
         },
@@ -874,6 +1054,8 @@ def _service_role_env_text(
         raise ValueError(f"{role} configuration has unsupported keys")
     for key, value in values.items():
         _require_safe_path(value, field=key)
+    if role == "database":
+        postgres_service.parse_runtime_config(values)
     if role in {"api", "edge"}:
         port_key = (
             "BLUEPRINT_API_PORT" if role == "api" else "BLUEPRINT_EDGE_API_PORT"
@@ -897,12 +1079,21 @@ def _service_role_env_text(
     )
 
 
-def _manifest(profile: str, *, system: bool, user: str | None = None) -> dict:
+def _manifest(
+    profile: str,
+    *,
+    system: bool,
+    user: str | None = None,
+    activation: str = "active",
+    entrypoints: dict[Path, Path] | None = None,
+) -> dict:
     roles = _require_profile(profile)
+    entrypoints = entrypoints or {}
     def role_payload(role: str) -> dict:
         payload = asdict(ROLE_SPECS[role])
         if payload["entrypoint"] is not None:
-            payload["entrypoint"] = str(payload["entrypoint"])
+            source = ROLE_SPECS[role].entrypoint
+            payload["entrypoint"] = str(entrypoints.get(source, source))
         payload["requires"] = list(_profile_role_requires(profile, role))
         return payload
 
@@ -910,6 +1101,7 @@ def _manifest(profile: str, *, system: bool, user: str | None = None) -> dict:
         "schema_version": _MANIFEST_VERSION,
         "profile": profile,
         "scope": "system" if system else "user",
+        "activation": activation,
         "node_root": str(node_root(system=system, user=user)),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "roles": [
@@ -966,6 +1158,7 @@ def do_install(
     token: str | None,
     url: str,
     dry_run: bool,
+    no_start: bool = False,
     resource_limits: dict[str, str] | None = None,
     role_configs: dict[str, dict[str, str]] | None = None,
     _run=subprocess.run,
@@ -1043,7 +1236,11 @@ def do_install(
     rendered: dict[str, str] = {}
     rendered_auxiliary: dict[str, str] = {}
     rendered_envs: dict[str, str] = {}
+    installed_entrypoints: dict[Path, Path] = {}
+    script_files_to_write: dict[Path, bytes] = {}
     try:
+        if profile == "local-control-plane" and system:
+            installed_entrypoints, script_files_to_write = _system_script_bundle()
         for role in executable_roles:
             rendered_envs[role] = (
                 _role_env_text(
@@ -1066,10 +1263,16 @@ def do_install(
                 profile=profile,
                 system=system,
                 env_file=env_path,
+                entrypoint=installed_entrypoints.get(ROLE_SPECS[role].entrypoint),
             )
             if role == "database-backup":
                 rendered_auxiliary[role] = _render_database_backup_service(
-                    profile=profile, system=system, env_file=env_path
+                    profile=profile,
+                    system=system,
+                    env_file=env_path,
+                    entrypoint=installed_entrypoints.get(
+                        _LOCAL_POSTGRES_BACKUP_SERVICE
+                    ),
                 )
     except (OSError, ValueError) as exc:
         print(f"ERROR: could not render node service: {exc}", file=sys.stderr)
@@ -1080,7 +1283,8 @@ def do_install(
         for role in executable_roles:
             print(f"[dry-run] would write: {unit_path(role, system=system)}")
             print(f"[dry-run] would seed:  {role_env_path(role, system=system, user=system_user)}")
-            print(f"[dry-run] would enable: {ROLE_SPECS[role].unit_name}")
+            action = "stage disabled/inactive" if no_start else "enable/start"
+            print(f"[dry-run] would {action}: {ROLE_SPECS[role].unit_name}")
             print(rendered[role])
             if role == "database-backup":
                 print(
@@ -1088,6 +1292,8 @@ def do_install(
                     f"{_database_backup_service_unit_path(system=system)}"
                 )
                 print(rendered_auxiliary[role])
+        for path in script_files_to_write:
+            print(f"[dry-run] would install immutable script: {path}")
         for role in planned_roles:
             print(f"[dry-run] planned, not installed: {role} ({ROLE_SPECS[role].description})")
         return 0
@@ -1104,15 +1310,28 @@ def do_install(
             ] = (rendered_auxiliary[role], 0o644)
     files_to_write[manifest_path(system=system, user=system_user)] = (
         json.dumps(
-            _manifest(profile, system=system, user=system_user), indent=2
+            _manifest(
+                profile,
+                system=system,
+                user=system_user,
+                activation="staged" if no_start else "active",
+                entrypoints=installed_entrypoints,
+            ),
+            indent=2,
         )
         + "\n",
         0o600,
     )
     units = [ROLE_SPECS[role].unit_name for role in executable_roles]
+    auxiliary_units = (
+        ["blueprint-database-backup.service"]
+        if profile == "local-control-plane"
+        else []
+    )
+    managed_units = [*units, *auxiliary_units]
     snapshots: dict[Path, _FileSnapshot] = {}
     prior_states = {
-        unit: _unit_state(unit, system=system, _run=_run) for unit in units
+        unit: _unit_state(unit, system=system, _run=_run) for unit in managed_units
     }
     try:
         if profile == "local-control-plane":
@@ -1124,15 +1343,32 @@ def do_install(
             _prepare_system_credential_dir(
                 credential_path, uid=credential_uid, gid=credential_gid
             )
+        if script_files_to_write:
+            _prepare_system_script_bundle_dir(
+                next(iter(script_files_to_write)).parent
+            )
         snapshots = {
-            path: _snapshot_file(path) for path in files_to_write
+            path: _snapshot_file(path)
+            for path in (*files_to_write, *script_files_to_write)
         }
         for path, (text, mode) in files_to_write.items():
             _atomic_write(path, text, mode=mode)
+        for path, payload in script_files_to_write.items():
+            _atomic_write_bytes(
+                path,
+                payload,
+                mode=0o555,
+                parent_mode=0o755,
+            )
+            if os.name != "nt":
+                os.chown(path, _TRUSTED_PATH_UID, -1)
+                os.chmod(path, 0o555)
+            _validate_installed_system_script(path, payload)
     except (OSError, ValueError) as exc:
         if snapshots:
             _rollback_install(
                 units=units,
+                stop_only_units=auxiliary_units,
                 prior_states=prior_states,
                 snapshots=snapshots,
                 system=system,
@@ -1145,6 +1381,7 @@ def do_install(
     if _systemctl(["daemon-reload"], system=system, _run=_run).returncode != 0:
         _rollback_install(
             units=units,
+            stop_only_units=auxiliary_units,
             prior_states=prior_states,
             snapshots=snapshots,
             system=system,
@@ -1153,25 +1390,15 @@ def do_install(
         )
         print("ERROR: systemctl daemon-reload failed", file=sys.stderr)
         return 1
-    for role in executable_roles:
-        unit = ROLE_SPECS[role].unit_name
-        result = _systemctl(["enable", "--now", unit], system=system, _run=_run)
-        if result.returncode != 0:
-            _rollback_install(
-                units=units,
-                prior_states=prior_states,
-                snapshots=snapshots,
-                system=system,
-                services_mutated=True,
-                _run=_run,
+    if no_start:
+        for unit in units:
+            result = _systemctl(
+                ["disable", "--now", unit], system=system, _run=_run
             )
-            print(f"ERROR: could not enable {unit}: {(result.stderr or '').strip()}", file=sys.stderr)
-            return 1
-        if prior_states[unit][1]:
-            result = _systemctl(["restart", unit], system=system, _run=_run)
             if result.returncode != 0:
                 _rollback_install(
                     units=units,
+                    stop_only_units=auxiliary_units,
                     prior_states=prior_states,
                     snapshots=snapshots,
                     system=system,
@@ -1179,28 +1406,117 @@ def do_install(
                     _run=_run,
                 )
                 print(
-                    f"ERROR: could not restart {unit} with updated configuration: "
+                    f"ERROR: could not stage {unit} disabled/inactive: "
                     f"{(result.stderr or '').strip()}",
                     file=sys.stderr,
                 )
                 return 1
-        if _systemctl(["is-active", unit], system=system, _run=_run).returncode != 0:
+        for unit in auxiliary_units:
+            result = _systemctl(["stop", unit], system=system, _run=_run)
+            if result.returncode != 0:
+                _rollback_install(
+                    units=units,
+                    stop_only_units=auxiliary_units,
+                    prior_states=prior_states,
+                    snapshots=snapshots,
+                    system=system,
+                    services_mutated=True,
+                    _run=_run,
+                )
+                print(
+                    f"ERROR: could not stop staged auxiliary unit {unit}: "
+                    f"{(result.stderr or '').strip()}",
+                    file=sys.stderr,
+                )
+                return 1
+        staged_failures: list[str] = []
+        for unit in units:
+            if _systemctl(
+                ["is-active", unit], system=system, _run=_run
+            ).returncode == 0:
+                staged_failures.append(f"{unit} is still active")
+            if _systemctl(
+                ["is-enabled", unit], system=system, _run=_run
+            ).returncode == 0:
+                staged_failures.append(f"{unit} is still enabled")
+        for unit in auxiliary_units:
+            if _systemctl(
+                ["is-active", unit], system=system, _run=_run
+            ).returncode == 0:
+                staged_failures.append(f"{unit} is still active")
+        if staged_failures:
             _rollback_install(
                 units=units,
+                stop_only_units=auxiliary_units,
                 prior_states=prior_states,
                 snapshots=snapshots,
                 system=system,
                 services_mutated=True,
                 _run=_run,
             )
-            print(f"ERROR: {unit} did not become active", file=sys.stderr)
+            print(
+                "ERROR: staged install state verification failed: "
+                + ", ".join(staged_failures),
+                file=sys.stderr,
+            )
             return 1
+    else:
+        for role in executable_roles:
+            unit = ROLE_SPECS[role].unit_name
+            result = _systemctl(["enable", "--now", unit], system=system, _run=_run)
+            if result.returncode != 0:
+                _rollback_install(
+                    units=units,
+                    stop_only_units=auxiliary_units,
+                    prior_states=prior_states,
+                    snapshots=snapshots,
+                    system=system,
+                    services_mutated=True,
+                    _run=_run,
+                )
+                print(
+                    f"ERROR: could not enable {unit}: "
+                    f"{(result.stderr or '').strip()}",
+                    file=sys.stderr,
+                )
+                return 1
+            if prior_states[unit][1]:
+                result = _systemctl(["restart", unit], system=system, _run=_run)
+                if result.returncode != 0:
+                    _rollback_install(
+                        units=units,
+                        stop_only_units=auxiliary_units,
+                        prior_states=prior_states,
+                        snapshots=snapshots,
+                        system=system,
+                        services_mutated=True,
+                        _run=_run,
+                    )
+                    print(
+                        f"ERROR: could not restart {unit} with updated configuration: "
+                        f"{(result.stderr or '').strip()}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            if _systemctl(["is-active", unit], system=system, _run=_run).returncode != 0:
+                _rollback_install(
+                    units=units,
+                    stop_only_units=auxiliary_units,
+                    prior_states=prior_states,
+                    snapshots=snapshots,
+                    system=system,
+                    services_mutated=True,
+                    _run=_run,
+                )
+                print(f"ERROR: {unit} did not become active", file=sys.stderr)
+                return 1
     if not system:
         _run(["loginctl", "enable-linger", _install_user()], capture_output=True, text=True)
 
     print(f"[blueprint-node] installed profile {profile}.")
     for role in executable_roles:
-        print(f"  active role:  {role} ({ROLE_SPECS[role].unit_name})")
+        state = "staged role" if no_start else "active role"
+        print(f"  {state}:  {role} ({ROLE_SPECS[role].unit_name})")
     for role in planned_roles:
         print(f"  planned role: {role} — not installed until its implementation lands")
     return 0
@@ -1292,6 +1608,11 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--system", action="store_true")
     install.add_argument("--url")
     install.add_argument("--dry-run", action="store_true")
+    install.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Install units disabled and inactive for an explicit staged cutover.",
+    )
     install.add_argument("--cloudsql-instance")
     install.add_argument("--cloudsql-proxy-binary")
     install.add_argument("--cloudsql-proxy-sha256")
@@ -1302,6 +1623,17 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--postgres-image-id")
     install.add_argument("--postgres-data-dir")
     install.add_argument("--postgres-secrets-file")
+    install.add_argument("--postgres-cpu-limit", default="4")
+    install.add_argument(
+        "--postgres-memory-bytes", default=str(12 * 1024**3)
+    )
+    install.add_argument("--postgres-max-connections", default="200")
+    install.add_argument(
+        "--postgres-min-free-disk-bytes", default=str(20 * 1024**3)
+    )
+    install.add_argument(
+        "--postgres-pgdata", default="/var/lib/postgresql/data"
+    )
     install.add_argument("--postgres-backup-project-id")
     install.add_argument("--postgres-backup-bucket")
     install.add_argument("--postgres-backup-credentials-file")
@@ -1372,6 +1704,15 @@ def main(argv: list[str] | None = None) -> int:
                         "BLUEPRINT_POSTGRES_IMAGE_ID": args.postgres_image_id,
                         "BLUEPRINT_POSTGRES_DATA_DIR": args.postgres_data_dir,
                         "BLUEPRINT_POSTGRES_SECRETS_FILE": args.postgres_secrets_file,
+                        "BLUEPRINT_POSTGRES_CPU_LIMIT": args.postgres_cpu_limit,
+                        "BLUEPRINT_POSTGRES_MEMORY_BYTES": args.postgres_memory_bytes,
+                        "BLUEPRINT_POSTGRES_MAX_CONNECTIONS": (
+                            args.postgres_max_connections
+                        ),
+                        "BLUEPRINT_POSTGRES_MIN_FREE_DISK_BYTES": (
+                            args.postgres_min_free_disk_bytes
+                        ),
+                        "BLUEPRINT_POSTGRES_PGDATA": args.postgres_pgdata,
                         "BLUEPRINT_CONTROL_PLANE_NETWORK": args.control_plane_network,
                     }.items()
                     if value
@@ -1433,6 +1774,7 @@ def main(argv: list[str] | None = None) -> int:
             token=resolve_install_token(system=args.system),
             url=runner.resolve_url(args.url),
             dry_run=args.dry_run,
+            no_start=args.no_start,
             resource_limits=limits,
             role_configs=role_configs,
         )

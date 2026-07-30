@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ MODULE_PATH = Path(__file__).with_name("local_postgres_service.py")
 SPEC = importlib.util.spec_from_file_location("local_postgres_service", MODULE_PATH)
 assert SPEC and SPEC.loader
 postgres = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = postgres
 SPEC.loader.exec_module(postgres)
 
 IMAGE_ID = f"sha256:{'a' * 64}"
@@ -43,6 +45,11 @@ class LocalPostgresServiceTests(unittest.TestCase):
             "BLUEPRINT_CONTROL_PLANE_NETWORK": NETWORK,
             "BLUEPRINT_POSTGRES_DATA_DIR": str(self.data),
             "BLUEPRINT_POSTGRES_SECRETS_FILE": str(self.password),
+            "BLUEPRINT_POSTGRES_CPU_LIMIT": "4",
+            "BLUEPRINT_POSTGRES_MEMORY_BYTES": str(12 * 1024**3),
+            "BLUEPRINT_POSTGRES_MAX_CONNECTIONS": "200",
+            "BLUEPRINT_POSTGRES_MIN_FREE_DISK_BYTES": str(1024**3),
+            "BLUEPRINT_POSTGRES_PGDATA": postgres._DEFAULT_PGDATA,
         }
         self.data_info = patch.object(
             postgres,
@@ -92,17 +99,19 @@ class LocalPostgresServiceTests(unittest.TestCase):
                     postgres._SERVICE_LABEL: postgres._SERVICE_LABEL_VALUE
                 },
                 "Env": [
+                    f"PGDATA={postgres._DEFAULT_PGDATA}",
                     f"POSTGRES_PASSWORD_FILE={postgres._PASSWORD_TARGET}",
                     f"POSTGRES_USER={postgres._POSTGRES_USER}",
                     f"POSTGRES_DB={postgres._POSTGRES_DB}",
                     "PG_MAJOR=15",
                 ],
+                "Cmd": ["postgres", "-c", "max_connections=200"],
             },
             "HostConfig": {
                 "NetworkMode": network,
                 "PortBindings": ports,
-                "Memory": 2 * 1024**3,
-                "NanoCpus": 2_000_000_000,
+                "Memory": 12 * 1024**3,
+                "NanoCpus": 4_000_000_000,
                 "PidsLimit": 256,
                 "ShmSize": 256 * 1024**2,
                 "SecurityOpt": ["no-new-privileges"],
@@ -179,15 +188,76 @@ class LocalPostgresServiceTests(unittest.TestCase):
             argv[argv.index("--network-alias") + 1], "blueprint-postgres"
         )
         self.assertEqual(argv[argv.index("--network") + 1], NETWORK)
-        self.assertEqual(argv[argv.index("--memory") + 1], "2g")
-        self.assertEqual(argv[argv.index("--cpus") + 1], "2")
+        self.assertEqual(argv[argv.index("--memory") + 1], str(12 * 1024**3))
+        self.assertEqual(argv[argv.index("--cpus") + 1], "4")
         self.assertEqual(argv[argv.index("--pids-limit") + 1], "256")
         self.assertIn("max-size=10m", argv)
         self.assertIn("max-file=3", argv)
-        self.assertEqual(argv[-1], IMAGE_ID)
+        self.assertEqual(
+            argv[-3:], ["postgres", "-c", "max_connections=200"]
+        )
+        self.assertEqual(argv[argv.index("--health-retries") + 2], IMAGE_ID)
         joined = " ".join(argv)
+        self.assertIn(f"PGDATA={postgres._DEFAULT_PGDATA}", joined)
         self.assertIn(f"POSTGRES_PASSWORD_FILE={postgres._PASSWORD_TARGET}", joined)
         self.assertNotIn("not-a-real-password", joined)
+
+    @patch.object(postgres, "_run")
+    def test_custom_resource_and_pgdata_configuration_reaches_docker(self, run):
+        run.side_effect = self.docker_side_effect()
+        env = {
+            **self.env,
+            "BLUEPRINT_POSTGRES_CPU_LIMIT": "2.5",
+            "BLUEPRINT_POSTGRES_MEMORY_BYTES": str(8 * 1024**3),
+            "BLUEPRINT_POSTGRES_MAX_CONNECTIONS": "350",
+            "BLUEPRINT_POSTGRES_PGDATA": "/var/lib/postgresql/blueprint-data",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(postgres.start(), 0)
+        argv = next(
+            call.args[0]
+            for call in run.call_args_list
+            if call.args[0][:2] == ["docker", "run"] and "--name" in call.args[0]
+        )
+        self.assertEqual(argv[argv.index("--cpus") + 1], "2.5")
+        self.assertEqual(argv[argv.index("--memory") + 1], str(8 * 1024**3))
+        self.assertIn("dst=/var/lib/postgresql/blueprint-data", " ".join(argv))
+        self.assertEqual(argv[-1], "max_connections=350")
+
+    def test_defaults_are_measured_server_limits(self):
+        with patch.dict(os.environ, {}, clear=True):
+            runtime = postgres._runtime()
+        self.assertEqual(runtime.cpu_limit, "4")
+        self.assertEqual(runtime.memory_bytes, 12 * 1024**3)
+        self.assertEqual(runtime.max_connections, 200)
+        self.assertEqual(runtime.min_free_disk_bytes, 20 * 1024**3)
+        self.assertEqual(runtime.pgdata, "/var/lib/postgresql/data")
+
+    def test_low_data_disk_headroom_fails_closed(self):
+        runtime = postgres.PostgresRuntime(
+            cpu_limit="4",
+            nano_cpus=4_000_000_000,
+            memory_bytes=12 * 1024**3,
+            max_connections=200,
+            min_free_disk_bytes=20 * 1024**3,
+            pgdata=postgres._DEFAULT_PGDATA,
+        )
+        with (
+            patch.object(postgres, "_free_disk_bytes", return_value=19 * 1024**3),
+            self.assertRaisesRegex(RuntimeError, "requires at least"),
+        ):
+            postgres._require_disk_headroom(self.data, runtime)
+
+    def test_pgdata_must_remain_under_postgres_root(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"BLUEPRINT_POSTGRES_PGDATA": "/run/secrets/postgres_password"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(ValueError, "child of /var/lib/postgresql"),
+        ):
+            postgres._runtime()
 
     @patch.object(postgres, "_run")
     def test_running_matching_container_is_idempotent(self, run):

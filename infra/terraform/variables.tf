@@ -39,6 +39,12 @@ variable "orchestrator_url" {
   default     = ""
 }
 
+variable "enable_public_orchestrator_access" {
+  description = "Grant roles/run.invoker to allUsers on the Cloud Run orchestrator. Defaults true to preserve existing public API/webhook behavior; set false only as an explicit local-control-plane cutover fence."
+  type        = bool
+  default     = true
+}
+
 variable "use_cloud_sql" {
   description = "Provision a Cloud SQL Postgres instance. Default true since alloydb.tf was archived 2026-05-02. Setting false will leave the deploy with NO database — only do this if you're restoring AlloyDB from archive/."
   type        = bool

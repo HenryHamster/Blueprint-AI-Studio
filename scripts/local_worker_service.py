@@ -62,6 +62,7 @@ _ALLOWED_SECRETS = (
     | _OPTIONAL_RUNTIME_CONFIG
 )
 _CONTAINER_NAME = "blueprint-local-worker"
+_WORKER_UNIT = "blueprint-worker.service"
 _CI_RUNNER_MARKERS = (
     b"Runner.Listener",
     b"Runner.Worker",
@@ -103,6 +104,63 @@ def _assert_no_host_ci_runner() -> None:
                 "host-level GitHub Actions runner detected; move CI into a VM "
                 "before starting the production worker"
             )
+
+
+def _cgroup_is_system_worker(payload: bytes) -> bool:
+    return (
+        b"system.slice/" + _WORKER_UNIT.encode() in payload
+        and b"user.slice/" not in payload
+    )
+
+
+def _running_as_system_worker_service() -> bool:
+    try:
+        return _cgroup_is_system_worker(Path("/proc/self/cgroup").read_bytes())
+    except OSError:
+        return False
+
+
+def _user_scoped_worker_process_present(proc_root: Path = Path("/proc")) -> bool:
+    """Detect a live user-manager worker even when its D-Bus is unavailable."""
+    own_pid = os.getpid()
+    marker = _WORKER_UNIT.encode()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == own_pid:
+            continue
+        try:
+            cgroup = (entry / "cgroup").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if b"user.slice/" in cgroup and marker in cgroup:
+            return True
+    return False
+
+
+def _assert_no_active_user_worker_service() -> None:
+    """Fence a system worker from a duplicate user-manager worker."""
+    if not _running_as_system_worker_service():
+        return
+    environment = os.environ.copy()
+    environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", _WORKER_UNIT],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if (
+        (result is not None and result.returncode == 0)
+        or _user_scoped_worker_process_present()
+    ):
+        raise RuntimeError(
+            "active user-scoped blueprint-worker.service detected; stop and "
+            "disable it before starting the system worker"
+        )
 
 
 def _load_secrets(path_text: str) -> dict[str, str]:
@@ -359,6 +417,7 @@ def _assert_proxy_reachable_from_network(
 
 def command() -> tuple[list[str], dict[str, str]]:
     _assert_no_host_ci_runner()
+    _assert_no_active_user_worker_service()
     image = _required_env("BLUEPRINT_WORKER_IMAGE_ID")
     if not _IMAGE_ID_RE.fullmatch(image):
         raise ValueError("BLUEPRINT_WORKER_IMAGE_ID must be an immutable sha256 image ID")
@@ -429,8 +488,16 @@ def command() -> tuple[list[str], dict[str, str]]:
         "512",
         "--memory",
         "4g",
+        "--memory-swap",
+        "4g",
         "--cpus",
         "4",
+        "--log-driver",
+        "json-file",
+        "--log-opt",
+        "max-size=10m",
+        "--log-opt",
+        "max-file=3",
     ]
     if database_mode == "cloudsql-proxy":
         argv.extend(["--add-host", f"host.docker.internal:{gateway}"])

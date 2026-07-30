@@ -172,16 +172,32 @@ docker image inspect --format '{{.Id}}' postgres:15
 docker image inspect --format '{{.Id}}' google/cloud-sdk:PINNED
 ```
 
-Dry-run the complete system profile first:
+Keep authoritative PostgreSQL data off the small root filesystem. On
+hamsterwheel, prepare a root-owned directory on the large `/srv/data`
+filesystem and expose it at the installer-trusted `/srv/blueprint` mountpoint.
+Every source and target ancestor must be root-owned and not group/world
+writable; do not bind-mount a directory whose parent remains user-writable.
+Record the bind mount in `/etc/fstab`, mount it, and prove both the filesystem
+and free-space result survive a reboot before import.
+
+Dry-run the complete system profile first. The measured Cloud SQL workload
+requires the local database defaults shown below: 4 CPUs, 12 GiB RAM, 200
+connections, and at least 20 GiB free on the data filesystem.
 
 ```bash
 sudo python3 scripts/blueprint_node.py install \
   --profile local-control-plane \
   --system \
+  --no-start \
   --dry-run \
   --postgres-image-id sha256:POSTGRES_IMAGE_ID \
-  --postgres-data-dir /var/lib/blueprint/postgres \
+  --postgres-data-dir /srv/blueprint/postgres \
   --postgres-secrets-file /etc/blueprint/postgres-password \
+  --postgres-cpu-limit 4 \
+  --postgres-memory-bytes 12884901888 \
+  --postgres-max-connections 200 \
+  --postgres-min-free-disk-bytes 21474836480 \
+  --postgres-pgdata /var/lib/postgresql/data \
   --postgres-backup-project-id RECOVERY_PROJECT \
   --postgres-backup-bucket gs://RECOVERY_BUCKET \
   --postgres-backup-credentials-file /etc/blueprint/backup-writer.json \
@@ -197,11 +213,24 @@ sudo python3 scripts/blueprint_node.py install \
 ```
 
 After reviewing the rendered paths and prerequisites, repeat without
-`--dry-run`. The installer validates paths and credentials, creates the private
-Docker network and PostgreSQL data directory, renders systemd units, and rolls
-back unit changes if a role fails to become active.
+`--dry-run` but keep `--no-start`. The installer validates paths and
+credentials, creates the PostgreSQL data directory, installs a
+content-addressed copy of every root-run helper beneath
+`/usr/local/lib/blueprint-node`, renders systemd units, and leaves every unit
+disabled and inactive. This is the only safe initial install while Cloud SQL is
+authoritative. Do not omit `--no-start` during staging.
 
-Verify every role and the externally visible API:
+After the recovery stack and credentials are proven, start only PostgreSQL:
+
+```bash
+sudo python3 scripts/blueprint_node.py start --role database --system
+sudo systemctl is-active blueprint-database.service
+sudo docker inspect blueprint-local-postgres
+```
+
+Do not start the API, worker, edge, or backup timer yet. Their activation order
+is part of the cutover below. After activation, verify every role and the
+externally visible API:
 
 ```bash
 sudo python3 scripts/blueprint_node.py status \
@@ -260,32 +289,364 @@ procedure.
 Stage the services while Cloud Run is still authoritative, but do not permit
 both databases to accept independent production writes.
 
-1. Stop writes or enter a maintenance window. Confirm the API, workers, and
-   operators can no longer commit production writes to Cloud SQL.
-2. While writes remain frozen, trigger a final full Cloud SQL logical export
-   and wait for it to complete successfully. Record its object generation,
-   timestamp, checksum, and source Alembic revision.
-3. Restore that exact final artifact into local PostgreSQL. Before enabling any
-   local writer, verify the checksum, Alembic revision, critical table row
-   counts, and representative aggregates against the frozen Cloud SQL source.
-   Do not use an earlier staged export or an undocumented "final delta": this
-   deployment has no CDC/delta mechanism.
-4. Start the local API and worker. Confirm exactly one process owns advisory
-   leadership and that dispatch/reaper heartbeats are current.
-5. Verify Funnel health, authentication, GitHub callbacks/webhooks, WebSockets,
-   artifact signed URLs, user-secret storage, and a representative local-runner
-   task.
-6. Move production DNS/callback/operator traffic to Funnel, then keep Cloud Run
-   available but non-authoritative during the observation window.
+1. Prove a recent off-host backup with its completion manifest can be restored
+   by the independent recovery identity. Keep retention unlocked until that
+   drill succeeds.
+2. Create a root-owned cutover directory, stop and disable the old
+   user-scoped worker, and stop every other source writer. Leave the
+   authenticated Cloud SQL proxy running because the final dump uses it:
+
+   ```bash
+   sudo install -d -m 0700 -o root -g root /var/lib/blueprint/cutover
+   systemctl --user stop blueprint-worker.service
+   systemctl --user disable blueprint-worker.service
+   systemctl --user is-active blueprint-worker.service
+   systemctl --user is-enabled blueprint-worker.service
+   docker ps --format '{{.Names}}' | grep -E '^blueprint-local-worker$'
+   ```
+
+   Both `systemctl` checks must report inactive/disabled and the container check
+   must find nothing. Stop any separately installed writer before continuing.
+3. Reconstruct the **complete** production Terraform input set and preserve
+   every existing non-default value, including CI/WIF, GitHub, billing, budget,
+   alerting, region, database, and orchestrator URL settings. Never run this
+   root with only `project_id` and the fence variable: empty or false defaults
+   can otherwise remove unrelated production resources. Create, inspect, and
+   apply one saved plan:
+
+   ```bash
+   terraform -chdir=infra/terraform plan \
+     -var-file=FULL_PRODUCTION_TFVARS \
+     -var=enable_public_orchestrator_access=false \
+     -out=/tmp/public-write-fence.tfplan
+   terraform -chdir=infra/terraform show \
+     /tmp/public-write-fence.tfplan
+   sudo install -m 0600 /tmp/public-write-fence.tfplan \
+     /var/lib/blueprint/cutover/public-write-fence.tfplan
+   terraform -chdir=infra/terraform apply \
+     /tmp/public-write-fence.tfplan
+   rm -- /tmp/public-write-fence.tfplan
+   ```
+
+   The plan must contain no unrelated deletes or replacements, especially of
+   Cloud SQL, Cloud Run, Workload Identity, monitoring, budgets, service
+   accounts, networks, or storage. Save the reviewed full-variable plan used to
+   restore public access as well; do not improvise a partial rollback plan.
+4. Capture the resulting service-bound IAM evidence and source identity
+   evidence. Use the installed cutover tool so the resource description and
+   IAM acquisition are performed together with the exact project, region, and
+   service arguments. The IAM JSON must contain neither `allUsers` nor
+   `allAuthenticatedUsers` in a `roles/run.invoker` binding. Repeatedly prove
+   that both the direct service
+   URL and every tagged `run.app` URL return `401` or `403`; DNS movement alone
+   is not a write fence:
+
+   ```bash
+   # OPERATOR HOST: run from the exact deployed commit.
+   python3 /path/to/Blueprint/scripts/local_postgres_cutover.py \
+     capture-cloud-run-fence \
+     --project-id blueprint-orchestrator --region us-central1 \
+     --service blueprint-orchestrator \
+     --output /absolute/operator/path/cloud-run-fence.json
+   gcloud sql instances describe blueprint-cloudsql-8cee8173 \
+     --project=blueprint-orchestrator --format=json \
+     > /absolute/operator/path/cloud-sql-instance.json
+   scp /absolute/operator/path/cloud-run-fence.json hamsterwheel:/tmp/cloud-run-fence.json
+   scp /absolute/operator/path/cloud-sql-instance.json hamsterwheel:/tmp/cloud-sql-instance.json
+
+   # HAMSTERWHEEL:
+   ssh -t hamsterwheel \
+     'sudo install -m 0600 /tmp/cloud-run-fence.json /var/lib/blueprint/cutover/cloud-run-fence.json'
+   ssh -t hamsterwheel \
+     'sudo install -m 0600 /tmp/cloud-sql-instance.json /var/lib/blueprint/cutover/cloud-sql-instance.json'
+   ssh hamsterwheel 'rm -- /tmp/cloud-run-fence.json /tmp/cloud-sql-instance.json'
+   ssh -t hamsterwheel sudo sha256sum \
+     /var/lib/blueprint/cutover/cloud-run-fence.json \
+     /var/lib/blueprint/cutover/cloud-sql-instance.json
+
+   # OPERATOR HOST:
+   curl -sS -o /dev/null -w '%{http_code}\n' CLOUD_RUN_SERVICE_URL
+   curl -sS -o /dev/null -w '%{http_code}\n' CLOUD_RUN_TAGGED_URL
+   ```
+
+   If `gcloud` is not on the operator host's `PATH`, pass its absolute path with
+   `--gcloud-executable`. On Windows, use the SDK's shell-free
+   `google-cloud-sdk\lib\gcloud.py` entrypoint; the tool invokes it with its own
+   Python interpreter. Delete the operator copy after its SHA-256 matches the
+   installed evidence.
+
+   Preserve the endpoint probe output and timestamps beside the fence
+   evidence. Abort if any probe returns a status other than `401` or `403`.
+5. Rotate the Cloud SQL `postgres` password to a random cutover-only value in a
+   root-owned mode-`0600` file on hamsterwheel. Do **not** update Secret Manager,
+   Cloud Run, the old worker, or any other old runtime with this value. Generate
+   it without shell history or argv exposure. From an interactive, non-recorded
+   hamsterwheel SSH session, display it once with `sudo cat`, copy it only to the
+   operator's password prompt, then clear the clipboard:
+
+   ```bash
+   # HAMSTERWHEEL:
+   ssh -t hamsterwheel \
+     "sudo sh -c 'umask 077; openssl rand -base64 48 > /var/lib/blueprint/cutover/cloudsql-source-password'"
+   ssh -t hamsterwheel sudo stat -c '%a %U:%G %n' \
+     /var/lib/blueprint/cutover/cloudsql-source-password
+   ssh -t hamsterwheel sudo cat \
+     /var/lib/blueprint/cutover/cloudsql-source-password
+
+   # OPERATOR HOST: paste the value at both prompts; do not put it in argv.
+   gcloud sql users set-password postgres \
+     --instance=blueprint-cloudsql-8cee8173 \
+     --project=blueprint-orchestrator \
+     --prompt-for-password --async --format='value(name)'
+   ```
+
+   On the operator host, record the returned operation name, wait for it, and
+   capture the raw operation JSON to an operator-local absolute path. Transfer
+   it to hamsterwheel and install it root-only:
+
+   ```bash
+   # OPERATOR HOST:
+   gcloud sql operations wait PASSWORD_ROTATION_OPERATION \
+     --project=blueprint-orchestrator
+   gcloud sql operations describe PASSWORD_ROTATION_OPERATION \
+     --project=blueprint-orchestrator --format=json \
+     > /absolute/operator/path/password-rotation-operation.json
+   scp /absolute/operator/path/password-rotation-operation.json \
+     hamsterwheel:/tmp/password-rotation-operation.json
+
+   # HAMSTERWHEEL:
+   ssh -t hamsterwheel \
+     'sudo install -m 0600 /tmp/password-rotation-operation.json /var/lib/blueprint/cutover/password-rotation-operation.json'
+   ssh hamsterwheel 'rm -- /tmp/password-rotation-operation.json'
+   ```
+
+   The operation must be `DONE`, type `UPDATE_USER`, target this project and
+   instance, and contain no error. Never use `--password="$(cat ...)"`: it puts
+   the credential in process arguments.
+6. Discover and verify the proxy path from the PostgreSQL container. The
+   standard local install exposes the authenticated proxy on the control-plane
+   bridge gateway port `5433`:
+
+   ```bash
+   systemctl --user is-active blueprint-database-proxy.service
+   docker network inspect blueprint-control-plane
+   docker network inspect --format '{{(index .IPAM.Config 0).Gateway}}' \
+     blueprint-control-plane
+   sudo ss -ltnp | grep ':5433'
+   ```
+
+   Substitute the reported gateway for `DOCKER_BRIDGE_GATEWAY` below. Abort if
+   the proxy unit is inactive, the listener is not the expected proxy, or a
+   connection from `blueprint-local-postgres` cannot authenticate.
+7. Through that proxy, terminate every existing source session except the
+   cutover operator session, including idle transactions. Use the temporary
+   password only through a root process environment (the same no-argv pattern
+   enforced by the cutover tool). This command passes only the variable name
+   through `docker exec`, not the value in argv:
+
+   ```bash
+   sudo sh -c '
+     export PGPASSWORD="$(cat /var/lib/blueprint/cutover/cloudsql-source-password)"
+     exec docker exec --interactive --env PGPASSWORD blueprint-local-postgres \
+       psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
+       --host "$1" --port 5433 --username postgres --dbname postgres \
+       --command "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()"
+   ' sh DOCKER_BRIDGE_GATEWAY
+   ```
+
+   Then capture at least three separate, time-ordered observations spanning at
+   least 30 seconds. Each adjacent pair must be at least 10 seconds apart; use
+   15 seconds below to leave scheduling margin. Each raw JSON file must contain
+   exactly `[]`, produced from:
+
+   ```bash
+   sudo sh -c '
+     export PGPASSWORD="$(cat /var/lib/blueprint/cutover/cloudsql-source-password)"
+     docker exec --interactive --env PGPASSWORD blueprint-local-postgres \
+       psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 --tuples-only --no-align \
+       --host "$1" --port 5433 --username postgres --dbname postgres \
+       --command "SELECT COALESCE(json_agg(json_build_object('\''pid'\'',pid,'\''user'\'',usename,'\''application_name'\'',application_name,'\''client_addr'\'',client_addr,'\''state'\'',state,'\''xact_start'\'',xact_start,'\''query_start'\'',query_start) ORDER BY pid),'\''[]'\''::json) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()" \
+       > "$2"
+   ' sh DOCKER_BRIDGE_GATEWAY /var/lib/blueprint/cutover/session-observation-1.json
+   date -u +%Y-%m-%dT%H:%M:%SZ \
+     | sudo tee /var/lib/blueprint/cutover/session-observation-1.captured-at
+   sudo sha256sum /var/lib/blueprint/cutover/session-observation-1.json
+   sleep 15
+   ```
+
+   Repeat that capture command for `session-observation-2.json` and
+   `session-observation-3.json`, changing the corresponding `.captured-at`
+   filename too. Record each UTC timestamp immediately after its query, and
+   sleep at least 15 seconds before the next query. The first-to-last timestamps
+   must span at least 30 seconds. Hash each unmodified JSON file. If any old
+   session reappears, the fence is not durable: find and stop that writer,
+   terminate sessions again, and restart all three observations.
+8. Create `/var/lib/blueprint/cutover/source-fence.json`, mode `0600`, with
+   `schema_version=1`, `kind=postgres-durable-source-fence`, and:
+
+   - `source`: `project_id`, `instance`, and `database`;
+   - `password_rotated=true` and `old_sessions_terminated=true`;
+   - `raw_evidence`: hash-bound absolute `path` entries whose unique `kind`
+     values are `cloud_run_fence`, `cloud_sql_instance`, and
+     `password_rotation_operation`; and
+   - `session_observations`: at least three ordered entries containing
+     `captured_at`, `old_session_count=0`, absolute `path`, and that raw file's
+   SHA-256.
+
+   The resulting document has this exact shape (replace every placeholder with
+   the captured value, and use the actual paths for observations two and
+   three):
+
+   ```json
+   {
+     "schema_version": 1,
+     "kind": "postgres-durable-source-fence",
+     "source": {
+       "project_id": "blueprint-orchestrator",
+       "instance": "blueprint-cloudsql-8cee8173",
+       "database": "postgres",
+       "cloud_run_service": "blueprint-orchestrator",
+       "cloud_run_region": "us-central1"
+     },
+     "password_rotated": true,
+     "old_sessions_terminated": true,
+     "raw_evidence": [
+       {
+         "kind": "cloud_run_fence",
+         "path": "/var/lib/blueprint/cutover/cloud-run-fence.json",
+         "sha256": "CLOUD_RUN_FENCE_SHA256"
+       },
+       {
+         "kind": "cloud_sql_instance",
+         "path": "/var/lib/blueprint/cutover/cloud-sql-instance.json",
+         "sha256": "CLOUD_SQL_INSTANCE_SHA256"
+       },
+       {
+         "kind": "password_rotation_operation",
+         "path": "/var/lib/blueprint/cutover/password-rotation-operation.json",
+         "sha256": "PASSWORD_ROTATION_OPERATION_SHA256"
+       }
+     ],
+     "session_observations": [
+       {
+         "captured_at": "UTC_TIMESTAMP_1",
+         "old_session_count": 0,
+         "path": "/var/lib/blueprint/cutover/session-observation-1.json",
+         "sha256": "SESSION_OBSERVATION_1_SHA256"
+       },
+       {
+         "captured_at": "UTC_TIMESTAMP_2",
+         "old_session_count": 0,
+         "path": "/var/lib/blueprint/cutover/session-observation-2.json",
+         "sha256": "SESSION_OBSERVATION_2_SHA256"
+       },
+       {
+         "captured_at": "UTC_TIMESTAMP_3",
+         "old_session_count": 0,
+         "path": "/var/lib/blueprint/cutover/session-observation-3.json",
+         "sha256": "SESSION_OBSERVATION_3_SHA256"
+       }
+     ]
+   }
+   ```
+
+   Do not summarize or rewrite the tool-captured Cloud Run envelope or the two
+   raw gcloud JSON files. The cutover tool loads and hashes them itself, binds
+   the Cloud Run policy to the requested service/project/region, validates
+   PostgreSQL 15 and the instance connection name, validates the completed
+   password operation, rejects malformed or public invoker IAM, and requires
+   every session observation file to parse as exactly `[]`.
+9. While the fence remains in force, run `dump-source` directly through the
+   authenticated proxy. It validates the durable fence, snapshots exact
+   Alembic revision, schema/catalog objects, table counts, sequence maxima, and
+   critical integrity aggregates, then streams a PostgreSQL 15 custom-format
+   `pg_dump` to the local artifact. It creates and hash-binds both the snapshot
+   and manifest; do not hand-author the manifest:
+
+   ```bash
+   sudo python3 /usr/local/lib/blueprint-node/CUTOVER_DIGEST/local_postgres_cutover.py dump-source \
+     --source-fence /var/lib/blueprint/cutover/source-fence.json \
+     --container blueprint-local-postgres \
+     --host DOCKER_BRIDGE_GATEWAY --port 5433 \
+     --database postgres --user postgres \
+     --password-file /var/lib/blueprint/cutover/cloudsql-source-password \
+     --instance blueprint-cloudsql-8cee8173 \
+     --artifact-output /var/lib/blueprint/cutover/cloudsql-final.dump \
+     --source-snapshot-output /var/lib/blueprint/cutover/source-snapshot.json \
+     --manifest-output /var/lib/blueprint/cutover/dump-manifest.json \
+     --timeout-seconds 7200
+   ```
+
+   There is no managed Cloud SQL export, GCS staging generation, CDC, or
+   undocumented final delta in this path.
+10. With only `blueprint-database.service` active, restore and verify the empty
+    local target:
+
+    ```bash
+    sudo python3 /usr/local/lib/blueprint-node/CUTOVER_DIGEST/local_postgres_cutover.py verify-import \
+      --source-snapshot /var/lib/blueprint/cutover/source-snapshot.json \
+      --source-fence /var/lib/blueprint/cutover/source-fence.json \
+      --export-manifest /var/lib/blueprint/cutover/dump-manifest.json \
+      --target-container blueprint-local-postgres \
+      --target-database blueprint --target-user blueprint \
+      --target-password-file /etc/blueprint/postgres-password \
+      --target-instance hamsterwheel \
+      --target-snapshot-output /var/lib/blueprint/cutover/target-snapshot.json \
+      --result-output /var/lib/blueprint/cutover/import-result.json \
+      --import-timeout-seconds 7200
+    ```
+
+    The verifier requires a custom PostgreSQL archive, proves the target public
+    namespace is empty, uses `pg_restore --single-transaction`, snapshots the
+    target, and refuses success unless every comparison field is exact.
+    Preserve the dump, manifest, mode-`0600` result, fence, raw evidence, and
+    both snapshots. On failure, keep all application units stopped, reinitialize
+    the target deliberately, and investigate; never continue from a partially
+    examined target.
+11. Start only the local API and prove its health before starting the edge:
+
+    ```bash
+    sudo systemctl start blueprint-api.service
+    sudo systemctl is-active blueprint-api.service
+    sudo systemctl start blueprint-edge.service
+    sudo systemctl is-active blueprint-edge.service
+    ```
+
+    Verify health, authentication,
+    GitHub OAuth/App callbacks and webhooks, WebSockets, CORS, artifact signed
+    URLs, and one controlled production write. This first local write crosses
+    the rollback boundary.
+12. Only after the controlled write succeeds, start the worker and confirm
+   exactly one process owns advisory leadership and dispatch/reaper heartbeats
+   are current. Start and manually exercise the backup service, verify its
+   recovery-bucket manifest independently, then enable the backup timer.
+13. Keep Cloud Run write-fenced and Cloud SQL frozen with deletion protection,
+   PITR, and backups for at least 72 hours and multiple successful local
+   backups. Do not delete Cloud SQL during the observation window.
 
 The rollback boundary is the first production write committed to local
-PostgreSQL. Before that point, returning traffic to Cloud Run and Cloud SQL is
-straightforward. After that point, a direct rollback to the old Cloud SQL
-database discards every local-only write and is therefore not a safe rollback.
-Failback then requires a reviewed reverse migration or restore into Cloud SQL,
-a new write freeze, reconciliation evidence, and an explicit operator decision.
-Do not describe “restart Cloud Run” as a complete rollback after local writes
-begin.
+PostgreSQL. Before that point, keep all local application units stopped, rotate
+the Cloud SQL `postgres` password back to the original value still held by the
+old production secret (again using `--prompt-for-password`, never argv), verify
+the resulting `UPDATE_USER` operation is `DONE`, apply the previously reviewed
+complete Terraform rollback plan, and only then re-enable/start the old worker.
+Recheck the intended Cloud Run IAM binding, health, and exactly one active
+writer before reopening traffic. Do not copy the temporary cutover password
+into the old secret or runtime.
+
+After either a successful rollback or acceptance of the local cutover, remove
+the temporary password file and any temporary access-token material while
+retaining the non-secret evidence and dump under the approved retention policy:
+
+```bash
+sudo rm -- /var/lib/blueprint/cutover/cloudsql-source-password
+```
+
+After the first local write, a direct rollback to the old Cloud SQL database
+discards every local-only write and is therefore unsafe. Failback then requires
+a reviewed reverse migration or restore into Cloud SQL, a new write freeze,
+reconciliation evidence, and an explicit operator decision. Do not describe
+“restart Cloud Run” as a complete rollback after local writes begin.
 
 For a local service failure that does not require database failback, stop only
 the affected role:

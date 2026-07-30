@@ -220,6 +220,10 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("blueprint-database-proxy.service", rendered)
 
     def test_edge_uses_dedicated_oneshot_unit_bound_to_api(self):
+        edge_entrypoint = node._system_script_bundle()[0][
+            node._TAILSCALE_FUNNEL_SERVICE
+        ]
+        trusted_python = node._trusted_system_python()
         with patch.object(node, "_system_install_user", return_value="blueprint-control"):
             rendered = node._render_unit(
                 "edge",
@@ -236,12 +240,17 @@ class RenderTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            f"ExecStart={sys.executable} {node._TAILSCALE_FUNNEL_SERVICE} start",
+            f"ExecStart={trusted_python} {edge_entrypoint} start",
             rendered,
         )
+        self.assertNotIn(str(node._TAILSCALE_FUNNEL_SERVICE), rendered)
         self.assertNotRegex(rendered, r"@[A-Z_]+@")
 
     def test_database_uses_explicit_oneshot_controller_lifecycle(self):
+        database_entrypoint = node._system_script_bundle()[0][
+            node._LOCAL_POSTGRES_SERVICE
+        ]
+        trusted_python = node._trusted_system_python()
         with patch.object(node, "_system_install_user", return_value="blueprint-control"):
             rendered = node._render_unit(
                 "database",
@@ -252,16 +261,20 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Type=oneshot", rendered)
         self.assertIn("RemainAfterExit=yes", rendered)
         self.assertIn(
-            f"ExecStart={sys.executable} {node._LOCAL_POSTGRES_SERVICE} start",
+            f"ExecStart={trusted_python} {database_entrypoint} start",
             rendered,
         )
         self.assertIn(
-            f"ExecStop={sys.executable} {node._LOCAL_POSTGRES_SERVICE} stop",
+            f"ExecStop={trusted_python} {database_entrypoint} stop",
             rendered,
         )
         self.assertNotIn("--check", rendered)
 
     def test_database_backup_has_twice_daily_randomized_system_timer(self):
+        backup_entrypoint = node._system_script_bundle()[0][
+            node._LOCAL_POSTGRES_BACKUP_SERVICE
+        ]
+        trusted_python = node._trusted_system_python()
         with patch.object(node, "_system_install_user", return_value="blueprint-control"):
             timer = node._render_unit(
                 "database-backup",
@@ -280,9 +293,51 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Requires=blueprint-database.service", timer)
         self.assertIn("Requires=blueprint-database.service", service)
         self.assertIn(
-            f"ExecStart={sys.executable} {node._LOCAL_POSTGRES_BACKUP_SERVICE}",
+            f"ExecStart={trusted_python} {backup_entrypoint}",
             service,
         )
+
+    def test_local_system_unit_rejects_non_content_addressed_entrypoint(self):
+        with patch.object(node, "_system_install_user", return_value="blueprint-control"):
+            with self.assertRaisesRegex(ValueError, "content-addressed"):
+                node._render_unit(
+                    "worker",
+                    profile="local-control-plane",
+                    system=True,
+                    env_file=Path("/etc/blueprint/worker.env"),
+                    entrypoint=Path("/tmp/user-writable-worker.py"),
+                )
+
+    @unittest.skipIf(os.name == "nt", "POSIX root trust boundary")
+    def test_system_python_rejects_user_writable_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = Path(directory) / "python3"
+            interpreter.write_bytes(b"not a real interpreter")
+            interpreter.chmod(0o777)
+            with self.assertRaisesRegex(
+                ValueError, "root-owned|group/world-writable|ancestors"
+            ):
+                node._trusted_system_python(str(interpreter))
+
+    def test_local_worker_preflight_uses_canonical_trusted_python(self):
+        worker_entrypoint = node._system_script_bundle()[0][
+            node._LOCAL_WORKER_SERVICE
+        ]
+        trusted_python = node._trusted_system_python()
+        with patch.object(node, "_system_install_user", return_value="blueprint-control"):
+            rendered = node._render_unit(
+                "worker",
+                profile="local-control-plane",
+                system=True,
+                env_file=Path("/etc/blueprint/worker.env"),
+            )
+        self.assertIn(
+            f"ExecStartPre={trusted_python} {worker_entrypoint} --check",
+            rendered,
+        )
+        self.assertIn(f"ExecStart={trusted_python} {worker_entrypoint}", rendered)
+        if Path(sys.executable) != trusted_python:
+            self.assertNotIn(f"ExecStart={sys.executable} ", rendered)
 
     def test_system_unit_adds_host_process_sandboxing(self):
         with patch.object(node, "_system_install_user", return_value="blueprint-control"):
@@ -329,6 +384,8 @@ class InstallTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=_TEMP_PARENT)
         self.root = Path(self.temp.name) / "node"
         self.units = Path(self.temp.name) / "units"
+        self.script_root = Path(self.temp.name) / "installed-scripts"
+        self.trusted_system_python = Path("/usr/bin/python3")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -336,7 +393,13 @@ class InstallTests(unittest.TestCase):
     def _patches(self):
         return [
             patch.object(node, "node_root", return_value=self.root),
-            patch.object(node, "unit_path", side_effect=lambda role, system: self.units / node.ROLE_SPECS[role].unit_name),
+            patch.object(
+                node,
+                "unit_path",
+                side_effect=lambda role, system: (
+                    self.units / node.ROLE_SPECS[role].unit_name
+                ),
+            ),
             patch.object(
                 node,
                 "_database_backup_service_unit_path",
@@ -351,6 +414,17 @@ class InstallTests(unittest.TestCase):
             ),
             patch.object(node, "_prepare_system_node_root"),
             patch.object(node, "_prepare_system_credential_dir"),
+            patch.object(node, "_SYSTEM_SCRIPT_ROOT", self.script_root),
+            patch.object(
+                node,
+                "_TRUSTED_PATH_UID",
+                os.getuid() if hasattr(os, "getuid") else 0,
+            ),
+            patch.object(
+                node,
+                "_trusted_system_python",
+                return_value=self.trusted_system_python,
+            ),
             patch.object(node, "_prepare_local_postgres_data_dir"),
         ]
 
@@ -377,8 +451,13 @@ class InstallTests(unittest.TestCase):
         shared_image = f"sha256:{'b' * 64}"
         return {
             "database": {
+                "BLUEPRINT_POSTGRES_CPU_LIMIT": "4",
                 "BLUEPRINT_POSTGRES_IMAGE_ID": f"sha256:{'c' * 64}",
                 "BLUEPRINT_POSTGRES_DATA_DIR": "/srv/blueprint/postgres",
+                "BLUEPRINT_POSTGRES_MAX_CONNECTIONS": "200",
+                "BLUEPRINT_POSTGRES_MEMORY_BYTES": str(12 * 1024**3),
+                "BLUEPRINT_POSTGRES_MIN_FREE_DISK_BYTES": str(20 * 1024**3),
+                "BLUEPRINT_POSTGRES_PGDATA": "/var/lib/postgresql/data",
                 "BLUEPRINT_POSTGRES_SECRETS_FILE": "/etc/blueprint/postgres.env",
                 "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
             },
@@ -473,8 +552,178 @@ class InstallTests(unittest.TestCase):
         self.assertIn("RemainAfterExit=yes", edge_unit)
         self.assertIn("BindsTo=blueprint-api.service", edge_unit)
         self.assertIn(
-            f"ExecStop={sys.executable} {node._TAILSCALE_FUNNEL_SERVICE} stop",
+            f"ExecStop={self.trusted_system_python} {self.script_root}",
             edge_unit,
+        )
+        self.assertNotIn(str(node._SCRIPT_DIR), edge_unit)
+        installed_scripts = list(self.script_root.glob("*/*.py"))
+        self.assertEqual(len(installed_scripts), 6)
+        bundle_dirs = {path.parent for path in installed_scripts}
+        self.assertEqual(len(bundle_dirs), 1)
+        bundle_dir = bundle_dirs.pop()
+        self.assertRegex(bundle_dir.name, r"^[0-9a-f]{64}$")
+        if os.name != "nt":
+            self.assertEqual(bundle_dir.stat().st_mode & 0o777, 0o755)
+        self.assertIn(str(bundle_dir / "local_postgres_service.py"), database_unit)
+        self.assertIn(
+            str(bundle_dir / "local_postgres_backup_service.py"),
+            backup_service,
+        )
+        self.assertTrue((bundle_dir / "local_postgres_cutover.py").is_file())
+        if os.name != "nt":
+            for script in installed_scripts:
+                self.assertEqual(script.stat().st_uid, os.getuid())
+                self.assertEqual(script.stat().st_mode & 0o777, 0o555)
+
+    def test_dry_run_rejects_invalid_postgres_runtime_before_writes(self):
+        invalid_values = (
+            ("BLUEPRINT_POSTGRES_CPU_LIMIT", "4,0"),
+            ("BLUEPRINT_POSTGRES_MEMORY_BYTES", "12,884,901,888"),
+            ("BLUEPRINT_POSTGRES_MAX_CONNECTIONS", "2,000"),
+            ("BLUEPRINT_POSTGRES_MIN_FREE_DISK_BYTES", "20,000"),
+            ("BLUEPRINT_POSTGRES_PGDATA", "/var/lib/postgresql/data/"),
+            ("BLUEPRINT_POSTGRES_PGDATA", "/var/lib/postgresql//data"),
+            ("BLUEPRINT_POSTGRES_PGDATA", "/var/lib/postgresql/data,other"),
+        )
+        for key, value in invalid_values:
+            with self.subTest(key=key, value=value):
+                calls = []
+                config = self._local_control_plane_config()
+                config["database"][key] = value
+                patches = self._patches()
+                for item in patches:
+                    item.start()
+                try:
+                    rc = node.do_install(
+                        profile="local-control-plane",
+                        system=True,
+                        token=None,
+                        url="https://orch.example",
+                        dry_run=True,
+                        no_start=True,
+                        role_configs=config,
+                        _run=_run_ok(calls),
+                    )
+                finally:
+                    for item in reversed(patches):
+                        item.stop()
+                self.assertEqual(rc, 1)
+                self.assertFalse(self.root.exists())
+                self.assertFalse(self.units.exists())
+
+    def test_no_start_stages_every_role_and_backup_service_inactive(self):
+        calls = []
+
+        def inactive_systemd(argv, **kwargs):
+            calls.append(list(argv))
+            if "is-enabled" in argv or "is-active" in argv:
+                return MagicMock(returncode=3, stdout="inactive\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="local-control-plane",
+                system=True,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                no_start=True,
+                role_configs=self._local_control_plane_config(),
+                _run=inactive_systemd,
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+
+        self.assertEqual(rc, 0)
+        commands = [" ".join(call) for call in calls]
+        for unit in (
+            "blueprint-database.service",
+            "blueprint-database-backup.timer",
+            "blueprint-api.service",
+            "blueprint-worker.service",
+            "blueprint-edge.service",
+        ):
+            self.assertTrue(
+                any(f"disable --now {unit}" in command for command in commands)
+            )
+        self.assertTrue(
+            any(
+                "stop blueprint-database-backup.service" in command
+                for command in commands
+            )
+        )
+        self.assertFalse(any("enable --now" in command for command in commands))
+        self.assertFalse(any(" restart " in f" {command} " for command in commands))
+        manifest = json.loads((self.root / "manifest.json").read_text())
+        self.assertEqual(manifest["activation"], "staged")
+
+    def test_failed_staged_disable_restores_files_and_prior_service_state(self):
+        calls = []
+        self.root.mkdir(parents=True)
+        self.units.mkdir(parents=True)
+        old_manifest = '{"profile":"old"}\n'
+        old_worker_unit = "old worker unit\n"
+        (self.root / "manifest.json").write_text(old_manifest, encoding="utf-8")
+        (self.units / "blueprint-worker.service").write_text(
+            old_worker_unit, encoding="utf-8"
+        )
+
+        def fail_worker_disable(argv, **kwargs):
+            calls.append(list(argv))
+            unit = argv[-1]
+            if "is-enabled" in argv or "is-active" in argv:
+                return MagicMock(
+                    returncode=0 if unit == "blueprint-api.service" else 3,
+                    stdout="",
+                    stderr="",
+                )
+            if (
+                "disable" in argv
+                and "--now" in argv
+                and unit == "blueprint-worker.service"
+            ):
+                return MagicMock(returncode=1, stdout="", stderr="denied")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            rc = node.do_install(
+                profile="local-control-plane",
+                system=True,
+                token=None,
+                url="https://orch.example",
+                dry_run=False,
+                no_start=True,
+                role_configs=self._local_control_plane_config(),
+                _run=fail_worker_disable,
+            )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            (self.root / "manifest.json").read_text(encoding="utf-8"),
+            old_manifest,
+        )
+        self.assertEqual(
+            (self.units / "blueprint-worker.service").read_text(encoding="utf-8"),
+            old_worker_unit,
+        )
+        self.assertFalse((self.units / "blueprint-edge.service").exists())
+        self.assertFalse(list(self.script_root.glob("*/*.py")))
+        commands = [" ".join(call) for call in calls]
+        self.assertTrue(
+            any("enable blueprint-api.service" in command for command in commands)
+        )
+        self.assertTrue(
+            any("start blueprint-api.service" in command for command in commands)
         )
 
     def test_local_control_plane_refuses_user_scope_before_writes(self):
