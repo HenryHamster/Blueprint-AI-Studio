@@ -1298,8 +1298,8 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_conversation_claims_0710_is_the_expected_schema_head():
-    """Conversation incarnation fencing extends the durable claim migration."""
+def test_discovery_admission_0712_is_the_expected_schema_head():
+    """Discovery admission extends the review-cycle persistence migration."""
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
         versions_dir / "0708_pipeline_operability_foundation.py"
@@ -1308,13 +1308,21 @@ def test_conversation_claims_0710_is_the_expected_schema_head():
     incarnation = (
         versions_dir / "0710_conversation_claim_incarnation.py"
     ).read_text()
+    discovery_cycles = (
+        versions_dir / "0711_discovery_review_cycles.py"
+    ).read_text()
+    discovery_admission = (
+        versions_dir / "0712_discovery_admission_ledger.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
+    assert parse_revision_identifiers(discovery_cycles) == ("0711", "0710")
+    assert parse_revision_identifiers(discovery_admission) == ("0712", "0711")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0710", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0710', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0712", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0712', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

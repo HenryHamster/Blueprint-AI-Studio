@@ -33,6 +33,7 @@ VALID_TASK_TYPES: set[str] = {
     "plan",
     "research",
     "strategic_review",
+    "discovery_review",
     "design_doc_update",
     "security_audit",
     "qa",

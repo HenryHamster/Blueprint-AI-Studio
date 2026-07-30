@@ -51,6 +51,7 @@ const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'review',
   'plan',
   'research',
+  'discovery_review',
   'strategic_review',
   'design_doc_update',
   'security_audit',

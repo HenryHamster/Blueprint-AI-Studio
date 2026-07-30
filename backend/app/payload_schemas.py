@@ -637,6 +637,70 @@ class ResearchPayload(_EmpiricalWorkContractMixin, _SystemPopulated):
     # is non-empty so the research agent can propose/create the missing foundation
     # or recommend retirement of the stranded demand.
     missing_capability_demand: dict[str, Any] | None = None
+    discovery_generation: int | None = Field(default=None, ge=1)
+    discovery_phase: str | None = None
+    discovery_intent_snapshot: dict[str, Any] | None = None
+    discovery_bet_snapshot: dict[str, Any] | None = None
+
+
+_UUID_TEXT_PATTERN = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_GIT_SHA_PATTERN = r"^[0-9a-fA-F]{7,64}$"
+
+
+class DiscoveryReviewEvidenceItem(BaseModel):
+    """One immutable, server-selected item in a discovery review packet."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(pattern=_UUID_TEXT_PATTERN)
+    semantic_role: str = Field(min_length=1, max_length=32)
+    source_kind: str = Field(min_length=1, max_length=32)
+    checksum: str = Field(pattern=_SHA256_PATTERN)
+    source_id: str | None = Field(default=None, max_length=255)
+    source_uri: str | None = Field(default=None, max_length=4000)
+    content_type: str | None = Field(default=None, max_length=128)
+    head_sha: str | None = Field(default=None, pattern=_GIT_SHA_PATTERN)
+    mechanism_fingerprint: str | None = Field(
+        default=None, pattern=_SHA256_PATTERN
+    )
+    evidence_metadata: dict[str, Any] = Field(default_factory=dict)
+    artifact_id: str | None = Field(default=None, pattern=_UUID_TEXT_PATTERN)
+
+
+class DiscoveryReviewPayload(BasePayload):
+    """Frozen server-owned input for an independent discovery decision review.
+
+    The task is deliberately not user- or Strategist-launchable.  Its creator
+    must build this packet from the authoritative cycle and evidence ledger,
+    then validate it strictly before inserting the Task.
+    """
+
+    type: Literal["discovery_review"] = "discovery_review"
+    cycle_id: str = Field(pattern=_UUID_TEXT_PATTERN)
+    expected_revision: int = Field(ge=0)
+    direction_key: str = Field(min_length=1, max_length=128)
+    intent_snapshot: dict[str, Any]
+    bet_snapshot: dict[str, Any]
+    outcome_kind: Literal["empirical", "experiential", "mixed"]
+    phase: Literal["probe", "demonstrate", "productize", "release"]
+    # Empty is meaningful: it lets the reviewer return ``inconclusive`` rather
+    # than stranding a cycle that reached its decision boundary with no proof.
+    evidence_packet: list[DiscoveryReviewEvidenceItem] = Field(max_length=200)
+    evidence_packet_manifest: dict[str, Any] = Field(default_factory=dict)
+    packet_checksum: str = Field(pattern=_SHA256_PATTERN)
+    candidate_sha: str | None = Field(default=None, pattern=_GIT_SHA_PATTERN)
+    mechanism_fingerprint: str | None = Field(
+        default=None, pattern=_SHA256_PATTERN
+    )
+    review_round: int = Field(default=1, ge=1, le=2)
+    prior_review_task_id: str | None = Field(
+        default=None, pattern=_UUID_TEXT_PATTERN
+    )
+    confirmation_proposal: dict[str, Any] | None = None
 
 
 class StrategicReviewPayload(_SystemPopulated):
@@ -1285,6 +1349,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.review: ReviewPayload,
     TaskType.fix: FixPayload,
     TaskType.research: ResearchPayload,
+    TaskType.discovery_review: DiscoveryReviewPayload,
     TaskType.strategic_review: StrategicReviewPayload,
     TaskType.design_doc_update: DesignDocUpdatePayload,
     TaskType.security_audit: SecurityAuditPayload,

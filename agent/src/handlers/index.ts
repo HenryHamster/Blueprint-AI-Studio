@@ -20,6 +20,7 @@ import type { AgentTaskType } from '../taskCapabilities.js';
 import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA, handleSalvageBundle } from './standard.js';
 import { handleReview, handleFix } from './review-fix.js';
 import { handlePlan, handleResearch } from './research-plan.js';
+import { handleDiscoveryReview } from './discovery-review.js';
 import { handleStrategic } from './strategic.js';
 import { handleStrategicResident } from './strategic-resident.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
@@ -93,6 +94,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   fix: handleFix,
   plan: handlePlan,
   research: dispatchResearch,
+  discovery_review: handleDiscoveryReview,
   docs: handleDocs,
   security_audit: handleSecurityAudit,
   self_audit: handleSelfAudit,

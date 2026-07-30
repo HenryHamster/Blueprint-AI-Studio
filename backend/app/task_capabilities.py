@@ -24,6 +24,7 @@ class TaskType(str, Enum):
     fix = "fix"
     plan = "plan"
     research = "research"
+    discovery_review = "discovery_review"
     strategic_review = "strategic_review"
     design_doc_update = "design_doc_update"
     security_audit = "security_audit"
@@ -326,6 +327,21 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_needs_locked_project=True,
         strategic_phase="phase2",
         evaluation="forward-quality",
+    ),
+    TaskCapability(
+        TaskType.discovery_review,
+        "Discovery Review",
+        "read_only",
+        default_category="strategic",
+        description=(
+            "Judge a bounded discovery cycle against its frozen bet and evidence."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=4.0,
+        completion_handler="discovery_review",
+        evaluation="structured-verdict",
     ),
     TaskCapability(
         TaskType.design_doc_update,
@@ -1038,6 +1054,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.release_audit_challenge.value,
         TaskType.release_merge_grade.value,
         TaskType.self_audit.value,
+        TaskType.discovery_review.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
         TaskType.criterion_coverage_trial.value,

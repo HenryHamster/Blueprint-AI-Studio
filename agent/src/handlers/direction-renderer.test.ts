@@ -5,49 +5,52 @@ vi.mock('../index.js', () => ({
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
 }));
 
-vi.mock('./research-plan.js', () => ({
-  aggregateDirectionStats: (history: Array<Record<string, unknown>>, agg: Record<string, unknown>) => {
-    const total = history.length + ((agg.total_cycles as number) || 0);
-    if (total === 0) return '';
-    return `Stats: ${total} cycles`;
-  },
-  buildScopeCalibrationSignal: (history: Array<Record<string, unknown>>) => {
-    if (history.length === 0) return '';
-    const last = history[history.length - 1];
-    const details = Array.isArray(last.failed_task_details) ? last.failed_task_details as Array<{category: string}> : [];
-    const codeErrors = details.filter(d => ['build_failed', 'claude_code_failed'].includes(d.category));
-    return codeErrors.length > 0 ? '\n  Last cycle failures: CODE_ERROR' : '';
-  },
-  parseResearchContext: (raw: string) => {
-    const established: string[] = [];
-    const failed: string[] = [];
-    const open: string[] = [];
-    let eviction = '';
-    type Section = 'established' | 'failed' | 'open' | 'eviction' | '';
-    let current: Section = '';
-    for (const line of raw.split('\n')) {
-      const t = line.trim();
-      if (t.startsWith('## Established')) { current = 'established'; continue; }
-      if (t.startsWith('## Failed')) { current = 'failed'; continue; }
-      if (t.startsWith('## Open')) { current = 'open'; continue; }
-      if (t.startsWith('## Eviction')) { current = 'eviction'; continue; }
-      if (current === 'eviction') { if (t) eviction = t; }
-      else if (t.startsWith('- ') && current === 'established') established.push(t);
-      else if (t.startsWith('- ') && current === 'failed') failed.push(t);
-      else if (t.startsWith('- ') && current === 'open') open.push(t);
-    }
-    return { established, failed, open, eviction };
-  },
-  buildFilteredFindingsSection: (history: Array<Record<string, unknown>>) => {
-    const recent = history.slice(-1);
-    const items: string[] = [];
-    for (const h of recent) {
-      const ff = Array.isArray(h.filtered_findings) ? h.filtered_findings as Array<{title: string}> : [];
-      for (const f of ff) items.push(f.title);
-    }
-    return items.length > 0 ? `\n  Recently filtered (avoid): ${items.join(', ')}` : '';
-  },
-}));
+vi.mock('./research-plan.js', () => {
+  return {
+    buildResearchScopeGuidance: vi.fn(),
+    aggregateDirectionStats: (history: Array<Record<string, unknown>>, agg: Record<string, unknown>) => {
+      const total = history.length + ((agg.total_cycles as number) || 0);
+      if (total === 0) return '';
+      return `Stats: ${total} cycles`;
+    },
+    buildScopeCalibrationSignal: (history: Array<Record<string, unknown>>) => {
+      if (history.length === 0) return '';
+      const last = history[history.length - 1];
+      const details = Array.isArray(last.failed_task_details) ? last.failed_task_details as Array<{category: string}> : [];
+      const codeErrors = details.filter(d => ['build_failed', 'claude_code_failed'].includes(d.category));
+      return codeErrors.length > 0 ? '\n  Last cycle failures: CODE_ERROR' : '';
+    },
+    parseResearchContext: (raw: string) => {
+      const established: string[] = [];
+      const failed: string[] = [];
+      const open: string[] = [];
+      let eviction = '';
+      type Section = 'established' | 'failed' | 'open' | 'eviction' | '';
+      let current: Section = '';
+      for (const line of raw.split('\n')) {
+        const t = line.trim();
+        if (t.startsWith('## Established')) { current = 'established'; continue; }
+        if (t.startsWith('## Failed')) { current = 'failed'; continue; }
+        if (t.startsWith('## Open')) { current = 'open'; continue; }
+        if (t.startsWith('## Eviction')) { current = 'eviction'; continue; }
+        if (current === 'eviction') { if (t) eviction = t; }
+        else if (t.startsWith('- ') && current === 'established') established.push(t);
+        else if (t.startsWith('- ') && current === 'failed') failed.push(t);
+        else if (t.startsWith('- ') && current === 'open') open.push(t);
+      }
+      return { established, failed, open, eviction };
+    },
+    buildFilteredFindingsSection: (history: Array<Record<string, unknown>>) => {
+      const recent = history.slice(-1);
+      const items: string[] = [];
+      for (const h of recent) {
+        const ff = Array.isArray(h.filtered_findings) ? h.filtered_findings as Array<{title: string}> : [];
+        for (const f of ff) items.push(f.title);
+      }
+      return items.length > 0 ? `\n  Recently filtered (avoid): ${items.join(', ')}` : '';
+    },
+  };
+});
 
 import { renderDirection } from './direction-renderer.js';
 

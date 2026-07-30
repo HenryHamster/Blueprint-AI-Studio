@@ -140,6 +140,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "compute_experiment_spend_threshold_usd",
         "cross_provider_fallback_enabled",
         "daily_cost_ceiling_usd",
+        "discovery_admission_mode",
         "monthly_budget_target_usd",
         "deploy_repo_identity",
         "drift_over_claim_consistency_threshold",
@@ -575,6 +576,9 @@ async def get_settings(
         ),
         "autonomous_spawn_budget_mode": str(
             _runtime_config.get("autonomous_spawn_budget_mode", "observe")
+        ),
+        "discovery_admission_mode": str(
+            _runtime_config.get("discovery_admission_mode", "shadow")
         ),
         "max_global_autonomous_initiative_tasks_per_hour": int(
             _runtime_config.get("max_global_autonomous_initiative_tasks_per_hour", 50)
@@ -1206,6 +1210,16 @@ async def _apply_settings(
             _debt_keys_to_resolve.append(
                 "dormant_knob:autonomous_spawn_budget_mode"
             )
+    if "discovery_admission_mode" in payload:
+        val = str(payload["discovery_admission_mode"] or "").strip().lower()
+        if val not in ("shadow", "enforced"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "discovery_admission_mode must be one of: shadow, enforced"
+                ),
+            )
+        _runtime_config["discovery_admission_mode"] = val
     if "max_global_autonomous_initiative_tasks_per_hour" in payload:
         try:
             _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = (
@@ -3522,6 +3536,9 @@ async def _apply_settings(
                     ),
                     "autonomous_spawn_budget_mode": str(
                         _runtime_config.get("autonomous_spawn_budget_mode", "observe")
+                    ),
+                    "discovery_admission_mode": str(
+                        _runtime_config.get("discovery_admission_mode", "shadow")
                     ),
                     "max_global_autonomous_initiative_tasks_per_hour": int(
                         _runtime_config.get(

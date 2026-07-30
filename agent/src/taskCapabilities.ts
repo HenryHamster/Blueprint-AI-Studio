@@ -21,6 +21,7 @@ export const AGENT_TASK_TYPE_IDS = [
   'fix',
   'plan',
   'research',
+  'discovery_review',
   'strategic_review',
   'design_doc_update',
   'security_audit',

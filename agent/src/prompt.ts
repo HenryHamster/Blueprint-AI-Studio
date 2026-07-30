@@ -263,6 +263,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'review',           // Uses review-fix.ts bespoke prompt assembly
   'plan',             // Uses research-plan.ts bespoke prompt assembly
   'research',         // Uses research-plan.ts bespoke prompt assembly
+  'discovery_review', // Uses discovery-review.ts evidence-bound prompt assembly
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly
   'smoketest',        // Uses specialized.ts bespoke prompt assembly
   'design_doc_update', // Uses design-doc.ts bespoke prompt assembly

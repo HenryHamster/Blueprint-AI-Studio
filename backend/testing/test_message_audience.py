@@ -59,6 +59,15 @@ def test_route_event_routine_maps_to_strategist_internal():
     assert route_event("direction_milestone") == STRATEGIST_INTERNAL
     assert route_event("auto_fix_spawned") == STRATEGIST_INTERNAL
     assert route_event("review_feedback") == STRATEGIST_INTERNAL
+    assert route_event("discovery.review_completed") == STRATEGIST_INTERNAL
+
+
+def test_discovery_review_attention_events_reach_operator():
+    assert route_event("discovery.review_blocked") == OPERATOR_ACTION_NEEDED
+    assert route_event("discovery.operator_question") == OPERATOR_ACTION_NEEDED
+    assert "discovery.review_completed" in get_non_operator_event_types()
+    assert "discovery.review_blocked" in get_operator_event_types()
+    assert "discovery.operator_question" in get_operator_event_types()
 
 
 def test_route_event_high_signal_maps_to_operator_fyi():

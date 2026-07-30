@@ -528,7 +528,6 @@ async def _resolve_quality_grader_completion(
         _handle_design_completion,
         _handle_web_research_completion,
     )
-
     is_adversarial = bool((grader.context or {}).get("adversarial_grader"))
     completed = payload.status == TaskStatus.COMPLETED
     grader_logs = payload.logs or grader.latest_status_message or ""
@@ -1120,6 +1119,10 @@ async def _process_post_commit(
         _handle_design_completion,
         _handle_web_research_completion,
     )
+    from app.discovery_review import (
+        _handle_discovery_review_completion,
+        block_failed_discovery_review,
+    )
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
@@ -1471,6 +1474,28 @@ async def _process_post_commit(
                 except Exception as _res_exc:
                     logger.error(
                         f"[RESEARCH] Failed to record research failure for {task.id}: {_res_exc!r}",
+                        exc_info=True,
+                    )
+
+            # A discovery review is the cycle's durable decision boundary. Once
+            # its normal task retries are exhausted, fail the cycle closed
+            # instead of leaving it indefinitely in ``reviewing``.
+            if task.first_payload.get("type") == "discovery_review":
+                try:
+                    await block_failed_discovery_review(
+                        session,
+                        task=task,
+                        reason=(
+                            payload.failure_category
+                            or task.latest_status_message
+                            or "discovery review task failed"
+                        ),
+                    )
+                except Exception as _discovery_exc:
+                    logger.error(
+                        "[DISCOVERY] Failed to block failed review %s: %r",
+                        task.id,
+                        _discovery_exc,
                         exc_info=True,
                     )
 
@@ -5634,6 +5659,7 @@ async def _process_post_commit(
                     "memo": _handle_memo_completion,
                     "web_research": _handle_web_research_completion,
                     "design": _handle_design_completion,
+                    "discovery_review": _handle_discovery_review_completion,
                     "repo_bootstrap": _handle_repo_bootstrap_completion,
                     "capability_proof_trial": _handle_capability_proof_trial_completion,
                     "criterion_coverage_trial": _handle_criterion_coverage_trial_completion,
@@ -5881,6 +5907,14 @@ async def _process_post_commit(
         ]:
             try:
                 await _check_and_trigger_rollup(task, session)
+                if task.discovery_cycle_id is not None:
+                    from app.discovery_review import (
+                        maybe_close_and_spawn_discovery_review,
+                    )
+
+                    await maybe_close_and_spawn_discovery_review(
+                        session, task.discovery_cycle_id
+                    )
             except Exception as e:
                 # NB: ``task_id`` (plain argument), never ``task.id`` — on a
                 # poisoned session with an expired instance the attribute read

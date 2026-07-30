@@ -35,6 +35,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert body["task_type_categories"]["strategic"] == [
         "strategic_review",
         "design_doc_update",
+        "discovery_review",
     ]
     assert body["task_type_categories"]["initiative"] == ["research", "plan"]
     # _default routing is the global allow-list + effort fallback.
@@ -129,6 +130,7 @@ def test_migrate_legacy_provider_config_backfills_without_rewriting_routes():
     assert migrated["task_type_categories"]["strategic"] == [
         "strategic_review",
         "design_doc_update",
+        "discovery_review",
     ]
     assert migrated["task_type_categories"]["initiative"] == ["research", "plan"]
     # Explicit nonempty routes are operator-owned: preserved byte-for-byte.
@@ -152,6 +154,62 @@ def test_migrate_legacy_provider_config_backfills_without_rewriting_routes():
         "deepseek-v4-flash"
     )
     assert migrated["provider_settings_defaults"]["deepseek"] == {}
+
+
+def test_provider_backfill_routes_discovery_review_without_rewriting_providers():
+    """Existing deployments gain the max-effort review type without a pin."""
+    from app.runtime_config_state import _migrate_legacy_provider_config
+
+    config = {
+        "task_type_categories": {
+            "strategic": ["strategic_review", "design_doc_update"],
+            "review": ["review"],
+        },
+        "category_routing": {
+            "strategic": {
+                "providers": ["anthropic", "openai"],
+                "effort": "max",
+            }
+        },
+        "provider_settings_by_effort": {},
+    }
+
+    migrated = _migrate_legacy_provider_config(config)
+
+    assert migrated["task_type_categories"]["strategic"] == [
+        "strategic_review",
+        "design_doc_update",
+        "discovery_review",
+    ]
+    assert migrated["category_routing"]["strategic"] == {
+        "providers": ["anthropic", "openai"],
+        "effort": "max",
+    }
+
+
+def test_provider_backfill_preserves_explicit_discovery_review_category():
+    from app.runtime_config_state import _migrate_legacy_provider_config
+
+    config = {
+        "task_type_categories": {
+            "strategic": ["strategic_review", "design_doc_update"],
+            "review": ["review", "discovery_review"],
+        },
+        "category_routing": {
+            "strategic": {"providers": ["zai"], "effort": "max"},
+            "review": {"providers": ["openai"], "effort": "high"},
+        },
+        "provider_settings_by_effort": {},
+    }
+
+    migrated = _migrate_legacy_provider_config(config)
+
+    assert "discovery_review" not in migrated["task_type_categories"]["strategic"]
+    assert "discovery_review" in migrated["task_type_categories"]["review"]
+    assert migrated["category_routing"]["review"] == {
+        "providers": ["openai"],
+        "effort": "high",
+    }
 
 
 def test_migrate_legacy_provider_config_is_stable_across_repeated_syncs():

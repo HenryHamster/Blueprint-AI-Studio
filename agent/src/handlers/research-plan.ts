@@ -54,7 +54,7 @@ import { setPromptSizeTelemetry, buildPromptSizeTelemetry } from '../telemetry.j
 
 export const PR_INELIGIBLE_TASK_TYPES = [
   'capability_proof_trial', 'compute_experiment', 'criterion_coverage_trial',
-  'debug', 'design', 'design_doc_update',
+  'debug', 'design', 'design_doc_update', 'discovery_review',
   'investigate', 'memo', 'perf', 'plan',
   'release_audit', 'release_audit_challenge', 'release_merge_grade',
   'repo_bootstrap', 'research', 'review', 'security_audit',
@@ -275,6 +275,72 @@ export function normalizePlanSubtaskTypes(planJson: string, log?: (msg: string) 
     changed = true;
   }
   return changed ? JSON.stringify(plan) : planJson;
+}
+
+/**
+ * A discovery-cycle research task answers one bounded decision. Ordinary
+ * tactical research keeps its existing broad exploration contract byte-for-
+ * byte; only server-stamped bounded_cycle claims enter this branch.
+ */
+export function buildResearchScopeGuidance(discoveryMode: unknown): string {
+  if (discoveryMode === 'bounded_cycle') {
+    return `# HOW TO RESEARCH — BOUNDED DISCOVERY CYCLE
+
+This task supports one frozen discovery bet. Inspect only the areas that can
+materially answer that decision. Do not inventory the whole repository, search
+for unrelated improvements, or convert speculative possibilities into work.
+
+1. Start from the stated direction, intent, bet, and stop/pivot condition.
+2. Identify the smallest set of code, runtime evidence, or external facts that
+   can confirm, refute, or materially qualify the bet.
+3. Stop exploring as soon as the decision is supportable. More findings are not
+   inherently better, and a complete repository survey is out of scope.
+4. Emit at most 1-3 coherent, decision-relevant findings. Findings should form
+   one sensible next move, not a grab bag of individually plausible tasks.
+5. It is explicitly valid to output \`[]\` when the evidence does not justify
+   new work. Do not manufacture an implementation finding to avoid an empty
+   result.
+6. Finding prompts still describe the problem and desired outcome, not line
+   numbers, exact signatures, or step-by-step implementation.
+
+# SCOPE GUIDANCE
+
+- Prefer the smallest scope that tests or advances the frozen bet.
+- Use scope=large only when the decision itself requires a cross-component
+  foundation; do not enlarge a finding merely because adjacent work exists.
+- Knowledge or experiment findings must answer a concrete uncertainty and carry
+  a real stop_or_pivot_condition.
+- Do not propose a new product, platform, or architectural program unless the
+  frozen bet and cited evidence directly require it.`;
+  }
+  return `# HOW TO RESEARCH
+
+1. Explore aggressively — spawn subagents for parallel exploration, use WebSearch for best practices, use TodoWrite to track coverage.
+2. For each direction, ask: "what would it take for this to be DONE?" Work backward from the goal.
+3. Check the design document — if the direction targets something missing, look for a spec on that system entry first. If a spec exists, use it as your design foundation. If no spec, design from scratch. If the direction targets something existing, improve it.
+4. Before writing findings, verify you explored all major directories.
+5. Finding prompts must describe the PROBLEM and desired outcome — NOT the implementation.
+   Do not write line numbers, specific function signatures, or step-by-step code changes.
+   The implementing agent reads the full codebase and decides how to build it. Over-specified
+   prompts waste time and anchor the agent on a suboptimal approach.
+   For foundational findings (scope=large), include: what the system needs and why, recommended
+   approach and technology choices, key architectural decisions, and how it fits with existing systems.
+   For smaller findings, state what's wrong and what "done" looks like — nothing more.
+
+# SCOPE GUIDANCE
+
+- **Building something new?** Use scope=large. Write the finding prompt as a design brief.
+  The plan agent will decompose this into ordered implementation steps.
+- **Improving something existing?** Use scope=small or medium as appropriate.
+- **Adding user-facing features?** Product features, UI improvements, and API enhancements are equally valid findings. Don't deprioritize them in favor of structural work.
+- **Building features on a foundation?** If research context shows a foundation was confirmed
+  (e.g., "(confirmed)" entries), output findings that USE it. These are typically scope=medium.
+
+Output ALL meaningful findings you discover — don't stop at one.
+A direction may need both foundational work AND incremental improvements.
+If you find 5 things worth doing, output 5 findings. Be ambitious — propose
+infrastructure, new systems, and architectural changes when the direction calls
+for it. Use scope=large when the change genuinely requires cross-component coordination. Prefer scope=small or scope=medium for focused product features and targeted improvements.`;
 }
 
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
@@ -630,6 +696,27 @@ export async function handleResearch(
   const directionsText = directions.length > 0
     ? directions.map((d, i) => renderDirection(d, i, currentDirectionId, activeTasks, queuedTasks)).join('\n\n')
     : 'No specific directions provided. Identify general improvements.';
+  const discoveryDecisionSection = payload.discovery_mode === 'bounded_cycle'
+    ? `# FROZEN DISCOVERY DECISION
+
+This cycle is generation ${String(payload.discovery_generation ?? '(unknown)')}
+in phase ${strVal(payload.discovery_phase) || '(unknown)'}. The intent and bet
+below are authoritative for this turn. In particular, a review-created
+\`discovery_bet_snapshot\` supersedes the standing direction wording: research
+what that bet asks, not the previous cycle again.
+
+Intent:
+\`\`\`json
+${JSON.stringify(payload.discovery_intent_snapshot ?? {}, null, 2)}
+\`\`\`
+
+Bet:
+\`\`\`json
+${JSON.stringify(payload.discovery_bet_snapshot ?? {}, null, 2)}
+\`\`\`
+
+`
+    : '';
 
   // Build cross-direction context from OTHER active directions
   const otherDirections = currentDirectionId
@@ -977,7 +1064,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 # CODEBASE CONTEXT
 
 ${codebaseSummary}${contextPrefix}${researchPlaybookSection}${researchRetryContext}${fileTreeSection}${gitHistorySection}
-${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}${researchAvailableCapabilitiesSection}# DIRECTIONS
+${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}${researchAvailableCapabilitiesSection}${discoveryDecisionSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${priorKnowledgeSection}${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these
@@ -1010,34 +1097,7 @@ ${(() => {
   return lines.length > 0 ? lines.join('\n') : '(none yet)';
 })()}
 
-# HOW TO RESEARCH
-
-1. Explore aggressively — spawn subagents for parallel exploration, use WebSearch for best practices, use TodoWrite to track coverage.
-2. For each direction, ask: "what would it take for this to be DONE?" Work backward from the goal.
-3. Check the design document — if the direction targets something missing, look for a spec on that system entry first. If a spec exists, use it as your design foundation. If no spec, design from scratch. If the direction targets something existing, improve it.
-4. Before writing findings, verify you explored all major directories.
-5. Finding prompts must describe the PROBLEM and desired outcome — NOT the implementation.
-   Do not write line numbers, specific function signatures, or step-by-step code changes.
-   The implementing agent reads the full codebase and decides how to build it. Over-specified
-   prompts waste time and anchor the agent on a suboptimal approach.
-   For foundational findings (scope=large), include: what the system needs and why, recommended
-   approach and technology choices, key architectural decisions, and how it fits with existing systems.
-   For smaller findings, state what's wrong and what "done" looks like — nothing more.
-
-# SCOPE GUIDANCE
-
-- **Building something new?** Use scope=large. Write the finding prompt as a design brief.
-  The plan agent will decompose this into ordered implementation steps.
-- **Improving something existing?** Use scope=small or medium as appropriate.
-- **Adding user-facing features?** Product features, UI improvements, and API enhancements are equally valid findings. Don't deprioritize them in favor of structural work.
-- **Building features on a foundation?** If research context shows a foundation was confirmed
-  (e.g., "(confirmed)" entries), output findings that USE it. These are typically scope=medium.
-
-Output ALL meaningful findings you discover — don't stop at one.
-A direction may need both foundational work AND incremental improvements.
-If you find 5 things worth doing, output 5 findings. Be ambitious — propose
-infrastructure, new systems, and architectural changes when the direction calls
-for it. Use scope=large when the change genuinely requires cross-component coordination. Prefer scope=small or scope=medium for focused product features and targeted improvements.
+${buildResearchScopeGuidance(payload.discovery_mode)}
 
 # BEFORE YOU WRITE FINDINGS — dedup check
 
@@ -1217,6 +1277,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
     ['system_verification', systemVerificationSection],
     ['capability_verification', capabilityVerificationSection],
     ['available_capabilities', researchAvailableCapabilitiesSection],
+    ['discovery_decision', discoveryDecisionSection],
     ['directions', directionsText],
     ['cross_direction', crossDirSection],
     ['prior_knowledge', priorKnowledgeSection],

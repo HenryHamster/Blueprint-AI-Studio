@@ -151,6 +151,11 @@ from app.shared_state import (
     scope_to_effort,
     get_project_integration_branch as _get_project_integration_branch,
 )
+from app.discovery_admission import (
+    consume_discovery_admission,
+    discovery_admission_mode_from_runtime,
+    reserve_discovery_admission,
+)
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
     _SCOPE_ORDER,
     SCOPE_FILE_BUDGETS,
@@ -1983,6 +1988,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _evergreen_item_id_early,
                     _eg_exc,
                 )
+            await session.commit()
+        if task.discovery_cycle_id is not None:
+            # A zero-finding research cycle has no child terminal event to
+            # re-enter rollup management. Queue its independent review here;
+            # the leader sweep is the durable backstop if this best-effort
+            # immediate trigger is interrupted.
+            from app.discovery_review import (
+                maybe_close_and_spawn_discovery_review,
+            )
+
+            await maybe_close_and_spawn_discovery_review(
+                session, task.discovery_cycle_id
+            )
             await session.commit()
         return
 
@@ -5199,6 +5217,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _spawn_criterion_ids = list(task.criterion_ids)
         new_task = Task(
             project_id=task.project_id,
+            discovery_cycle_id=task.discovery_cycle_id,
             title=title,
             description=finding.get("description", prompt[:200]),
             parent_task_id=task.id,
@@ -5450,7 +5469,41 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _spawn_gate_challenged
             else None,
         }
+        if task.discovery_cycle_id is not None:
+            _finding_admission_key = f"research-finding:{task.id}:{fhash}"
+            _finding_admission = await reserve_discovery_admission(
+                session,
+                cycle_id=task.discovery_cycle_id,
+                admission_key=_finding_admission_key,
+                mode=discovery_admission_mode_from_runtime(_runtime_config),
+                metadata={"source": "research_finding"},
+            )
+            if not _finding_admission.allowed:
+                logger.info(
+                    "[RESEARCH] Discovery admission denied finding %s for task %s: %s",
+                    fhash,
+                    task.id,
+                    _finding_admission.reason,
+                )
+                continue
         session.add(new_task)
+        if task.discovery_cycle_id is not None:
+            _bound_finding_admission = await reserve_discovery_admission(
+                session,
+                cycle_id=task.discovery_cycle_id,
+                admission_key=_finding_admission_key,
+                task_id=new_task.id,
+            )
+            if not _bound_finding_admission.allowed or not (
+                await consume_discovery_admission(
+                    session,
+                    cycle_id=task.discovery_cycle_id,
+                    admission_key=_finding_admission_key,
+                )
+            ):
+                raise RuntimeError(
+                    "discovery finding admission could not be bound and consumed"
+                )
         if (
             task_type == "compute_experiment"
             and _compute_requires_approval
@@ -5607,6 +5660,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         _memo_task = Task(
             project_id=task.project_id,
+            discovery_cycle_id=task.discovery_cycle_id,
             title=f"Memo: {_memo_topic[:120]}",
             description=f"Reasoning memo for dropped finding ({_drop_reason})",
             parent_task_id=task.id,
@@ -5623,7 +5677,41 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             depends_on=[],
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
+        if task.discovery_cycle_id is not None:
+            _memo_admission_key = f"research-memo:{task.id}:{_mf_hash}"
+            _memo_admission = await reserve_discovery_admission(
+                session,
+                cycle_id=task.discovery_cycle_id,
+                admission_key=_memo_admission_key,
+                mode=discovery_admission_mode_from_runtime(_runtime_config),
+                metadata={"source": "research_memo"},
+            )
+            if not _memo_admission.allowed:
+                logger.info(
+                    "[RESEARCH] Discovery admission denied memo %s for task %s: %s",
+                    _mf_hash,
+                    task.id,
+                    _memo_admission.reason,
+                )
+                continue
         session.add(_memo_task)
+        if task.discovery_cycle_id is not None:
+            _bound_memo_admission = await reserve_discovery_admission(
+                session,
+                cycle_id=task.discovery_cycle_id,
+                admission_key=_memo_admission_key,
+                task_id=_memo_task.id,
+            )
+            if not _bound_memo_admission.allowed or not (
+                await consume_discovery_admission(
+                    session,
+                    cycle_id=task.discovery_cycle_id,
+                    admission_key=_memo_admission_key,
+                )
+            ):
+                raise RuntimeError(
+                    "discovery memo admission could not be bound and consumed"
+                )
         try:
             from app.task_completion import _apply_synthesized_memo
 
@@ -5699,6 +5787,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _salvage_payload = _build_salvage_payload(_salvage_candidates, task.id)
         _salvage_task = Task(
             project_id=task.project_id,
+            discovery_cycle_id=task.discovery_cycle_id,
             title=f"Salvage bundle: {len(_salvage_candidates)} discarded finding(s)",
             description=(
                 f"Consolidated fix batch for {len(_salvage_candidates)} research finding(s) "
@@ -5717,24 +5806,58 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             depends_on=[],
             priority=TASK_PRIORITY_MAP.get("medium", 50),
         )
-        session.add(_salvage_task)
-        # Record salvage activity on the parent research task context so
-        # downstream consumers (strategist, operator, admin UI) can see
-        # that salvage was triggered and trace to the spawned bundle.
-        _salvage_ctx = dict(task.context or {})
-        _salvage_ctx["salvage_activity"] = {
-            "salvage_task_id": str(_salvage_task.id),
-            "salvaged_count": len(_salvage_candidates),
-            "salvaged_at": _utcnow().isoformat(),
-        }
-        task.context = _salvage_ctx
-        flag_modified(task, "context")
-        session.add(task)
-        logger.info(
-            "[RESEARCH] Spawned consolidated salvage-bundle task for %d discarded finding(s) (task %s)",
-            len(_salvage_candidates),
-            task.id,
-        )
+        if task.discovery_cycle_id is not None:
+            _salvage_admission_key = f"research-salvage:{task.id}"
+            _salvage_admission = await reserve_discovery_admission(
+                session,
+                cycle_id=task.discovery_cycle_id,
+                admission_key=_salvage_admission_key,
+                mode=discovery_admission_mode_from_runtime(_runtime_config),
+                metadata={"source": "research_salvage"},
+            )
+            if not _salvage_admission.allowed:
+                logger.info(
+                    "[RESEARCH] Discovery admission denied salvage task for %s: %s",
+                    task.id,
+                    _salvage_admission.reason,
+                )
+                _salvage_task = None
+        if _salvage_task is not None:
+            session.add(_salvage_task)
+            if task.discovery_cycle_id is not None:
+                _bound_salvage_admission = await reserve_discovery_admission(
+                    session,
+                    cycle_id=task.discovery_cycle_id,
+                    admission_key=_salvage_admission_key,
+                    task_id=_salvage_task.id,
+                )
+                if not _bound_salvage_admission.allowed or not (
+                    await consume_discovery_admission(
+                        session,
+                        cycle_id=task.discovery_cycle_id,
+                        admission_key=_salvage_admission_key,
+                    )
+                ):
+                    raise RuntimeError(
+                        "discovery salvage admission could not be bound and consumed"
+                    )
+            # Record salvage activity on the parent research task context so
+            # downstream consumers can trace the admitted bundle.
+            _salvage_ctx = dict(task.context or {})
+            _salvage_ctx["salvage_activity"] = {
+                "salvage_task_id": str(_salvage_task.id),
+                "salvaged_count": len(_salvage_candidates),
+                "salvaged_at": _utcnow().isoformat(),
+            }
+            task.context = _salvage_ctx
+            flag_modified(task, "context")
+            session.add(task)
+            logger.info(
+                "[RESEARCH] Spawned consolidated salvage-bundle task for %d "
+                "discarded finding(s) (task %s)",
+                len(_salvage_candidates),
+                task.id,
+            )
 
     _deferral_reasons: list[str] = []
     if _low_actionability_deferred:

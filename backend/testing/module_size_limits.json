@@ -24,6 +24,7 @@
     "github_pulls.py": 1500,
     "github_http.py": 250,
     "github_merge_summary.py": 350,
+    "discovery_review.py": 1700,
     "routers/admin_settings.py": 4750,
     "routers/admin_analytics.py": 2750,
     "routers/admin_operator_triggers.py": 1450,

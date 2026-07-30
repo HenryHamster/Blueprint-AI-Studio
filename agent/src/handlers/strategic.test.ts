@@ -231,6 +231,7 @@ const {
     'buildOperatorOverridesSection',
     'buildPortfolioComposition',
     'buildRejectedProposalsSection',
+    'buildResearchScopeGuidance',
     'buildRunningUpdateSupersededSection',
     'buildScopeCalibrationSignal',
     'buildStrategicCompletionLogs',
@@ -482,6 +483,7 @@ vi.mock('./research-plan.js', () => ({
   buildStrategicCompletionLogs: () => ({ logs: '' }),
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
+  buildResearchScopeGuidance: vi.fn(),
   buildOperatorOverridesSection: (o: Array<Record<string, unknown>>) =>
     Array.isArray(o) && o.length ? `OPERATOR_OVERRIDES(${o.length})` : '',
   buildRunningUpdateSupersededSection: (signal: Record<string, unknown> | null | undefined) =>

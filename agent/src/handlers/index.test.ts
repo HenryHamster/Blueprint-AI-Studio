@@ -113,7 +113,7 @@ import { handleStrategicResident } from './strategic-resident.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  // 27 BESPOKE handlers are hand-registered today. This is no longer the
+  // 32 BESPOKE handlers are hand-registered today. This is no longer the
   // launchability gate — dispatch falls back to contract-driven GENERIC runners
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
@@ -407,6 +407,7 @@ const TASK_CLASS_MAP = {
   release_audit:     'read-only',
   release_audit_challenge: 'read-only',
   release_merge_grade: 'read-only',
+  discovery_review:  'read-only',
   smoketest:         'read-only',
   debug:             'read-only',
   perf:              'read-only',

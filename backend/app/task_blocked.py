@@ -551,6 +551,26 @@ def clear_blocker_metadata(task: Task) -> None:
     )
 
 
+def mark_task_for_fresh_execution_attempt(task: Task) -> int:
+    """Advance the durable execution incarnation used by discovery accounting.
+
+    Retry policy has several ways to return an existing task row to ``QUEUED``.
+    Keeping the incarnation in task context gives the dispatch boundary one
+    stable idempotency key per actual fresh execution without coupling this
+    synchronous state-reset helper to a database session.
+    """
+
+    context = dict(task.context or {})
+    raw_ordinal = context.get("_discovery_attempt_ordinal", 0)
+    try:
+        ordinal = max(0, int(raw_ordinal)) + 1
+    except (TypeError, ValueError):
+        ordinal = 1
+    context["_discovery_attempt_ordinal"] = ordinal
+    task.context = context
+    return ordinal
+
+
 def reset_task_for_fresh_attempt(task: Task) -> None:
     """Clear stale runtime state before a task returns to QUEUED.
 
@@ -587,6 +607,7 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
         **strip_fresh_attempt_context(task.context or {}),
         "_fresh_attempt_started_at": _utcnow().isoformat(),
     }
+    mark_task_for_fresh_execution_attempt(task)
 
 
 def unblock_to_queued(task: Task, *, message: Optional[str] = None) -> None:

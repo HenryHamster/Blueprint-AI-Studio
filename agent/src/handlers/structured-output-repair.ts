@@ -67,6 +67,8 @@ export interface RepairStructuredOutputOptions {
    *  that fails schema validation is treated like a format miss and reopened
    *  once, using the returned miss reason. */
   validateParsedValue?: (value: unknown) => ParsedValueValidationResult;
+  /** Injectable runner for handlers with a narrow dependency facade. */
+  run?: typeof runClaudeCode;
 }
 
 export type ParsedValueValidationResult =
@@ -198,7 +200,7 @@ export async function repairStructuredOutput<T = unknown>(
   const {
     mode, requiredKeys, first, reopenPrompt,
     ws, statusRef, model, effort, disallowedTools, retryStatus, schemaLabel,
-    validateParsedValue,
+    validateParsedValue, run = runClaudeCode,
   } = opts;
 
   let firstAttempt = tryExtract(
@@ -226,7 +228,7 @@ export async function repairStructuredOutput<T = unknown>(
     const priorOutput = first.lastResultText || first.allOutput || '';
     const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt, priorOutput);
     const tokensBefore = getLlmTelemetry();
-    const retryRun = await runClaudeCode(
+    const retryRun = await run(
       missAwarePrompt, ws, statusRef, model, effort, disallowedTools,
     );
     const tokensAfter = getLlmTelemetry();

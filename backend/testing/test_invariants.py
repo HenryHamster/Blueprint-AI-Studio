@@ -11315,6 +11315,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "plan": "none",
         "research": "forward-quality",
         "strategic_review": "forward-quality",
+        "discovery_review": "structured-verdict",
         "design_doc_update": "forward-quality",
         "security_audit": "forward-quality",
         "qa": "code-ci-review",
@@ -13570,13 +13571,13 @@ class TestProblemModelWritePathInvariants:
         ("routers/admin_agent_ops.py", 2712): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         ("routers/admin_agent_ops.py", 2967): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4274): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4277): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4302): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4305): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 4833): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4836): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 4915): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 4918): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):

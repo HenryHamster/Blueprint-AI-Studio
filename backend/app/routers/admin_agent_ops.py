@@ -4078,6 +4078,9 @@ async def strategic_operation(
                 burst_window_minutes=int(
                     _runtime_config.get("strategist_spawn_window_minutes", 60)
                 ),
+                discovery_admission_mode=str(
+                    _runtime_config.get("discovery_admission_mode", "shadow")
+                ),
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

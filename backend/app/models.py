@@ -59,6 +59,11 @@ from app.release_models import (  # noqa: F401
     ResidualVerdict,
     VersionAcceptanceCriterion,
 )
+from app.discovery_models import (  # noqa: F401
+    DiscoveryAdmission,
+    DiscoveryCycle,
+    DiscoveryEvidenceItem,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
@@ -292,6 +297,10 @@ class ArtifactType(str, Enum):
     # artifact column is a plain String so no migration is needed for the
     # ArtifactType itself.
     RELEASE_MERGE_GRADE = "RELEASE_MERGE_GRADE"
+    # Structured direction verdict emitted by the normal discovery_review task.
+    # Stored in the plain String artifact column, so adding the value requires no
+    # database enum migration.
+    DISCOVERY_REVIEW = "DISCOVERY_REVIEW"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test
     # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is
@@ -1232,6 +1241,20 @@ class Task(SQLModel, table=True):
     description: str = Field(default="")
     parent_task_id: uuid.UUID | None = Field(
         default=None, foreign_key="task.id", index=True
+    )
+    discovery_cycle_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey(
+                "discoverycycle.id",
+                name="fk_task_discovery_cycle_id",
+                ondelete="SET NULL",
+                use_alter=True,
+            ),
+            nullable=True,
+            index=True,
+        ),
     )
     latest_status_message: str | None = None
     status_log: List[Dict[str, Any]] = Field(
@@ -3395,6 +3418,15 @@ class StrategicSpawnRequest(SQLModel, table=True):
     )
     direction_id: str | None = Field(
         default=None, sa_column=Column(String(128), nullable=True)
+    )
+    discovery_cycle_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("discoverycycle.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
     )
     state: str = Field(
         default="accepted",

@@ -78,7 +78,10 @@ from app.failure_classification import (
     _persist_stuck_call_reclassification,
 )
 from app.retry_budget import append_failure_class_history
-from app.task_blocked import reset_task_for_fresh_attempt
+from app.task_blocked import (
+    mark_task_for_fresh_execution_attempt,
+    reset_task_for_fresh_attempt,
+)
 from app.time_utils import (
     _utcnow,
     clear_retry_after,
@@ -1514,6 +1517,7 @@ async def reaper_service():
                             da_ctx.pop("failure_class", None)
                             da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
+                            mark_task_for_fresh_execution_attempt(task)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
                             clear_retry_after(task)
@@ -1560,6 +1564,7 @@ async def reaper_service():
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
+                            mark_task_for_fresh_execution_attempt(task)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
                             clear_retry_after(task)
@@ -2654,6 +2659,20 @@ async def reaper_service():
                     _mark_reaper_progress,
                     landed_cb=_mark_landed_parent_dependents,
                 )
+
+                # Step 3.25: discovery review convergence. Immediate completion
+                # hooks are latency optimizations; this bounded leader-owned
+                # sweep is the correctness path for expired envelopes and
+                # terminal cohorts whose request process died between commits.
+                try:
+                    from app.discovery_review import sweep_discovery_reviews
+
+                    await sweep_discovery_reviews(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Discovery-review sweep error: {e}",
+                        exc_info=True,
+                    )
 
                 # Step 3.5: Detach EVALUATING provider tasks whose direction closed.
                 # direction_id is provenance, not a kill-tether — a retired

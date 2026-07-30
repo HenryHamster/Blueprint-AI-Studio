@@ -54,6 +54,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "issue_implementation_spawned": STRATEGIST_INTERNAL,
     "review_feedback": STRATEGIST_INTERNAL,
     "feedback_acknowledgment": STRATEGIST_INTERNAL,
+    "discovery.review_completed": STRATEGIST_INTERNAL,
     # Escalation → operator-action-needed
     "auto_fix_escalated": OPERATOR_ACTION_NEEDED,
     "residual_fix_escalated": OPERATOR_ACTION_NEEDED,
@@ -62,6 +63,8 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "direction_burn_pause": OPERATOR_ACTION_NEEDED,
     "direction_outcome_scaffolding_escalation": OPERATOR_ACTION_NEEDED,
     "direction_churn_pause": OPERATOR_ACTION_NEEDED,
+    "discovery.review_blocked": OPERATOR_ACTION_NEEDED,
+    "discovery.operator_question": OPERATOR_ACTION_NEEDED,
     # High-signal → operator-fyi
     "artifact_handoff_failed": OPERATOR_ACTION_NEEDED,
     "failure_alert": OPERATOR_FYI,

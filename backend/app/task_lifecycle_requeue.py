@@ -616,6 +616,10 @@ async def _requeue_parent_task(
         clone_ctx = {
             **strip_fresh_attempt_context(child_ctx),
             "_fresh_attempt_started_at": _utcnow().isoformat(),
+            # A replacement clone is a retry of the same logical bet, not a new
+            # logical task. The common dispatch boundary charges this
+            # incarnation exactly once when execution actually starts.
+            "_discovery_attempt_ordinal": 1,
         }
 
         # Preserve the prior attempt's provider/model under a non-stripped key
@@ -879,6 +883,7 @@ async def _requeue_parent_task(
 
         new_child = Task(
             project_id=child.project_id,
+            discovery_cycle_id=child.discovery_cycle_id,
             title=child.title,
             description=child.description,
             parent_task_id=parent.id,
