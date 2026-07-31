@@ -29,6 +29,9 @@ Optional environment variables:
                                       "bwrap" forces the host bwrap path even if an image is
                                       set (disables the docker agent backend).
     BLUEPRINT_RUNNER_POLL_INTERVAL    Base poll interval in seconds (default: 2, floor 0.5)
+    BLUEPRINT_RUNNER_IDLE_POLL_MAX_INTERVAL
+                                      Maximum no-task poll interval in seconds
+                                      (default: 5, never below the base interval).
     BLUEPRINT_RUNNER_AGENT_MAX_SECONDS Wall-clock deadline for an agent subprocess before the
                                       reaper terminates its process group (default: 14400 = 4h,
                                       floor 60)
@@ -213,6 +216,16 @@ def _env_float(name: str, default: float, *, minimum: float | None = None) -> fl
             )
         value = minimum
     return value
+
+
+def _next_idle_poll_interval(
+    current: float,
+    *,
+    base: float,
+    maximum: float,
+) -> float:
+    """Bound exponential no-task backoff for latency-sensitive agent claims."""
+    return max(base, min(current * 2, maximum))
 
 
 def _parse_retry_after(value) -> float | None:
@@ -7754,6 +7767,7 @@ def _spawn_agent_task(
     agent_teardown: dict,
     lock: threading.Lock,
     project_id: str | None = None,
+    resident_session: bool = False,
     llm_env: dict[str, str] | None = None,
     llm_files: list[dict[str, str]] | None = None,
     decline_reason_out: list[str] | None = None,
@@ -7867,6 +7881,10 @@ def _spawn_agent_task(
         injected_env.update(effective_llm_env)
     # Task identity is authoritative and must not be overridden by provider
     # credential material returned in credentials.env.
+    injected_env["BLUEPRINT_PRE_CLAIM_TASK_TYPE"] = task_type
+    injected_env.pop("BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION", None)
+    if resident_session:
+        injected_env["BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION"] = "1"
     if project_id:
         injected_env["PROJECT_ID"] = project_id
     plan = iso.plan_agent_execution(
@@ -8042,6 +8060,11 @@ def main() -> None:
         "BLUEPRINT_RUNNER_MAX_CONCURRENT_COMPUTE_JOBS", 2, minimum=1
     )
     base_poll_interval = _env_float("BLUEPRINT_RUNNER_POLL_INTERVAL", 2.0, minimum=0.5)
+    idle_poll_max_interval = _env_float(
+        "BLUEPRINT_RUNNER_IDLE_POLL_MAX_INTERVAL",
+        5.0,
+        minimum=base_poll_interval,
+    )
     agent_max_seconds = _env_float(
         "BLUEPRINT_RUNNER_AGENT_MAX_SECONDS", 14400.0, minimum=60.0
     )
@@ -8516,7 +8539,16 @@ def main() -> None:
             if status == 204 or body is None:
                 resource_ledger.release(reservation_key)
                 _release_capacity(agent_capacity)
-                poll_interval = min(poll_interval * 2, 30.0)
+                # This loop is also the admission path for an interactive
+                # Resident. A 30-second idle backoff made a newly-started chat
+                # wait an average 15 seconds before any process existed. Keep a
+                # modest idle cap; explicit 429 and pool-exhausted paths retain
+                # their separate, longer backoffs.
+                poll_interval = _next_idle_poll_interval(
+                    poll_interval,
+                    base=base_poll_interval,
+                    maximum=idle_poll_max_interval,
+                )
                 time.sleep(poll_interval)
                 continue
 
@@ -8533,6 +8565,7 @@ def main() -> None:
             project_id = body.get("project_id")
             agent_token = body.get("agent_token", "")
             task_type = body.get("task_type", "unknown")
+            resident_session = body.get("resident_session") is True
             vm_instance_id = body.get("vm_instance_id") or "runner:local"
             # Per-task server-vended LLM credentials from the nested
             # {"credentials": {"env": {...}, "files": [...]}} response shape.
@@ -8623,6 +8656,7 @@ def main() -> None:
                 agent_teardown=agent_teardown,
                 lock=lock,
                 project_id=project_id,
+                resident_session=resident_session,
                 llm_env=llm_env,
                 llm_files=llm_files,
                 decline_reason_out=decline_reason,

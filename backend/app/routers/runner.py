@@ -1480,6 +1480,10 @@ async def next_task(
         "vm_instance_id": pinned_vm_id,
         "payload": task.payloads,
         "task_type": task_type,
+        "resident_session": (
+            (task.first_payload or {}).get("resident_session") is True
+            or (task.context or {}).get("_resident_session") is True
+        ),
         "capability_slice": agent_capability_slice(task_type),
         "credentials": credentials,
     }

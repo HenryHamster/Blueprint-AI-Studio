@@ -92,6 +92,7 @@ import {
   refreshRuntimeState,
   _resetCredentialStateForTesting,
 } from './index.js';
+import { shouldDeferProviderValidationToResident } from './resident-startup.js';
 import {
   __setCommandExistsOverrideForSmoke,
   __resetClaudeCapabilityCacheForTesting,
@@ -111,6 +112,15 @@ function defined<T>(v: T | undefined | null, msg = 'expected value to be defined
 }
 const makeFetchMock = () => vi.fn<(input: unknown, init?: RequestInit) => Promise<unknown>>();
 type FetchMock = ReturnType<typeof makeFetchMock>;
+
+describe('Resident startup provider validation', () => {
+  it('defers only the long-lived Strategic Resident to its canonical stream launch', () => {
+    expect(shouldDeferProviderValidationToResident('strategic_review', '1')).toBe(true);
+    expect(shouldDeferProviderValidationToResident('strategic_review', undefined)).toBe(false);
+    expect(shouldDeferProviderValidationToResident('fix', '1')).toBe(false);
+    expect(shouldDeferProviderValidationToResident(undefined, '1')).toBe(false);
+  });
+});
 
 beforeEach(() => {
   // Bypass the pre-flight CLI-exists check: provider binaries (claude, codex, etc.)
@@ -657,19 +667,55 @@ describe('provider runner prompt transport', () => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync)
       .mockReturnValueOnce('claude 1.2.3')
+      .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>')
       .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>');
     const first = probeClaudeCapabilities('claude', process.env);
     const second = probeClaudeCapabilities('claude', process.env);
 
     expect(first).toEqual(new Set(['--model', '--effort']));
     expect(second).toBe(first);
-    expect(execFileSync).toHaveBeenCalledTimes(2);
+    expect(execFileSync).toHaveBeenCalledTimes(3);
     expect(stripUnsupportedClaudeOptionalArgs(
       ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], first,
     )).toEqual(['--model', 'glm-5.2', '--effort', 'high']);
     expect(stripUnsupportedClaudeOptionalArgs(
       ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], new Set(['--model']),
     )).toEqual(['--model', 'glm-5.2']);
+  });
+
+  it('retries a truncated Claude help surface before caching Resident capabilities', () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('claude 2.1.220')
+      .mockReturnValueOnce([
+        'Usage: claude [options]',
+        '  --model <model>',
+        '  --effort <level>',
+        '  --include-partial-messages',
+        '  --input-format <format>',
+        '  --output-format <format>',
+        '  --verbose',
+      ].join('\n'))
+      .mockReturnValueOnce([
+        'Usage: claude [options]',
+        '  --model <model>',
+        '  --append-system-prompt <prompt>',
+        '  --mcp-config <path>',
+        '  --strict-mcp-config',
+        '  --allowedTools <tool>',
+      ].join('\n'));
+
+    const capabilities = probeClaudeCapabilities('claude', process.env);
+
+    expect(capabilities).toEqual(new Set([
+      '--model',
+      '--append-system-prompt',
+      '--mcp-config',
+      '--strict-mcp-config',
+      '--allowedTools',
+    ]));
+    expect(probeClaudeCapabilities('claude', process.env)).toBe(capabilities);
+    expect(execFileSync).toHaveBeenCalledTimes(3);
   });
 
   it('fails open when the Claude capability probe is ambiguous or fails', () => {

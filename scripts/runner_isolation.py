@@ -169,6 +169,8 @@ _AGENT_IDENTITY_ENV_KEYS: frozenset[str] = frozenset(
         "TASK_ID",
         "VM_INSTANCE_ID",
         "PROJECT_ID",
+        "BLUEPRINT_PRE_CLAIM_TASK_TYPE",
+        "BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION",
         "AGENT_WORKSPACE",
         "HOME",
     }

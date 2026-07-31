@@ -2098,13 +2098,26 @@ class TestMaxConcurrentCap(unittest.TestCase):
             local_runner._shutdown_event.clear()
 
     def test_backoff_doubles_on_no_task(self):
-        """Poll interval doubles (up to 30s) on 204 responses."""
-        # Test the backoff arithmetic directly
+        """Interactive agent polling stays bounded at the five-second idle cap."""
         poll_interval = 2.0
-        for expected in [4.0, 8.0, 16.0, 30.0, 30.0]:
-            poll_interval = min(poll_interval * 2, 30.0)
-            self.assertLessEqual(poll_interval, 30.0)
-        self.assertEqual(poll_interval, 30.0)
+        for expected in [4.0, 5.0, 5.0, 5.0, 5.0]:
+            poll_interval = local_runner._next_idle_poll_interval(
+                poll_interval,
+                base=2.0,
+                maximum=5.0,
+            )
+            self.assertEqual(poll_interval, expected)
+        self.assertEqual(poll_interval, 5.0)
+
+    def test_idle_backoff_never_drops_below_a_custom_base(self):
+        self.assertEqual(
+            local_runner._next_idle_poll_interval(
+                7.0,
+                base=7.0,
+                maximum=7.0,
+            ),
+            7.0,
+        )
 
     def test_backoff_resets_on_task(self):
         """Poll interval resets to base on a 200 response."""
@@ -6050,7 +6063,8 @@ class TestDockerAgentBackend(unittest.TestCase):
     # ---- plan + spawn + container tracking -----------------------------------
 
     def _spawn(self, *, backend, container_name, agent_image, agent_binary, caps,
-               task_type="research", llm_env=None, project_id="project-123"):
+               task_type="research", llm_env=None, project_id="project-123",
+               resident_session=False):
         active_tasks: dict = {}
         agent_started_at: dict = {}
         agent_teardown: dict = {}
@@ -6088,6 +6102,7 @@ class TestDockerAgentBackend(unittest.TestCase):
                 agent_teardown=agent_teardown,
                 lock=threading.Lock(),
                 project_id=project_id,
+                resident_session=resident_session,
                 llm_env=llm_env,
             )
         return {
@@ -6122,6 +6137,10 @@ class TestDockerAgentBackend(unittest.TestCase):
         # Injected identity env is passed through unchanged.
         self.assertEqual(pkw["injected_env"]["AGENT_SECRET_TOKEN"], "agent-tok")
         self.assertEqual(pkw["injected_env"]["TASK_ID"], "task-xyz")
+        self.assertEqual(
+            pkw["injected_env"]["BLUEPRINT_PRE_CLAIM_TASK_TYPE"],
+            "research",
+        )
 
     def test_bwrap_spawn_relocates_codex_home_before_planning(self):
         r = self._spawn(
@@ -6159,6 +6178,55 @@ class TestDockerAgentBackend(unittest.TestCase):
         self.assertEqual(
             pkw["injected_env"]["PROJECT_ID"],
             "authoritative-project",
+        )
+
+    def test_task_type_overrides_provider_credential_env(self):
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=_bwrap_caps(),
+            task_type="strategic_review",
+            llm_env={"BLUEPRINT_PRE_CLAIM_TASK_TYPE": "fix"},
+        )
+
+        _, pkw = r["plan"].call_args
+        self.assertEqual(
+            pkw["injected_env"]["BLUEPRINT_PRE_CLAIM_TASK_TYPE"],
+            "strategic_review",
+        )
+
+    def test_only_server_resident_marker_enables_pre_claim_resident_identity(self):
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=_bwrap_caps(),
+            task_type="strategic_review",
+            resident_session=True,
+            llm_env={"BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION": "0"},
+        )
+        _, pkw = r["plan"].call_args
+        self.assertEqual(
+            pkw["injected_env"]["BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION"],
+            "1",
+        )
+
+        ordinary = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=_bwrap_caps(),
+            task_type="strategic_review",
+            llm_env={"BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION": "1"},
+        )
+        _, ordinary_kw = ordinary["plan"].call_args
+        self.assertNotIn(
+            "BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION",
+            ordinary_kw["injected_env"],
         )
 
     def test_real_iso_interface_docker_plan_and_container_name(self):

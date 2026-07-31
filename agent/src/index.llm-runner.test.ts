@@ -306,13 +306,14 @@ describe('provider runner prompt transport', () => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync)
       .mockReturnValueOnce('claude 1.2.3')
+      .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>')
       .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>');
     const first = probeClaudeCapabilities('claude', process.env);
     const second = probeClaudeCapabilities('claude', process.env);
 
     expect(first).toEqual(new Set(['--model', '--effort']));
     expect(second).toBe(first);
-    expect(execFileSync).toHaveBeenCalledTimes(2);
+    expect(execFileSync).toHaveBeenCalledTimes(3);
     expect(stripUnsupportedClaudeOptionalArgs(
       ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], first,
     )).toEqual(['--model', 'glm-5.2', '--effort', 'high']);

@@ -76,6 +76,12 @@ function _commandExists(command: string): boolean {
 }
 
 const CLAUDE_PARTIAL_MESSAGES_FLAG = '--include-partial-messages';
+const CLAUDE_RESIDENT_REQUIRED_FLAGS = new Set([
+  '--append-system-prompt',
+  '--mcp-config',
+  '--strict-mcp-config',
+  '--allowedTools',
+]);
 const CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS: Readonly<Record<string, number>> = {
   [CLAUDE_PARTIAL_MESSAGES_FLAG]: 0,
   '--effort': 1,
@@ -126,7 +132,30 @@ export function probeClaudeCapabilities(command: string, env: NodeJS.ProcessEnv)
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const helpText = typeof help === 'string' ? help.trim() : '';
-    const capabilities = helpText ? claudeFlagsFromHelp(helpText) : null;
+    let capabilities = helpText ? claudeFlagsFromHelp(helpText) : null;
+    // Some packaged Claude CLIs have intermittently emitted a truncated help
+    // surface. Retry a suspiciously incomplete result before caching it; a
+    // stable known-negative result remains known-negative and the Resident's
+    // required-flag gate still fails closed.
+    if (capabilities && [...CLAUDE_RESIDENT_REQUIRED_FLAGS].some((flag) => !capabilities?.has(flag))) {
+      try {
+        const retryHelp = execFileSync(command, ['--help'], {
+          env,
+          encoding: 'utf8',
+          timeout: 5_000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const retryText = typeof retryHelp === 'string' ? retryHelp.trim() : '';
+        const retryCapabilities = retryText ? claudeFlagsFromHelp(retryText) : null;
+        const retryProvesResidentSupport = retryCapabilities
+          && [...CLAUDE_RESIDENT_REQUIRED_FLAGS].every((flag) => retryCapabilities.has(flag));
+        if (retryCapabilities && (retryProvesResidentSupport || retryCapabilities.size > capabilities.size)) {
+          capabilities = retryCapabilities;
+        }
+      } catch {
+        // Keep the first definite result; required consumers still fail closed.
+      }
+    }
     claudeCapabilityCache.set(cacheKey, capabilities);
     claudeCapabilityByCommand.set(command, capabilities);
     return capabilities;
