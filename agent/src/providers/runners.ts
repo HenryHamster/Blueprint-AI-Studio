@@ -95,7 +95,22 @@ const CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS: Readonly<Record<string, number>> = {
   '--no-session-persistence': 0,
 };
 const claudeCapabilityCache = new Map<string, ReadonlySet<string> | null>();
-const claudeCapabilityByCommand = new Map<string, ReadonlySet<string> | null>();
+const claudeCapabilityByEnvironment = new Map<string, ReadonlySet<string> | null>();
+
+function claudeCapabilityEnvironmentKey(command: string, env: NodeJS.ProcessEnv): string {
+  // The same literal command can resolve to different binaries across the
+  // normal provider environment and isolated memory/foreground environments.
+  // HOME/config can also select a packaged wrapper with a different help
+  // surface. Never let an earlier probe poison a later Resident launch merely
+  // because both commands happen to be named "claude".
+  return [
+    command,
+    env.PATH ?? '',
+    env.HOME ?? '',
+    env.CLAUDE_CONFIG_DIR ?? '',
+    env.CLAUDE_CODE_SIMPLE ?? '',
+  ].join('\u0000');
+}
 
 export function claudeHelpSupportsPartialMessages(helpText: string): boolean {
   return helpText.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
@@ -112,17 +127,18 @@ function claudeFlagsFromHelp(helpText: string): ReadonlySet<string> {
  * treating an unavailable `--help` surface as proof that flags are unsupported.
  */
 export function probeClaudeCapabilities(command: string, env: NodeJS.ProcessEnv): ReadonlySet<string> | null {
-  const commandCached = claudeCapabilityByCommand.get(command);
-  if (commandCached !== undefined) return commandCached;
+  const environmentKey = claudeCapabilityEnvironmentKey(command, env);
+  const environmentCached = claudeCapabilityByEnvironment.get(environmentKey);
+  if (environmentCached !== undefined) return environmentCached;
   try {
     const version = execFileSync(command, ['--version'], {
       env, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
     if (!version) return null;
-    const cacheKey = `${command}\u0000${version}`;
+    const cacheKey = `${environmentKey}\u0000${version}`;
     const cached = claudeCapabilityCache.get(cacheKey);
     if (cached !== undefined) {
-      claudeCapabilityByCommand.set(command, cached);
+      claudeCapabilityByEnvironment.set(environmentKey, cached);
       return cached;
     }
     const help = execFileSync(command, ['--help'], {
@@ -157,7 +173,7 @@ export function probeClaudeCapabilities(command: string, env: NodeJS.ProcessEnv)
       }
     }
     claudeCapabilityCache.set(cacheKey, capabilities);
-    claudeCapabilityByCommand.set(command, capabilities);
+    claudeCapabilityByEnvironment.set(environmentKey, capabilities);
     return capabilities;
   } catch {
     return null;
@@ -182,7 +198,7 @@ export function stripUnsupportedClaudeOptionalArgs(
 
 export function __resetClaudeCapabilityCacheForTesting(): void {
   claudeCapabilityCache.clear();
-  claudeCapabilityByCommand.clear();
+  claudeCapabilityByEnvironment.clear();
 }
 
 const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {

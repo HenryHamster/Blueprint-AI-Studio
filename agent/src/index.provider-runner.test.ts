@@ -718,6 +718,35 @@ describe('provider runner prompt transport', () => {
     expect(execFileSync).toHaveBeenCalledTimes(3);
   });
 
+  it('does not reuse Claude capabilities across distinct executable environments', () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockImplementation((_command, args, options) => {
+      if (args?.[0] === '--version') return '2.1.220 (Claude Code)\n';
+      if (args?.[0] === '--help') {
+        const probePath = (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.PATH;
+        return probePath === '/modern/bin'
+          ? '--append-system-prompt --mcp-config --strict-mcp-config --allowedTools'
+          : '--mcp-config --strict-mcp-config --allowedTools';
+      }
+      return '';
+    });
+
+    const legacy = probeClaudeCapabilities('claude', {
+      ...process.env,
+      PATH: '/legacy/bin',
+      HOME: '/legacy/home',
+    });
+    const modern = probeClaudeCapabilities('claude', {
+      ...process.env,
+      PATH: '/modern/bin',
+      HOME: '/modern/home',
+    });
+
+    expect(legacy?.has('--append-system-prompt')).toBe(false);
+    expect(modern?.has('--append-system-prompt')).toBe(true);
+    expect(execFileSync).toHaveBeenCalledTimes(5);
+  });
+
   it('fails open when the Claude capability probe is ambiguous or fails', () => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync).mockReturnValueOnce('claude 1.2.4').mockReturnValueOnce('');
