@@ -1,5 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
+import path from 'path';
 
 // ── Hoisted setup ─────────────────────────────────────────────────────────────
 const { mockRecordToolUse, mockRecordCheckOutcome, mockIsCheckInvocation, mockSendLog } =
@@ -90,6 +91,7 @@ vi.mock('../prompt.js', () => ({
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 import { spawn } from 'child_process';
 import {
+  buildIsolatedTextOnlyMemoryCommand,
   runProviderAgent,
   getLastProviderRunErrorReport,
   _setLastProviderRunErrorReportForTesting,
@@ -157,6 +159,59 @@ function emitStream(jsonLines: string[], exitCode = 0): void {
 // environment; spawn is mocked separately per test.
 beforeEach(() => {
   __setCommandExistsOverrideForSmoke(() => true);
+});
+
+describe('isolated receipt-only runner contract', () => {
+  it('uses a fresh cwd/env and proves no built-in or MCP tool surface', () => {
+    const runner = {
+      provider: 'anthropic' as const,
+      authMode: 'api_key' as const,
+      displayName: 'Claude',
+      credentialSummary: () => 'test',
+      missingCredentials: () => [],
+      buildValidationCommand: () => null,
+      buildRunCommand: () => ({
+        command: 'claude',
+        args: [
+          '-p', '--dangerously-skip-permissions', '--include-partial-messages',
+          '--tools', 'Bash,Read', '--mcp-config', '/ambient/mcp.json',
+          '--strict-mcp-config', '--allowedTools', 'Bash', '--max-turns', '9',
+        ],
+        env: {
+          HOME: '/ambient-home', PATH: '/bin', AGENT_API_TOKEN: 'must-not-leak',
+          ANTHROPIC_API_KEY: 'provider-only', GITHUB_TOKEN: 'must-not-leak',
+        },
+        outputMode: 'claude-stream-json' as const,
+        timeoutMs: 600_000,
+        promptInput: 'stdin-file' as const,
+        displayName: 'Claude',
+      }),
+    };
+    const command = buildIsolatedTextOnlyMemoryCommand(
+      runner,
+      'receipt prompt',
+      undefined,
+      undefined,
+      { cwd: '/isolated', timeoutMs: 90_000, maxOutputBytes: 1024 },
+    );
+
+    expect(command.args).not.toContain('--dangerously-skip-permissions');
+    expect(command.args).not.toContain('--include-partial-messages');
+    expect(command.args).toEqual(expect.arrayContaining([
+      '--tools', '', '--strict-mcp-config', '--allowedTools', '', '--max-turns', '1',
+      '--mcp-config', path.join('/isolated', '.memory-empty-mcp.json'),
+    ]));
+    expect(command.env).toEqual({
+      HOME: '/isolated', PATH: '/bin', LANG: 'en_US.UTF-8', TERM: 'xterm-256color',
+      ANTHROPIC_API_KEY: 'provider-only',
+    });
+    expect(command.timeoutMs).toBe(90_000);
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      path.join('/isolated', '.memory-empty-mcp.json'),
+      '{"mcpServers":{}}\n',
+      expect.objectContaining({ mode: 0o600 }),
+    );
+  });
 });
 
 describe('drainJsonChunks — assistant event dispatch', () => {

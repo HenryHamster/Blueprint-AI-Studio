@@ -1603,6 +1603,168 @@ async def test_resident_claim_reply_to_must_belong_to_covered_batch(
 
 
 @pytest.mark.asyncio
+async def test_resident_reply_to_cannot_bypass_fast_owned_claim(
+    client: AsyncClient, db_session
+):
+    """Generic reply_to cannot publish or mutate a Fast-owned operator turn."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_resident_message_worker(db_session)
+    inbound = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Fast owns this exact turn.",
+        resident_session_id="resident-receipt-session",
+        context={"_conversation_public_reply_owner": "fast"},
+    )
+    db_session.add(inbound)
+    await db_session.commit()
+    await db_session.refresh(inbound)
+    inbound.handling_state = MessageHandlingState.CLAIMED
+    inbound.handled_by_task_id = task.id
+    inbound.conversation_claim_id = uuid.uuid4()
+    inbound.conversation_claim_generation = 1
+    inbound.conversation_claim_incarnation = uuid.uuid4()
+    inbound.conversation_claim_expires_at = _utcnow() + timedelta(minutes=10)
+    inbound.conversation_claim_attempt = 1
+    db_session.add(inbound)
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "This generic reply must not publish.",
+                "idempotency_key": "fast-reply-to-bypass",
+                "context": {"reply_to": str(inbound.id)},
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    await db_session.refresh(inbound)
+    assert inbound.status == "open"
+    assert inbound.handling_state == MessageHandlingState.CLAIMED
+    replies = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.from_type == "strategic",
+            )
+        )
+    ).scalars().all()
+    assert replies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_type", "context"),
+    [
+        ("NOTE", {"event_type": "question_answer"}),
+        ("BUG_REPORT", {}),
+        ("BLOCKER", {}),
+        ("QUESTION", {}),
+    ],
+)
+async def test_unscoped_public_generic_message_cannot_bypass_fast_claim(
+    client: AsyncClient,
+    db_session,
+    mocker,
+    message_type: str,
+    context: dict,
+):
+    """No generic public emission may race the receipt-bound Fast response."""
+    from unittest.mock import AsyncMock
+
+    from app.auth import create_agent_token
+
+    citation_warning = mocker.patch(
+        "app.routers.admin_agent_ops._compute_message_citation_warning",
+        new=AsyncMock(return_value=None),
+    )
+    project, task = await _make_resident_message_worker(db_session)
+    incarnation = uuid.uuid4()
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["worker_incarnation_id"] = str(incarnation)
+    resident["worker_incarnation_expires_at"] = (
+        _utcnow() + timedelta(minutes=5)
+    ).isoformat()
+    project.vision = {**project.vision, "_resident_strategic_session": resident}
+    flag_modified(project, "vision")
+    inbound = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.CLAIMED,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Fast owns this exact turn.",
+        resident_session_id="resident-receipt-session",
+        handled_by_task_id=task.id,
+        conversation_claim_id=uuid.uuid4(),
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=incarnation,
+        conversation_claim_expires_at=_utcnow() + timedelta(minutes=5),
+        conversation_claim_attempt=1,
+        context={"_conversation_public_reply_owner": "fast"},
+    )
+    db_session.add_all([project, inbound])
+    await db_session.commit()
+    # PostgreSQL's legacy INSERT compatibility trigger canonicalizes new user
+    # conversation rows to PENDING.  Model the later coordinator claim as the
+    # production path does: update only the handling state after insertion, so
+    # the 0638 trigger guard preserves the live claim.
+    await db_session.refresh(inbound)
+    inbound.handling_state = MessageHandlingState.CLAIMED
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(incarnation),
+            "op": "create_message",
+            "data": {
+                "type": message_type,
+                "content": "This must not become a competing public answer.",
+                "idempotency_key": f"fast-unscoped-bypass-{message_type}",
+                "context": context,
+            },
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    # The Fast claim is an authorization boundary.  It must reject before the
+    # expensive BUG_REPORT/BLOCKER citation verifier can consume its lease.
+    citation_warning.assert_not_awaited()
+    replies = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.from_type == "strategic",
+            )
+        )
+    ).scalars().all()
+    assert replies == []
+
+
+@pytest.mark.asyncio
 async def test_resident_direct_message_resolution_is_rejected(
     client: AsyncClient, db_session
 ):

@@ -381,6 +381,7 @@ EXPECTED_TYPES = {
     "salvage_bundle",
     "capability_proof_trial",
     "criterion_coverage_trial",
+    "memory_consolidation",
     "walkthrough_e2e",
 }
 

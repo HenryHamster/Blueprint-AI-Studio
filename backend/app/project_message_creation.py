@@ -94,6 +94,15 @@ CONVERSATION_EVENT_TYPES = frozenset(
     }
 )
 
+
+def _is_uuid_string(value: str) -> bool:
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return False
+    return str(parsed) == value.lower()
+
+
 # Operator-authored context remains free-form for legacy callers, but the keys
 # owned by the workbench contract are bounded before they become durable hidden
 # message state.
@@ -368,6 +377,45 @@ async def build_project_message(
         if from_type == "strategic"
         else MessageHandlingState.PENDING
     )
+    reply_reference_ids: set[uuid.UUID] = set()
+    if isinstance(reply_to_message_id, uuid.UUID):
+        reply_reference_ids.add(reply_to_message_id)
+    if isinstance(context, dict) and isinstance(
+        context.get("_resident_reply_covered_message_ids"), list
+    ):
+        reply_reference_ids.update(
+            uuid.UUID(message_id)
+            for message_id in context["_resident_reply_covered_message_ids"]
+            if isinstance(message_id, str) and _is_uuid_string(message_id)
+        )
+    has_reply_provenance = False
+    if reply_reference_ids:
+        has_reply_provenance = (
+            await session.scalar(
+                select(ProjectMessage.id)
+                .where(
+                    ProjectMessage.id.in_(reply_reference_ids),
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                    ProjectMessage.from_type.in_(("user", "operator")),
+                )
+                .limit(1)
+            )
+            is not None
+        )
+    is_operator_reply = (
+        resolved_surface == MessageSurface.CONVERSATION
+        and from_type == "strategic"
+        and resolved_handling == MessageHandlingState.RESPONDED
+        and has_reply_provenance
+    )
+    # ``open`` is the model/default legacy value and is never valid for a
+    # proven outbound operator reply. Override it even when a caller supplied
+    # it explicitly; preserve other terminal states for replay/import callers.
+    if is_operator_reply and values.get("status", "open") == "open":
+        values["status"] = "resolved"
+        if values.get("resolved_at") is None:
+            values["resolved_at"] = _utcnow()
     return ProjectMessage(
         project_id=project_id,
         sequence=(
@@ -827,6 +875,15 @@ async def create_operator_project_message(
     )
     session.add(msg)
     try:
+        # Flush the canonical message and its ORM-managed source receipt before
+        # correction detection.  Barrier creation and the authority-generation
+        # bump remain in this same transaction and commit atomically below.
+        await session.flush()
+        from app.strategic_memory_corrections import (
+            process_operator_message_correction_barriers,
+        )
+
+        await process_operator_message_correction_barriers(session, msg)
         await session.commit()
     except IntegrityError:
         await session.rollback()
@@ -849,6 +906,9 @@ async def create_operator_project_message(
                     arming="duplicate",
                     wakeup_state=stored_wakeup_state(existing),
                 )
+        raise
+    except Exception:
+        await session.rollback()
         raise
     await session.refresh(msg)
     message_id = msg.id

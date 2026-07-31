@@ -36,6 +36,7 @@ import { handleWebResearch } from './web-research.js';
 import { handleDesign } from './design.js';
 import { handleCapabilityProofTrial } from './capability-proof-trial.js';
 import { handleCriterionCoverageTrial } from './criterion-coverage-trial.js';
+import { handleMemoryConsolidation } from './memory-consolidation.js';
 import {
   resolveTaskCapabilityContract,
   resolveGenericRunner,
@@ -120,6 +121,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   salvage_bundle: handleSalvageBundle,
   capability_proof_trial: handleCapabilityProofTrial,
   criterion_coverage_trial: handleCriterionCoverageTrial,
+  memory_consolidation: handleMemoryConsolidation,
   walkthrough_e2e: handleWalkthroughE2e,
 };
 

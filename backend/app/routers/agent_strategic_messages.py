@@ -43,7 +43,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -78,6 +78,7 @@ from app.project_message_creation import (
     lock_project_and_next_message_sequence,
     parse_operator_message_type,
 )
+from app.time_utils import _utcnow
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter
@@ -147,6 +148,142 @@ class ClaimResidentMessages(BaseModel):
     lease_seconds: int = Field(default=45, ge=15, le=300)
 
 
+class ClaimPublicConversationTurn(BaseModel):
+    """Server-fenced admission for one Fast or explicit Standard turn."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    client_claim_id: uuid.UUID
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+    message_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=20)
+    owner: Literal["fast", "standard"]
+    explicit_standard_fallback: bool = False
+    lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
+class CompleteTurnWorkdayRequest(BaseModel):
+    """The one bounded private investigation a Fast public turn may enqueue."""
+
+    delivery_key: str = Field(..., min_length=1, max_length=128)
+    question: str = Field(..., min_length=1, max_length=20_000)
+    continuation_key: str | None = Field(default=None, max_length=128)
+
+
+class CompletePublicConversationTurn(BaseModel):
+    """The foreground lane's caller-supplied answer; no fallback text exists."""
+
+    task_id: uuid.UUID
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    claim_id: uuid.UUID
+    owner: Literal["fast", "standard"]
+    content: str = Field(..., min_length=1, max_length=20_000)
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+    envelope: dict[str, Any]
+    workday_request: CompleteTurnWorkdayRequest | None = None
+
+
+class AbandonPublicConversationTurn(BaseModel):
+    """Release a failed Fast claim before legacy Workday may recover it."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    claim_id: uuid.UUID
+
+
+class DeliverWorkdayConsultation(BaseModel):
+    """Durable background packet request; Workday cannot supply reply text."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    claim_id: uuid.UUID
+    delivery_key: str = Field(..., min_length=1, max_length=128)
+    continuation_key: str | None = Field(default=None, max_length=128)
+    question: str = Field(..., min_length=1, max_length=20_000)
+
+
+class ClaimNextWorkdayConsultation(BaseModel):
+    """Ask for one lease-bound internal packet; no public reply field exists."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
+class AcknowledgeWorkdayConsultation(BaseModel):
+    """Close or deliberately release one exact internal delivery."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    workday_claim_id: uuid.UUID
+    outcome: Literal["completed", "abandoned"]
+    result_summary: str | None = Field(default=None, max_length=20_000)
+
+
+class RenewWorkdayConsultation(BaseModel):
+    """Extend one exact private Workday packet before its lease expires."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    workday_claim_id: uuid.UUID
+    lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
+class ClaimWorkdayContinuation(BaseModel):
+    """Ask Fast for one server-created result-continuation receipt."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
+class CompleteWorkdayContinuation(BaseModel):
+    """Receipt-bound Fast follow-up for a completed Workday consultation."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    continuation_claim_id: uuid.UUID
+    content: str = Field(..., min_length=1, max_length=20_000)
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+
+
+class RenewWorkdayContinuation(BaseModel):
+    """Extend an exact Fast continuation receipt before it expires."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    continuation_claim_id: uuid.UUID
+    lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
+class ReleaseWorkdayContinuation(BaseModel):
+    """Release a failed continuation receipt without reopening completed output."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    continuation_claim_id: uuid.UUID
+
+
 def _resident_poll_rate_limit_key(request: Request) -> str:
     """Isolate high-frequency polls by network origin and project.
 
@@ -157,6 +294,225 @@ def _resident_poll_rate_limit_key(request: Request) -> str:
     remote = get_remote_address(request)
     project_scope = str(request.path_params.get("project_id") or "unknown-project")
     return f"resident-message-poll:{remote}:{project_scope}"
+
+
+def _task_is_fast_owner(task: Task, project: Project) -> bool:
+    context = task.context if isinstance(task.context, dict) else {}
+    resident = (
+        (project.vision or {}).get("_resident_strategic_session") or {}
+        if isinstance(project.vision, dict)
+        else {}
+    )
+    if (
+        context.get("_resident_session") is True
+        and resident.get("status") == "active"
+        and not bool(resident.get("stop_requested"))
+        and str(resident.get("task_id") or "") == str(task.id)
+        and str(resident.get("session_id") or "")
+        == str(context.get("strategic_session_id") or "")
+        and _parse_persisted_worker_generation(resident.get("worker_generation"))
+        == _parse_persisted_worker_generation(
+            context.get("_resident_worker_generation")
+        )
+    ):
+        # Typed Fast is a foreground role within the existing Resident task.
+        return True
+    return False
+
+
+def _require_current_fast_task_identity(
+    *,
+    task: Task,
+    project: Project,
+    worker_generation: int,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Bind Fast API calls to the one active Resident task/session/generation."""
+    context = task.context if isinstance(task.context, dict) else {}
+    persisted_generation = _parse_persisted_worker_generation(
+        context.get("_resident_worker_generation")
+    )
+    persisted_session_id = str(context.get("strategic_session_id") or "")
+    if (
+        context.get("_resident_session") is not True
+        or not persisted_session_id
+        or persisted_generation is None
+        or persisted_generation != worker_generation
+        or (session_id is not None and session_id != persisted_session_id)
+        or not _task_is_fast_owner(task, project)
+    ):
+        raise HTTPException(status_code=409, detail="Fast Resident identity is superseded")
+    return context
+
+
+async def _claim_current_fast_process_incarnation(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    project: Project,
+    task_id: uuid.UUID,
+    worker_generation: int,
+    incarnation_id: uuid.UUID,
+) -> uuid.UUID:
+    """Renew the server-owned process lease while the caller holds Project lock."""
+    from app.strategic_resident_session import claim_resident_worker_incarnation
+    from app.task_locking import with_vision_locked
+
+    accepted: uuid.UUID | None = None
+
+    def _claim(vision: dict) -> None:
+        nonlocal accepted
+        accepted = claim_resident_worker_incarnation(
+            vision,
+            task_id=task_id,
+            worker_generation=worker_generation,
+            incarnation_id=incarnation_id,
+        )
+        if accepted is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Fast Resident process incarnation is superseded",
+            )
+
+    await with_vision_locked(
+        session,
+        project_id,
+        _claim,
+        _locked_project=project,
+    )
+    assert accepted is not None
+    return accepted
+
+
+def _require_current_fast_process_incarnation(
+    *,
+    project: Project,
+    task_id: uuid.UUID,
+    worker_generation: int,
+    incarnation_id: uuid.UUID,
+) -> None:
+    """Do not let an old process complete/ack a live owner's work."""
+    from app.strategic_resident_session import resident_worker_incarnation_is_current
+
+    if not resident_worker_incarnation_is_current(
+        project.vision,
+        task_id=task_id,
+        worker_generation=worker_generation,
+        incarnation_id=incarnation_id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Fast Resident process incarnation is superseded",
+        )
+
+
+def _memory_query_from_claimed_operator_rows(rows: Sequence[ProjectMessage]) -> str:
+    """Return the bounded canonical operator text that drives V2 retrieval.
+
+    The conversation claim is already the authoritative turn boundary. Keep the
+    retrieval query ephemeral and byte-bounded: it guides selection but never
+    becomes durable trace content.
+    """
+
+    joined = "\n".join(
+        str(row.content or "")
+        for row in sorted(rows, key=lambda row: (int(row.sequence or 0), str(row.id)))
+    )
+    return joined.encode("utf-8")[:16_384].decode("utf-8", "ignore")
+
+
+async def _resolve_current_context_envelope(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    reference: Any,
+    session_id: str | None = None,
+    claim_id: uuid.UUID | None = None,
+    worker_generation: int | None = None,
+    worker_incarnation: uuid.UUID | None = None,
+):
+    """Resolve a non-content pointer and reject stale privacy/authority state."""
+    if not isinstance(reference, dict):
+        raise HTTPException(
+            status_code=409, detail="Strategic context envelope reference is invalid"
+        )
+    from app.strategic_memory_envelope import (
+        get_fenced_context_envelope_by_reference,
+        get_fenced_context_envelope_snapshot,
+    )
+
+    envelope = await get_fenced_context_envelope_by_reference(
+        session,
+        project_id=project_id,
+        reference=reference,
+    )
+    if envelope is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Strategic context envelope is stale, expired, or revoked",
+        )
+    if any(
+        value is not None
+        for value in (
+            session_id,
+            claim_id,
+            worker_generation,
+            worker_incarnation,
+        )
+    ):
+        try:
+            snapshot_id = uuid.UUID(str(reference["snapshot_id"]))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise HTTPException(
+                status_code=409,
+                detail="Strategic context envelope reference is invalid",
+            ) from None
+        exact = await get_fenced_context_envelope_snapshot(
+            session,
+            project_id=project_id,
+            snapshot_id=snapshot_id,
+            session_id=session_id,
+            claim_id=claim_id,
+            worker_generation=worker_generation,
+            worker_incarnation=worker_incarnation,
+        )
+        if (
+            exact is None
+            or exact.canonical_sha256 != envelope.canonical_sha256
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Strategic context envelope belongs to another turn",
+            )
+    return envelope
+
+
+async def _resolve_message_context_envelope(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    message_id: uuid.UUID,
+):
+    """Lock a private packet/result and resolve its current envelope pointer."""
+    row = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.id == message_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=409, detail="Private packet is unavailable")
+    context = row.context if isinstance(row.context, dict) else {}
+    envelope = await _resolve_current_context_envelope(
+        session,
+        project_id=project_id,
+        reference=context.get("envelope"),
+    )
+    return row, envelope
 
 
 @router.post("/projects/{project_id}/strategic-call/finalized-transcript")
@@ -627,6 +983,942 @@ async def complete_call_turn(
     await session.refresh(output)
     await broadcast_to_project(str(project_id), "message_created", message_event_payload(output))
     return {"id": str(output.id), "status": "created", "input_revision": payload.input_revision}
+
+
+@router.post("/projects/{project_id}/conversation/turns/claim")
+@limiter.limit("120/minute")
+async def claim_public_conversation_turn(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ClaimPublicConversationTurn,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Claim one foreground answer owner; Workday has no public-owner route."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == payload.task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Foreground task is not active")
+    owner = payload.owner
+    if owner != "fast":
+        # Do not turn every in-progress project task into a public Strategic
+        # identity while a future Standard lease protocol is still unbuilt.
+        raise HTTPException(
+            status_code=409,
+            detail="Standard fallback is disabled until it has a server-provisioned lease",
+        )
+    task_context = _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    accepted_incarnation = await _claim_current_fast_process_incarnation(
+        session,
+        project_id=project_id,
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+
+    from app.conversation_coordinator import (
+        ConversationPublicReplyOwner,
+        claim_operator_messages,
+    )
+
+    claim = await claim_operator_messages(
+        session,
+        project_id=project_id,
+        session_id=payload.session_id,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=accepted_incarnation,
+        message_ids=payload.message_ids,
+        lease_seconds=payload.lease_seconds,
+        public_reply_owner=ConversationPublicReplyOwner(owner),
+        canonical_conversation_only=True,
+        client_claim_id=payload.client_claim_id,
+        claim_idempotency_key=payload.idempotency_key,
+    )
+    if claim is None:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Turn is already claimed or changed")
+    transcript_sequence = max(int(row.sequence or 0) for row in claim.rows)
+    if transcript_sequence <= 0:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Turn is missing its canonical transcript sequence",
+        )
+    from app.strategic_memory_envelope import (
+        ContextEnvelopeFenceError,
+        build_and_store_context_envelope_snapshot,
+    )
+
+    try:
+        envelope = await build_and_store_context_envelope_snapshot(
+            session,
+            project_id=project_id,
+            session_id=payload.session_id,
+            claim_id=claim.claim_id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=accepted_incarnation,
+            input_revision=transcript_sequence,
+            transcript_sequence=transcript_sequence,
+            decision_authority={},
+            memory_query=_memory_query_from_claimed_operator_rows(claim.rows),
+        )
+    except (ContextEnvelopeFenceError, ValueError) as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {
+        "claim_id": str(claim.claim_id),
+        "owner": owner,
+        "message_ids": [str(row.id) for row in claim.rows],
+        "attempt": claim.attempt,
+        "lease_expires_at": claim.lease_expires_at.isoformat(),
+        "envelope": envelope.model_dump(mode="json"),
+    }
+
+
+@router.post("/projects/{project_id}/conversation/turns/complete")
+@limiter.limit("120/minute")
+async def complete_public_conversation_turn(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: CompletePublicConversationTurn,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Commit caller-provided Fast/Standard text after rechecking owner state."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Foreground task is not active")
+    task_context = task.context if isinstance(task.context, dict) else {}
+    if payload.owner != "fast":
+        raise HTTPException(
+            status_code=409,
+            detail="Standard fallback is disabled until it has a server-provisioned lease",
+        )
+    task_context = _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    # A committed receipt is safe to replay after its short-lived derived
+    # envelope has expired: it creates no new prompt, packet, or public text.
+    # The coordinator below still proves the idempotency key, claim, owner,
+    # content, and optional Workday request exactly match. New completions must
+    # always resolve the live privacy/authority pointer first.
+    existing_completion = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == payload.idempotency_key.strip(),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_completion is None:
+        await _resolve_current_context_envelope(
+            session,
+            project_id=project_id,
+            reference=payload.envelope,
+            session_id=task_context.get("strategic_session_id"),
+            claim_id=payload.claim_id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=payload.incarnation_id,
+        )
+
+    from app.conversation_coordinator import (
+        ConversationPublicReplyOwner,
+        complete_claimed_public_turn,
+    )
+
+    try:
+        result = await complete_claimed_public_turn(
+            session,
+            project_id=project_id,
+            claim_id=payload.claim_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            incarnation_id=payload.incarnation_id,
+            owner=ConversationPublicReplyOwner(payload.owner),
+            content=payload.content,
+            idempotency_key=payload.idempotency_key,
+            resident_session_id=task_context.get("strategic_session_id"),
+            workday_request=(
+                payload.workday_request.model_dump()
+                if payload.workday_request is not None
+                else None
+            ),
+            envelope=payload.envelope,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    if not result.duplicate:
+        await broadcast_to_project(
+            str(project_id), "message_created", message_event_payload(result.message)
+        )
+    response: dict[str, Any] = {
+        "id": str(result.message.id),
+        "status": "duplicate" if result.duplicate else "created",
+    }
+    if result.consultation_packet is not None:
+        packet_context = (
+            result.consultation_packet.context
+            if isinstance(result.consultation_packet.context, dict)
+            else {}
+        )
+        response["workday_packet"] = {
+            "packet_id": str(result.consultation_packet.id),
+            "continuation_key": packet_context.get(
+                "_conversation_consultation_continuation"
+            ),
+            "envelope": packet_context.get("envelope"),
+        }
+    return response
+
+
+@router.post("/projects/{project_id}/conversation/turns/abandon")
+@limiter.limit("120/minute")
+async def abandon_public_conversation_turn(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: AbandonPublicConversationTurn,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Release a Fast claim only when it cannot race a completed reply."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Foreground task is not active")
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    from app.conversation_coordinator import abandon_fast_public_turn
+
+    try:
+        status = await abandon_fast_public_turn(
+            session,
+            project_id=project_id,
+            claim_id=payload.claim_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            incarnation_id=payload.incarnation_id,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {
+        "status": status,
+        "legacy_fallback_admissible": status
+        in {"abandoned", "already_abandoned"},
+    }
+
+
+@router.post("/projects/{project_id}/workday-consultations")
+@limiter.limit("120/minute")
+async def deliver_workday_consultation(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: DeliverWorkdayConsultation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Give Workday a durable Fast-owned consultation packet, never reply text."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        project is None
+        or task is None
+        or task.status != TaskStatus.IN_PROGRESS
+    ):
+        raise HTTPException(status_code=409, detail="Workday session is superseded or inactive")
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    claim_rows = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.conversation_claim_id == payload.claim_id,
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    if not claim_rows or any(
+        row.from_type != "user"
+        or row.status != "open"
+        or row.handling_state != MessageHandlingState.CLAIMED
+        or row.handled_by_task_id != payload.task_id
+        or row.conversation_claim_generation != payload.worker_generation
+        or row.conversation_claim_incarnation != payload.incarnation_id
+        or row.conversation_claim_expires_at is None
+        or row.conversation_claim_expires_at <= _utcnow()
+        or row.resident_session_id not in {None, payload.session_id}
+        or (row.context or {}).get("_conversation_public_reply_owner") != "fast"
+        for row in claim_rows
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Consultation requires the live Fast-owned claim",
+        )
+
+    from app.strategic_memory_envelope import build_and_store_context_envelope_snapshot
+    from app.conversation_coordinator import ConversationClaim, create_or_get_workday_consultation_packet
+
+    claim = ConversationClaim(
+        claim_id=payload.claim_id,
+        rows=tuple(claim_rows),
+        lease_expires_at=max(row.conversation_claim_expires_at for row in claim_rows if row.conversation_claim_expires_at is not None),
+        attempt=max(row.conversation_claim_attempt for row in claim_rows),
+    )
+    envelope = await build_and_store_context_envelope_snapshot(
+        session,
+        project_id=project_id,
+        session_id=payload.session_id,
+        claim_id=payload.claim_id,
+        worker_generation=payload.worker_generation,
+        worker_incarnation=payload.incarnation_id,
+        input_revision=max(int(row.sequence or 0) for row in claim_rows),
+        transcript_sequence=max(int(row.sequence or 0) for row in claim_rows),
+        decision_authority={},
+        memory_query=_memory_query_from_claimed_operator_rows(claim_rows),
+    )
+    try:
+        packet = await create_or_get_workday_consultation_packet(
+            session,
+            project_id=project_id,
+            claim=claim,
+            envelope=envelope,
+            delivery_key=payload.delivery_key,
+            question=payload.question,
+            continuation_key=payload.continuation_key,
+            resident_session_id=payload.session_id,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {
+        "packet_id": str(packet.message.id),
+        "status": "duplicate" if packet.duplicate else "created",
+        "envelope": packet.message.context["envelope"],
+        "continuation_key": packet.message.context["_conversation_consultation_continuation"],
+    }
+
+
+def _workday_consultation_packet_response(
+    *,
+    packet: ProjectMessage,
+    workday_claim_id: uuid.UUID,
+    lease_expires_at: datetime,
+    attempt: int,
+    envelope: Any,
+) -> dict[str, Any]:
+    """Project only server-created packet fields to the authenticated Resident."""
+    context = packet.context if isinstance(packet.context, dict) else {}
+    return {
+        "packet_id": str(packet.id),
+        "workday_claim_id": str(workday_claim_id),
+        "lease_expires_at": lease_expires_at.isoformat(),
+        "attempt": attempt,
+        "claim_id": context.get("claim_id"),
+        "delivery_key": context.get("delivery_key"),
+        "continuation_key": context.get("_conversation_consultation_continuation"),
+        "question": packet.content,
+        "envelope": envelope.model_dump(mode="json"),
+    }
+
+
+@router.post("/projects/{project_id}/workday-consultations/claim-next")
+@limiter.limit("120/minute")
+async def claim_next_workday_consultation(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ClaimNextWorkdayConsultation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Atomically lease one durable Fast-authored packet to current Workday."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Workday session is superseded or inactive")
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    accepted_incarnation = await _claim_current_fast_process_incarnation(
+        session,
+        project_id=project_id,
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    from app.conversation_coordinator import claim_next_workday_consultation_packet
+
+    packet_claim = await claim_next_workday_consultation_packet(
+        session,
+        project_id=project_id,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        worker_incarnation=accepted_incarnation,
+        resident_session_id=payload.session_id,
+        lease_seconds=payload.lease_seconds,
+    )
+    resolved_envelope = None
+    if packet_claim is not None:
+        _, resolved_envelope = await _resolve_message_context_envelope(
+            session,
+            project_id=project_id,
+            message_id=packet_claim.message.id,
+        )
+    await session.commit()
+    if packet_claim is None:
+        return {"status": "empty"}
+    return {
+        "status": "claimed",
+        "packet": _workday_consultation_packet_response(
+            packet=packet_claim.message,
+            workday_claim_id=packet_claim.workday_claim_id,
+            lease_expires_at=packet_claim.lease_expires_at,
+            attempt=packet_claim.attempt,
+            envelope=resolved_envelope,
+        ),
+    }
+
+
+@router.post("/projects/{project_id}/workday-consultations/{packet_id}/ack")
+@limiter.limit("120/minute")
+async def acknowledge_workday_consultation(
+    request: Request,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    payload: AcknowledgeWorkdayConsultation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Complete or explicitly release an exact Workday packet lease."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Workday session is superseded or inactive")
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    await _resolve_message_context_envelope(
+        session,
+        project_id=project_id,
+        message_id=packet_id,
+    )
+    from app.conversation_coordinator import acknowledge_workday_consultation_packet
+
+    try:
+        duplicate = await acknowledge_workday_consultation_packet(
+            session,
+            project_id=project_id,
+            packet_id=packet_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=payload.incarnation_id,
+            resident_session_id=payload.session_id,
+            workday_claim_id=payload.workday_claim_id,
+            outcome=payload.outcome,
+            result_summary=payload.result_summary,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {"status": "duplicate" if duplicate else "acknowledged"}
+
+
+@router.post("/projects/{project_id}/workday-consultations/{packet_id}/renew")
+@limiter.limit("120/minute")
+async def renew_workday_consultation(
+    request: Request,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    payload: RenewWorkdayConsultation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Renew only a still-live, exact private Workday delivery lease."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Workday session is superseded or inactive")
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    await _resolve_message_context_envelope(
+        session,
+        project_id=project_id,
+        message_id=packet_id,
+    )
+    from app.conversation_coordinator import renew_workday_consultation_packet
+
+    try:
+        renewed = await renew_workday_consultation_packet(
+            session,
+            project_id=project_id,
+            packet_id=packet_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=payload.incarnation_id,
+            resident_session_id=payload.session_id,
+            workday_claim_id=payload.workday_claim_id,
+            lease_seconds=payload.lease_seconds,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {
+        "workday_claim_id": str(renewed.workday_claim_id),
+        "lease_expires_at": renewed.lease_expires_at.isoformat(),
+        "attempt": renewed.attempt,
+    }
+
+
+def _workday_continuation_response(
+    claim: Any,
+    envelope: Any,
+) -> dict[str, Any]:
+    """Project only a server-created result and its Fast continuation receipt."""
+    packet = claim.message
+    context = packet.context if isinstance(packet.context, dict) else {}
+    return {
+        "result_packet_id": str(packet.id),
+        "continuation_claim_id": str(claim.continuation_claim_id),
+        "lease_expires_at": claim.lease_expires_at.isoformat(),
+        "attempt": claim.attempt,
+        "claim_id": context.get("claim_id"),
+        "delivery_key": context.get("delivery_key"),
+        "continuation_key": context.get("_conversation_consultation_continuation"),
+        "result_summary": packet.content,
+        "envelope": envelope.model_dump(mode="json"),
+    }
+
+
+@router.post("/projects/{project_id}/workday-consultations/continuations/claim-next")
+@limiter.limit("120/minute")
+async def claim_next_workday_continuation(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ClaimWorkdayContinuation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Issue Fast an exact receipt for an eventual Workday result follow-up."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Fast session is superseded or inactive")
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    accepted_incarnation = await _claim_current_fast_process_incarnation(
+        session,
+        project_id=project_id,
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    from app.conversation_coordinator import claim_next_workday_consultation_continuation
+
+    claim = await claim_next_workday_consultation_continuation(
+        session,
+        project_id=project_id,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        worker_incarnation=accepted_incarnation,
+        resident_session_id=payload.session_id,
+        lease_seconds=payload.lease_seconds,
+    )
+    resolved_envelope = None
+    if claim is not None:
+        _, resolved_envelope = await _resolve_message_context_envelope(
+            session,
+            project_id=project_id,
+            message_id=claim.message.id,
+        )
+    await session.commit()
+    if claim is None:
+        return {"status": "empty"}
+    return {
+        "status": "claimed",
+        "continuation": _workday_continuation_response(
+            claim, resolved_envelope
+        ),
+    }
+
+
+@router.post("/projects/{project_id}/workday-consultations/continuations/{result_packet_id}/complete")
+@limiter.limit("120/minute")
+async def complete_workday_continuation(
+    request: Request,
+    project_id: uuid.UUID,
+    result_packet_id: uuid.UUID,
+    payload: CompleteWorkdayContinuation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Commit the only public reply allowed for a result-continuation receipt."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Fast session is superseded or inactive")
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    # A response can be lost after the transaction committed.  This replay has
+    # no need to resolve (or expose) the derived envelope: the public text and
+    # continuation receipt are already durable.  Keep the comparison stricter
+    # than the coordinator's general idempotency helper because this route has
+    # a result-packet path parameter as part of its public contract.
+    normalized_idempotency_key = payload.idempotency_key.strip()
+    normalized_content = payload.content.strip()
+    existing_completion = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == normalized_idempotency_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_completion is not None:
+        existing_context = (
+            existing_completion.context
+            if isinstance(existing_completion.context, dict)
+            else {}
+        )
+        if (
+            existing_completion.from_type != "strategic"
+            or existing_completion.from_task_id != task.id
+            or existing_completion.content != normalized_content
+            or existing_completion.resident_session_id != payload.session_id
+            or existing_context.get("_workday_continuation_claim_id")
+            != str(payload.continuation_claim_id)
+            or existing_context.get("_workday_result_packet_id")
+            != str(result_packet_id)
+            or existing_context.get("_conversation_public_reply_owner") != "fast"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="idempotency_key already belongs to a different continuation",
+            )
+        return {"id": str(existing_completion.id), "status": "duplicate"}
+    await _resolve_message_context_envelope(
+        session,
+        project_id=project_id,
+        message_id=result_packet_id,
+    )
+    from app.conversation_coordinator import complete_workday_consultation_continuation
+
+    try:
+        result = await complete_workday_consultation_continuation(
+            session,
+            project_id=project_id,
+            result_packet_id=result_packet_id,
+            continuation_claim_id=payload.continuation_claim_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=payload.incarnation_id,
+            resident_session_id=payload.session_id,
+            content=payload.content,
+            idempotency_key=payload.idempotency_key,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    if not result.duplicate:
+        await broadcast_to_project(
+            str(project_id), "message_created", message_event_payload(result.message)
+        )
+    return {"id": str(result.message.id), "status": "duplicate" if result.duplicate else "created"}
+
+
+@router.post(
+    "/projects/{project_id}/workday-consultations/continuations/"
+    "{result_packet_id}/renew"
+)
+@limiter.limit("120/minute")
+async def renew_workday_continuation(
+    request: Request,
+    project_id: uuid.UUID,
+    result_packet_id: uuid.UUID,
+    payload: RenewWorkdayContinuation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Renew one exact, current Fast continuation receipt."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=409, detail="Fast session is superseded or inactive"
+        )
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    await _resolve_message_context_envelope(
+        session,
+        project_id=project_id,
+        message_id=result_packet_id,
+    )
+    from app.conversation_coordinator import (
+        renew_workday_consultation_continuation as renew_continuation,
+    )
+
+    try:
+        renewed = await renew_continuation(
+            session,
+            project_id=project_id,
+            result_packet_id=result_packet_id,
+            continuation_claim_id=payload.continuation_claim_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=payload.incarnation_id,
+            resident_session_id=payload.session_id,
+            lease_seconds=payload.lease_seconds,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {
+        "continuation_claim_id": str(renewed.continuation_claim_id),
+        "lease_expires_at": renewed.lease_expires_at.isoformat(),
+        "attempt": renewed.attempt,
+    }
+
+
+@router.post(
+    "/projects/{project_id}/workday-consultations/continuations/"
+    "{result_packet_id}/release"
+)
+@limiter.limit("120/minute")
+async def release_workday_continuation(
+    request: Request,
+    project_id: uuid.UUID,
+    result_packet_id: uuid.UUID,
+    payload: ReleaseWorkdayContinuation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Release one failed continuation receipt, idempotently."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=409, detail="Fast session is superseded or inactive"
+        )
+    _require_current_fast_task_identity(
+        task=task,
+        project=project,
+        worker_generation=payload.worker_generation,
+        session_id=payload.session_id,
+    )
+    _require_current_fast_process_incarnation(
+        project=project,
+        task_id=task.id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.incarnation_id,
+    )
+    await _resolve_message_context_envelope(
+        session,
+        project_id=project_id,
+        message_id=result_packet_id,
+    )
+    from app.conversation_coordinator import (
+        release_workday_consultation_continuation as release_continuation,
+    )
+
+    try:
+        status = await release_continuation(
+            session,
+            project_id=project_id,
+            result_packet_id=result_packet_id,
+            continuation_claim_id=payload.continuation_claim_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=payload.incarnation_id,
+            resident_session_id=payload.session_id,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {"status": status}
 
 
 class PermanentWorkdayArtifactError(ValueError):
@@ -1657,6 +2949,31 @@ async def agent_poll_messages(
             projected["context"] = context
         projected_messages.append(projected)
 
+    # The ordinary Workday poll remains deliberately broad: it also carries
+    # activity/non-conversation work that must not disappear during the typed
+    # foreground rollout.  Give Fast a server-computed subset from the one
+    # canonical predicate instead of asking it to infer visibility from mutable
+    # message context or failing an entire mixed page at its claim boundary.
+    fast_message_ids: list[str] = []
+    if resident_poll and remaining_rows:
+        from app.strategic_conversation_query import strategic_conversation_predicate
+
+        canonical_ids = set(
+            (
+                await session.execute(
+                    select(ProjectMessage.id).where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.id.in_([row.id for row in remaining_rows]),
+                        ProjectMessage.from_type == "user",
+                        strategic_conversation_predicate(),
+                    )
+                )
+            ).scalars().all()
+        )
+        fast_message_ids = [
+            str(row.id) for row in remaining_rows if row.id in canonical_ids
+        ]
+
     return {
         "messages": projected_messages,
         "server_time": server_time.isoformat(),
@@ -1664,4 +2981,7 @@ async def agent_poll_messages(
         # giving it to a provider. Older agents ignore this additive field during
         # the rolling-deploy window; generation fencing still prevents overlap.
         "claim_required": resident_poll,
+        # Additive: old Workday agents continue using ``messages``. Typed Fast
+        # must submit only these ids to its canonical claim endpoint.
+        "fast_message_ids": fast_message_ids,
     }

@@ -55,6 +55,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "review_feedback": STRATEGIST_INTERNAL,
     "feedback_acknowledgment": STRATEGIST_INTERNAL,
     "discovery.review_completed": STRATEGIST_INTERNAL,
+    # Two-speed Resident handoff packets are private coordination between the
+    # Fast Resident and Workday; they must never appear in the operator thread.
+    "workday_consultation": STRATEGIST_INTERNAL,
+    "workday_consultation_result": STRATEGIST_INTERNAL,
     # Escalation → operator-action-needed
     "auto_fix_escalated": OPERATOR_ACTION_NEEDED,
     "residual_fix_escalated": OPERATOR_ACTION_NEEDED,

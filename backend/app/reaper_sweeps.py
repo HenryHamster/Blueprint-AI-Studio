@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, delete, or_
 from sqlmodel import select
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 
@@ -67,6 +67,7 @@ from app.models import (
     ComputeJobStatus,
     LocalRunner,
     ProjectMessageAttachmentUpload,
+    ProjectMessage,
     Task,
     TaskStatus,
 )
@@ -1484,6 +1485,58 @@ async def sweep_routine_message_retention(session, *, retention_days: int = 7) -
     if purged:
         await session.commit()
         logger.info(f"[REAPER] Purged {purged} stale routine message(s)")
+    return purged
+
+
+async def sweep_strategic_context_retention(
+    session,
+    *,
+    packet_retention_days: int = 7,
+    batch_size: int = 128,
+) -> int:
+    """Globally purge expired envelope blobs and completed private packets.
+
+    Envelope snapshots are short-lived content caches.  Workday packets/results
+    are also derived content, but pending/claimed records are deliberately kept
+    so an in-flight nonterminal investigation remains restart-safe.  Completed
+    internal records receive the longer bounded retention window and then are
+    deleted in a small global batch; this must not depend on that project
+    receiving another message.
+    """
+
+    from app.strategic_memory_envelope import (
+        purge_expired_context_envelope_snapshots,
+    )
+
+    purged = await purge_expired_context_envelope_snapshots(session)
+    cutoff = _utcnow() - timedelta(days=max(1, int(packet_retention_days)))
+    context = ProjectMessage.context
+    private_packet = or_(
+        context["_conversation_consultation_packet"].as_boolean().is_(True),
+        context["_workday_consultation_result"].as_boolean().is_(True),
+    )
+    expired_ids = (
+        await session.execute(
+            select(ProjectMessage.id)
+            .where(
+                private_packet,
+                ProjectMessage.created_at < cutoff,
+                # ``open`` includes pending/claimed packets and continuations;
+                # those remain live until normal recovery resolves them.
+                ProjectMessage.status != "open",
+            )
+            .order_by(ProjectMessage.created_at.asc(), ProjectMessage.id.asc())
+            .limit(max(1, min(512, int(batch_size))))
+        )
+    ).scalars().all()
+    if expired_ids:
+        result = await session.execute(
+            delete(ProjectMessage).where(ProjectMessage.id.in_(expired_ids))
+        )
+        purged += int(result.rowcount or 0)
+    if purged:
+        await session.commit()
+        logger.info("[REAPER] Purged %d expired Strategic context record(s)", purged)
     return purged
 
 

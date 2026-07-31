@@ -1510,6 +1510,9 @@ export interface PollResult {
   // (treating it as truth) rather than resetting to origin/<branch>.
   laneCheckpointSha?: string;
   isLanePhase?: boolean;
+  // Backend-owned capability received before the warm repository reset.
+  // Omitted/unknown stays fail-closed as repository-backed.
+  workspaceRequirement?: 'repo' | 'none';
 }
 
 export interface ParkDirective {
@@ -1638,9 +1641,9 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         }
         // 200 OK with a JSON body that selects claim or exit.
         if (res.status === 200) {
-          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown; lane_checkpoint_sha?: unknown; is_lane_phase?: unknown } = {};
+          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown; lane_checkpoint_sha?: unknown; is_lane_phase?: unknown; workspace_requirement?: unknown } = {};
           try {
-            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown; lane_checkpoint_sha?: unknown; is_lane_phase?: unknown };
+            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown; lane_checkpoint_sha?: unknown; is_lane_phase?: unknown; workspace_requirement?: unknown };
           } catch (e) {
             log(`pollForNextRole: 200 with unparseable body: ${String(e)}`);
             await new Promise(r => setTimeout(r, pollIntervalMs));
@@ -1661,6 +1664,9 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
               ...(secretManifest ? { secretManifest } : {}),
               ...(typeof body.lane_checkpoint_sha === 'string' ? { laneCheckpointSha: body.lane_checkpoint_sha } : {}),
               ...(body.is_lane_phase === true ? { isLanePhase: true } : {}),
+              ...(body.workspace_requirement === 'none' || body.workspace_requirement === 'repo'
+                ? { workspaceRequirement: body.workspace_requirement }
+                : {}),
             };
           }
           if (body.action === 'exit') {
@@ -3925,21 +3931,27 @@ export async function continueWarmContinuation(
     return { action: 'exit' };
   }
 
-  // claim — rotate the agent token, reset, then re-enter the loop.
+  // claim — reset repository state only when the backend-published capability
+  // requires one. workspace:none handlers own an isolated temp cwd instead.
   log(`Warm-claimed next role: task ${pollResult.taskId ?? ''}`);
   deps.activateClaimedRole(pollResult, 'reset_failed: warm-claim');
-  try {
-    await deps.resetForNextRole({
-      workspace: WORKSPACE,
-      priorTaskId: opts.priorTaskId,
-      baseBranch: opts.baseBranch ?? undefined,
-    });
-  } catch (resetErr) {
-    const resetMsg = resetErr instanceof Error ? resetErr.message : String(resetErr);
-    log(`resetForNextRole failed: ${resetMsg}`);
-    const err = new Error(`reset_failed: ${resetMsg}`) as Error & { failureCategory?: FailureCategory };
-    err.failureCategory = 'reset_failed';
-    throw err;
+  const noWorkspace = pollResult.workspaceRequirement === 'none';
+  if (noWorkspace) {
+    log(`Warm-claimed no-workspace task ${pollResult.taskId ?? ''}; skipping repository reset.`);
+  } else {
+    try {
+      await deps.resetForNextRole({
+        workspace: WORKSPACE,
+        priorTaskId: opts.priorTaskId,
+        baseBranch: opts.baseBranch ?? undefined,
+      });
+    } catch (resetErr) {
+      const resetMsg = resetErr instanceof Error ? resetErr.message : String(resetErr);
+      log(`resetForNextRole failed: ${resetMsg}`);
+      const err = new Error(`reset_failed: ${resetMsg}`) as Error & { failureCategory?: FailureCategory };
+      err.failureCategory = 'reset_failed';
+      throw err;
+    }
   }
   deps.materializeClaimCredentialState(pollResult.secretManifest, 'reset_failed: warm-claim');
   // Lane workspace-mode: set env vars BEFORE BLUEPRINT_WARM_HANDOFF so
@@ -4069,32 +4081,46 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     let ghToken = '';
     let owner = '';
     let repo = '';
-    // Fetch GitHub credentials for the repository-backed task.
+    // Repository access is the default. Only an exact backend-published
+    // capability opt-out may bypass this credential path; a payload cannot
+    // request it and an absent/unknown contract remains fail-closed here.
+    const workspaceRequirement = task.task_capability
+      && typeof task.task_capability === 'object'
+      && !Array.isArray(task.task_capability)
+      ? (task.task_capability as Record<string, unknown>).workspace_requirement
+      : undefined;
+    const noWorkspace = workspaceRequirement === 'none';
+    // Fetch GitHub credentials for repository-backed tasks.
     // Timeout must cover the backend's worst case for get_github_token_for_task:
     // _github_request sleeps up to 120s on a near-empty rate-limit bucket, plus up
     // to 3 retries each with a 15s httpx timeout. 180s comfortably covers the full
     // backoff. The same path is already covered at 240s for the PR-create call
     // (line ~2724); the token-only fetch here uses 180s (no extra GitHub round-trips
     // beyond token minting). Any failure here is infrastructure, not a code fault.
-    statusRef.value = 'Fetching GitHub credentials...';
-    let ghRes: { data: { token: string; owner: string; repo: string } };
-    try {
-      ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
-      throw err;
-    }
-    ({ token: ghToken, owner, repo } = ghRes.data);
-    log(`GitHub: ${owner}/${repo}`);
+    if (noWorkspace) {
+      statusRef.value = 'Starting isolated no-workspace capability...';
+      log(`Task ${taskId} is published as workspace_requirement=none; GitHub credentials withheld.`);
+    } else {
+      statusRef.value = 'Fetching GitHub credentials...';
+      let ghRes: { data: { token: string; owner: string; repo: string } };
+      try {
+        ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
+      } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e));
+        (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
+        throw err;
+      }
+      ({ token: ghToken, owner, repo } = ghRes.data);
+      log(`GitHub: ${owner}/${repo}`);
 
-    // Seed the GitHub token file immediately so bash helpers can use it from
-    // the first invocation. Then schedule proactive refreshes every 45 min
-    // (the GitHub installation token TTL is 60 min; the backend cache is 50 min,
-    // so force_refresh=false hits the cache at zero GitHub API cost).
-    ensureGithubTokenFileEnv();
-    writeGithubTokenFile(ghToken);
-    scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
+      // Seed the GitHub token file immediately so bash helpers can use it from
+      // the first invocation. Then schedule proactive refreshes every 45 min
+      // (the GitHub installation token TTL is 60 min; the backend cache is 50 min,
+      // so force_refresh=false hits the cache at zero GitHub API cost).
+      ensureGithubTokenFileEnv();
+      writeGithubTokenFile(ghToken);
+      scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
+    }
 
     // Dispatch to handler — contract-driven (registry-driven task types).
     //

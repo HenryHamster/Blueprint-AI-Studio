@@ -4537,11 +4537,12 @@ class _FakeMaxPlanAccount:
 
 
 class _FakeLoadSession:
-    """Session stub for load_max_plan_pool: first execute() returns accounts, second returns tasks."""
+    """Session stub for load_max_plan_pool's account, task, and Resident-lease reads."""
 
-    def __init__(self, accounts: list, active_tasks: list | None = None):
+    def __init__(self, accounts: list, active_tasks: list | None = None, project_rows: list | None = None):
         self._accounts = accounts
         self._active_tasks = active_tasks or []
+        self._project_rows = project_rows or []
         self._call_count = 0
 
     async def __aenter__(self):
@@ -4554,7 +4555,9 @@ class _FakeLoadSession:
         self._call_count += 1
         if self._call_count == 1:
             return _FakeScalarsResult(self._accounts)
-        return _FakeScalarsResult(self._active_tasks)
+        if self._call_count == 2:
+            return _FakeScalarsResult(self._active_tasks)
+        return _FakeScalarsResult(self._project_rows)
 
     async def commit(self):
         pass
@@ -4576,11 +4579,11 @@ class _FakeScalarsResult:
 
 @pytest.mark.asyncio
 class TestLoadMaxPlanPoolStartupFailureRestore:
-    async def _load_with_accounts(self, accounts: list, monkeypatch) -> None:
+    async def _load_with_accounts(self, accounts: list, monkeypatch, *, project_rows: list | None = None) -> None:
         from app import max_plan_pool as mpp
 
         monkeypatch.setattr(
-            mpp, "AsyncSessionLocal", lambda: _FakeLoadSession(accounts)
+            mpp, "AsyncSessionLocal", lambda: _FakeLoadSession(accounts, project_rows=project_rows)
         )
         await mpp.load_max_plan_pool()
 
@@ -4669,6 +4672,73 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         entry = _account_by_id[str(acct.id)]
         assert entry.get("startup_failure_cooldown_at") is None
 
+    async def test_restart_rebuild_counts_only_unexpired_typed_fast_slot(self, monkeypatch):
+        """A persisted typed-Fast process survives pool rebuild without daily use."""
+        now = _utcnow()
+        acct = _FakeMaxPlanAccount("acct-typed-fast")
+        project_id = uuid.uuid4()
+        await self._load_with_accounts(
+            [acct],
+            monkeypatch,
+            project_rows=[
+                (
+                    project_id,
+                    {
+                        "_resident_strategic_session": {
+                            "status": "active",
+                            "typed_fast": {
+                                "kind": "typed_fast",
+                                "status": "active",
+                                "account_id": str(acct.id),
+                                "slot_reserved": True,
+                                "expires_at": (now + timedelta(minutes=2)).isoformat(),
+                            },
+                            "call": {
+                                "status": "active",
+                                "account_id": str(acct.id),
+                                "slot_reserved": True,
+                                "expires_at": (now - timedelta(seconds=1)).isoformat(),
+                            },
+                        }
+                    },
+                ),
+                (
+                    uuid.uuid4(),
+                    {
+                        "_resident_strategic_session": {
+                            "status": "active",
+                            "typed_fast": {
+                                "kind": "typed_fast",
+                                "status": "active",
+                                "account_id": str(acct.id),
+                                "slot_reserved": True,
+                                "expires_at": (now - timedelta(seconds=1)).isoformat(),
+                            },
+                        }
+                    },
+                ),
+                (
+                    uuid.uuid4(),
+                    {
+                        "_resident_strategic_session": {
+                            "status": "active",
+                            "typed_fast": {
+                                "kind": "typed_fast",
+                                "status": "active",
+                                "account_id": str(acct.id),
+                                "slot_reserved": False,
+                                "expires_at": (now + timedelta(minutes=2)).isoformat(),
+                            },
+                        }
+                    },
+                ),
+            ],
+        )
+        entry = _account_by_id[str(acct.id)]
+        assert entry["active_tasks"] == 1
+        assert entry["project_state"][str(project_id)]["active_tasks"] == 1
+        assert entry["daily_task_count"] == 0
+
 
 @pytest.mark.asyncio
 class TestLoadMaxPlanPoolSecretFetchFailed:
@@ -4739,6 +4809,35 @@ class TestLoadMaxPlanPoolSecretFetchFailed:
         await mpp.load_max_plan_pool()
         entry = _account_by_id[str(acct.id)]
         assert entry["secret_fetch_failed"] is False
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_slot_respects_concurrency_without_charging_daily_quota(monkeypatch):
+    """Typed Fast uses the existing process cap, never a fake Task/day count."""
+    from app.max_plan_pool import (
+        release_max_plan_auxiliary_slot,
+        reserve_max_plan_auxiliary_slot,
+    )
+
+    account_id = "typed-fast-cap"
+    project_id = "project-typed-fast"
+    account = {
+        "active_tasks": 1,
+        "max_concurrent_tasks": 1,
+        "project_max_concurrent_tasks": {project_id: 1},
+        "project_state": {project_id: {"active_tasks": 1, "daily_task_count": 7}},
+        "daily_task_count": 11,
+    }
+    monkeypatch.setitem(_account_by_id, account_id, account)
+    assert await reserve_max_plan_auxiliary_slot(account_id, project_id=project_id) is False
+    account["max_concurrent_tasks"] = 2
+    account["project_max_concurrent_tasks"][project_id] = 2
+    assert await reserve_max_plan_auxiliary_slot(account_id, project_id=project_id) is True
+    assert account["active_tasks"] == 2
+    assert account["daily_task_count"] == 11
+    assert account["project_state"][project_id]["daily_task_count"] == 7
+    await release_max_plan_auxiliary_slot(account_id, project_id=project_id)
+    assert account["active_tasks"] == 1
 
 
 class TestGetTaskLlmAccountId:

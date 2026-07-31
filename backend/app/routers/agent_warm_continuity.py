@@ -49,6 +49,7 @@ from app.discovery_admission import (
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
+from app.task_capabilities import get_task_capability
 import app.shared_state as _shared_state
 
 logger = logging.getLogger(__name__)
@@ -885,6 +886,14 @@ async def _finalize_warm_claim(
         "warm_start": True,
         "agent_token": agent_token,
     }
+    # The warm agent receives this before it decides whether to reset its
+    # existing workspace. This is registry-owned policy, not task payload:
+    # workspace:none workers never touch the prior role's repository.
+    # Unknown types intentionally omit it so the agent defaults fail-closed to
+    # repository-backed behavior.
+    task_capability = get_task_capability(task_type)
+    if task_capability is not None:
+        response["workspace_requirement"] = task_capability.workspace_requirement
     if secret_manifest is not None:
         response["secret_manifest"] = secret_manifest
     # Lane workspace-mode: pass the checkpoint SHA + lane marker to the agent

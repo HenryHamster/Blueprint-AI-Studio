@@ -18,10 +18,14 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    StrategicMemorySource,
+    _lock_project_before_strategic_state_for_flush,
+    _next_strategic_memory_source_sequence_for_flush,
 )
 from app.notification_dispatch import post_event_message
 from app.project_message_creation import (
     _lock_operator_idempotency_key,
+    build_project_message,
     create_operator_project_message,
     lock_project_and_next_message_sequence,
     reserve_project_message_sequences,
@@ -67,6 +71,128 @@ async def _send_conversation(
         include_strategic_session_snapshot=False,
         precommit_validate=precommit_validate,
     )
+
+
+@pytest.mark.asyncio
+async def test_canonical_builder_resolves_only_proven_operator_replies(
+    db_session,
+):
+    project = await _project(db_session)
+    project_id = project.id
+    task_id = uuid.uuid4()
+    input_message = ProjectMessage(
+        project_id=project_id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="Operator input",
+    )
+    internal_message = ProjectMessage(
+        project_id=project_id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        from_type="strategic",
+        content="Internal message",
+    )
+    other_project = await _project(db_session)
+    cross_project_input = ProjectMessage(
+        project_id=other_project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="Other project's input",
+    )
+    db_session.add_all(
+        [input_message, internal_message, cross_project_input]
+    )
+    await db_session.commit()
+
+    linked = await build_project_message(
+        db_session,
+        project_id=project_id,
+        sequence=3,
+        from_type="strategic",
+        from_task_id=task_id,
+        reply_to_message_id=input_message.id,
+        content="Linked reply",
+        context={},
+        status="open",
+    )
+    covered = await build_project_message(
+        db_session,
+        project_id=project_id,
+        sequence=4,
+        from_type="strategic",
+        from_task_id=task_id,
+        content="Covered reply",
+        context={
+            "message_role": "operator_reply",
+            "_resident_reply_covered_message_ids": [str(input_message.id)],
+        },
+    )
+    generic = await build_project_message(
+        db_session,
+        project_id=project_id,
+        sequence=5,
+        from_type="strategic",
+        from_task_id=task_id,
+        content="Internal update",
+        context={"event_type": "strategic_message"},
+    )
+    malformed_coverage = await build_project_message(
+        db_session,
+        project_id=project_id,
+        sequence=6,
+        from_type="strategic",
+        from_task_id=task_id,
+        content="Not a proven reply",
+        context={
+            "_resident_reply_covered_message_ids": [None, "", "not-a-uuid"]
+        },
+    )
+    spoofed_role = await build_project_message(
+        db_session,
+        project_id=project_id,
+        sequence=7,
+        from_type="strategic",
+        from_task_id=task_id,
+        content="Agent-copied context is not proof",
+        context={"message_role": "operator_reply"},
+    )
+    cross_project_reference = await build_project_message(
+        db_session,
+        project_id=project_id,
+        sequence=8,
+        from_type="strategic",
+        from_task_id=task_id,
+        reply_to_message_id=cross_project_input.id,
+        content="Cross-project reference is not proof",
+        context={},
+    )
+    internal_reference = await build_project_message(
+        db_session,
+        project_id=project_id,
+        sequence=9,
+        from_type="strategic",
+        from_task_id=task_id,
+        content="Internal reference is not proof",
+        context={
+            "_resident_reply_covered_message_ids": [
+                str(internal_message.id)
+            ]
+        },
+    )
+
+    assert linked.status == "resolved"
+    assert linked.resolved_at is not None
+    assert covered.status == "resolved"
+    assert covered.resolved_at is not None
+    assert generic.status == "open"
+    assert generic.resolved_at is None
+    assert malformed_coverage.status == "open"
+    assert spoofed_role.status == "open"
+    assert cross_project_reference.status == "open"
+    assert internal_reference.status == "open"
 
 
 def test_sequence_critical_section_contains_only_atomic_acceptance_work():
@@ -118,6 +244,16 @@ def test_shared_allocator_enforces_project_before_counter_for_all_writers():
         "INSERT INTO projectmessagesequence AS counter"
     )
     assert project_at < counter_at
+
+
+def test_receipt_allocator_reuses_shared_project_lock_without_upgrade():
+    lock_source = inspect.getsource(_lock_project_before_strategic_state_for_flush)
+    receipt_source = inspect.getsource(
+        _next_strategic_memory_source_sequence_for_flush
+    )
+
+    assert ".with_for_update(read=True, key_share=True)" in lock_source
+    assert "exclusive=False" in receipt_source
 
     from app.routers.admin_agent_ops import strategic_operation
     from app.routers.admin_notifications import resolve_message
@@ -282,6 +418,75 @@ async def test_precommit_gets_final_message_id_on_activity_send(db_session):
     )
 
     assert seen_message_id == result.message.id
+
+
+@pytest.mark.asyncio
+async def test_operator_writer_processes_corrections_after_source_receipt_flush(
+    db_session,
+):
+    project = await _project(db_session)
+    seen_message_id = None
+
+    async def assert_flushed_receipt(session, message):
+        nonlocal seen_message_id
+        seen_message_id = message.id
+        source = await session.scalar(
+            select(StrategicMemorySource).where(
+                StrategicMemorySource.project_id == project.id,
+                StrategicMemorySource.source_type == "project_message",
+                StrategicMemorySource.source_key == str(message.id),
+                StrategicMemorySource.payload_state == "active",
+            )
+        )
+        assert source is not None
+
+    with patch(
+        "app.strategic_memory_corrections.process_operator_message_correction_barriers",
+        new=AsyncMock(side_effect=assert_flushed_receipt),
+    ) as process_corrections:
+        result = await _send_conversation(
+            db_session,
+            project.id,
+            content="No, eta was 0.2.",
+            idempotency_key="correction-hook-after-receipt",
+        )
+
+    assert seen_message_id == result.message.id
+    process_corrections.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_operator_writer_rolls_back_message_when_correction_processing_fails(
+    db_session,
+):
+    project = await _project(db_session)
+    project_id = project.id
+
+    with patch(
+        "app.strategic_memory_corrections.process_operator_message_correction_barriers",
+        new=AsyncMock(side_effect=RuntimeError("correction processing failed")),
+    ), pytest.raises(RuntimeError, match="correction processing failed"):
+        await _send_conversation(
+            db_session,
+            project_id,
+            content="Actually, that value is wrong.",
+            idempotency_key="correction-hook-rollback",
+        )
+
+    message = await db_session.scalar(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.idempotency_key == "correction-hook-rollback",
+        )
+    )
+    source = await db_session.scalar(
+        select(StrategicMemorySource).where(
+            StrategicMemorySource.project_id == project_id,
+            StrategicMemorySource.source_type == "project_message",
+        )
+    )
+    assert message is None
+    assert source is None
 
 
 @pytest.mark.skipif(

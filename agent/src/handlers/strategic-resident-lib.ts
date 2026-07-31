@@ -52,6 +52,8 @@ export interface ResidentInboundMessage {
 
 export interface MessagesPollResponse {
   messages?: ResidentInboundMessage[];
+  /** Server-computed canonical subset eligible for the typed Fast claim. */
+  fast_message_ids?: string[];
   server_time?: string;
   claim_required?: boolean;
 }

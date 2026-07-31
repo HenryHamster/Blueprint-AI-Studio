@@ -11,6 +11,7 @@ from app.max_plan_pool import (
     apply_task_llm_runtime_context,
     clear_task_llm_runtime_context,
     reconcile_llm_runtime_identity,
+    resolve_task_routing,
     select_llm_runtime_for_task,
 )
 from app.llm_cost_attribution import compute_llm_cost_breakdown
@@ -742,6 +743,73 @@ async def test_select_llm_runtime_balanced_mode_honors_narrowed_allow_list(
     result = await select_llm_runtime_for_task(
         user_id=_TEST_USER,
         task=_task(payload={"type": "research", "quality_tier": "opus"}),
+        runtime_config=runtime_config,
+    )
+
+    assert result is not None
+    assert result.provider == "anthropic"
+    assert result.account_id == "acct-anthropic"
+
+
+@pytest.mark.asyncio
+async def test_memory_consolidation_provider_pin_cannot_fall_through_to_another_pool(
+    clean_runtime_pool,
+):
+    """The verified text-only worker is Anthropic-only until another provider
+    has the same isolation contract.  A backend-owned task pin must remain a
+    complete allow-list even when global routing would prefer another account.
+    """
+    anthropic = {
+        "id": "acct-anthropic",
+        "user_id": _TEST_USER,
+        "name": "anthropic",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 9,
+    }
+    openai = {
+        "id": "acct-openai",
+        "user_id": _TEST_USER,
+        "name": "openai",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).extend([anthropic, openai])
+    _account_by_id[anthropic["id"]] = anthropic
+    _account_by_id[openai["id"]] = openai
+
+    runtime_config = {
+        "provider_selection_mode": "balanced",
+        "provider_routing_verdict_state": "ADOPT",
+        "task_type_categories": {"build": ["memory_consolidation"]},
+        "provider_tier_model_map": {
+            "anthropic": {"sonnet": "claude-sonnet-4-6"},
+            "openai": {"sonnet": "gpt-5.6-terra"},
+            "deepseek": {"sonnet": "deepseek-chat"},
+        },
+        # Deliberately hostile global routing: a scheduled memory task must
+        # still never be assigned this more-idle OpenAI account.
+        "task_type_routing": {
+            "memory_consolidation": {"providers": ["openai"], "effort": "medium"}
+        },
+    }
+
+    task = _task(
+        payload={"type": "memory_consolidation"},
+        context={"provider_preference": ["anthropic"]},
+    )
+    assert resolve_task_routing(task, runtime_config)["providers"] == ["anthropic"]
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
         runtime_config=runtime_config,
     )
 

@@ -1612,6 +1612,12 @@ class TestSchemaRevisionSync:
             r"add_column\(\s*(?:['\"](\w+)['\"]|(\w+))\s*,"
             r"(?:\s|#[^\n]*\n)*sa\.Column\(\s*['\"](\w+)['\"]"
         )
+        batch_alter_re = re.compile(
+            r"^[ \t]*with\s+op\.batch_alter_table\(\s*"
+            r"(?:['\"](\w+)['\"]|(\w+))\s*\)\s+as\s+(\w+)\s*:[ \t]*"
+            r"(?P<body>(?:\n[ \t]+[^\n]*)*)",
+            re.MULTILINE,
+        )
         create_table_re = re.compile(
             r"create_table\(\s*(?:['\"](\w+)['\"]|(\w+))", re.MULTILINE
         )
@@ -1632,6 +1638,21 @@ class TestSchemaRevisionSync:
                 table = m.group(1) or consts.get(m.group(2) or "", "")
                 if table:
                     migration_columns.add((table, m.group(3)))
+
+            # batch_op.add_column(sa.Column(...)) is the portable Alembic form
+            # for an existing table.  The table is declared by the enclosing
+            # batch_alter_table context rather than on every add_column call.
+            for batch_m in batch_alter_re.finditer(content):
+                table = batch_m.group(1) or consts.get(batch_m.group(2) or "", "")
+                if not table:
+                    continue
+                alias = re.escape(batch_m.group(3))
+                batch_add_col_re = re.compile(
+                    rf"\b{alias}\.add_column\(\s*"
+                    r"(?:\s|#[^\n]*\n)*sa\.Column\(\s*['\"](\w+)['\"]"
+                )
+                for add_m in batch_add_col_re.finditer(batch_m.group("body")):
+                    migration_columns.add((table, add_m.group(1)))
 
             # alter_column('table', 'old_name', new_column_name='new_name', ...)
             for m in rename_re.finditer(content):
@@ -1785,6 +1806,12 @@ class TestSchemaRevisionSync:
             r"\s*(?:sa|postgresql|sqlmodel\.sql\.sqltypes)\.(\w+)"
             r"(\(timezone=True\))?"
         )
+        json_with_postgresql_jsonb_re = re.compile(
+            r"sa\.Column\(\s*['\"](\w+)['\"]\s*,\s*"
+            r"sa\.JSON\(\)\.with_variant\(\s*"
+            r"postgresql\.JSONB\(.*?\)\s*,\s*['\"]postgresql['\"]\s*\)",
+            re.DOTALL,
+        )
 
         # alter_column scanning: patterns used to detect upgrade-to-TIMESTAMPTZ calls.
         # We extract only the upgrade() body to avoid matching downgrade() reversals.
@@ -1831,6 +1858,10 @@ class TestSchemaRevisionSync:
                 for col_m in col_in_create_re.finditer(block):
                     type_str = col_m.group(2) + ("_tz" if col_m.group(3) else "")
                     migration_types[(table, col_m.group(1))] = type_str
+                # PostgreSQL receives JSONB for this SQLAlchemy variant, even
+                # though the generic parser above first sees its JSON base type.
+                for col_m in json_with_postgresql_jsonb_re.finditer(block):
+                    migration_types[(table, col_m.group(1))] = "JSONB"
 
             # --- alter_column → TIMESTAMPTZ upgrade pass ---
             # Extract upgrade() body (stop before next top-level def/class).
@@ -11341,6 +11372,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "capability_proof_trial": "none",
         "criterion_coverage_trial": "none",
         "walkthrough_e2e": "none",
+        "memory_consolidation": "none",
     }
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == expected_registry, (
         "TaskType evaluation registry has drifted from the locked spec. "
@@ -13553,9 +13585,9 @@ class TestProblemModelWritePathInvariants:
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
         ("strategic_completion.py", 6418): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1139): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1140): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1267): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1268): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
         ("routers/admin_projects.py", 853): "validated pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
@@ -13563,21 +13595,21 @@ class TestProblemModelWritePathInvariants:
         # admin_projects.py: current_model.model_dump()
         ("routers/admin_projects.py", 1378): "current_model pydantic model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
-        ("routers/admin_onboard.py", 967): "pm parsed from ProblemModel, model_dump",
+        ("routers/admin_onboard.py", 968): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1741): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2159): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2599): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2712): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2967): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 1836): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2254): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2694): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2807): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3062): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4277): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4475): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4305): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4503): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 4836): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5034): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 4918): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5116): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):

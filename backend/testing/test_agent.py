@@ -17834,6 +17834,49 @@ async def test_next_role_claims_warm_pinned_queued_task(
 
 
 @pytest.mark.asyncio
+async def test_next_role_publishes_backend_owned_no_workspace_capability(
+    client: AsyncClient, db_session
+):
+    """Warm memory tasks tell the agent to skip repository reset before running."""
+    from datetime import timedelta
+
+    project = Project(name="Next-Role Memory Capability", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-memory-capability"
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 1}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.COMPLETED,
+    )
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memory_consolidation", "job_id": str(uuid.uuid4())}],
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": vm_id,
+            "warm_handoff_deadline": (_utcnow() + timedelta(seconds=240)).isoformat(),
+        },
+    )
+    db_session.add_all([prior_task, pinned_task])
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    token = create_agent_token(str(prior_task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={"vm_instance_id": vm_id, "prior_task_id": str(prior_task.id)},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["workspace_requirement"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_next_role_respects_retry_after_for_warm_pinned_task(
     client: AsyncClient, db_session
 ):

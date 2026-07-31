@@ -28,6 +28,9 @@ vi.mock('../providers/runners.js', () => ({
   probeClaudeCapabilities: vi.fn(() => null),
   stripUnsupportedClaudeOptionalArgs: vi.fn((args: readonly string[]) => [...args]),
   runClaudeCode: vi.fn().mockResolvedValue(undefined),
+  TextOnlyProviderUnavailableError: class extends Error {},
+  buildIsolatedTextOnlyMemoryCommand: vi.fn(),
+  runIsolatedTextOnlyMemory: vi.fn(),
 }));
 
 vi.mock('../fix-loop-events.js', () => ({

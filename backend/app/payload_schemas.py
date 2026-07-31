@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -129,6 +130,29 @@ class BasePayload(BaseModel):
         if not cleaned:
             return None
         return cleaned
+
+
+class MemoryConsolidationPayload(BasePayload):
+    """Bounded control payload for the no-workspace memory worker.
+
+    Provider identity is never accepted from this payload: the authenticated
+    task's leased pool account is the sole provider authority.  The numeric
+    caps are conservative hard ceilings consumed again at the agent API.
+    """
+
+    job_id: uuid.UUID
+    max_prompt_tokens: int = Field(default=4096, ge=1, le=8192)
+    max_completion_tokens: int = Field(default=2048, ge=1, le=4096)
+    max_total_tokens: int = Field(default=6144, ge=1, le=12_288)
+    max_input_bytes: int = Field(default=131_072, ge=1, le=131_072)
+
+    @model_validator(mode="after")
+    def _memory_budget_is_coherent(self) -> "MemoryConsolidationPayload":
+        if self.max_total_tokens < self.max_prompt_tokens:
+            raise ValueError("max_total_tokens must cover max_prompt_tokens")
+        if self.max_total_tokens < self.max_completion_tokens:
+            raise ValueError("max_total_tokens must cover max_completion_tokens")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -1383,6 +1407,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     # shape (mirrors capability_proof_trial). Bounded caps are enforced at
     # enrollment + in the agent handler, not by the schema.
     TaskType.criterion_coverage_trial: BasePayload,
+    TaskType.memory_consolidation: MemoryConsolidationPayload,
 }
 
 

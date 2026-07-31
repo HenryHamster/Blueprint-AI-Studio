@@ -288,6 +288,7 @@ from app.reaper_sweeps import (
     sweep_stuck_qualifications,
     sweep_evergreen_fill_decision_retention,
     sweep_expired_message_attachment_uploads,
+    sweep_strategic_context_retention,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
     sweep_recover_stranded_transient_blockers,
@@ -2792,7 +2793,22 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 10a: Global expired message-attachment cleanup. This is
+                # Step 10a: Global Strategic envelope/private-packet retention.
+                # This is intentionally independent of a project receiving its
+                # next message, so expired prompt copies cannot become dormant
+                # data-retention leaks.
+                _mark_reaper_progress()
+                try:
+                    await sweep_strategic_context_retention(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Strategic context retention purge: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 10b: Global expired message-attachment cleanup. This is
                 # independent of any actor returning to upload again.
                 _mark_reaper_progress()
                 try:

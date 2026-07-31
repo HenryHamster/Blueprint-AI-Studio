@@ -59,6 +59,7 @@ VALID_TASK_TYPES: set[str] = {
     "capability_proof_trial",
     "criterion_coverage_trial",
     "walkthrough_e2e",
+    "memory_consolidation",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}

@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Mapping
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import (
+    ARRAY,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -23,18 +24,24 @@ from sqlalchemy import (
     JSON,
     String,
     Integer,
+    LargeBinary,
     Float,
     Index,
     Text,
     UniqueConstraint,
     ForeignKey,
+    ForeignKeyConstraint,
+    Numeric,
+    or_,
     text,
     event,
     func,
+    select,
     Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session as _OrmSession
+import hashlib
 import logging
 import uuid
 from datetime import datetime
@@ -3996,6 +4003,12 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_created_at", "created_at"),
         Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
+        Index(
+            "ix_projectmessage_content_trgm",
+            "content",
+            postgresql_using="gin",
+            postgresql_ops={"content": "gin_trgm_ops"},
+        ),
         # Composite index for the strategic cold-load live-message preview query
         # (project_id, status IN ('open','linked'), ORDER BY created_at DESC LIMIT 12).
         # Two-branch UNION ALL rewrite uses this index for each status branch.
@@ -4052,6 +4065,1789 @@ class ProjectMessageSequence(SQLModel, table=True):
             name="chk_projectmessagesequence_nonnegative",
         ),
     )
+
+
+class StrategicMemoryProjectState(SQLModel, table=True):
+    """Per-project fence generations for persisted Strategic context envelopes.
+
+    This is deliberately separate from ``Project`` so envelope invalidation is
+    a narrow, durable state change rather than a JSONB rewrite of the project
+    record.  ``context_authority_generation`` is named explicitly: the bare
+    ``authority_generation`` name is reserved by a repository-wide ORM
+    invariant for the retired resident authority model.
+    """
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    context_authority_generation: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    privacy_generation: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    # ``source_sequence`` is a durable ingestion ordering distinct from event
+    # time.  It is only used to drive contiguous receipt processing and must
+    # never be used to answer historical/event-time questions.
+    source_high_watermark: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    incorporated_source_sequence: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    # The semantic ledger is independently revisioned from source ingestion.
+    # A successful proposal advances this only with its append-only rows.
+    ledger_revision: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    backfill_status: str = Field(
+        default="pending",
+        sa_column=Column(String(16), nullable=False, server_default=text("'pending'")),
+    )
+    extraction_status: str = Field(
+        default="healthy",
+        sa_column=Column(String(16), nullable=False, server_default=text("'healthy'")),
+    )
+    last_error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    attempt: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime, nullable=False, server_default=func.now()
+        ),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "context_authority_generation >= 0",
+            name="ck_smem_state_ctx_gen",
+        ),
+        CheckConstraint(
+            "privacy_generation >= 0",
+            name="ck_smem_state_priv_gen",
+        ),
+        CheckConstraint(
+            "source_high_watermark >= 0",
+            name="ck_smem_state_source_high",
+        ),
+        CheckConstraint(
+            "incorporated_source_sequence >= 0",
+            name="ck_smem_state_source_incorporated",
+        ),
+        CheckConstraint(
+            "incorporated_source_sequence <= source_high_watermark",
+            name="ck_smem_state_source_watermark",
+        ),
+        CheckConstraint("ledger_revision >= 0", name="ck_smem_state_ledger_revision"),
+        CheckConstraint(
+            "attempt >= 0",
+            name="ck_smem_state_attempt",
+        ),
+        CheckConstraint(
+            "backfill_status IN ('pending','running','complete','failed')",
+            name="ck_smem_state_backfill_status",
+        ),
+        CheckConstraint(
+            "extraction_status IN ('healthy','lagging','quarantined','failed')",
+            name="ck_smem_state_extraction_status",
+        ),
+    )
+
+
+class StrategicContextEnvelopeSnapshot(SQLModel, table=True):
+    """One immutable, fenced serialization of Strategic context.
+
+    The canonical payload is binary on purpose.  Fast and Workday transport the
+    exact stored bytes (base64 encoded at the boundary), never independently
+    serialize a dict and accidentally create divergent prompts.
+    """
+
+    snapshot_id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    session_id: str = Field(sa_column=Column(String(255), nullable=False))
+    claim_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    worker_generation: int = Field(
+        sa_column=Column(Integer, nullable=False)
+    )
+    worker_incarnation: uuid.UUID = Field(
+        sa_column=Column(GUID(), nullable=False)
+    )
+    input_revision: int = Field(sa_column=Column(BigInteger, nullable=False))
+    transcript_sequence: int = Field(
+        sa_column=Column(BigInteger, nullable=False)
+    )
+    ledger_revision: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    problem_model_revision: str = Field(
+        default="0", sa_column=Column(String(128), nullable=False, server_default=text("'0'"))
+    )
+    decision_authority_revision: str = Field(
+        default="0", sa_column=Column(String(128), nullable=False, server_default=text("'0'"))
+    )
+    context_authority_generation: int = Field(
+        sa_column=Column(Integer, nullable=False)
+    )
+    privacy_generation: int = Field(sa_column=Column(Integer, nullable=False))
+    canonical_envelope: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    canonical_sha256: str = Field(sa_column=Column(String(64), nullable=False))
+    retrieval_trace: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime, nullable=False, server_default=func.now()
+        ),
+    )
+    expires_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False)
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "worker_generation >= 0",
+            name="ck_sctx_worker_gen",
+        ),
+        CheckConstraint(
+            "input_revision >= 0",
+            name="ck_sctx_input_rev",
+        ),
+        CheckConstraint(
+            "transcript_sequence >= 0",
+            name="ck_sctx_transcript_seq",
+        ),
+        CheckConstraint(
+            "ledger_revision >= 0",
+            name="ck_sctx_ledger_rev",
+        ),
+        CheckConstraint(
+            "context_authority_generation >= 0",
+            name="ck_sctx_context_gen",
+        ),
+        CheckConstraint(
+            "privacy_generation >= 0",
+            name="ck_sctx_privacy_gen",
+        ),
+        CheckConstraint(
+            "length(canonical_sha256) = 64",
+            name="ck_sctx_sha256_len",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_sctx_expiry",
+        ),
+        UniqueConstraint(
+            "project_id",
+            "session_id",
+            "claim_id",
+            "worker_generation",
+            "worker_incarnation",
+            "input_revision",
+            "transcript_sequence",
+            "ledger_revision",
+            "problem_model_revision",
+            "decision_authority_revision",
+            "context_authority_generation",
+            "privacy_generation",
+            name="uq_sctx_input_fence",
+        ),
+        Index(
+            "ix_sctx_project_expires",
+            "project_id",
+            "expires_at",
+        ),
+        Index(
+            "ix_sctx_project_session_seq",
+            "project_id",
+            "session_id",
+            "transcript_sequence",
+        ),
+        Index(
+            "ix_sctx_project_claim",
+            "project_id",
+            "claim_id",
+        ),
+    )
+
+
+class StrategicMemorySource(SQLModel, table=True):
+    """Immutable, project-scoped receipt for one piece of source evidence.
+
+    The receipt intentionally records an immutable identity and content hash,
+    rather than copying ordinary transcript/artifact bodies.  Mutable sources
+    may retain their canonical bytes in ``canonical_payload`` so exact spans
+    remain resolvable after the native source changes.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    source_sequence: int = Field(sa_column=Column(BigInteger, nullable=False))
+    native_sequence: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    ingestion_origin: str = Field(
+        default="live",
+        sa_column=Column(String(16), nullable=False, server_default=text("'live'")),
+    )
+    source_type: str = Field(sa_column=Column(String(64), nullable=False))
+    source_key: str = Field(sa_column=Column(String(512), nullable=False))
+    source_revision: str = Field(sa_column=Column(String(255), nullable=False))
+    content_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    actor_kind: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    actor_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    occurred_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    resident_session_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    visibility: str = Field(
+        default="project",
+        sa_column=Column(String(32), nullable=False, server_default=text("'project'")),
+    )
+    sensitivity: str = Field(
+        default="normal",
+        sa_column=Column(String(32), nullable=False, server_default=text("'normal'")),
+    )
+    payload_state: str = Field(
+        default="active",
+        sa_column=Column(String(16), nullable=False, server_default=text("'active'")),
+    )
+    tombstoned_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    # SQLAlchemy reserves the Python name ``metadata`` for declarative model
+    # metadata.  Keep the physical schema column named ``metadata`` while
+    # exposing a non-conflicting ORM field to all producers/consumers.
+    source_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("metadata", JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    canonical_payload: bytes | None = Field(
+        default=None, sa_column=Column(LargeBinary, nullable=True)
+    )
+
+    __table_args__ = (
+        CheckConstraint("source_sequence >= 1", name="ck_smem_source_sequence"),
+        CheckConstraint(
+            "native_sequence IS NULL OR native_sequence >= 0",
+            name="ck_smem_source_native_sequence",
+        ),
+        CheckConstraint(
+            "ingestion_origin IN ('live','backfill')",
+            name="ck_smem_source_origin",
+        ),
+        CheckConstraint(
+            "source_type IN ('project_message','artifact_revision','task_result',"
+            "'problem_model_revision','decision','operator_action',"
+            "'legacy_knowledge_document_revision')",
+            name="ck_smem_source_type",
+        ),
+        CheckConstraint(
+            "payload_state IN ('active','redacted','deleted')",
+            name="ck_smem_source_payload_state",
+        ),
+        CheckConstraint(
+            "length(content_hash) = 64", name="ck_smem_source_hash_len"
+        ),
+        UniqueConstraint(
+            "project_id", "source_sequence", name="uq_smem_source_project_sequence"
+        ),
+        UniqueConstraint("project_id", "id", name="uq_smem_source_project_id"),
+        UniqueConstraint(
+            "project_id",
+            "source_type",
+            "source_key",
+            "source_revision",
+            name="uq_smem_source_receipt",
+        ),
+        Index("ix_smem_source_project_sequence", "project_id", "source_sequence"),
+        Index("ix_smem_source_project_type_key", "project_id", "source_type", "source_key"),
+        Index("ix_smem_source_project_hash", "project_id", "content_hash"),
+        Index("ix_smem_source_project_occurred", "project_id", "occurred_at"),
+    )
+
+
+class StrategicMemoryBackfillCursor(SQLModel, table=True):
+    """Frozen, resumable per-producer receipt-backfill state."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    producer: str = Field(sa_column=Column(String(128), nullable=False))
+    cutoff_spec: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    cursor: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    scanned_count: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    admitted_count: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    skipped_count: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    status: str = Field(
+        default="pending",
+        sa_column=Column(String(16), nullable=False, server_default=text("'pending'")),
+    )
+    error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime, nullable=False, server_default=func.now(), onupdate=_utcnow
+        ),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "producer", name="uq_smem_backfill_producer"),
+        CheckConstraint("scanned_count >= 0", name="ck_smem_backfill_scanned"),
+        CheckConstraint("admitted_count >= 0", name="ck_smem_backfill_admitted"),
+        CheckConstraint("skipped_count >= 0", name="ck_smem_backfill_skipped"),
+        CheckConstraint(
+            "admitted_count + skipped_count <= scanned_count",
+            name="ck_smem_backfill_counts",
+        ),
+        CheckConstraint(
+            "status IN ('pending','running','complete','failed')",
+            name="ck_smem_backfill_status",
+        ),
+        Index("ix_smem_backfill_project_status", "project_id", "status"),
+    )
+
+
+class StrategicMemoryConsolidationJob(SQLModel, table=True):
+    """Durable leased work item for contiguous or targeted reconsolidation."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    source_start: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    source_end: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    mode: str = Field(
+        default="contiguous",
+        sa_column=Column(String(32), nullable=False, server_default=text("'contiguous'")),
+    )
+    target_source_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(), ForeignKey("strategicmemorysource.id"), nullable=True
+        ),
+    )
+    base_ledger_revision: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    # These fences are snapshotted at enqueue time.  A worker must reject its
+    # proposal when an operator/privacy action advanced either generation
+    # while it was waiting or running.
+    context_authority_generation: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    privacy_generation: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    status: str = Field(
+        default="queued",
+        sa_column=Column(String(16), nullable=False, server_default=text("'queued'")),
+    )
+    lease_owner: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    lease_generation: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    lease_expires_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    attempt: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    model: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
+    prompt_version: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    # Accepted proposal identity makes a lost response retryable without
+    # accepting a different proposal for the same completed job.
+    accepted_proposal_idempotency_key: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    accepted_proposal_hash: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    proposal_schema_version: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    resulting_ledger_revision: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime, nullable=False, server_default=func.now(), onupdate=_utcnow
+        ),
+    )
+    completed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('contiguous','reconsolidation')", name="ck_smem_job_mode"
+        ),
+        CheckConstraint(
+            "status IN ('queued','running','retry','complete','dead')",
+            name="ck_smem_job_status",
+        ),
+        CheckConstraint(
+            "base_ledger_revision >= 0", name="ck_smem_job_base_ledger"
+        ),
+        CheckConstraint(
+            "context_authority_generation >= 0", name="ck_smem_job_context_gen"
+        ),
+        CheckConstraint(
+            "privacy_generation >= 0", name="ck_smem_job_privacy_gen"
+        ),
+        CheckConstraint("lease_generation >= 0", name="ck_smem_job_lease_gen"),
+        CheckConstraint("attempt >= 0", name="ck_smem_job_attempt"),
+        CheckConstraint(
+            "accepted_proposal_hash IS NULL OR length(accepted_proposal_hash) = 64",
+            name="ck_smem_job_proposal_hash_len",
+        ),
+        CheckConstraint(
+            "resulting_ledger_revision IS NULL OR resulting_ledger_revision >= 0",
+            name="ck_smem_job_result_ledger",
+        ),
+        CheckConstraint(
+            "(source_start IS NULL AND source_end IS NULL) OR "
+            "(source_start >= 1 AND source_end >= source_start)",
+            name="ck_smem_job_source_range",
+        ),
+        CheckConstraint(
+            "(mode = 'contiguous' AND source_start IS NOT NULL AND source_end IS NOT NULL "
+            "AND target_source_id IS NULL) OR "
+            "(mode = 'reconsolidation' AND target_source_id IS NOT NULL)",
+            name="ck_smem_job_mode_target",
+        ),
+        UniqueConstraint("project_id", "id", name="uq_smem_job_project_id"),
+        Index("ix_smem_job_project_status", "project_id", "status"),
+        Index("ix_smem_job_project_range", "project_id", "source_start", "source_end"),
+        Index(
+            "uq_smem_job_project_accepted_proposal",
+            "project_id",
+            "accepted_proposal_idempotency_key",
+            unique=True,
+            postgresql_where=text("accepted_proposal_idempotency_key IS NOT NULL"),
+            sqlite_where=text("accepted_proposal_idempotency_key IS NOT NULL"),
+        ),
+        Index(
+            "uq_smem_job_active_project",
+            "project_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued','running','retry')"),
+            sqlite_where=text("status IN ('queued','running','retry')"),
+        ),
+    )
+
+
+class StrategicMemorySourceDisposition(SQLModel, table=True):
+    """Mutable processing disposition for exactly one immutable source receipt."""
+
+    source_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("strategicmemorysource.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    status: str = Field(
+        default="pending",
+        sa_column=Column(String(16), nullable=False, server_default=text("'pending'")),
+    )
+    reason: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    classifier_version: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    extractor_model: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    prompt_version: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    consolidation_job_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(), ForeignKey("strategicmemoryconsolidationjob.id"), nullable=True
+        ),
+    )
+    processed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','incorporated','no_memory','quarantined')",
+            name="ck_smem_disposition_status",
+        ),
+        Index("ix_smem_disposition_job", "consolidation_job_id"),
+        Index("ix_smem_disposition_status", "status"),
+    )
+
+
+class StrategicMemoryItem(SQLModel, table=True):
+    """Stable project-scoped identity whose semantic assertions are versioned."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    scope_type: str = Field(
+        default="project",
+        sa_column=Column(String(32), nullable=False, server_default=text("'project'")),
+    )
+    # ``project`` uses the empty-string sentinel.  NULL would defeat the
+    # project/scope/logical-key uniqueness fence on PostgreSQL.
+    scope_key: str = Field(
+        default="", sa_column=Column(String(255), nullable=False, server_default=text("''"))
+    )
+    kind: str = Field(sa_column=Column(String(32), nullable=False))
+    logical_key: str = Field(sa_column=Column(String(512), nullable=False))
+    current_version: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    current_status: str = Field(
+        default="active",
+        sa_column=Column(String(16), nullable=False, server_default=text("'active'")),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime, nullable=False, server_default=func.now(), onupdate=_utcnow
+        ),
+    )
+    forgotten_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope_type IN ('project','research_topic')", name="ck_smem_item_scope_type"
+        ),
+        CheckConstraint(
+            "(scope_type = 'project' AND scope_key = '') OR "
+            "(scope_type = 'research_topic' AND length(scope_key) > 0)",
+            name="ck_smem_item_scope_key",
+        ),
+        CheckConstraint(
+            "kind IN ('goal','preference','constraint','definition','notation',"
+            "'assumption','claim','decision','result','counterexample',"
+            "'open_question','procedure','lesson')",
+            name="ck_smem_item_kind",
+        ),
+        CheckConstraint("current_version >= 0", name="ck_smem_item_current_version"),
+        CheckConstraint(
+            "current_status IN ('active','challenged','superseded','retracted','forgotten')",
+            name="ck_smem_item_current_status",
+        ),
+        CheckConstraint(
+            "(current_status = 'forgotten') = (forgotten_at IS NOT NULL)",
+            name="ck_smem_item_forgotten_time",
+        ),
+        UniqueConstraint("project_id", "id", name="uq_smem_item_project_id"),
+        UniqueConstraint(
+            "project_id", "scope_type", "scope_key", "logical_key",
+            name="uq_smem_item_project_scope_logical",
+        ),
+        Index("ix_smem_item_project_kind_status", "project_id", "kind", "current_status"),
+        Index("ix_smem_item_project_updated", "project_id", "updated_at"),
+    )
+
+
+class StrategicMemoryItemVersion(SQLModel, table=True):
+    """Immutable assertion content for one logical item version."""
+
+    item_id: uuid.UUID = Field(sa_column=Column(GUID(), primary_key=True, nullable=False))
+    version: int = Field(sa_column=Column(Integer, primary_key=True, nullable=False))
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    canonical_text: str = Field(sa_column=Column(Text, nullable=False))
+    structured_value: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    epistemic_status: str = Field(sa_column=Column(String(32), nullable=False))
+    confidence: float = Field(sa_column=Column(Numeric(5, 4), nullable=False))
+    asserted_effective_from: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    asserted_effective_until: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    recorded_source_sequence: int = Field(sa_column=Column(BigInteger, nullable=False))
+    exact_terms: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(ARRAY(Text).with_variant(JSON(), "sqlite"), nullable=False),
+    )
+    formula_fingerprints: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(ARRAY(Text).with_variant(JSON(), "sqlite"), nullable=False),
+    )
+    content_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    created_by_job_id: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    extractor_version: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "item_id"],
+            ["strategicmemoryitem.project_id", "strategicmemoryitem.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "created_by_job_id"],
+            [
+                "strategicmemoryconsolidationjob.project_id",
+                "strategicmemoryconsolidationjob.id",
+            ],
+        ),
+        CheckConstraint("version >= 1", name="ck_smem_item_version_positive"),
+        CheckConstraint(
+            "epistemic_status IN ('operator_explicit','verified_evidence',"
+            "'agent_conclusion','agent_hypothesis')",
+            name="ck_smem_item_version_epistemic",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1", name="ck_smem_item_version_confidence"
+        ),
+        CheckConstraint(
+            "asserted_effective_until IS NULL OR asserted_effective_from IS NULL "
+            "OR asserted_effective_until > asserted_effective_from",
+            name="ck_smem_item_version_effective_interval",
+        ),
+        CheckConstraint("recorded_source_sequence >= 1", name="ck_smem_item_version_source_seq"),
+        CheckConstraint("length(content_hash) = 64", name="ck_smem_item_version_hash_len"),
+        UniqueConstraint(
+            "project_id", "item_id", "version", name="uq_smem_item_version_project_item"
+        ),
+        Index("ix_smem_item_version_item_recorded", "item_id", "recorded_at"),
+        Index(
+            "ix_smem_item_version_project_source", "project_id", "recorded_source_sequence"
+        ),
+        Index(
+            "ix_smem_item_version_effective",
+            "project_id",
+            "asserted_effective_from",
+            "asserted_effective_until",
+        ),
+    )
+
+
+class StrategicMemoryItemSource(SQLModel, table=True):
+    """Exact, normalized receipt provenance for an immutable item version."""
+
+    item_id: uuid.UUID = Field(sa_column=Column(GUID(), primary_key=True, nullable=False))
+    item_version: int = Field(sa_column=Column(Integer, primary_key=True, nullable=False))
+    source_id: uuid.UUID = Field(sa_column=Column(GUID(), primary_key=True, nullable=False))
+    source_role: str = Field(sa_column=Column(String(16), primary_key=True, nullable=False))
+    span_index: int = Field(sa_column=Column(Integer, primary_key=True, nullable=False))
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    span_kind: str = Field(sa_column=Column(String(32), nullable=False))
+    span_start: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    span_end: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    span_hash: str = Field(sa_column=Column(String(64), nullable=False))
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "item_id", "item_version"],
+            [
+                "strategicmemoryitemversion.project_id",
+                "strategicmemoryitemversion.item_id",
+                "strategicmemoryitemversion.version",
+            ],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "source_id"],
+            ["strategicmemorysource.project_id", "strategicmemorysource.id"],
+        ),
+        CheckConstraint(
+            "source_role IN ('assertion','evidence','correction','verification')",
+            name="ck_smem_item_source_role",
+        ),
+        CheckConstraint(
+            "span_kind IN ('text','inline_math','display_math','code','identifier',"
+            "'artifact_region')",
+            name="ck_smem_item_source_span_kind",
+        ),
+        CheckConstraint("span_index >= 0", name="ck_smem_item_source_span_index"),
+        CheckConstraint(
+            "(span_start IS NULL AND span_end IS NULL) OR "
+            "(span_start >= 0 AND span_end > span_start)",
+            name="ck_smem_item_source_span_range",
+        ),
+        CheckConstraint("length(span_hash) = 64", name="ck_smem_item_source_hash_len"),
+        Index("ix_smem_item_source_project_source", "project_id", "source_id"),
+    )
+
+
+class StrategicMemoryTransition(SQLModel, table=True):
+    """Append-only authority event changing an item version's current status."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    item_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    item_version: int = Field(sa_column=Column(Integer, nullable=False))
+    transition: str = Field(sa_column=Column(String(16), nullable=False))
+    target_item_id: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    target_version: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
+    effective_from: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    effective_until: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    recorded_source_sequence: int = Field(sa_column=Column(BigInteger, nullable=False))
+    source_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    reason: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "item_id", "item_version"],
+            [
+                "strategicmemoryitemversion.project_id",
+                "strategicmemoryitemversion.item_id",
+                "strategicmemoryitemversion.version",
+            ],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "target_item_id", "target_version"],
+            [
+                "strategicmemoryitemversion.project_id",
+                "strategicmemoryitemversion.item_id",
+                "strategicmemoryitemversion.version",
+            ],
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "source_id"],
+            ["strategicmemorysource.project_id", "strategicmemorysource.id"],
+        ),
+        CheckConstraint(
+            "transition IN ('activate','challenge','supersede','retract','forget')",
+            name="ck_smem_transition_kind",
+        ),
+        CheckConstraint(
+            "(target_item_id IS NULL AND target_version IS NULL) OR "
+            "(target_item_id IS NOT NULL AND target_version IS NOT NULL)",
+            name="ck_smem_transition_target_pair",
+        ),
+        CheckConstraint(
+            "(transition = 'supersede' AND target_item_id IS NOT NULL) OR "
+            "(transition <> 'supersede' AND target_item_id IS NULL)",
+            name="ck_smem_transition_target_kind",
+        ),
+        CheckConstraint("recorded_source_sequence >= 1", name="ck_smem_transition_source_seq"),
+        CheckConstraint(
+            "effective_until IS NULL OR effective_from IS NULL OR effective_until > effective_from",
+            name="ck_smem_transition_effective_interval",
+        ),
+        Index("ix_smem_transition_project_item_sequence", "project_id", "item_id", "recorded_source_sequence"),
+        Index("ix_smem_transition_project_source", "project_id", "source_id"),
+    )
+
+
+class StrategicMemoryCorrectionBarrier(SQLModel, table=True):
+    """Append-only candidate suppression opened by a correction source."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    correction_source_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    candidate_item_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    candidate_version: int = Field(sa_column=Column(Integer, nullable=False))
+    match_kind: str = Field(sa_column=Column(String(16), nullable=False))
+    match_score: float | None = Field(default=None, sa_column=Column(Numeric(5, 4), nullable=True))
+    context_generation: int = Field(sa_column=Column(Integer, nullable=False))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "correction_source_id"],
+            ["strategicmemorysource.project_id", "strategicmemorysource.id"],
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "candidate_item_id", "candidate_version"],
+            [
+                "strategicmemoryitemversion.project_id",
+                "strategicmemoryitemversion.item_id",
+                "strategicmemoryitemversion.version",
+            ],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "match_kind IN ('exact','reply_link','classifier')",
+            name="ck_smem_barrier_match_kind",
+        ),
+        CheckConstraint(
+            "match_score IS NULL OR (match_score >= 0 AND match_score <= 1)",
+            name="ck_smem_barrier_match_score",
+        ),
+        CheckConstraint("context_generation >= 0", name="ck_smem_barrier_authority_gen"),
+        UniqueConstraint(
+            "project_id", "correction_source_id", "candidate_item_id", "candidate_version",
+            name="uq_smem_barrier_candidate",
+        ),
+        UniqueConstraint("project_id", "id", name="uq_smem_barrier_project_id"),
+        Index("ix_smem_barrier_project_candidate", "project_id", "candidate_item_id", "candidate_version"),
+    )
+
+
+class StrategicMemoryCorrectionBarrierEvent(SQLModel, table=True):
+    """Append-only audit event; the latest valid event derives barrier state."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    barrier_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    event_type: str = Field(sa_column=Column(String(32), nullable=False))
+    source_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    actor_kind: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
+    actor_id: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
+    reason: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    recorded_source_sequence: int = Field(sa_column=Column(BigInteger, nullable=False))
+    context_generation: int = Field(sa_column=Column(Integer, nullable=False))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "barrier_id"],
+            ["strategicmemorycorrectionbarrier.project_id", "strategicmemorycorrectionbarrier.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "source_id"],
+            ["strategicmemorysource.project_id", "strategicmemorysource.id"],
+        ),
+        CheckConstraint(
+            "event_type IN ('opened','target_confirmed','resolved','dismissed')",
+            name="ck_smem_barrier_event_type",
+        ),
+        CheckConstraint("recorded_source_sequence >= 1", name="ck_smem_barrier_event_source_seq"),
+        CheckConstraint("context_generation >= 0", name="ck_smem_barrier_event_authority_gen"),
+        Index("ix_smem_barrier_event_project_barrier", "project_id", "barrier_id", "created_at"),
+    )
+
+
+class StrategicMemoryEdge(SQLModel, table=True):
+    """Versioned, typed relation between two item-version endpoints."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    from_node_type: str = Field(
+        default="item_version",
+        sa_column=Column(String(32), nullable=False, server_default=text("'item_version'")),
+    )
+    from_node_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    from_version: int = Field(sa_column=Column(Integer, nullable=False))
+    relation: str = Field(sa_column=Column(String(32), nullable=False))
+    to_node_type: str = Field(
+        default="item_version",
+        sa_column=Column(String(32), nullable=False, server_default=text("'item_version'")),
+    )
+    to_node_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    to_version: int = Field(sa_column=Column(Integer, nullable=False))
+    confidence: float = Field(sa_column=Column(Numeric(5, 4), nullable=False))
+    version: int = Field(
+        default=1, sa_column=Column(Integer, nullable=False, server_default=text("1"))
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "from_node_id", "from_version"],
+            [
+                "strategicmemoryitemversion.project_id",
+                "strategicmemoryitemversion.item_id",
+                "strategicmemoryitemversion.version",
+            ],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "to_node_id", "to_version"],
+            [
+                "strategicmemoryitemversion.project_id",
+                "strategicmemoryitemversion.item_id",
+                "strategicmemoryitemversion.version",
+            ],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("from_node_type = 'item_version'", name="ck_smem_edge_from_type"),
+        CheckConstraint("to_node_type = 'item_version'", name="ck_smem_edge_to_type"),
+        CheckConstraint(
+            "relation IN ('supports','contradicts','derived_from','depends_on')",
+            name="ck_smem_edge_relation",
+        ),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_smem_edge_confidence"),
+        CheckConstraint("version >= 1", name="ck_smem_edge_version"),
+        CheckConstraint(
+            "from_node_id <> to_node_id OR from_version <> to_version",
+            name="ck_smem_edge_no_self",
+        ),
+        UniqueConstraint("project_id", "id", name="uq_smem_edge_project_id"),
+        UniqueConstraint(
+            "project_id", "from_node_id", "from_version", "relation", "to_node_id", "to_version", "version",
+            name="uq_smem_edge_versioned_relation",
+        ),
+        Index("ix_smem_edge_project_from", "project_id", "from_node_id", "from_version"),
+        Index("ix_smem_edge_project_to", "project_id", "to_node_id", "to_version"),
+    )
+
+
+class StrategicMemoryEdgeSource(SQLModel, table=True):
+    """Non-cascading provenance link from a typed edge to source evidence."""
+
+    edge_id: uuid.UUID = Field(sa_column=Column(GUID(), primary_key=True, nullable=False))
+    source_id: uuid.UUID = Field(sa_column=Column(GUID(), primary_key=True, nullable=False))
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["project_id", "edge_id"],
+            ["strategicmemoryedge.project_id", "strategicmemoryedge.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "source_id"],
+            ["strategicmemorysource.project_id", "strategicmemorysource.id"],
+        ),
+        Index("ix_smem_edge_source_project_source", "project_id", "source_id"),
+    )
+
+
+class StrategicMemoryProjection(SQLModel, table=True):
+    """Rebuildable current-state cache; ledger rows remain the only truth."""
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), primary_key=True, nullable=False
+        )
+    )
+    ledger_revision: int = Field(sa_column=Column(BigInteger, nullable=False))
+    through_source_sequence: int = Field(sa_column=Column(BigInteger, nullable=False))
+    structured_state: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    canonical_text: str = Field(sa_column=Column(Text, nullable=False))
+    canonical_sha256: str = Field(sa_column=Column(String(64), nullable=False))
+    rebuilt_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        CheckConstraint("ledger_revision >= 0", name="ck_smem_projection_ledger_revision"),
+        CheckConstraint(
+            "through_source_sequence >= 0", name="ck_smem_projection_through_source"
+        ),
+        CheckConstraint("length(canonical_sha256) = 64", name="ck_smem_projection_sha_len"),
+    )
+
+
+_DERIVED_STRATEGIC_PACKET_CONTEXT_KEYS = (
+    "_conversation_consultation_packet",
+    "_workday_consultation_result",
+)
+
+
+def _is_derived_strategic_packet_context(value: object) -> bool:
+    """Whether a message is private derived Workday coordination state.
+
+    These records are not canonical conversation evidence.  Lease bookkeeping
+    mutates their JSON context frequently, and must not impersonate a governed
+    source redaction.  Actual privacy actions scrub them together with every
+    envelope snapshot below.
+    """
+
+    return isinstance(value, Mapping) and any(
+        value.get(key) is True for key in _DERIVED_STRATEGIC_PACKET_CONTEXT_KEYS
+    )
+
+
+def _purge_derived_strategic_context_for_privacy_mutation(
+    session: _OrmSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Synchronously scrub every revocable Strategic derived copy for a project.
+
+    This is deliberately shared by the ORM flush hook and the explicit async
+    privacy helper.  Both paths must erase the snapshot bytes *and* the private
+    Workday packet/result rows, while also making already-held ORM objects safe
+    to inspect during the same request.
+    """
+
+    connection = session.connection()
+    # Raw Core DML does not synchronize the identity map. Erase content before
+    # detaching each loaded derived object so callers cannot recover stale text
+    # from a same-request Python reference after the database delete starts.
+    loaded_snapshots = [
+        loaded
+        for loaded in list(session.identity_map.values())
+        if (
+            isinstance(loaded, StrategicContextEnvelopeSnapshot)
+            and loaded.__dict__.get("project_id") == project_id
+        )
+    ]
+    for loaded in loaded_snapshots:
+        loaded.canonical_envelope = b""
+        loaded.canonical_sha256 = ""
+        loaded.retrieval_trace = {}
+        session.expunge(loaded)
+
+    loaded_private_packets = [
+        loaded
+        for loaded in list(session.identity_map.values())
+        if (
+            isinstance(loaded, ProjectMessage)
+            and loaded.__dict__.get("project_id") == project_id
+            and _is_derived_strategic_packet_context(
+                loaded.__dict__.get("context")
+            )
+        )
+    ]
+    for loaded in loaded_private_packets:
+        loaded.content = ""
+        loaded.context = {}
+        session.expunge(loaded)
+
+    connection.execute(
+        StrategicContextEnvelopeSnapshot.__table__.delete().where(
+            StrategicContextEnvelopeSnapshot.project_id == project_id
+        )
+    )
+    packet_context = ProjectMessage.__table__.c.context
+    connection.execute(
+        ProjectMessage.__table__.delete().where(
+            ProjectMessage.__table__.c.project_id == project_id,
+            or_(
+                packet_context[_DERIVED_STRATEGIC_PACKET_CONTEXT_KEYS[0]]
+                .as_boolean()
+                .is_(True),
+                packet_context[_DERIVED_STRATEGIC_PACKET_CONTEXT_KEYS[1]]
+                .as_boolean()
+                .is_(True),
+            ),
+        )
+    )
+
+
+def _tombstone_project_message_source_receipts_for_privacy_mutation(
+    session: _OrmSession,
+    *,
+    project_id: uuid.UUID,
+    message_id: uuid.UUID,
+    payload_state: str,
+) -> None:
+    """Make source-receipt privacy state explicit before invalidating caches.
+
+    A receipt retains only identity/hash for immutable ProjectMessage content,
+    but it must still say that its native evidence is no longer usable.  The
+    Core update runs in the same native-message transaction as the privacy
+    mutation; it does not delete semantic history or cascade into future
+    ledger tables.  ``deleted`` dominates an earlier ``redacted`` state.
+    """
+
+    if payload_state not in {"redacted", "deleted"}:  # pragma: no cover - caller invariant
+        raise ValueError("ProjectMessage source tombstone must be redacted or deleted")
+    source_table = StrategicMemorySource.__table__
+    predicate = (
+        source_table.c.project_id == project_id,
+        source_table.c.source_type == "project_message",
+        source_table.c.source_key == str(message_id),
+    )
+    if payload_state == "redacted":
+        predicate = (*predicate, source_table.c.payload_state == "active")
+    now = _utcnow()
+    connection = session.connection()
+    affected = connection.execute(
+        select(source_table.c.id, source_table.c.source_sequence).where(*predicate)
+    ).all()
+    # A source that became unavailable before semantic admission is
+    # deterministically non-incorporable, not an eternal pending gap.  Preserve
+    # already-terminal history for the later governed ledger privacy service.
+    disposition_table = StrategicMemorySourceDisposition.__table__
+    job_table = StrategicMemoryConsolidationJob.__table__
+    for source_id, source_sequence in affected:
+        # Any active job whose immutable input range included this receipt is
+        # stale. Mark it dead transactionally; enqueue will advance across the
+        # new terminal disposition and create a fresh range after the gap.
+        connection.execute(
+            job_table.update()
+            .where(
+                job_table.c.project_id == project_id,
+                job_table.c.status.in_(("queued", "running", "retry")),
+                or_(
+                    job_table.c.target_source_id == source_id,
+                    (
+                        (job_table.c.source_start <= source_sequence)
+                        & (job_table.c.source_end >= source_sequence)
+                    ),
+                ),
+            )
+            .values(
+                status="dead",
+                error=f"source_{payload_state}",
+                lease_owner=None,
+                lease_expires_at=None,
+                completed_at=now,
+                updated_at=now,
+            )
+        )
+    # Completion uses Project -> state -> job -> source -> disposition.  The
+    # privacy path follows exactly the same row order to avoid a job/source
+    # cycle during concurrent governed redaction.
+    connection.execute(
+        source_table.update()
+        .where(*predicate)
+        .values(payload_state=payload_state, tombstoned_at=now)
+    )
+    for source_id, _source_sequence in affected:
+        connection.execute(
+            disposition_table.update()
+            .where(
+                disposition_table.c.source_id == source_id,
+                disposition_table.c.status == "pending",
+            )
+            .values(
+                status="no_memory",
+                reason=f"source_{payload_state}",
+                processed_at=now,
+                consolidation_job_id=None,
+            )
+        )
+    # Core DML bypasses identity-map synchronization.  Keep same-request
+    # retrieval from observing an active object after a governed redaction.
+    for loaded in session.identity_map.values():
+        if (
+            isinstance(loaded, StrategicMemorySource)
+            and loaded.__dict__.get("project_id") == project_id
+            and loaded.__dict__.get("source_type") == "project_message"
+            and loaded.__dict__.get("source_key") == str(message_id)
+            and (
+                payload_state == "deleted"
+                or loaded.__dict__.get("payload_state") == "active"
+            )
+        ):
+            loaded.payload_state = payload_state
+            loaded.tombstoned_at = now
+        elif (
+            isinstance(loaded, StrategicMemorySourceDisposition)
+            and any(loaded.__dict__.get("source_id") == row[0] for row in affected)
+            and loaded.__dict__.get("status") == "pending"
+        ):
+            session.expire(loaded)
+        elif (
+            isinstance(loaded, StrategicMemoryConsolidationJob)
+            and loaded.__dict__.get("project_id") == project_id
+            and loaded.__dict__.get("status") in {"queued", "running", "retry"}
+        ):
+            session.expire(loaded)
+
+
+def _lock_project_before_strategic_state_for_flush(
+    session: _OrmSession,
+    project_id: uuid.UUID,
+    *,
+    exclusive: bool = True,
+) -> None:
+    """Enforce the global Project -> strategic-state row lock order."""
+
+    statement = select(Project.id).where(Project.id == project_id)
+    if exclusive:
+        statement = statement.with_for_update()
+    else:
+        # Canonical message allocation already holds this parent row in
+        # KEY SHARE mode. Reusing the same strength avoids a concurrent
+        # KEY SHARE -> UPDATE lock-upgrade deadlock while the strategic-state
+        # row still serializes receipt sequence allocation.
+        statement = statement.with_for_update(read=True, key_share=True)
+    locked = session.connection().execute(
+        statement
+    ).scalar_one_or_none()
+    if locked is None:
+        raise RuntimeError("Strategic state mutation requires an existing Project")
+
+
+def _strategic_memory_state_upsert_for_flush(
+    session: _OrmSession,
+    *,
+    project_id: uuid.UUID,
+    authority_changed: bool,
+    privacy_changed: bool,
+) -> None:
+    """Atomically advance envelope fences from the ORM write boundary.
+
+    Project JSON mutations have many producers.  This hook is intentionally
+    below that API surface: a direct ``project.problem_model = ...`` assignment
+    cannot accidentally leave an old Fast/Workday envelope valid.  PostgreSQL
+    and the SQLite test runtime both provide ON CONFLICT DO UPDATE with atomic
+    ``column = column + 1`` semantics.
+    """
+
+    if not authority_changed and not privacy_changed:
+        return
+    _lock_project_before_strategic_state_for_flush(session, project_id)
+    table = StrategicMemoryProjectState.__table__
+    values = {
+        "project_id": project_id,
+        "context_authority_generation": int(authority_changed),
+        "privacy_generation": int(privacy_changed),
+        "created_at": _utcnow(),
+        "updated_at": _utcnow(),
+    }
+    set_values = {
+        "context_authority_generation": (
+            table.c.context_authority_generation + int(authority_changed)
+        ),
+        "privacy_generation": table.c.privacy_generation + int(privacy_changed),
+        "updated_at": _utcnow(),
+    }
+    connection = session.connection()
+    if connection.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif connection.dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # pragma: no cover - Blueprint supports PostgreSQL; SQLite is tests.
+        raise RuntimeError(
+            "Strategic envelope invalidation requires PostgreSQL or SQLite ON CONFLICT"
+        )
+    statement = dialect_insert(table).values(**values).on_conflict_do_update(
+        index_elements=[table.c.project_id],
+        set_=set_values,
+    )
+    connection.execute(statement)
+    # The upsert is Core SQL rather than an ORM assignment so it is atomic
+    # across independent Resident transactions. Expire an already-loaded state
+    # row in this Session; otherwise a later envelope build could read the
+    # identity-map's pre-increment generation.
+    for loaded in session.identity_map.values():
+        if (
+            isinstance(loaded, StrategicMemoryProjectState)
+            and loaded.__dict__.get("project_id") == project_id
+        ):
+            session.expire(loaded)
+    if privacy_changed:
+        _purge_derived_strategic_context_for_privacy_mutation(session, project_id)
+
+
+@event.listens_for(_OrmSession, "before_flush")
+def _invalidate_strategic_envelopes_for_authority_and_privacy_changes(
+    session: _OrmSession,
+    flush_context: object,
+    instances: object,
+) -> None:
+    """Keep envelope generations transactional with their source mutation.
+
+    Authority changes are the two current Project-owned inputs to the V1
+    envelope: ``problem_model`` and retained legacy
+    ``strategic_memory_notes``.  A ProjectMessage content rewrite/delete is a
+    governed privacy action until the dedicated privacy UI lands, so it bumps
+    the privacy generation and immediately deletes derived snapshots.
+
+    Bulk SQL DML bypasses ORM events by definition.  The only current bulk
+    ProjectMessage delete is the routine-system-message reaper (not canonical
+    conversation evidence); any future privacy delete must use
+    ``bump_privacy_generation_and_purge_context_envelopes`` before bulk DML.
+    """
+
+    from sqlalchemy import inspect as _sa_inspect
+
+    changes: dict[uuid.UUID, tuple[bool, bool]] = {}
+    # Keyed by the immutable native source identity.  Prefer a deletion over a
+    # redaction if both appear in a complex flush.
+    source_tombstones: dict[tuple[uuid.UUID, uuid.UUID], str] = {}
+
+    def mark(
+        project_id: uuid.UUID | None,
+        *,
+        authority: bool = False,
+        privacy: bool = False,
+    ) -> None:
+        if project_id is None:
+            return
+        prior_authority, prior_privacy = changes.get(project_id, (False, False))
+        changes[project_id] = (
+            prior_authority or authority,
+            prior_privacy or privacy,
+        )
+
+    def tombstone_message_source(
+        project_id: uuid.UUID | None,
+        message_id: uuid.UUID | None,
+        *,
+        payload_state: str,
+    ) -> None:
+        if project_id is None or message_id is None:
+            return
+        key = (project_id, message_id)
+        existing = source_tombstones.get(key)
+        if existing != "deleted":
+            source_tombstones[key] = payload_state
+
+    for instance in session.dirty:
+        if isinstance(instance, Project):
+            inspected = _sa_inspect(instance)
+            project_id = (inspected.identity or (None,))[0]
+            if project_id is None:
+                continue
+            authority = any(
+                inspected.attrs[field].history.has_changes()
+                for field in ("problem_model", "strategic_memory_notes")
+            )
+            mark(project_id, authority=authority)
+        elif isinstance(instance, ProjectMessage):
+            inspected = _sa_inspect(instance)
+            # Every mutable value copied into the serialized transcript must
+            # invalidate it.  Include the canonical visibility predicate too:
+            # changing a row from/to the conversation is semantically a
+            # redaction even when its body is unchanged.
+            privacy_fields = (
+                "content",
+                "context",
+                "from_type",
+                "sequence",
+                "surface",
+                "reply_to_message_id",
+            )
+            context_history = inspected.attrs.context.history
+            old_contexts = list(context_history.deleted)
+            remains_private_packet = (
+                _is_derived_strategic_packet_context(instance.__dict__.get("context"))
+                and old_contexts
+                and all(
+                    _is_derived_strategic_packet_context(value)
+                    for value in old_contexts
+                )
+            )
+            if not remains_private_packet and any(
+                inspected.attrs[field].history.has_changes()
+                for field in privacy_fields
+            ):
+                mark(instance.__dict__.get("project_id"), privacy=True)
+                tombstone_message_source(
+                    instance.__dict__.get("project_id"),
+                    (inspected.identity or (None,))[0] or instance.__dict__.get("id"),
+                    payload_state="redacted",
+                )
+            if inspected.attrs.project_id.history.has_changes():
+                # Project reassignment is unusual but must not retain this
+                # message in either the source or destination project's cache.
+                mark(instance.__dict__.get("project_id"), privacy=True)
+                for previous_project_id in inspected.attrs.project_id.history.deleted:
+                    mark(previous_project_id, privacy=True)
+                    tombstone_message_source(
+                        previous_project_id,
+                        (inspected.identity or (None,))[0] or instance.__dict__.get("id"),
+                        payload_state="redacted",
+                    )
+
+    for instance in session.deleted:
+        if isinstance(instance, ProjectMessage):
+            # ORM deletion is the conservative governed privacy path.  Routine
+            # bulk pruning remains explicitly documented above.
+            if not _is_derived_strategic_packet_context(
+                instance.__dict__.get("context")
+            ):
+                mark(instance.__dict__.get("project_id"), privacy=True)
+                tombstone_message_source(
+                    instance.__dict__.get("project_id"),
+                    instance.__dict__.get("id"),
+                    payload_state="deleted",
+                )
+
+    # Acquire the canonical Project -> state locks before touching jobs,
+    # sources, or dispositions. Any failure rolls the entire privacy mutation
+    # and cache invalidation transaction back.
+    for project_id in sorted(changes, key=str):
+        authority, privacy = changes[project_id]
+        _strategic_memory_state_upsert_for_flush(
+            session,
+            project_id=project_id,
+            authority_changed=authority,
+            privacy_changed=privacy,
+        )
+    for project_id, message_id in sorted(
+        source_tombstones, key=lambda key: (str(key[0]), str(key[1]))
+    ):
+        payload_state = source_tombstones[(project_id, message_id)]
+        _tombstone_project_message_source_receipts_for_privacy_mutation(
+            session,
+            project_id=project_id,
+            message_id=message_id,
+            payload_state=payload_state,
+        )
+
+
+def _next_strategic_memory_source_sequence_for_flush(
+    session: _OrmSession,
+    *,
+    project_id: uuid.UUID,
+) -> int:
+    """Atomically reserve one receipt sequence inside the enclosing flush.
+
+    Source receipts are allowed to interleave between live and backfill
+    producers, but no two commits may receive the same per-project sequence.
+    The state row doubles as the allocation fence; this keeps the receipt and
+    watermark mutation in the same transaction as the native source write.
+    """
+
+    _lock_project_before_strategic_state_for_flush(
+        session,
+        project_id,
+        exclusive=False,
+    )
+    table = StrategicMemoryProjectState.__table__
+    connection = session.connection()
+    if connection.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif connection.dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # pragma: no cover - Blueprint supports PostgreSQL; SQLite is tests.
+        raise RuntimeError(
+            "Strategic memory receipt allocation requires PostgreSQL or SQLite ON CONFLICT"
+        )
+    now = _utcnow()
+    statement = (
+        dialect_insert(table)
+        .values(
+            project_id=project_id,
+            source_high_watermark=1,
+            incorporated_source_sequence=0,
+            created_at=now,
+            updated_at=now,
+        )
+        .on_conflict_do_update(
+            index_elements=[table.c.project_id],
+            set_={
+                "source_high_watermark": table.c.source_high_watermark + 1,
+                "updated_at": now,
+            },
+        )
+        .returning(table.c.source_high_watermark)
+    )
+    allocated = connection.execute(statement).scalar_one()
+    for loaded in session.identity_map.values():
+        if (
+            isinstance(loaded, StrategicMemoryProjectState)
+            and loaded.__dict__.get("project_id") == project_id
+        ):
+            session.expire(loaded)
+    return int(allocated)
+
+
+def _stage_strategic_memory_source_for_flush(
+    session: _OrmSession,
+    *,
+    project_id: uuid.UUID,
+    source_type: str,
+    source_key: str,
+    source_revision: str,
+    content_hash: str,
+    native_sequence: int | None,
+    occurred_at: datetime,
+    actor_kind: str | None,
+    actor_id: str | None,
+    resident_session_id: str | None = None,
+    source_metadata: Dict[str, Any] | None = None,
+    canonical_payload: bytes | None = None,
+) -> None:
+    """Add one pending receipt/disposition pair to the current transaction.
+
+    This helper is deliberately narrow and synchronous so canonical ORM
+    writers cannot commit source evidence without a durable receipt.  Services
+    that ingest non-ORM/backfill producers use their own asynchronous contract
+    but must preserve the same unique receipt key and state allocator rules.
+    """
+
+    source = StrategicMemorySource(
+        project_id=project_id,
+        source_sequence=_next_strategic_memory_source_sequence_for_flush(
+            session, project_id=project_id
+        ),
+        native_sequence=native_sequence,
+        ingestion_origin="live",
+        source_type=source_type,
+        source_key=source_key,
+        source_revision=source_revision,
+        content_hash=content_hash,
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+        occurred_at=occurred_at,
+        recorded_at=_utcnow(),
+        resident_session_id=resident_session_id,
+        source_metadata=source_metadata or {},
+        canonical_payload=canonical_payload,
+    )
+    session.add(source)
+    session.add(StrategicMemorySourceDisposition(source_id=source.id, status="pending"))
+
+
+def _canonical_problem_model_payload(value: object) -> bytes:
+    """Reuse the receipt service's one canonical JSON implementation lazily.
+
+    ``strategic_memory_sources`` imports models for its ORM contracts, so this
+    import must stay inside the flush-time helper.  By then model import is
+    complete and both live ORM writes and non-ORM/backfill receipts use the
+    exact same strict number/key serialization rules.
+    """
+
+    from app.strategic_memory_sources import canonical_json_bytes
+
+    return canonical_json_bytes(value)
+
+
+def _current_context_authority_generation_for_flush(
+    session: _OrmSession,
+    *,
+    project_id: uuid.UUID,
+) -> int:
+    """Read the generation advanced by the preceding authority flush hook."""
+
+    value = session.connection().execute(
+        select(StrategicMemoryProjectState.context_authority_generation).where(
+            StrategicMemoryProjectState.project_id == project_id
+        )
+    ).scalar_one_or_none()
+    if value is None:
+        raise RuntimeError("Problem-model receipt requires an authority generation")
+    return int(value)
+
+
+@event.listens_for(_OrmSession, "before_flush")
+def _dual_write_strategic_memory_receipts_from_canonical_orm_writers(
+    session: _OrmSession,
+    flush_context: object,
+    instances: object,
+) -> None:
+    """Capture canonical live message/problem-model evidence transactionally.
+
+    New ProjectMessages with a canonical sequence are source evidence on both
+    activity and conversation surfaces.  Derived private Workday packets are
+    execution coordination, not source evidence, and therefore remain
+    excluded.  Legacy unsequenced writers are deliberately not silently
+    upgraded here: they must first enter the canonical sequence path, rather
+    than receive a fabricated source revision.
+
+    The listener has no best-effort exception swallowing.  If receipt
+    allocation fails, the native write fails too, preventing silent memory
+    loss.  Later deterministic classification may mark a receipt no_memory;
+    evidence capture itself is never model-gated.
+    """
+
+    from sqlalchemy import inspect as _sa_inspect
+
+    for instance in list(session.new):
+        if not isinstance(instance, ProjectMessage):
+            continue
+        values = instance.__dict__
+        if _is_derived_strategic_packet_context(values.get("context")):
+            continue
+        project_id = values.get("project_id")
+        sequence = values.get("sequence")
+        message_id = values.get("id")
+        if project_id is None or message_id is None:
+            raise RuntimeError("Canonical ProjectMessage receipt requires project_id and id")
+        # A null sequence identifies a legacy/noncanonical writer.  It is not
+        # valid evidence identity, so fail closed only for explicitly marked
+        # canonical messages; the mixed-version migration window otherwise
+        # remains readable until those writers are converted.
+        if sequence is None:
+            if values.get("surface") == MessageSurface.CONVERSATION:
+                raise RuntimeError("Canonical ProjectMessage receipt requires a positive sequence")
+            continue
+        sequence_int = int(sequence)
+        if sequence_int < 1:
+            raise RuntimeError("Canonical ProjectMessage receipt requires a positive sequence")
+        content = values.get("content") or ""
+        content_bytes = str(content).encode("utf-8")
+        _stage_strategic_memory_source_for_flush(
+            session,
+            project_id=project_id,
+            source_type="project_message",
+            source_key=str(message_id),
+            source_revision=str(sequence_int),
+            content_hash=hashlib.sha256(content_bytes).hexdigest(),
+            native_sequence=sequence_int,
+            occurred_at=values.get("created_at") or _utcnow(),
+            actor_kind=values.get("from_type"),
+            actor_id=values.get("actor_user_id"),
+            resident_session_id=values.get("resident_session_id"),
+            source_metadata={
+                "surface": (
+                    (values.get("surface") or MessageSurface.ACTIVITY).value
+                    if isinstance(
+                        values.get("surface") or MessageSurface.ACTIVITY,
+                        MessageSurface,
+                    )
+                    else str(values.get("surface") or MessageSurface.ACTIVITY.value)
+                )
+            },
+        )
+
+    for instance in list(session.dirty):
+        if not isinstance(instance, Project):
+            continue
+        inspected = _sa_inspect(instance)
+        if not inspected.attrs.problem_model.history.has_changes():
+            continue
+        project_id = (inspected.identity or (None,))[0]
+        if project_id is None:
+            raise RuntimeError("Problem-model receipt requires a persistent project identity")
+        # Stable JSON bytes are the canonical immutable payload for this
+        # mutable Project column; content_hash and source_revision are both
+        # derived from exactly those bytes.
+        canonical_payload = _canonical_problem_model_payload(
+            instance.__dict__.get("problem_model") or {}
+        )
+        payload_hash = hashlib.sha256(canonical_payload).hexdigest()
+        # The authority-generation value is monotonic even if an operator
+        # changes a model and later restores byte-identical content.  The
+        # receipt key therefore remains a temporal revision, while the hash
+        # still identifies exactly what bytes were observed.
+        context_generation = _current_context_authority_generation_for_flush(
+            session, project_id=project_id
+        )
+        _stage_strategic_memory_source_for_flush(
+            session,
+            project_id=project_id,
+            source_type="problem_model_revision",
+            source_key=str(project_id),
+            source_revision=str(context_generation),
+            content_hash=payload_hash,
+            native_sequence=None,
+            occurred_at=_utcnow(),
+            actor_kind="system",
+            actor_id=None,
+            source_metadata={"field": "problem_model"},
+            canonical_payload=canonical_payload,
+        )
 
 
 class ProjectMessageAttachmentUpload(SQLModel, table=True):

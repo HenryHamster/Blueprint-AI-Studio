@@ -12,8 +12,6 @@ const role = process.env.CALL_RESIDENT_ROLE || '';
 const receiptPath = process.env.CALL_TURN_RECEIPT_PATH || '';
 const stageDir = process.env.CALL_LOCAL_STAGE_DIR || '';
 const MAX_BYTES = 65_536;
-const FAST_TOOLS = ['complete_turn', 'request_workday', 'show_display_blocks'];
-const WORKDAY_TOOLS = ['emit_call_packet'];
 
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 function error(id, text) { send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: true } }); }
@@ -35,10 +33,20 @@ function regularJson(filename, label) {
   } finally { fs.closeSync(fd); }
 }
 function activeReceipt() {
-  const receipt = regularJson(receiptPath, 'call turn receipt');
-  if (!object(receipt) || typeof receipt.call_id !== 'string' || !Number.isSafeInteger(receipt.call_generation)
-    || !Number.isSafeInteger(receipt.input_revision) || typeof receipt.idempotency_key !== 'string') {
-    throw new Error('invalid call turn receipt');
+  const receipt = regularJson(receiptPath, 'foreground turn receipt');
+  const callReceipt = role === 'fast'
+    && typeof receipt.call_id === 'string'
+    && Number.isSafeInteger(receipt.call_generation)
+    && Number.isSafeInteger(receipt.input_revision)
+    && typeof receipt.idempotency_key === 'string';
+  const typedReceipt = role === 'typed'
+    && typeof receipt.claim_id === 'string'
+    && Array.isArray(receipt.message_ids)
+    && receipt.message_ids.length > 0
+    && receipt.message_ids.every((id) => typeof id === 'string' && id)
+    && typeof receipt.idempotency_key === 'string';
+  if (!object(receipt) || (!callReceipt && !typedReceipt)) {
+    throw new Error('invalid foreground turn receipt');
   }
   return receipt;
 }
@@ -55,6 +63,10 @@ function stage(kind, value, identity) {
   } finally { try { fs.unlinkSync(temporary); } catch {} }
 }
 function definitions() {
+  if (role === 'typed') return [
+    { name: 'complete_turn', description: 'Complete the active public typed turn using its receipt.', inputSchema: { type: 'object', properties: { spoken_text: { type: 'string' }, durable: { type: 'boolean' } }, required: ['spoken_text'], additionalProperties: false } },
+    { name: 'request_workday', description: 'Request durable private Workday reasoning while Fast still completes this turn.', inputSchema: { type: 'object', properties: { request_id: { type: 'string' }, prompt: { type: 'string' } }, required: ['request_id', 'prompt'], additionalProperties: false } },
+  ];
   if (role === 'fast') return [
     { name: 'complete_turn', description: 'Complete the active public call turn using its receipt.', inputSchema: { type: 'object', properties: { spoken_text: { type: 'string' }, exact_text: { type: 'string' }, display_blocks: { type: 'array' }, durable: { type: 'boolean' } }, required: ['spoken_text'], additionalProperties: false } },
     { name: 'request_workday', description: 'Request private Workday reasoning. This does not speak or grant authority.', inputSchema: { type: 'object', properties: { request_id: { type: 'string' }, prompt: { type: 'string' } }, required: ['request_id', 'prompt'], additionalProperties: false } },
@@ -70,14 +82,22 @@ function handleCall(id, params) {
   try {
     if (name === 'complete_turn') {
       const receipt = activeReceipt();
-      const completion = { receipt, spoken_text: nonEmpty(args.spoken_text, 'spoken_text'), exact_text: args.exact_text === undefined ? undefined : nonEmpty(args.exact_text, 'exact_text'), display_blocks: args.display_blocks, durable: args.durable !== false };
+      const completion = role === 'typed'
+        ? { receipt, content: nonEmpty(args.spoken_text, 'content'), durable: args.durable !== false }
+        : { receipt, spoken_text: nonEmpty(args.spoken_text, 'spoken_text'), exact_text: args.exact_text === undefined ? undefined : nonEmpty(args.exact_text, 'exact_text'), display_blocks: args.display_blocks, durable: args.durable !== false };
       stage('complete', completion, receipt.idempotency_key);
-      return text(id, 'Call completion accepted for Coordinator validation.');
+      return text(id, role === 'typed'
+        ? 'Conversation completion accepted for Coordinator validation.'
+        : 'Call completion accepted for Coordinator validation.');
     }
     if (name === 'request_workday') {
-      const request = { request_id: nonEmpty(args.request_id, 'request_id', 256), prompt: nonEmpty(args.prompt, 'prompt'), receipt: activeReceipt() };
-      stage('request', request, request.request_id);
-      return text(id, 'Private Workday request accepted for Coordinator validation.');
+      const request = role === 'typed'
+        ? { delivery_key: nonEmpty(args.request_id, 'delivery_key', 256), prompt: nonEmpty(args.prompt, 'prompt'), receipt: activeReceipt() }
+        : { request_id: nonEmpty(args.request_id, 'request_id', 256), prompt: nonEmpty(args.prompt, 'prompt'), receipt: activeReceipt() };
+      stage('request', request, role === 'typed' ? request.delivery_key : request.request_id);
+      return text(id, role === 'typed'
+        ? 'Workday consultation request accepted for Coordinator validation.'
+        : 'Private Workday request accepted for Coordinator validation.');
     }
     if (name === 'show_display_blocks') {
       if (!Array.isArray(args.display_blocks) || args.display_blocks.length > 8) throw new Error('invalid display_blocks');

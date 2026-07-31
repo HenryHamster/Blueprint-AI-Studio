@@ -150,7 +150,11 @@ from app.storage import (
     generate_download_signed_url,
     storage as gcs_storage,
 )
-from app.message_audience import stamp_message_audience, STRATEGIST_INTERNAL, PIPELINE_LOG
+from app.message_audience import stamp_message_audience
+from app.strategic_conversation_query import (
+    query_strategic_conversation,
+    strategic_conversation_predicate,
+)
 from app.strategic_resident_session import (
     _ResidentEnsureModeChanged,
     acquire_resident_call_lease,
@@ -1217,32 +1221,9 @@ _SESSION_OUTPUT_LIMIT = 8
 
 
 def _session_conversation_predicate():
-    # A Strategic sender is not, by itself, proof that a row belongs in the
-    # operator transcript: internal bookkeeping is also strategist-authored.
-    # New replies carry an explicit immutable role. The reply FK and resident
-    # covered-message receipt retain only provable legacy replies.
-    _non_operator = [STRATEGIST_INTERNAL, PIPELINE_LOG]
-    _proven_operator_reply = and_(
-        ProjectMessage.from_type == "strategic",
-        or_(
-            ProjectMessage.context["message_role"].as_string() == "operator_reply",
-            ProjectMessage.context["event_type"].as_string() == "strategic_message",
-            ProjectMessage.reply_to_message_id.isnot(None),
-            ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
-        ),
-    )
-    return and_(
-        ProjectMessage.surface == MessageSurface.CONVERSATION,
-        or_(
-            ProjectMessage.context["event_type"].as_string().is_(None),
-            ProjectMessage.context["event_type"].as_string() != _CHECK_IN_EVENT_TYPE,
-        ),
-        or_(
-            _proven_operator_reply,
-            ProjectMessage.context["audience"].as_string().is_(None),
-            ~ProjectMessage.context["audience"].as_string().in_(_non_operator),
-        ),
-    )
+    """Compatibility alias while the shared read facade becomes canonical."""
+
+    return strategic_conversation_predicate()
 
 
 def _message_preview(
@@ -1383,100 +1364,16 @@ async def _recent_session_conversation(
     search: str | None = None,
     stamp_delivery: bool = False,
 ) -> Dict[str, Any]:
-    base_conditions: list[Any] = [
-        ProjectMessage.project_id == project_id,
-        _session_conversation_predicate(),
-    ]
-    if search:
-        escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        base_conditions.append(ProjectMessage.content.ilike(f"%{escaped}%", escape="\\"))
-    included_message: ProjectMessage | None = None
-    if include_message_id is not None:
-        included_message = (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.id == include_message_id,
-                    *base_conditions,
-                )
-            )
-        ).scalars().first()
-        # Silently ignore cross-project or deleted messages — 404 would leak existence.
-
-    if included_message is not None and included_message.sequence is not None:
-        before_count = limit // 2
-        after_count = max(0, limit - before_count - 1)
-        before_rows = (
-            await session.execute(
-                select(ProjectMessage)
-                .where(*base_conditions, ProjectMessage.sequence < included_message.sequence)
-                .order_by(ProjectMessage.sequence.desc())
-                .limit(before_count)
-            )
-        ).scalars().all()
-        after_rows = (
-            await session.execute(
-                select(ProjectMessage)
-                .where(*base_conditions, ProjectMessage.sequence > included_message.sequence)
-                .order_by(ProjectMessage.sequence.asc())
-                .limit(after_count)
-            )
-        ).scalars().all()
-        # Fill an uneven edge from the other side while preserving the limit.
-        missing = limit - (len(before_rows) + 1 + len(after_rows))
-        if missing and len(before_rows) < before_count:
-            after_rows = (
-                await session.execute(
-                    select(ProjectMessage)
-                    .where(*base_conditions, ProjectMessage.sequence > included_message.sequence)
-                    .order_by(ProjectMessage.sequence.asc())
-                    .limit(after_count + missing)
-                )
-            ).scalars().all()
-        elif missing and len(after_rows) < after_count:
-            before_rows = (
-                await session.execute(
-                    select(ProjectMessage)
-                    .where(*base_conditions, ProjectMessage.sequence < included_message.sequence)
-                    .order_by(ProjectMessage.sequence.desc())
-                    .limit(before_count + missing)
-                )
-            ).scalars().all()
-        visible_rows = [*reversed(before_rows), included_message, *after_rows]
-        first_sequence = visible_rows[0].sequence
-        has_more = bool(
-            first_sequence is not None
-            and await session.scalar(
-                select(ProjectMessage.id)
-                .where(*base_conditions, ProjectMessage.sequence < first_sequence)
-                .limit(1)
-            )
-        )
-    elif after_sequence is not None:
-        rows = (
-            await session.execute(
-                select(ProjectMessage)
-                .where(*base_conditions, ProjectMessage.sequence > after_sequence)
-                .order_by(ProjectMessage.sequence.asc())
-                .limit(limit + 1)
-            )
-        ).scalars().all()
-        has_more = len(rows) > limit
-        visible_rows = rows[:limit]
-    else:
-        stmt = select(ProjectMessage).where(*base_conditions)
-        if before_sequence is not None:
-            stmt = stmt.where(ProjectMessage.sequence < before_sequence)
-        rows = (
-            await session.execute(
-                stmt.order_by(
-                    ProjectMessage.sequence.desc().nullslast(),
-                    ProjectMessage.created_at.desc(),
-                    ProjectMessage.id.desc(),
-                ).limit(limit + 1)
-            )
-        ).scalars().all()
-        has_more = len(rows) > limit
-        visible_rows = list(reversed(rows[:limit]))
+    page = await query_strategic_conversation(
+        session,
+        project_id,
+        include_message_id=include_message_id,
+        before_sequence=before_sequence,
+        after_sequence=after_sequence,
+        limit=limit,
+        search=search,
+    )
+    visible_rows = list(page.rows)
 
     if stamp_delivery:
         _now = _utcnow()
@@ -1497,19 +1394,12 @@ async def _recent_session_conversation(
         limit=48,
     )
     return {
-        "limit": limit,
-        "has_more": has_more,
-        "next_before_sequence": (
-            visible_rows[0].sequence
-            if has_more and visible_rows and visible_rows[0].sequence is not None
-            else None
-        ),
-        "next_after_sequence": (
-            visible_rows[-1].sequence
-            if after_sequence is not None and visible_rows
-            else None
-        ),
-        "order": "oldest_first",
+        "limit": page.limit,
+        "has_more": page.has_more,
+        "next_before_sequence": page.next_before_sequence,
+        "next_after_sequence": page.next_after_sequence,
+        "target_found": page.target_found,
+        "order": page.order,
         "items": [
             _message_preview(
                 message,
@@ -2889,16 +2779,20 @@ async def get_project_strategic_conversation(
     )
     lookup_key = (client_idempotency_key or idempotency_key or "").strip() or None
     search = (search or "").strip() or None
-    if search and (include_message_id is not None or lookup_key):
+    if search and (
+        include_message_id is not None
+        or lookup_key
+        or after_sequence is not None
+    ):
         raise HTTPException(
             status_code=400,
-            detail="search cannot be combined with a targeted message lookup",
+            detail="search cannot be combined with target, identity, or after",
         )
     if client_idempotency_key and idempotency_key and client_idempotency_key != idempotency_key:
         raise HTTPException(status_code=400, detail="Conflicting idempotency identities")
     selectors = sum(
         value is not None
-        for value in (before_sequence, after_sequence, include_message_id, lookup_key, search)
+        for value in (before_sequence, after_sequence, include_message_id, lookup_key)
     )
     if selectors > 1:
         raise HTTPException(

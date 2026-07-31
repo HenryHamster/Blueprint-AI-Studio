@@ -559,6 +559,7 @@ _CATALOG_FIELDS = {
     "requires_code",
     "requires_web",
     "requires_compute",
+    "workspace_requirement",
     "evaluation_strategy",
     "cost_ceiling_usd",
 }
@@ -587,6 +588,7 @@ def test_task_type_catalog_covers_every_capability_with_all_fields():
         assert isinstance(entry["requires_code"], bool)
         assert isinstance(entry["requires_web"], bool)
         assert isinstance(entry["requires_compute"], bool)
+        assert entry["workspace_requirement"] in {"repo", "none"}
         assert entry["cost_ceiling_usd"] is None or isinstance(
             entry["cost_ceiling_usd"], (int, float)
         )
@@ -631,6 +633,7 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "evaluation_strategy": "none",
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
+        "workspace_requirement": "repo",
     }
 
 

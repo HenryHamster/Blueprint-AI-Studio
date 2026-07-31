@@ -2155,6 +2155,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
+    # Resident-only Fast activation is a tiny server-owned launch contract.
+    # It must survive packing because the runner starts from this payload.
+    "typed_fast_enabled": {"priority": "critical"},
+    "typed_fast_models": {"priority": "critical", "exempt": True},
+    "typed_fast_effort": {"priority": "critical"},
+    "typed_fast_qualification": {"priority": "critical"},
     # Trim-proof authoritative direction counts (true active/paused/total computed
     # before any trimming) and the operator's real max-active ceiling. Critical
     # tier with no summarize_fn: tiny scalars the packer ships verbatim, so the
@@ -5416,6 +5422,7 @@ async def _spawn_strategic_review(
     preferred_runner_target_id: str | None = None,
     local_runner_context: dict[str, Any] | None = None,
     extra_context: dict[str, Any] | None = None,
+    extra_payload: dict[str, Any] | None = None,
     resident_minimal: bool = False,
     runner_pin_id: str | None = None,
     *,
@@ -5435,6 +5442,11 @@ async def _spawn_strategic_review(
     over the context this function derives, so an explicit ``extra_context``
     value wins on any key collision (e.g. the local-runner pin), leaving
     runner-pin semantics identical to stamping it a beat later.
+
+    ``extra_payload`` is the equivalent birth-time contract for the task's
+    first payload. It is reserved for the minimal Resident spawn path: the
+    task reaches a warm runner already carrying the foreground capability
+    configuration, rather than relying on a runner-local environment toggle.
 
     ``operator_steered`` carries the operator-origin signal forward when this
     spawn is the Phase 2 tail of an architecture cycle. On that path the
@@ -5483,6 +5495,9 @@ async def _spawn_strategic_review(
     except LegacyEngineAuthorityExpired:
         await session.rollback()
         return False
+
+    if extra_payload and not resident_minimal:
+        raise ValueError("extra_payload is reserved for resident_minimal strategic spawns")
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -5690,6 +5705,7 @@ async def _spawn_strategic_review(
                     # index (newest 25, body-omitted) so the resident agent gets
                     # the same format as spawned agents.
                     "strategic_memory_notes": await build_strategic_memory_index(session, project.id),
+                    **(extra_payload or {}),
                     # Gaps whose history entries warrant compaction — surfaced
                     # directly in the payload so the strategist sees an automatic
                     # signal without manual inspection. Pure in-memory computation.

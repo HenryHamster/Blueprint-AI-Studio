@@ -2,7 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-export type CallResidentToolRole = 'fast' | 'workday';
+/**
+ * `typed` deliberately shares the same local-only process with call Fast, but
+ * carries a different receipt shape.  It is not a transport or a network
+ * client: the parent Coordinator remains the only component that can commit a
+ * public message or enqueue Workday work.
+ */
+export type CallResidentToolRole = 'fast' | 'typed' | 'workday';
 
 export interface CallResidentToolPaths {
   stageDir: string;
@@ -24,7 +30,9 @@ export function provisionCallResidentTool(
   role: CallResidentToolRole,
   paths: CallResidentToolPaths,
 ): ProvisionedCallResidentTool {
-  if (role === 'fast' && !paths.receiptPath) throw new Error('Fast call tool requires a turn receipt path');
+  if ((role === 'fast' || role === 'typed') && !paths.receiptPath) {
+    throw new Error('Fast foreground tool requires a turn receipt path');
+  }
   fs.mkdirSync(paths.stageDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(paths.stageDir, 0o700);
   const scriptPath = path.join(workspace, '.call-resident-mcp.mjs');
@@ -33,7 +41,9 @@ export function provisionCallResidentTool(
   fs.chmodSync(scriptPath, 0o700);
   const toolNames = role === 'fast'
     ? ['mcp__call__complete_turn', 'mcp__call__request_workday', 'mcp__call__show_display_blocks']
-    : ['mcp__call__emit_call_packet'];
+    : role === 'typed'
+      ? ['mcp__call__complete_turn', 'mcp__call__request_workday']
+      : ['mcp__call__emit_call_packet'];
   fs.writeFileSync(configPath, JSON.stringify({
     mcpServers: {
       call: {

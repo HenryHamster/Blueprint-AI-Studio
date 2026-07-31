@@ -40,6 +40,8 @@ vi.mock('./strategic-resident.js', () => ({
   CALL_OPERATOR_RECONNECT_GRACE_MS: 30_000,
   handleStrategicResident: vi.fn().mockResolvedValue(undefined),
   residentReplyRuntimePaths: vi.fn(),
+  partitionTypedFastMessages: vi.fn(),
+  selectTypedFastClaimMessages: vi.fn(),
 }));
 
 vi.mock('./audits.js', () => ({
@@ -418,6 +420,7 @@ const TASK_CLASS_MAP = {
   capability_proof_trial:  'read-only',
   criterion_coverage_trial: 'read-only',
   walkthrough_e2e:       'read-only',
+  memory_consolidation:  'read-only',
   // Research / planning (7): read-heavy, no code shipped
   plan:              'research',
   research:          'research',

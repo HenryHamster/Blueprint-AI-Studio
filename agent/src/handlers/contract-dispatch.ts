@@ -26,6 +26,7 @@ export interface PublishedTaskCapabilityContract {
   requires_code?: boolean;
   requires_web?: boolean;
   requires_compute?: boolean;
+  workspace_requirement?: string;
   evaluation_strategy?: string;
   cost_ceiling_usd?: number | null;
   run_shape?: string;

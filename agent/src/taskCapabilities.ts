@@ -48,6 +48,7 @@ export const AGENT_TASK_TYPE_IDS = [
   'salvage_bundle',
   'capability_proof_trial',
   'criterion_coverage_trial',
+  'memory_consolidation',
 ] as const;
 
 export type AgentTaskType = (typeof AGENT_TASK_TYPE_IDS)[number];

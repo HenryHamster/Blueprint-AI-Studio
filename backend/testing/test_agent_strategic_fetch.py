@@ -20,6 +20,8 @@ from app.models import (
     AuditFindingResolution,
     ComputeJob,
     ComputeJobStatus,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     Project,
     ProjectMember,
@@ -3683,6 +3685,8 @@ async def test_strategic_resolve_question_posts_answer_note(
         from_type="user",
         content="What is the current approach?",
         status="open",
+        surface=MessageSurface.CONVERSATION,
+        sequence=1,
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
@@ -3729,6 +3733,8 @@ async def test_strategic_resolve_question_posts_answer_note(
     assert len(matching) == 1, f"Expected 1 question_answer NOTE, got {len(matching)}"
     await db_session.refresh(msg)
     reply_msg = matching[0]
+    assert reply_msg.status == "resolved"
+    assert reply_msg.handling_state == MessageHandlingState.RESPONDED
     assert broadcast.await_count == 2
     update_call, create_call = broadcast.await_args_list
     project_id, event, payload = update_call.args
@@ -3749,7 +3755,7 @@ async def test_strategic_resolve_question_posts_answer_note(
         project=project,
         msg=reply_msg,
         action="created",
-        status="open",
+        status="resolved",
     )
 
 
@@ -5681,9 +5687,13 @@ async def test_agent_fetch_payload_section_self_reflection_log(
 
 @pytest.mark.asyncio
 async def test_agent_fetch_payload_section_rejected_proposals(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Generic /sections endpoint returns only recent (within 30d) rejected directions."""
+    mocker.patch(
+        "app.time_utils._utcnow",
+        return_value=datetime(2026, 7, 5, tzinfo=timezone.utc),
+    )
     project = Project(
         name="Rejected Props Test",
         user_id="test-user-sf-rp",
@@ -5710,7 +5720,7 @@ async def test_agent_fetch_payload_section_rejected_proposals(
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "success"
-    # Only the recent (within 30d of 2026-07-05) rejected direction appears
+    # Only the recent (within 30d of the frozen 2026-07-05) rejected direction appears
     assert len(body["data"]) == 1
     assert body["data"][0]["text"] == "Recent rejected"
 

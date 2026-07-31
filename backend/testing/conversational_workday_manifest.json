@@ -255,7 +255,9 @@
         "test_call_start_rejects_provider_without_qualified_foreground_adapter",
         "test_nested_call_projection_hides_actor_account_and_playout_receipts",
         "test_ready_call_renewal_is_capped_at_absolute_duration",
-        "test_recovery_carries_rate_limit_denylist_but_not_failed_runtime_identity"
+        "test_recovery_carries_rate_limit_denylist_but_not_failed_runtime_identity",
+        "test_typed_fast_capacity_denial_persists_no_lease_for_workday_fallback",
+        "test_typed_fast_lease_is_fenced_renewed_and_released"
       ]
     },
     {
@@ -331,7 +333,14 @@
         "retries a failed initial heartbeat before polling or starting provider work",
         "revalidates an authority proof that ages out during workspace preparation",
         "revalidates an existing claim before retrying the provider turn",
-        "waits through retryable legacy grace without publishing loser helpers"
+        "waits through retryable legacy grace without publishing loser helpers",
+        "acquires the fenced slot before readiness and releases it on normal shutdown",
+        "closes a lease-lost Fast controller and uses Workday for the next tagged message",
+        "falls back to the normal Workday responder when capacity denies Fast before launch",
+        "releases the exact lease after a failed readiness probe without starting a Fast turn",
+        "retries only M1 when a later page contains M1 plus M2",
+        "sends only the backend-marked canonical user subset to Fast",
+        "uses the retained M1 input while its stable claim is leased"
       ]
     },
     {

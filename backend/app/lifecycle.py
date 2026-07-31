@@ -1772,6 +1772,15 @@ async def lifespan(app):
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
+    # Receipt capture is synchronous with its native writers; this separate,
+    # leader-only bounded tick only turns already-durable pending prefixes into
+    # debounced no-workspace pool Tasks. It is rollout-gated inside the service.
+    from app.strategic_memory_runtime import memory_consolidation_dispatch_service
+
+    memory_consolidation_dispatch_task = asyncio.create_task(
+        memory_consolidation_dispatch_service(AsyncSessionLocal)
+    )
+
     # Per-instance credential sweep — clears resolved Secret Manager secrets
     # from idle accounts every 5 minutes, bounding in-process credential dwell
     # time.  Re-fetches on next select_max_plan_account call.
@@ -1834,6 +1843,7 @@ async def lifespan(app):
     from app.shared_state import background_tasks as _bg_tasks
 
     _bg_tasks["orchestrator"] = orchestrator_task
+    _bg_tasks["memory_consolidation_dispatch"] = memory_consolidation_dispatch_task
     _bg_tasks["credential_sweep"] = credential_sweep_task
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
@@ -1870,6 +1880,7 @@ async def lifespan(app):
         cancel_reasons: Dict[str, str] = {}
         task_factories = {
             "orchestrator": orchestrator_worker,
+            "memory_consolidation_dispatch": lambda: memory_consolidation_dispatch_service(AsyncSessionLocal),
             "reaper": reaper_service,
             "gcp_cleanup": gcp_cleanup_service,
             "artifact_ref_lifecycle": artifact_ref_lifecycle_service,

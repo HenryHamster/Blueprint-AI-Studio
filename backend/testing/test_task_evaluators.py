@@ -91,6 +91,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "capability_proof_trial": "none",
         "criterion_coverage_trial": "none",
         "walkthrough_e2e": "none",
+        "memory_consolidation": "none",
     }
 
 

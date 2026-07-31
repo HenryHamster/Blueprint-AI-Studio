@@ -935,6 +935,7 @@ def _seed_strategic_intent(
         ) from None
     pm.intent.purpose = goal
     pm.intent.current_focus = goal
+    pm.intent.user_purpose = goal
     pm.intent.source = Source(
         type="user_message", message_id=str(message.id), excerpt=goal[:120]
     )
