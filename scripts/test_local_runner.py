@@ -5534,7 +5534,11 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
-                              side_effect=["v25-1-g4f5a6b7", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"]), \
+                              side_effect=[
+                                  "v25-1-g4f5a6b7",
+                                  "v25-1-g4f5a6b7",
+                                  "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+                              ]), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
@@ -5566,8 +5570,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
         reexec_mock.assert_called_once()
 
-    def test_noop_auto_update_keeps_newer_checkout_running(self):
-        """An ancestry-converged newer checkout must not re-exec-loop."""
+    def test_detached_newer_checkout_skips_auto_update(self):
+        """An ancestry-converged detached checkout must not invoke its updater."""
         output_lines = []
 
         def fake_post(url, token, body, **kwargs):
@@ -5606,7 +5610,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         finally:
             local_runner._shutdown_event.clear()
 
-        update_mock.assert_called_once_with(restart_service=False)
+        update_mock.assert_not_called()
         contains_mock.assert_called_once_with(
             "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
         )
@@ -5614,10 +5618,96 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
         reexec_mock.assert_not_called()
         self.assertFalse(local_runner._update_in_progress.is_set())
-        self.assertIn("continuing without re-exec", " ".join(output_lines))
+        self.assertIn("continuing without an update", " ".join(output_lines))
+
+    def test_non_sha_version_hint_cannot_take_ancestry_shortcut(self):
+        """Git revision expressions are not trusted as commit identities."""
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": "HEAD"}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
+                 patch.object(local_runner.br, "checkout_contains_commit",
+                              return_value=True) as contains_mock, \
+                 patch.object(local_runner.br, "report_update_result"), \
+                 patch.object(local_runner, "_reexec_after_update") as reexec_mock:
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        contains_mock.assert_not_called()
+        update_mock.assert_called_once_with(restart_service=False)
+        reexec_mock.assert_not_called()
+        self.assertTrue(local_runner._update_in_progress.is_set())
+
+    def test_moved_checkout_cannot_converge_running_process(self):
+        """A newer disk HEAD cannot make already-running older code current."""
+        hint = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              side_effect=["v25-1-g4f5a6b7",
+                                           "v25-2-g8f9a0b1"]), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
+                 patch.object(local_runner.br, "checkout_contains_commit",
+                              return_value=True) as contains_mock, \
+                 patch.object(local_runner.br, "report_update_result"), \
+                 patch.object(local_runner, "_reexec_after_update") as reexec_mock:
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        contains_mock.assert_not_called()
+        update_mock.assert_called_once_with(restart_service=False)
+        reexec_mock.assert_not_called()
+        self.assertTrue(local_runner._update_in_progress.is_set())
 
     def test_accepted_ancestor_hint_is_suppressed_until_hint_changes(self):
-        """The same older hint updates once; a changed hint is evaluated afresh."""
+        """The same older hint is suppressed; a changed hint is evaluated afresh."""
         hints = [
             "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
@@ -5665,7 +5755,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             local_runner._shutdown_event.clear()
 
         self.assertEqual(calls, 3)
-        self.assertEqual(update_mock.call_count, 2)
+        update_mock.assert_not_called()
         self.assertEqual(contains_mock.call_count, 2)
         self.assertEqual(
             [call.args[0] for call in contains_mock.call_args_list],
