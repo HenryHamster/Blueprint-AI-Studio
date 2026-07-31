@@ -420,9 +420,7 @@ class OwnedClientTests(unittest.TestCase):
                     "Memory": 256 * 1024 * 1024,
                     "NanoCpus": 500_000_000,
                     "LogConfig": {"Type": "none", "Config": {}},
-                    "Tmpfs": {
-                        "/tmp": "rw,noexec,nosuid,nodev,size=64m"
-                    },
+                    "Tmpfs": producer._CLIENT_TMPFS,
                 },
                 "NetworkSettings": {
                     "Networks": {"blueprint-control-plane": {}}
@@ -441,12 +439,19 @@ class OwnedClientTests(unittest.TestCase):
         self.assertNotIn("--mount", start_argv)
         self.assertIn("--read-only", start_argv)
         self.assertIn("no-new-privileges", start_argv)
+        self.assertIn(
+            (
+                "/var/lib/postgresql/data:"
+                f"{producer._CLIENT_TMPFS['/var/lib/postgresql/data']}"
+            ),
+            start_argv,
+        )
 
         run = Mock(side_effect=[present, success, absent])
         producer._remove_client(args, name, session, run=run)
         self.assertEqual(
-            run.call_args_list[1].args[0][1:4],
-            ["container", "rm", "--force"],
+            run.call_args_list[1].args[0][1:5],
+            ["container", "rm", "--force", "--volumes"],
         )
 
     def test_cleanup_refuses_foreign_label(self):

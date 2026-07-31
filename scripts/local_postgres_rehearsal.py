@@ -51,6 +51,15 @@ _NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SESSION_PREFIX = "blueprint-precutover-rehearsal-"
 _POSTGRES_UID = 999
 _POSTGRES_GID = 999
+_SOURCE_CLIENT_TMPFS = {
+    "/tmp": "rw,noexec,nosuid,nodev,size=64m",
+    # The official PostgreSQL image declares PGDATA as a VOLUME. Mask it with
+    # an ephemeral tmpfs so Docker cannot silently create a persistent
+    # anonymous volume for this read-only client container.
+    "/var/lib/postgresql/data": (
+        "rw,noexec,nosuid,nodev,size=1m,uid=999,gid=999,mode=0700"
+    ),
+}
 _NETWORK_LABEL = "dev.blueprint.purpose"
 _NETWORK_LABEL_VALUE = "local-control-plane"
 _SNAPSHOT_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{8}-[0-9A-Fa-f]+$")
@@ -506,7 +515,11 @@ def _remove_owned_container(
     if payload is None:
         return
     _assert_owned_container(payload, session_id)
-    result = _run([docker_binary, "container", "rm", "--force", name], timeout=180, run=run)
+    result = _run(
+        [docker_binary, "container", "rm", "--force", "--volumes", name],
+        timeout=180,
+        run=run,
+    )
     if result.returncode != 0:
         raise RehearsalError("cleanup", "container_remove_failed")
     if _container_payload(docker_binary, name, run=run) is not None:
@@ -589,7 +602,12 @@ def _start_source_client(
             f"{_POSTGRES_UID}:{_POSTGRES_GID}",
             "--read-only",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,size=64m",
+            f"/tmp:{_SOURCE_CLIENT_TMPFS['/tmp']}",
+            "--tmpfs",
+            (
+                "/var/lib/postgresql/data:"
+                f"{_SOURCE_CLIENT_TMPFS['/var/lib/postgresql/data']}"
+            ),
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -630,6 +648,7 @@ def _assert_source_isolation(
         or set(networks) != {network}
         or bool(payload.get("Mounts"))
         or bool(host.get("PortBindings"))
+        or host.get("Tmpfs") != _SOURCE_CLIENT_TMPFS
         or host.get("ReadonlyRootfs") is not True
         or host.get("CapDrop") != ["ALL"]
         or host.get("SecurityOpt") != ["no-new-privileges"]

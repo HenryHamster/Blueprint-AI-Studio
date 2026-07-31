@@ -79,6 +79,13 @@ class LocalPostgresBackupTests(unittest.TestCase):
         self.assertIn("--host=blueprint-postgres", joined)
         self.assertEqual(argv[argv.index("--log-driver") + 1], "none")
         self.assertEqual(argv[argv.index("--memory") + 1], "1g")
+        self.assertIn(
+            (
+                "/var/lib/postgresql/data:"
+                "rw,noexec,nosuid,nodev,size=1m,uid=999,gid=999,mode=0700"
+            ),
+            argv,
+        )
 
     def test_uploader_has_writer_credentials_but_no_database_secret(self):
         argv = backup._upload_command(
@@ -105,6 +112,13 @@ class LocalPostgresBackupTests(unittest.TestCase):
         argv = backup._gzip_command(POSTGRES_ID)
         self.assertEqual(argv[argv.index("--network") + 1], "none")
         self.assertIn("no-new-privileges", argv)
+        self.assertIn(
+            (
+                "/var/lib/postgresql/data:"
+                "rw,noexec,nosuid,nodev,size=1m,uid=999,gid=999,mode=0700"
+            ),
+            argv,
+        )
         self.assertEqual(argv[-3:], ["gzip", "-6", "-c"])
 
     def test_mutable_images_are_rejected(self):
