@@ -4,6 +4,7 @@ import {
   assertForegroundLaunchIsRestricted, buildClaudeForegroundLaunch,
   configuredClaudeForegroundAdapter, createForegroundResidentProfile,
   mergeForegroundProviderEnvironment, sanitizeForegroundEnvironment,
+  typedFastRuntimeConfig,
 } from './foreground-resident.js';
 
 describe('Fast Resident foreground profile', () => {
@@ -33,9 +34,17 @@ describe('Fast Resident foreground profile', () => {
         ], env: profile.env,
         cwd: profile.cwd, allowedTools: profile.allowedTools,
       };
-      expect(() => assertForegroundLaunchIsRestricted(safe)).not.toThrow();
-      expect(() => assertForegroundLaunchIsRestricted({ ...safe, args: [...safe.args, '--dangerously-skip-permissions'] })).toThrow(/broad-permission/);
-      expect(() => assertForegroundLaunchIsRestricted({ ...safe, args: safe.args.filter((arg) => arg !== '--tools' && arg !== '') })).toThrow(/disable Claude built-in tools/);
+      expect(() => { assertForegroundLaunchIsRestricted(safe); }).not.toThrow();
+      expect(() => {
+        assertForegroundLaunchIsRestricted({
+          ...safe, args: [...safe.args, '--dangerously-skip-permissions'],
+        });
+      }).toThrow(/broad-permission/);
+      expect(() => {
+        assertForegroundLaunchIsRestricted({
+          ...safe, args: safe.args.filter((arg) => arg !== '--tools' && arg !== ''),
+        });
+      }).toThrow(/disable Claude built-in tools/);
     } finally {
       fs.rmSync(profile.cwd, { recursive: true, force: true });
       if (profile.env.HOME) fs.rmSync(profile.env.HOME, { recursive: true, force: true });
@@ -54,6 +63,69 @@ describe('Fast Resident foreground profile', () => {
     expect(configuredClaudeForegroundAdapter({
       CALL_FOREGROUND_QUALIFICATION: 'claude-warm-stream-json',
     }).validation).toBe('unvalidated');
+  });
+
+  it('activates typed Fast only for an explicitly qualified compatible provider', () => {
+    const qualification = {
+      CALL_FOREGROUND_QUALIFICATION: 'claude-warm-stream-json:phase0-v1',
+    };
+    expect(typedFastRuntimeConfig(false, qualification, 'anthropic')).toMatchObject({
+      activated: false, reason: 'not requested',
+    });
+    const unqualified = typedFastRuntimeConfig(true, {}, 'anthropic');
+    expect(unqualified.activated).toBe(false);
+    expect(unqualified.reason).toContain('qualification');
+    const incompatible = typedFastRuntimeConfig(true, qualification, 'openai');
+    expect(incompatible.activated).toBe(false);
+    expect(incompatible.reason).toContain('no qualified foreground adapter');
+    expect(typedFastRuntimeConfig(true, qualification, 'anthropic')).toMatchObject({
+      activated: true, model: 'haiku', effort: 'low',
+    });
+    expect(typedFastRuntimeConfig(true, {
+      ...qualification,
+      TYPED_FAST_MODEL: 'provider-fast-model',
+      TYPED_FAST_EFFORT: 'medium',
+    }, 'zai')).toMatchObject({
+      activated: true, model: 'provider-fast-model', effort: 'medium',
+    });
+  });
+
+  it('uses the server-owned Resident payload without runner environment toggles', () => {
+    expect(typedFastRuntimeConfig({
+      enabled: true,
+      qualification: 'claude-warm-stream-json:phase0-v1',
+      models: { anthropic: 'claude-haiku-4-5-20251001' },
+      effort: 'low',
+    }, {}, 'anthropic')).toMatchObject({
+      activated: true,
+      model: 'claude-haiku-4-5-20251001',
+      effort: 'low',
+      adapter: { validation: 'qualified' },
+    });
+  });
+
+  it('does not inherit runner qualification or model for payload-owned activation', () => {
+    expect(typedFastRuntimeConfig({
+      enabled: true,
+      models: {},
+    }, {
+      CALL_FOREGROUND_QUALIFICATION: 'claude-warm-stream-json:phase0-v1',
+      TYPED_FAST_MODEL: 'runner-local-model',
+    }, 'anthropic')).toMatchObject({
+      activated: false,
+      reason: 'foreground adapter is not qualification-approved',
+    });
+
+    expect(typedFastRuntimeConfig({
+      enabled: true,
+      qualification: 'claude-warm-stream-json:phase0-v1',
+      models: {},
+    }, {
+      TYPED_FAST_MODEL: 'runner-local-model',
+    }, 'anthropic')).toMatchObject({
+      activated: false,
+      reason: 'TYPED_FAST_MODEL is required for anthropic',
+    });
   });
 
   it('keeps Claude-compatible derived auth without copying runner authority', () => {

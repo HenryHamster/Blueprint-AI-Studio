@@ -42,9 +42,14 @@ from app.capability_execution_fence import (
 )
 from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
+from app.discovery_admission import (
+    authorize_discovery_task_execution,
+    discovery_admission_mode_from_runtime,
+)
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
+from app.task_capabilities import get_task_capability
 import app.shared_state as _shared_state
 
 logger = logging.getLogger(__name__)
@@ -618,6 +623,51 @@ async def _finalize_warm_claim(
             ", ".join(n["ref"] for n in _fence_blocking),
         )
         return Response(status_code=204)
+    # Warm claims bypass the cold orchestrator, so enforce the same centralized
+    # discovery authority immediately before QUEUED -> IN_PROGRESS. This also
+    # repairs descendants whose constructor omitted discovery_cycle_id.
+    _discovery_authority = await authorize_discovery_task_execution(
+        session,
+        task=task,
+        mode=discovery_admission_mode_from_runtime(_shared_state.runtime_config),
+    )
+    if not _discovery_authority.allowed:
+        from app.warm_pool import release_pool_vm
+
+        clear_warm_dispatch_pin(task)
+        await release_pool_vm(
+            session, vm_instance_id, owning_task_id=task.id
+        )
+        if _discovery_authority.terminal_denial:
+            task.status = TaskStatus.CANCELLED
+            task.completed_at = _utcnow()
+            task.latest_status_message = (
+                "Cancelled by discovery admission: "
+                f"{_discovery_authority.reason}"
+            )
+        else:
+            task.latest_status_message = (
+                "Waiting for discovery execution slot: "
+                f"{_discovery_authority.reason}"
+            )
+        session.add(task)
+        await session.commit()
+        logger.warning(
+            "[NEXT-ROLE][discovery-authority] Declining warm claim (%s) for "
+            "task %s on vm %s: %s%s",
+            origin,
+            task.id,
+            vm_instance_id,
+            _discovery_authority.reason,
+            " (cancelled)" if _discovery_authority.terminal_denial else "",
+        )
+        return Response(status_code=204)
+    if _discovery_authority.shadow_violation:
+        logger.warning(
+            "[NEXT-ROLE][discovery-admission-shadow] Task %s would be denied: %s",
+            task.id,
+            _discovery_authority.reason,
+        )
     from app.compute import VM_PROVISIONING_MODEL
 
     task.vm_instance_id = vm_instance_id
@@ -836,6 +886,14 @@ async def _finalize_warm_claim(
         "warm_start": True,
         "agent_token": agent_token,
     }
+    # The warm agent receives this before it decides whether to reset its
+    # existing workspace. This is registry-owned policy, not task payload:
+    # workspace:none workers never touch the prior role's repository.
+    # Unknown types intentionally omit it so the agent defaults fail-closed to
+    # repository-backed behavior.
+    task_capability = get_task_capability(task_type)
+    if task_capability is not None:
+        response["workspace_requirement"] = task_capability.workspace_requirement
     if secret_manifest is not None:
         response["secret_manifest"] = secret_manifest
     # Lane workspace-mode: pass the checkpoint SHA + lane marker to the agent

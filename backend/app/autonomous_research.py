@@ -221,6 +221,20 @@ def research_idempotency_key(project_id, direction_id) -> str:
     return research_direction_claim_key(project_id, direction_id)
 
 
+def _is_research_claim_integrity_error(exc: IntegrityError) -> bool:
+    """Recognize only the unique-index race this spawn path can safely absorb."""
+
+    orig = exc.orig
+    diag = getattr(orig, "diag", None)
+    if getattr(diag, "constraint_name", None) == "ux_task_active_idempotency_key":
+        return True
+    message = str(orig).lower()
+    return (
+        "unique constraint failed: task.idempotency_key" in message
+        or "ux_task_active_idempotency_key" in message
+    )
+
+
 def _research_payload_direction_id(payload: dict) -> str | None:
     """Return the direction id from a research payload.
 
@@ -2934,8 +2948,59 @@ async def _spawn_research_task_inner(
                 )
                 continue
 
+        from app.discovery_admission import (
+            consume_discovery_admission,
+            DiscoveryCycleUnavailable,
+            discovery_admission_mode_from_runtime,
+            ensure_discovery_cycle_for_research,
+            reserve_discovery_admission,
+        )
+
+        _discovery_cycle = None
+        if current_dir_id:
+            try:
+                _discovery_cycle = await ensure_discovery_cycle_for_research(
+                    session,
+                    project=project,
+                    direction_key=current_dir_id,
+                    direction=chosen_direction or {"id": current_dir_id},
+                    runtime_config=_runtime_config,
+                    candidate_sha=_v_branch_sha,
+                )
+            except DiscoveryCycleUnavailable as exc:
+                logger.info(
+                    "[AUTONOMOUS] Skipping discovery-root spawn for project %s "
+                    "direction %s: %s",
+                    project.id,
+                    current_dir_id,
+                    exc,
+                )
+                continue
+            _discovery_cycle_id = (
+                _discovery_cycle.id if _discovery_cycle is not None else None
+            )
+            if _discovery_cycle is not None:
+                research_payload.update(
+                    {
+                        "discovery_generation": _discovery_cycle.generation,
+                        "discovery_phase": _discovery_cycle.phase,
+                        "discovery_intent_snapshot": dict(
+                            _discovery_cycle.intent_snapshot or {}
+                        ),
+                        "discovery_bet_snapshot": dict(
+                            _discovery_cycle.bet_snapshot or {}
+                        ),
+                    }
+                )
+                research_payload = validate_internal_payload(
+                    research_payload,
+                    "autonomous_research:discovery_cycle",
+                )
+        else:
+            _discovery_cycle_id = None
         new_task = Task(
             project_id=project.id,
+            discovery_cycle_id=_discovery_cycle_id,
             title=f"Research: {direction_text}",
             description=f"Autonomous research for: {direction_text}",
             payloads=[research_payload],
@@ -2975,10 +3040,58 @@ async def _spawn_research_task_inner(
         await session.flush()
         try:
             async with session.begin_nested():
+                _discovery_admission_key = (
+                    f"autonomous-research:{new_task.idempotency_key}"
+                )
+                if _discovery_cycle_id is not None:
+                    _discovery_decision = await reserve_discovery_admission(
+                        session,
+                        cycle_id=_discovery_cycle_id,
+                        admission_key=_discovery_admission_key,
+                        mode=discovery_admission_mode_from_runtime(_runtime_config),
+                        metadata={"source": "autonomous_research"},
+                    )
+                    if not _discovery_decision.allowed:
+                        logger.info(
+                            "[AUTONOMOUS] Discovery admission denied for project %s "
+                            "direction %s: %s",
+                            project.id,
+                            current_dir_id,
+                            _discovery_decision.reason,
+                        )
+                        continue
                 session.add(new_task)
                 session.add(history)
                 await session.flush()
+                if _discovery_cycle_id is not None:
+                    if (
+                        _discovery_cycle is not None
+                        and _discovery_cycle.source_research_task_id is None
+                    ):
+                        _discovery_cycle.source_research_task_id = new_task.id
+                        session.add(_discovery_cycle)
+                    _bound_decision = await reserve_discovery_admission(
+                        session,
+                        cycle_id=_discovery_cycle_id,
+                        admission_key=_discovery_admission_key,
+                        task_id=new_task.id,
+                    )
+                    if not _bound_decision.allowed:
+                        raise RuntimeError(
+                            "discovery admission binding failed: "
+                            f"{_bound_decision.reason}"
+                        )
+                    if not await consume_discovery_admission(
+                        session,
+                        cycle_id=_discovery_cycle_id,
+                        admission_key=_discovery_admission_key,
+                    ):
+                        raise RuntimeError(
+                            "discovery admission could not be consumed"
+                        )
         except IntegrityError as exc:
+            if not _is_research_claim_integrity_error(exc):
+                raise
             # A sibling tick (another orchestrator instance, or the manual
             # research endpoint) committed a research task for this direction
             # between our no-active-research read and this insert — exactly
@@ -2992,6 +3105,12 @@ async def _spawn_research_task_inner(
                 current_dir_id or "undirected",
                 exc.orig,
             )
+            if (
+                _discovery_cycle is not None
+                and _discovery_cycle.source_research_task_id is None
+            ):
+                _discovery_cycle.state = "cancelled"
+                session.add(_discovery_cycle)
             continue
         spawned_tasks.append(new_task)
 

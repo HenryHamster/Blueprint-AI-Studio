@@ -1,0 +1,32 @@
+[Unit]
+Description=Blueprint node role: edge
+BindsTo=blueprint-api.service
+Requires=tailscaled.service
+Wants=network-online.target
+After=network-online.target tailscaled.service blueprint-api.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+EnvironmentFile=@ENV_FILE@
+ExecStartPre=@PYTHON@ @EXECUTABLE@ --check
+ExecStart=@PYTHON@ @EXECUTABLE@ start
+ExecStop=@PYTHON@ @EXECUTABLE@ stop
+TimeoutStartSec=60
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target blueprint-api.service tailscaled.service

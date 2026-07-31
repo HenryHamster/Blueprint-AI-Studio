@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - 'infra/terraform/**'
+      - 'infra/recovery/**'
   workflow_dispatch:
     # Plan-only by design. Production applies remain an explicit local operation.
 
@@ -48,6 +49,13 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.x
+
+      - name: Validate recovery infrastructure
+        working-directory: infra/recovery
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
 
       - name: Validate production plan inputs
         shell: bash

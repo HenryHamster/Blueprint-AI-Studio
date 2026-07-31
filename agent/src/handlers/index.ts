@@ -20,6 +20,7 @@ import type { AgentTaskType } from '../taskCapabilities.js';
 import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA, handleSalvageBundle } from './standard.js';
 import { handleReview, handleFix } from './review-fix.js';
 import { handlePlan, handleResearch } from './research-plan.js';
+import { handleDiscoveryReview } from './discovery-review.js';
 import { handleStrategic } from './strategic.js';
 import { handleStrategicResident } from './strategic-resident.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
@@ -35,6 +36,7 @@ import { handleWebResearch } from './web-research.js';
 import { handleDesign } from './design.js';
 import { handleCapabilityProofTrial } from './capability-proof-trial.js';
 import { handleCriterionCoverageTrial } from './criterion-coverage-trial.js';
+import { handleMemoryConsolidation } from './memory-consolidation.js';
 import {
   resolveTaskCapabilityContract,
   resolveGenericRunner,
@@ -93,6 +95,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   fix: handleFix,
   plan: handlePlan,
   research: dispatchResearch,
+  discovery_review: handleDiscoveryReview,
   docs: handleDocs,
   security_audit: handleSecurityAudit,
   self_audit: handleSelfAudit,
@@ -118,6 +121,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   salvage_bundle: handleSalvageBundle,
   capability_proof_trial: handleCapabilityProofTrial,
   criterion_coverage_trial: handleCriterionCoverageTrial,
+  memory_consolidation: handleMemoryConsolidation,
   walkthrough_e2e: handleWalkthroughE2e,
 };
 

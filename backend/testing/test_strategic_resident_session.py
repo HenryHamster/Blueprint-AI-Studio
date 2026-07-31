@@ -50,13 +50,17 @@ from app.strategic_resident_session import (
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
     _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
     acquire_resident_call_lease,
+    acquire_resident_typed_fast_lease,
     claim_resident_worker_incarnation,
     legacy_resident_worker_incarnation,
     new_session_id,
     read_resident_session,
     resident_call_is_active,
     resident_call_snapshot,
+    resident_typed_fast_snapshot,
+    release_resident_typed_fast_lease,
     renew_resident_call_lease,
+    renew_resident_typed_fast_lease,
     renew_resident_session_lease,
     resident_session_is_active,
     resident_session_snapshot,
@@ -515,6 +519,132 @@ async def test_call_lease_reuse_rechecks_owner_under_project_lock(db_session):
     assert call["call_id"] == "call-owner-race"
 
 
+@pytest.mark.asyncio
+async def test_typed_fast_lease_is_fenced_renewed_and_released(db_session):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    incarnation = uuid.uuid4()
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "ss-typed-fast",
+            "status": "active",
+            "stop_requested": False,
+            "task_id": str(task.id),
+            "worker_generation": 3,
+            "worker_incarnation_id": str(incarnation),
+            "worker_incarnation_expires_at": (
+                _utcnow() + timedelta(minutes=2)
+            ).isoformat(),
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    lease, stale_account, created = await acquire_resident_typed_fast_lease(
+        db_session,
+        project,
+        task_id=task.id,
+        worker_generation=3,
+        incarnation_id=incarnation,
+        account_id="pool-account",
+    )
+    assert created is True
+    assert stale_account is None
+    snapshot = resident_typed_fast_snapshot(project.vision)
+    assert snapshot is not None
+    assert snapshot["status"] == "active"
+    assert snapshot["kind"] == "typed_fast"
+    assert "account_id" not in snapshot
+
+    with pytest.raises(HTTPException) as fenced:
+        await renew_resident_typed_fast_lease(
+            db_session,
+            project,
+            task_id=str(task.id),
+            worker_generation=3,
+            incarnation_id=incarnation,
+            lease_id=lease["lease_id"],
+            generation=lease["generation"] + 1,
+        )
+    assert fenced.value.status_code == 409
+
+    renewed = await renew_resident_typed_fast_lease(
+        db_session,
+        project,
+        task_id=str(task.id),
+        worker_generation=3,
+        incarnation_id=incarnation,
+        lease_id=lease["lease_id"],
+        generation=lease["generation"],
+    )
+    assert renewed["status"] == "active"
+    _released, account_id, changed = await release_resident_typed_fast_lease(
+        db_session,
+        project,
+        lease_id=lease["lease_id"],
+        generation=lease["generation"],
+        task_id=task.id,
+        worker_generation=3,
+        incarnation_id=incarnation,
+        reason="parent_shutdown",
+    )
+    assert changed is True
+    assert account_id == "pool-account"
+    assert resident_typed_fast_snapshot(project.vision)["status"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_typed_fast_capacity_denial_persists_no_lease_for_workday_fallback(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    incarnation = uuid.uuid4()
+    task.context = {"_resident_session": True}
+    task.llm_account_id = "pool-at-cap"
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "ss-typed-fast-denied",
+            "status": "active",
+            "stop_requested": False,
+            "task_id": str(task.id),
+            "worker_generation": 1,
+            "worker_incarnation_id": str(incarnation),
+            "worker_incarnation_expires_at": (
+                _utcnow() + timedelta(minutes=2)
+            ).isoformat(),
+        }
+    }
+    flag_modified(task, "context")
+    flag_modified(project, "vision")
+    db_session.add_all([task, project])
+    await db_session.commit()
+    monkeypatch.setattr(
+        resident_session_module,
+        "_resolve_agent_project",
+        AsyncMock(return_value=project),
+    )
+    reserve = AsyncMock(return_value=False)
+    monkeypatch.setattr("app.max_plan_pool.reserve_max_plan_auxiliary_slot", reserve)
+
+    result = await resident_session_module.acquire_agent_typed_fast_lease(
+        request=AsyncMock(),
+        project_id=project.id,
+        payload=resident_session_module.ResidentTypedFastLeaseRequest(
+            task_id=str(task.id),
+            worker_generation=1,
+            resident_incarnation_id=incarnation,
+        ),
+        session=db_session,
+        token={"sub": str(task.id)},
+    )
+
+    assert result == {"acquired": False, "reason": "no_concurrent_capacity"}
+    reserve.assert_awaited_once_with("pool-at-cap", project_id=str(project.id))
+    assert resident_typed_fast_snapshot(project.vision) is None
+
+
 def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(
     monkeypatch,
 ):
@@ -671,7 +801,8 @@ async def test_hydration_ensure_cannot_resurrect_after_committed_mode_leave(
 
 
 @pytest.mark.asyncio
-async def test_continuous_hydration_ensure_succeeds(db_session):
+async def test_continuous_hydration_ensure_succeeds(db_session, monkeypatch):
+    monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
     project = await _make_project(db_session)
     runner = await _make_runner(db_session, project)
     await persist_strategic_workbench_update(
@@ -705,6 +836,10 @@ async def test_continuous_hydration_ensure_succeeds(db_session):
         ).scalars().all()
     assert len(tasks) == 1
     assert str(tasks[0].id) == response["session"]["task_id"]
+    assert tasks[0].first_payload["typed_fast_enabled"] is True
+    assert tasks[0].first_payload["typed_fast_qualification"] == (
+        "claude-warm-stream-json:phase0-v1"
+    )
 
 
 @pytest.mark.asyncio
@@ -796,7 +931,8 @@ async def test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_
     assert [row.id for row in tasks] == [task_id]
 
 
-async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_session):
+async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_session, monkeypatch):
+    monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     runner = await _make_runner(db_session, project)
@@ -812,6 +948,11 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
     assert refreshed_task.context["_resident_session"] is True
     assert refreshed_task.context["strategic_session_id"] == snapshot["session_id"]
     assert refreshed_task.vm_instance_id == f"runner:{runner.id}"
+    assert refreshed_task.first_payload["typed_fast_enabled"] is True
+    assert refreshed_task.first_payload["typed_fast_qualification"] == (
+        "claude-warm-stream-json:phase0-v1"
+    )
+    assert refreshed_task.first_payload["typed_fast_models"]["anthropic"]
 
     project = await db_session.get(Project, project.id)
     progress = await renew_resident_session_lease(
@@ -1591,6 +1732,20 @@ async def test_stop_ends_task_releases_continuation_and_hands_off_messages(
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["typed_fast"] = {
+        "lease_id": "typed-fast-stop",
+        "generation": 1,
+        "kind": "typed_fast",
+        "status": "active",
+        "account_id": "pool-fast-stop",
+        "slot_reserved": True,
+        "expires_at": (_utcnow() + timedelta(minutes=5)).isoformat(),
+    }
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
     pending = ProjectMessage(
         project_id=project.id,
         message_type=MessageType.QUESTION,
@@ -1607,6 +1762,10 @@ async def test_stop_ends_task_releases_continuation_and_hands_off_messages(
         "app.strategic_trigger.maybe_arm_operator_refresh",
         AsyncMock(return_value="steering"),
     )
+    released_fast_slot = AsyncMock()
+    monkeypatch.setattr(
+        "app.max_plan_pool.release_max_plan_auxiliary_slot", released_fast_slot
+    )
 
     project = await db_session.get(Project, project.id)
     snapshot = await stop_resident_session(
@@ -1620,6 +1779,11 @@ async def test_stop_ends_task_releases_continuation_and_hands_off_messages(
     assert refreshed_task.context["failure_category"] == "ADMIN_CANCEL"
     refreshed_project = await db_session.get(Project, project.id)
     assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (refreshed_project.vision or {})
+    assert refreshed_project.vision[RESIDENT_SESSION_KEY]["typed_fast"]["status"] == "ended"
+    assert refreshed_project.vision[RESIDENT_SESSION_KEY]["typed_fast"]["slot_reserved"] is False
+    released_fast_slot.assert_awaited_once_with(
+        "pool-fast-stop", project_id=str(project.id)
+    )
     await db_session.refresh(pending)
     assert pending.status == "open"
     assert pending.resident_session_id is None

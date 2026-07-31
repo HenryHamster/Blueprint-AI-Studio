@@ -2399,7 +2399,7 @@ async def test_strategic_session_includes_requested_older_message_once(
     conversation = resp.json()["conversation"]
     ids = [item["id"] for item in conversation["items"]]
     assert conversation["limit"] == 20
-    assert conversation["has_more"] is False
+    assert conversation["has_more"] is True
     assert conversation["order"] == "oldest_first"
     assert ids.count(str(target.id)) == 1
     assert ids[0] == str(target.id)
@@ -2407,6 +2407,7 @@ async def test_strategic_session_includes_requested_older_message_once(
     assert [item["content"] for item in conversation["items"][1:]] == [
         f"newer session row {index:02d}" for index in range(19)
     ]
+    assert conversation["next_after_sequence"] == 20
 
     cross_project_resp = await client.get(
         f"/api/admin/projects/{project.id}/strategic-session"
@@ -2620,6 +2621,14 @@ async def test_strategic_conversation_keeps_strategic_reply_with_internal_audien
 ):
     """A reply in the user-facing transcript must not disappear due to its stamp."""
     project = await _make_project(db_session)
+    user_message = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="hi",
+    )
     db_session.add_all([
         ProjectMessage(
             project_id=project.id,
@@ -2630,14 +2639,7 @@ async def test_strategic_conversation_keeps_strategic_reply_with_internal_audien
             content="internal bookkeeping",
             context={"audience": "strategist-internal"},
         ),
-        ProjectMessage(
-            project_id=project.id,
-            sequence=2,
-            surface=MessageSurface.CONVERSATION,
-            message_type=MessageType.NOTE,
-            from_type="user",
-            content="hi",
-        ),
+        user_message,
         ProjectMessage(
             project_id=project.id,
             sequence=3,
@@ -2645,8 +2647,9 @@ async def test_strategic_conversation_keeps_strategic_reply_with_internal_audien
             message_type=MessageType.NOTE,
             from_type="strategic",
             content="Hi — what can I help with?",
+            reply_to_message_id=user_message.id,
             context={
-                "event_type": "strategic_message",
+                "message_role": "operator_reply",
                 "audience": "strategist-internal",
             },
         ),

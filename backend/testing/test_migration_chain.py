@@ -1298,8 +1298,8 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_conversation_claims_0710_is_the_expected_schema_head():
-    """Conversation incarnation fencing extends the durable claim migration."""
+def test_strategic_memory_0718_is_the_expected_schema_head():
+    """Strategic Memory follows main's hot-sweep migration as one linear chain."""
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
         versions_dir / "0708_pipeline_operability_foundation.py"
@@ -1308,13 +1308,45 @@ def test_conversation_claims_0710_is_the_expected_schema_head():
     incarnation = (
         versions_dir / "0710_conversation_claim_incarnation.py"
     ).read_text()
+    discovery_cycles = (
+        versions_dir / "0711_discovery_review_cycles.py"
+    ).read_text()
+    discovery_admission = (
+        versions_dir / "0712_discovery_admission_ledger.py"
+    ).read_text()
+    sweep_indexes = (
+        versions_dir / "0713_hot_sweep_partial_indexes.py"
+    ).read_text()
+    correctness = (
+        versions_dir / "0714_repair_strategic_conversation_correctness.py"
+    ).read_text()
+    envelopes = (
+        versions_dir / "0715_strategic_context_envelope_snapshots.py"
+    ).read_text()
+    source_control = (
+        versions_dir / "0716_strategic_memory_source_control_plane.py"
+    ).read_text()
+    semantic_ledger = (
+        versions_dir / "0717_strategic_memory_semantic_ledger.py"
+    ).read_text()
+    timezone_columns = (
+        versions_dir / "0718_strategic_memory_timezone_columns.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
+    assert parse_revision_identifiers(discovery_cycles) == ("0711", "0710")
+    assert parse_revision_identifiers(discovery_admission) == ("0712", "0711")
+    assert parse_revision_identifiers(sweep_indexes) == ("0713", "0712")
+    assert parse_revision_identifiers(correctness) == ("0714", "0713")
+    assert parse_revision_identifiers(envelopes) == ("0715", "0714")
+    assert parse_revision_identifiers(source_control) == ("0716", "0715")
+    assert parse_revision_identifiers(semantic_ledger) == ("0717", "0716")
+    assert parse_revision_identifiers(timezone_columns) == ("0718", "0717")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0710", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0710', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0718", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0718', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

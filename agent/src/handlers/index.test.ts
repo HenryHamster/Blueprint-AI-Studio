@@ -40,6 +40,8 @@ vi.mock('./strategic-resident.js', () => ({
   CALL_OPERATOR_RECONNECT_GRACE_MS: 30_000,
   handleStrategicResident: vi.fn().mockResolvedValue(undefined),
   residentReplyRuntimePaths: vi.fn(),
+  partitionTypedFastMessages: vi.fn(),
+  selectTypedFastClaimMessages: vi.fn(),
 }));
 
 vi.mock('./audits.js', () => ({
@@ -113,7 +115,7 @@ import { handleStrategicResident } from './strategic-resident.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  // 27 BESPOKE handlers are hand-registered today. This is no longer the
+  // 32 BESPOKE handlers are hand-registered today. This is no longer the
   // launchability gate — dispatch falls back to contract-driven GENERIC runners
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
@@ -407,6 +409,7 @@ const TASK_CLASS_MAP = {
   release_audit:     'read-only',
   release_audit_challenge: 'read-only',
   release_merge_grade: 'read-only',
+  discovery_review:  'read-only',
   smoketest:         'read-only',
   debug:             'read-only',
   perf:              'read-only',
@@ -417,6 +420,7 @@ const TASK_CLASS_MAP = {
   capability_proof_trial:  'read-only',
   criterion_coverage_trial: 'read-only',
   walkthrough_e2e:       'read-only',
+  memory_consolidation:  'read-only',
   // Research / planning (7): read-heavy, no code shipped
   plan:              'research',
   research:          'research',

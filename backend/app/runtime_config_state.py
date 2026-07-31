@@ -111,6 +111,10 @@ runtime_config: Dict = {
     # Ships "observe" as a deliberate gradual-rollout posture so operators can
     # measure the initiative/servicing split before switching the tighter gate on.
     "autonomous_spawn_budget_mode": "observe",
+    # Discovery-cycle admission is initially record-only. Operators can graduate
+    # it to ``enforced`` after shadow telemetry confirms that cycle lineage and
+    # credit accounting are complete across every spawn path.
+    "discovery_admission_mode": "shadow",
     # Tighter cross-project cap on INITIATIVE-category spawns (net-new research/
     # create, excluding review/fix servicing churn). Only binds when
     # autonomous_spawn_budget_mode == "enforce"; pending its dedicated rollout.
@@ -630,7 +634,11 @@ runtime_config: Dict = {
     # the whole group. Every task type listed here falls under the matching
     # category_routing block; unlisted types resolve via category_routing["_default"].
     "task_type_categories": {
-        "strategic": ["strategic_review", "design_doc_update"],
+        "strategic": [
+            "strategic_review",
+            "design_doc_update",
+            "discovery_review",
+        ],
         "initiative": ["research", "plan"],
         "build": ["create", "refactor", "migrate"],
         "review": ["review", "qa", "security_audit", "perf", "debug", "fix"],
@@ -1690,6 +1698,17 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
                 for member in strategic_members
                 if member not in ("research", "plan")
             ]
+            strategic_members = categories["strategic"]
+            present_elsewhere = any(
+                isinstance(members, list) and "discovery_review" in members
+                for members in categories.values()
+                if members is not strategic_members
+            )
+            if (
+                not present_elsewhere
+                and "discovery_review" not in strategic_members
+            ):
+                strategic_members.append("discovery_review")
 
         initiative_members = categories.setdefault("initiative", [])
         if isinstance(initiative_members, list):
@@ -2048,6 +2067,14 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in {"off", "observe", "enforce"}:
                         _set("autonomous_spawn_budget_mode", raw_mode)
+                if "discovery_admission_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["discovery_admission_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in {"shadow", "enforced"}:
+                        _set("discovery_admission_mode", raw_mode)
                 if "max_global_autonomous_initiative_tasks_per_hour" in config_json:
                     try:
                         raw_cap = int(

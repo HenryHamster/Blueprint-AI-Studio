@@ -47,6 +47,9 @@ vi.mock('./runners.js', () => ({
   __resetClaudeCapabilityCacheForTesting: vi.fn(),
   probeClaudeCapabilities: vi.fn(() => null),
   stripUnsupportedClaudeOptionalArgs: vi.fn((args: readonly string[]) => [...args]),
+  TextOnlyProviderUnavailableError: class extends Error {},
+  buildIsolatedTextOnlyMemoryCommand: vi.fn(),
+  runIsolatedTextOnlyMemory: vi.fn(),
   matchesRateLimit: vi.fn((text: string) => /rate limit|weekly limit/i.test(text)),
   matchesAuthFailure: vi.fn((text: string) => /unauthorized/i.test(text)),
   getProviderRunner: vi.fn(() => ({

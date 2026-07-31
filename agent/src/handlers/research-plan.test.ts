@@ -293,7 +293,29 @@ import {
   buildAvailableCapabilitiesSection,
   CAPABILITY_DECLARATION_DOC,
   normalizePlanSubtaskTypes,
+  buildResearchScopeGuidance,
 } from './research-plan.js';
+
+describe('bounded discovery-cycle research guidance', () => {
+  it('caps decision-relevant findings and explicitly permits an empty result', () => {
+    const guidance = buildResearchScopeGuidance('bounded_cycle');
+    expect(guidance).toContain('Inspect only the areas');
+    expect(guidance).toContain('at most 1-3 coherent');
+    expect(guidance).toContain('valid to output `[]`');
+    expect(guidance).toContain('Do not manufacture');
+    expect(guidance).not.toContain('Explore aggressively');
+    expect(guidance).not.toContain('Output ALL meaningful findings');
+  });
+
+  it('leaves ordinary tactical research guidance unchanged', () => {
+    const guidance = buildResearchScopeGuidance(undefined);
+    expect(guidance).toContain('Explore aggressively');
+    expect(guidance).toContain('verify you explored all major directories');
+    expect(guidance).toContain('Output ALL meaningful findings');
+    expect(guidance).toContain('Be ambitious');
+    expect(guidance).not.toContain('BOUNDED DISCOVERY CYCLE');
+  });
+});
 
 async function expectMockCoversActualNamedExports(moduleId: string, mockedModule: Record<string, unknown>) {
   const actual = await vi.importActual<Record<string, unknown>>(moduleId);

@@ -14,10 +14,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 import cloud_sql_proxy_service as proxy
 import local_worker_service as worker
 
+_TEMP_PARENT = Path(__file__).parent if os.name == "nt" else None
+
 
 class WorkerServiceTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.temp = tempfile.TemporaryDirectory(dir=_TEMP_PARENT)
         self.root = Path(self.temp.name)
         self.secrets = self.root / "worker-secrets.json"
         self.google_credentials = self.root / "worker-gcp.json"
@@ -68,7 +70,9 @@ class WorkerServiceTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_database_url_is_rewritten_to_unpublished_host_gateway(self):
-        rewritten = worker._database_url_for_container(self.payload["DATABASE_URL"])
+        rewritten = worker._database_url_for_container(
+            self.payload["DATABASE_URL"], mode="cloudsql-proxy"
+        )
         self.assertEqual(
             rewritten,
             (
@@ -81,7 +85,8 @@ class WorkerServiceTests(unittest.TestCase):
     def test_database_url_disables_client_tls_for_cloud_sql_proxy(self):
         rewritten = worker._database_url_for_container(
             "postgresql+asyncpg://user:pass@10.0.0.2:5432/blueprint"
-            "?application_name=worker&ssl=require&sslmode=verify-full"
+            "?application_name=worker&ssl=require&sslmode=verify-full",
+            mode="cloudsql-proxy",
         )
         self.assertEqual(
             rewritten,
@@ -93,8 +98,39 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertNotIn("require", rewritten)
         self.assertNotIn("verify-full", rewritten)
 
+    def test_local_postgres_uses_fixed_private_bridge_alias(self):
+        rewritten = worker._database_url_for_container(
+            "postgresql+asyncpg://user:pass@untrusted-host:9999/blueprint"
+            "?application_name=worker&sslmode=require",
+            mode="local-postgres",
+        )
+        self.assertEqual(
+            rewritten,
+            (
+                "postgresql+asyncpg://user:pass@blueprint-postgres:5432/"
+                "blueprint?application_name=worker&ssl=disable"
+            ),
+        )
+        self.assertNotIn("untrusted-host", rewritten)
+
+    def test_database_mode_must_be_explicit_and_known(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "BLUEPRINT_DATABASE_MODE"):
+                worker._database_mode()
+        with patch.dict(
+            os.environ, {"BLUEPRINT_DATABASE_MODE": "inferred-from-host"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "must be one of"):
+                worker._database_mode()
+
     def test_secret_bundle_rejects_unknown_key(self):
         self.payload["ADMIN_API_KEY"] = "must-not-enter-worker"
+        self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unsupported keys"):
+            worker._load_secrets(str(self.secrets))
+
+    def test_secret_bundle_rejects_api_only_github_oauth_credentials(self):
+        self.payload["GITHUB_CLIENT_SECRET"] = "must-not-enter-worker"
         self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "unsupported keys"):
             worker._load_secrets(str(self.secrets))
@@ -116,9 +152,34 @@ class WorkerServiceTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(ValueError, "dedicated runtime"):
+        with self.assertRaisesRegex(ValueError, "blueprint-local-worker-runtime"):
             worker._secure_credentials_file(
-                str(self.google_credentials), project_id="project-123"
+                str(self.google_credentials),
+                project_id="project-123",
+                expected_account_id="blueprint-local-worker-runtime",
+                credential_label="worker",
+            )
+
+    def test_worker_rejects_dedicated_api_credentials(self):
+        self.google_credentials.write_text(
+            json.dumps(
+                {
+                    "type": "service_account",
+                    "project_id": "project-123",
+                    "client_email": (
+                        "blueprint-local-api-runtime@project-123."
+                        "iam.gserviceaccount.com"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "blueprint-local-worker-runtime"):
+            worker._secure_credentials_file(
+                str(self.google_credentials),
+                project_id="project-123",
+                expected_account_id="blueprint-local-worker-runtime",
+                credential_label="worker",
             )
 
     @unittest.skipIf(os.name == "nt", "POSIX ownership and mode contract")
@@ -130,15 +191,17 @@ class WorkerServiceTests(unittest.TestCase):
     @patch.object(worker, "_network_gateway", return_value="172.20.0.1")
     @patch.object(worker, "_assert_proxy_reachable_from_network")
     @patch.object(worker, "_wait_for_proxy")
+    @patch.object(worker, "_assert_no_active_user_worker_service")
     @patch.object(worker, "_assert_no_host_ci_runner")
     def test_container_has_no_published_ports_and_is_hardened(
-        self, _ci_guard, _wait, _network_probe, _gateway
+        self, _ci_guard, _user_worker_guard, _wait, _network_probe, _gateway
     ):
         env = {
             "BLUEPRINT_WORKER_IMAGE_ID": f"sha256:{'a' * 64}",
             "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
             "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
             "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
+            "BLUEPRINT_DATABASE_MODE": "cloudsql-proxy",
         }
         with patch.dict(os.environ, env, clear=True):
             argv, child_env = worker.command()
@@ -148,6 +211,15 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertNotIn("host-gateway", argv)
         self.assertIn("--read-only", argv)
         self.assertIn("no-new-privileges", argv)
+        self.assertEqual(argv[argv.index("--memory") + 1], "4g")
+        self.assertEqual(argv[argv.index("--memory-swap") + 1], "4g")
+        self.assertEqual(argv[argv.index("--log-driver") + 1], "json-file")
+        log_options = [
+            argv[index + 1]
+            for index, value in enumerate(argv)
+            if value == "--log-opt"
+        ]
+        self.assertEqual(log_options, ["max-size=10m", "max-file=3"])
         self.assertIn(f"{os.getuid()}:{os.getgid()}", argv)
         self.assertTrue(
             any(
@@ -166,6 +238,29 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertNotIn("ALLOW_PLAINTEXT_CREDENTIALS", child_env)
         self.assertNotIn(self.payload["GITHUB_PRIVATE_KEY"], " ".join(argv))
         self.assertNotIn(self.payload["DATABASE_URL"], " ".join(argv))
+
+    @patch.object(worker, "_network_gateway", return_value="172.20.0.1")
+    @patch.object(worker, "_assert_proxy_reachable_from_network")
+    @patch.object(worker, "_wait_for_proxy")
+    @patch.object(worker, "_assert_no_active_user_worker_service")
+    @patch.object(worker, "_assert_no_host_ci_runner")
+    def test_local_postgres_mode_never_uses_proxy_or_host_gateway(
+        self, _ci_guard, _user_worker_guard, wait, network_probe, _gateway
+    ):
+        env = {
+            "BLUEPRINT_WORKER_IMAGE_ID": f"sha256:{'a' * 64}",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
+            "BLUEPRINT_DATABASE_MODE": "local-postgres",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            argv, child_env = worker.command()
+        wait.assert_not_called()
+        network_probe.assert_not_called()
+        self.assertNotIn("--add-host", argv)
+        self.assertIn("@blueprint-postgres:5432/", child_env["DATABASE_URL"])
+        self.assertIn("ssl=disable", child_env["DATABASE_URL"])
 
     @patch.object(worker.subprocess, "run")
     def test_network_probe_fails_closed_when_host_firewall_blocks_bridge(self, run):
@@ -188,13 +283,83 @@ class WorkerServiceTests(unittest.TestCase):
             "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
             "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
             "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
+            "BLUEPRINT_DATABASE_MODE": "cloudsql-proxy",
         }
         with (
             patch.dict(os.environ, env, clear=True),
             patch.object(worker, "_assert_no_host_ci_runner"),
+            patch.object(worker, "_assert_no_active_user_worker_service"),
         ):
             with self.assertRaisesRegex(ValueError, "immutable"):
                 worker.command()
+
+    @patch.object(worker, "_running_as_system_worker_service", return_value=True)
+    @patch.object(worker, "_user_scoped_worker_process_present", return_value=False)
+    @patch.object(worker.subprocess, "run")
+    def test_system_worker_rejects_active_user_worker(
+        self, run, _proc_guard, _system_scope
+    ):
+        run.return_value.returncode = 0
+        with self.assertRaisesRegex(RuntimeError, "active user-scoped"):
+            worker._assert_no_active_user_worker_service()
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "systemctl",
+                "--user",
+                "is-active",
+                "--quiet",
+                "blueprint-worker.service",
+            ],
+        )
+
+    @patch.object(worker, "_running_as_system_worker_service", return_value=True)
+    @patch.object(worker, "_user_scoped_worker_process_present", return_value=True)
+    @patch.object(worker.subprocess, "run")
+    def test_system_worker_detects_user_worker_when_user_bus_is_unavailable(
+        self, run, _proc_guard, _system_scope
+    ):
+        run.side_effect = OSError("user bus unavailable")
+        with self.assertRaisesRegex(RuntimeError, "active user-scoped"):
+            worker._assert_no_active_user_worker_service()
+
+    @patch.object(worker, "_running_as_system_worker_service", return_value=False)
+    @patch.object(worker.subprocess, "run")
+    def test_user_worker_does_not_reject_itself(self, run, _system_scope):
+        worker._assert_no_active_user_worker_service()
+        run.assert_not_called()
+
+    def test_cgroup_scope_detection_distinguishes_system_and_user_units(self):
+        self.assertTrue(
+            worker._cgroup_is_system_worker(
+                b"0::/system.slice/blueprint-worker.service\n"
+            )
+        )
+        self.assertFalse(
+            worker._cgroup_is_system_worker(
+                b"0::/user.slice/user-1000.slice/user@1000.service/"
+                b"app.slice/blueprint-worker.service\n"
+            )
+        )
+
+    def test_proc_fallback_finds_only_user_scoped_worker_process(self):
+        proc_root = self.root / "proc"
+        system_process = proc_root / "101"
+        user_process = proc_root / "102"
+        system_process.mkdir(parents=True)
+        user_process.mkdir()
+        (system_process / "cgroup").write_bytes(
+            b"0::/system.slice/blueprint-worker.service\n"
+        )
+        (user_process / "cgroup").write_bytes(
+            b"0::/user.slice/user-1000.slice/user@1000.service/"
+            b"app.slice/blueprint-worker.service\n"
+        )
+        self.assertTrue(worker._user_scoped_worker_process_present(proc_root))
+        (user_process / "cgroup").write_bytes(
+            b"0::/user.slice/user-1000.slice/user@1000.service/app.slice/shell.scope\n"
+        )
+        self.assertFalse(worker._user_scoped_worker_process_present(proc_root))
 
     def test_host_ci_runner_is_a_hard_security_gate(self):
         with tempfile.TemporaryDirectory(dir=self.root) as proc:
@@ -213,7 +378,7 @@ class WorkerServiceTests(unittest.TestCase):
 
 class ProxyServiceTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.temp = tempfile.TemporaryDirectory(dir=_TEMP_PARENT)
         self.root = Path(self.temp.name)
         self.binary = self.root / "cloud-sql-proxy"
         self.credentials = self.root / "cloudsql.json"
@@ -312,11 +477,15 @@ class TerraformIdentityContractTests(unittest.TestCase):
         worker_start = terraform.index(
             'resource "google_service_account" "local_worker_sa"'
         )
+        api_start = terraform.index(
+            'resource "google_service_account" "local_api_sa"'
+        )
         agent_start = terraform.index(
             '# Agent "Naked" Service Account'
         )
         proxy_section = terraform[proxy_start:worker_start]
-        worker_section = terraform[worker_start:agent_start]
+        worker_section = terraform[worker_start:api_start]
+        api_section = terraform[api_start:agent_start]
 
         self.assertIn('"roles/cloudsql.client"', proxy_section)
         self.assertNotIn("secretmanager", proxy_section)
@@ -382,6 +551,11 @@ class TerraformIdentityContractTests(unittest.TestCase):
         self.assertNotIn("roles/secretmanager.admin", worker_section)
         self.assertNotIn("roles/iam.serviceAccountTokenCreator", worker_section)
         self.assertNotIn("roles/run.admin", worker_section)
+        self.assertIn("roles/iam.serviceAccountTokenCreator", api_section)
+        self.assertNotIn("roles/compute.instanceAdmin.v1", api_section)
+        self.assertNotIn("roles/cloudbuild.builds.editor", api_section)
+        self.assertNotIn("roles/run.jobsExecutorWithOverrides", api_section)
+        self.assertNotIn("local_worker_sa.email", api_section)
 
     def test_terraform_plan_gate_propagates_pipeline_failure(self):
         workflow = (

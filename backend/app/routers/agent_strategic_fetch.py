@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
@@ -38,13 +38,27 @@ from app.knowledge_query import (
     build_sweep_knowledge_index,
 )
 from app.message_convergence import get_message_link, resolve_message_ref
-from app.models import ComputeJob, Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
-from app.project_message_projection import agent_fetch_message_dict
+from app.models import (
+    ComputeJob,
+    Project,
+    ProjectMessage,
+    QualificationVerdict,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+    UiLoadTimingSample,
+)
+from app.project_message_projection import (
+    agent_fetch_message_dict,
+    agent_thread_message_dict,
+    message_preview_dict,
+)
 from app.qualification_state_resolver import apply_verdict_substitution
 from app.release_scoring import blocker_execution_site as _blocker_execution_site
 from app.routers.agent import verify_agent_token
 from app.schemas import serialize_compute_job_response_safe
 from app.shared_state import limiter
+from app.strategic_conversation_query import query_strategic_conversation
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.source_ref_validation import (
     ground_design_doc_value,
@@ -57,6 +71,11 @@ logger = logging.getLogger(__name__)
 
 _RESEARCH_HISTORY_KEEP_ON_FETCH = 20
 _RECENT_CLOSED_VERSIONS_KEEP = 5
+_RESIDENT_CONVERSATION_MAX_LIMIT = 50
+_RESIDENT_CONVERSATION_CONTENT_CAP = 4_000
+_RESIDENT_CONVERSATION_RESOLUTION_CAP = 1_000
+_RESIDENT_CONVERSATION_AGGREGATE_TEXT_CAP = 32_000
+_RESIDENT_CONVERSATION_RESPONSE_BYTES_CAP = 64 * 1024
 
 
 # Agent-requested image builds intentionally detach from a resident HTTP turn.
@@ -762,6 +781,324 @@ async def _resolve_agent_project(
     return project
 
 
+async def _authorize_resident_conversation_reader(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    token: dict,
+    *,
+    resident_session_id: str,
+    worker_generation: int,
+    worker_incarnation_id: uuid.UUID,
+) -> Project:
+    """Fence transcript access to the current authenticated Resident worker.
+
+    The task token establishes project membership; persisted task context and
+    the project-owned Resident lease establish session/generation authority.
+    This prevents an ordinary project task or a superseded Resident token from
+    turning the transcript endpoint into a project-wide data reader.
+    """
+
+    try:
+        task_id = uuid.UUID(str(token.get("sub") or ""))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid task id in token") from None
+    # Match the project-then-task lock order used by message claim/completion.
+    # The lock spans the transcript query, so stop/replacement cannot invalidate
+    # this worker between authorization and the rows it receives.
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = (
+        await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    task = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    context = task.context if task is not None and isinstance(task.context, dict) else {}
+    if (
+        project is None
+        or task is None
+        or task.project_id != project_id
+        or task.status != TaskStatus.IN_PROGRESS
+        or context.get("_resident_session") is not True
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Strategic conversation history requires a Resident task",
+        )
+    authenticated_session_id = str(context.get("strategic_session_id") or "")
+    try:
+        authenticated_generation = int(
+            context.get("_resident_worker_generation") or 1
+        )
+    except (TypeError, ValueError):
+        authenticated_generation = 0
+    if (
+        not authenticated_session_id
+        or resident_session_id != authenticated_session_id
+        or worker_generation != authenticated_generation
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident worker identity mismatch",
+        )
+
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_worker_incarnation_is_current,
+    )
+
+    resident = read_resident_session(project.vision)
+    try:
+        current_generation = int((resident or {}).get("worker_generation") or 1)
+    except (TypeError, ValueError):
+        current_generation = 0
+    if (
+        not isinstance(resident, dict)
+        or resident.get("status") != "active"
+        or bool(resident.get("stop_requested"))
+        or str(resident.get("session_id") or "") != authenticated_session_id
+        or str(resident.get("task_id") or "") != str(task_id)
+        or current_generation != authenticated_generation
+        or not resident_worker_incarnation_is_current(
+            project.vision,
+            task_id=task_id,
+            worker_generation=authenticated_generation,
+            incarnation_id=worker_incarnation_id,
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident worker generation superseded or inactive",
+        )
+    return project
+
+
+def _serialized_bytes(value: Any) -> int:
+    # Starlette's JSONResponse renders UTF-8 with ensure_ascii=False. Budget the
+    # exact transport encoding so multibyte text is neither under-counted nor
+    # expanded into Python json's default ``\uXXXX`` escape representation.
+    return len(
+        json.dumps(
+            value,
+            separators=(",", ":"),
+            default=str,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+
+
+def _utf8_prefix(value: str, *, max_bytes: int) -> str:
+    """Trim text at a Unicode boundary without exceeding a transport budget."""
+
+    if max_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _resident_conversation_refetch(
+    *, project_id: uuid.UUID, message_id: str
+) -> dict[str, str]:
+    return {
+        "method": "GET",
+        "path": f"/api/agent/projects/{project_id}/messages/{message_id}",
+        "reason": "full_message_content",
+    }
+
+
+def _fit_resident_item_to_serialized_budget(
+    item: dict[str, Any],
+    *,
+    item_budget: int,
+    project_id: uuid.UUID,
+    message_id: str,
+) -> dict[str, Any]:
+    """Hard-fit one item after JSON escaping, preserving its durable pointer."""
+
+    if _serialized_bytes(item) <= item_budget:
+        return item
+
+    # Quotes, backslashes, and control characters can occupy more transport
+    # bytes than their UTF-8 source. Trim the already-bounded fields against
+    # the serialized item rather than assuming source bytes equal JSON bytes.
+    # Reserve the recovery pointer before fitting so the final item remains
+    # inside the same hard budget.
+    item["refetch"] = _resident_conversation_refetch(
+        project_id=project_id,
+        message_id=message_id,
+    )
+    for field, empty_value in (("resolution", None), ("content", "")):
+        original = str(item.get(field) or "")
+        low, high = 0, len(original)
+        best = empty_value
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate = original[:midpoint]
+            item[field] = candidate or empty_value
+            if _serialized_bytes(item) <= item_budget:
+                best = item[field]
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        item[field] = best
+        if (item.get(field) or "") != original:
+            item[f"{field}_truncated"] = bool(original)
+        if _serialized_bytes(item) <= item_budget:
+            return item
+
+    # With the endpoint's 64 KiB / 50-row contract the fixed projection fits
+    # comfortably. Keep a deterministic minimal fallback so that future shape
+    # growth still cannot escape the hard response ceiling.
+    return {
+        "id": message_id,
+        "type": str(item.get("type") or "")[:40] or None,
+        "from": str(item.get("from") or "")[:32] or None,
+        "sequence": item.get("sequence"),
+        "surface": str(item.get("surface") or "")[:32] or None,
+        "handling_state": (
+            str(item.get("handling_state") or "")[:32] or None
+        ),
+        "status": str(item.get("status") or "")[:32] or None,
+        "content": "",
+        "resolution": None,
+        "context": {"projection_truncated": True},
+        "content_truncated": bool(item.get("content_truncated")),
+        "resolution_truncated": bool(item.get("resolution_truncated")),
+        "context_truncated": True,
+        "context_refetch_available": False,
+        "refetch": _resident_conversation_refetch(
+            project_id=project_id,
+            message_id=message_id,
+        ),
+    }
+
+
+def _bounded_resident_conversation_items(
+    rows: tuple[ProjectMessage, ...],
+    *,
+    project_id: uuid.UUID,
+    serialized_bytes_budget: int,
+    text_bytes_budget: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Project a page under aggregate serialized and UTF-8 text ceilings."""
+
+    items: list[dict[str, Any]] = []
+    remaining = serialized_bytes_budget
+    remaining_text = text_bytes_budget
+    truncated_items = 0
+    for index, row in enumerate(rows):
+        rows_left = len(rows) - index
+        # Reserve one byte for the JSON-array comma; doing so for the final
+        # row too is harmless and makes the aggregate proof simple.
+        item_budget = max(0, (remaining // rows_left) - 1) if rows_left else 0
+        text_item_budget = (
+            max(0, remaining_text // rows_left) if rows_left else 0
+        )
+        content_budget = min(
+            _RESIDENT_CONVERSATION_CONTENT_CAP,
+            max(0, (item_budget * 4) // 5),
+            max(0, (text_item_budget * 4) // 5),
+        )
+        content = row.content or ""
+        bounded_content = _utf8_prefix(content, max_bytes=content_budget)
+        content_truncated = bounded_content != content
+
+        resolution = row.resolution or ""
+        resolution_budget = min(
+            _RESIDENT_CONVERSATION_RESOLUTION_CAP,
+            max(0, item_budget - len(bounded_content.encode("utf-8"))),
+            max(0, text_item_budget - len(bounded_content.encode("utf-8"))),
+        )
+        bounded_resolution = _utf8_prefix(resolution, max_bytes=resolution_budget)
+        resolution_truncated = bounded_resolution != resolution
+
+        item = agent_thread_message_dict(row)
+        # Use the existing compact/sanitized preview context. The canonical
+        # content and resolution bounds above are independent and explicit.
+        item["context"] = message_preview_dict(row).get("context", {})
+        item["content"] = bounded_content
+        item["resolution"] = bounded_resolution or None
+        item["content_truncated"] = content_truncated
+        item["resolution_truncated"] = resolution_truncated
+        item["context_truncated"] = False
+        if content_truncated or resolution_truncated:
+            item["refetch"] = _resident_conversation_refetch(
+                project_id=project_id,
+                message_id=str(row.id),
+            )
+
+        # Context has its own projection cap, but 50 individually-valid rows
+        # can still exceed a response budget. Prefer a truthful compact context
+        # over dropping rows or returning an oversized page.
+        if _serialized_bytes(item) > item_budget:
+            item["context"] = {"projection_truncated": True}
+            item["context_truncated"] = True
+            # The canonical agent message refetch intentionally returns full
+            # content/resolution but not arbitrary durable context, so do not
+            # over-promise a context recovery path.
+            item["context_refetch_available"] = False
+
+        if _serialized_bytes(item) > item_budget:
+            item["content"] = ""
+            item["resolution"] = None
+            item["content_truncated"] = bool(content)
+            item["resolution_truncated"] = bool(resolution)
+            fixed_size = _serialized_bytes(item)
+            text_budget = min(
+                text_item_budget,
+                max(0, item_budget - fixed_size),
+            )
+            content_budget = min(
+                _RESIDENT_CONVERSATION_CONTENT_CAP,
+                (text_budget * 4) // 5,
+            )
+            item["content"] = _utf8_prefix(content, max_bytes=content_budget)
+            resolution_budget = min(
+                _RESIDENT_CONVERSATION_RESOLUTION_CAP,
+                max(0, text_budget - len(item["content"].encode("utf-8"))),
+            )
+            item["resolution"] = _utf8_prefix(
+                resolution, max_bytes=resolution_budget
+            ) or None
+            item["content_truncated"] = item["content"] != content
+            item["resolution_truncated"] = (
+                (item["resolution"] or "") != resolution
+            )
+
+        item = _fit_resident_item_to_serialized_budget(
+            item,
+            item_budget=item_budget,
+            project_id=project_id,
+            message_id=str(row.id),
+        )
+
+        if (
+            item["content_truncated"]
+            or item["resolution_truncated"]
+            or item["context_truncated"]
+        ):
+            truncated_items += 1
+        retained_text_bytes = len(item["content"].encode("utf-8")) + len(
+            (item["resolution"] or "").encode("utf-8")
+        )
+        remaining_text -= retained_text_bytes
+        remaining -= _serialized_bytes(item) + 1
+        items.append(item)
+    return items, truncated_items
+
+
 @router.get("/projects/{project_id}/compute-environment")
 @limiter.limit("30/minute")
 async def agent_fetch_compute_environment(
@@ -949,6 +1286,95 @@ async def agent_fetch_directions_list(
         if isinstance(d, dict)
     ]
     return {"status": "success", "data": directions}
+
+
+@router.get("/projects/{project_id}/strategic-conversation")
+@limiter.limit("60/minute")
+async def agent_fetch_strategic_conversation(
+    request: Request,
+    project_id: uuid.UUID,
+    resident_session_id: str = Query(..., min_length=1, max_length=255),
+    worker_generation: int = Query(..., ge=1),
+    worker_incarnation_id: uuid.UUID = Query(...),
+    include_message_id: uuid.UUID | None = Query(None),
+    before_sequence: int | None = Query(None, ge=1),
+    after_sequence: int | None = Query(None, ge=0),
+    limit: int = Query(
+        20,
+        ge=1,
+        le=_RESIDENT_CONVERSATION_MAX_LIMIT,
+    ),
+    search: str | None = Query(None, min_length=2, max_length=200),
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return canonical open and handled Strategic conversation history.
+
+    This is a read/query surface, not the live open-message poll. It deliberately
+    shares the admin transcript's visibility predicate, search behavior, cursor
+    semantics, and response shape. Resident task, project, session, and worker
+    generation are all backend-fenced before any transcript row is read.
+    """
+
+    await _authorize_resident_conversation_reader(
+        session,
+        project_id,
+        token,
+        resident_session_id=resident_session_id,
+        worker_generation=worker_generation,
+        worker_incarnation_id=worker_incarnation_id,
+    )
+    normalized_search = (search or "").strip() or None
+    if (
+        include_message_id is not None
+        and (
+            before_sequence is not None
+            or after_sequence is not None
+            or normalized_search is not None
+        )
+    ) or (
+        after_sequence is not None
+        and (before_sequence is not None or normalized_search is not None)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="target and after selectors are exclusive; search may page with before",
+        )
+    try:
+        page = await query_strategic_conversation(
+            session,
+            project_id,
+            include_message_id=include_message_id,
+            before_sequence=before_sequence,
+            after_sequence=after_sequence,
+            limit=limit,
+            search=normalized_search,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result: dict[str, Any] = {
+        "limit": page.limit,
+        "has_more": page.has_more,
+        "next_before_sequence": page.next_before_sequence,
+        "next_after_sequence": page.next_after_sequence,
+        "target_found": page.target_found,
+        "order": page.order,
+        "items": [],
+        "response_text_cap": _RESIDENT_CONVERSATION_AGGREGATE_TEXT_CAP,
+        "response_bytes_cap": _RESIDENT_CONVERSATION_RESPONSE_BYTES_CAP,
+        "truncated_item_count": 0,
+    }
+    items, truncated_item_count = _bounded_resident_conversation_items(
+        page.rows,
+        project_id=project_id,
+        serialized_bytes_budget=(
+            _RESIDENT_CONVERSATION_RESPONSE_BYTES_CAP - _serialized_bytes(result)
+        ),
+        text_bytes_budget=_RESIDENT_CONVERSATION_AGGREGATE_TEXT_CAP,
+    )
+    result["items"] = items
+    result["truncated_item_count"] = truncated_item_count
+    return result
 
 
 @router.get("/projects/{project_id}/messages/open")
@@ -1940,6 +2366,10 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "vision": None, "effective_purpose": None, "direction_counts": None,
     "max_active_directions": None,
     "open_message_count": None,
+    # Server-owned Fast activation contract — task payload configuration with
+    # no independent fetch path. These critical scalars are carried verbatim.
+    "typed_fast_enabled": None, "typed_fast_models": None,
+    "typed_fast_effort": None, "typed_fast_qualification": None,
     # High — dedicated fetch verbs
     "open_messages": "message",
     "directions_summary": "direction",

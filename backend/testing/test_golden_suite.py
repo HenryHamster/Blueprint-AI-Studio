@@ -33,6 +33,7 @@ VALID_TASK_TYPES: set[str] = {
     "plan",
     "research",
     "strategic_review",
+    "discovery_review",
     "design_doc_update",
     "security_audit",
     "qa",
@@ -58,6 +59,7 @@ VALID_TASK_TYPES: set[str] = {
     "capability_proof_trial",
     "criterion_coverage_trial",
     "walkthrough_e2e",
+    "memory_consolidation",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}

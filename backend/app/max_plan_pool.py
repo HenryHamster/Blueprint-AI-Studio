@@ -27,6 +27,7 @@ from app.providers.openai import (
     codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
 )
 from app.providers.registry import get_provider
+from app.task_capabilities import get_task_capability
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -589,6 +590,17 @@ def _resolve_routing_core(
     resolved_providers = _apply_routing_verdict(
         resolved_providers, task_type, runtime_config
     )
+    capability = get_task_capability(task_type)
+    if capability is not None and capability.allowed_providers is not None:
+        # A task capability's verified execution boundary is stricter than
+        # runtime routing.  In particular, an experiment verdict may reorder
+        # providers but must never widen a capability to a provider whose
+        # isolation contract has not been qualified.
+        resolved_providers = [
+            provider
+            for provider in resolved_providers
+            if provider in capability.allowed_providers
+        ]
     return {
         "providers": resolved_providers,
         "effort": effort if effort is not None else DEFAULT_EFFORT_LEVEL,
@@ -1172,42 +1184,42 @@ async def load_max_plan_pool():
                     proj_map = active_per_account_project.setdefault(acct_id, {})
                     proj_map[pid] = proj_map.get(pid, 0) + 1
 
-        # A live Conversation Fast Resident is a second model process without a
-        # Task row.  Its bounded lease is persisted inside the owning project's
-        # Resident state, so include it in the same active-concurrency ledger on
-        # every rebuild while deliberately NOT touching daily_task_count.  This
-        # is also the crash/restart reconciliation path: expired lease records
-        # disappear from the capacity floor without relying on an in-memory
-        # release callback surviving the coordinator.
+        # Resident auxiliary workers are model processes without Task rows. Their
+        # bounded leases are persisted inside the owning project's Resident state,
+        # so include every unexpired reserved lease in the concurrency ledger
+        # while deliberately NOT touching daily_task_count. This is also the
+        # crash/restart reconciliation path: expired records disappear from the
+        # capacity floor without relying on an in-memory release callback.
         now = _utcnow()
         call_rows = await session.execute(sql_select(Project.id, Project.vision))
         for project_id, vision in call_rows.all():
             resident = (vision or {}).get("_resident_strategic_session")
-            call = resident.get("call") if isinstance(resident, dict) else None
             if (
                 not isinstance(resident, dict)
                 or resident.get("status") != "active"
                 or bool(resident.get("stop_requested"))
-                or not isinstance(call, dict)
-                or call.get("status") != "active"
             ):
                 continue
-            raw_expiry = call.get("expires_at")
-            try:
-                expiry = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
-                if expiry.tzinfo is not None:
-                    expiry = expiry.replace(tzinfo=None) - expiry.utcoffset()
-            except (TypeError, ValueError):
-                continue
-            if expiry <= now:
-                continue
-            account_id = str(call.get("account_id") or "")
-            if not account_id or not bool(call.get("slot_reserved")):
-                continue
-            active_per_account[account_id] = active_per_account.get(account_id, 0) + 1
-            project_counts = active_per_account_project.setdefault(account_id, {})
-            pid = str(project_id)
-            project_counts[pid] = project_counts.get(pid, 0) + 1
+            for lease_key in ("call", "typed_fast"):
+                lease = resident.get(lease_key)
+                if not isinstance(lease, dict) or lease.get("status") != "active":
+                    continue
+                raw_expiry = lease.get("expires_at")
+                try:
+                    expiry = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
+                    if expiry.tzinfo is not None:
+                        expiry = expiry.replace(tzinfo=None) - expiry.utcoffset()
+                except (TypeError, ValueError):
+                    continue
+                if expiry <= now:
+                    continue
+                account_id = str(lease.get("account_id") or "")
+                if not account_id or not bool(lease.get("slot_reserved")):
+                    continue
+                active_per_account[account_id] = active_per_account.get(account_id, 0) + 1
+                project_counts = active_per_account_project.setdefault(account_id, {})
+                pid = str(project_id)
+                project_counts[pid] = project_counts.get(pid, 0) + 1
 
         # Preserve in-memory usage-meter state across the periodic rebuild —
         # this loader runs every ~300s from the orchestrator cycle, and the
@@ -4677,6 +4689,24 @@ async def select_llm_runtime_for_task(
         explicit_model, runtime_config
     )
     routing_task_type = _task_type(task)
+    capability = get_task_capability(routing_task_type)
+    hard_allowed_providers = (
+        capability.allowed_providers
+        if capability is not None
+        else None
+    )
+    if hard_allowed_providers is not None:
+        # `llm_provider` and model preferences can be retained from an earlier
+        # claim.  Do not let that durable runtime identity bypass a newly
+        # enforced capability boundary on retry or after routing changes.
+        if explicit_provider not in hard_allowed_providers:
+            explicit_provider = None
+            explicit_model = None
+        model_preferences = [
+            preference
+            for preference in model_preferences
+            if preference.get("provider") in hard_allowed_providers
+        ]
     # Resolve project_id: explicit parameter takes precedence, then task attribute.
     _resolved_project_id = (
         project_id
@@ -5156,8 +5186,8 @@ async def reserve_max_plan_account(account_id: str) -> bool:
         return True
 
 
-async def reserve_max_plan_call_slot(account_id: str, *, project_id: str) -> bool:
-    """Reserve a Fast-Resident concurrency slot without charging a task quota.
+async def reserve_max_plan_auxiliary_slot(account_id: str, *, project_id: str) -> bool:
+    """Reserve one non-Task Resident model-process slot without task quota use.
 
     The caller supplies the already-assigned Workday account.  Reusing that
     account is permitted only when both its global and project concurrent caps
@@ -5182,8 +5212,8 @@ async def reserve_max_plan_call_slot(account_id: str, *, project_id: str) -> boo
         return True
 
 
-async def release_max_plan_call_slot(account_id: str | None, *, project_id: str | None) -> None:
-    """Idempotently release a call-only slot; daily task use is untouched."""
+async def release_max_plan_auxiliary_slot(account_id: str | None, *, project_id: str | None) -> None:
+    """Idempotently release a non-Task Resident slot; daily task use is untouched."""
     if not account_id:
         return
     async with _max_plan_pool_lock:
@@ -5194,6 +5224,16 @@ async def release_max_plan_call_slot(account_id: str | None, *, project_id: str 
         if project_id:
             project_state = account.setdefault("project_state", {}).setdefault(project_id, {})
             project_state["active_tasks"] = max(0, int(project_state.get("active_tasks") or 0) - 1)
+
+
+async def reserve_max_plan_call_slot(account_id: str, *, project_id: str) -> bool:
+    """Compatibility wrapper for the bounded call Fast-Resident slot."""
+    return await reserve_max_plan_auxiliary_slot(account_id, project_id=project_id)
+
+
+async def release_max_plan_call_slot(account_id: str | None, *, project_id: str | None) -> None:
+    """Compatibility wrapper for the bounded call Fast-Resident slot."""
+    await release_max_plan_auxiliary_slot(account_id, project_id=project_id)
 
 
 def build_account_retarget_manifest(

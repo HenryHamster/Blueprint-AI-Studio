@@ -1537,6 +1537,7 @@ class TestOnboardStrategicIntentSeed:
         pm = parse_problem_model(project.problem_model)
         assert pm.intent.purpose == goal
         assert pm.intent.current_focus == goal
+        assert pm.intent.user_purpose == goal
         assert pm.last_updated_by == "user"
         assert pm.intent.source is not None
         assert pm.intent.source.type == "user_message"

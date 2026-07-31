@@ -33,6 +33,7 @@ session seam both depend on.
 
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -106,6 +107,7 @@ _RESIDENT_WORKER_INCARNATION_PROTOCOL = 1
 # generation is the public-reply fence: every call-owned mutation must present
 # the exact id + generation recorded here.
 RESIDENT_CALL_KEY = "call"
+RESIDENT_TYPED_FAST_KEY = "typed_fast"
 CALL_STATUS_ACTIVE = "active"
 CALL_STATUS_ENDED = "ended"
 CALL_STATUS_EXPIRED = "expired"
@@ -121,6 +123,9 @@ _RESIDENT_CALL_USAGE_LIMITS = {
     "provider_errors": 100_000,
 }
 _RESIDENT_WORKER_INCARNATION_LEASE_SECONDS = 180
+_DEFAULT_TYPED_FAST_LEASE_TTL_SECONDS = 300
+_TYPED_FAST_LEASE_TTL_MIN_SECONDS = 30
+_TYPED_FAST_LEASE_TTL_MAX_SECONDS = 900
 
 # ``Project.vision`` key holding the reason the *last* Workday auto-start was
 # blocked or failed (surfaced by the strategic read model so the operator sees
@@ -157,6 +162,49 @@ RESIDENT_SESSION_REASON_RUNNER_OFFLINE = "runner_offline"
 # the effective cap self-documenting rather than silently disagreeing with it.
 STRATEGIC_SESSION_MAX_UNATTENDED_SETTING = "strategic_session_max_unattended_seconds"
 _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 7200  # 2h
+
+# Typed Fast is activated by a server-owned Resident payload contract, never by
+# an undocumented environment toggle on an individual runner.  The model map
+# is derived from the existing fleet runtime configuration so it follows an
+# operator's provider tier changes without duplicating provider model choices.
+_TYPED_FAST_QUALIFICATION = "claude-warm-stream-json:phase0-v1"
+_TYPED_FAST_COMPATIBLE_PROVIDERS = ("anthropic", "zai", "deepseek")
+
+
+def _resident_typed_fast_payload() -> dict[str, Any]:
+    """Return the trim-proof Fast launch contract for every Workday Resident.
+
+    The foreground child remains restricted and may still decline readiness;
+    this only makes the server-selected activation intent explicit at task
+    birth and on adoption.  The agent then safely falls back to Workday if the
+    qualified adapter cannot start.
+    """
+    qualification = os.getenv("CALL_FOREGROUND_QUALIFICATION", "").strip()
+    if qualification != _TYPED_FAST_QUALIFICATION:
+        return {"typed_fast_enabled": False}
+
+    tier_map = runtime_config.get("provider_tier_model_map")
+    models: dict[str, str] = {}
+    for provider in _TYPED_FAST_COMPATIBLE_PROVIDERS:
+        configured = (
+            tier_map.get(provider, {}).get("haiku")
+            if isinstance(tier_map, dict) and isinstance(tier_map.get(provider), dict)
+            else None
+        )
+        if isinstance(configured, str) and configured.strip():
+            models[provider] = configured.strip()
+    anthropic_low = (
+        runtime_config.get("provider_settings_by_effort", {})
+        .get("anthropic", {})
+        .get("low", {})
+    )
+    effort = anthropic_low.get("effort") if isinstance(anthropic_low, dict) else None
+    return {
+        "typed_fast_enabled": True,
+        "typed_fast_models": models,
+        "typed_fast_effort": effort if isinstance(effort, str) and effort else "low",
+        "typed_fast_qualification": qualification,
+    }
 
 # A task row can remain IN_PROGRESS long after its resident subprocess or runner
 # disappeared. Workday's synchronous ensure path must not trust that row
@@ -383,6 +431,13 @@ def read_resident_call(vision: dict[str, Any] | None) -> dict[str, Any] | None:
     return call if isinstance(call, dict) else None
 
 
+def read_resident_typed_fast(vision: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the nested typed-Fast model-process lease, if any."""
+    session_blob = read_resident_session(vision)
+    lease = (session_blob or {}).get(RESIDENT_TYPED_FAST_KEY)
+    return lease if isinstance(lease, dict) else None
+
+
 def legacy_resident_worker_incarnation(
     task_id: uuid.UUID | str,
     worker_generation: int,
@@ -509,6 +564,41 @@ def resident_call_is_active(
         return False
     expires_at = _parse_iso_naive(call.get("expires_at"))
     return expires_at is not None and expires_at > (now or _utcnow())
+
+
+def resident_typed_fast_is_active(
+    lease: dict[str, Any] | None, *, now: datetime | None = None
+) -> bool:
+    """True only for an unexpired active typed-Fast lease."""
+    if not isinstance(lease, dict) or lease.get("status") != CALL_STATUS_ACTIVE:
+        return False
+    expires_at = _parse_iso_naive(lease.get("expires_at"))
+    return expires_at is not None and expires_at > (now or _utcnow())
+
+
+def resident_typed_fast_snapshot(
+    vision: dict[str, Any] | None, *, now: datetime | None = None
+) -> dict[str, Any] | None:
+    """Return the non-secret typed-Fast lease projection for its Resident."""
+    lease = read_resident_typed_fast(vision)
+    if lease is None:
+        return None
+    current_now = now or _utcnow()
+    status = lease.get("status")
+    if status == CALL_STATUS_ACTIVE and not resident_typed_fast_is_active(lease, now=current_now):
+        status = CALL_STATUS_EXPIRED
+    return {
+        "lease_id": lease.get("lease_id"),
+        "generation": int(lease.get("generation") or 1),
+        "kind": "typed_fast",
+        "status": status,
+        "started_at": lease.get("started_at"),
+        "updated_at": lease.get("updated_at"),
+        "expires_at": lease.get("expires_at"),
+        "last_heartbeat_at": lease.get("last_heartbeat_at"),
+        "worker_task_id": lease.get("worker_task_id"),
+        "worker_generation": int(lease.get("worker_generation") or 1),
+    }
 
 
 def resident_call_snapshot(
@@ -829,6 +919,201 @@ async def renew_resident_call_lease(
             holder["release_account_id"], project_id=str(project.id)
         )
     return resident_call_snapshot(project.vision) or {}
+
+
+def _bounded_typed_fast_lease_ttl_seconds(value: int | None) -> int:
+    try:
+        parsed = int(value or _DEFAULT_TYPED_FAST_LEASE_TTL_SECONDS)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_TYPED_FAST_LEASE_TTL_SECONDS
+    return min(_TYPED_FAST_LEASE_TTL_MAX_SECONDS, max(_TYPED_FAST_LEASE_TTL_MIN_SECONDS, parsed))
+
+
+async def acquire_resident_typed_fast_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+    incarnation_id: uuid.UUID | None,
+    account_id: str,
+    ttl_seconds: int | None = None,
+) -> tuple[dict[str, Any], str | None, bool]:
+    """Persist the additional typed-Fast model-process slot behind its owner fence."""
+    now = _utcnow()
+    now_iso = now.isoformat()
+    ttl = _bounded_typed_fast_lease_ttl_seconds(ttl_seconds)
+    holder: dict[str, Any] = {"lease": None, "expired_account_id": None, "created": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        if (
+            not resident_session_is_active(resident)
+            or str((resident or {}).get("task_id")) != str(task_id)
+            or int((resident or {}).get("worker_generation") or 1) != worker_generation
+            or not resident_worker_incarnation_is_current(
+                vision,
+                task_id=task_id,
+                worker_generation=worker_generation,
+                incarnation_id=incarnation_id,
+                now=now,
+            )
+        ):
+            raise HTTPException(status_code=409, detail="Resident process incarnation superseded")
+        existing = resident.get(RESIDENT_TYPED_FAST_KEY)
+        if resident_typed_fast_is_active(existing, now=now):
+            if (
+                str(existing.get("worker_task_id")) != str(task_id)
+                or int(existing.get("worker_generation") or 1) != worker_generation
+                or str(existing.get("account_id") or "") != account_id
+            ):
+                raise HTTPException(status_code=409, detail="Typed Fast lease superseded")
+            holder["lease"] = dict(existing)
+            return
+        if isinstance(existing, dict) and existing.get("status") == CALL_STATUS_ACTIVE:
+            holder["expired_account_id"] = str(existing.get("account_id") or "") or None
+        prior_generation = int(existing.get("generation") or 0) if isinstance(existing, dict) else 0
+        lease = {
+            "lease_id": f"typed-fast-{uuid.uuid4().hex[:16]}",
+            "generation": prior_generation + 1,
+            "kind": "typed_fast",
+            "status": CALL_STATUS_ACTIVE,
+            "started_at": now_iso,
+            "updated_at": now_iso,
+            "expires_at": (now + timedelta(seconds=ttl)).isoformat(),
+            "last_heartbeat_at": now_iso,
+            "worker_task_id": str(task_id),
+            "worker_generation": worker_generation,
+            "worker_incarnation_id": str(incarnation_id) if incarnation_id else None,
+            "account_id": account_id,
+            "project_id": str(project.id),
+            "slot_reserved": True,
+        }
+        resident[RESIDENT_TYPED_FAST_KEY] = lease
+        vision[RESIDENT_SESSION_KEY] = resident
+        holder["lease"] = dict(lease)
+        holder["created"] = True
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    return dict(holder["lease"]), holder["expired_account_id"], bool(holder["created"])
+
+
+async def release_resident_typed_fast_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    lease_id: str | None = None,
+    generation: int | None = None,
+    task_id: uuid.UUID | str | None = None,
+    worker_generation: int | None = None,
+    incarnation_id: uuid.UUID | None = None,
+    reason: str = "ended",
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Fence and retire the typed-Fast slot before releasing pool capacity."""
+    now_iso = _utcnow().isoformat()
+    holder: dict[str, Any] = {"lease": None, "account_id": None, "changed": False}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        existing = (resident or {}).get(RESIDENT_TYPED_FAST_KEY)
+        if not isinstance(existing, dict):
+            return
+        if lease_id is not None and str(existing.get("lease_id")) != str(lease_id):
+            raise HTTPException(status_code=409, detail="Typed Fast lease superseded")
+        if generation is not None and int(existing.get("generation") or 0) != generation:
+            raise HTTPException(status_code=409, detail="Typed Fast lease generation superseded")
+        if task_id is not None and not resident_worker_incarnation_is_current(
+            vision,
+            task_id=task_id,
+            worker_generation=worker_generation or int(existing.get("worker_generation") or 1),
+            incarnation_id=incarnation_id,
+            now=_utcnow(),
+        ):
+            raise HTTPException(status_code=409, detail="Resident process incarnation superseded")
+        holder["lease"] = dict(existing)
+        if existing.get("status") == CALL_STATUS_ACTIVE:
+            holder["account_id"] = str(existing.get("account_id") or "") or None
+            existing["status"] = (
+                CALL_STATUS_EXPIRED
+                if reason in {"expired", "readiness_failed"}
+                else CALL_STATUS_ENDED
+            )
+            existing["ended_at"] = now_iso
+            existing["updated_at"] = now_iso
+            existing["failure"] = reason if reason != "ended" else None
+            existing["slot_reserved"] = False
+            resident[RESIDENT_TYPED_FAST_KEY] = existing
+            vision[RESIDENT_SESSION_KEY] = resident
+            holder["changed"] = True
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    if holder["lease"] is not None:
+        await session.commit()
+        await session.refresh(project)
+    return holder["lease"], holder["account_id"], bool(holder["changed"])
+
+
+async def renew_resident_typed_fast_lease(
+    session: AsyncSession,
+    project: Project,
+    *,
+    task_id: str,
+    worker_generation: int,
+    incarnation_id: uuid.UUID | None,
+    lease_id: str,
+    generation: int,
+    ttl_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Renew the exact typed Fast lease; a stale child cannot retain capacity."""
+    now = _utcnow()
+    now_iso = now.isoformat()
+    ttl = _bounded_typed_fast_lease_ttl_seconds(ttl_seconds)
+    holder: dict[str, Any] = {"release_account_id": None}
+
+    def _apply(vision: dict[str, Any]) -> None:
+        resident = read_resident_session(vision)
+        lease = (resident or {}).get(RESIDENT_TYPED_FAST_KEY)
+        if (
+            not resident_session_is_active(resident)
+            or not isinstance(lease, dict)
+            or str(lease.get("lease_id")) != lease_id
+            or int(lease.get("generation") or 0) != generation
+            or str(lease.get("worker_task_id")) != str(task_id)
+            or int(lease.get("worker_generation") or 1) != worker_generation
+            or not resident_worker_incarnation_is_current(
+                vision,
+                task_id=task_id,
+                worker_generation=worker_generation,
+                incarnation_id=incarnation_id,
+                now=now,
+            )
+            or lease.get("status") != CALL_STATUS_ACTIVE
+        ):
+            raise HTTPException(status_code=409, detail="Typed Fast lease superseded")
+        if not resident_typed_fast_is_active(lease, now=now):
+            lease["status"] = CALL_STATUS_EXPIRED
+            lease["ended_at"] = now_iso
+            lease["updated_at"] = now_iso
+            lease["failure"] = "lease_expired"
+            lease["slot_reserved"] = False
+            holder["release_account_id"] = str(lease.get("account_id") or "") or None
+        else:
+            lease["last_heartbeat_at"] = now_iso
+            lease["updated_at"] = now_iso
+            lease["expires_at"] = (now + timedelta(seconds=ttl)).isoformat()
+        resident[RESIDENT_TYPED_FAST_KEY] = lease
+        vision[RESIDENT_SESSION_KEY] = resident
+
+    await with_vision_locked(session, project.id, _apply, skip_locked=False)
+    await session.commit()
+    await session.refresh(project)
+    if holder["release_account_id"]:
+        from app.max_plan_pool import release_max_plan_auxiliary_slot
+
+        await release_max_plan_auxiliary_slot(holder["release_account_id"], project_id=str(project.id))
+    return resident_typed_fast_snapshot(project.vision) or {}
 
 
 async def record_resident_call_playout_receipt(
@@ -2093,6 +2378,7 @@ async def _spawn_resident_strategic_task(
             decisions_register=decisions_register,
             blacklisted_accounts=blacklisted_accounts,
         ),
+        extra_payload=_resident_typed_fast_payload(),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
         # content/tree fetches, branch-SHA lookups, recent-intervention ancestry,
@@ -2407,6 +2693,12 @@ def _stamp_resident_context(
     and the task keeps its existing status / vm id — unchanged from before.
     """
     context = dict(task.context or {})
+    payloads = list(task.payloads or [])
+    if payloads:
+        first_payload = dict(task.first_payload or {})
+        first_payload.update(_resident_typed_fast_payload())
+        task.payloads = [first_payload, *payloads[1:]]
+        flag_modified(task, "payloads")
     context["_resident_session"] = True
     context["strategic_session_id"] = session_id
     context["_resident_worker_generation"] = worker_generation
@@ -3506,7 +3798,7 @@ async def stop_resident_session(
     # so autoflush locked the task row first (Task→Project, the opposing order).
     # Ending the blob first and locking the task only while the project lock is
     # still held makes stop strictly Project→Task, so neither path can deadlock.
-    ended_holder: dict[str, dict[str, Any] | None] = {"blob": None}
+    ended_holder: dict[str, Any] = {"blob": None, "typed_fast_account_id": None}
 
     def _release_and_end(vision: dict[str, Any]) -> None:
         # Release the continuation lease (the resident session is over) and mark
@@ -3534,6 +3826,17 @@ async def stop_resident_session(
             "last_action": "Session stopped by operator",
             "next_review_at": None,
         }
+        typed_fast = ended.get(RESIDENT_TYPED_FAST_KEY)
+        if isinstance(typed_fast, dict) and typed_fast.get("status") == CALL_STATUS_ACTIVE:
+            ended_holder["typed_fast_account_id"] = (
+                str(typed_fast.get("account_id") or "") or None
+            )
+            typed_fast["status"] = CALL_STATUS_ENDED
+            typed_fast["ended_at"] = now_iso
+            typed_fast["updated_at"] = now_iso
+            typed_fast["failure"] = "parent_stopped"
+            typed_fast["slot_reserved"] = False
+            ended[RESIDENT_TYPED_FAST_KEY] = typed_fast
         vision[RESIDENT_SESSION_KEY] = ended
         ended_holder["blob"] = ended
 
@@ -3614,6 +3917,13 @@ async def stop_resident_session(
 
     await session.commit()
     await session.refresh(project)
+    typed_fast_account_id = ended_holder["typed_fast_account_id"]
+    if typed_fast_account_id:
+        from app.max_plan_pool import release_max_plan_auxiliary_slot
+
+        await release_max_plan_auxiliary_slot(
+            typed_fast_account_id, project_id=str(project.id)
+        )
     logger.info(
         "[RESIDENT_SESSION] stopped session for project %s (task %s)",
         project.id,
@@ -4915,6 +5225,9 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     call_ttl_seconds: int | None = None
     call_ready: bool = False
     call_usage: dict[str, Any] | None = None
+    typed_fast_lease_id: str | None = None
+    typed_fast_generation: int | None = None
+    typed_fast_ttl_seconds: int | None = None
     conversation_claim_id: uuid.UUID | None = None
     conversation_claim_incarnation: uuid.UUID | None = None
     conversation_claim_lease_seconds: int = Field(default=45, ge=15, le=300)
@@ -4927,6 +5240,109 @@ class ResidentCallSpeechCredentialsRequest(BaseModel):
     resident_incarnation_id: uuid.UUID | None = None
     call_id: str
     call_generation: int
+
+
+class ResidentTypedFastLeaseRequest(BaseModel):
+    task_id: str
+    worker_generation: int = Field(default=1, ge=1)
+    resident_incarnation_id: uuid.UUID | None = None
+    lease_id: str | None = Field(default=None, min_length=1, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    reason: str = Field(default="ended", max_length=128)
+
+
+@router.post("/projects/{project_id}/strategic-session/typed-fast-lease/acquire")
+@limiter.limit("30/minute")
+async def acquire_agent_typed_fast_lease(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ResidentTypedFastLeaseRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Reserve and fence Typed Fast before the agent may launch its model child."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    project = await _resolve_agent_project(project_id, token, session)
+    task = await session.get(Task, uuid.UUID(payload.task_id))
+    if task is None or (task.context or {}).get("_resident_session") is not True:
+        raise HTTPException(status_code=409, detail="Typed Fast requires a Resident task")
+    from app.max_plan_pool import (
+        get_task_llm_account_id,
+        release_max_plan_auxiliary_slot,
+        reserve_max_plan_auxiliary_slot,
+    )
+
+    account_id = get_task_llm_account_id(task)
+    if not account_id:
+        return {"acquired": False, "reason": "no_pooled_account"}
+    existing = read_resident_typed_fast(project.vision)
+    if isinstance(existing, dict) and existing.get("status") == CALL_STATUS_ACTIVE and not resident_typed_fast_is_active(existing):
+        _lease, stale_account_id, changed = await release_resident_typed_fast_lease(
+            session,
+            project,
+            lease_id=str(existing.get("lease_id") or ""),
+            generation=int(existing.get("generation") or 0),
+            reason="expired",
+        )
+        if changed and stale_account_id:
+            await release_max_plan_auxiliary_slot(stale_account_id, project_id=str(project.id))
+        existing = read_resident_typed_fast(project.vision)
+    reserved_here = False
+    if not resident_typed_fast_is_active(existing):
+        reserved_here = await reserve_max_plan_auxiliary_slot(account_id, project_id=str(project.id))
+        if not reserved_here:
+            return {"acquired": False, "reason": "no_concurrent_capacity"}
+    try:
+        lease, expired_account_id, created = await acquire_resident_typed_fast_lease(
+            session,
+            project,
+            task_id=payload.task_id,
+            worker_generation=payload.worker_generation,
+            incarnation_id=payload.resident_incarnation_id,
+            account_id=account_id,
+        )
+    except Exception:
+        if reserved_here:
+            await release_max_plan_auxiliary_slot(account_id, project_id=str(project.id))
+        raise
+    if reserved_here and not created:
+        await release_max_plan_auxiliary_slot(account_id, project_id=str(project.id))
+    if expired_account_id:
+        await release_max_plan_auxiliary_slot(expired_account_id, project_id=str(project.id))
+    return {"acquired": True, "lease": resident_typed_fast_snapshot(project.vision)}
+
+
+@router.post("/projects/{project_id}/strategic-session/typed-fast-lease/release")
+@limiter.limit("30/minute")
+async def release_agent_typed_fast_lease(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ResidentTypedFastLeaseRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Release the exact Typed Fast slot on normal child or parent shutdown."""
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    if payload.lease_id is None or payload.generation is None:
+        raise HTTPException(status_code=400, detail="typed Fast lease id and generation are required")
+    project = await _resolve_agent_project(project_id, token, session)
+    _lease, account_id, changed = await release_resident_typed_fast_lease(
+        session,
+        project,
+        lease_id=payload.lease_id,
+        generation=payload.generation,
+        task_id=payload.task_id,
+        worker_generation=payload.worker_generation,
+        incarnation_id=payload.resident_incarnation_id,
+        reason=payload.reason,
+    )
+    if changed and account_id:
+        from app.max_plan_pool import release_max_plan_auxiliary_slot
+
+        await release_max_plan_auxiliary_slot(account_id, project_id=str(project.id))
+    return {"released": changed}
 
 
 @router.post("/projects/{project_id}/strategic-call/speech-credentials")
@@ -5077,6 +5493,31 @@ async def resident_session_heartbeat(
         )
     else:
         response["call"] = resident_call_snapshot(project.vision)
+    if payload.typed_fast_lease_id is not None or payload.typed_fast_generation is not None:
+        if not payload.typed_fast_lease_id or payload.typed_fast_generation is None:
+            raise HTTPException(
+                status_code=400,
+                detail="typed_fast_lease_id and typed_fast_generation must be supplied together",
+            )
+        try:
+            response["typed_fast"] = await renew_resident_typed_fast_lease(
+                session,
+                project,
+                task_id=payload.task_id,
+                worker_generation=payload.worker_generation,
+                incarnation_id=payload.resident_incarnation_id,
+                lease_id=payload.typed_fast_lease_id,
+                generation=payload.typed_fast_generation,
+                ttl_seconds=payload.typed_fast_ttl_seconds,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            # Typed Fast is optional acceleration. A fenced/lapsed child must
+            # fall back to Workday rather than make the parent heartbeat fail.
+            response["typed_fast"] = resident_typed_fast_snapshot(project.vision)
+    else:
+        response["typed_fast"] = resident_typed_fast_snapshot(project.vision)
     active_call = read_resident_call(project.vision)
     if (
         resident_call_is_active(active_call)

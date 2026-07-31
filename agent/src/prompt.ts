@@ -263,6 +263,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'review',           // Uses review-fix.ts bespoke prompt assembly
   'plan',             // Uses research-plan.ts bespoke prompt assembly
   'research',         // Uses research-plan.ts bespoke prompt assembly
+  'discovery_review', // Uses discovery-review.ts evidence-bound prompt assembly
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly
   'smoketest',        // Uses specialized.ts bespoke prompt assembly
   'design_doc_update', // Uses design-doc.ts bespoke prompt assembly
@@ -277,6 +278,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
   'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
   'criterion_coverage_trial', // Uses criterion-coverage-trial.ts; runs discovered covering tests directly, no Claude prompt
+  'memory_consolidation',     // Uses memory-consolidation.ts bespoke receipt-only prompt
   'walkthrough_e2e',        // Uses specialized.ts bespoke prompt assembly (live-stack walkthrough harness)
 ]);
 

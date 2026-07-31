@@ -11,6 +11,12 @@ export const FAST_CALL_TOOL_NAMES = [
   'mcp__call__show_display_blocks',
 ] as const;
 
+/** Typed conversation has no call-media/display capability. */
+export const FAST_TYPED_TOOL_NAMES = [
+  'mcp__call__complete_turn',
+  'mcp__call__request_workday',
+] as const;
+
 /** Environment names deliberately permitted to reach the foreground child. */
 const PROVIDER_ENV = new Set([
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_BASE_URL',
@@ -60,12 +66,15 @@ export function sanitizeForegroundEnvironment(source: NodeJS.ProcessEnv): NodeJS
   return result;
 }
 
-export function createForegroundResidentProfile(source = process.env): ForegroundResidentProfile {
+export function createForegroundResidentProfile(
+  source = process.env,
+  allowedTools: readonly string[] = FAST_CALL_TOOL_NAMES,
+): ForegroundResidentProfile {
   return {
     cwd: createForegroundWorkingDirectory(),
     env: sanitizeForegroundEnvironment(source),
     allowedEgress: ['provider', 'local-coordinator'],
-    allowedTools: [...FAST_CALL_TOOL_NAMES],
+    allowedTools: [...allowedTools],
   };
 }
 
@@ -120,6 +129,82 @@ export const claudeForegroundAdapter: ForegroundResidentAdapter = {
 };
 
 const CLAUDE_FOREGROUND_QUALIFICATION = 'claude-warm-stream-json:phase0-v1';
+const CLAUDE_COMPATIBLE_PROVIDERS = new Set(['anthropic', 'zai', 'deepseek']);
+
+export interface TypedFastRuntimeConfig {
+  activated: boolean;
+  reason: string;
+  model?: string;
+  effort?: string;
+  adapter: ForegroundResidentAdapter;
+}
+
+/** Backend-owned Resident payload contract for the restricted Fast child. */
+export interface TypedFastActivation {
+  enabled: boolean;
+  models?: Record<string, string>;
+  effort?: string;
+  qualification?: string;
+}
+
+/**
+ * Typed Fast is an explicitly provisioned capability, not something inferred
+ * from the mere existence of a Workday Resident.  This check happens before a
+ * durable public-turn claim, so an unavailable adapter leaves the operator
+ * input untouched for the normal Resident path.
+ */
+export function typedFastRuntimeConfig(
+  activation: boolean | TypedFastActivation,
+  env: NodeJS.ProcessEnv = process.env,
+  provider = getProviderRunner().provider,
+): TypedFastRuntimeConfig {
+  const payloadOwned = typeof activation === 'object';
+  const requested = payloadOwned ? activation.enabled === true : activation;
+  const payloadQualification = payloadOwned ? activation.qualification : undefined;
+  // The deployed Resident receives this exact qualification from the backend
+  // task payload. A payload-owned activation must never inherit a runner-local
+  // qualification; the boolean form preserves only the legacy call sites.
+  const adapter = payloadOwned
+    ? (
+        payloadQualification === CLAUDE_FOREGROUND_QUALIFICATION
+          ? { ...claudeForegroundAdapter, validation: 'qualified' as const }
+          : claudeForegroundAdapter
+      )
+    : configuredClaudeForegroundAdapter(env);
+  if (!requested) {
+    return { activated: false, reason: 'not requested', adapter };
+  }
+  if (adapter.validation !== 'qualified') {
+    return { activated: false, reason: 'foreground adapter is not qualification-approved', adapter };
+  }
+  if (!CLAUDE_COMPATIBLE_PROVIDERS.has(provider)) {
+    return {
+      activated: false,
+      reason: `active provider ${provider} has no qualified foreground adapter`,
+      adapter,
+    };
+  }
+  const payloadModel = payloadOwned ? activation.models?.[provider]?.trim() : undefined;
+  const model = payloadOwned
+    ? payloadModel
+    : (env.TYPED_FAST_MODEL?.trim() || (provider === 'anthropic' ? 'haiku' : undefined));
+  if (!model) {
+    return {
+      activated: false,
+      reason: `TYPED_FAST_MODEL is required for ${provider}`,
+      adapter,
+    };
+  }
+  return {
+    activated: true,
+    reason: 'qualified',
+    model,
+    effort: payloadOwned
+      ? (activation.effort?.trim() || 'low')
+      : (env.TYPED_FAST_EFFORT?.trim() || 'low'),
+    adapter,
+  };
+}
 
 /**
  * A deployment may enable only the adapter/benchmark contract it actually
@@ -206,7 +291,12 @@ export function assertForegroundLaunchIsRestricted(launch: ClaudeForegroundLaunc
   if (!launch.args.includes('--no-session-persistence')) {
     throw new Error('foreground launch must disable session persistence');
   }
-  for (const tool of FAST_CALL_TOOL_NAMES) {
+  for (const tool of launch.allowedTools) {
+    if (![...FAST_CALL_TOOL_NAMES].includes(tool as typeof FAST_CALL_TOOL_NAMES[number])) {
+      throw new Error(`foreground launch exposes unsupported tool ${tool}`);
+    }
+  }
+  for (const tool of FAST_TYPED_TOOL_NAMES) {
     if (!launch.allowedTools.includes(tool)) throw new Error(`foreground launch misses ${tool}`);
   }
   if (fs.existsSync(path.join(launch.cwd, '.git'))) throw new Error('foreground launch cwd is a repository');

@@ -1,0 +1,15 @@
+# Blueprint local PostgreSQL off-host backup schedule — systemd SYSTEM unit TEMPLATE
+
+[Unit]
+Description=Run Blueprint local PostgreSQL off-host backup twice daily
+Requires=blueprint-database.service
+After=blueprint-database.service
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=blueprint-database-backup.service
+
+[Install]
+WantedBy=timers.target

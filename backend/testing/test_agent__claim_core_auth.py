@@ -47,6 +47,50 @@ async def test_agent_claim_success(client: AsyncClient, db_session):
     assert task.status == TaskStatus.IN_PROGRESS
 
 
+@pytest.mark.asyncio
+async def test_agent_claim_exposes_bounded_discovery_cycle_lineage(
+    client: AsyncClient, db_session
+):
+    """A cycle-owned task receives the lineage and bounded prompt mode."""
+    from app.models import DiscoveryCycle
+
+    project = Project(name="Discovery Claim Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = DiscoveryCycle(
+        project_id=project.id,
+        direction_key="d-agent-claim",
+        outcome_kind="empirical",
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+    await db_session.refresh(cycle)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "answer the bounded bet"}],
+        vm_instance_id="agent-vm-discovery-claim",
+        discovery_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-discovery-claim")
+    resp = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": token}
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["discovery_cycle_id"] == str(cycle.id)
+    assert data["discovery_mode"] == "bounded_cycle"
+    assert data["payloads"][0]["discovery_cycle_id"] == str(cycle.id)
+    assert data["payloads"][0]["discovery_mode"] == "bounded_cycle"
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_agent_claim_unauthorized(client: AsyncClient):

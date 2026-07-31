@@ -73,6 +73,12 @@ DIRECTION_TEXT_MAX = 2000
 COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
 
+
+class DiscoveryResolutionPayload(BaseModel):
+    action: str = Field(pattern=r"^(continue|close)$")
+    next_bet: dict[str, Any] | None = None
+    note: str | None = Field(default=None, max_length=2000)
+
 # Module-level cache for per-direction metric enrichment. The four computation
 # functions (_compute_direction_quality_score, _compute_lifetime_generalized_outcome_state,
 # _compute_churn_metrics, _compute_lifetime_burn_metrics) are pure given the direction
@@ -1576,6 +1582,41 @@ async def decide_churn_retirement(
     return resp
 
 
+@router.post(
+    "/projects/{project_id}/directions/{direction_id}/discovery-resolution"
+)
+async def resolve_direction_discovery_cycle(
+    project_id: uuid.UUID,
+    direction_id: str,
+    payload: DiscoveryResolutionPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.discovery_review import resolve_discovery_cycle
+
+    try:
+        resolved = await resolve_discovery_cycle(
+            session,
+            project_id=project_id,
+            direction_key=direction_id,
+            action=payload.action,
+            next_bet=payload.next_bet,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await session.commit()
+    return {
+        "status": "resolved",
+        "action": payload.action,
+        "cycle_id": str(resolved.id),
+        "generation": resolved.generation,
+    }
+
+
 @router.post("/projects/{project_id}/directions/{direction_id}/research")
 async def create_direction_research_task(
     project_id: uuid.UUID,
@@ -1758,6 +1799,39 @@ async def create_direction_research_task(
         },
         "directions:research",
     )
+    from app.discovery_admission import (
+        DiscoveryCycleUnavailable,
+        ensure_discovery_cycle_for_research,
+    )
+    from app.shared_state import runtime_config as _runtime_config
+
+    try:
+        discovery_cycle = await ensure_discovery_cycle_for_research(
+            session,
+            project=project,
+            direction_key=direction_id,
+            direction=direction,
+            runtime_config=_runtime_config,
+        )
+    except DiscoveryCycleUnavailable as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if discovery_cycle is not None:
+        task_payload.update(
+            {
+                "discovery_generation": discovery_cycle.generation,
+                "discovery_phase": discovery_cycle.phase,
+                "discovery_intent_snapshot": dict(
+                    discovery_cycle.intent_snapshot or {}
+                ),
+                "discovery_bet_snapshot": dict(
+                    discovery_cycle.bet_snapshot or {}
+                ),
+            }
+        )
+        task_payload = validate_internal_payload(
+            task_payload,
+            "directions:discovery_cycle",
+        )
     # Atomic per-direction claim — the SAME key the autonomous loop stamps, so
     # a manual spawn and a concurrent autonomous tick (or a double-click) can
     # never BOTH create an active research cycle on this direction. The in-app
@@ -1766,6 +1840,9 @@ async def create_direction_research_task(
     idempotency_key = research_direction_claim_key(project.id, direction_id)
     new_task = Task(
         project_id=project.id,
+        discovery_cycle_id=(
+            discovery_cycle.id if discovery_cycle is not None else None
+        ),
         title=f"Research: {direction_text[:200]}",
         description=description,
         payloads=[task_payload],
@@ -1777,6 +1854,10 @@ async def create_direction_research_task(
     )
     session.add(new_task)
     try:
+        await session.flush()
+        if discovery_cycle is not None:
+            discovery_cycle.source_research_task_id = new_task.id
+            session.add(discovery_cycle)
         await session.commit()
     except IntegrityError:
         # Concurrent spawn (another manual request or the autonomous loop) won

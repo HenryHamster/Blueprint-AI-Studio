@@ -696,6 +696,35 @@ describe('park directives and warm continuation', () => {
     expect(performWarmRetarget).not.toHaveBeenCalled();
   });
 
+  it('does not reset or reuse the repository for a workspace:none warm claim', async () => {
+    process.env.TASK_ID = 'task-prior';
+    process.env.VM_INSTANCE_ID = 'vm-memory-worker';
+    const resetForNextRole = vi.fn();
+    const materializeClaimCredentialState = vi.fn();
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'task-prior',
+      priorPrNumber: 10,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole: () => Promise.resolve({
+        action: 'claim',
+        taskId: 'memory-consolidation-task',
+        agentToken: 'rotated-memory-jwt',
+        workspaceRequirement: 'none',
+      }),
+      resetForNextRole,
+      activateClaimedRole: vi.fn(),
+      materializeClaimCredentialState,
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: () => 'vm-memory-worker',
+    });
+
+    expect(result).toEqual({ action: 'continue' });
+    expect(resetForNextRole).not.toHaveBeenCalled();
+    expect(materializeClaimCredentialState).toHaveBeenCalledOnce();
+  });
+
   it('sets lane workspace env for a lane-phase warm claim', async () => {
     process.env.TASK_ID = 'task-prior';
     process.env.VM_INSTANCE_ID = 'vm-lane-claim';

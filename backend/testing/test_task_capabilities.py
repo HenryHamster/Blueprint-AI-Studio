@@ -136,6 +136,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "plan": "plan",
         "design_doc_update": "design_doc",
         "strategic_review": "strategic",
+        "discovery_review": "discovery_review",
         "research": "research",
         "security_audit": "security_audit",
         "perf": "perf",
@@ -160,6 +161,23 @@ def test_completion_handler_declarations_match_legacy_dispatch():
     for cap in TASK_CAPABILITIES:
         if cap.completion_needs_locked_project:
             assert cap.completion_handler is not None
+
+
+def test_discovery_review_is_a_normal_fail_closed_review_task():
+    cap = get_task_capability("discovery_review")
+
+    assert cap is not None
+    assert cap.agent_mode == "read_only"
+    assert cap.default_category == "strategic"
+    assert cap.output_kind == "verdict"
+    assert cap.evaluation == "structured-verdict"
+    assert cap.completion_handler == "discovery_review"
+    assert cap.user_launchable is False
+    assert cap.strategist_dispatch == "disabled"
+    assert cap.periodic_eligible is False
+    assert cap.completion_needs_locked_project is False
+    assert cap.strategic_phase is None
+    assert "discovery_review" not in STRATEGIC_TASK_TYPES
 
 
 def test_strategic_task_types_match_legacy_tuple():
@@ -223,6 +241,7 @@ def test_task_lifecycle_binds_every_declared_completion_handler():
             f"completion handler {handler_name!r} declared in the registry is "
             "not bound in task_lifecycle._process_post_commit"
         )
+    assert "block_failed_discovery_review(" in source
 
 
 def test_every_capability_declares_a_valid_evaluation_strategy():
@@ -540,6 +559,7 @@ _CATALOG_FIELDS = {
     "requires_code",
     "requires_web",
     "requires_compute",
+    "workspace_requirement",
     "evaluation_strategy",
     "cost_ceiling_usd",
 }
@@ -568,6 +588,7 @@ def test_task_type_catalog_covers_every_capability_with_all_fields():
         assert isinstance(entry["requires_code"], bool)
         assert isinstance(entry["requires_web"], bool)
         assert isinstance(entry["requires_compute"], bool)
+        assert entry["workspace_requirement"] in {"repo", "none"}
         assert entry["cost_ceiling_usd"] is None or isinstance(
             entry["cost_ceiling_usd"], (int, float)
         )
@@ -612,6 +633,7 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "evaluation_strategy": "none",
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
+        "workspace_requirement": "repo",
     }
 
 

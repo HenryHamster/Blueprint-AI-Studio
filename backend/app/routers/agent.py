@@ -1044,6 +1044,7 @@ async def claim_task(
     # reading task.context after an enrichment failure expired the instance.)
     _claimed_task_id = task.id
     _claimed_project_id = task.project_id
+    _claimed_discovery_cycle_id = task.discovery_cycle_id
     _claimed_context = dict(task.context or {})
     _claimed_payloads = list(task.payloads or [])
     _claimed_first_payload = task.first_payload
@@ -1135,6 +1136,9 @@ async def claim_task(
                 patched["promotion_target"] = project_promotion_target
             if project_integration_branch and not patched.get("integration_branch"):
                 patched["integration_branch"] = project_integration_branch
+            if _claimed_discovery_cycle_id is not None:
+                patched["discovery_cycle_id"] = str(_claimed_discovery_cycle_id)
+                patched["discovery_mode"] = "bounded_cycle"
             response_payloads.append(patched)
         else:
             response_payloads.append(entry)
@@ -1151,6 +1155,14 @@ async def claim_task(
         "description": task.description,
         "payloads": response_payloads,
         "context": safe_context,
+        "discovery_cycle_id": (
+            str(_claimed_discovery_cycle_id)
+            if _claimed_discovery_cycle_id is not None
+            else None
+        ),
+        "discovery_mode": (
+            "bounded_cycle" if _claimed_discovery_cycle_id is not None else None
+        ),
         "repo_map_holdback_fraction": get_effective_holdback_fraction(
             _project_verdicts, "repo_map", 0.0
         ),

@@ -1,0 +1,39 @@
+# Blueprint local PostgreSQL controller — systemd SYSTEM unit TEMPLATE
+#
+# The controller needs root visibility into the container-owned 0700 data
+# directory. Docker socket access is already root-equivalent; all container and
+# path validation remains in local_postgres_service.py.
+
+[Unit]
+Description=Blueprint node role: database
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+UMask=0077
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+PrivateDevices=true
+ExecStart=@PYTHON@ @EXECUTABLE@ start
+ExecStop=@PYTHON@ @EXECUTABLE@ stop
+EnvironmentFile=@ENV_FILE@
+StandardOutput=journal
+StandardError=journal
+KillSignal=SIGTERM
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -27,6 +27,7 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    StrategicContextEnvelopeSnapshot,
     Task,
     TaskStatus,
 )
@@ -40,6 +41,11 @@ from app.routers.agent_strategic_messages import (
 )
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
+from app.strategic_memory_envelope import (
+    get_or_create_project_memory_state,
+    purge_expired_context_envelope_snapshots,
+)
+from app.time_utils import _utcnow
 
 # The inbound-poll router is intentionally NOT wired into app.main here — that
 # registration line is reported to the operator, not committed by the plumbing
@@ -642,6 +648,50 @@ async def _make_resident_poll_worker(
     return project, task
 
 
+async def _activate_typed_fast_worker(db_session, project, task) -> str:
+    """Install one current typed-Fast process fence for route-level tests."""
+    incarnation = str(uuid.uuid4())
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["worker_incarnation_id"] = incarnation
+    resident["worker_incarnation_expires_at"] = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    ).isoformat()
+    project.vision = {**project.vision, "_resident_strategic_session": resident}
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    return incarnation
+
+
+async def _add_typed_fast_input(db_session, project, *, sequence: int = 1):
+    return await _add_message(
+        db_session,
+        project,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Explain the current theory direction.",
+        resident_session_id="resident-session",
+        context={"audience": "operator-fyi"},
+    )
+
+
+def _typed_fast_claim_payload(task, incarnation: str, message_id: uuid.UUID, *, client_claim_id: str):
+    return {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": incarnation,
+        "client_claim_id": client_claim_id,
+        "idempotency_key": f"typed-fast-claim:{client_claim_id}",
+        "message_ids": [str(message_id)],
+        "owner": "fast",
+        "lease_seconds": 45,
+    }
+
+
 async def _activate_test_call(db_session, project, task):
     incarnation = "00000000-0000-0000-0000-000000000744"
     resident = dict(project.vision["_resident_strategic_session"])
@@ -742,6 +792,322 @@ async def test_call_completion_replay_is_exact_and_terminal_task_cannot_commit(
     finally:
         app.dependency_overrides.pop(verify_agent_token, None)
     assert terminal.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_typed_fast_claim_replay_completion_fences_and_abandon(
+    client: AsyncClient, db_session
+):
+    """The typed public-turn boundary survives response loss and rejects stale owners."""
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    inbound = await _add_typed_fast_input(db_session, project)
+    client_claim_id = str(uuid.uuid4())
+    claim_payload = _typed_fast_claim_payload(
+        task, incarnation, inbound.id, client_claim_id=client_claim_id
+    )
+    path = f"/api/agent/projects/{project.id}/conversation/turns/claim"
+
+    claimed = await client.post(
+        path,
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=claim_payload,
+    )
+    assert claimed.status_code == 200, claimed.text
+    replay = await client.post(
+        path,
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=claim_payload,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["claim_id"] == claimed.json()["claim_id"]
+    assert replay.json()["envelope"]["snapshot_id"] == claimed.json()["envelope"]["snapshot_id"]
+
+    completion = {
+        "task_id": str(task.id),
+        "worker_generation": 2,
+        "incarnation_id": incarnation,
+        "claim_id": claimed.json()["claim_id"],
+        "owner": "fast",
+        "content": "Here is the immediate answer.",
+        "idempotency_key": "typed-fast-completion-fence",
+        "envelope": claimed.json()["envelope"],
+    }
+    stale_owner = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**completion, "incarnation_id": str(uuid.uuid4())},
+    )
+    assert stale_owner.status_code == 409
+    stale_envelope = dict(completion["envelope"])
+    stale_envelope["canonical_sha256"] = "0" * 64
+    stale_snapshot = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **completion,
+            "envelope": stale_envelope,
+            "workday_request": {
+                "delivery_key": "must-not-persist",
+                "question": "This private packet must roll back with completion.",
+            },
+        },
+    )
+    assert stale_snapshot.status_code == 409
+    packets_after_failed_complete = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.from_type == "system",
+            )
+        )
+    ).scalars().all()
+    assert packets_after_failed_complete == []
+
+    abandoned = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/abandon",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "incarnation_id": incarnation,
+            "claim_id": claimed.json()["claim_id"],
+        },
+    )
+    assert abandoned.status_code == 200, abandoned.text
+    assert abandoned.json() == {
+        "status": "abandoned",
+        "legacy_fallback_admissible": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_ledger_fast_claim_and_workday_consultation_use_live_envelope_revision(
+    client: AsyncClient, db_session
+):
+    """A V2 admission must not strand the foreground or private hand-off."""
+
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    inbound = await _add_typed_fast_input(db_session, project)
+    state = await get_or_create_project_memory_state(db_session, project.id)
+    state.ledger_revision = 7
+    await db_session.commit()
+
+    claim = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_typed_fast_claim_payload(
+            task, incarnation, inbound.id, client_claim_id=str(uuid.uuid4())
+        ),
+    )
+    assert claim.status_code == 200, claim.text
+    assert claim.json()["envelope"]["ledger_revision"] == 7
+
+    consultation = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "incarnation_id": incarnation,
+            "claim_id": claim.json()["claim_id"],
+            "delivery_key": "post-ledger-consultation",
+            "question": "Please inspect the derivation.",
+        },
+    )
+    assert consultation.status_code == 200, consultation.text
+    assert consultation.json()["envelope"]["ledger_revision"] == 7
+
+
+@pytest.mark.asyncio
+async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
+    client: AsyncClient, db_session
+):
+    """Private delivery and public continuation use distinct renewable receipts."""
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    inbound = await _add_typed_fast_input(db_session, project)
+    claim = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_typed_fast_claim_payload(
+            task, incarnation, inbound.id, client_claim_id=str(uuid.uuid4())
+        ),
+    )
+    assert claim.status_code == 200, claim.text
+    claim_id = claim.json()["claim_id"]
+    identity = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": incarnation,
+    }
+    completed_turn = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "worker_generation": 2,
+            "incarnation_id": incarnation,
+            "claim_id": claim_id,
+            "owner": "fast",
+            "content": "I will check the missing derivation and follow up.",
+            "idempotency_key": "typed-workday-initial-answer",
+            "envelope": claim.json()["envelope"],
+            "workday_request": {
+                "delivery_key": "derive-bound",
+                "question": "Check the missing derivation privately.",
+            },
+        },
+    )
+    assert completed_turn.status_code == 200, completed_turn.text
+    packet_id = completed_turn.json()["workday_packet"]["packet_id"]
+    duplicate_turn = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "worker_generation": 2,
+            "incarnation_id": incarnation,
+            "claim_id": claim_id,
+            "owner": "fast",
+            "content": "I will check the missing derivation and follow up.",
+            "idempotency_key": "typed-workday-initial-answer",
+            "envelope": claim.json()["envelope"],
+            "workday_request": {
+                "delivery_key": "derive-bound",
+                "question": "Check the missing derivation privately.",
+            },
+        },
+    )
+    assert duplicate_turn.status_code == 200, duplicate_turn.text
+    assert duplicate_turn.json()["status"] == "duplicate"
+    assert duplicate_turn.json()["workday_packet"]["packet_id"] == packet_id
+    packet_claim = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**identity, "lease_seconds": 45},
+    )
+    assert packet_claim.status_code == 200, packet_claim.text
+    packet = packet_claim.json()["packet"]
+    assert packet["packet_id"] == packet_id
+    renewed_packet = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/{packet_id}/renew",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "workday_claim_id": packet["workday_claim_id"],
+            "lease_seconds": 45,
+        },
+    )
+    assert renewed_packet.status_code == 200, renewed_packet.text
+    acknowledged = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/{packet_id}/ack",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "workday_claim_id": packet["workday_claim_id"],
+            "outcome": "completed",
+            "result_summary": "The missing step follows by conditioning.",
+        },
+    )
+    assert acknowledged.status_code == 200, acknowledged.text
+
+    continuation_claim = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/continuations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**identity, "lease_seconds": 45},
+    )
+    assert continuation_claim.status_code == 200, continuation_claim.text
+    continuation = continuation_claim.json()["continuation"]
+    result_packet_id = continuation["result_packet_id"]
+    renewed_continuation = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/renew",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "continuation_claim_id": continuation["continuation_claim_id"],
+            "lease_seconds": 45,
+        },
+    )
+    assert renewed_continuation.status_code == 200, renewed_continuation.text
+    released = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/release",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "continuation_claim_id": continuation["continuation_claim_id"],
+        },
+    )
+    assert released.status_code == 200, released.text
+    assert released.json()["status"] == "released"
+    reclaimed = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/continuations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**identity, "lease_seconds": 45},
+    )
+    assert reclaimed.status_code == 200, reclaimed.text
+    follow_up = reclaimed.json()["continuation"]
+    completed = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "continuation_claim_id": follow_up["continuation_claim_id"],
+            "content": "I checked it: conditioning gives the missing step.",
+            "idempotency_key": "typed-workday-follow-up",
+        },
+    )
+    assert completed.status_code == 200, completed.text
+    # The result packet pins its source envelope only as a bounded prompt
+    # cache. A lost HTTP response must still be exactly replayable after that
+    # cache has expired and been purged: no new prompt, packet, or public text
+    # is needed to return the already-created receipt.
+    snapshot = (
+        await db_session.execute(
+            select(StrategicContextEnvelopeSnapshot).where(
+                StrategicContextEnvelopeSnapshot.project_id == project.id
+            )
+        )
+    ).scalars().one()
+    snapshot.created_at = _utcnow() - timedelta(minutes=20)
+    snapshot.expires_at = _utcnow() - timedelta(seconds=1)
+    db_session.add(snapshot)
+    await db_session.commit()
+    await purge_expired_context_envelope_snapshots(
+        db_session,
+        project_id=project.id,
+    )
+    await db_session.commit()
+    assert (
+        await db_session.get(StrategicContextEnvelopeSnapshot, snapshot.snapshot_id)
+    ) is None
+    duplicate = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "continuation_claim_id": follow_up["continuation_claim_id"],
+            "content": "I checked it: conditioning gives the missing step.",
+            "idempotency_key": "typed-workday-follow-up",
+        },
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["status"] == "duplicate"
+    conflicting_replay = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "continuation_claim_id": follow_up["continuation_claim_id"],
+            "content": "Different text must not reuse the continuation receipt.",
+            "idempotency_key": "typed-workday-follow-up",
+        },
+    )
+    assert conflicting_replay.status_code == 409
 
 
 @pytest.mark.asyncio

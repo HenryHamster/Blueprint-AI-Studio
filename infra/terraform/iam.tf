@@ -69,6 +69,25 @@ resource "google_project_iam_custom_role" "agent_secret_deleter" {
   permissions = ["secretmanager.secrets.delete"]
 }
 
+# Public API handlers probe an exact user secret before creating it. Keep that
+# metadata read separate from value access and project-wide inventory.
+resource "google_project_iam_custom_role" "user_secret_metadata_reader" {
+  role_id     = "blueprintUserSecretMetadataReader"
+  title       = "Blueprint User Secret Metadata Reader"
+  description = "Read condition-scoped user secret metadata without reading values or listing secrets"
+  permissions = ["secretmanager.secrets.get"]
+}
+
+# User disconnect and credential-pool removal endpoints delete their own
+# user-* secrets. The binding below narrows this generic permission to that
+# namespace.
+resource "google_project_iam_custom_role" "user_secret_deleter" {
+  role_id     = "blueprintUserSecretDeleter"
+  title       = "Blueprint User Secret Deleter"
+  description = "Delete only condition-scoped user-managed secrets"
+  permissions = ["secretmanager.secrets.delete"]
+}
+
 resource "google_project_iam_member" "orchestrator_secret_creator" {
   project = var.project_id
   role    = google_project_iam_custom_role.secret_creator.id
@@ -193,10 +212,9 @@ locals {
     resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/user-")
   EOT
 
-  local_worker_agent_secret_condition = <<-EOT
-    resource.name.startsWith("projects/${var.project_id}/secrets/agent-creds-") ||
-    resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/agent-creds-")
-  EOT
+  # Keep the IAM condition byte-stable across Windows and Linux Terraform
+  # clients. A CRLF-only heredoc drift otherwise forces replacement.
+  local_worker_agent_secret_condition = "resource.name.startsWith(\"projects/${var.project_id}/secrets/agent-creds-\") ||\nresource.name.startsWith(\"projects/${data.google_project.local_worker_project.number}/secrets/agent-creds-\")\n"
 }
 
 resource "google_project_iam_member" "local_worker_agent_secret_deleter" {
@@ -265,6 +283,110 @@ resource "google_cloud_run_v2_job_iam_member" "local_worker_runs_agent_job" {
   name     = google_cloud_run_v2_job.blueprint_agent_job.name
   role     = "roles/run.jobsExecutorWithOverrides"
   member   = "serviceAccount:${google_service_account.local_worker_sa.email}"
+}
+
+# ------------------------------------------------------------------------------
+# Local public API identity
+# ------------------------------------------------------------------------------
+# The public API has a distinct exported credential from the background worker.
+# It can serve HTTP handlers, manage user-scoped credentials, read API
+# observability, and sign artifact URLs. It cannot create or attach VMs, submit
+# builds/jobs, mutate Cloud Run services, or use the worker identity.
+resource "google_service_account" "local_api_sa" {
+  account_id   = "blueprint-local-api-runtime"
+  display_name = "Blueprint local public API"
+  description  = "External public API identity; no compute, build, job-execution, or project-IAM administration"
+}
+
+locals {
+  local_api_project_roles = toset([
+    "roles/logging.viewer",
+    "roles/run.viewer",
+  ])
+
+  local_api_user_secret_condition = <<-EOT
+    resource.name.startsWith("projects/${var.project_id}/secrets/user-") ||
+    resource.name.startsWith("projects/${data.google_project.local_worker_project.number}/secrets/user-")
+  EOT
+}
+
+resource "google_project_iam_member" "local_api_project_roles" {
+  for_each = local.local_api_project_roles
+  project  = var.project_id
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.local_api_sa.email}"
+}
+
+# Secret creation is authorized on the project parent, before the destination
+# secret resource exists, so Google IAM cannot resource-condition this one
+# permission by the eventual user-* name. Every post-creation operation is
+# condition-scoped below.
+resource "google_project_iam_member" "local_api_secret_creator" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.secret_creator.id
+  member  = "serviceAccount:${google_service_account.local_api_sa.email}"
+}
+
+resource "google_project_iam_member" "local_api_user_secret_metadata_reader" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.user_secret_metadata_reader.id
+  member  = "serviceAccount:${google_service_account.local_api_sa.email}"
+
+  condition {
+    title       = "BlueprintLocalApiUserSecretMetadata"
+    description = "Read metadata only for user-managed secrets"
+    expression  = local.local_api_user_secret_condition
+  }
+}
+
+resource "google_project_iam_member" "local_api_user_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.local_api_sa.email}"
+
+  condition {
+    title       = "BlueprintLocalApiUserSecretValues"
+    description = "Read values only from user-managed secrets"
+    expression  = local.local_api_user_secret_condition
+  }
+}
+
+resource "google_project_iam_member" "local_api_user_secret_version_adder" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretVersionAdder"
+  member  = "serviceAccount:${google_service_account.local_api_sa.email}"
+
+  condition {
+    title       = "BlueprintLocalApiUserSecretVersions"
+    description = "Add versions only to user-managed secrets"
+    expression  = local.local_api_user_secret_condition
+  }
+}
+
+resource "google_project_iam_member" "local_api_user_secret_deleter" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.user_secret_deleter.id
+  member  = "serviceAccount:${google_service_account.local_api_sa.email}"
+
+  condition {
+    title       = "BlueprintLocalApiUserSecretDeletion"
+    description = "Delete only user-managed secrets"
+    expression  = local.local_api_user_secret_condition
+  }
+}
+
+resource "google_storage_bucket_iam_member" "local_api_artifact_bucket_admin" {
+  bucket = google_storage_bucket.artifacts.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.local_api_sa.email}"
+}
+
+# Signed artifact/download URLs use IAM Credentials signBlob. This binding is
+# deliberately self-referential: the API can sign only as its own identity.
+resource "google_service_account_iam_member" "local_api_self_token_creator" {
+  service_account_id = google_service_account.local_api_sa.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.local_api_sa.email}"
 }
 
 # ------------------------------------------------------------------------------

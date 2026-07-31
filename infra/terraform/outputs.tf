@@ -13,6 +13,11 @@ output "orchestrator_url" {
   description = "The public URL of the Orchestrator Cloud Run service"
 }
 
+output "public_orchestrator_access_enabled" {
+  value       = var.enable_public_orchestrator_access
+  description = "Whether Terraform grants allUsers the Cloud Run invoker role. Set false as the explicit public Cloud Run cutover fence."
+}
+
 output "orchestrator_service_account" {
   value       = google_service_account.orchestrator_sa.email
   description = "The Service Account email used by the Orchestrator"
@@ -54,6 +59,11 @@ output "cloud_sql_instance_name" {
   description = "The Cloud SQL instance name (used by gcloud sql commands)"
 }
 
+output "cloud_sql_service_account_email" {
+  value       = var.use_cloud_sql ? "serviceAccount:${google_sql_database_instance.default[0].service_account_email_address}" : ""
+  description = "Cloud SQL instance service account in IAM member form. Pass this to infra/recovery for writer-only archive access."
+}
+
 output "compute_images_repository_url" {
   value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.compute_images_repo.repository_id}"
   description = "The Artifact Registry URL for the project-baked compute images repository"
@@ -62,4 +72,19 @@ output "compute_images_repository_url" {
 output "artifact_bucket_name" {
   value       = google_storage_bucket.artifacts.name
   description = "The GCS bucket for agent payloads and credentials"
+}
+
+output "local_cloudsql_proxy_service_account" {
+  value       = google_service_account.local_cloudsql_proxy_sa.email
+  description = "Dedicated Cloud SQL Auth Proxy identity for an external control-plane host"
+}
+
+output "local_worker_service_account" {
+  value       = google_service_account.local_worker_sa.email
+  description = "Dedicated background-worker runtime identity for an external control-plane host"
+}
+
+output "local_api_service_account" {
+  value       = google_service_account.local_api_sa.email
+  description = "Dedicated public-API runtime identity for an external control-plane host"
 }

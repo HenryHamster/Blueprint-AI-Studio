@@ -72,7 +72,11 @@ from app.models import (
     TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
 )
-from app.message_audience import stamp_message_audience
+from app.message_audience import (
+    OPERATOR_ACTION_NEEDED,
+    OPERATOR_FYI,
+    stamp_message_audience,
+)
 from app.project_message_creation import (
     build_project_message,
     lock_project_and_next_message_sequence,
@@ -1080,6 +1084,54 @@ async def _enforce_resident_mutation_fence(
         )
 
 
+async def _has_exact_live_fast_public_claim(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    task_id: uuid.UUID,
+    resident_session_id: str,
+    worker_generation: int,
+    worker_incarnation_id: uuid.UUID | None,
+) -> bool:
+    """Whether this exact Resident process currently has a Fast-owned turn.
+
+    ``create_message`` predates the typed foreground route and remains available
+    to the broad Workday process for genuine internal artifacts.  It is *not* a
+    second public-reply capability: while Fast owns a canonical input, an
+    unscoped operator-visible generic message would be indistinguishable from a
+    competing answer.  Keep this check server-side rather than relying on the
+    Workday prompt or a ``reply_to`` field supplied by the model.
+    """
+    if worker_incarnation_id is None:
+        return False
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                    ProjectMessage.status == "open",
+                    ProjectMessage.handling_state == MessageHandlingState.CLAIMED,
+                    ProjectMessage.handled_by_task_id == task_id,
+                    ProjectMessage.conversation_claim_generation == worker_generation,
+                    ProjectMessage.conversation_claim_incarnation
+                    == worker_incarnation_id,
+                    ProjectMessage.conversation_claim_expires_at > _utcnow(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return any(
+        row.resident_session_id in {None, resident_session_id}
+        and isinstance(row.context, dict)
+        and row.context.get("_conversation_public_reply_owner") == "fast"
+        for row in rows
+    )
+
+
 
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
@@ -1221,6 +1273,49 @@ async def strategic_operation(
                 raise HTTPException(
                     status_code=409,
                     detail="Call lease owns public replies for this Resident generation",
+                )
+            # A private typed-Fast consultation deliberately shares this
+            # Resident process with broad Workday tools.  Prompts are not an
+            # authority boundary: while an exact internal packet lease is live,
+            # the generic/native reply route must not be able to publish a
+            # second answer.  Only the receipt-bound Fast completion routes in
+            # agent_strategic_messages may produce public text in that window.
+            from app.conversation_coordinator import _workday_claim_expiry
+
+            workday_packets = (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.from_type == "system",
+                        ProjectMessage.status == "open",
+                        ProjectMessage.handling_state == MessageHandlingState.CLAIMED,
+                        ProjectMessage.handled_by_task_id == task.id,
+                    )
+                )
+            ).scalars().all()
+            exact_private_lease = any(
+                isinstance(packet.context, dict)
+                and packet.context.get("_conversation_consultation_packet") is True
+                and packet.context.get("audience") == "strategist-internal"
+                and packet.context.get("message_role") == "workday_consultation"
+                and packet.context.get("_workday_consultation_claim_generation")
+                == task_generation
+                and str(packet.context.get("_workday_consultation_claim_incarnation"))
+                == str(payload.resident_incarnation_id)
+                and _workday_claim_expiry(
+                    packet.context.get("_workday_consultation_claim_expires_at")
+                )
+                is not None
+                and _workday_claim_expiry(
+                    packet.context.get("_workday_consultation_claim_expires_at")
+                )
+                > _utcnow()
+                for packet in workday_packets
+            )
+            if exact_private_lease:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Private Workday consultation lease forbids native public replies",
                 )
     data = payload.data
     warnings: List[str] = []
@@ -3037,17 +3132,6 @@ async def strategic_operation(
                 status_code=400, detail="Message context too large (max 50KB)"
             )
         msg_ctx = dict(msg_ctx)
-        # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
-        # messages: a strategist-emitted BUG_REPORT/BLOCKER citing code already
-        # fixed/refactored away would re-enter the strategist inbox fully
-        # trusted. Run the SAME conservative grounding the user/annotation paths
-        # use and stash an ``_provenance_warnings`` signal when a citation is
-        # unambiguously absent. Best-effort — indeterminate never flags, never
-        # fails message creation. (project is already locked above.)
-        if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
-            warning = await _compute_message_citation_warning(session, project, content)
-            if warning:
-                msg_ctx = {**msg_ctx, "_provenance_warnings": warning}
         # Idempotency guard: a network error can cause the caller to retry after
         # the server already committed. Accept an optional idempotency_key from
         # the agent and short-circuit if a matching row already exists.
@@ -3186,7 +3270,81 @@ async def strategic_operation(
             else "strategic_message"
         )
         msg_ctx = stamp_message_audience(msg_ctx, event_type or _default_event_type, message_type=msg_type.value)
+        if (
+            resident_ctx.get("_resident_session") is True
+            and msg_ctx.get("audience")
+            in {OPERATOR_ACTION_NEEDED, OPERATOR_FYI}
+            and (
+                msg_ctx.get("message_role") == "operator_reply"
+                or (event_type or _default_event_type) == "question_answer"
+            )
+            and covered_message_ids is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Resident operator replies require exact covered_message_ids"
+                ),
+            )
         is_routine = event_type in ROUTINE_EVENT_TYPES
+        # The generic Workday message route remains available for internal
+        # artifacts and activity-surface bookkeeping.  It must not, however,
+        # become an unscoped second public answer while the restricted Fast
+        # child owns an operator turn.  This deliberately keys on the stamped
+        # audience rather than the caller's message type: BUG_REPORT/BLOCKER/
+        # QUESTION are operator-visible via the audience fallback too.
+        if (
+            resident_ctx.get("_resident_session") is True
+            and not is_routine
+            and msg_ctx.get("audience") in {OPERATOR_ACTION_NEEDED, OPERATOR_FYI}
+        ):
+            from app.conversation_coordinator import (
+                legacy_conversation_claim_incarnation,
+            )
+
+            effective_incarnation = (
+                payload.resident_incarnation_id
+                or legacy_conversation_claim_incarnation(
+                    task.id, int(resident_ctx.get("_resident_worker_generation") or 1)
+                )
+            )
+            if await _has_exact_live_fast_public_claim(
+                session,
+                project_id=project.id,
+                task_id=task.id,
+                resident_session_id=str(
+                    resident_ctx.get("strategic_session_id") or ""
+                ),
+                worker_generation=int(
+                    resident_ctx.get("_resident_worker_generation") or 1
+                ),
+                worker_incarnation_id=effective_incarnation,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Fast-owned conversation claim forbids generic "
+                        "operator-visible messages"
+                    ),
+                )
+        # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
+        # messages: a strategist-emitted BUG_REPORT/BLOCKER citing code already
+        # fixed/refactored away would re-enter the strategist inbox fully
+        # trusted. Run the SAME conservative grounding the user/annotation paths
+        # use and stash an ``_provenance_warnings`` signal when a citation is
+        # unambiguously absent. Best-effort — indeterminate never flags, never
+        # fails message creation.  Crucially, it runs only after the Fast-owned
+        # public-turn guard: citation verification can involve branch I/O and
+        # must not consume a short-lived Fast claim before authorization.
+        if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+            warning = await _compute_message_citation_warning(session, project, content)
+            if warning:
+                msg_ctx = {**msg_ctx, "_provenance_warnings": warning}
+        # Rolling deploys keep the legacy Resident reply route live until the
+        # typed Fast worker has *itself* claimed a turn.  The coordinator then
+        # marks that exact input Fast-owned and refuses legacy reclamation; a
+        # blanket task-level rejection here would instead strand a pre-upgrade
+        # worker after it had already claimed operator input.
         if covered_message_ids is not None and is_routine:
             raise HTTPException(
                 status_code=409,
@@ -3304,10 +3462,36 @@ async def strategic_operation(
             ).scalar_one_or_none()
             if reply_target is None:
                 raise HTTPException(status_code=400, detail="Invalid reply_to message")
-            reply_target.handling_state = MessageHandlingState.RESPONDED
-            reply_target.handled_by_task_id = task.id
-            reply_target.updated_at = _utcnow()
-            session.add(reply_target)
+            if resident_ctx.get("_resident_session") is True:
+                from app.conversation_coordinator import (
+                    native_resident_reply_may_complete_claim,
+                )
+
+                if not native_resident_reply_may_complete_claim(reply_target):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Fast-owned conversation inputs require the "
+                            "foreground completion route"
+                        ),
+                    )
+                if (
+                    covered_message_ids is None
+                    or reply_target.id not in covered_message_ids
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Resident reply_to must belong to exact "
+                            "covered_message_ids"
+                        ),
+                    )
+                # The exact covered-message transaction below owns the mutation.
+            else:
+                reply_target.handling_state = MessageHandlingState.RESPONDED
+                reply_target.handled_by_task_id = task.id
+                reply_target.updated_at = _utcnow()
+                session.add(reply_target)
             msg_ctx["message_role"] = "operator_reply"
         # Rollback expires ORM instances even when expire_on_commit=False. Keep
         # identities as plain UUID/string values for replay paths.
@@ -3402,6 +3586,20 @@ async def strategic_operation(
                         detail="covered_message_ids contains a non-open message",
                 )
                 if conversation_claim_id is not None:
+                    # Typed Fast owns this lane through its dedicated
+                    # receipt-bound completion endpoint.  A generic Resident
+                    # reply can have the same task/incarnation after a local
+                    # Fast failure or a rolling deploy; those fields alone do
+                    # not grant it Fast's public-reply authority.
+                    from app.conversation_coordinator import (
+                        native_resident_reply_may_complete_claim,
+                    )
+
+                    if not native_resident_reply_may_complete_claim(inbound):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Fast-owned conversation claims require the foreground completion route",
+                        )
                     if (
                         inbound.handling_state != MessageHandlingState.CLAIMED
                         or inbound.conversation_claim_id
@@ -4077,6 +4275,9 @@ async def strategic_operation(
                 ),
                 burst_window_minutes=int(
                     _runtime_config.get("strategist_spawn_window_minutes", 60)
+                ),
+                discovery_admission_mode=str(
+                    _runtime_config.get("discovery_admission_mode", "shadow")
                 ),
             )
         except ValueError as exc:

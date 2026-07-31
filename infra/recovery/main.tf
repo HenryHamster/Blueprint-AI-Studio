@@ -1,0 +1,80 @@
+locals {
+  recovery_enabled = var.enable_recovery_backup_stack
+}
+
+# Fail closed: an apply cannot quietly create a bucket in the production
+# project, without a recovery-admin group, or with invalid archive retention.
+resource "terraform_data" "recovery_configuration" {
+  count = local.recovery_enabled ? 1 : 0
+
+  input = {
+    recovery_project_id = var.recovery_project_id
+    source_project_id   = var.source_project_id
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.recovery_project_id != "" && var.recovery_project_id != var.source_project_id
+      error_message = "recovery_project_id must be set and must differ from source_project_id."
+    }
+    precondition {
+      condition     = var.recovery_backup_bucket_name != ""
+      error_message = "recovery_backup_bucket_name must be set when enable_recovery_backup_stack=true."
+    }
+    precondition {
+      condition     = lower(var.recovery_kms_location) == lower(var.recovery_bucket_location)
+      error_message = "recovery_kms_location and recovery_bucket_location must match so the bucket can use the CMEK."
+    }
+    precondition {
+      condition     = can(regex("^serviceAccount:[^@]+@[^@]+$", var.source_cloud_sql_service_account_email))
+      error_message = "source_cloud_sql_service_account_email must use IAM member form, e.g. serviceAccount:..."
+    }
+    precondition {
+      condition     = can(regex("^group:[^@]+@[^@]+$", var.recovery_admin_member))
+      error_message = "recovery_admin_member must be a Google Group in IAM member form; do not assign a single hamsterwheel user."
+    }
+    precondition {
+      condition     = var.retention_period_seconds >= 7776000 && var.archive_expiry_days >= 90
+      error_message = "Recovery archives require at least 90 days of retention and expiry."
+    }
+  }
+}
+
+resource "google_project_service" "required" {
+  for_each = local.recovery_enabled ? toset([
+    "cloudkms.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "run.googleapis.com",
+    "sqladmin.googleapis.com",
+    "storage.googleapis.com",
+  ]) : toset([])
+
+  project            = var.recovery_project_id
+  service            = each.value
+  disable_on_destroy = false
+}
+
+resource "terraform_data" "restore_verifier_configuration" {
+  count = local.recovery_enabled && var.enable_restore_verifier ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition = (
+        var.restore_verifier_image != "" &&
+        var.restore_verifier_private_network != "" &&
+        var.restore_verifier_private_subnetwork != "" &&
+        var.restore_verifier_expected_revision != ""
+      )
+      error_message = "restore verifier image, network, subnetwork, and expected revision are required."
+    }
+  }
+}
+
+resource "google_project_service_identity" "cloud_sql" {
+  provider = google-beta
+  count    = local.recovery_enabled ? 1 : 0
+  project  = var.recovery_project_id
+  service  = "sqladmin.googleapis.com"
+
+  depends_on = [google_project_service.required]
+}

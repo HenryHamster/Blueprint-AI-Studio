@@ -78,7 +78,10 @@ from app.failure_classification import (
     _persist_stuck_call_reclassification,
 )
 from app.retry_budget import append_failure_class_history
-from app.task_blocked import reset_task_for_fresh_attempt
+from app.task_blocked import (
+    mark_task_for_fresh_execution_attempt,
+    reset_task_for_fresh_attempt,
+)
 from app.time_utils import (
     _utcnow,
     clear_retry_after,
@@ -285,6 +288,7 @@ from app.reaper_sweeps import (
     sweep_stuck_qualifications,
     sweep_evergreen_fill_decision_retention,
     sweep_expired_message_attachment_uploads,
+    sweep_strategic_context_retention,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
     sweep_recover_stranded_transient_blockers,
@@ -490,7 +494,7 @@ async def reaper_service():
                 pr_artifacts = (
                     (
                         await session.execute(
-                            select(Artifact).where(
+                            select(Artifact.task_id).where(
                                 Artifact.task_id.in_(task_ids_to_check),
                                 Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             )
@@ -501,7 +505,7 @@ async def reaper_service():
                     if task_ids_to_check
                     else []
                 )
-                tasks_with_pr = {a.task_id for a in pr_artifacts}
+                tasks_with_pr = set(pr_artifacts)
 
                 # Heartbeat false-reap fix (option B): batch-fetch the
                 # uncontended ``vmcontact`` liveness rows for THIS sweep's
@@ -1514,6 +1518,7 @@ async def reaper_service():
                             da_ctx.pop("failure_class", None)
                             da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
+                            mark_task_for_fresh_execution_attempt(task)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
                             clear_retry_after(task)
@@ -1560,6 +1565,7 @@ async def reaper_service():
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
+                            mark_task_for_fresh_execution_attempt(task)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
                             clear_retry_after(task)
@@ -2655,6 +2661,20 @@ async def reaper_service():
                     landed_cb=_mark_landed_parent_dependents,
                 )
 
+                # Step 3.25: discovery review convergence. Immediate completion
+                # hooks are latency optimizations; this bounded leader-owned
+                # sweep is the correctness path for expired envelopes and
+                # terminal cohorts whose request process died between commits.
+                try:
+                    from app.discovery_review import sweep_discovery_reviews
+
+                    await sweep_discovery_reviews(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Discovery-review sweep error: {e}",
+                        exc_info=True,
+                    )
+
                 # Step 3.5: Detach EVALUATING provider tasks whose direction closed.
                 # direction_id is provenance, not a kill-tether — a retired
                 # direction must NEVER cancel in-flight/completed work (cancelling
@@ -2773,7 +2793,22 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 10a: Global expired message-attachment cleanup. This is
+                # Step 10a: Global Strategic envelope/private-packet retention.
+                # This is intentionally independent of a project receiving its
+                # next message, so expired prompt copies cannot become dormant
+                # data-retention leaks.
+                _mark_reaper_progress()
+                try:
+                    await sweep_strategic_context_retention(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Strategic context retention purge: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 10b: Global expired message-attachment cleanup. This is
                 # independent of any actor returning to upload again.
                 _mark_reaper_progress()
                 try:

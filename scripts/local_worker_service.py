@@ -17,6 +17,8 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NETWORK_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$")
+_DATABASE_MODES = frozenset({"cloudsql-proxy", "local-postgres"})
+_LOCAL_POSTGRES_ALIAS = "blueprint-postgres"
 _REQUIRED_SECRETS = frozenset(
     {
         "DATABASE_URL",
@@ -27,7 +29,7 @@ _REQUIRED_SECRETS = frozenset(
         "GITHUB_PAT_ENCRYPTION_KEY",
     }
 )
-_OPTIONAL_SECRETS = frozenset({"GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET"})
+_OPTIONAL_SECRETS = frozenset()
 _REQUIRED_RUNTIME_CONFIG = frozenset(
     {
         "GCP_PROJECT_ID",
@@ -60,6 +62,7 @@ _ALLOWED_SECRETS = (
     | _OPTIONAL_RUNTIME_CONFIG
 )
 _CONTAINER_NAME = "blueprint-local-worker"
+_WORKER_UNIT = "blueprint-worker.service"
 _CI_RUNNER_MARKERS = (
     b"Runner.Listener",
     b"Runner.Worker",
@@ -101,6 +104,63 @@ def _assert_no_host_ci_runner() -> None:
                 "host-level GitHub Actions runner detected; move CI into a VM "
                 "before starting the production worker"
             )
+
+
+def _cgroup_is_system_worker(payload: bytes) -> bool:
+    return (
+        b"system.slice/" + _WORKER_UNIT.encode() in payload
+        and b"user.slice/" not in payload
+    )
+
+
+def _running_as_system_worker_service() -> bool:
+    try:
+        return _cgroup_is_system_worker(Path("/proc/self/cgroup").read_bytes())
+    except OSError:
+        return False
+
+
+def _user_scoped_worker_process_present(proc_root: Path = Path("/proc")) -> bool:
+    """Detect a live user-manager worker even when its D-Bus is unavailable."""
+    own_pid = os.getpid()
+    marker = _WORKER_UNIT.encode()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == own_pid:
+            continue
+        try:
+            cgroup = (entry / "cgroup").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if b"user.slice/" in cgroup and marker in cgroup:
+            return True
+    return False
+
+
+def _assert_no_active_user_worker_service() -> None:
+    """Fence a system worker from a duplicate user-manager worker."""
+    if not _running_as_system_worker_service():
+        return
+    environment = os.environ.copy()
+    environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", _WORKER_UNIT],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if (
+        (result is not None and result.returncode == 0)
+        or _user_scoped_worker_process_present()
+    ):
+        raise RuntimeError(
+            "active user-scoped blueprint-worker.service detected; stop and "
+            "disable it before starting the system worker"
+        )
 
 
 def _load_secrets(path_text: str) -> dict[str, str]:
@@ -174,24 +234,36 @@ def _load_secrets(path_text: str) -> dict[str, str]:
     return payload
 
 
-def _secure_credentials_file(path_text: str, *, project_id: str) -> Path:
+def _secure_credentials_file(
+    path_text: str,
+    *,
+    project_id: str,
+    expected_account_id: str,
+    credential_label: str,
+) -> Path:
     path = Path(path_text)
     if not path.is_absolute():
-        raise ValueError("BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE must be absolute")
+        raise ValueError(f"{credential_label} Google credentials path must be absolute")
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise ValueError("worker Google credentials must be a regular, non-symlink file")
+        raise ValueError(
+            f"{credential_label} Google credentials must be a regular, non-symlink file"
+        )
     if info.st_uid != os.getuid():
-        raise ValueError(f"worker Google credentials must be owned by uid {os.getuid()}")
+        raise ValueError(
+            f"{credential_label} Google credentials must be owned by uid {os.getuid()}"
+        )
     if info.st_mode & 0o077:
-        raise ValueError("worker Google credentials must have mode 0600 or stricter")
+        raise ValueError(
+            f"{credential_label} Google credentials must have mode 0600 or stricter"
+        )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("worker Google credentials are not valid JSON") from exc
-    expected_email = (
-        f"blueprint-local-worker-runtime@{project_id}.iam.gserviceaccount.com"
-    )
+        raise ValueError(
+            f"{credential_label} Google credentials are not valid JSON"
+        ) from exc
+    expected_email = f"{expected_account_id}@{project_id}.iam.gserviceaccount.com"
     if (
         not isinstance(payload, dict)
         or payload.get("type") != "service_account"
@@ -199,27 +271,39 @@ def _secure_credentials_file(path_text: str, *, project_id: str) -> Path:
         or payload.get("client_email") != expected_email
     ):
         raise ValueError(
-            "worker Google credentials are not the dedicated runtime service account"
+            f"{credential_label} Google credentials are not the dedicated "
+            f"{expected_account_id} service account"
         )
     return path
 
 
-def _database_url_for_container(value: str) -> str:
+def _database_mode() -> str:
+    mode = _required_env("BLUEPRINT_DATABASE_MODE")
+    if mode not in _DATABASE_MODES:
+        allowed = ", ".join(sorted(_DATABASE_MODES))
+        raise ValueError(f"BLUEPRINT_DATABASE_MODE must be one of: {allowed}")
+    return mode
+
+
+def _database_url_for_container(value: str, *, mode: str) -> str:
+    if mode not in _DATABASE_MODES:
+        raise ValueError("database mode must be explicit")
     parsed = urlsplit(value)
     if parsed.scheme not in {"postgresql", "postgresql+asyncpg"}:
         raise ValueError("DATABASE_URL must use PostgreSQL")
     if not parsed.username or parsed.password is None or not parsed.path.strip("/"):
         raise ValueError("DATABASE_URL must include user, password, and database")
     userinfo = parsed.netloc.rsplit("@", 1)[0]
-    netloc = f"{userinfo}@host.docker.internal:5433"
-    # Cloud SQL Auth Proxy encrypts the remote leg itself; its local client
-    # socket deliberately speaks plaintext PostgreSQL.  Production DATABASE_URL
-    # currently carries ``ssl=require`` for direct Cloud SQL connections.  If
-    # that hint reaches asyncpg after rewriting only the host, asyncpg sends a
-    # TLS handshake to the plaintext proxy listener and waits until its connect
-    # timeout.  Preserve unrelated query parameters, remove every existing SSL
-    # mode spelling, and explicitly disable client-side TLS for this private
-    # Docker-network hop.
+    host, port = (
+        ("host.docker.internal", 5433)
+        if mode == "cloudsql-proxy"
+        else (_LOCAL_POSTGRES_ALIAS, 5432)
+    )
+    netloc = f"{userinfo}@{host}:{port}"
+    # Both database transports are confined to the private Docker bridge. The
+    # Cloud SQL Auth Proxy encrypts its remote leg, while local Postgres never
+    # leaves the host. Preserve unrelated query parameters, remove every
+    # existing SSL spelling, and disable TLS only for this private hop.
     kept_query = [
         pair
         for pair in parsed.query.split("&")
@@ -333,19 +417,26 @@ def _assert_proxy_reachable_from_network(
 
 def command() -> tuple[list[str], dict[str, str]]:
     _assert_no_host_ci_runner()
+    _assert_no_active_user_worker_service()
     image = _required_env("BLUEPRINT_WORKER_IMAGE_ID")
     if not _IMAGE_ID_RE.fullmatch(image):
         raise ValueError("BLUEPRINT_WORKER_IMAGE_ID must be an immutable sha256 image ID")
+    database_mode = _database_mode()
     network = _required_env("BLUEPRINT_CONTROL_PLANE_NETWORK")
     secrets = _load_secrets(_required_env("BLUEPRINT_WORKER_SECRETS_FILE"))
     google_credentials = _secure_credentials_file(
         _required_env("BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE"),
         project_id=secrets["GCP_PROJECT_ID"],
+        expected_account_id="blueprint-local-worker-runtime",
+        credential_label="worker",
     )
-    secrets["DATABASE_URL"] = _database_url_for_container(secrets["DATABASE_URL"])
+    secrets["DATABASE_URL"] = _database_url_for_container(
+        secrets["DATABASE_URL"], mode=database_mode
+    )
     gateway = _network_gateway(network)
-    _wait_for_proxy(gateway)
-    _assert_proxy_reachable_from_network(image, network, gateway)
+    if database_mode == "cloudsql-proxy":
+        _wait_for_proxy(gateway)
+        _assert_proxy_reachable_from_network(image, network, gateway)
 
     environment = os.environ.copy()
     environment.update(secrets)
@@ -380,8 +471,6 @@ def command() -> tuple[list[str], dict[str, str]]:
         _CONTAINER_NAME,
         "--network",
         network,
-        "--add-host",
-        f"host.docker.internal:{gateway}",
         "--pull",
         "never",
         "--read-only",
@@ -399,9 +488,19 @@ def command() -> tuple[list[str], dict[str, str]]:
         "512",
         "--memory",
         "4g",
+        "--memory-swap",
+        "4g",
         "--cpus",
         "4",
+        "--log-driver",
+        "json-file",
+        "--log-opt",
+        "max-size=10m",
+        "--log-opt",
+        "max-file=3",
     ]
+    if database_mode == "cloudsql-proxy":
+        argv.extend(["--add-host", f"host.docker.internal:{gateway}"])
     for name in forwarded:
         if name in environment:
             argv.extend(["--env", name])

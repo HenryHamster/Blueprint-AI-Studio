@@ -24,6 +24,7 @@ class TaskType(str, Enum):
     fix = "fix"
     plan = "plan"
     research = "research"
+    discovery_review = "discovery_review"
     strategic_review = "strategic_review"
     design_doc_update = "design_doc_update"
     security_audit = "security_audit"
@@ -50,10 +51,12 @@ class TaskType(str, Enum):
     capability_proof_trial = "capability_proof_trial"
     criterion_coverage_trial = "criterion_coverage_trial"
     walkthrough_e2e = "walkthrough_e2e"
+    memory_consolidation = "memory_consolidation"
 
 
 AgentMode = Literal["write", "read_only"]
 ExecutionOwner = Literal["agent", "backend"]
+WorkspaceRequirement = Literal["repo", "none"]
 
 # Closed set of forward evaluation-gate strategy keys. Each TaskType DECLARES
 # which one applies via ``TaskCapability.evaluation``; the pluggable evaluator
@@ -145,6 +148,12 @@ class TaskCapability:
     user_launchable: bool = False
     operator_contract_launchable: bool = False
     provider_configurable: bool = True
+    # Optional hard routing boundary for task capabilities whose execution
+    # sandbox has only been qualified for a subset of providers.  Unlike a
+    # routing preference, this is enforced after every runtime-config layer
+    # (including routing experiments) and cannot be widened by an operator
+    # setting or stale per-task runtime identity.
+    allowed_providers: frozenset[str] | None = None
     filter_visible: bool = True
     description: str = ""
     # --- Enriched declarative registry fields (operator catalog + eval routing).
@@ -155,6 +164,10 @@ class TaskCapability:
     requires_code: bool = True
     requires_web: bool = False
     requires_compute: bool = False
+    # ``none`` is an explicit opt-out for narrow, task-JWT-scoped workers that
+    # never clone or touch the project's repository. Any omitted/unknown value
+    # remains repository-backed by default in the agent runtime.
+    workspace_requirement: WorkspaceRequirement = "repo"
     evaluation_strategy: EvaluationStrategy = "review_only"
     # Declared soft per-task spend ceiling in USD, or None for "no declared
     # bound". This is a guidance/display figure, not an enforced quota.
@@ -326,6 +339,21 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_needs_locked_project=True,
         strategic_phase="phase2",
         evaluation="forward-quality",
+    ),
+    TaskCapability(
+        TaskType.discovery_review,
+        "Discovery Review",
+        "read_only",
+        default_category="strategic",
+        description=(
+            "Judge a bounded discovery cycle against its frozen bet and evidence."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=4.0,
+        completion_handler="discovery_review",
+        evaluation="structured-verdict",
     ),
     TaskCapability(
         TaskType.design_doc_update,
@@ -785,6 +813,29 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_handler="walkthrough_e2e",
         evaluation="none",
     ),
+    TaskCapability(
+        TaskType.memory_consolidation,
+        "Memory Consolidation",
+        "read_only",
+        default_category="strategic",
+        user_launchable=False,
+        operator_contract_launchable=False,
+        provider_configurable=False,
+        allowed_providers=frozenset({"anthropic"}),
+        filter_visible=False,
+        description=(
+            "Receipt-bound, budgeted Strategic Memory consolidation. Runs with a "
+            "task-scoped model account but never receives repository credentials "
+            "or a project checkout."
+        ),
+        run_shape="single_agent",
+        output_kind="none",
+        requires_code=False,
+        workspace_requirement="none",
+        evaluation_strategy="none",
+        cost_ceiling_usd=0.25,
+        evaluation="none",
+    ),
 )
 
 TASK_CAPABILITY_BY_TYPE: dict[TaskType, TaskCapability] = {
@@ -1038,10 +1089,12 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.release_audit_challenge.value,
         TaskType.release_merge_grade.value,
         TaskType.self_audit.value,
+        TaskType.discovery_review.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
         TaskType.criterion_coverage_trial.value,
         TaskType.walkthrough_e2e.value,
+        TaskType.memory_consolidation.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering
@@ -1136,6 +1189,11 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         "user_launchable": capability.user_launchable,
         "operator_contract_launchable": capability.operator_contract_launchable,
         "provider_configurable": capability.provider_configurable,
+        "allowed_providers": (
+            None
+            if capability.allowed_providers is None
+            else sorted(capability.allowed_providers)
+        ),
         "filter_visible": capability.filter_visible,
         "delivers_product": capability.delivers_product,
         "reservable": capability.reservable,
@@ -1145,6 +1203,7 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         "requires_code": capability.requires_code,
         "requires_web": capability.requires_web,
         "requires_compute": capability.requires_compute,
+        "workspace_requirement": capability.workspace_requirement,
     }
 
 
@@ -1238,6 +1297,7 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "requires_code": capability.requires_code,
         "requires_web": capability.requires_web,
         "requires_compute": capability.requires_compute,
+        "workspace_requirement": capability.workspace_requirement,
         "evaluation_strategy": capability.evaluation_strategy,
         "cost_ceiling_usd": capability.cost_ceiling_usd,
     }

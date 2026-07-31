@@ -85,6 +85,7 @@ const CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS: Readonly<Record<string, number>> = {
   '--strict-mcp-config': 0,
   '--mcp-config': 1,
   '--allowedTools': 1,
+  '--max-turns': 1,
   '--no-session-persistence': 0,
 };
 const claudeCapabilityCache = new Map<string, ReadonlySet<string> | null>();
@@ -691,6 +692,103 @@ export interface ProviderRunner {
   missingCredentials(): string[];
 }
 
+/** Narrow execution contract for a receipt-only memory worker.
+ *
+ * It is deliberately not a general sandbox toggle: callers must supply a
+ * freshly-created private directory, and only the native Claude runner is
+ * admitted until another provider can demonstrate an equivalent no-tool
+ * allowlist.  This fails closed rather than silently widening a sensitive
+ * task's capabilities on a provider change.
+ */
+export interface IsolatedTextOnlyRunOptions {
+  cwd: string;
+  timeoutMs: number;
+  maxOutputBytes: number;
+}
+
+export class TextOnlyProviderUnavailableError extends Error {
+  readonly failureCategory = 'runtime_unavailable' as const;
+  constructor(provider: ProviderName, detail: string) {
+    super(`text_only_provider_unavailable:${provider}:${detail}`);
+    this.name = 'TextOnlyProviderUnavailableError';
+  }
+}
+
+const TEXT_ONLY_MAX_TURNS = 1;
+
+function removeClaudeFlags(args: readonly string[], flags: ReadonlySet<string>): string[] {
+  const clean: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!flags.has(arg)) {
+      clean.push(arg);
+      continue;
+    }
+    index += CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS[arg] ?? 0;
+  }
+  return clean;
+}
+
+function isolatedAnthropicEnv(baseEnv: Record<string, string>, cwd: string): Record<string, string> {
+  // Do not inherit the agent's HOME, repository credentials, generic helper
+  // path, or unrelated provider credentials.  The selected provider token is
+  // enough for the supported text-only path; a CLI that requires more ambient
+  // state simply fails closed.
+  const env: Record<string, string> = {
+    HOME: cwd,
+    PATH: baseEnv.PATH || '/usr/local/bin:/usr/bin:/bin',
+    LANG: baseEnv.LANG || 'en_US.UTF-8',
+    TERM: baseEnv.TERM || 'xterm-256color',
+  };
+  for (const key of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'] as const) {
+    if (baseEnv[key]) env[key] = baseEnv[key];
+  }
+  return env;
+}
+
+/** Build the testable command contract used by memory consolidation only. */
+export function buildIsolatedTextOnlyMemoryCommand(
+  runner: ProviderRunner,
+  prompt: string,
+  model: string | undefined,
+  effort: string | undefined,
+  options: IsolatedTextOnlyRunOptions,
+): RunnerCommand {
+  if (runner.provider !== 'anthropic') {
+    throw new TextOnlyProviderUnavailableError(runner.provider, 'no_verified_text_only_runner');
+  }
+  const command = runner.buildRunCommand(prompt, model, effort);
+  if (command.command !== 'claude') {
+    throw new TextOnlyProviderUnavailableError(runner.provider, 'unexpected_cli');
+  }
+  // The regular command opts into blanket permissions for coding work. The
+  // receipt worker removes every inherited tool/config flag and uses the
+  // explicit empty built-in list plus a fresh empty strict-MCP config. Note
+  // that --allowedTools controls approval, not availability: --tools '' is
+  // the actual built-in-tool boundary.
+  command.args = removeClaudeFlags(command.args, new Set([
+    '--dangerously-skip-permissions',
+    CLAUDE_PARTIAL_MESSAGES_FLAG,
+    '--tools',
+    '--allowedTools',
+    '--mcp-config',
+    '--strict-mcp-config',
+    '--max-turns',
+  ]));
+  const mcpConfigPath = path.join(options.cwd, '.memory-empty-mcp.json');
+  writePrivateFileSync(mcpConfigPath, '{"mcpServers":{}}\n');
+  command.args.push(
+    '--tools', '',
+    '--mcp-config', mcpConfigPath,
+    '--strict-mcp-config',
+    '--allowedTools', '',
+    '--max-turns', String(TEXT_ONLY_MAX_TURNS),
+  );
+  command.env = isolatedAnthropicEnv(command.env, options.cwd);
+  command.timeoutMs = Math.min(command.timeoutMs, options.timeoutMs);
+  return command;
+}
+
 function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, string> {
   const env: Record<string, string> = {
     HOME: process.env.HOME || os.homedir(),
@@ -1145,13 +1243,42 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
   return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
 }
 
-export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
+/** Append text without exceeding a byte ceiling (JS string length is UTF-16). */
+function appendWithinByteLimit(current: string, chunk: string, maxBytes: number): string {
+  const used = Buffer.byteLength(current, 'utf8');
+  const remaining = maxBytes - used;
+  if (remaining <= 0) return current;
+  if (Buffer.byteLength(chunk, 'utf8') <= remaining) return current + chunk;
+  let low = 0;
+  let high = chunk.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(chunk.slice(0, middle), 'utf8') <= remaining) low = middle;
+    else high = middle - 1;
+  }
+  return current + chunk.slice(0, low);
+}
+
+export async function runIsolatedTextOnlyMemory(
+  prompt: string,
+  ws: WebSocket | null,
+  statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number },
+  model: string | undefined,
+  effort: string | undefined,
+  options: IsolatedTextOnlyRunOptions,
+): Promise<{ exitCode: number; allOutput: string; lastResultText: string; codexTurnCompleted?: boolean; stderrTail?: string }> {
+  return runProviderAgent(prompt, ws, statusRef, model, effort, undefined, false, options);
+}
+
+export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, isolatedTextOnly?: IsolatedTextOnlyRunOptions): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
   stderrTail?: string;
 }> {
   const runner = getProviderRunner();
-  const runCommand = runner.buildRunCommand(prompt, model, effort, disallowedTools);
+  let runCommand = isolatedTextOnly
+    ? buildIsolatedTextOnlyMemoryCommand(runner, prompt, model, effort, isolatedTextOnly)
+    : runner.buildRunCommand(prompt, model, effort, disallowedTools);
   let allOutput = '';
   let lastResultText = '';
   let stderrBuffer = '';
@@ -1195,7 +1322,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       ...(classified ? { classified } : {}),
     };
   };
-  const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean; agentKillIssued: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false, agentKillIssued: false };
+  const flags: { timedOut: boolean; outputLimited: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean; agentKillIssued: boolean } = { timedOut: false, outputLimited: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false, agentKillIssued: false };
   let lastToolUseAt: number | null = null;
   let toolInFlight = false;
   // True while the in-flight top-level tool is a workflow / sub-agent fan-out
@@ -1236,7 +1363,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   let lastCheckOutputOffset = -1;
   let codexTurnCompleted = false;
 
-  sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
+  const promptPreview = isolatedTextOnly
+    ? '[receipt-only prompt redacted]'
+    : `${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}`;
+  sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${promptPreview}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
 
   // Pre-flight: verify the CLI binary is present before spawning. A missing
@@ -1255,7 +1385,33 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   let partialMessageProgressAvailable = runCommand.args.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
   if (cliCommand === 'claude') {
     const capabilities = probeClaudeCapabilities(cliCommand, runCommand.env);
+    if (isolatedTextOnly && (
+      capabilities === null
+      || !capabilities.has('--tools')
+      || !capabilities.has('--mcp-config')
+      || !capabilities.has('--strict-mcp-config')
+      || !capabilities.has('--allowedTools')
+      || !capabilities.has('--max-turns')
+    )) {
+      throw new TextOnlyProviderUnavailableError(
+        runner.provider,
+        'cli_cannot_prove_toolless_strict_mcp_turn_cap',
+      );
+    }
     const compatibleArgs = stripUnsupportedClaudeOptionalArgs(runCommand.args, capabilities);
+    if (isolatedTextOnly && (
+      !compatibleArgs.includes('--tools')
+      || !compatibleArgs.includes('--mcp-config')
+      || !compatibleArgs.includes('--strict-mcp-config')
+      || !compatibleArgs.includes('--allowedTools')
+      || !compatibleArgs.includes('--max-turns')
+      || compatibleArgs.includes('--dangerously-skip-permissions')
+    )) {
+      throw new TextOnlyProviderUnavailableError(
+        runner.provider,
+        'tool_or_turn_boundary_removed_by_compatibility_filter',
+      );
+    }
     const removedPartialMessages = partialMessageProgressAvailable
       && !compatibleArgs.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
     runCommand.args = compatibleArgs;
@@ -1272,7 +1428,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // exact credit only when the real seven-day window is exhausted. Exact IDs
   // make concurrent starts converge on one redemption, while probe failures
   // fail open to the normal Codex CLI classification path.
-  if (runner.provider === 'openai' && runner.authMode === 'oauth') {
+  if (!isolatedTextOnly && runner.provider === 'openai' && runner.authMode === 'oauth') {
     statusRef.value = 'Checking Codex usage';
     const reset = await maybeConsumeCodexWeeklyReset({
       command: cliCommand,
@@ -1293,8 +1449,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // Provision the ambient helper CLIs (./note, ./playbook, ./messages) that
   // every model task may use regardless of handler. Self-guarding and
   // idempotent — see provisionAmbientHelpers.
-  provisionAmbientHelpers(process.env.TASK_ID || '', WORKSPACE);
-  syncAgentHelpersToPath(WORKSPACE, runCommand.env);
+  if (!isolatedTextOnly) {
+    provisionAmbientHelpers(process.env.TASK_ID || '', WORKSPACE);
+    syncAgentHelpersToPath(WORKSPACE, runCommand.env);
+  }
 
   const exitCode = await new Promise<number>((resolve) => {
     let promptFile = '';
@@ -1302,13 +1460,18 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     let child = null as ReturnType<typeof spawn> | null;
 
     if (runCommand.promptInput === 'stdin-file') {
-      promptFile = `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
-      writePrivateFileSync(promptFile, withExecutionModePrompt(prompt));
+      promptFile = isolatedTextOnly
+        ? path.join(isolatedTextOnly.cwd, '.prompt')
+        : `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
+      writePrivateFileSync(
+        promptFile,
+        isolatedTextOnly ? prompt : withExecutionModePrompt(prompt),
+      );
       promptFd = fs.openSync(promptFile, 'r');
     }
 
     child = spawn(runCommand.command, runCommand.args, {
-      cwd: WORKSPACE,
+      cwd: isolatedTextOnly?.cwd || WORKSPACE,
       env: runCommand.env,
       detached: true,
       stdio: [runCommand.promptInput === 'stdin' ? 'pipe' : (promptFd ?? 'ignore'), 'pipe', 'pipe'],
@@ -1336,7 +1499,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     if (promptFd !== undefined) fs.closeSync(promptFd);
     if (runCommand.promptInput === 'stdin') {
       try {
-        child.stdin?.end(withExecutionModePrompt(prompt));
+        child.stdin?.end(isolatedTextOnly ? prompt : withExecutionModePrompt(prompt));
       } catch { /* child may exit immediately */ }
     }
 
@@ -1359,6 +1522,20 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         flags.agentKillIssued = true;
         callback();
       }, PROCESS_KILL_GRACE_MS);
+    };
+    const enforceOutputLimit = () => {
+      const outputLimit = isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES;
+      if (Buffer.byteLength(allOutput, 'utf8') < outputLimit || flags.outputLimited || !processGroupStillOwned()) return;
+      flags.outputLimited = true;
+      sendLog(ws, `\n[OUTPUT_LIMIT] ${runCommand.displayName} exceeded ${outputLimit} output bytes; terminating text-only run.\n`);
+      const pid = originalPid;
+      if (pid !== undefined) {
+        try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+        setForceKillTimer(() => {
+          if (!processGroupStillOwned()) return;
+          try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+        });
+      }
     };
     const resetStallWatchdog = () => {
       if (stallWatchdog) clearTimeout(stallWatchdog);
@@ -1974,7 +2151,12 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         statusRef.lastProgressAt = Date.now();
       }
       const text = data.toString();
-      if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
+      allOutput = appendWithinByteLimit(
+        allOutput,
+        text,
+        isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES,
+      );
+      enforceOutputLimit();
       if (runCommand.outputMode === 'claude-stream-json') {
         pendingJsonChunks.push(text);
         drainJsonChunks().catch((e: unknown) => {
@@ -1999,7 +2181,12 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
 
     child.stderr.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
-      if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
+      allOutput = appendWithinByteLimit(
+        allOutput,
+        text,
+        isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES,
+      );
+      enforceOutputLimit();
       stderrBuffer = appendBoundedTail(stderrBuffer, text, STDERR_TAIL_BYTES);
       sendLog(ws, `[stderr] ${text}`);
     });
@@ -2056,7 +2243,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         flags.providerKilledByOOM = true;
         const oomLine = `EOOM: ${runCommand.displayName} process received external SIGKILL before agent timeout; likely cgroup OOM\n`;
         stderrBuffer = appendBoundedTail(stderrBuffer, oomLine, STDERR_TAIL_BYTES);
-        if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += oomLine;
+        allOutput = appendWithinByteLimit(allOutput, oomLine, MAX_OUTPUT_BYTES);
         sendLog(ws, `[stderr] ${oomLine}`);
       }
       if (promptFile) {
@@ -2079,6 +2266,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   if (flags.timedOut) {
     recordRunErrorReport(exitCode, 'timeout');
     throw new ClaudeTimeoutError(`${runner.displayName} exceeded ${runCommand.timeoutMs / 60000}-minute time limit`);
+  }
+  if (flags.outputLimited) {
+    recordRunErrorReport(exitCode, 'output_limit');
+    throw new ClaudeTimeoutError(`${runner.displayName} exceeded the ${isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES}-byte output limit`);
   }
   if (flags.stalledMidStream) {
     recordRunErrorReport(exitCode, 'tool_stall');

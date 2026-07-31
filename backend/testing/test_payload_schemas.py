@@ -355,6 +355,7 @@ EXPECTED_TYPES = {
     "fix",
     "plan",
     "research",
+    "discovery_review",
     "strategic_review",
     "design_doc_update",
     "security_audit",
@@ -380,6 +381,7 @@ EXPECTED_TYPES = {
     "salvage_bundle",
     "capability_proof_trial",
     "criterion_coverage_trial",
+    "memory_consolidation",
     "walkthrough_e2e",
 }
 
@@ -439,6 +441,91 @@ def test_fix_passes():
     )
     assert result["prompt"] == "Fix it"
     assert result["pr_number"] == 7
+
+
+def _discovery_review_payload() -> dict:
+    return {
+        "type": "discovery_review",
+        "cycle_id": "11111111-1111-4111-8111-111111111111",
+        "expected_revision": 3,
+        "direction_key": "direction-1",
+        "intent_snapshot": {"goal": "Prove the interaction is useful."},
+        "bet_snapshot": {"mechanism": "Paired level construction."},
+        "outcome_kind": "experiential",
+        "phase": "demonstrate",
+        "evidence_packet": [
+            {
+                "evidence_id": "22222222-2222-4222-8222-222222222222",
+                "semantic_role": "primary_result",
+                "source_kind": "artifact",
+                "source_id": "result-1",
+                "checksum": "a" * 64,
+                "artifact_id": "33333333-3333-4333-8333-333333333333",
+                "evidence_metadata": {"score": 0.7},
+            }
+        ],
+        "packet_checksum": "b" * 64,
+        "candidate_sha": "c" * 40,
+        "mechanism_fingerprint": "d" * 64,
+        "review_round": 1,
+    }
+
+
+def test_discovery_review_payload_strict_contract_round_trips():
+    result = _valid(_discovery_review_payload())
+
+    assert result["type"] == "discovery_review"
+    assert result["expected_revision"] == 3
+    assert result["evidence_packet"][0]["semantic_role"] == "primary_result"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cycle_id", "not-a-uuid"),
+        ("expected_revision", -1),
+        ("outcome_kind", "theoretical"),
+        ("phase", "explore_forever"),
+        ("packet_checksum", "short"),
+        ("review_round", 3),
+    ],
+)
+def test_discovery_review_payload_rejects_invalid_contract(field, value):
+    payload = _discovery_review_payload()
+    payload[field] = value
+    assert "discovery_review" in _invalid(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "cycle_id",
+        "expected_revision",
+        "direction_key",
+        "intent_snapshot",
+        "bet_snapshot",
+        "outcome_kind",
+        "phase",
+        "evidence_packet",
+        "packet_checksum",
+    ],
+)
+def test_discovery_review_payload_rejects_missing_server_fields(field):
+    payload = _discovery_review_payload()
+    payload.pop(field)
+    assert "discovery_review" in _invalid(payload)
+
+
+def test_discovery_review_payload_rejects_unknown_evidence_fields():
+    payload = _discovery_review_payload()
+    payload["evidence_packet"][0]["authorize_this_uri"] = True
+    assert "extra_forbidden" in _invalid(payload)
+
+
+def test_discovery_review_payload_allows_empty_evidence_for_inconclusive_review():
+    payload = _discovery_review_payload()
+    payload["evidence_packet"] = []
+    assert _valid(payload)["evidence_packet"] == []
 
 
 @pytest.mark.parametrize(
