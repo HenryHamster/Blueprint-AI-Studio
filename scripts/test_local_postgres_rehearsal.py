@@ -153,6 +153,42 @@ class RehearsalTests(unittest.TestCase):
             )
         self.assertEqual(run.call_count, 1)
 
+        owned = [
+            {
+                "Name": "/blueprint-precutover-rehearsal-abc-target",
+                "Config": {
+                    "Labels": {
+                        rehearsal._OWNER_LABEL: rehearsal._OWNER_VALUE,
+                        rehearsal._SESSION_LABEL: "abc",
+                    }
+                },
+            }
+        ]
+        present = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(owned), stderr=""
+        )
+        removed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        absent = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="Error: No such container"
+        )
+        run = mock.Mock(side_effect=[present, removed, absent])
+        rehearsal._remove_owned_container(
+            "/usr/bin/docker",
+            "blueprint-precutover-rehearsal-abc-target",
+            "abc",
+            run=run,
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0][1:],
+            [
+                "container",
+                "rm",
+                "--force",
+                "--volumes",
+                "blueprint-precutover-rehearsal-abc-target",
+            ],
+        )
+
     def test_target_isolation_rejects_network_or_port_exposure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -220,6 +256,7 @@ class RehearsalTests(unittest.TestCase):
                 },
                 "HostConfig": {
                     "PortBindings": {},
+                    "Tmpfs": rehearsal._SOURCE_CLIENT_TMPFS,
                     "ReadonlyRootfs": True,
                     "CapDrop": ["ALL"],
                     "SecurityOpt": ["no-new-privileges"],
@@ -235,6 +272,84 @@ class RehearsalTests(unittest.TestCase):
                 [], 0, stdout=json.dumps(payload), stderr=""
             )
         )
+        with self.assertRaisesRegex(rehearsal.RehearsalError, "isolation_mismatch"):
+            rehearsal._assert_source_isolation(
+                "/usr/bin/docker",
+                "blueprint-precutover-rehearsal-abc-source",
+                "abc",
+                image_id,
+                "blueprint-control-plane",
+                run=run,
+            )
+
+    def test_source_client_masks_postgres_image_volume_with_tmpfs(self) -> None:
+        image_id = "sha256:" + "a" * 64
+        run = mock.Mock(
+            side_effect=[
+                subprocess.CompletedProcess(
+                    [], 1, stdout="", stderr="Error: No such object"
+                ),
+                subprocess.CompletedProcess([], 0, stdout="container-id\n", stderr=""),
+            ]
+        )
+
+        rehearsal._start_source_client(
+            "/usr/bin/docker",
+            "blueprint-precutover-rehearsal-abc-source",
+            "abc",
+            image_id,
+            "blueprint-control-plane",
+            run=run,
+        )
+
+        argv = run.call_args_list[1].args[0]
+        tmpfs_values = [
+            argv[index + 1]
+            for index, value in enumerate(argv)
+            if value == "--tmpfs"
+        ]
+        self.assertEqual(
+            tmpfs_values,
+            [
+                f"/tmp:{rehearsal._SOURCE_CLIENT_TMPFS['/tmp']}",
+                (
+                    "/var/lib/postgresql/data:"
+                    f"{rehearsal._SOURCE_CLIENT_TMPFS['/var/lib/postgresql/data']}"
+                ),
+            ],
+        )
+
+    def test_source_isolation_requires_exact_tmpfs_contract(self) -> None:
+        image_id = "sha256:" + "a" * 64
+        payload = [
+            {
+                "Name": "/blueprint-precutover-rehearsal-abc-source",
+                "Image": image_id,
+                "Config": {
+                    "Labels": {
+                        rehearsal._OWNER_LABEL: rehearsal._OWNER_VALUE,
+                        rehearsal._SESSION_LABEL: "abc",
+                    }
+                },
+                "HostConfig": {
+                    "PortBindings": {},
+                    "Tmpfs": {"/tmp": rehearsal._SOURCE_CLIENT_TMPFS["/tmp"]},
+                    "ReadonlyRootfs": True,
+                    "CapDrop": ["ALL"],
+                    "SecurityOpt": ["no-new-privileges"],
+                },
+                "NetworkSettings": {
+                    "Networks": {"blueprint-control-plane": {}}
+                },
+                "Mounts": [],
+            }
+        ]
+        run = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(payload), stderr=""
+            )
+        )
+
         with self.assertRaisesRegex(rehearsal.RehearsalError, "isolation_mismatch"):
             rehearsal._assert_source_isolation(
                 "/usr/bin/docker",

@@ -53,6 +53,14 @@ _CLIENT_OWNER_LABEL = "com.blueprint.owner"
 _CLIENT_OWNER_VALUE = "live-source-rehearsal-export"
 _CLIENT_SESSION_LABEL = "com.blueprint.rehearsal-id"
 _CLIENT_PREFIX = "blueprint-rehearsal-export-"
+_CLIENT_TMPFS = {
+    "/tmp": "rw,noexec,nosuid,nodev,size=64m",
+    # Mask the PostgreSQL image's declared PGDATA VOLUME so Docker does not
+    # create an anonymous writable volume for this dump-only client.
+    "/var/lib/postgresql/data": (
+        "rw,noexec,nosuid,nodev,size=1m,uid=999,gid=999,mode=0700"
+    ),
+}
 _CREDENTIALS_TARGET = "/run/secrets/gcp.json"
 _SOURCE_TARGET = "/run/input/source"
 _UPLOAD_HELPER = Path(__file__).with_name("gcs_create_only_upload.py")
@@ -663,6 +671,9 @@ def _assert_owned_client(
     host = payload.get("HostConfig") or {}
     tmpfs = host.get("Tmpfs") or {}
     tmp_options = set(str(tmpfs.get("/tmp") or "").split(","))
+    postgres_data_options = set(
+        str(tmpfs.get("/var/lib/postgresql/data") or "").split(",")
+    )
     log_config = host.get("LogConfig") or {}
     if (
         str(payload.get("Name") or "").lstrip("/") != name
@@ -682,7 +693,10 @@ def _assert_owned_client(
         or host.get("Memory") != 256 * 1024 * 1024
         or host.get("NanoCpus") != 500_000_000
         or log_config.get("Type") != "none"
-        or tmp_options != {"rw", "noexec", "nosuid", "nodev", "size=64m"}
+        or set(tmpfs) != set(_CLIENT_TMPFS)
+        or tmp_options != set(_CLIENT_TMPFS["/tmp"].split(","))
+        or postgres_data_options
+        != set(_CLIENT_TMPFS["/var/lib/postgresql/data"].split(","))
         or (payload.get("State") or {}).get("Running") is not True
     ):
         raise RehearsalExportError("docker_validation", "client_isolation_mismatch")
@@ -734,7 +748,12 @@ def _start_client(
             "999:999",
             "--read-only",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            f"/tmp:{_CLIENT_TMPFS['/tmp']}",
+            "--tmpfs",
+            (
+                "/var/lib/postgresql/data:"
+                f"{_CLIENT_TMPFS['/var/lib/postgresql/data']}"
+            ),
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -789,7 +808,14 @@ def _remove_client(
         image_id=args.postgres_image_id,
     )
     result = run(
-        [args.docker_binary, "container", "rm", "--force", name],
+        [
+            args.docker_binary,
+            "container",
+            "rm",
+            "--force",
+            "--volumes",
+            name,
+        ],
         capture_output=True,
         text=True,
         check=False,

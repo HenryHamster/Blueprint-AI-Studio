@@ -325,6 +325,11 @@ def _dump_command(image: str, network: str, password_file: Path) -> list[str]:
         "--read-only",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev,size=64m",
+        "--tmpfs",
+        (
+            "/var/lib/postgresql/data:"
+            "rw,noexec,nosuid,nodev,size=1m,uid=999,gid=999,mode=0700"
+        ),
         "--cap-drop",
         "ALL",
         "--security-opt",
@@ -360,6 +365,11 @@ def _gzip_command(image: str) -> list[str]:
         "--pids-limit",
         "32",
         "--read-only",
+        "--tmpfs",
+        (
+            "/var/lib/postgresql/data:"
+            "rw,noexec,nosuid,nodev,size=1m,uid=999,gid=999,mode=0700"
+        ),
         "--cap-drop",
         "ALL",
         "--security-opt",
