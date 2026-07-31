@@ -54,6 +54,14 @@ export interface MessagesPollResponse {
   messages?: ResidentInboundMessage[];
   /** Server-computed canonical subset eligible for the typed Fast claim. */
   fast_message_ids?: string[];
+  /** Exact durable Fast-claim membership when a prior process left a turn open. */
+  fast_claim_groups?: Array<{
+    idempotency_key?: string;
+    message_ids?: string[];
+    member_count?: number;
+    complete?: boolean;
+    artifacts_degraded?: boolean;
+  }>;
   server_time?: string;
   claim_required?: boolean;
 }

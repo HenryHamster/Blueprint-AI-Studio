@@ -578,6 +578,12 @@ class TestHardWatchdogThread:
     abort — proving it runs independently of the (here, un-blocked) event loop."""
 
     def test_thread_fires_on_stale_leader(self, restore_orch_state):
+        # The application lifespan and other tests may already have started the
+        # process-global watchdog.  ``start_*`` is intentionally idempotent, so
+        # without isolating that state this test can inherit a thread whose
+        # callbacks predate ``fake_abort`` and then wait forever for the wrong
+        # Event.  Always prove a newly injected thread here.
+        _orch.stop_orchestrator_hard_watchdog()
         _ss.is_leader = True
         _orch._orchestrator_last_cycle = None
         _orch._orchestrator_cycle_started = None
@@ -603,6 +609,7 @@ class TestHardWatchdogThread:
             _orch.stop_orchestrator_hard_watchdog()
 
     def test_thread_does_not_fire_for_follower(self, restore_orch_state):
+        _orch.stop_orchestrator_hard_watchdog()
         _ss.is_leader = False  # follower: never guarded
         _orch._orchestrator_last_cycle = None
         _orch._orchestrator_cycle_started = None

@@ -2772,6 +2772,74 @@ async def agent_poll_messages(
         .all()
     )
 
+    # A crashed Fast process may leave one immutable claimed turn in front of
+    # newer unclaimed input.  Ordinary paging must never cut that turn: the
+    # claim coordinator will (correctly) reject a subset forever.  Once any
+    # member reaches the resident page, replace the ordinary page with the
+    # exact full open group.  Typed claims are created from this endpoint's
+    # bounded page, so a valid group fits within the same server cap.
+    resident_claim_group_ids: list[uuid.UUID] = []
+    resident_claim_group_id: uuid.UUID | None = None
+    resident_claim_group_key: str | None = None
+    resident_claim_group_selected = False
+    resident_claim_artifacts_degraded = False
+    if resident_poll:
+        claimed_head = next(
+            (
+                row
+                for row in rows
+                if row.conversation_claim_id is not None
+                and (row.context or {}).get("_conversation_public_reply_owner")
+                == "fast"
+                and isinstance(
+                    (row.context or {}).get(
+                        "_conversation_claim_idempotency_key"
+                    ),
+                    str,
+                )
+            ),
+            None,
+        )
+        if claimed_head is not None:
+            resident_claim_group_id = claimed_head.conversation_claim_id
+            claim_group_conditions = [
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.conversation_claim_id
+                == claimed_head.conversation_claim_id,
+                ProjectMessage.from_type == from_type,
+                ProjectMessage.status == status,
+            ]
+            if session_id:
+                claim_group_conditions.append(
+                    or_(
+                        ProjectMessage.resident_session_id == session_id,
+                        ProjectMessage.resident_session_id.is_(None),
+                    )
+                )
+            exact_claim_rows = (
+                (
+                    await session.execute(
+                        select(ProjectMessage)
+                        .where(*claim_group_conditions)
+                        .order_by(*_poll_message_ordering())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            resident_claim_group_ids = [row.id for row in exact_claim_rows]
+            raw_claim_key = (claimed_head.context or {}).get(
+                "_conversation_claim_idempotency_key"
+            )
+            resident_claim_group_key = (
+                raw_claim_key.strip()
+                if isinstance(raw_claim_key, str) and raw_claim_key.strip()
+                else None
+            )
+            if exact_claim_rows and len(exact_claim_rows) <= _MESSAGES_POLL_MAX_LIMIT:
+                rows = exact_claim_rows
+                resident_claim_group_selected = True
+
     remaining_rows = list(rows)
     while True:
         try:
@@ -2787,6 +2855,15 @@ async def agent_poll_messages(
             )
             break
         except WorkdayArtifactBatchLimit as batch_limit:
+            if resident_claim_group_selected:
+                # Membership recovery is atomic: shrinking an old Fast turn
+                # would make its immutable coordinator claim unrecoverable.
+                # Preserve every text row and explicitly degrade attachments;
+                # Fast can then ask for a resend or consult Workday instead of
+                # polling the same impossible prefix forever.
+                artifact_attachments = {}
+                resident_claim_artifacts_degraded = True
+                break
             prefix: list[ProjectMessage] = []
             for row in remaining_rows:
                 if row.id == batch_limit.first_excluded_message_id:
@@ -2908,13 +2985,28 @@ async def agent_poll_messages(
                 status_code=409,
                 detail="Resident worker generation superseded or inactive",
             )
+        if resident_claim_group_selected and resident_claim_group_id is not None:
+            final_conditions = [
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.conversation_claim_id == resident_claim_group_id,
+                ProjectMessage.from_type == from_type,
+                ProjectMessage.status == status,
+            ]
+            if session_id:
+                final_conditions.append(
+                    or_(
+                        ProjectMessage.resident_session_id == session_id,
+                        ProjectMessage.resident_session_id.is_(None),
+                    )
+                )
+            fresh_query = select(ProjectMessage).where(*final_conditions)
+        else:
+            fresh_query = select(ProjectMessage).where(*conditions).limit(limit)
         fresh_rows = (
             (
                 await session.execute(
-                    select(ProjectMessage)
-                    .where(*conditions)
+                    fresh_query
                     .order_by(*_poll_message_ordering())
-                    .limit(limit)
                     .execution_options(populate_existing=True)
                 )
             )
@@ -2938,6 +3030,17 @@ async def agent_poll_messages(
     projected_messages: list[dict[str, Any]] = []
     for row in remaining_rows:
         projected = _poll_message_dict(row)
+        if resident_claim_artifacts_degraded:
+            projected["content"] = (
+                f"{projected.get('content') or ''}\n\n"
+                "[System recovery notice: attachments from this interrupted "
+                "turn exceeded the safe delivery limit and were not included. "
+                "Ask the operator to resend the relevant artifact if needed.]"
+            )
+            degraded_context = dict(projected.get("context") or {})
+            degraded_context.pop("attachments", None)
+            degraded_context["_artifact_delivery_deferred"] = True
+            projected["context"] = degraded_context
         extras = artifact_attachments.get(row.id, [])
         if extras:
             context = dict(projected.get("context") or {})
@@ -2971,8 +3074,28 @@ async def agent_poll_messages(
             ).scalars().all()
         )
         fast_message_ids = [
-            str(row.id) for row in remaining_rows if row.id in canonical_ids
+            str(row.id)
+            for row in remaining_rows
+            if row.id in canonical_ids
+            and (
+                row.conversation_claim_id is None
+                or (row.context or {}).get("_conversation_public_reply_owner")
+                == "fast"
+            )
         ]
+
+    visible_message_ids = {row.id for row in remaining_rows}
+    fast_claim_groups: list[dict[str, object]] = []
+    if resident_claim_group_ids and resident_claim_group_key is not None:
+        fast_claim_groups.append(
+            {
+                "idempotency_key": resident_claim_group_key,
+                "message_ids": [str(value) for value in resident_claim_group_ids],
+                "member_count": len(resident_claim_group_ids),
+                "complete": set(resident_claim_group_ids) == visible_message_ids,
+                "artifacts_degraded": resident_claim_artifacts_degraded,
+            }
+        )
 
     return {
         "messages": projected_messages,
@@ -2984,4 +3107,7 @@ async def agent_poll_messages(
         # Additive: old Workday agents continue using ``messages``. Typed Fast
         # must submit only these ids to its canonical claim endpoint.
         "fast_message_ids": fast_message_ids,
+        # Authoritative completeness metadata for recovering a durable Fast
+        # claim after process/session restart.  Older agents ignore it.
+        "fast_claim_groups": fast_claim_groups,
     }

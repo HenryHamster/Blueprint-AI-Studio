@@ -237,6 +237,55 @@ describe('partitionTypedFastMessages', () => {
 });
 
 describe('selectTypedFastClaimMessages', () => {
+  it('recovers an older claimed turn before newer unclaimed input after restart', () => {
+    const staleM1 = {
+      id: 'm1',
+      from_type: 'user',
+      content: 'first',
+      context: { _conversation_claim_idempotency_key: 'old-fast-turn' },
+    } as never;
+    const m2 = { id: 'm2', from_type: 'user', content: 'second', context: {} } as never;
+
+    expect(selectTypedFastClaimMessages([staleM1, m2])).toEqual([staleM1]);
+  });
+
+  it('waits for authoritative stale claim membership instead of claiming a partial page', () => {
+    const staleM1 = {
+      id: 'm1',
+      from_type: 'user',
+      content: 'first',
+      context: {
+        _conversation_claim_idempotency_key: 'old-fast-turn',
+        _conversation_claim_message_ids: ['m1', 'm2'],
+        _conversation_claim_member_count: 2,
+        _conversation_claim_group_complete: false,
+      },
+    } as never;
+
+    expect(selectTypedFastClaimMessages([staleM1])).toBeNull();
+  });
+
+  it('recovers an authoritative complete stale claim group exactly', () => {
+    const claimContext = {
+      _conversation_claim_idempotency_key: 'old-fast-turn',
+      _conversation_claim_message_ids: ['m1', 'm2'],
+      _conversation_claim_member_count: 2,
+      _conversation_claim_group_complete: true,
+    };
+    const staleM1 = {
+      id: 'm1', from_type: 'user', content: 'first', context: claimContext,
+    } as never;
+    const staleM2 = {
+      id: 'm2', from_type: 'user', content: 'second', context: claimContext,
+    } as never;
+    const newer = { id: 'm3', from_type: 'user', content: 'third', context: {} } as never;
+
+    expect(selectTypedFastClaimMessages([staleM1, staleM2, newer])).toEqual([
+      staleM1,
+      staleM2,
+    ]);
+  });
+
   it('retries only M1 when a later page contains M1 plus M2', () => {
     const m1 = { id: 'm1', from_type: 'user', content: 'first' } as never;
     const m2 = { id: 'm2', from_type: 'user', content: 'second' } as never;
@@ -540,6 +589,213 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(typedFastMocks.ensureReady).not.toHaveBeenCalled();
     expect(leaseAcquireCount).toBe(1);
     expect(messagePolls).toBeLessThanOrEqual(3);
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+  });
+
+  it('recovers an expired claimed turn before sequentially answering newer input', async () => {
+    const staleM1 = {
+      id: 'typed-fast-stale-m1', content: 'hi',
+      created_at: '2026-07-31T08:25:25.598Z', from_type: 'user',
+      context: { _conversation_claim_idempotency_key: 'old-fast-turn' },
+    };
+    const newerM2 = {
+      id: 'typed-fast-newer-m2', content: 'hihi',
+      created_at: '2026-07-31T21:06:18.659Z', from_type: 'user',
+      context: { _server_artifact_delivery_deferred: true },
+    };
+    let completed = 0;
+    const claimBodies: Array<Record<string, unknown> | undefined> = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      const messages = completed === 0 ? [staleM1, newerM2]
+        : completed === 1 ? [newerM2] : [];
+      return Promise.resolve({
+        messages,
+        fast_message_ids: messages.map(message => message.id),
+        fast_claim_groups: completed === 0 ? [{
+          idempotency_key: 'old-fast-turn',
+          message_ids: [staleM1.id],
+          member_count: 1,
+          complete: true,
+          artifacts_degraded: true,
+        }] : [],
+        claim_required: true,
+      });
+    });
+    const envelopeFor = (messageId: string) => {
+      const transcriptSequence = messageId === staleM1.id ? 101 : 102;
+      const canonicalEnvelope = {
+        version: 1,
+        project_id: '11111111-1111-4111-8111-111111111111',
+        context_authority_generation: 4,
+        privacy_generation: 2,
+        transcript_sequence: transcriptSequence,
+        ledger_revision: 0,
+        problem_model: {},
+        decisions: [],
+        memory: { active: [] },
+        recent_conversation: [{ sequence: transcriptSequence, content: messageId }],
+      };
+      const canonicalBytes = Buffer.from(JSON.stringify(canonicalEnvelope), 'utf8');
+      return {
+        snapshot_id: `snapshot-${messageId}`,
+        canonical_envelope_b64: canonicalBytes.toString('base64'),
+        canonical_sha256: createHash('sha256').update(canonicalBytes).digest('hex'),
+        context_authority_generation: 4,
+        privacy_generation: 2,
+        transcript_sequence: transcriptSequence,
+        ledger_revision: 0,
+        expires_at: '2035-01-01T00:00:00.000Z',
+      };
+    };
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({ authority_held: true });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true, lease: { lease_id: 'lease-stale-recovery', generation: 1 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        claimBodies.push(body);
+        const messageIds = body?.message_ids as string[];
+        return Promise.resolve({
+          claim_id: `claim-${messageIds[0]}`,
+          owner: 'fast',
+          message_ids: messageIds,
+          envelope: envelopeFor(messageIds[0]),
+        });
+      }
+      if (url.endsWith('/conversation/turns/complete')) {
+        completed += 1;
+        return Promise.resolve({ status: 'completed' });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation(async (receipt: unknown) => ({
+      receipt,
+      result: turnResult({ resultText: `reply-${completed + 1}` }),
+      completion: { receipt, content: `reply-${completed + 1}` },
+      workdayRequests: [],
+    }));
+    const workday = makeSession(async () => turnResult(), () => completed < 2);
+    mockStartSession.mockReturnValue(workday);
+
+    await run('typed-fast-stale-recovery', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+
+    expect(claimBodies.map(body => body?.message_ids)).toEqual([
+      [staleM1.id],
+      [newerM2.id],
+    ]);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    const recoveredPrompt = typedFastMocks.dispatch.mock.calls[0]?.[1];
+    const recoveredPromptText = typeof recoveredPrompt === 'string'
+      ? recoveredPrompt
+      : JSON.stringify(recoveredPrompt);
+    expect(recoveredPromptText).toContain(
+      'attachments from this interrupted turn exceeded the safe delivery limit',
+    );
+    const ordinaryPrompt = typedFastMocks.dispatch.mock.calls[1]?.[1];
+    const ordinaryPromptText = typeof ordinaryPrompt === 'string'
+      ? ordinaryPrompt
+      : JSON.stringify(ordinaryPrompt);
+    expect(ordinaryPromptText).not.toContain(
+      'attachments from this interrupted turn exceeded the safe delivery limit',
+    );
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+  });
+
+  it('paces a transient Fast claim conflict and retries the same client identity', async () => {
+    const operatorMessage = {
+      id: 'typed-fast-conflict', content: 'hello',
+      created_at: new Date().toISOString(), from_type: 'user', context: {},
+    };
+    let completed = false;
+    const claimBodies: Array<Record<string, unknown> | undefined> = [];
+    const claimTimes: number[] = [];
+    mockApiGet.mockImplementation((url: string) => Promise.resolve(
+      url.includes('/messages?') && !completed
+        ? { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] }
+        : { messages: [] },
+    ));
+    const canonicalEnvelope = {
+      version: 1,
+      project_id: '11111111-1111-4111-8111-111111111111',
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 103,
+      ledger_revision: 0,
+      problem_model: {}, decisions: [], memory: { active: [] },
+      recent_conversation: [{ sequence: 103, content: 'hello' }],
+    };
+    const canonicalBytes = Buffer.from(JSON.stringify(canonicalEnvelope), 'utf8');
+    const envelope = {
+      snapshot_id: 'snapshot-paced-conflict',
+      canonical_envelope_b64: canonicalBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(canonicalBytes).digest('hex'),
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 103,
+      ledger_revision: 0,
+      expires_at: '2035-01-01T00:00:00.000Z',
+    };
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({ authority_held: true });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true, lease: { lease_id: 'lease-paced-conflict', generation: 1 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        claimBodies.push(body);
+        claimTimes.push(Date.now());
+        if (claimBodies.length === 1) {
+          return Promise.reject(new Error('409: Turn is already claimed or changed'));
+        }
+        return Promise.resolve({
+          claim_id: 'claim-paced-conflict', owner: 'fast',
+          message_ids: [operatorMessage.id], envelope,
+        });
+      }
+      if (url.endsWith('/conversation/turns/complete')) {
+        completed = true;
+        return Promise.resolve({ status: 'completed' });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation(async (receipt: unknown) => ({
+      receipt,
+      result: turnResult({ resultText: 'Hello.' }),
+      completion: { receipt, content: 'Hello.' },
+      workdayRequests: [],
+    }));
+    const workday = makeSession(async () => turnResult(), () => !completed);
+    mockStartSession.mockReturnValue(workday);
+
+    await run('typed-fast-paced-conflict', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+
+    expect(claimBodies).toHaveLength(2);
+    expect(claimTimes[1] - claimTimes[0]).toBeGreaterThanOrEqual(900);
+    expect(claimBodies[1]?.client_claim_id).toBe(claimBodies[0]?.client_claim_id);
+    expect(claimBodies[1]?.idempotency_key).toBe(claimBodies[0]?.idempotency_key);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 

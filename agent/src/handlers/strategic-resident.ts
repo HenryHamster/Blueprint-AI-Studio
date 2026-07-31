@@ -209,7 +209,40 @@ export function selectTypedFastClaimMessages(
     messages: ResidentInboundMessage[];
   } | null,
 ): ResidentInboundMessage[] | null {
-  if (!pending) return messages;
+  if (!pending) {
+    // A previous Resident incarnation can leave an expired, exact Fast claim
+    // in front of newer unclaimed input.  The coordinator intentionally
+    // forbids appending the newer rows to that immutable logical turn.  Polls
+    // retain the claim idempotency marker in the internal message context, so
+    // recover the oldest marked turn by itself; the newer rows remain open and
+    // are picked up immediately after its atomic completion.
+    const oldestClaimKey = messages.find(message => (
+      typeof message.context?._conversation_claim_idempotency_key === 'string'
+      && message.context._conversation_claim_idempotency_key.trim().length > 0
+    ))?.context?._conversation_claim_idempotency_key;
+    if (typeof oldestClaimKey === 'string') {
+      const claimedMessages = messages.filter(message => (
+        message.context?._conversation_claim_idempotency_key === oldestClaimKey
+      ));
+      const groupContext = claimedMessages[0]?.context;
+      const expectedCount = groupContext?._conversation_claim_member_count;
+      const expectedIds = groupContext?._conversation_claim_message_ids;
+      if (groupContext?._conversation_claim_group_complete === false) return null;
+      if (
+        typeof expectedCount === 'number'
+        && (!Number.isInteger(expectedCount) || expectedCount !== claimedMessages.length)
+      ) return null;
+      if (Array.isArray(expectedIds)) {
+        const visibleIds = new Set(claimedMessages.map(message => message.id));
+        if (
+          expectedIds.length !== claimedMessages.length
+          || expectedIds.some(id => typeof id !== 'string' || !visibleIds.has(id))
+        ) return null;
+      }
+      return claimedMessages;
+    }
+    return messages;
+  }
   const pageById = new Map(messages.map(message => [
     typeof message.id === 'string' ? message.id.trim() : '',
     message,
@@ -1883,15 +1916,56 @@ export async function handleStrategicResident(
           (Array.isArray(resp.fast_message_ids) ? resp.fast_message_ids : [])
             .filter((id): id is string => typeof id === 'string' && id.length > 0),
         );
+        const fastClaimGroupByMessageId = new Map<string, {
+          idempotencyKey: string;
+          messageIds: string[];
+          memberCount: number;
+          complete: boolean;
+          artifactsDegraded: boolean;
+        }>();
+        for (const group of Array.isArray(resp.fast_claim_groups) ? resp.fast_claim_groups : []) {
+          const idempotencyKey = typeof group.idempotency_key === 'string'
+            ? group.idempotency_key.trim()
+            : '';
+          const messageIds = Array.isArray(group.message_ids)
+            ? group.message_ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+            : [];
+          const memberCount = typeof group.member_count === 'number'
+            ? group.member_count
+            : messageIds.length;
+          if (!idempotencyKey || messageIds.length === 0) continue;
+          for (const messageId of messageIds) {
+            fastClaimGroupByMessageId.set(messageId, {
+              idempotencyKey,
+              messageIds,
+              memberCount,
+              complete: group.complete === true,
+              artifactsDegraded: group.artifacts_degraded === true,
+            });
+          }
+        }
         // The backend alone decides canonical Fast membership. Carry the
         // additive projection through the legacy batch admission so a mixed
         // page can split safely instead of causing a broad typed claim.
         const raw = (Array.isArray(resp.messages) ? resp.messages : []).map(message => {
           const id = typeof message.id === 'string' ? message.id : '';
           if (!fastIds.has(id)) return message;
+          const claimGroup = fastClaimGroupByMessageId.get(id);
           return {
             ...message,
-            context: { ...(message.context ?? {}), _typed_fast_eligible: true },
+            context: {
+              ...(message.context ?? {}),
+              _typed_fast_eligible: true,
+              // Always overwrite the free-form operator context with the
+              // server-owned poll projection, including the false case.
+              _server_artifact_delivery_deferred: claimGroup?.artifactsDegraded === true,
+              ...(claimGroup ? {
+                _conversation_claim_idempotency_key: claimGroup.idempotencyKey,
+                _conversation_claim_message_ids: claimGroup.messageIds,
+                _conversation_claim_member_count: claimGroup.memberCount,
+                _conversation_claim_group_complete: claimGroup.complete,
+              } : {}),
+            },
           };
         });
         const admission = admitMessageBatchPage(
@@ -3683,9 +3757,18 @@ export async function handleStrategicResident(
     displacedWorkdayClaim: ConversationClaimSnapshot | null = null,
   ): Promise<TypedFastTurnOutcome> => {
     if (typedFastDispatching || callCoordinator.suppressOrdinaryWorkday()) return 'not_available';
+    // Preserve a stable pending request without re-hitting claim/abandon while
+    // its retry circuit is open.  This check must precede unresolved-claim
+    // reconciliation because that path uses the same coordinator budget.
+    if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
     const unresolved = await reconcileUnresolvedTypedFastClaim();
     if (unresolved === 'completed') return 'completed';
-    if (unresolved === 'pending') return 'deferred';
+    if (unresolved === 'pending') {
+      typedFastFailureCount += 1;
+      typedFastCircuitOpenUntil = Date.now()
+        + typedFastFailureBackoffMs(typedFastFailureCount);
+      return 'deferred';
+    }
     // The typed endpoint is intentionally narrower than legacy polling. Never
     // let an internal packet or a mixed legacy page become a Fast public turn.
     if (msgs.some(message => (
@@ -3703,6 +3786,9 @@ export async function handleStrategicResident(
     if (selectedMessages === null) {
       // We still cannot reconstruct the old exact input, so do not replace it
       // with a new claim or let legacy Workday race it.
+      typedFastFailureCount += 1;
+      typedFastCircuitOpenUntil = Date.now()
+        + typedFastFailureBackoffMs(typedFastFailureCount);
       return 'deferred';
     }
     const messageIds = selectedMessages
@@ -3793,6 +3879,9 @@ export async function handleStrategicResident(
       const attachmentBlocks = await materializeContentBlocks(
         combineOperatorMessages(attachmentOnlyMessages),
       );
+      const artifactDeliveryDeferred = selectedMessages.some(message => (
+        message.context?._server_artifact_delivery_deferred === true
+      ));
       const promptText = [
         buildFastResidentContextFrame(verified, typedFastTranscriptSequence),
         '',
@@ -3801,6 +3890,9 @@ export async function handleStrategicResident(
         attachmentBlocks.length > 0
           ? 'The model input following this text contains the active turn attachments.'
           : 'There are no separate attachment blocks for this turn.',
+        ...(artifactDeliveryDeferred ? [
+          'Recovery notice: attachments from this interrupted turn exceeded the safe delivery limit and were not included. Ask the operator to resend the relevant artifact if it is needed to answer accurately.',
+        ] : []),
         '',
         'You MUST use mcp__call__complete_turn exactly once with the natural public reply.',
         'If fresh investigation is genuinely necessary, also use mcp__call__request_workday with a concise private request, but still complete this turn naturally (for example, say what you are checking). Do not emit a competing public answer in plain text.',
@@ -3951,6 +4043,22 @@ export async function handleStrategicResident(
       } else {
         rollbackPendingOperatorAdmission();
         setResidentActivity('waiting', 'Fast Resident turn remains pending');
+        // Claim conflicts and transient coordinator locks are retryable, but a
+        // pending stable claim request must not bypass the circuit deadline and
+        // hot-loop the claim endpoint.  The live failure that motivated this
+        // fence reached the endpoint's 120/minute limit before any model turn.
+        const retryDelayMs = Math.max(
+          cfg.messagePollMs,
+          Math.min(
+            cfg.idleTickMs,
+            Math.max(0, typedFastCircuitOpenUntil - Date.now()),
+          ),
+        );
+        await sleep(retryDelayMs);
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested || !authorityHeld) return 'stop';
+        }
         return 'continue';
       }
     }

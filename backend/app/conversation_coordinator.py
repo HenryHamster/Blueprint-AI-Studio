@@ -276,14 +276,6 @@ async def claim_operator_messages(
         )
         if {row.id for row in all_claim_rows} != set(requested):
             return None
-        if client_claim_id is not None and existing_claim_id != client_claim_id:
-            return None
-        if normalized_claim_key is not None and any(
-            (row.context or {}).get(_CONVERSATION_CLAIM_IDEMPOTENCY_CONTEXT_KEY)
-            != normalized_claim_key
-            for row in all_claim_rows
-        ):
-            return None
     claimed_rows = tuple(
         row for row in ordered if row.conversation_claim_id is not None
     )
@@ -326,10 +318,51 @@ async def claim_operator_messages(
         and row.conversation_claim_expires_at > now
         for row in claimed_rows
     )
+    lease_expired = bool(claimed_rows) and all(
+        row.handling_state == MessageHandlingState.CLAIMED
+        and row.conversation_claim_expires_at is not None
+        and row.conversation_claim_expires_at <= now
+        for row in claimed_rows
+    )
     if existing_claim_id is not None and lease_live and not same_owner:
         return None
 
-    if client_claim_id is not None and existing_claim_id is None:
+    client_identity_matches = existing_claim_id is None or (
+        (client_claim_id is None or existing_claim_id == client_claim_id)
+        and (
+            normalized_claim_key is None
+            or all(
+                (row.context or {}).get(
+                    _CONVERSATION_CLAIM_IDEMPOTENCY_CONTEXT_KEY
+                )
+                == normalized_claim_key
+                for row in claimed_rows
+            )
+        )
+    )
+    # A live same-process replay must retain its stable client identity.  Once
+    # the lease expires, however, a replacement process has necessarily lost
+    # those in-memory identifiers.  Exact immutable membership is already
+    # locked and verified above, so allow the replacement to bind a fresh
+    # client identity instead of leaving the operator turn unrecoverable.
+    if existing_claim_id is not None and lease_live and not client_identity_matches:
+        return None
+
+    rebind_expired_client_identity = (
+        existing_claim_id is not None
+        and lease_expired
+        and not client_identity_matches
+    )
+    if (
+        existing_claim_id is not None
+        and not client_identity_matches
+        and not rebind_expired_client_identity
+    ):
+        return None
+
+    if client_claim_id is not None and (
+        existing_claim_id is None or rebind_expired_client_identity
+    ):
         rows_using_client_claim = (
             (
                 await session.execute(
@@ -346,8 +379,14 @@ async def claim_operator_messages(
         )
         if rows_using_client_claim:
             return None
-    claim_id = existing_claim_id or client_claim_id or uuid.uuid4()
-    reclaimed = existing_claim_id is not None and not same_owner
+    claim_id = (
+        client_claim_id
+        if rebind_expired_client_identity
+        else existing_claim_id or client_claim_id or uuid.uuid4()
+    )
+    reclaimed = existing_claim_id is not None and (
+        not same_owner or rebind_expired_client_identity
+    )
     expires_at = now + timedelta(seconds=lease_seconds)
     attempt = max((row.conversation_claim_attempt for row in ordered), default=0)
     if existing_claim_id is None or reclaimed:
