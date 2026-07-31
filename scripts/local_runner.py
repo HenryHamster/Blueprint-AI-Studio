@@ -3942,6 +3942,42 @@ def _heartbeat_loop(
                             stale = not version_hint.startswith(runner_sha)
                         else:
                             stale = version_hint not in version
+                        # A detached deployment checkout may already be newer
+                        # than the orchestrator's advertised commit. Prove that
+                        # relation before invoking do_update(): detached
+                        # checkouts intentionally have no upstream, so the
+                        # updater cannot be the prerequisite for this proof.
+                        ancestry_shortcut_eligible = (
+                            isinstance(version_hint, str)
+                            and re.fullmatch(r"[0-9a-f]{40}", version_hint) is not None
+                            # Bind the disk ancestry proof to the commit whose
+                            # code this process actually loaded. An operator or
+                            # deployment may move HEAD before restarting us.
+                            and _runner_version() == version
+                        )
+                        if (
+                            stale
+                            and ancestry_shortcut_eligible
+                            and br.checkout_contains_commit(version_hint)
+                        ):
+                            br.report_update_result(
+                                orchestrator_url,
+                                token,
+                                status="success",
+                                old_version=version,
+                                new_version=version,
+                            )
+                            accepted_ancestor_version_hint = version_hint
+                            last_auto_update_failure = None
+                            next_auto_update_attempt_at = 0.0
+                            _update_in_progress.clear()
+                            stale = False
+                            print(
+                                "[runner] checkout is newer than the "
+                                "orchestrator version hint and already "
+                                "contains it — continuing without an update.",
+                                flush=True,
+                            )
                         if stale:
                             # Enter drain mode immediately. Both agent and
                             # compute pollers stop NEW claims while existing
