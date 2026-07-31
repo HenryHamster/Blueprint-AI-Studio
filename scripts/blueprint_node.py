@@ -45,6 +45,8 @@ _CLOUD_SQL_PROXY_SERVICE = _SCRIPT_DIR / "cloud_sql_proxy_service.py"
 _LOCAL_POSTGRES_SERVICE = _SCRIPT_DIR / "local_postgres_service.py"
 _LOCAL_POSTGRES_BACKUP_SERVICE = _SCRIPT_DIR / "local_postgres_backup_service.py"
 _LOCAL_POSTGRES_CUTOVER = _SCRIPT_DIR / "local_postgres_cutover.py"
+_LOCAL_POSTGRES_REHEARSAL = _SCRIPT_DIR / "local_postgres_rehearsal.py"
+_LIVE_SOURCE_REHEARSAL_EXPORT = _SCRIPT_DIR / "live_source_rehearsal_export.py"
 _LOCAL_API_SERVICE = _SCRIPT_DIR / "local_api_service.py"
 _LOCAL_WORKER_SERVICE = _SCRIPT_DIR / "local_worker_service.py"
 _TAILSCALE_FUNNEL_SERVICE = _SCRIPT_DIR / "tailscale_funnel_service.py"
@@ -72,6 +74,8 @@ _LOCAL_CONTROL_PLANE_SCRIPT_SOURCES = (
     _LOCAL_POSTGRES_SERVICE,
     _LOCAL_POSTGRES_BACKUP_SERVICE,
     _LOCAL_POSTGRES_CUTOVER,
+    _LOCAL_POSTGRES_REHEARSAL,
+    _LIVE_SOURCE_REHEARSAL_EXPORT,
     _LOCAL_API_SERVICE,
     _LOCAL_WORKER_SERVICE,
     _TAILSCALE_FUNNEL_SERVICE,
