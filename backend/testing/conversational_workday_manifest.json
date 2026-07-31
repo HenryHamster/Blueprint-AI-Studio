@@ -335,11 +335,14 @@
         "revalidates an existing claim before retrying the provider turn",
         "waits through retryable legacy grace without publishing loser helpers",
         "acquires the fenced slot before readiness and releases it on normal shutdown",
-        "closes a lease-lost Fast controller and uses Workday for the next tagged message",
-        "falls back to the normal Workday responder when capacity denies Fast before launch",
+        "closes a lease-lost Fast controller without giving its next tagged message to Workday",
+        "completes a pure Fast message while an autonomous Workday turn keeps running",
+        "preserves the operator message without broad Workday fallback when Fast capacity is denied",
+        "renews and restores the ordinary Workday claim while Fast replies",
         "releases the exact lease after a failed readiness probe without starting a Fast turn",
         "retries only M1 when a later page contains M1 plus M2",
         "sends only the backend-marked canonical user subset to Fast",
+        "stops both lanes when the displaced Workday claim cannot be renewed",
         "uses the retained M1 input while its stable claim is leased"
       ]
     },

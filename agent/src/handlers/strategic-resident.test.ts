@@ -2,6 +2,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'crypto';
 
 // ── Hoisted mock sinks ────────────────────────────────────────────────────────
 const {
@@ -494,16 +495,18 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(typedFastMocks.construct).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to the normal Workday responder when capacity denies Fast before launch', async () => {
+  it('preserves the operator message without broad Workday fallback when Fast capacity is denied', async () => {
+    vi.useFakeTimers();
     const operatorMessage = {
       id: 'typed-fast-denied-message', content: 'Please respond normally.',
       created_at: new Date().toISOString(), from_type: 'user',
     };
-    let polled = false;
+    let messagePolls = 0;
+    let leaseAcquireCount = 0;
     let heartbeatCount = 0;
     mockApiGet.mockImplementation((url: string) => {
-      if (url.includes('/messages?') && !polled) {
-        polled = true;
+      if (url.includes('/messages?')) {
+        messagePolls += 1;
         return Promise.resolve({ messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
       }
       return Promise.resolve({ messages: [] });
@@ -514,6 +517,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({ authority_held: true, stop_requested: heartbeatCount > 1 });
       }
       if (url.endsWith('/typed-fast-lease/acquire')) {
+        leaseAcquireCount += 1;
         return Promise.resolve({ acquired: false, reason: 'no_concurrent_capacity' });
       }
       return Promise.resolve({});
@@ -524,11 +528,19 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     );
     mockStartSession.mockReturnValue(workday);
 
-    await run('typed-fast-denied');
+    const done = run('typed-fast-denied', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(3_000);
+    await done;
 
     expect(typedFastMocks.construct).not.toHaveBeenCalled();
     expect(typedFastMocks.ensureReady).not.toHaveBeenCalled();
-    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(leaseAcquireCount).toBe(1);
+    expect(messagePolls).toBeLessThanOrEqual(3);
+    expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
   it('releases the exact lease after a failed readiness probe without starting a Fast turn', async () => {
@@ -557,7 +569,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     })]);
   });
 
-  it('closes a lease-lost Fast controller and uses Workday for the next tagged message', async () => {
+  it('closes a lease-lost Fast controller without giving its next tagged message to Workday', async () => {
     vi.useFakeTimers();
     const operatorMessage = {
       id: 'typed-fast-lease-lost-message', content: 'Continue after the lease loss.',
@@ -566,6 +578,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     let leaseLost = false;
     let delivered = false;
     let heartbeatCount = 0;
+    let leaseAcquireCount = 0;
     const releaseCalls: string[] = [];
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/messages?') && leaseLost && !delivered) {
@@ -587,6 +600,10 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({ authority_held: true, stop_requested: heartbeatCount > 2 });
       }
       if (url.endsWith('/typed-fast-lease/acquire')) {
+        leaseAcquireCount += 1;
+        if (leaseAcquireCount > 1) {
+          return Promise.resolve({ acquired: false, reason: 'replacement_capacity_pending' });
+        }
         return Promise.resolve({ acquired: true, lease: { lease_id: 'lease-lost', generation: 3 } });
       }
       if (url.endsWith('/typed-fast-lease/release')) {
@@ -606,12 +623,338 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       strategic_session_idle_tick_seconds: 1,
       strategic_session_message_poll_seconds: 0.001,
     });
-    await vi.advanceTimersByTimeAsync(3_000);
+    for (let tick = 0; tick < 6; tick += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
     await done;
 
     expect(typedFastMocks.close).toHaveBeenCalledTimes(1);
-    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(leaseAcquireCount).toBe(2);
+    expect(workday.sendTurn).not.toHaveBeenCalled();
     expect(releaseCalls).toEqual([]);
+  });
+
+  it('completes a pure Fast message while an autonomous Workday turn keeps running', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'typed-fast-parallel-message',
+      content: 'hi',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        messagePolls += 1;
+        return Promise.resolve(messagePolls === 2
+          ? {
+              messages: [operatorMessage],
+              fast_message_ids: [operatorMessage.id],
+              claim_required: true,
+            }
+          : { messages: [], fast_message_ids: [], claim_required: true });
+      }
+      return Promise.resolve(null);
+    });
+
+    const canonicalEnvelope = {
+      version: 1,
+      project_id: '11111111-1111-4111-8111-111111111111',
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 81,
+      ledger_revision: 0,
+      problem_model: {},
+      decisions: [],
+      memory: { active: [] },
+      recent_conversation: [{ sequence: 81, content: 'hi' }],
+    };
+    const canonicalBytes = Buffer.from(JSON.stringify(canonicalEnvelope), 'utf8');
+    const envelope = {
+      snapshot_id: 'snapshot-parallel-fast',
+      canonical_envelope_b64: canonicalBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(canonicalBytes).digest('hex'),
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 81,
+      ledger_revision: 0,
+      expires_at: '2035-01-01T00:00:00.000Z',
+    };
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatCount > 1,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: 'lease-parallel-fast', generation: 1 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-parallel-fast',
+          owner: 'fast',
+          message_ids: [operatorMessage.id],
+          envelope,
+        });
+      }
+      if (url.endsWith('/conversation/turns/complete')) {
+        return Promise.resolve({ status: 'completed' });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation(async (receipt: unknown) => ({
+      receipt,
+      result: turnResult({ resultText: 'Hi — what are you thinking about?' }),
+      completion: {
+        receipt,
+        content: 'Hi — what are you thinking about?',
+      },
+      workdayRequests: [],
+    }));
+
+    let resolveAutonomous!: (result: ResidentTurnResult) => void;
+    const autonomous = new Promise<ResidentTurnResult>((resolve) => {
+      resolveAutonomous = resolve;
+    });
+    const workday = makeSession(() => autonomous, () => true);
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('typed-fast-parallel', {
+      ...qualifiedPayload(),
+      strategic_session_autonomous: true,
+      strategic_session_message_poll_seconds: 0.001,
+      strategic_session_min_tick_seconds: 1,
+    });
+    // Let startup, repository freshness, the initial empty poll, and the
+    // autonomous turn all settle before watchTurn's foreground poll fires.
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
+    expect(mockApiPost.mock.calls.some(([url]) =>
+      url.endsWith('/conversation/turns/complete'))).toBe(true);
+    expect(workday.interrupt).not.toHaveBeenCalled();
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+
+    resolveAutonomous(turnResult({ resultText: 'TICK-VERDICT: CLEAR — background done' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await done;
+  });
+
+  const runOrdinaryWorkdayOverlapCase = async (renewalFails: boolean) => {
+    vi.useFakeTimers();
+    const legacyMessage = {
+      id: 'legacy-workday-message',
+      content: 'legacy input already owned by Workday',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    const fastMessage = {
+      id: 'typed-fast-during-workday',
+      content: 'hi',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      messagePolls += 1;
+      if (messagePolls === 1) {
+        return Promise.resolve({
+          messages: [legacyMessage],
+          fast_message_ids: [],
+          claim_required: true,
+        });
+      }
+      if (messagePolls === 2) {
+        return Promise.resolve({
+          messages: [fastMessage],
+          fast_message_ids: [fastMessage.id],
+          claim_required: true,
+        });
+      }
+      return Promise.resolve({ messages: [], fast_message_ids: [], claim_required: true });
+    });
+
+    const canonicalEnvelope = {
+      version: 1,
+      project_id: '11111111-1111-4111-8111-111111111111',
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 82,
+      ledger_revision: 0,
+      problem_model: {},
+      decisions: [],
+      memory: { active: [] },
+      recent_conversation: [{ sequence: 82, content: 'hi' }],
+    };
+    const canonicalBytes = Buffer.from(JSON.stringify(canonicalEnvelope), 'utf8');
+    const envelope = {
+      snapshot_id: 'snapshot-fast-during-workday',
+      canonical_envelope_b64: canonicalBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(canonicalBytes).digest('hex'),
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 82,
+      ledger_revision: 0,
+      expires_at: '2035-01-01T00:00:00.000Z',
+    };
+    let heartbeatCount = 0;
+    const heartbeatClaimIds: unknown[] = [];
+    const workdayClaimBodies: Array<Record<string, unknown> | undefined> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        heartbeatCount += 1;
+        heartbeatClaimIds.push(body?.conversation_claim_id);
+        return Promise.resolve({
+          authority_held: true,
+          conversation_claim_held: true,
+          stop_requested: heartbeatCount > 3,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: 'lease-fast-during-workday', generation: 1 },
+        });
+      }
+      if (url.endsWith('/messages/claim')) {
+        workdayClaimBodies.push(body);
+        if (renewalFails && workdayClaimBodies.length > 1) {
+          return Promise.resolve({
+            claim_id: 'different-claim',
+            incarnation_id: 'incarnation-legacy-workday',
+            incarnation_supported: true,
+            message_ids: [legacyMessage.id],
+          });
+        }
+        return Promise.resolve({
+          claim_id: 'claim-legacy-workday',
+          incarnation_id: 'incarnation-legacy-workday',
+          incarnation_supported: true,
+          message_ids: [legacyMessage.id],
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-fast-during-workday',
+          owner: 'fast',
+          message_ids: [fastMessage.id],
+          envelope,
+        });
+      }
+      if (url.endsWith('/conversation/turns/complete')) {
+        return Promise.resolve({ status: 'completed' });
+      }
+      if (url.endsWith('/conversation/turns/abandon')) {
+        return Promise.resolve({
+          status: 'abandoned',
+          legacy_fallback_admissible: true,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      return Promise.resolve({});
+    });
+    let resolveFast!: (turn: {
+      receipt: unknown;
+      result: ResidentTurnResult;
+      completion: { receipt: unknown; content: string };
+      workdayRequests: [];
+    }) => void;
+    typedFastMocks.dispatch.mockImplementation((_receipt: unknown) => new Promise((resolve) => {
+      resolveFast = resolve;
+    }));
+
+    let resolveWorkday!: (result: ResidentTurnResult) => void;
+    const workdayReply = new Promise<ResidentTurnResult>((resolve) => {
+      resolveWorkday = resolve;
+    });
+    const workday = makeSession(() => workdayReply, () => true);
+    workday.interrupt.mockImplementation(() => {
+      resolveWorkday(turnResult({ interrupted: true }));
+    });
+    mockStartSession.mockReturnValue(workday);
+    typedFastMocks.interrupt.mockImplementation(() => {
+      resolveFast({
+        receipt: typedFastMocks.dispatch.mock.calls[0]?.[0],
+        result: turnResult({ interrupted: true }),
+        completion: {
+          receipt: typedFastMocks.dispatch.mock.calls[0]?.[0],
+          content: 'interrupted',
+        },
+        workdayRequests: [],
+      });
+    });
+
+    const done = run('typed-fast-during-workday', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(workdayClaimBodies).toHaveLength(2);
+    expect(workdayClaimBodies[1]).toEqual(expect.objectContaining({
+      message_ids: [legacyMessage.id],
+      incarnation_id: 'incarnation-legacy-workday',
+    }));
+
+    if (renewalFails) {
+      await vi.advanceTimersByTimeAsync(2_000);
+      await done;
+      expect(typedFastMocks.interrupt).toHaveBeenCalledTimes(1);
+      expect(workday.interrupt).toHaveBeenCalledTimes(1);
+      expect(mockApiPost.mock.calls.some(([url]) =>
+        url.endsWith('/conversation/turns/complete'))).toBe(false);
+      return;
+    }
+
+    const fastReceipt = typedFastMocks.dispatch.mock.calls[0]?.[0];
+    resolveFast({
+      receipt: fastReceipt,
+      result: turnResult({ resultText: 'Hi — what are you thinking about?' }),
+      completion: {
+        receipt: fastReceipt,
+        content: 'Hi — what are you thinking about?',
+      },
+      workdayRequests: [],
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(mockApiPost.mock.calls.some(([url]) =>
+      url.endsWith('/conversation/turns/complete'))).toBe(true);
+    expect(workday.interrupt).not.toHaveBeenCalled();
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(heartbeatClaimIds).toContain('claim-legacy-workday');
+
+    resolveWorkday(turnResult({
+      sentOperatorMessage: true,
+      resultText: 'Legacy Workday reply completed.',
+    }));
+    await vi.advanceTimersByTimeAsync(4_000);
+    await done;
+  };
+
+  it('renews and restores the ordinary Workday claim while Fast replies', async () => {
+    await runOrdinaryWorkdayOverlapCase(false);
+  });
+
+  it('stops both lanes when the displaced Workday claim cannot be renewed', async () => {
+    await runOrdinaryWorkdayOverlapCase(true);
   });
 });
 
