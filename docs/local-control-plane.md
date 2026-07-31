@@ -141,7 +141,7 @@ Do not make local PostgreSQL authoritative until all of these are true:
    state, CMEK, versioned bucket, retention policy, and independent custodians.
 2. The dedicated local backup writer can create objects only in that recovery
    bucket. The local server cannot read or delete retained backups.
-3. A manual backup succeeds and produces both
+3. Before cutover, a fresh live-source rehearsal export succeeds and produces both
    `local-postgres-exports/*.sql.gz` and its `.manifest.json` completion marker.
    The manifest SHA-256 and byte count must match the archive.
 4. The restore verifier is configured to accept the local archive prefix and
@@ -150,7 +150,7 @@ Do not make local PostgreSQL authoritative until all of these are true:
 5. The recovery Cloud SQL service identity can read the retained archive, and
    the recovery-only verifier identity has the documented Cloud SQL lifecycle,
    private-network, evidence-write, logging, archive-read, and CMEK permissions.
-6. A complete independent restore drill imports the newest local archive,
+6. A complete independent restore drill imports the newest rehearsal archive,
    verifies the expected Alembic revision and aggregate checks, records
    evidence, and deletes the temporary recovery instance.
 7. An external TTL janitor exists for abandoned restore-drill instances; the
@@ -232,6 +232,138 @@ Do not start the API, worker, edge, or backup timer yet. Their activation order
 is part of the cutover below. After activation, verify every role and the
 externally visible API:
 
+### Disposable pre-cutover restore rehearsal
+
+Before the production write fence, rehearse the direct PostgreSQL path without
+putting production data into `/srv/blueprint/postgres`. Create separate
+root-only evidence and disposable-work directories:
+
+On an authenticated operator workstation (not hamsterwheel), capture the
+current Cloud SQL instance identity and copy it over Tailscale:
+
+```bash
+umask 077
+gcloud sql instances describe blueprint-cloudsql-8cee8173 \
+  --project=blueprint-orchestrator --format=json \
+  > cloud-sql-instance.json
+scp cloud-sql-instance.json hamsterwheel:/tmp/blueprint-cloud-sql-instance.json
+rm -- cloud-sql-instance.json
+```
+
+Then, in one hamsterwheel shell, install that evidence, bind the exact
+owner-matched, non-group/world-writable proxy process, and materialize the
+existing Cloud SQL password without putting it in argv or shell history:
+
+```bash
+sudo install -d -m 0700 -o root -g root \
+  /var/lib/blueprint/precutover-evidence \
+  /var/lib/blueprint/precutover-rehearsals
+sudo install -m 0600 -o root -g root \
+  /tmp/blueprint-cloud-sql-instance.json \
+  /var/lib/blueprint/precutover-evidence/cloud-sql-instance.json
+rm -- /tmp/blueprint-cloud-sql-instance.json
+DOCKER_BRIDGE_GATEWAY="$(docker network inspect \
+  --format '{{(index .IPAM.Config 0).Gateway}}' \
+  blueprint-control-plane)"
+PROXY_PID="$(systemctl --user show blueprint-database-proxy.service \
+  --property=MainPID --value)"
+PROXY_EXE="$(sudo readlink -f "/proc/$PROXY_PID/exe")"
+PROXY_SHA256="$(sudo sha256sum "$PROXY_EXE" | awk '{print $1}')"
+sudo bash -c 'umask 077; read -r -s -p "Cloud SQL password: " value; printf "\n"; printf "%s" "$value" > /root/blueprint-cloudsql-rehearsal-password'
+```
+
+Run the content-addressed rehearsal helper installed with the database service.
+The source remains writable. The helper opens one serializable, read-only,
+deferrable transaction, exports its snapshot, and uses that exact snapshot for
+both the source inventory queries and `pg_dump --snapshot`. The restored target
+must exactly match that inventory; the custom archive still does not claim to
+be the final cutover artifact:
+
+```bash
+sudo python3 /usr/local/lib/blueprint-node/HELPER_DIGEST/local_postgres_rehearsal.py \
+  --postgres-image-id postgres@sha256:POSTGRES_REPO_DIGEST \
+  --docker-binary /usr/bin/docker \
+  --source-network blueprint-control-plane \
+  --source-host "$DOCKER_BRIDGE_GATEWAY" --source-port 5433 \
+  --source-database postgres --source-user postgres \
+  --source-password-file /root/blueprint-cloudsql-rehearsal-password \
+  --source-project-id blueprint-orchestrator \
+  --source-instance blueprint-cloudsql-8cee8173 \
+  --cloud-sql-instance-evidence-file /var/lib/blueprint/precutover-evidence/cloud-sql-instance.json \
+  --proxy-pid "$PROXY_PID" \
+  --expected-proxy-executable-sha256 "$PROXY_SHA256" \
+  --expected-proxy-address "$DOCKER_BRIDGE_GATEWAY" \
+  --expected-alembic-revision EXPECTED_SCHEMA_REVISION \
+  --work-root /var/lib/blueprint/precutover-rehearsals \
+  --permanent-data-dir /srv/blueprint/postgres \
+  --artifact-output /var/lib/blueprint/precutover-evidence/live-source-rehearsal.dump \
+  --manifest-output /var/lib/blueprint/precutover-evidence/live-source-rehearsal-manifest.json \
+  --source-snapshot-output /var/lib/blueprint/precutover-evidence/live-source-snapshot.json \
+  --snapshot-output /var/lib/blueprint/precutover-evidence/disposable-target-snapshot.json \
+  --result-output /var/lib/blueprint/precutover-evidence/rehearsal-result.json
+```
+
+The helper uses two uniquely named, ownership-labelled containers. The source
+client has no mounts. The restore target has `--network none`, publishes no
+ports, and mounts only a generated session directory beneath `--work-root`.
+Success is written only after the target container and session data directory
+are gone. It refuses any overlap with `--permanent-data-dir`.
+
+Review the manifest, restored Alembic revision, critical integrity aggregates,
+table counts, and isolation evidence. The manifest and result explicitly say
+`final_cutover_eligible: false`; never pass this rehearsal artifact to the
+fenced `verify-import` command. A failed or incomplete cleanup is a failed
+rehearsal and must be investigated before cutover.
+
+Create the separate recovery-shaped archive with the other content-addressed
+helper. This is a fresh PostgreSQL 15 plain-SQL dump taken while production
+remains writable; it is not the final custom-format cutover artifact. The
+dedicated recovery writer can create objects but cannot read or delete them.
+The uploader is a pinned Cloud SDK container, so hamsterwheel does not need a
+host `gcloud` installation:
+
+```bash
+sudo install -d -m 0700 -o root -g root /run/blueprint-rehearsal-export
+
+sudo python3 /usr/local/lib/blueprint-node/HELPER_DIGEST/live_source_rehearsal_export.py \
+  --postgres-image-id postgres@sha256:POSTGRES_REPO_DIGEST \
+  --host "$DOCKER_BRIDGE_GATEWAY" --port 5433 \
+  --source-database postgres --user postgres \
+  --source-project-id blueprint-orchestrator \
+  --source-instance blueprint-cloudsql-8cee8173 \
+  --cloud-sql-instance-evidence /var/lib/blueprint/precutover-evidence/cloud-sql-instance.json \
+  --proxy-pid "$PROXY_PID" \
+  --source-evidence-output /var/lib/blueprint/precutover-evidence/live-source-evidence.json \
+  --password-file /root/blueprint-cloudsql-rehearsal-password \
+  --archive-output /var/lib/blueprint/precutover-evidence/live-source.sql.gz \
+  --bucket gs://RECOVERY_BUCKET \
+  --recovery-project-id RECOVERY_PROJECT_ID \
+  --writer-credentials-file /etc/blueprint/backup-writer.json \
+  --uploader-image-id gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:CLOUD_SDK_REPO_DIGEST \
+  --control-plane-network blueprint-control-plane \
+  --secret-stage-root /run/blueprint-rehearsal-export
+
+sudo rm -- /root/blueprint-cloudsql-rehearsal-password
+```
+
+The exporter validates the raw Cloud SQL identity and the live proxy PID,
+owner-matched executable hash, exact argv, connection name, bridge address, and
+port before and after the dump. It creates its own pinned, mount-free,
+ownership-labelled PG15 client and proves that container is gone before any
+archive upload. The source evidence is create-only and hash-binds those facts
+to the exact local archive and planned recovery object. Writer-key staging is
+allowed only beneath the validated root-owned `/run` tmpfs directory; stale
+owned staging files are removed before work begins.
+
+The archive is uploaded with a generation-zero precondition before its exact v1
+completion marker. No marker is published after a dump, client cleanup,
+identity-evidence, or archive-upload failure. Trigger the independent recovery
+verifier unchanged, preserve its evidence, and require that evidence to
+identify this archive generation before claiming the off-host gate passed.
+After cutover, the normal local backup service replaces this rehearsal producer
+and must independently produce and restore its first successful archive before
+the timer is enabled.
+
 ```bash
 sudo python3 scripts/blueprint_node.py status \
   --profile local-control-plane --system
@@ -289,9 +421,11 @@ procedure.
 Stage the services while Cloud Run is still authoritative, but do not permit
 both databases to accept independent production writes.
 
-1. Prove a recent off-host backup with its completion manifest can be restored
-   by the independent recovery identity. Keep retention unlocked until that
-   drill succeeds.
+1. Prove the fresh live-source rehearsal archive and completion manifest above
+   can be restored by the independent recovery identity. Keep retention
+   unlocked until that drill succeeds. This pre-cutover rehearsal is the only
+   exception to the normal rule that `local-postgres-exports/` comes from the
+   authoritative local backup service; the verifier contract is unchanged.
 2. Create a root-owned cutover directory, stop and disable the old
    user-scoped worker, and stop every other source writer. Leave the
    authenticated Cloud SQL proxy running because the final dump uses it:

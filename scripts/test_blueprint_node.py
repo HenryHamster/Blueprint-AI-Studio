@@ -557,7 +557,7 @@ class InstallTests(unittest.TestCase):
         )
         self.assertNotIn(str(node._SCRIPT_DIR), edge_unit)
         installed_scripts = list(self.script_root.glob("*/*.py"))
-        self.assertEqual(len(installed_scripts), 6)
+        self.assertEqual(len(installed_scripts), 8)
         bundle_dirs = {path.parent for path in installed_scripts}
         self.assertEqual(len(bundle_dirs), 1)
         bundle_dir = bundle_dirs.pop()
@@ -570,6 +570,10 @@ class InstallTests(unittest.TestCase):
             backup_service,
         )
         self.assertTrue((bundle_dir / "local_postgres_cutover.py").is_file())
+        self.assertTrue((bundle_dir / "local_postgres_rehearsal.py").is_file())
+        self.assertTrue(
+            (bundle_dir / "live_source_rehearsal_export.py").is_file()
+        )
         if os.name != "nt":
             for script in installed_scripts:
                 self.assertEqual(script.stat().st_uid, os.getuid())

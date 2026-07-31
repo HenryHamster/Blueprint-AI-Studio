@@ -342,6 +342,7 @@ class DockerPsql:
         password_file: str | None = None,
         host: str | None = None,
         port: int | None = None,
+        docker_binary: str = "docker",
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
         self.container = _safe_cli_name(container, "container")
@@ -356,6 +357,7 @@ class DockerPsql:
             raise CutoverError("configuration", "invalid_port")
         self.host = host
         self.port = port
+        self.docker_binary = _safe_text(docker_binary, "docker_binary")
         self._run = run
 
     def environment(self, *, app_name: str | None = None) -> dict[str, str]:
@@ -389,7 +391,7 @@ class DockerPsql:
         import_mode: bool = False,
         app_name: str | None = None,
     ) -> list[str]:
-        argv = ["docker", "exec", "--interactive"]
+        argv = [self.docker_binary, "exec", "--interactive"]
         if self.password_file is not None:
             # Docker copies the value from its own environment. The value is
             # absent from argv, process listings, logs, and evidence.
@@ -437,7 +439,7 @@ class DockerPsql:
     def pg_tool_argv(self, tool: str, *options: str) -> list[str]:
         if tool not in {"pg_dump", "pg_restore"}:
             raise CutoverError("configuration", "unsupported_postgres_tool")
-        argv = ["docker", "exec", "--interactive"]
+        argv = [self.docker_binary, "exec", "--interactive"]
         if self.password_file is not None:
             argv.extend(["--env", "PGPASSWORD"])
         argv.extend(["--env", "PGAPPNAME", self.container, tool])
@@ -841,14 +843,20 @@ def compare_snapshots(
     *,
     source_owner: str = "postgres",
     target_owner: str = "blueprint",
+    compare_sequences: bool = True,
 ) -> None:
     validate_snapshot(source, label="source")
     validate_snapshot(target, label="target")
     source_owner = _safe_cli_name(source_owner, "source_owner")
     target_owner = _safe_cli_name(target_owner, "target_owner")
+    comparison_fields = (
+        _COMPARISON_FIELDS
+        if compare_sequences
+        else tuple(field for field in _COMPARISON_FIELDS if field != "sequences")
+    )
     mismatches = [
         field
-        for field in _COMPARISON_FIELDS
+        for field in comparison_fields
         if _normalize_role_bound(source[field], source_owner)
         != _normalize_role_bound(target[field], target_owner)
     ]
@@ -1123,7 +1131,7 @@ def _create_archive_fd(path_value: str) -> tuple[int, Path]:
 
 def _pg15_version(client: DockerPsql, tool: str) -> str:
     result = subprocess.run(
-        ["docker", "exec", client.container, tool, "--version"],
+        [client.docker_binary, "exec", client.container, tool, "--version"],
         capture_output=True,
         text=True,
         check=False,
@@ -1142,6 +1150,8 @@ def create_custom_dump(
     output: str,
     *,
     timeout_seconds: int,
+    serializable_deferrable: bool = False,
+    snapshot_id: str | None = None,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
 ) -> dict[str, Any]:
     if timeout_seconds < 60 or timeout_seconds > 21600:
@@ -1151,10 +1161,21 @@ def create_custom_dump(
     app_name = _CUTOVER_APP_PREFIX + "dump"
     process: subprocess.Popen[bytes] | None = None
     try:
+        options = ["--format=custom", "--no-owner", "--no-acl"]
+        if serializable_deferrable and snapshot_id is not None:
+            raise CutoverError("configuration", "conflicting_dump_snapshot_options")
+        if serializable_deferrable:
+            # Rehearsal dumps are taken while production remains writable.
+            # PostgreSQL waits for a safe serializable read-only snapshot, so
+            # the resulting archive is transactionally self-consistent without
+            # borrowing the final cutover's durable write fence.
+            options.append("--serializable-deferrable")
+        if snapshot_id is not None:
+            if not re.fullmatch(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{8}-[0-9A-Fa-f]+", snapshot_id):
+                raise CutoverError("configuration", "invalid_exported_snapshot")
+            options.append(f"--snapshot={snapshot_id}")
         process = popen(
-            client.pg_tool_argv(
-                "pg_dump", "--format=custom", "--no-owner", "--no-acl"
-            ),
+            client.pg_tool_argv("pg_dump", *options),
             stdin=subprocess.DEVNULL,
             stdout=descriptor,
             stderr=subprocess.PIPE,
