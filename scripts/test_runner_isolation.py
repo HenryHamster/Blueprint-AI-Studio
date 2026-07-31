@@ -400,7 +400,9 @@ class TestEnvAllowlist(unittest.TestCase):
         env = iso.build_agent_env(
             source,
             {"AGENT_SECRET_TOKEN": "jwt", "ORCHESTRATOR_URL": "https://api.example.com",
-             "TASK_ID": "t1", "AGENT_WORKSPACE": "/workspace", "HOME": "/home"},
+             "TASK_ID": "t1", "AGENT_WORKSPACE": "/workspace", "HOME": "/home",
+             "BLUEPRINT_PRE_CLAIM_TASK_TYPE": "strategic_review",
+             "BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION": "1"},
             ["/opt/agent/bin"],
         )
         # Runner secrets NEVER present.
@@ -414,6 +416,11 @@ class TestEnvAllowlist(unittest.TestCase):
         # Injected identity vars present.
         self.assertEqual(env["AGENT_SECRET_TOKEN"], "jwt")
         self.assertEqual(env["TASK_ID"], "t1")
+        self.assertEqual(
+            env["BLUEPRINT_PRE_CLAIM_TASK_TYPE"],
+            "strategic_review",
+        )
+        self.assertEqual(env["BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION"], "1")
         # PATH rebuilt from tool dirs + system dirs (host $HOME nvm dirs gone).
         self.assertIn("/opt/agent/bin", env["PATH"])
         self.assertIn("/usr/bin", env["PATH"])

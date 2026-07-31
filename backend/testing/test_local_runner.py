@@ -2425,10 +2425,13 @@ class TestRunnerEndpoints:
 
             task = Task(
                 project_id=project.id,
-                payloads=[{"type": task_type}],
+                payloads=[{"type": task_type, "resident_session": "false"}],
                 status=TaskStatus.PROVISIONING,
                 vm_instance_id=f"runner:{runner.id}",
-                context={"runner_target_id": str(runner.id)},
+                context={
+                    "runner_target_id": str(runner.id),
+                    "_resident_session": 1,
+                },
             )
             db_session.add(task)
             await db_session.commit()
@@ -2440,6 +2443,7 @@ class TestRunnerEndpoints:
             assert resp.status_code == 200
             body = resp.json()
             assert body["task_type"] == task_type
+            assert body["resident_session"] is False
             capability = body["capability_slice"]
             assert capability["id"] == task_type
             assert capability["agent_mode"] == "read_only"
@@ -2449,6 +2453,37 @@ class TestRunnerEndpoints:
             claims = auth_mod.verify_agent_jwt(body["agent_token"])
             assert claims["task_type"] == task_type
             assert claims["project_id"] == str(project.id)
+        finally:
+            _clear_pool()
+
+    @pytest.mark.asyncio
+    async def test_next_task_marks_only_actual_resident_session(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        _seed_pool_account(TEST_USER_ID)
+        try:
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "strategic_review"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={
+                    "runner_target_id": str(runner.id),
+                    "_resident_session": True,
+                },
+            )
+            db_session.add(task)
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+            assert resp.status_code == 200
+            assert resp.json()["resident_session"] is True
         finally:
             _clear_pool()
 

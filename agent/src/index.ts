@@ -19,6 +19,7 @@ import {
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
 import { resetForNextRole, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
 import { isHeartbeatTransient, parseHeartbeatStatus } from './heartbeat-classify.js';
+import { shouldDeferProviderValidationToResident } from './resident-startup.js';
 import {
   type FixLoopEvent,
   pushFixLoopEvent,
@@ -475,6 +476,8 @@ const IDENTITY_ENV_KEYS = new Set([
   'ORCHESTRATOR_URL',
   'PROJECT_ID',
   'BLUEPRINT_POOL_MODE',
+  'BLUEPRINT_PRE_CLAIM_TASK_TYPE',
+  'BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION',
 ]);
 // Resolve the agent's HOME exactly the way the spawned provider CLI does
 // (runners.ts:buildBaseCliEnv → `process.env.HOME || os.homedir()`), so every
@@ -3621,6 +3624,13 @@ export async function main() {
   // so the backend heartbeat endpoint accepts this task_id before claim runs.
   const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
   const poolMode = process.env.BLUEPRINT_POOL_MODE === '1';
+  // A local runner already knows the task type when it launches this process.
+  // For the long-lived Strategic Resident, the canonical Claude stream process
+  // is itself the provider/auth boundary. Running a throwaway model call first
+  // adds up to the full validation timeout before Fast can even start, while
+  // proving less than the actual Resident launch. Other task types retain the
+  // pre-claim validation that protects one-shot work.
+  const residentValidatesProviderOnLaunch = shouldDeferProviderValidationToResident();
   // Cloud Run Job containers run exactly one task per execution — no warm
   // continuity poll, no heartbeat idle window between roles. Cloud Run auto-sets
   // CLOUD_RUN_JOB (reserved) to the job name, so presence is the signal.
@@ -3729,7 +3739,16 @@ export async function main() {
         startHeartbeat(PRE_CLAIM_TASK_ID, () => startupStatusRef.value);
       }
       try {
-        await completeStartup(getProviderRunner(), reportPreClaimFailure, PRE_CLAIM_TASK_ID, startupStatusRef);
+        if (residentValidatesProviderOnLaunch) {
+          log('Strategic Resident startup — deferring provider validation to the canonical stream session');
+        }
+        await completeStartup(
+          getProviderRunner(),
+          reportPreClaimFailure,
+          PRE_CLAIM_TASK_ID,
+          startupStatusRef,
+          residentValidatesProviderOnLaunch,
+        );
         captureBootCredentialSnapshot();
       } catch (startupErr) {
         stopHeartbeat();
