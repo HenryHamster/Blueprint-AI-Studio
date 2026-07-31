@@ -3,7 +3,8 @@ locals {
 }
 
 # Fail closed: an apply cannot quietly create a bucket in the production
-# project, without a recovery-admin group, or with invalid archive retention.
+# project, without an explicit recovery administrator, or with invalid archive
+# retention.
 resource "terraform_data" "recovery_configuration" {
   count = local.recovery_enabled ? 1 : 0
 
@@ -30,8 +31,11 @@ resource "terraform_data" "recovery_configuration" {
       error_message = "source_cloud_sql_service_account_email must use IAM member form, e.g. serviceAccount:..."
     }
     precondition {
-      condition     = can(regex("^group:[^@]+@[^@]+$", var.recovery_admin_member))
-      error_message = "recovery_admin_member must be a Google Group in IAM member form; do not assign a single hamsterwheel user."
+      condition = can(regex(
+        "^(user|group):[^@[:space:]]+@[^@[:space:]]+$",
+        var.recovery_admin_member,
+      ))
+      error_message = "recovery_admin_member must be a user or Google Group in IAM member form."
     }
     precondition {
       condition     = var.retention_period_seconds >= 7776000 && var.archive_expiry_days >= 90
@@ -42,6 +46,8 @@ resource "terraform_data" "recovery_configuration" {
 
 resource "google_project_service" "required" {
   for_each = local.recovery_enabled ? toset([
+    "cloudresourcemanager.googleapis.com",
+    "iam.googleapis.com",
     "cloudkms.googleapis.com",
     "cloudscheduler.googleapis.com",
     "run.googleapis.com",
@@ -77,4 +83,17 @@ resource "google_project_service_identity" "cloud_sql" {
   service  = "sqladmin.googleapis.com"
 
   depends_on = [google_project_service.required]
+}
+
+# Google can return newly created managed service-agent addresses before those
+# principals are visible to Cloud KMS IAM. Give IAM propagation a bounded head
+# start so a first apply does not fail halfway through with "does not exist".
+resource "time_sleep" "service_agent_propagation" {
+  count           = local.recovery_enabled ? 1 : 0
+  create_duration = "30s"
+
+  depends_on = [
+    data.google_storage_project_service_account.recovery,
+    google_project_service_identity.cloud_sql,
+  ]
 }

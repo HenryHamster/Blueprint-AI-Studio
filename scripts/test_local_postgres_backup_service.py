@@ -95,7 +95,11 @@ class LocalPostgresBackupTests(unittest.TestCase):
         self.assertIn("max-size=10m", argv)
         self.assertIn("max-file=1", argv)
         self.assertEqual(argv[argv.index("--pull") + 1], "never")
-        self.assertEqual(argv[-2], "gs://recovery-db-backups/object.sql.gz")
+        self.assertEqual(argv[-1], "gs://recovery-db-backups/object.sql.gz")
+        self.assertIn("gcs_create_only_upload.py", joined)
+        self.assertIn("python3", argv)
+        self.assertNotIn("storage", argv)
+        self.assertIn("readonly", joined)
 
     def test_gzip_stage_is_networkless_and_bounded(self):
         argv = backup._gzip_command(POSTGRES_ID)
@@ -212,6 +216,9 @@ class LocalPostgresBackupTests(unittest.TestCase):
         self.assertIn("none", argv)
         self.assertIn("128m", argv)
         self.assertNotIn(str(self.credentials), " ".join(argv))
+        self.assertIn("gcloud --version", argv[-1])
+        self.assertIn("python3 --version", argv[-1])
+        self.assertIn("curl --version", argv[-1])
 
     def test_stream_fails_when_dump_fails_even_if_upload_exits_zero(self):
         with patch.object(backup.subprocess, "Popen") as popen:
@@ -313,7 +320,7 @@ class LocalPostgresBackupTests(unittest.TestCase):
         manifests: list[dict] = []
 
         def capture(_dump, _gzip, upload):
-            objects.append(upload[-2])
+            objects.append(upload[-1])
             return backup.StreamResult(
                 dump_returncode=0,
                 gzip_returncode=0,

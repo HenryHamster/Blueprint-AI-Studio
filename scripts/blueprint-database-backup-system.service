@@ -5,6 +5,11 @@ Description=Blueprint local PostgreSQL off-host backup
 Requires=blueprint-database.service
 After=network-online.target blueprint-database.service
 Wants=network-online.target
+# Retry a transient Wi-Fi outage promptly, but bound archive amplification when
+# a persistent upload/manifest/configuration failure affects every attempt. The
+# twice-daily persistent timer retries after this window has expired.
+StartLimitIntervalSec=6h
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -25,5 +30,7 @@ PrivateDevices=true
 EnvironmentFile=@ENV_FILE@
 ExecStart=@PYTHON@ @EXECUTABLE@
 TimeoutStartSec=3700
+Restart=on-failure
+RestartSec=15m
 StandardOutput=journal
 StandardError=journal

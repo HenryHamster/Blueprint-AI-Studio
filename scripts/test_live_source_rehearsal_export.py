@@ -300,7 +300,13 @@ class ContainerUploadTests(unittest.TestCase):
             argv = run.call_args.args[0]
             self.assertEqual(argv[0], "/usr/bin/docker")
             self.assertIn(image_id, argv)
-            self.assertIn("--if-generation-match=0", argv)
+            self.assertIn("gcs_create_only_upload.py", " ".join(argv))
+            self.assertIn("--destination", argv)
+            self.assertIn(
+                "gs://recovery/local-postgres-exports/a.sql.gz",
+                argv,
+            )
+            self.assertNotIn("storage", argv)
             self.assertNotIn("/usr/bin/gcloud", argv)
             self.assertIn("no-new-privileges", argv)
             self.assertIn("readonly", " ".join(argv))

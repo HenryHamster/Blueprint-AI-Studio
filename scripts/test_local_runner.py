@@ -5566,8 +5566,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
         reexec_mock.assert_called_once()
 
-    def test_noop_auto_update_reexecs_when_checkout_is_newer_than_hint(self):
-        """A newer checkout converges by ancestry and replaces the old process."""
+    def test_noop_auto_update_keeps_newer_checkout_running(self):
+        """An ancestry-converged newer checkout must not re-exec-loop."""
         output_lines = []
 
         def fake_post(url, token, body, **kwargs):
@@ -5612,7 +5612,66 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         )
         report_mock.assert_called_once()
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
-        reexec_mock.assert_called_once()
+        reexec_mock.assert_not_called()
+        self.assertFalse(local_runner._update_in_progress.is_set())
+        self.assertIn("continuing without re-exec", " ".join(output_lines))
+
+    def test_accepted_ancestor_hint_is_suppressed_until_hint_changes(self):
+        """The same older hint updates once; a changed hint is evaluated afresh."""
+        hints = [
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            "b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        ]
+        calls = 0
+
+        def fake_post(url, token, body, **kwargs):
+            nonlocal calls
+            hint = hints[calls]
+            calls += 1
+            if calls == len(hints):
+                local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=0) as update_mock, \
+                 patch.object(local_runner.br, "checkout_contains_commit",
+                              return_value=True) as contains_mock, \
+                 patch.object(local_runner.br, "report_update_result"), \
+                 patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
+                 patch("time.sleep", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(update_mock.call_count, 2)
+        self.assertEqual(contains_mock.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in contains_mock.call_args_list],
+            [hints[0], hints[2]],
+        )
+        reexec_mock.assert_not_called()
 
     def test_failed_auto_update_stays_drained_and_reports_failure(self):
         """A failed update cannot silently resume claims on the old process."""
@@ -6788,6 +6847,141 @@ class TestCredentialPersistence(unittest.TestCase):
             any(t == "tok-from-file" for t in tokens_used),
             f"Expected token from file in heartbeat calls, got: {tokens_used}",
         )
+
+
+class TestInitialOrchestratorRetry(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        local_runner._shutdown_event.clear()
+
+    def test_transient_startup_network_failure_retries_with_capped_backoff(self):
+        attempts = 0
+        waits = []
+
+        def fake_probe(url, token, body):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 7:
+                return {
+                    "orchestrator_ok": False,
+                    "token_valid": False,
+                    "token_401": False,
+                    "ping_error": "temporary DNS failure",
+                    "enrolled_max_concurrent": None,
+                }
+            return {
+                "orchestrator_ok": True,
+                "token_valid": True,
+                "token_401": False,
+                "ping_error": None,
+                "enrolled_max_concurrent": 8,
+            }
+
+        initial = {
+            "orchestrator_ok": False,
+            "token_valid": False,
+            "token_401": False,
+            "ping_error": "name resolution failed",
+            "enrolled_max_concurrent": None,
+            "_heartbeat_body": {"active_work_report": False},
+        }
+        with patch.object(local_runner, "_probe_orchestrator",
+                          side_effect=fake_probe), \
+             patch.object(local_runner._shutdown_event, "wait",
+                          side_effect=lambda delay: waits.append(delay) or False):
+            result = local_runner._retry_initial_orchestrator_connection(
+                "https://api", "tok", initial
+            )
+
+        self.assertTrue(result["orchestrator_ok"])
+        self.assertTrue(result["token_valid"])
+        self.assertEqual(result["enrolled_max_concurrent"], 8)
+        self.assertEqual(waits, [2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0])
+        self.assertEqual(attempts, 7)
+
+    def test_reachable_token_rejection_stops_retry_for_fatal_handling(self):
+        initial = {
+            "orchestrator_ok": False,
+            "token_valid": False,
+            "token_401": False,
+            "ping_error": "temporary route loss",
+            "enrolled_max_concurrent": None,
+            "_heartbeat_body": {"active_work_report": False},
+        }
+        rejected = {
+            "orchestrator_ok": True,
+            "token_valid": False,
+            "token_401": False,
+            "ping_error": None,
+            "enrolled_max_concurrent": None,
+        }
+        with patch.object(local_runner, "_probe_orchestrator",
+                          return_value=rejected) as probe_mock, \
+             patch.object(local_runner._shutdown_event, "wait",
+                          return_value=False):
+            result = local_runner._retry_initial_orchestrator_connection(
+                "https://api", "bad-token", initial
+            )
+
+        probe_mock.assert_called_once()
+        self.assertTrue(result["orchestrator_ok"])
+        self.assertFalse(result["token_valid"])
+        self.assertFalse(result["token_401"])
+
+    def test_throttle_and_server_errors_remain_retryable(self):
+        for status in (408, 429, 503):
+            with self.subTest(status=status), patch.object(
+                local_runner, "_post", return_value=(status, {"detail": "transient"})
+            ):
+                result = local_runner._probe_orchestrator(
+                    "https://api", "tok", {"active_work_report": False}
+                )
+
+            self.assertFalse(result["orchestrator_ok"])
+            self.assertFalse(result["token_valid"])
+            self.assertFalse(result["token_401"])
+            self.assertEqual(result["ping_error"], f"HTTP {status}")
+
+    def test_check_mode_fails_once_without_entering_daemon_retry(self):
+        env = {
+            "BLUEPRINT_RUNNER_TOKEN": "tok-check",
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://offline.example",
+            "BLUEPRINT_CREDENTIAL_DIR": self._tmpdir,
+        }
+        with patch.dict(os.environ, env, clear=False), \
+             patch.object(sys, "argv", ["local_runner.py", "--check"]), \
+             patch.object(local_runner, "_post",
+                          side_effect=OSError("temporary DNS failure")) as post_mock, \
+             patch.object(local_runner, "_get_capabilities",
+                          return_value=_bwrap_caps()), \
+             patch.object(local_runner, "_locate_agent_binary",
+                          return_value=None), \
+             patch.object(local_runner, "_detect_gpu", return_value={}), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_workspace_writable",
+                          return_value=True), \
+             patch.object(local_runner, "_retry_initial_orchestrator_connection"
+                          ) as retry_mock, \
+             patch.object(local_runner, "iso") as mock_iso:
+            mock_iso.claimable_classes.return_value = {
+                "agent": False, "compute": False,
+            }
+            mock_iso.agent_decline_reason.return_value = "no binary"
+            mock_iso.CLASS_AGENT = "agent"
+            mock_iso.CLASS_COMPUTE = "compute"
+            mock_iso.AGENT_DOCKER_TYPES = []
+            with self.assertRaises(SystemExit) as raised:
+                local_runner.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        post_mock.assert_called_once()
+        retry_mock.assert_not_called()
 
 
 class TestConcurrencyPresetMismatch(unittest.TestCase):

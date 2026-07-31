@@ -10,11 +10,12 @@ production Cloud SQL service account.
 Before enabling it, supply all of the following:
 
 1. A separate recovery GCP project with billing enabled and a dedicated,
-   versioned Terraform-state bucket. Recovery-project administrators must be
-   independent from the production/hamsterwheel operator.
-2. A Google Group with at least two recovery custodians, supplied as
-   `recovery_admin_member=group:...`. This group, not hamsterwheel, gets
-   archive-view and CMEK decrypt permission.
+   versioned Terraform-state bucket. Its administrator credentials must never
+   be installed on hamsterwheel.
+2. An explicit recovery administrator supplied as `recovery_admin_member`.
+   Personal deployments may use `user:owner@example.com`; multi-operator
+   deployments should use a separately managed `group:...`. This principal,
+   not hamsterwheel, gets archive-view and CMEK decrypt permission.
 3. The production Cloud SQL *instance service account* in IAM member form,
    obtained from the production `cloud_sql_service_account_email` output.
 4. A globally unique recovery bucket name, a location/retention policy, and a

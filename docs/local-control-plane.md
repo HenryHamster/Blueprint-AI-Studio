@@ -138,7 +138,8 @@ Cloud Run traffic.
 Do not make local PostgreSQL authoritative until all of these are true:
 
 1. `infra/recovery` is applied in a separate recovery project with its own
-   state, CMEK, versioned bucket, retention policy, and independent custodians.
+   state, CMEK, versioned bucket, retention policy, and an explicit recovery
+   administrator whose credentials are never installed on hamsterwheel.
 2. The dedicated local backup writer can create objects only in that recovery
    bucket. The local server cannot read or delete retained backups.
 3. Before cutover, a fresh live-source rehearsal export succeeds and produces both
@@ -320,7 +321,10 @@ helper. This is a fresh PostgreSQL 15 plain-SQL dump taken while production
 remains writable; it is not the final custom-format cutover artifact. The
 dedicated recovery writer can create objects but cannot read or delete them.
 The uploader is a pinned Cloud SDK container, so hamsterwheel does not need a
-host `gcloud` installation:
+host `gcloud` installation. The mounted, content-addressed upload helper uses
+`gcloud` only to mint an access token, then streams directly to GCS with an
+`ifGenerationMatch=0` create precondition. It performs no post-upload read or
+list operation, so the writer retains create-only IAM:
 
 ```bash
 sudo install -d -m 0700 -o root -g root /run/blueprint-rehearsal-export
@@ -363,6 +367,16 @@ identify this archive generation before claiming the off-host gate passed.
 After cutover, the normal local backup service replaces this rehearsal producer
 and must independently produce and restore its first successful archive before
 the timer is enabled.
+
+The installed backup service retries a failed run after 15 minutes, with at
+most three starts in a six-hour window (the initial run plus two retries). The
+twice-daily persistent timer tries again after that window, so a Wi-Fi or
+default-route outage cannot require a manual reset, while a persistent
+credential, IAM, or manifest failure cannot create unbounded retained orphan
+archives. Successful runs do not restart, and the backup's single-flight lock
+plus unique object names prevent overlapping retries or overwrites. Investigate
+repeated failures in the journal rather than relying on retries to mask a
+credential, capacity, or database problem.
 
 ```bash
 sudo python3 scripts/blueprint_node.py status \

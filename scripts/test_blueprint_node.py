@@ -271,9 +271,16 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("--check", rendered)
 
     def test_database_backup_has_twice_daily_randomized_system_timer(self):
-        backup_entrypoint = node._system_script_bundle()[0][
+        bundle, payloads = node._system_script_bundle()
+        backup_entrypoint = bundle[
             node._LOCAL_POSTGRES_BACKUP_SERVICE
         ]
+        upload_helper = bundle[node._GCS_CREATE_ONLY_UPLOAD]
+        self.assertEqual(upload_helper.parent, backup_entrypoint.parent)
+        self.assertEqual(
+            payloads[upload_helper],
+            node._GCS_CREATE_ONLY_UPLOAD.read_bytes(),
+        )
         trusted_python = node._trusted_system_python()
         with patch.object(node, "_system_install_user", return_value="blueprint-control"):
             timer = node._render_unit(
@@ -292,6 +299,11 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Persistent=true", timer)
         self.assertIn("Requires=blueprint-database.service", timer)
         self.assertIn("Requires=blueprint-database.service", service)
+        self.assertIn("Restart=on-failure", service)
+        self.assertIn("RestartSec=15m", service)
+        self.assertIn("StartLimitIntervalSec=6h", service)
+        self.assertIn("StartLimitBurst=3", service)
+        self.assertNotIn("Restart=always", service)
         self.assertIn(
             f"ExecStart={trusted_python} {backup_entrypoint}",
             service,
@@ -557,7 +569,7 @@ class InstallTests(unittest.TestCase):
         )
         self.assertNotIn(str(node._SCRIPT_DIR), edge_unit)
         installed_scripts = list(self.script_root.glob("*/*.py"))
-        self.assertEqual(len(installed_scripts), 8)
+        self.assertEqual(len(installed_scripts), 9)
         bundle_dirs = {path.parent for path in installed_scripts}
         self.assertEqual(len(bundle_dirs), 1)
         bundle_dir = bundle_dirs.pop()
@@ -569,6 +581,7 @@ class InstallTests(unittest.TestCase):
             str(bundle_dir / "local_postgres_backup_service.py"),
             backup_service,
         )
+        self.assertTrue((bundle_dir / "gcs_create_only_upload.py").is_file())
         self.assertTrue((bundle_dir / "local_postgres_cutover.py").is_file())
         self.assertTrue((bundle_dir / "local_postgres_rehearsal.py").is_file())
         self.assertTrue(

@@ -17,6 +17,8 @@ resource "google_service_account" "local_postgres_backup_writer" {
   account_id   = "blueprint-local-db-backup"
   display_name = "Blueprint local PostgreSQL backup writer"
   description  = "Writer-only identity for streamed local PostgreSQL recovery exports."
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_storage_bucket_iam_member" "local_postgres_backup_writer" {
@@ -41,11 +43,13 @@ resource "google_kms_crypto_key_iam_member" "recovery_cloud_sql_decrypter" {
   crypto_key_id = google_kms_crypto_key.db_backup[0].id
   role          = "roles/cloudkms.cryptoKeyDecrypter"
   member        = "serviceAccount:${google_project_service_identity.cloud_sql[0].email}"
+
+  depends_on = [time_sleep.service_agent_propagation]
 }
 
-# The recovery-admin group is controlled outside the production project. It is
-# the only application-level principal granted both archive reads and KMS
-# decrypt, so recovery remains possible without hamsterwheel credentials.
+# The explicit recovery administrator is the only application-level principal
+# granted both archive reads and KMS decrypt. A personal deployment may use one
+# Google user; larger deployments should use a separately managed group.
 resource "google_storage_bucket_iam_member" "recovery_admin_reader" {
   count  = local.recovery_enabled ? 1 : 0
   bucket = google_storage_bucket.db_backup[0].name

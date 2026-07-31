@@ -55,6 +55,8 @@ _CLIENT_SESSION_LABEL = "com.blueprint.rehearsal-id"
 _CLIENT_PREFIX = "blueprint-rehearsal-export-"
 _CREDENTIALS_TARGET = "/run/secrets/gcp.json"
 _SOURCE_TARGET = "/run/input/source"
+_UPLOAD_HELPER = Path(__file__).with_name("gcs_create_only_upload.py")
+_UPLOAD_HELPER_TARGET = "/usr/local/lib/blueprint/gcs_create_only_upload.py"
 _SECRET_PREFIX = ".rehearsal-writer-"
 _EVIDENCE_KIND = "live-source-rehearsal-source-evidence"
 
@@ -353,8 +355,13 @@ def _validate_uploader_image(
             "--log-driver",
             "none",
             image,
-            "gcloud",
-            "--version",
+            "/bin/sh",
+            "-ceu",
+            (
+                "gcloud --version >/dev/null; "
+                "python3 --version >/dev/null; "
+                "curl --version >/dev/null"
+            ),
         ],
         capture_output=True,
         text=True,
@@ -362,7 +369,7 @@ def _validate_uploader_image(
         timeout=60,
     )
     if result.returncode != 0:
-        raise RehearsalExportError("docker_validation", "uploader_gcloud_unavailable")
+        raise RehearsalExportError("docker_validation", "uploader_tools_unavailable")
 
 
 def _validate_postgres_image(
@@ -1005,7 +1012,8 @@ def _upload(
 ) -> None:
     source = source.resolve(strict=True)
     credential_file = credential_file.resolve(strict=True)
-    for path in (source, credential_file):
+    upload_helper = _UPLOAD_HELPER.resolve(strict=True)
+    for path in (source, credential_file, upload_helper):
         if "," in str(path) or any(ord(char) < 32 for char in str(path)):
             raise RehearsalExportError("filesystem", "docker_mount_unsafe")
     result = run(
@@ -1021,6 +1029,8 @@ def _upload(
             f"type=bind,src={credential_file},dst={_CREDENTIALS_TARGET},readonly",
             "--mount",
             f"type=bind,src={source},dst={_SOURCE_TARGET},readonly",
+            "--mount",
+            f"type=bind,src={upload_helper},dst={_UPLOAD_HELPER_TARGET},readonly",
             "--env",
             f"GOOGLE_APPLICATION_CREDENTIALS={_CREDENTIALS_TARGET}",
             "--env",
@@ -1049,13 +1059,12 @@ def _upload(
             "--log-opt",
             "max-file=1",
             uploader_image_id,
-            "gcloud",
-            "storage",
-            "cp",
+            "python3",
+            _UPLOAD_HELPER_TARGET,
+            "--source",
             _SOURCE_TARGET,
+            "--destination",
             destination,
-            "--if-generation-match=0",
-            "--quiet",
         ],
         capture_output=True,
         text=True,

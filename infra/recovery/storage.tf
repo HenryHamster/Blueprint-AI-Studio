@@ -32,6 +32,8 @@ resource "google_kms_crypto_key_iam_member" "storage_service_agent" {
   crypto_key_id = google_kms_crypto_key.db_backup[0].id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
   member        = "serviceAccount:${data.google_storage_project_service_account.recovery[0].email_address}"
+
+  depends_on = [time_sleep.service_agent_propagation]
 }
 
 resource "google_storage_bucket" "db_backup" {

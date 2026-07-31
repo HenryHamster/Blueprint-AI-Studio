@@ -53,7 +53,7 @@ variable "enable_local_postgres_backup_writer" {
 }
 
 variable "recovery_admin_member" {
-  description = "Recovery-admin Google Group in IAM member form, e.g. group:db-recovery@example.com. This group alone receives archive-view and KMS-decrypt access."
+  description = "Recovery administrator in IAM member form. Use user:... for a personal deployment or group:... for multi-custodian operation. This principal alone receives archive-view and KMS-decrypt access."
   type        = string
   default     = ""
 }
