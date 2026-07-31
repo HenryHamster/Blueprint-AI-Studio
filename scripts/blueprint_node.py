@@ -44,6 +44,7 @@ _LOCAL_RUNNER = _SCRIPT_DIR / "local_runner.py"
 _CLOUD_SQL_PROXY_SERVICE = _SCRIPT_DIR / "cloud_sql_proxy_service.py"
 _LOCAL_POSTGRES_SERVICE = _SCRIPT_DIR / "local_postgres_service.py"
 _LOCAL_POSTGRES_BACKUP_SERVICE = _SCRIPT_DIR / "local_postgres_backup_service.py"
+_GCS_CREATE_ONLY_UPLOAD = _SCRIPT_DIR / "gcs_create_only_upload.py"
 _LOCAL_POSTGRES_CUTOVER = _SCRIPT_DIR / "local_postgres_cutover.py"
 _LOCAL_POSTGRES_REHEARSAL = _SCRIPT_DIR / "local_postgres_rehearsal.py"
 _LIVE_SOURCE_REHEARSAL_EXPORT = _SCRIPT_DIR / "live_source_rehearsal_export.py"
@@ -73,6 +74,7 @@ _TRUSTED_PATH_UID = 0
 _LOCAL_CONTROL_PLANE_SCRIPT_SOURCES = (
     _LOCAL_POSTGRES_SERVICE,
     _LOCAL_POSTGRES_BACKUP_SERVICE,
+    _GCS_CREATE_ONLY_UPLOAD,
     _LOCAL_POSTGRES_CUTOVER,
     _LOCAL_POSTGRES_REHEARSAL,
     _LIVE_SOURCE_REHEARSAL_EXPORT,

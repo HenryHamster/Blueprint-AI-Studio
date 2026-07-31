@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/google-beta"
       version = "~> 5.0"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 
   # This intentionally has no bucket configured in source. Initialize this

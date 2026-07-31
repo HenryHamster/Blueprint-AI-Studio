@@ -27,6 +27,8 @@ _NETWORK_LABEL = "dev.blueprint.purpose"
 _NETWORK_LABEL_VALUE = "local-control-plane"
 _PASSWORD_TARGET = "/run/secrets/postgres_password"
 _CREDENTIALS_TARGET = "/run/secrets/gcp.json"
+_UPLOAD_HELPER = Path(__file__).with_name("gcs_create_only_upload.py")
+_UPLOAD_HELPER_TARGET = "/usr/local/lib/blueprint/gcs_create_only_upload.py"
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _POSTGRES_DIGEST_RE = re.compile(
     r"^(?:(?:docker\.io/)?library/)?postgres:15@sha256:[0-9a-f]{64}$"
@@ -136,12 +138,17 @@ def _assert_cloud_sdk(image: str) -> None:
             "--log-driver",
             "none",
             image,
-            "gcloud",
-            "--version",
+            "/bin/sh",
+            "-ceu",
+            (
+                "gcloud --version >/dev/null; "
+                "python3 --version >/dev/null; "
+                "curl --version >/dev/null"
+            ),
         ]
     )
     if result.returncode != 0:
-        raise RuntimeError("pinned uploader image does not provide a working gcloud")
+        raise RuntimeError("pinned uploader image lacks required upload tools")
 
 
 def _secure_file_contents(value: str, label: str) -> bytes:
@@ -369,6 +376,9 @@ def _gzip_command(image: str) -> list[str]:
 def _upload_command(
     image: str, network: str, credentials: Path, project_id: str, object_uri: str
 ) -> list[str]:
+    helper = _UPLOAD_HELPER.resolve(strict=True)
+    if "," in str(helper) or any(ord(char) < 32 for char in str(helper)):
+        raise ValueError("create-only upload helper path is unsafe")
     return [
         "docker",
         "run",
@@ -380,6 +390,8 @@ def _upload_command(
         network,
         "--mount",
         f"type=bind,src={credentials},dst={_CREDENTIALS_TARGET},readonly",
+        "--mount",
+        f"type=bind,src={helper},dst={_UPLOAD_HELPER_TARGET},readonly",
         "--env",
         f"GOOGLE_APPLICATION_CREDENTIALS={_CREDENTIALS_TARGET}",
         "--env",
@@ -408,12 +420,12 @@ def _upload_command(
         "--log-opt",
         "max-file=1",
         image,
-        "gcloud",
-        "storage",
-        "cp",
+        "python3",
+        _UPLOAD_HELPER_TARGET,
+        "--source",
         "-",
+        "--destination",
         object_uri,
-        "--quiet",
     ]
 
 

@@ -3631,6 +3631,11 @@ def _heartbeat_loop(
     consecutive_network_failures = 0
     next_auto_update_attempt_at = 0.0
     last_auto_update_failure: tuple[str, str | None] | None = None
+    # A deployment can legitimately advertise an older commit while this
+    # checkout already contains it. Remember that accepted ancestry relation so
+    # an update no-op does not re-exec the same newer checkout every heartbeat.
+    # A changed hint is evaluated afresh.
+    accepted_ancestor_version_hint: str | None = None
     # Whether ANY heartbeat has ever authenticated (200/204). A token that has
     # never authenticated and gets a 401 is definitively bad (wrong/revoked, or a
     # deleted runner) — the daemon fast-fails on that first 401 rather than
@@ -3931,7 +3936,9 @@ def _heartbeat_loop(
                     version_hint = resp_body.get("version_hint")
                     if version_hint and version:
                         runner_sha = _describe_sha(version)
-                        if runner_sha:
+                        if version_hint == accepted_ancestor_version_hint:
+                            stale = False
+                        elif runner_sha:
                             stale = not version_hint.startswith(runner_sha)
                         else:
                             stale = version_hint not in version
@@ -3976,11 +3983,7 @@ def _heartbeat_loop(
                                         bool(refreshed_version)
                                         and version_hint in refreshed_version
                                     )
-                                    checkout_converged = (
-                                        refreshed_matches_exactly
-                                        or br.checkout_contains_commit(version_hint)
-                                    )
-                                    if checkout_converged:
+                                    if refreshed_matches_exactly:
                                         br.report_update_result(
                                             orchestrator_url,
                                             token,
@@ -3993,6 +3996,27 @@ def _heartbeat_loop(
                                         # instead of trusting an unverified
                                         # external service restart.
                                         _reexec_after_update()
+                                    elif br.checkout_contains_commit(version_hint):
+                                        br.report_update_result(
+                                            orchestrator_url,
+                                            token,
+                                            status="success",
+                                            old_version=version,
+                                            new_version=refreshed_version,
+                                        )
+                                        accepted_ancestor_version_hint = version_hint
+                                        version = refreshed_version or version
+                                        last_auto_update_failure = None
+                                        next_auto_update_attempt_at = 0.0
+                                        _update_in_progress.clear()
+                                        print(
+                                            "[runner] checkout is newer than the "
+                                            "orchestrator version hint and already "
+                                            "contains it — continuing without "
+                                            "re-exec; this hint will not trigger "
+                                            "another update.",
+                                            flush=True,
+                                        )
                                     else:
                                         failure = (version_hint, refreshed_version)
                                         if last_auto_update_failure != failure:
@@ -4043,6 +4067,8 @@ def _heartbeat_loop(
                                     flush=True,
                                 )
                         else:
+                            if version_hint != accepted_ancestor_version_hint:
+                                accepted_ancestor_version_hint = None
                             last_auto_update_failure = None
                             next_auto_update_attempt_at = 0.0
                             _update_in_progress.clear()
@@ -7275,57 +7301,41 @@ def _preflight(
     gpu_caps = _detect_gpu()
 
     # Orchestrator / token ping (the token validation).
-    orchestrator_ok = False
-    token_valid = False
-    token_401 = False
-    ping_error: str | None = None
-    enrolled_max_concurrent: int | None = None
-    try:
-        heartbeat_body = {
-            # Preflight probe, NOT a genuine active-work report: this empty
-            # active set must NOT overwrite a live report on a box that is
-            # already running a real runner. active_work_report=False makes
-            # the orchestrator ignore the active set here, so the reaper's
-            # zombie reconcile cannot mistake this probe for "no work claimed"
-            # and reap a live task (reaper_orphan_classify).
-            "active_task_ids": [],
-            "active_compute_job_ids": [],
-            "active_work_report": False,
-            "agent_available": claimable[iso.CLASS_AGENT],
-            "supported_agent_task_types": supported_agent_task_types,
-            "hostname": hostname,
-            "version": _runner_version(),
-            # Isolation-backend inventory + selected backends so `--check`
-            # populates the fleet view the same way the running heartbeat does.
-            "isolation_backends": iso.capabilities_inventory(caps),
-            "container_gpu_passthrough": caps.container_gpu_passthrough,
-            "agent_backend": iso.decide_agent_backend(
-                caps, agent_binary_present=agent_binary is not None,
-                agent_image=agent_image,
-            ),
-            "compute_backend": iso.decide_compute_backend(
-                caps, has_image=agent_image is not None
-            ),
-            **gpu_caps,
-        }
-        if project_verification is not None:
-            heartbeat_body["project_verification"] = project_verification
-        status, ping_body = _post(
-            f"{orchestrator_url}/api/runner/heartbeat",
-            token,
-            heartbeat_body,
-        )
-        orchestrator_ok = True
-        if status in (200, 204):
-            token_valid = True
-            if isinstance(ping_body, dict):
-                raw_emc = ping_body.get("enrolled_max_concurrent")
-                if isinstance(raw_emc, int) and raw_emc > 0:
-                    enrolled_max_concurrent = raw_emc
-        elif status == 401:
-            token_401 = True
-    except Exception as exc:
-        ping_error = str(exc)
+    heartbeat_body = {
+        # Preflight probe, NOT a genuine active-work report: this empty
+        # active set must NOT overwrite a live report on a box that is
+        # already running a real runner. active_work_report=False makes
+        # the orchestrator ignore the active set here, so the reaper's
+        # zombie reconcile cannot mistake this probe for "no work claimed"
+        # and reap a live task (reaper_orphan_classify).
+        "active_task_ids": [],
+        "active_compute_job_ids": [],
+        "active_work_report": False,
+        "agent_available": claimable[iso.CLASS_AGENT],
+        "supported_agent_task_types": supported_agent_task_types,
+        "hostname": hostname,
+        "version": _runner_version(),
+        # Isolation-backend inventory + selected backends so `--check`
+        # populates the fleet view the same way the running heartbeat does.
+        "isolation_backends": iso.capabilities_inventory(caps),
+        "container_gpu_passthrough": caps.container_gpu_passthrough,
+        "agent_backend": iso.decide_agent_backend(
+            caps, agent_binary_present=agent_binary is not None,
+            agent_image=agent_image,
+        ),
+        "compute_backend": iso.decide_compute_backend(
+            caps, has_image=agent_image is not None
+        ),
+        **gpu_caps,
+    }
+    if project_verification is not None:
+        heartbeat_body["project_verification"] = project_verification
+    probe = _probe_orchestrator(orchestrator_url, token, heartbeat_body)
+    orchestrator_ok = probe["orchestrator_ok"]
+    token_valid = probe["token_valid"]
+    token_401 = probe["token_401"]
+    ping_error = probe["ping_error"]
+    enrolled_max_concurrent = probe["enrolled_max_concurrent"]
 
     def _fmt(label: str, value: str) -> None:
         print(f"  {label:<16}: {value}", flush=True)
@@ -7543,7 +7553,89 @@ def _preflight(
         "supervisor_evidence": supervisor_state["evidence"],
         "setup_ok": setup_ok,
         "enrolled_max_concurrent": enrolled_max_concurrent,
+        # Kept private to startup: a daemon whose first contact loses DNS/default
+        # route can repeat the exact non-claiming heartbeat without re-running
+        # expensive host/GPU verification probes.
+        "_heartbeat_body": heartbeat_body,
     }
+
+
+def _probe_orchestrator(
+    orchestrator_url: str, token: str, heartbeat_body: dict
+) -> dict:
+    """Perform one non-claiming startup heartbeat and classify the result."""
+    orchestrator_ok = False
+    token_valid = False
+    token_401 = False
+    ping_error: str | None = None
+    enrolled_max_concurrent: int | None = None
+    try:
+        status, ping_body = _post(
+            f"{orchestrator_url}/api/runner/heartbeat",
+            token,
+            heartbeat_body,
+        )
+        if status in (200, 204):
+            orchestrator_ok = True
+            token_valid = True
+            if isinstance(ping_body, dict):
+                raw_emc = ping_body.get("enrolled_max_concurrent")
+                if isinstance(raw_emc, int) and raw_emc > 0:
+                    enrolled_max_concurrent = raw_emc
+        elif status == 401:
+            orchestrator_ok = True
+            token_401 = True
+        elif status in (408, 429) or 500 <= status <= 599:
+            # Cloud Run throttling and upstream/server failures are transport-
+            # equivalent at daemon startup: keep this process alive and retry
+            # with capped backoff instead of feeding systemd's start limit.
+            ping_error = f"HTTP {status}"
+        else:
+            # Other HTTP responses prove the endpoint is reachable but rejected
+            # this runner in a non-transient way. Preserve fail-fast handling.
+            orchestrator_ok = True
+    except Exception as exc:
+        ping_error = str(exc)
+    return {
+        "orchestrator_ok": orchestrator_ok,
+        "token_valid": token_valid,
+        "token_401": token_401,
+        "ping_error": ping_error,
+        "enrolled_max_concurrent": enrolled_max_concurrent,
+    }
+
+
+def _retry_initial_orchestrator_connection(
+    orchestrator_url: str,
+    token: str,
+    result: dict,
+    *,
+    initial_delay: float = 2.0,
+    max_delay: float = 30.0,
+) -> dict:
+    """Keep a supervised daemon alive while startup connectivity is transient.
+
+    Missing configuration and rejected credentials are still fatal elsewhere.
+    Only an actual transport failure reaches this loop. Backoff grows
+    exponentially but is capped, and the shutdown event makes the wait
+    interruptible.
+    """
+    delay = initial_delay
+    while not result["orchestrator_ok"] and not _shutdown_event.is_set():
+        print(
+            "[runner] orchestrator unreachable at boot "
+            f"({result['ping_error']}); retrying in {delay:g}s "
+            f"(backoff capped at {max_delay:g}s).",
+            flush=True,
+        )
+        if _shutdown_event.wait(delay):
+            break
+        probe = _probe_orchestrator(
+            orchestrator_url, token, result["_heartbeat_body"]
+        )
+        result.update(probe)
+        delay = min(max_delay, delay * 2)
+    return result
 
 
 def _safe_credential_path(fpath: str, workspace_root: str) -> str:
@@ -8063,14 +8155,20 @@ def main() -> None:
             sys.exit(1)
         sys.exit(0 if result["setup_ok"] else 1)
 
-    # Hard prereq: orchestrator must be reachable. A 401 is NOT fatal (the row may
-    # be inactive and the heartbeat re-arms it) — mirrors the prior behavior.
+    # A transient boot-time DNS/default-route loss must not turn the service's
+    # crash-loop guard into a terminal failed unit. Stay in this process and
+    # retry only the non-claiming heartbeat with capped backoff. ``--check``
+    # already exited above, so its operator-facing probe remains fast.
     if not result["orchestrator_ok"]:
-        print(
-            f"ERROR: orchestrator unreachable at boot: {result['ping_error']}",
-            file=sys.stderr,
+        result = _retry_initial_orchestrator_connection(
+            orchestrator_url, token, result
         )
-        sys.exit(1)
+        if _shutdown_event.is_set():
+            return
+
+    # A 401 is NOT fatal (the row may be inactive and the heartbeat re-arms it)
+    # — mirrors the prior behavior. Other reachable rejection responses retain
+    # the fail-fast token protection.
     if result["token_401"]:
         print(
             "[runner] WARNING: initial heartbeat returned 401 — token may be stale or "
