@@ -1040,8 +1040,12 @@ def _metadata_diff(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for field, key_fields in _DIFF_KEYS.items():
-        source_items = cutover._normalize_role_bound(source[field], source_owner)
-        target_items = cutover._normalize_role_bound(target[field], target_owner)
+        source_items = cutover._normalize_comparison_field(
+            field, source[field], source_owner
+        )
+        target_items = cutover._normalize_comparison_field(
+            field, target[field], target_owner
+        )
 
         def keyed(items: Any, label: str) -> dict[tuple[Any, ...], dict[str, Any]]:
             if not isinstance(items, list):

@@ -596,6 +596,47 @@ class RehearsalTests(unittest.TestCase):
         self.assertNotIn("target_value", change)
         self.assertNotEqual(change["source_sha256"], change["target_sha256"])
 
+    def test_metadata_diff_uses_cutover_comparison_normalization(self) -> None:
+        source = {
+            "public_columns": [
+                {"schema": "public", "table": "task", "name": "id", "ordinal": 1},
+                {
+                    "schema": "public",
+                    "table": "task",
+                    "name": "status",
+                    "ordinal": 3,
+                },
+            ],
+            "public_constraints": [
+                {
+                    "schema": "public",
+                    "table": "task",
+                    "name": "chk_task_status",
+                    "definition": (
+                        "CHECK (status::text = ANY (ARRAY['queued'::character varying, "
+                        "'running'::character varying]::text[]))"
+                    ),
+                }
+            ],
+            "public_indexes": [],
+        }
+        target = json.loads(json.dumps(source))
+        target["public_columns"][1]["ordinal"] = 2
+        target["public_constraints"][0]["definition"] = (
+            "CHECK (status::text = ANY (ARRAY['queued'::character varying::text, "
+            "'running'::character varying::text]))"
+        )
+
+        value = rehearsal._metadata_diff(
+            source,
+            target,
+            source_owner="postgres",
+            target_owner="blueprint",
+        )
+
+        self.assertEqual(value["public_columns"]["change_count"], 0)
+        self.assertEqual(value["public_constraints"]["change_count"], 0)
+
     def test_metadata_diff_rejects_ambiguous_inventory_identity(self) -> None:
         column = {
             "schema": "public",
