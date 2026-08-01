@@ -2994,6 +2994,16 @@ async def start_resident_session(
             expected_interaction_mode is None
             and _resident_worker_task_is_healthy(live, existing, now)
         ):
+            existing_runner_id = str(existing.get("runner_id") or "").strip()
+            requested_runner_id = str(runner_id or "").strip()
+            if requested_runner_id and existing_runner_id != requested_runner_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Workday is already active on another device; stop the "
+                        "current session before changing devices"
+                    ),
+                )
             snapshot = (
                 resident_session_snapshot_for_task(project.vision, live, now=now) or {}
             )
@@ -3114,6 +3124,11 @@ async def start_resident_session(
             ):
                 decision["mode"] = "recovery_superseded"
         if decision["mode"] is None and resident_session_is_active(fresh):
+            fresh_runner_id = str(fresh.get("runner_id") or "").strip()
+            requested_runner_id = str(runner_id or "").strip()
+            runner_mismatch = bool(
+                requested_runner_id and fresh_runner_id != requested_runner_id
+            )
             fresh_task_id = fresh.get("task_id")
             try:
                 fresh_generation = int(fresh.get("worker_generation") or 1)
@@ -3126,7 +3141,9 @@ async def start_resident_session(
             )
             if fresh_task_id:
                 if stale_predecessor is None or fresh_identity != stale_predecessor:
-                    decision["mode"] = "existing"
+                    decision["mode"] = (
+                        "runner_mismatch" if runner_mismatch else "existing"
+                    )
                 else:
                     try:
                         fresh_task_uuid = uuid.UUID(str(fresh_task_id))
@@ -3139,7 +3156,11 @@ async def start_resident_session(
                             if _resident_worker_task_is_healthy(
                                 locked_task, fresh, now
                             ):
-                                decision["mode"] = "existing"
+                                decision["mode"] = (
+                                    "runner_mismatch"
+                                    if runner_mismatch
+                                    else "existing"
+                                )
                             else:
                                 stale_locked_task = locked_task
                                 carried_blacklisted_accounts = (
@@ -3151,7 +3172,9 @@ async def start_resident_session(
                         decision["session_id"] = str(fresh.get("session_id"))
                         decision["worker_generation"] = fresh_generation + 1
             elif not _start_claim_is_stale(fresh, now):
-                decision["mode"] = "existing"
+                decision["mode"] = (
+                    "runner_mismatch" if runner_mismatch else "existing"
+                )
             elif stale_predecessor is not None:
                 if fresh_identity != stale_predecessor:
                     decision["mode"] = "existing"
@@ -3169,6 +3192,7 @@ async def start_resident_session(
             "existing",
             "recovery_superseded",
             "ensure_mode_changed",
+            "runner_mismatch",
         }:
             pass
         elif runner_block is not None:
@@ -3281,6 +3305,14 @@ async def start_resident_session(
     if decision["mode"] == "recovery_superseded":
         raise _ResidentRecoverySuperseded(
             "Resident recovery identity was stopped, requeued, or superseded"
+        )
+    if decision["mode"] == "runner_mismatch":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Workday is already active on another device; stop the current "
+                "session before changing devices"
+            ),
         )
     if decision["mode"] == "existing":
         snapshot = await authoritative_resident_session_snapshot(session, project) or {}

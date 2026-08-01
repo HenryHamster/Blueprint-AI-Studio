@@ -931,6 +931,36 @@ async def test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_
     assert [row.id for row in tasks] == [task_id]
 
 
+async def test_explicit_runner_change_rejects_active_session(db_session):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    first_runner = await _make_runner(db_session, project)
+    second_runner = await _make_runner(db_session, project)
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(first_runner.id),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            runner_id=str(second_runner.id),
+        )
+
+    assert exc.value.status_code == 409
+    assert "stop the current session" in str(exc.value.detail)
+    refreshed = await db_session.get(Project, project.id)
+    blob = read_resident_session(dict(refreshed.vision or {}))
+    assert blob is not None
+    assert blob["session_id"] == started["session_id"]
+    assert blob["runner_id"] == str(first_runner.id)
+
+
 async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_session, monkeypatch):
     monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
     project = await _make_project(db_session)
@@ -1599,6 +1629,51 @@ async def test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale(db_s
     assert replaced["session_id"] == started["session_id"]
     assert replaced["worker_generation"] == started["worker_generation"] + 1
     assert replaced["task_id"] != started["task_id"]
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_explicit_runner_replaces_a_genuinely_stale_active_worker(db_session):
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    first_runner = await _make_runner(db_session, project)
+    second_runner = await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(first_runner.id),
+    )
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.QUEUED
+    old_task.last_heartbeat = stale_at
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob.pop("worker_heartbeat_at", None)
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    replaced = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(second_runner.id),
+    )
+
+    assert replaced["session_id"] == started["session_id"]
+    assert replaced["worker_generation"] == started["worker_generation"] + 1
+    assert replaced["task_id"] != started["task_id"]
+    assert replaced["runner_id"] == str(second_runner.id)
     await db_session.refresh(old_task)
     assert old_task.status == TaskStatus.CANCELLED
 

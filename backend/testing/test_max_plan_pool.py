@@ -236,6 +236,31 @@ class TestFilterProvidersByCLI:
         result = _filter_providers_by_cli(["anthropic", "openai"], clis)
         assert result == ["openai"]
 
+    def test_resident_readiness_blocks_only_resident_claude_routes(self):
+        clis = {
+            "claude": {"present": True, "resident_ready": False},
+            "codex": {"present": True},
+        }
+        assert _filter_providers_by_cli(
+            ["anthropic", "openai"], clis
+        ) == ["anthropic", "openai"]
+        assert _filter_providers_by_cli(
+            ["anthropic", "openai"],
+            clis,
+            require_resident_ready=True,
+        ) == ["openai"]
+
+    def test_missing_resident_readiness_does_not_prove_resident_capability(self):
+        clis = {"claude": {"present": True}}
+        assert _filter_providers_by_cli(
+            ["anthropic"], clis, require_resident_ready=True
+        ) == []
+
+    def test_empty_inventory_does_not_prove_resident_capability(self):
+        assert _filter_providers_by_cli(
+            ["anthropic"], {}, require_resident_ready=True
+        ) == []
+
     def test_empty_provider_list_returns_empty(self):
         assert _filter_providers_by_cli([], {"claude": {"present": True}}) == []
 
@@ -5963,6 +5988,59 @@ class TestSelectLLMRuntimeFiltersByRunnerCLIs:
             assert mock_select.called
         finally:
             self._reset_pools()
+
+    @patch("app.max_plan_pool.select_max_plan_account", new_callable=AsyncMock)
+    async def test_explicit_provider_cannot_bypass_resident_cli_readiness(
+        self, mock_select
+    ):
+        self._reset_pools()
+        mock_select.side_effect = lambda **kwargs: {
+            "id": f"acct-{kwargs['provider']}",
+            "name": f"acct-{kwargs['provider']}",
+            "oauth_token": "token",
+            "auth_mode": "oauth",
+            "provider": kwargs["provider"],
+        }
+        task = MagicMock(
+            spec=[
+                "first_payload", "payloads", "context", "project_id",
+                "launched_by_user_id", "id",
+            ]
+        )
+        task.first_payload = {"type": "create"}
+        task.payloads = [{}]
+        task.context = {
+            "_resident_session": True,
+            "llm_provider": "anthropic",
+        }
+        task.project_id = None
+        task.launched_by_user_id = None
+        task.id = "resident-explicit-provider-filter"
+        runtime_config = {
+            "provider_selection_mode": "preferred",
+            "category_routing": {
+                "_default": {"providers": ["anthropic", "openai"]}
+            },
+            "task_type_categories": {},
+        }
+
+        result = await select_llm_runtime_for_task(
+            user_id=self._USER,
+            task=task,
+            runtime_config=runtime_config,
+            runner_available_clis={
+                "claude": {"present": True, "resident_ready": False},
+                "codex": {"present": True},
+            },
+        )
+
+        assert result is not None
+        assert result.provider == "openai"
+        assert all(
+            call.kwargs.get("provider") != "anthropic"
+            for call in mock_select.call_args_list
+        )
+        self._reset_pools()
 
 
 # ── get_meter_reliability_stats ─────────────────────────────────────────────

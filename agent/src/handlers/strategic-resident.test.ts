@@ -1347,6 +1347,101 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await done;
   });
 
+  it('does not start an autonomous turn while a private Fast consultation owns Workday', async () => {
+    vi.useFakeTimers();
+    mockApiGet.mockResolvedValue({ messages: [], fast_message_ids: [], claim_required: true });
+
+    const canonicalEnvelope = {
+      version: 2,
+      project_id: '11111111-1111-4111-8111-111111111111',
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 90,
+      ledger_revision: 0,
+      problem_model: {},
+      decisions: [],
+      memory: { active: [] },
+      recent_conversation: [],
+    };
+    const canonicalBytes = Buffer.from(JSON.stringify(canonicalEnvelope), 'utf8');
+    const envelope = {
+      snapshot_id: 'snapshot-private-workday',
+      canonical_envelope_b64: canonicalBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(canonicalBytes).digest('hex'),
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 90,
+      ledger_revision: 0,
+      expires_at: '2035-01-01T00:00:00.000Z',
+    };
+    let consultationClaims = 0;
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({ authority_held: true });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        consultationClaims += 1;
+        return Promise.resolve(consultationClaims === 1 ? {
+          status: 'claimed',
+          packet: {
+            packet_id: 'packet-private-workday',
+            workday_claim_id: 'workday-claim-private',
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: 1,
+            claim_id: 'fast-claim-private',
+            delivery_key: 'delivery-private',
+            continuation_key: 'continuation-private',
+            question: 'Inspect the repository without blocking Fast.',
+            envelope,
+          },
+        } : { status: 'empty' });
+      }
+      if (url.endsWith('/workday-consultations/packet-private-workday/renew')) {
+        return Promise.resolve({
+          workday_claim_id: 'workday-claim-private',
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-private-workday/ack')) {
+        return Promise.resolve({ status: 'completed' });
+      }
+      return Promise.resolve({});
+    });
+
+    let resolvePrivate!: (result: ResidentTurnResult) => void;
+    const privateTurn = new Promise<ResidentTurnResult>((resolve) => {
+      resolvePrivate = resolve;
+    });
+    let alive = true;
+    const workday = makeSession(() => {
+      if (workday.sendTurn.mock.calls.length > 1) {
+        throw new Error('resident sendTurn called while a turn is already active');
+      }
+      return privateTurn;
+    }, () => alive);
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('typed-fast-private-workday-serialization', {
+      ...qualifiedPayload(),
+      typed_fast_enabled: false,
+      strategic_session_autonomous: true,
+      strategic_session_message_poll_seconds: 0.001,
+      strategic_session_min_tick_seconds: 1,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(mockSendLog).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('sendTurn called while a turn is already active'),
+    );
+
+    alive = false;
+    resolvePrivate(turnResult({ resultText: 'Private investigation complete.' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await done;
+  });
+
   const runOrdinaryWorkdayOverlapCase = async (renewalFails: boolean) => {
     vi.useFakeTimers();
     const legacyMessage = {

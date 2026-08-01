@@ -377,6 +377,8 @@ _PROVIDER_REQUIRED_CLI: dict[str, str] = {
 def _filter_providers_by_cli(
     providers: list[str],
     runner_available_clis: dict[str, dict] | None,
+    *,
+    require_resident_ready: bool = False,
 ) -> list[str]:
     """Filter *providers* to those whose required CLI is present on the runner.
 
@@ -393,8 +395,11 @@ def _filter_providers_by_cli(
     """
     if runner_available_clis is None:
         return providers
-    # Empty dict → conservative: assume only claude is available.
+    # Empty concrete inventory cannot positively prove Resident capability.
+    # Preserve the legacy Claude-only fallback for ordinary one-shot work.
     if not runner_available_clis:
+        if require_resident_ready:
+            return []
         return [p for p in providers if _PROVIDER_REQUIRED_CLI.get(p) == "claude"]
     result: list[str] = []
     for provider in providers:
@@ -402,7 +407,19 @@ def _filter_providers_by_cli(
         if required_cli is None:
             continue  # Unknown provider — can't determine requirement
         cli_entry = runner_available_clis.get(required_cli)
-        if isinstance(cli_entry, dict) and cli_entry.get("present", False):
+        resident_blocked = (
+            require_resident_ready
+            and required_cli == "claude"
+            and (
+                not isinstance(cli_entry, dict)
+                or cli_entry.get("resident_ready") is not True
+            )
+        )
+        if (
+            isinstance(cli_entry, dict)
+            and cli_entry.get("present", False)
+            and not resident_blocked
+        ):
             result.append(provider)
     return result
 
@@ -4750,20 +4767,43 @@ async def select_llm_runtime_for_task(
         if provider_preference:
             provider_preference = provider_preference[:1]
 
+    # Reconcile an explicit provider before applying runner capability filters.
+    # Otherwise the pin could be inserted after filtering and bypass a failed
+    # Resident readiness proof on the claimed runner.
+    if explicit_provider:
+        if allow_fallback:
+            provider_preference = [explicit_provider] + [
+                p for p in provider_preference if p != explicit_provider
+            ]
+        else:
+            provider_preference = [explicit_provider]
+    elif explicit_model and provider_preference:
+        # Unknown/custom model strings must not silently degrade into tier defaults
+        # or cross-provider retries. Keep the caller's requested model on the
+        # first configured provider only until mappings are updated.
+        provider_preference = provider_preference[:1]
+
     # Filter providers by runner CLI inventory: when a concrete runner is
     # known (runner claim path), remove providers whose required CLI is not
     # present on that runner. The orchestrator pre-provision / warm-retarget
     # paths pass runner_available_clis=None and skip this filter entirely.
     if runner_available_clis is not None:
+        require_resident_ready = (
+            _task_context(task).get("_resident_session") is True
+        )
         provider_preference = _filter_providers_by_cli(
-            provider_preference, runner_available_clis
+            provider_preference,
+            runner_available_clis,
+            require_resident_ready=require_resident_ready,
         )
         if model_preferences:
             model_preferences = [
                 p
                 for p in model_preferences
                 if _filter_providers_by_cli(
-                    [p.get("provider", "")], runner_available_clis
+                    [p.get("provider", "")],
+                    runner_available_clis,
+                    require_resident_ready=require_resident_ready,
                 )
             ]
         if not provider_preference and not model_preferences:
@@ -4811,19 +4851,6 @@ async def select_llm_runtime_for_task(
                         task, runtime_config, provider_name, model_name
                     ),
                 )
-
-    if explicit_provider:
-        if allow_fallback:
-            provider_preference = [explicit_provider] + [
-                p for p in provider_preference if p != explicit_provider
-            ]
-        else:
-            provider_preference = [explicit_provider]
-    elif explicit_model and provider_preference:
-        # Unknown/custom model strings must not silently degrade into tier defaults
-        # or cross-provider retries. Keep the caller's requested model on the
-        # first configured provider only until mappings are updated.
-        provider_preference = provider_preference[:1]
 
     # The intended routing is the most-preferred provider and its tier/explicit
     # model. Captured here (after provider_preference is finalized) so every

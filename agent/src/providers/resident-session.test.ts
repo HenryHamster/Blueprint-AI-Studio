@@ -127,6 +127,11 @@ const STRATEGIC_CREATE = './strategic create-direction \'{}\'';
 describe('startResidentClaudeSession', () => {
   beforeEach(() => {
     vi.mocked(spawn).mockReset();
+    vi.mocked(probeClaudeCapabilities).mockReset();
+    vi.mocked(probeClaudeCapabilities).mockReturnValue(new Set([
+      '--input-format', '--append-system-prompt', '--mcp-config',
+      '--strict-mcp-config', '--allowedTools',
+    ]));
     vi.mocked(registerChildPid).mockClear();
     vi.mocked(unregisterChildPid).mockClear();
     vi.spyOn(process, 'kill').mockReturnValue(true); // never signal a real pid in tests
@@ -156,7 +161,9 @@ describe('startResidentClaudeSession', () => {
   it('applies the Claude optional-flag compatibility gate before resident spawn', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
-    vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(new Set(['--effort']));
+    vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(
+      new Set(['--input-format', '--effort']),
+    );
     vi.mocked(stripUnsupportedClaudeOptionalArgs).mockImplementationOnce((args) => args.filter((arg) => arg !== '--include-partial-messages'));
 
     const session = startResidentClaudeSession({});
@@ -190,6 +197,33 @@ describe('startResidentClaudeSession', () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it('refuses a known Claude CLI without streaming input support', () => {
+    vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(new Set(['--effort']));
+    expect(() => startResidentClaudeSession({})).toThrow(/--input-format/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('refuses resident launch when Claude capabilities cannot be proven', () => {
+    vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(null);
+    expect(() => startResidentClaudeSession({})).toThrow(/verified Claude --input-format/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('probes and spawns with the same effective environment', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({
+      env: { PATH: '/resident/claude/bin', CLAUDE_CONFIG_DIR: '/resident/config' },
+    });
+    const probedEnv = vi.mocked(probeClaudeCapabilities).mock.calls[0]?.[1];
+    const spawnOptions = vi.mocked(spawn).mock.calls[0]?.[2] as { env?: NodeJS.ProcessEnv };
+    expect(probedEnv).toMatchObject({
+      PATH: '/resident/claude/bin', CLAUDE_CONFIG_DIR: '/resident/config',
+    });
+    expect(spawnOptions.env).toEqual(probedEnv);
+    session.close();
+  });
+
   it('launches the receipt-bound Workday reply tool through MCP when configured', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
@@ -207,7 +241,7 @@ describe('startResidentClaudeSession', () => {
 
   it('refuses a known Claude CLI that cannot isolate the reply MCP config', () => {
     vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(
-      new Set(['--mcp-config', '--allowedTools']),
+      new Set(['--input-format', '--mcp-config', '--allowedTools']),
     );
 
     expect(() => startResidentClaudeSession({

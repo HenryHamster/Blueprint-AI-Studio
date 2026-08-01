@@ -55,6 +55,15 @@ export function useStrategicSession({
     Map<string, ReturnType<typeof startStrategicSession>>
   >(new Map());
   const strategicWorkdayExplicitlyStoppedProjectRef = useRef<string | null>(null);
+  const strategicWorkdayExplicitStartRef = useRef<{
+    projectId: string;
+    sessionId: string | null;
+    workerGeneration: number | null;
+  } | null>(null);
+  const strategicRunnerSelectionRef = useRef<{
+    touched: boolean;
+    value: string | null;
+  }>({ touched: false, value: null });
   const strategicWorkbenchOperatorSurfaceTouchedRef = useRef(false);
   const strategicWorkbenchRestoreProjectRef = useRef<string | null>(null);
 
@@ -69,6 +78,8 @@ export function useStrategicSession({
     strategicCheckInIdempotencyKeyRef.current = null;
     strategicWorkdayEnsuredKeysRef.current.clear();
     strategicWorkdayExplicitlyStoppedProjectRef.current = null;
+    strategicWorkdayExplicitStartRef.current = null;
+    strategicRunnerSelectionRef.current = { touched: false, value: null };
     setCheckingInStrategicSession(false);
     setStrategicSessionBusy(false);
   }, [selectedProjectId]);
@@ -131,6 +142,35 @@ export function useStrategicSession({
     ?? null;
   const refreshStrategicReadModel = strategicReadModel.refresh;
 
+  useEffect(() => {
+    const explicitStart = strategicWorkdayExplicitStartRef.current;
+    const observedSessionId = residentStrategicSession?.session_id ?? null;
+    const observedGeneration = residentStrategicSession?.worker_generation ?? null;
+    const matchesExplicitStart = Boolean(
+      explicitStart
+      && explicitStart.projectId === selectedProjectId
+      && explicitStart.sessionId === observedSessionId
+      && (
+        explicitStart.workerGeneration === null
+        || explicitStart.workerGeneration === observedGeneration
+      )
+    );
+    if (matchesExplicitStart && strategicSessionActive) {
+      const ensuredRunnerId = residentStrategicSession?.runner_id
+        ?? strategicSessionSelectedRunnerId;
+      strategicWorkdayEnsuredKeysRef.current.add(
+        `${selectedProjectId}:continuous:${ensuredRunnerId ?? 'auto'}:hydrate`,
+      );
+      strategicWorkdayExplicitStartRef.current = null;
+      strategicWorkbenchOperatorSurfaceTouchedRef.current = false;
+    }
+  }, [
+    residentStrategicSession,
+    selectedProjectId,
+    strategicSessionActive,
+    strategicSessionSelectedRunnerId,
+  ]);
+
   // Polling snapshots can remain byte-for-byte unchanged while a provisional
   // worker crosses the backend's five-minute stale-claim threshold. Schedule a
   // single local wake-up at that boundary so recovery does not depend on a
@@ -174,6 +214,11 @@ export function useStrategicSession({
       strategicWorkdayEnsuredKeysRef.current.clear();
       return;
     }
+    // A live operator transition into Workday is followed by an explicit Start
+    // after runner selection. Auto-ensure is only for reload hydration/recovery;
+    // otherwise a stale saved runner can win the start race before the new
+    // selection is persisted.
+    if (strategicWorkbenchOperatorSurfaceTouchedRef.current) return;
     if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
     // Retry-wait is dormant/healthy only while the session itself is active.
     // End/stop paths may preserve the last worker fields, and that stale value
@@ -205,9 +250,9 @@ export function useStrategicSession({
           workerState ?? lifecycleState ?? 'unknown',
         ].join(':')
       : 'hydrate';
-    const ensureKey = `${projectId}:continuous:${ensureEpoch}`;
-    if (strategicWorkdayEnsuredKeysRef.current.has(ensureKey)) return;
     const preferredRunnerId = strategicSessionSelectedRunnerId;
+    const ensureKey = `${projectId}:continuous:${preferredRunnerId ?? 'auto'}:${ensureEpoch}`;
+    if (strategicWorkdayEnsuredKeysRef.current.has(ensureKey)) return;
     let cancelled = false;
     let retryTimer: number | null = null;
     let retryAttempt = 0;
@@ -330,6 +375,9 @@ export function useStrategicSession({
   const persistStrategicWorkbench = useCallback((patch: Partial<StrategicWorkbenchState>) => {
     const projectId = selectedProjectId;
     if (!projectId) return;
+    if (patch.interaction_mode !== undefined) {
+      strategicWorkbenchOperatorSurfaceTouchedRef.current = true;
+    }
     const saveSeq = strategicWorkbenchSaveSeqRef.current + 1;
     strategicWorkbenchSaveSeqRef.current = saveSeq;
     const base = strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench;
@@ -354,6 +402,12 @@ export function useStrategicSession({
           if (selectedProjectIdRef.current === projectId && strategicWorkbenchSaveSeqRef.current === saveSeq) {
             strategicWorkbenchStateRef.current = base;
             setOptimisticStrategicWorkbench(base);
+            if (patch.preferred_runner_id !== undefined) {
+              strategicRunnerSelectionRef.current = {
+                touched: false,
+                value: base?.preferred_runner_id ?? null,
+              };
+            }
             addToast('Could not save Strategic session', 'error');
           }
         } finally {
@@ -372,6 +426,7 @@ export function useStrategicSession({
   }, [persistStrategicWorkbench, strategicReadModelWorkbench]);
 
   const handleSelectStrategicRunner = useCallback((runnerId: string | null) => {
+    strategicRunnerSelectionRef.current = { touched: true, value: runnerId };
     persistStrategicWorkbench({ preferred_runner_id: runnerId });
   }, [persistStrategicWorkbench]);
 
@@ -412,8 +467,25 @@ export function useStrategicSession({
     strategicWorkdayExplicitlyStoppedProjectRef.current = null;
     setStrategicSessionBusy(true);
     try {
-      const preferredRunnerId = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.preferred_runner_id ?? null;
-      await startStrategicSession(projectId, preferredRunnerId ? { runner_id: preferredRunnerId } : {});
+      // Wait before reading the selection: a failed save reconciles the
+      // optimistic runner ref to the still-visible persisted value.
+      await strategicWorkbenchSaveQueueRef.current;
+      const selectedRunnerId = strategicRunnerSelectionRef.current.touched
+        ? strategicRunnerSelectionRef.current.value
+        : (
+          strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench
+        )?.preferred_runner_id ?? null;
+      const startResponse = await startStrategicSession(
+        projectId,
+        selectedRunnerId ? { runner_id: selectedRunnerId } : {},
+      );
+      if (startResponse.session) {
+        strategicWorkdayExplicitStartRef.current = {
+          projectId,
+          sessionId: startResponse.session.session_id ?? null,
+          workerGeneration: startResponse.session.worker_generation ?? null,
+        };
+      }
       if (selectedProjectIdRef.current !== projectId) return;
       addToast('Strategic session starting', 'success');
       void strategicReadModel.refresh();
@@ -422,7 +494,9 @@ export function useStrategicSession({
         addToast(err instanceof Error ? err.message : 'Could not start Strategic session', 'error');
       }
     } finally {
-      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
+      if (selectedProjectIdRef.current === projectId) {
+        setStrategicSessionBusy(false);
+      }
     }
   }, [strategicSessionBusy, addToast, strategicReadModel, strategicReadModelWorkbench, selectedProjectId]);
 

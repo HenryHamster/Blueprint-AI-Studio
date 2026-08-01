@@ -1576,7 +1576,9 @@ class TestProbeLlmClis(unittest.TestCase):
                     args=args,
                     returncode=0,
                     stdout=(
-                        "codex-cli 0.144.1\n"
+                        "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                        if args[-1] == "--help"
+                        else "codex-cli 0.144.1\n"
                         if args[0].endswith("codex")
                         else f"{args[0]} 0.2.0\n"
                     ),
@@ -1591,6 +1593,7 @@ class TestProbeLlmClis(unittest.TestCase):
             self.assertTrue(result[name]["healthy"])
             self.assertIsNone(result[name]["reason"])
         self.assertIn("0.2.0", result["claude"]["version"])
+        self.assertTrue(result["claude"]["resident_ready"])
         self.assertIn("0.144.1", result["codex"]["version"])
         self.assertIn("0.2.0", result["gemini"]["version"])
 
@@ -1598,7 +1601,7 @@ class TestProbeLlmClis(unittest.TestCase):
         safe_env = {"PATH": "/safe/bin", "HOME": "/safe/home"}
         with (
             mock.patch.object(
-                iso, "_which", side_effect=self._which_side_effect
+                iso.shutil, "which", side_effect=lambda name, path=None: self._which_side_effect(name)
             ),
             mock.patch.object(
                 iso.subprocess,
@@ -1607,7 +1610,9 @@ class TestProbeLlmClis(unittest.TestCase):
                     args=args,
                     returncode=0,
                     stdout=(
-                        "codex-cli 0.144.1"
+                        "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                        if args[-1] == "--help"
+                        else "codex-cli 0.144.1"
                         if args[0].endswith("codex")
                         else "cli 1.0.0"
                     ),
@@ -1616,7 +1621,7 @@ class TestProbeLlmClis(unittest.TestCase):
             ) as run,
         ):
             iso.probe_llm_clis(env=safe_env)
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 4)
         for call in run.call_args_list:
             self.assertEqual(call.kwargs["env"], safe_env)
 
@@ -1729,13 +1734,18 @@ class TestProbeLlmClis(unittest.TestCase):
     def test_container_probe_uses_image_entrypoint_not_host_path(self):
         def fake_run(args, **kwargs):
             cli = args[args.index("--entrypoint") + 1]
-            version = "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
-            return subprocess.CompletedProcess(args, 0, stdout=version, stderr="")
+            output = (
+                "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                if args[-1] == "--help"
+                else "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
+            )
+            return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
 
         with mock.patch.object(iso.subprocess, "run", side_effect=fake_run) as run:
             result = iso.probe_container_llm_clis("agent:test")
         self.assertTrue(result["codex"]["healthy"])
-        self.assertEqual(run.call_count, 3)
+        self.assertTrue(result["claude"]["resident_ready"])
+        self.assertEqual(run.call_count, 4)
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0:2], ["docker", "run"])
             self.assertIn("agent:test", call.args[0])
@@ -1758,6 +1768,44 @@ class TestProbeLlmClis(unittest.TestCase):
             result = iso.probe_container_llm_clis("agent:broken")
         self.assertFalse(result["codex"]["present"])
         self.assertEqual(result["codex"]["reason"], "missing_native_package")
+
+    def test_container_help_timeout_preserves_ordinary_claude_health(self):
+        def fake_run(args, **kwargs):
+            cli = args[args.index("--entrypoint") + 1]
+            if cli == "claude" and args[-1] == "--help":
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 20))
+            output = "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
+            return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            result = iso.probe_container_llm_clis("agent:help-timeout")
+
+        self.assertTrue(result["claude"]["present"])
+        self.assertTrue(result["claude"]["healthy"])
+        self.assertFalse(result["claude"]["resident_ready"])
+        self.assertEqual(
+            result["claude"]["capability_probe_reason"],
+            "container_help_probe_timeout",
+        )
+
+    def test_container_help_error_preserves_ordinary_claude_health(self):
+        def fake_run(args, **kwargs):
+            cli = args[args.index("--entrypoint") + 1]
+            if cli == "claude" and args[-1] == "--help":
+                raise OSError("runtime help failed")
+            output = "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
+            return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            result = iso.probe_container_llm_clis("agent:help-error")
+
+        self.assertTrue(result["claude"]["present"])
+        self.assertTrue(result["claude"]["healthy"])
+        self.assertFalse(result["claude"]["resident_ready"])
+        self.assertEqual(
+            result["claude"]["capability_probe_reason"],
+            "container_help_probe_error",
+        )
 
     def test_empty_caps_on_capabilities_dataclass(self):
         """llm_clis defaults to {} on a freshly-constructed Capabilities."""

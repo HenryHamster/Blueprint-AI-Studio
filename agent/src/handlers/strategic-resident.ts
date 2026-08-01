@@ -1137,7 +1137,7 @@ export async function handleStrategicResident(
   // Keep private requests serialized, but never make the foreground input loop
   // await them: newer operator input must remain immediately dispatchable.
   let privateWorkdayChain: Promise<void> = Promise.resolve();
-  let privateWorkdayBusy = false;
+  let pendingPrivateWorkdayJobs = 0;
   let nextTypedConsultationPollAt = 0;
   let cursor = initialCursor(task, payload);
   // Bounded set of message ids already handled — with `created_at >= since` poll
@@ -3012,6 +3012,7 @@ export async function handleStrategicResident(
   const schedulePrivateWorkdayRequest = (
     request: { request_id: string; prompt: string; receipt: CallTurnReceipt },
   ): void => {
+    pendingPrivateWorkdayJobs += 1;
     privateWorkdayChain = privateWorkdayChain
       .catch(() => undefined)
       .then(async () => {
@@ -3026,6 +3027,9 @@ export async function handleStrategicResident(
       })
       .catch((error: unknown) => {
         sendLog(ws, `[resident] private call Workday request failed: ${sanitize(String(error))}\n`);
+      })
+      .finally(() => {
+        pendingPrivateWorkdayJobs = Math.max(0, pendingPrivateWorkdayJobs - 1);
       });
   };
 
@@ -3145,7 +3149,7 @@ export async function handleStrategicResident(
   };
 
   const scheduleTypedConsultation = (packet: ClaimedTypedConsultation): void => {
-    privateWorkdayBusy = true;
+    pendingPrivateWorkdayJobs += 1;
     privateWorkdayChain = privateWorkdayChain
       .catch(() => undefined)
       .then(async () => {
@@ -3207,13 +3211,13 @@ export async function handleStrategicResident(
         }
       })
       .finally(() => {
-        privateWorkdayBusy = false;
+        pendingPrivateWorkdayJobs = Math.max(0, pendingPrivateWorkdayJobs - 1);
       });
   };
 
   const maybeClaimTypedConsultation = async (): Promise<boolean> => {
     if (
-      privateWorkdayBusy
+      pendingPrivateWorkdayJobs > 0
       || callCoordinator.suppressOrdinaryWorkday()
       || Date.now() < nextTypedConsultationPollAt
     ) return false;
@@ -4172,7 +4176,7 @@ export async function handleStrategicResident(
     // legacy-only batch cannot start a competing runTurn.  Crucially this is
     // after the Fast subset was dispatched above: private research may defer
     // only legacy Workday work, never a new typed Fast reply.
-    if (workdayMessages.length > 0 && privateWorkdayBusy) {
+    if (workdayMessages.length > 0 && pendingPrivateWorkdayJobs > 0) {
       rollbackPendingOperatorAdmission();
       setResidentActivity('waiting', 'Private Workday research is running');
       return 'continue';
@@ -4642,6 +4646,23 @@ export async function handleStrategicResident(
       // at a time and keep the main loop cycling so a new operator message can
       // still be picked up by the independent foreground child immediately.
       if (await maybeClaimTypedConsultation()) {
+        setResidentActivity('working', 'Workday is investigating a Fast consultation');
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested) break;
+        }
+        await sleep(cfg.messagePollMs);
+        continue;
+      }
+
+      // The private consultation chain and the ordinary loop share the same
+      // persistent Workday subprocess. Keep Fast responsive in its independent
+      // foreground child, but never start a continuation, legacy reply, compact,
+      // or autonomous turn until the current private Workday turn has settled.
+      // Without this gate the next loop iteration can call runTurn() while the
+      // consultation still owns ResidentSession.sendTurn(), terminating the
+      // entire session with "sendTurn called while a turn is already active".
+      if (pendingPrivateWorkdayJobs > 0) {
         setResidentActivity('working', 'Workday is investigating a Fast consultation');
         if (livenessHeartbeatDue()) {
           const hb = await livenessHeartbeat();

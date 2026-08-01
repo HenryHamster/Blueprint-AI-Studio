@@ -122,6 +122,7 @@ it MUST be under a process supervisor, or wrapped so it comes back:
 """
 
 import base64
+import hashlib
 import http.client
 import io
 import json
@@ -601,6 +602,7 @@ _MANAGED_CLI_POLICY: dict[str, tuple[str, str]] = {
     # Preserve the existing Docker/Packer policy for Claude Code: current latest.
     "claude": ("@anthropic-ai/claude-code", "latest"),
 }
+_CLAUDE_RESIDENT_REQUIRED_FLAGS = iso.CLAUDE_RESIDENT_REQUIRED_FLAGS
 _CLI_MAINTENANCE_LOCK = threading.Lock()
 _CLI_MAINTENANCE_INTERVAL_SECONDS = 6 * 60 * 60
 _CLI_INSTALL_TIMEOUT_SECONDS = 180
@@ -740,6 +742,39 @@ def _version_text(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _cli_meets_capability_policy(
+    name: str,
+    executable: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
+    """Verify capabilities that a version string cannot establish.
+
+    Claude Code distributions and wrappers can report the same version while
+    exposing different command surfaces. Resident startup depends on these
+    flags, so both maintenance and staged activation must validate the binary
+    that will actually be placed on PATH.
+    """
+    if name != "claude":
+        return True
+    try:
+        result = subprocess.run(
+            [executable, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_cli_subprocess_env() if env is None else env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    help_text = "\n".join((result.stdout or "", result.stderr or ""))
+    return _CLAUDE_RESIDENT_REQUIRED_FLAGS.issubset(
+        set(re.findall(r"--[0-9A-Za-z][0-9A-Za-z-]*", help_text))
+    )
+
+
 def _npm_latest_version(npm: str, package: str) -> str | None:
     try:
         result = subprocess.run(
@@ -758,25 +793,74 @@ def _cli_backoff_path(name: str) -> str:
     return os.path.join(_managed_cli_base(), name, "maintenance.json")
 
 
-def _cli_in_backoff(name: str, now: float) -> bool:
+def _cli_policy_fingerprint(name: str, package: str, target: str) -> str:
+    capabilities = (
+        sorted(_CLAUDE_RESIDENT_REQUIRED_FLAGS) if name == "claude" else []
+    )
+    material = json.dumps(
+        {"name": name, "package": package, "target": target, "capabilities": capabilities},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+def _cli_in_backoff(
+    name: str,
+    now: float,
+    *,
+    policy_fingerprint: str | None = None,
+) -> bool:
     state = _read_json(_cli_backoff_path(name))
+    if (
+        policy_fingerprint is not None
+        and state.get("policy_fingerprint") != policy_fingerprint
+    ):
+        return False
     retry_at = state.get("next_retry_at", 0)
     return isinstance(retry_at, (int, float)) and retry_at > now
 
 
-def _record_cli_install_result(name: str, *, succeeded: bool, now: float) -> None:
+def _record_cli_install_result(
+    name: str,
+    *,
+    succeeded: bool,
+    now: float,
+    policy_fingerprint: str | None = None,
+) -> None:
     if succeeded:
         _atomic_json(
             _cli_backoff_path(name),
-            {"failures": 0, "next_retry_at": 0, "last_success_at": now},
+            {
+                "failures": 0,
+                "next_retry_at": 0,
+                "last_success_at": now,
+                **(
+                    {"policy_fingerprint": policy_fingerprint}
+                    if policy_fingerprint is not None else {}
+                ),
+            },
         )
         return
     old = _read_json(_cli_backoff_path(name))
-    failures = min(int(old.get("failures", 0) or 0) + 1, 10)
+    prior_failures = (
+        int(old.get("failures", 0) or 0)
+        if policy_fingerprint is None
+        or old.get("policy_fingerprint") == policy_fingerprint
+        else 0
+    )
+    failures = min(prior_failures + 1, 10)
     delay = min(6 * 60 * 60, 60 * (2 ** (failures - 1)))
     _atomic_json(
         _cli_backoff_path(name),
-        {"failures": failures, "next_retry_at": now + delay},
+        {
+            "failures": failures,
+            "next_retry_at": now + delay,
+            **(
+                {"policy_fingerprint": policy_fingerprint}
+                if policy_fingerprint is not None else {}
+            ),
+        },
     )
 
 
@@ -1029,6 +1113,10 @@ def _install_managed_cli(
         actual = _version_text(info.get("version") or "")
         if target != "latest" and actual != target:
             return False
+        if not _cli_meets_capability_policy(
+            name, executable, env=subprocess_env
+        ):
+            return False
 
         safe_version = re.sub(r"[^0-9A-Za-z._-]", "_", actual or target)
         unique = os.path.basename(staging).removeprefix(".stage-")
@@ -1072,17 +1160,38 @@ def _maintain_host_llm_clis_once(*, now: float | None = None) -> None:
             _activate_managed_cli_paths()
             inventory = iso.probe_llm_clis(env=_cli_subprocess_env())
             for name, (package, policy_target) in _MANAGED_CLI_POLICY.items():
-                if _cli_in_backoff(name, timestamp):
+                policy_fingerprint = _cli_policy_fingerprint(
+                    name, package, policy_target
+                )
+                if _cli_in_backoff(
+                    name,
+                    timestamp,
+                    policy_fingerprint=policy_fingerprint,
+                ):
                     continue
                 info = inventory.get(name) or {}
                 target: str | None = None
                 if info.get("healthy") is not True:
-                    target = policy_target
+                    target = (
+                        _npm_latest_version(npm, package)
+                        if name == "claude"
+                        else policy_target
+                    )
                 elif name == "claude":
-                    latest = _npm_latest_version(npm, package)
-                    actual = _version_text(info.get("version") or "")
-                    if latest and actual and latest != actual:
-                        target = latest
+                    executable = shutil.which(name)
+                    if not executable or not _cli_meets_capability_policy(
+                        name, executable
+                    ):
+                        # Repair the capability surface even when a wrapper or
+                        # partial distribution reports the current version. Pin
+                        # the staged repair to the registry's resolved version;
+                        # do not promote a moving `latest` target.
+                        target = _npm_latest_version(npm, package)
+                    else:
+                        latest = _npm_latest_version(npm, package)
+                        actual = _version_text(info.get("version") or "")
+                        if latest and actual and latest != actual:
+                            target = latest
                 # Codex health already enforces >= the reviewed minimum. Healthy
                 # compatible operator installs are left alone; repairs go managed.
                 if target is None:
@@ -1096,7 +1205,10 @@ def _maintain_host_llm_clis_once(*, now: float | None = None) -> None:
                     name, npm, package, target
                 )
                 _record_cli_install_result(
-                    name, succeeded=succeeded, now=timestamp
+                    name,
+                    succeeded=succeeded,
+                    now=timestamp,
+                    policy_fingerprint=policy_fingerprint,
                 )
                 if succeeded:
                     print(
@@ -3593,6 +3705,27 @@ def _intersect_llm_cli_health(
             backend: info.get("version") or None
             for backend, info in details.items()
         }
+        if name == "claude":
+            readiness = [info.get("resident_ready") for info in details.values()]
+            explicit_readiness = [value for value in readiness if isinstance(value, bool)]
+            if explicit_readiness:
+                selected["resident_ready"] = (
+                    len(explicit_readiness) == len(readiness)
+                    and all(explicit_readiness)
+                )
+                selected["missing_resident_flags"] = sorted(
+                    {
+                        flag
+                        for info in details.values()
+                        for flag in (info.get("missing_resident_flags") or [])
+                        if isinstance(flag, str)
+                    }
+                )[:16]
+                selected["capability_probe_reason"] = (
+                    None
+                    if selected["resident_ready"]
+                    else "missing_or_unverified_on_selectable_backend"
+                )
         if failed:
             selected.update(
                 {
