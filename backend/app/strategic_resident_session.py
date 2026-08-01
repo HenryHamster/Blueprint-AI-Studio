@@ -59,6 +59,7 @@ from app.voice_credentials import (
     validate_resident_call_deployment_configuration,
 )
 from app.models import (
+    ArtifactType,
     Direction,
     Project,
     ProjectMessage,
@@ -68,6 +69,7 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.schemas import AgentStatusPayload
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.strategic_payload_summaries import (
@@ -487,6 +489,48 @@ def resident_worker_incarnation_is_current(
             or expires_at > (now or _utcnow())
         )
     )
+
+
+def resident_worker_matches_ended_identity(
+    vision: dict[str, Any] | None,
+    *,
+    task_id: uuid.UUID | str,
+    worker_generation: int,
+    incarnation_id: uuid.UUID | None,
+) -> bool:
+    """Match the one process identity recorded on an already-ended session.
+
+    This is deliberately not an authority check: an ended process may not
+    heartbeat or mutate Strategic state.  It exists only so the status endpoint
+    can accept that exact process's terminal callback after the backend has
+    atomically ended its session and task.  A replacement changes the canonical
+    blob identity, so a stale generation/incarnation no longer matches.
+    """
+    resident = read_resident_session(vision)
+    if not isinstance(resident, dict):
+        return False
+    if resident.get("status") != STATUS_ENDED or not bool(
+        resident.get("stop_requested")
+    ):
+        return False
+    try:
+        recorded_generation = int(resident.get("worker_generation") or 1)
+    except (TypeError, ValueError):
+        return False
+    if (
+        str(resident.get("task_id")) != str(task_id)
+        or recorded_generation != worker_generation
+    ):
+        return False
+    requested = incarnation_id or legacy_resident_worker_incarnation(
+        task_id, worker_generation
+    )
+    recorded = resident.get("worker_incarnation_id")
+    if recorded is None:
+        recorded = str(
+            legacy_resident_worker_incarnation(task_id, worker_generation)
+        )
+    return str(recorded) == str(requested)
 
 
 def claim_resident_worker_incarnation(
@@ -4855,6 +4899,76 @@ async def renew_resident_session_lease(
                 _renew,
                 _locked_project=locked_project,
             )
+            # The cap/lapse session end and its backing task terminalization
+            # must share one transaction.  Previously the backend committed
+            # only the ended session blob and trusted the winding-down agent to
+            # make a second status request.  A runner update or process exit in
+            # that gap left a permanently IN_PROGRESS orphan.
+            if holder["capped"] or holder["lapsed"]:
+                try:
+                    resident_task_uuid = uuid.UUID(str(task_id))
+                except (TypeError, ValueError):
+                    resident_task_uuid = None
+                if resident_task_uuid is not None:
+                    async with task_lock(
+                        session, resident_task_uuid, skip_locked=False
+                    ) as locked_task:
+                        if (
+                            locked_task is not None
+                            and locked_task.project_id == locked_project.id
+                            and locked_task.status in _LIVE_TASK_STATUSES
+                            and _task_matches_resident_identity(
+                                locked_task,
+                                session_id=session_id,
+                                worker_generation=worker_generation,
+                            )
+                        ):
+                            locked_task.status = TaskStatus.COMPLETED
+                            terminal_message = (
+                                "Resident strategic session ended after reaching "
+                                "the idle limit"
+                                if holder["capped"]
+                                else "Resident strategic session ended after its "
+                                "continuation lease lapsed"
+                            )
+                            locked_task.latest_status_message = terminal_message
+                            terminal_payload = AgentStatusPayload(
+                                task_id=locked_task.id,
+                                resident_incarnation_id=incarnation_id,
+                                status=TaskStatus.COMPLETED,
+                                artifact_type=ArtifactType.RESEARCH_FINDINGS,
+                                logs=(
+                                    f"{terminal_message} (session {session_id}, "
+                                    f"generation {worker_generation})."
+                                ),
+                            )
+                            # Write-ahead the SAME durable recovery contract as
+                            # the ordinary agent terminal-status route.  The
+                            # status, ended session blob, handoff, and marker
+                            # commit atomically; a process death immediately
+                            # after commit is therefore recoverable by the
+                            # post-commit sweep rather than becoming a subtler
+                            # completion-pipeline orphan.
+                            locked_task.post_commit_pending = True
+                            locked_task.context = {
+                                **(locked_task.context or {}),
+                                "_post_commit_pending_meta": {
+                                    "at": _utcnow().isoformat(),
+                                    # No inline post-commit pass is running in
+                                    # this heartbeat request: the winding-down
+                                    # agent's idempotent terminal POST normally
+                                    # drives it next.  A distinct reason lets
+                                    # the sweep retry immediately if that POST
+                                    # is lost with the runner process.
+                                    "reason": "resident_session_ended",
+                                    "payload": terminal_payload.model_dump(
+                                        mode="json"
+                                    ),
+                                    "attempts": 0,
+                                },
+                            }
+                            flag_modified(locked_task, "context")
+                            session.add(locked_task)
     if holder["legacy_grace_until"] is not None:
         legacy_grace_until = holder["legacy_grace_until"]
         lease_now = holder["lease_now"] or _utcnow()
@@ -5113,6 +5227,13 @@ async def renew_resident_session_lease(
             )
     await session.commit()
     await session.refresh(project)
+
+    # Do not hold the heartbeat response open for the potentially minutes-long
+    # terminal pipeline.  The agent observes stop_requested and immediately
+    # makes its ordinary terminal POST; because post_commit_pending is already
+    # durable, the idempotency guard runs the full pipeline instead of returning
+    # already_terminal.  If the runner dies before that POST, the sweep sees the
+    # non-inline marker above and takes over without a grace delay.
 
     cont = strategic_local_continuation_status_from_vision(
         project.vision, operator_user_id=op_id

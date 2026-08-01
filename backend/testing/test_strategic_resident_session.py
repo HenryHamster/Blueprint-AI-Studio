@@ -1970,6 +1970,18 @@ async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
     assert capped["authority_held"] is False
     assert capped["stop_requested"] is True
     assert capped["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.latest_status_message == (
+        "Resident strategic session ended after reaching the idle limit"
+    )
+    assert task.post_commit_pending is True
+    assert task.context["_post_commit_pending_meta"]["reason"] == (
+        "resident_session_ended"
+    )
+    assert task.context["_post_commit_pending_meta"]["payload"]["status"] == (
+        TaskStatus.COMPLETED
+    )
     await db_session.refresh(pending)
     assert pending.status == "open"
     assert pending.resident_session_id is None
@@ -2037,6 +2049,9 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
 
     assert capped["authority_held"] is False
     assert capped["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.post_commit_pending is True
     # Message must be released even though rearm raised
     await db_session.refresh(pending)
     assert pending.resident_session_id is None, (
@@ -2045,6 +2060,121 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
     )
     assert pending.handling_state == MessageHandlingState.PENDING
     assert pending.handled_by_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    monkeypatch.setitem(
+        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
+    )
+    monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
+
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
+    marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
+    marker["updated_at"] = marker["last_seen_at"]
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    lapsed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+    )
+
+    assert lapsed["authority_held"] is False
+    assert lapsed["stop_requested"] is True
+    assert lapsed["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.post_commit_pending is True
+    assert task.latest_status_message == (
+        "Resident strategic session ended after its continuation lease lapsed"
+    )
+    pending = task.context["_post_commit_pending_meta"]
+    assert pending["reason"] == "resident_session_ended"
+    assert pending["payload"]["status"] == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_cap_never_terminalizes_cross_project_resident_task_pointer(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    foreign_project = Project(
+        name="Foreign resident project", user_id=TEST_USER_ID
+    )
+    db_session.add(foreign_project)
+    await db_session.commit()
+    await db_session.refresh(foreign_project)
+    foreign_task = Task(
+        project_id=foreign_project.id,
+        payloads=[{"type": "strategic_review", "resident_session": True}],
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": started["session_id"],
+            "_resident_worker_generation": 1,
+        },
+    )
+    db_session.add(foreign_task)
+    await db_session.commit()
+    await db_session.refresh(foreign_task)
+
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["task_id"] = str(foreign_task.id)
+    blob["worker_incarnation_id"] = str(
+        legacy_resident_worker_incarnation(foreign_task.id, 1)
+    )
+    blob["worker_incarnation_expires_at"] = (
+        _utcnow() + timedelta(minutes=5)
+    ).isoformat()
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    ended = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=str(foreign_task.id),
+        progress=False,
+    )
+
+    assert ended["status"] == "ended"
+    await db_session.refresh(foreign_task)
+    assert foreign_task.status == TaskStatus.IN_PROGRESS
+    assert foreign_task.post_commit_pending is False
 
 
 @pytest.mark.asyncio
