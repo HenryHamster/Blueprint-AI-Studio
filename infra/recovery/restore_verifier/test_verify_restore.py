@@ -28,6 +28,7 @@ def config(**overrides):
             "projects/blueprint-recovery/global/networks/recovery"
         ),
         "EXPECTED_ALEMBIC_REVISION": "0711",
+        "CLOUD_SQL_PROXY_BINARY": str(Path(__file__).resolve()),
     }
     values.update(overrides)
     return verifier.Config.from_env(values)
@@ -50,6 +51,7 @@ class FakeStorage:
         self.selected = selected or archive()
         self.fail_writes = fail_writes
         self.writes = []
+        self.import_generation_checks = []
 
     def latest_archive(self, now):
         return self.selected
@@ -58,6 +60,9 @@ class FakeStorage:
         if self.fail_writes:
             raise RuntimeError("hidden storage error")
         self.writes.append((name, json.loads(json.dumps(payload))))
+
+    def assert_import_generation_current(self, selected):
+        self.import_generation_checks.append(selected.archive_id)
 
 
 class FakeLogger:
@@ -286,6 +291,22 @@ class ConfigTests(unittest.TestCase):
         ):
             config(DRILL_OPERATION_TIMEOUT_SECONDS="forever")
 
+    def test_exact_archive_pin_is_all_or_nothing(self):
+        with self.assertRaisesRegex(
+            verifier.DrillError, "incomplete_expected_archive"
+        ):
+            config(EXPECTED_ARCHIVE_NAME="local-postgres-exports/only.sql.gz")
+        with self.assertRaisesRegex(
+            verifier.DrillError, "invalid_expected_archive_name"
+        ):
+            config(
+                EXPECTED_ARCHIVE_NAME="local-postgres-exports/../escape.sql.gz",
+                EXPECTED_ARCHIVE_GENERATION="1",
+                EXPECTED_MANIFEST_GENERATION="2",
+                EXPECTED_ARCHIVE_SHA256="a" * 64,
+                EXPECTED_ARCHIVE_SIZE_BYTES="10",
+            )
+
 
 class StorageTests(unittest.TestCase):
     @staticmethod
@@ -339,9 +360,111 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.DrillError, "archive_exceeds_rpo"):
             verifier.RecoveryStorage(stale_client, config()).latest_archive(NOW)
 
+    def test_exact_archive_pin_binds_both_generations_digest_and_size(self):
+        content = b"exact-generation"
+        client = self.client_with_archive(content=content)
+        bucket = client.bucket.return_value
+        archive_blob = bucket.blob.return_value
+        manifest_blob = client.list_blobs.return_value[0]
+        manifest_blob.reload = Mock()
+
+        def blob_for_name(name, generation=None):
+            if name.endswith(".manifest.json"):
+                self.assertEqual(generation, 2)
+                return manifest_blob
+            self.assertEqual(name, "local-postgres-exports/new.sql.gz")
+            self.assertEqual(generation, 1)
+            return archive_blob
+
+        bucket.blob.side_effect = blob_for_name
+        selected = verifier.RecoveryStorage(
+            client,
+            config(
+                EXPECTED_ARCHIVE_NAME="local-postgres-exports/new.sql.gz",
+                EXPECTED_ARCHIVE_GENERATION="1",
+                EXPECTED_MANIFEST_GENERATION="2",
+                EXPECTED_ARCHIVE_SHA256=hashlib.sha256(content).hexdigest(),
+                EXPECTED_ARCHIVE_SIZE_BYTES=str(len(content)),
+            ),
+        ).latest_archive(NOW)
+
+        self.assertEqual(
+            selected.archive_id,
+            "blueprint-recovery-archives/local-postgres-exports/new.sql.gz#1",
+        )
+        self.assertEqual(selected.manifest_generation, "2")
+        client.list_blobs.assert_not_called()
+
+    def test_latest_selection_hashes_only_newest_completed_candidate(self):
+        client = self.client_with_archive()
+        newest = client.list_blobs.return_value[0]
+        newest.time_created = NOW
+        newest.updated = None
+        older_downloads = []
+        manifests = [newest]
+        for index in range(10):
+            download = Mock(return_value="not-json")
+            older_downloads.append(download)
+            manifests.append(
+                SimpleNamespace(
+                    name=f"local-postgres-exports/old-{index}.sql.gz.manifest.json",
+                    size=8,
+                    generation=index + 10,
+                    time_created=NOW - timedelta(hours=index + 2),
+                    updated=None,
+                    download_as_text=download,
+                )
+            )
+        client.list_blobs.return_value = manifests
+
+        selected = verifier.RecoveryStorage(client, config()).latest_archive(NOW)
+
+        self.assertEqual(selected.name, "local-postgres-exports/new.sql.gz")
+        self.assertEqual(sum(item.call_count for item in older_downloads), 0)
+
+    def test_invalid_size_on_newest_manifest_does_not_fall_back(self):
+        client = self.client_with_archive()
+        older = client.list_blobs.return_value[0]
+        older.time_created = NOW - timedelta(hours=2)
+        older.updated = None
+        older_download = Mock(wraps=older.download_as_text)
+        older.download_as_text = older_download
+        newest_download = Mock(return_value="not-json")
+        newest = SimpleNamespace(
+            name="local-postgres-exports/newest.sql.gz.manifest.json",
+            size=0,
+            generation=3,
+            time_created=NOW,
+            updated=None,
+            download_as_text=newest_download,
+        )
+        client.list_blobs.return_value = [older, newest]
+
+        with self.assertRaisesRegex(
+            verifier.DrillError, "newest_archive_invalid"
+        ):
+            verifier.RecoveryStorage(client, config()).latest_archive(NOW)
+
+        newest_download.assert_not_called()
+        older_download.assert_not_called()
+
+    def test_import_generation_guard_rejects_current_object_replacement(self):
+        client = self.client_with_archive()
+        storage = verifier.RecoveryStorage(client, config())
+        selected = storage.latest_archive(NOW)
+        replacement = Mock()
+        replacement.generation = 99
+        replacement.size = selected.size
+        client.bucket.return_value.blob.return_value = replacement
+
+        with self.assertRaisesRegex(
+            verifier.DrillError, "archive_generation_changed"
+        ):
+            storage.assert_import_generation_current(selected)
+
     def test_skips_corrupt_archive_and_rejects_wrong_project_bucket(self):
         corrupt = self.client_with_archive(corrupt=True)
-        with self.assertRaisesRegex(verifier.DrillError, "no_usable_archive"):
+        with self.assertRaisesRegex(verifier.DrillError, "newest_archive_invalid"):
             verifier.RecoveryStorage(corrupt, config()).latest_archive(NOW)
 
         wrong_project = self.client_with_archive()
@@ -549,6 +672,8 @@ class DrillLifecycleTests(unittest.TestCase):
         self.assertTrue(evidence["cleanup"]["completed"])
         self.assertTrue(process.terminated)
         self.assertEqual(len(storage.writes), 1)
+        self.assertEqual(len(storage.import_generation_checks), 2)
+        self.assertTrue(evidence["archive"]["generation_stable_during_import"])
         self.assertEqual(len(logger.writes), 1)
         self.assertTrue(
             any(call[0] == "import_archive" for call in sql.calls)

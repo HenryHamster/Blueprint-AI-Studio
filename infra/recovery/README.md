@@ -20,6 +20,9 @@ Before enabling it, supply all of the following:
    obtained from the production `cloud_sql_service_account_email` output.
 4. A globally unique recovery bucket name, a location/retention policy, and a
    successful restore drill before setting `lock_retention_policy=true`.
+5. The billing account ID. This root creates a recovery-project-only monthly
+   budget (USD 20 by default) with alerts at 25%, 50%, and 100% to billing
+   account recipients. It is an alert, not a hard spending cap.
 
 Initialize this root with recovery-project state, never the production state:
 
@@ -52,23 +55,50 @@ role.
 
 ## Scheduled restore verification and janitor
 
-Set `enable_restore_verifier=true` only after supplying:
+First set `enable_restore_verifier_prerequisites=true` and supply the dedicated
+network/subnetwork names. This creates an isolated VPC, Direct VPC egress
+subnet, Private Services Access range/connection, and dedicated Artifact
+Registry repository without creating or running a restore job. Build and push
+the verifier image to the `restore_verifier_image_repository` output, record
+its repository digest, and only then set `enable_restore_verifier=true` with:
 
 - an immutable `restore_verifier_image` pinned by `@sha256`;
 - the recovery VPC network and subnetwork;
 - the exact expected Alembic revision.
 
-The network names alone are not sufficient. Before enabling the verifier,
-enable both `compute.googleapis.com` and `servicenetworking.googleapis.com` in
-the recovery project, reserve an internal peering range for Google managed
-services, and create Private Services Access from the recovery VPC to
-`servicenetworking.googleapis.com`. Confirm that a private-IP-only PostgreSQL
-15 Cloud SQL instance can be created on that network and reached from the
-selected Cloud Run Direct VPC egress subnet. This Terraform root deliberately
-does not create the VPC, reserved range, or private service connection.
-Keep `enable_restore_verifier=false` until all of those prerequisites exist.
+For the first pre-cutover drill, also set the exact archive name, archive
+generation, completion-manifest generation, SHA-256, and byte size produced by
+the rehearsal. Leave `enable_restore_drill_schedule=false`; execute the job
+manually and require its evidence to repeat those immutable values and prove
+temporary-instance deletion. Enable the recurring drill schedule only after
+that gate succeeds. Scheduled runs select and hash only the newest completion
+manifest. A corrupt newest completed backup fails the drill instead of silently
+certifying an older archive, and archive-retention growth does not make
+verification work unbounded.
 
-Terraform then creates two recovery-project Cloud Run jobs. A weekly drill
+The prerequisite layer enables `compute.googleapis.com`,
+`servicenetworking.googleapis.com`, `dns.googleapis.com`, and
+`artifactregistry.googleapis.com` and manages the network path. Recovery jobs
+send all traffic through that VPC without Cloud NAT; private DNS sends supported
+Google APIs through `restricted.googleapis.com`, and targeted egress firewall
+rules allow only metadata/DNS, the restricted API VIP, and Cloud SQL's private
+proxy port. A network response policy sinkholes every non-Google API DNS name,
+closing DNS as an alternate egress channel; longest-match rules retain only
+`*.googleapis.com` through the restricted VIP and the exact
+`metadata.google.internal` name through the metadata IP for service-identity
+tokens. No wildcard under `google.internal` is allowed. The verifier image must come
+from this recovery project's dedicated
+repository and be deployed by immutable digest. Tags are immutable and no
+automatic cleanup may remove a digest still referenced by the drill or its
+janitor; verifier image storage is intentionally retained as a small recovery
+dependency. Keep
+`enable_restore_verifier=false` until Terraform has applied the prerequisite
+layer and the verifier image exists by immutable digest.
+
+Terraform then creates two recovery-project Cloud Run jobs. The janitor has a
+separate identity that cannot read archives or create/import Cloud SQL
+instances and remains enabled independently of the full drill. Once explicitly
+scheduled, a weekly drill
 integrity-checks the newest manifest/archive pair, creates a private
 PostgreSQL 15 Cloud SQL instance, imports and probes it, writes evidence, and
 deletes it. A separate 30-minute janitor lists only recovery-project Cloud SQL
@@ -77,6 +107,11 @@ instances and deletes expired or ambiguous instances only when both their
 ownership. Cleanup intent is recorded before every create request, so an
 ambiguous create response still triggers immediate deletion and later janitor
 reconciliation.
+
+The janitor service account, job, and schedule are protected from ordinary
+Terraform destruction. Retiring them is a deliberate break-glass change: first
+prove that the recovery project has zero restore-drill instances, retain that
+evidence, and then explicitly remove the lifecycle guards in a reviewed change.
 
 The verifier requires `RECOVERY_PROJECT_NUMBER` and reloads the archive bucket
 before any list or evidence write. It refuses to proceed unless the bucket's

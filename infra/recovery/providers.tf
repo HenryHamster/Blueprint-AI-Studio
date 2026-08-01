@@ -21,5 +21,5 @@ data "google_project" "recovery" {
   # A newly created recovery project may not have the Resource Manager API
   # enabled yet. Defer this lookup until the root has bootstrapped its required
   # services instead of making the first plan fail with a 403.
-  depends_on = [google_project_service.required]
+  depends_on = [google_project_service.required["cloudresourcemanager.googleapis.com"]]
 }

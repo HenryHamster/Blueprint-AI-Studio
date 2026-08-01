@@ -24,7 +24,7 @@ data "google_storage_project_service_account" "recovery" {
   count   = local.recovery_enabled ? 1 : 0
   project = var.recovery_project_id
 
-  depends_on = [google_project_service.required]
+  depends_on = [google_project_service.required["storage.googleapis.com"]]
 }
 
 resource "google_kms_crypto_key_iam_member" "storage_service_agent" {
@@ -34,6 +34,15 @@ resource "google_kms_crypto_key_iam_member" "storage_service_agent" {
   member        = "serviceAccount:${data.google_storage_project_service_account.recovery[0].email_address}"
 
   depends_on = [time_sleep.service_agent_propagation]
+
+  # The Google-managed Storage identity is immutable for a project. Enabling
+  # an unrelated API can defer the data-source read until apply; do not turn
+  # that unknown value into a transient destroy/recreate of archive encryption
+  # access.
+  lifecycle {
+    prevent_destroy = true
+    ignore_changes  = [member]
+  }
 }
 
 resource "google_storage_bucket" "db_backup" {

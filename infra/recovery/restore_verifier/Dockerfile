@@ -1,4 +1,4 @@
-FROM python:3.12.11-slim-bookworm
+FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
 
 ARG CLOUD_SQL_PROXY_VERSION=2.22.0
 ARG CLOUD_SQL_PROXY_SHA256=42e73a8775bc3300b6514816cc4893f01b109a50f65aa779a451d3e4ff4c3ead
@@ -14,8 +14,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir --requirement requirements.txt
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes --requirement requirements.lock
 
 COPY verify_restore.py .
 

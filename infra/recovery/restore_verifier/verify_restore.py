@@ -28,6 +28,7 @@ _REVISION_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 _PREFIX_RE = re.compile(r"^[a-zA-Z0-9_./-]{1,160}$")
 _INSTANCE_RE = re.compile(r"^[a-z][a-z0-9-]{0,96}[a-z0-9]$")
 _OPERATION_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,200}$")
+_ARCHIVE_OBJECT_RE = re.compile(r"^[a-zA-Z0-9_./-]{1,1024}$")
 _PROXY_PORT = 5434
 _DATABASE_NAME = "blueprint"
 _DATABASE_USER = "postgres"
@@ -73,6 +74,15 @@ def _bounded_int(
 
 
 @dataclass(frozen=True)
+class ArchivePin:
+    name: str
+    generation: str
+    manifest_generation: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
 class Config:
     recovery_project_id: str
     recovery_project_number: str
@@ -88,6 +98,7 @@ class Config:
     operation_timeout_seconds: int
     proxy_start_timeout_seconds: int
     proxy_binary: str
+    expected_archive: ArchivePin | None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -108,6 +119,15 @@ class Config:
         proxy_binary = values.get(
             "CLOUD_SQL_PROXY_BINARY", "/usr/local/bin/cloud-sql-proxy"
         ).strip()
+        expected_archive_values = {
+            "name": values.get("EXPECTED_ARCHIVE_NAME", "").strip(),
+            "generation": values.get("EXPECTED_ARCHIVE_GENERATION", "").strip(),
+            "manifest_generation": values.get(
+                "EXPECTED_MANIFEST_GENERATION", ""
+            ).strip(),
+            "sha256": values.get("EXPECTED_ARCHIVE_SHA256", "").strip(),
+            "size": values.get("EXPECTED_ARCHIVE_SIZE_BYTES", "").strip(),
+        }
 
         if (
             not _PROJECT_RE.fullmatch(recovery_project)
@@ -142,6 +162,37 @@ class Config:
             raise DrillError("configuration", "invalid_storage_prefix")
         if not Path(proxy_binary).is_absolute():
             raise DrillError("configuration", "proxy_binary_not_absolute")
+        expected_archive: ArchivePin | None = None
+        if any(expected_archive_values.values()):
+            if not all(expected_archive_values.values()):
+                raise DrillError("configuration", "incomplete_expected_archive")
+            expected_name = expected_archive_values["name"]
+            if (
+                not _ARCHIVE_OBJECT_RE.fullmatch(expected_name)
+                or ".." in expected_name.split("/")
+                or not expected_name.startswith(archive_prefix)
+                or not expected_name.endswith(".sql.gz")
+            ):
+                raise DrillError("configuration", "invalid_expected_archive_name")
+            if (
+                not expected_archive_values["generation"].isdigit()
+                or not expected_archive_values["manifest_generation"].isdigit()
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", expected_archive_values["sha256"]
+                )
+                or not expected_archive_values["size"].isdigit()
+                or int(expected_archive_values["size"]) <= 0
+            ):
+                raise DrillError("configuration", "invalid_expected_archive")
+            expected_archive = ArchivePin(
+                name=expected_name,
+                generation=expected_archive_values["generation"],
+                manifest_generation=expected_archive_values[
+                    "manifest_generation"
+                ],
+                sha256=expected_archive_values["sha256"],
+                size=int(expected_archive_values["size"]),
+            )
 
         return cls(
             recovery_project_id=recovery_project,
@@ -180,6 +231,7 @@ class Config:
                 maximum=120,
             ),
             proxy_binary=proxy_binary,
+            expected_archive=expected_archive,
         )
 
 
@@ -227,7 +279,9 @@ class RecoveryStorage:
             created = created.replace(tzinfo=timezone.utc)
         return created.astimezone(timezone.utc)
 
-    def _archive_from_manifest(self, manifest_blob: Any) -> Archive | None:
+    def _archive_from_manifest(
+        self, manifest_blob: Any, expected: ArchivePin | None = None
+    ) -> Archive | None:
         name = str(getattr(manifest_blob, "name", "") or "")
         if not name.endswith(".sql.gz.manifest.json"):
             return None
@@ -239,6 +293,7 @@ class RecoveryStorage:
             payload = json.loads(manifest_blob.download_as_text(timeout=60))
         except Exception:
             return None
+        manifest_generation = str(getattr(manifest_blob, "generation", "") or "")
         archive_name = name.removesuffix(".manifest.json")
         expected_uri = f"gs://{self._config.bucket_name}/{archive_name}"
         if (
@@ -253,22 +308,34 @@ class RecoveryStorage:
             or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("sha256", "")))
             or not isinstance(payload.get("size_bytes"), int)
             or payload["size_bytes"] <= 0
+            or (
+                expected is not None
+                and (
+                    archive_name != expected.name
+                    or manifest_generation != expected.manifest_generation
+                    or payload["sha256"] != expected.sha256
+                    or payload["size_bytes"] != expected.size
+                )
+            )
         ):
             return None
         bucket = self._bucket()
-        archive_blob = bucket.blob(archive_name)
+        archive_blob = bucket.blob(
+            archive_name,
+            generation=(int(expected.generation) if expected is not None else None),
+        )
         try:
             archive_blob.reload(timeout=60)
         except Exception:
             return None
         generation = str(getattr(archive_blob, "generation", "") or "")
-        manifest_generation = str(getattr(manifest_blob, "generation", "") or "")
         created = self._created(archive_blob)
         if (
             not generation.isdigit()
             or not manifest_generation.isdigit()
             or created is None
             or int(getattr(archive_blob, "size", 0) or 0) != payload["size_bytes"]
+            or (expected is not None and generation != expected.generation)
         ):
             return None
         digest = hashlib.sha256()
@@ -299,25 +366,70 @@ class RecoveryStorage:
         )
 
     def latest_archive(self, now: datetime) -> Archive:
-        self._bucket()
-        candidates: list[Archive] = []
-        for blob in self._client.list_blobs(
-            self._config.bucket_name,
-            prefix=self._config.archive_prefix,
-            timeout=60,
-        ):
-            candidate = self._archive_from_manifest(blob)
-            if candidate is not None:
-                candidates.append(candidate)
-        if not candidates:
-            raise DrillError("archive_selection", "no_usable_archive")
-        archive = max(candidates, key=lambda item: item.created_at)
+        bucket = self._bucket()
+        expected = self._config.expected_archive
+        if expected is not None:
+            manifest_blob = bucket.blob(
+                f"{expected.name}.manifest.json",
+                generation=int(expected.manifest_generation),
+            )
+            try:
+                manifest_blob.reload(timeout=60)
+            except Exception as exc:
+                raise DrillError(
+                    "archive_selection", "expected_archive_not_found"
+                ) from exc
+            archive = self._archive_from_manifest(manifest_blob, expected)
+            if archive is None:
+                raise DrillError("archive_selection", "expected_archive_invalid")
+        else:
+            manifests = [
+                blob
+                for blob in self._client.list_blobs(
+                    self._config.bucket_name,
+                    prefix=self._config.archive_prefix,
+                    timeout=60,
+                )
+                if str(getattr(blob, "name", "") or "").endswith(
+                    ".sql.gz.manifest.json"
+                )
+            ]
+            manifests.sort(
+                key=lambda blob: (
+                    self._created(blob)
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    str(getattr(blob, "name", "") or ""),
+                ),
+                reverse=True,
+            )
+            archive = (
+                self._archive_from_manifest(manifests[0]) if manifests else None
+            )
+            if archive is None:
+                error_code = (
+                    "newest_archive_invalid" if manifests else "no_usable_archive"
+                )
+                raise DrillError("archive_selection", error_code)
         rpo_seconds = (now - archive.created_at).total_seconds()
         if rpo_seconds < -300:
             raise DrillError("archive_selection", "archive_timestamp_in_future")
         if rpo_seconds > self._config.max_rpo_seconds:
             raise DrillError("archive_selection", "archive_exceeds_rpo")
         return archive
+
+    def assert_import_generation_current(self, archive: Archive) -> None:
+        current = self._bucket().blob(archive.name)
+        try:
+            current.reload(timeout=60)
+        except Exception as exc:
+            raise DrillError(
+                "archive_import", "archive_current_generation_unavailable"
+            ) from exc
+        if (
+            str(getattr(current, "generation", "") or "") != archive.generation
+            or int(getattr(current, "size", 0) or 0) != archive.size
+        ):
+            raise DrillError("archive_import", "archive_generation_changed")
 
     def write_evidence(self, object_name: str, payload: dict[str, Any]) -> None:
         encoded = json.dumps(
@@ -870,8 +982,13 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
         evidence["archive"] = {
             "id": archive.archive_id,
             "created_at": archive.created_at.isoformat(),
+            "manifest_generation": archive.manifest_generation,
+            "sha256": archive.sha256,
             "size_bytes": archive.size,
             "rpo_seconds": rpo_seconds,
+            "selection": (
+                "expected" if config.expected_archive is not None else "newest_usable"
+            ),
         }
 
         evidence["stage"] = "instance_create"
@@ -901,8 +1018,11 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
         _wait_operation(runtime, config, operation, stage="database_user")
 
         evidence["stage"] = "archive_import"
+        runtime.storage.assert_import_generation_current(archive)
         operation = runtime.sql.import_archive(drill_id, archive.uri)
         _wait_operation(runtime, config, operation, stage="archive_import")
+        runtime.storage.assert_import_generation_current(archive)
+        evidence["archive"]["generation_stable_during_import"] = True
 
         evidence["stage"] = "proxy_start"
         proxy, _proxy_command = _start_proxy(runtime, config, connection_name)
