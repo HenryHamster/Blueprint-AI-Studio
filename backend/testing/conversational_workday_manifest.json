@@ -341,6 +341,7 @@
         "closes a lease-lost Fast controller without giving its next tagged message to Workday",
         "completes a pure Fast message while an autonomous Workday turn keeps running",
         "preserves the operator message without broad Workday fallback when Fast capacity is denied",
+        "continues polling and heartbeating while the Fast readiness probe is pending",
         "recovers an expired claimed turn before sequentially answering newer input",
         "paces a transient Fast claim conflict and retries the same client identity",
         "renews and restores the ordinary Workday claim while Fast replies",

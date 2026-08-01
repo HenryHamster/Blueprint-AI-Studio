@@ -56,6 +56,12 @@ export interface ForegroundTypedControllerOptions {
   allowUnvalidatedAdapter?: boolean;
 }
 
+// A private READY probe exists only to prove that the restricted child can
+// complete a provider turn.  It must never consume the normal 90-second Fast
+// turn budget: provisioning runs beside the Resident loop, and a wedged CLI
+// should be replaced quickly while operator input remains unclaimed.
+const TYPED_FAST_READINESS_TIMEOUT_MS = 15_000;
+
 function nonEmpty(value: unknown, name: string, max = MAX_TYPED_REPLY_CHARS): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max) {
     throw new Error(`invalid typed Fast ${name}`);
@@ -192,6 +198,7 @@ export class ForegroundTypedController {
     if (!session) throw new Error('Fast Resident failed to start');
     const result = await session.sendTurn(
       'Private startup health probe. Do not call any tools. Reply with READY only.',
+      { hardTimeoutMs: TYPED_FAST_READINESS_TIMEOUT_MS },
     );
     if (
       result.processGone || result.timedOut || result.hardTimedOut

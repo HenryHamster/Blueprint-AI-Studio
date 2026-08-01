@@ -1103,6 +1103,8 @@ export async function handleStrategicResident(
       : undefined,
   });
   let typedFastReady = typedFastConfig.activated;
+  let typedFastProvisioning = false;
+  let typedFastProvisionAttempt: Promise<boolean> | null = null;
   let typedFastProvisionRetryAt = 0;
   let typedFastFailureCount = 0;
   let typedFastCircuitOpenUntil = 0;
@@ -2392,10 +2394,16 @@ export async function handleStrategicResident(
   const ensureTypedFastReady = async (): Promise<boolean> => {
     if (!typedFastConfig.activated) return false;
     if (typedFastReady && foregroundTyped !== null && typedFastLease !== null) return true;
+    // Provisioning is kicked off beside the main Resident loop.  Never await
+    // the same provider probe from message admission: that would make a hung
+    // foreground CLI prevent both polling and liveness heartbeats.
+    if (typedFastProvisioning) return false;
     if (Date.now() < typedFastProvisionRetryAt) return false;
 
     // Bound retry pressure when the provider/account pool is temporarily full.
     typedFastProvisionRetryAt = Date.now() + 5_000;
+    typedFastProvisioning = true;
+    typedFastReady = false;
     let warmingController: ForegroundTypedController | null = null;
     try {
       const leaseResponse = await apiPost(
@@ -2449,7 +2457,18 @@ export async function handleStrategicResident(
         `[resident] typed Fast unavailable before admission: ${sanitize(String(error))}; retrying while preserving operator input\n`,
       );
       return false;
+    } finally {
+      typedFastProvisioning = false;
     }
+  };
+
+  const kickTypedFastProvisioning = (): void => {
+    if (typedFastProvisionAttempt !== null) return;
+    const attempt = ensureTypedFastReady();
+    typedFastProvisionAttempt = attempt;
+    void attempt.finally(() => {
+      if (typedFastProvisionAttempt === attempt) typedFastProvisionAttempt = null;
+    });
   };
 
   /** Keep Fast lifecycle independent from the persistent Workday subprocess. */
@@ -3797,7 +3816,10 @@ export async function handleStrategicResident(
     if (messageIds.length !== selectedMessages.length || messageIds.length === 0) return 'deferred';
     if (!pendingClaimRequest) {
       if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
-      if (!await ensureTypedFastReady()) return 'not_available';
+      if (!typedFastReady || foregroundTyped === null || typedFastLease === null) {
+        kickTypedFastProvisioning();
+        return 'not_available';
+      }
     }
     const claimRequest = pendingClaimRequest ?? {
       clientClaimId: randomUUID(),
@@ -4440,7 +4462,9 @@ export async function handleStrategicResident(
   applyHeartbeatResponse(initialAuthorityAdmission);
   lastLivenessHeartbeatAt = Date.now();
   if (typedFastConfig.activated) {
-    await ensureTypedFastReady();
+    // Fast warm-up is opportunistic.  A provider readiness probe must not hold
+    // the persistent Resident before its first message poll or heartbeat.
+    kickTypedFastProvisioning();
   } else {
     sendLog(ws, `[resident] typed Fast inactive: ${sanitize(typedFastConfig.reason)}\n`);
   }
@@ -4965,7 +4989,16 @@ export async function handleStrategicResident(
     const foregroundToClose: ForegroundCallController | null = foregroundCall;
     (foregroundToClose as ForegroundCallController | null)?.close();
     foregroundCall = null;
-    const typedForegroundToClose: ForegroundTypedController | null = foregroundTyped;
+    let typedForegroundToClose: ForegroundTypedController | null = foregroundTyped;
+    (typedForegroundToClose as ForegroundTypedController | null)?.close();
+    // The attempt may still be waiting for lease acquisition and can assign a
+    // controller after the first snapshot above.  Its provider probe is
+    // bounded; join it during teardown, then close/release the final state so a
+    // quick stop cannot leak a pooled slot or restricted child.
+    if (typedFastProvisionAttempt !== null) {
+      await typedFastProvisionAttempt;
+    }
+    typedForegroundToClose = foregroundTyped;
     (typedForegroundToClose as ForegroundTypedController | null)?.close();
     foregroundTyped = null;
     await releaseTypedFastLease('parent_shutdown');

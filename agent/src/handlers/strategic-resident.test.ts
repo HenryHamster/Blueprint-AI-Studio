@@ -592,6 +592,60 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
+  it('continues polling and heartbeating while the Fast readiness probe is pending', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'typed-fast-warming-message', content: 'Are you there?',
+      created_at: new Date().toISOString(), from_type: 'user',
+    };
+    let messagePolls = 0;
+    let heartbeatCount = 0;
+    let claimCount = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        messagePolls += 1;
+        return Promise.resolve({ messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
+      }
+      return Promise.resolve({ messages: [] });
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({ authority_held: true, stop_requested: heartbeatCount > 1 });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true, lease: { lease_id: 'lease-still-warming', generation: 1 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) claimCount += 1;
+      if (url.endsWith('/typed-fast-lease/release')) return Promise.resolve({ released: true });
+      return Promise.resolve({});
+    });
+    let finishReadiness: (() => void) | null = null;
+    typedFastMocks.ensureReady.mockImplementation(() => new Promise<void>((resolve) => {
+      finishReadiness = resolve;
+    }));
+    typedFastMocks.close.mockImplementation(() => { finishReadiness?.(); });
+    const workday = makeSession(async () => turnResult(), () => true);
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('typed-fast-readiness-pending', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(3_000);
+    await done;
+
+    expect(typedFastMocks.ensureReady).toHaveBeenCalledTimes(1);
+    expect(messagePolls).toBeGreaterThan(0);
+    expect(heartbeatCount).toBeGreaterThan(1);
+    expect(claimCount).toBe(0);
+    expect(typedFastMocks.dispatch).not.toHaveBeenCalled();
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+  });
+
   it('recovers an expired claimed turn before sequentially answering newer input', async () => {
     const staleM1 = {
       id: 'typed-fast-stale-m1', content: 'hi',
