@@ -535,11 +535,13 @@ _INDEXES_SQL = """
 SELECT COALESCE(jsonb_agg(jsonb_build_object(
   'schema', x.schemaname, 'table', x.tablename, 'name', x.indexname,
   'definition', x.indexdef, 'owner', pg_get_userbyid(i.relowner),
-  'acl', COALESCE(i.relacl::text[], ARRAY[]::text[])
+  'acl', COALESCE(i.relacl::text[], ARRAY[]::text[]),
+  'valid', state.indisvalid, 'ready', state.indisready, 'live', state.indislive
 ) ORDER BY x.tablename, x.indexname), '[]'::jsonb)::text
 FROM pg_indexes x
 JOIN pg_namespace n ON n.nspname=x.schemaname
 JOIN pg_class i ON i.relnamespace=n.oid AND i.relname=x.indexname
+JOIN pg_index state ON state.indexrelid=i.oid
 WHERE x.schemaname = 'public';
 """
 
@@ -731,6 +733,33 @@ def snapshot_database(client: DockerPsql, *, label: str, instance: str) -> dict[
     ]
     if unvalidated_constraints:
         raise CutoverError("database_snapshot", "unvalidated_constraints_present")
+    required_index_fields = {
+        "schema",
+        "table",
+        "name",
+        "definition",
+        "owner",
+        "acl",
+        "valid",
+        "ready",
+        "live",
+    }
+    for index in indexes:
+        if (
+            not isinstance(index, dict)
+            or not required_index_fields.issubset(index)
+            or not isinstance(index.get("definition"), str)
+            or not all(
+                isinstance(index.get(field), bool)
+                for field in ("valid", "ready", "live")
+            )
+        ):
+            raise CutoverError("database_snapshot", "invalid_index_inventory")
+    if any(
+        not index["valid"] or not index["ready"] or not index["live"]
+        for index in indexes
+    ):
+        raise CutoverError("database_snapshot", "unhealthy_indexes_present")
     for key in ("orphan_tasks", "orphan_parent_tasks", "orphan_artifacts"):
         if critical.get(key) != 0:
             raise CutoverError("database_snapshot", f"critical_{key}")

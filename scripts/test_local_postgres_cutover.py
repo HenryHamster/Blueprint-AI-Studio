@@ -42,7 +42,22 @@ class FakeSnapshotClient:
                 }
             ]
         if sql == cutover._INDEXES_SQL:
-            return [{"schema": "public", "table": "task", "name": "task_pkey", "definition": "CREATE UNIQUE INDEX task_pkey ON public.task USING btree (id)"}]
+            return [
+                {
+                    "schema": "public",
+                    "table": "task",
+                    "name": "task_pkey",
+                    "definition": (
+                        "CREATE UNIQUE INDEX task_pkey "
+                        "ON public.task USING btree (id)"
+                    ),
+                    "owner": "postgres",
+                    "acl": [],
+                    "valid": True,
+                    "ready": True,
+                    "live": True,
+                }
+            ]
         if sql == cutover._TRIGGERS_SQL:
             return []
         if sql == cutover._VIEWS_SQL:
@@ -305,7 +320,42 @@ class CutoverTests(unittest.TestCase):
         self.assertEqual(value["unvalidated_constraints"], [])
         self.assertEqual(value["public_constraints"][0]["definition"], "PRIMARY KEY (id)")
         self.assertEqual(value["public_indexes"][0]["name"], "task_pkey")
+        self.assertTrue(value["public_indexes"][0]["valid"])
         self.assertEqual(value["critical_aggregates"]["orphan_tasks"], 0)
+
+    def test_snapshot_rejects_unhealthy_or_malformed_index_state(self):
+        missing = object()
+
+        class UnhealthyIndexClient(FakeSnapshotClient):
+            def __init__(self, field, field_value):
+                self.field = field
+                self.field_value = field_value
+
+            def query_json(self, sql: str):
+                value = super().query_json(sql)
+                if sql == cutover._INDEXES_SQL:
+                    if self.field_value is missing:
+                        value[0].pop(self.field)
+                    else:
+                        value[0][self.field] = self.field_value
+                return value
+
+        cases = (
+            ("valid", False, "unhealthy_indexes_present"),
+            ("ready", False, "unhealthy_indexes_present"),
+            ("live", False, "unhealthy_indexes_present"),
+            ("valid", None, "invalid_index_inventory"),
+            ("ready", "false", "invalid_index_inventory"),
+            ("live", missing, "invalid_index_inventory"),
+        )
+        for field, field_value, expected_error in cases:
+            with self.subTest(field=field, field_value=field_value):
+                with self.assertRaisesRegex(cutover.CutoverError, expected_error):
+                    cutover.snapshot_database(
+                        UnhealthyIndexClient(field, field_value),
+                        label="source-frozen",
+                        instance="blueprint-cloudsql-1234",
+                    )
 
     def test_target_must_be_exactly_empty(self):
         client = mock.Mock()
