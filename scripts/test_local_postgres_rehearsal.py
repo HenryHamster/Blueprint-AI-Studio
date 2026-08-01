@@ -41,6 +41,112 @@ class _DumpProcess:
 
 
 class RehearsalTests(unittest.TestCase):
+    def test_session_files_are_owned_by_unprivileged_postgres(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                mock.patch.object(os, "name", "posix"),
+                mock.patch.object(os, "chown") as chown,
+            ):
+                _session, data, password = rehearsal._create_session(root, "abc")
+
+            self.assertEqual(
+                chown.call_args_list,
+                [
+                    mock.call(
+                        data,
+                        rehearsal._POSTGRES_UID,
+                        rehearsal._POSTGRES_GID,
+                    ),
+                    mock.call(
+                        password,
+                        rehearsal._POSTGRES_UID,
+                        rehearsal._POSTGRES_GID,
+                    ),
+                ],
+            )
+            self.assertEqual(password.stat().st_mode & 0o777, 0o600)
+
+    def test_target_runs_as_unprivileged_postgres_with_all_caps_dropped(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data"
+            password = root / "password"
+            run = mock.Mock(
+                return_value=subprocess.CompletedProcess(
+                    [], 0, stdout="id\n", stderr=""
+                )
+            )
+            with mock.patch.object(rehearsal, "_container_payload", return_value=None):
+                rehearsal._start_target(
+                    "/usr/bin/docker",
+                    "blueprint-precutover-rehearsal-abc-target",
+                    "abc",
+                    "sha256:" + "a" * 64,
+                    data,
+                    password,
+                    run=run,
+                )
+
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[argv.index("--user") + 1], "999:999")
+            self.assertEqual(argv[argv.index("--cap-drop") + 1], "ALL")
+            self.assertEqual(
+                argv[argv.index("--security-opt") + 1], "no-new-privileges"
+            )
+
+    def test_target_isolation_requires_unprivileged_postgres_user(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data"
+            password = root / "password"
+            data.mkdir()
+            password.write_text("secret", encoding="utf-8")
+            payload = [
+                {
+                    "Name": "/blueprint-precutover-rehearsal-abc-target",
+                    "Image": "sha256:" + "a" * 64,
+                    "Config": {
+                        "User": "0:0",
+                        "Labels": {
+                            rehearsal._OWNER_LABEL: rehearsal._OWNER_VALUE,
+                            rehearsal._SESSION_LABEL: "abc",
+                        },
+                    },
+                    "HostConfig": {"NetworkMode": "none", "PortBindings": {}},
+                    "Mounts": [
+                        {
+                            "Destination": "/var/lib/postgresql/data",
+                            "Source": str(data),
+                            "RW": True,
+                        },
+                        {
+                            "Destination": "/run/secrets/postgres_password",
+                            "Source": str(password),
+                            "RW": False,
+                        },
+                    ],
+                }
+            ]
+            run = mock.Mock(
+                return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(payload), stderr=""
+                )
+            )
+
+            with self.assertRaisesRegex(rehearsal.RehearsalError, "isolation_mismatch"):
+                rehearsal._assert_target_isolation(
+                    "/usr/bin/docker",
+                    "blueprint-precutover-rehearsal-abc-target",
+                    "abc",
+                    "sha256:" + "a" * 64,
+                    data,
+                    password,
+                    run=run,
+                )
+
     def test_snapshot_keeper_forces_machine_readable_psql_output(self) -> None:
         snapshot_id = "00000003-0000001B-1"
         process = mock.Mock()

@@ -561,6 +561,7 @@ def _create_session(work_root: Path, session_id: str) -> tuple[Path, Path, Path]
             os.close(descriptor)
         if os.name != "nt":
             os.chown(data_dir, _POSTGRES_UID, _POSTGRES_GID)
+            os.chown(password_file, _POSTGRES_UID, _POSTGRES_GID)
         return session_dir, data_dir, password_file
     except Exception:
         if session_dir.exists() and not session_dir.is_symlink():
@@ -687,6 +688,8 @@ def _start_target(
             f"type=bind,src={data_dir},dst=/var/lib/postgresql/data",
             "--mount",
             f"type=bind,src={password_file},dst=/run/secrets/postgres_password,readonly",
+            "--user",
+            f"{_POSTGRES_UID}:{_POSTGRES_GID}",
             "--env",
             "POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password",
             "--env",
@@ -761,6 +764,7 @@ def _assert_target_isolation(
         raise RehearsalError("target", "container_disappeared")
     _assert_owned_container(payload, session_id)
     host = payload.get("HostConfig") or {}
+    config = payload.get("Config") or {}
     mounts = payload.get("Mounts") or []
     destinations = {
         str(item.get("Destination")): item
@@ -771,6 +775,7 @@ def _assert_target_isolation(
     password_mount = destinations.get("/run/secrets/postgres_password") or {}
     if (
         payload.get("Image") != image_id
+        or config.get("User") != f"{_POSTGRES_UID}:{_POSTGRES_GID}"
         or host.get("NetworkMode") != "none"
         or bool(host.get("PortBindings"))
         or set(destinations)
