@@ -1,6 +1,9 @@
 import { createHash, timingSafeEqual } from 'crypto';
 
-export const STRATEGIC_CONTEXT_ENVELOPE_VERSION = 1;
+// Keep this in lockstep with backend/app/strategic_memory_envelope.py.
+// The backend's V2 core adds the bounded memory_v2 retrieval projection.
+export const STRATEGIC_CONTEXT_ENVELOPE_VERSION = 2;
+const SUPPORTED_STRATEGIC_CONTEXT_ENVELOPE_VERSIONS = new Set([1, 2]);
 export const STRATEGIC_CONTEXT_ENVELOPE_MAX_BYTES = 512 * 1024;
 
 export interface StrategicContextEnvelopeTransport {
@@ -15,7 +18,7 @@ export interface StrategicContextEnvelopeTransport {
 }
 
 export interface StrategicContextEnvelope {
-  version: 1;
+  version: 1 | 2;
   project_id: string;
   context_authority_generation: number;
   privacy_generation: number;
@@ -24,6 +27,7 @@ export interface StrategicContextEnvelope {
   problem_model: unknown;
   decisions: unknown;
   memory: unknown;
+  memory_v2?: unknown;
   recent_conversation: unknown[];
 }
 
@@ -107,7 +111,10 @@ export function verifyStrategicContextEnvelope(
     throw new Error('strategic context envelope bytes are not valid UTF-8 JSON');
   }
   const raw = requireRecord(decoded);
-  if (raw.version !== STRATEGIC_CONTEXT_ENVELOPE_VERSION) {
+  if (
+    !Number.isSafeInteger(raw.version)
+    || !SUPPORTED_STRATEGIC_CONTEXT_ENVELOPE_VERSIONS.has(Number(raw.version))
+  ) {
     throw new Error('strategic context envelope version is unsupported');
   }
   if (typeof raw.project_id !== 'string' || raw.project_id.length === 0) {

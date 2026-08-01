@@ -1,9 +1,11 @@
 """Focused persistence and byte-identity coverage for Strategic envelopes."""
 
 import base64
-from datetime import timedelta
 import json
+import re
 import uuid
+from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import inspect
@@ -16,6 +18,7 @@ from app.models import (
 )
 from app.reaper_sweeps import sweep_strategic_context_retention
 from app.strategic_memory_envelope import (
+    ENVELOPE_SCHEMA_VERSION,
     MAX_CANONICAL_ENVELOPE_BYTES,
     MAX_MEMORY_ITEMS,
     MAX_TRANSCRIPT_CONTENT_BYTES,
@@ -32,6 +35,31 @@ from app.strategic_memory_envelope import (
     purge_expired_context_envelope_snapshots,
 )
 from app.time_utils import _utcnow
+
+
+def test_agent_verifier_supports_the_backend_envelope_schema_version():
+    """Prevent backend envelope evolution from silently disabling Fast."""
+
+    relative_source = Path("agent/src/handlers/strategic-context-envelope.ts")
+    source_path = next(
+        (
+            candidate
+            for candidate in (
+                Path("/repo") / relative_source,
+                Path("/") / relative_source,
+                Path(__file__).resolve().parents[2] / relative_source,
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    assert source_path is not None
+    source = source_path.read_text(encoding="utf-8")
+    match = re.search(
+        r"STRATEGIC_CONTEXT_ENVELOPE_VERSION\s*=\s*(\d+)", source
+    )
+    assert match is not None
+    assert int(match.group(1)) == ENVELOPE_SCHEMA_VERSION
 
 
 def test_canonical_core_has_stable_bytes_independent_of_mapping_order():
