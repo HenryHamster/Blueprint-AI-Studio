@@ -837,14 +837,14 @@ def _normalize_role_bound(value: Any, role: str) -> Any:
     return value
 
 
-def compare_snapshots(
+def snapshot_mismatches(
     source: Mapping[str, Any],
     target: Mapping[str, Any],
     *,
     source_owner: str = "postgres",
     target_owner: str = "blueprint",
     compare_sequences: bool = True,
-) -> None:
+) -> list[str]:
     validate_snapshot(source, label="source")
     validate_snapshot(target, label="target")
     source_owner = _safe_cli_name(source_owner, "source_owner")
@@ -854,12 +854,29 @@ def compare_snapshots(
         if compare_sequences
         else tuple(field for field in _COMPARISON_FIELDS if field != "sequences")
     )
-    mismatches = [
+    return [
         field
         for field in comparison_fields
         if _normalize_role_bound(source[field], source_owner)
         != _normalize_role_bound(target[field], target_owner)
     ]
+
+
+def compare_snapshots(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    source_owner: str = "postgres",
+    target_owner: str = "blueprint",
+    compare_sequences: bool = True,
+) -> None:
+    mismatches = snapshot_mismatches(
+        source,
+        target,
+        source_owner=source_owner,
+        target_owner=target_owner,
+        compare_sequences=compare_sequences,
+    )
     if mismatches:
         raise CutoverError("comparison", "mismatch_" + "_".join(mismatches))
 
