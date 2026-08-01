@@ -1086,7 +1086,8 @@ export async function handleStrategicResident(
   // child sharing the Resident's *conversation authority*, not a second
   // Workday/coding session or a UI mode toggle.
   let foregroundTyped: ForegroundTypedController | null = null;
-  let typedFastLease: { leaseId: string; generation: number } | null = null;
+  type TypedFastLeaseIdentity = { leaseId: string; generation: number };
+  let typedFastLease: TypedFastLeaseIdentity | null = null;
   let typedFastDispatching = false;
   const typedFastConfig = typedFastRuntimeConfig({
     enabled: payload.typed_fast_enabled === true,
@@ -2191,7 +2192,10 @@ export async function handleStrategicResident(
     return 'continue';
   };
 
-  const applyHeartbeatResponse = (resp: SessionHeartbeatResponse): void => {
+  const applyHeartbeatResponse = (
+    resp: SessionHeartbeatResponse,
+    heartbeatTypedFastLease: TypedFastLeaseIdentity | null = null,
+  ): void => {
     if (resp.resident_incarnation_id === residentProcessIncarnation) {
       conversationIncarnationSupported = true;
     }
@@ -2211,14 +2215,21 @@ export async function handleStrategicResident(
       );
       reconcileCallLifecycle();
     }
-    if (typedFastLease !== null && Object.prototype.hasOwnProperty.call(resp, 'typed_fast')) {
+    const heartbeatStillOwnsCurrentFastLease = heartbeatTypedFastLease !== null
+      && typedFastLease !== null
+      && heartbeatTypedFastLease.leaseId === typedFastLease.leaseId
+      && heartbeatTypedFastLease.generation === typedFastLease.generation;
+    if (
+      heartbeatStillOwnsCurrentFastLease
+      && Object.prototype.hasOwnProperty.call(resp, 'typed_fast')
+    ) {
       const typedLease = (resp as SessionHeartbeatResponse & { typed_fast?: unknown }).typed_fast;
       const active = typedLease !== null
         && typeof typedLease === 'object'
         && !Array.isArray(typedLease)
         && (typedLease as Record<string, unknown>).status === 'active'
-        && (typedLease as Record<string, unknown>).lease_id === typedFastLease.leaseId
-        && Number((typedLease as Record<string, unknown>).generation) === typedFastLease.generation;
+        && (typedLease as Record<string, unknown>).lease_id === heartbeatTypedFastLease.leaseId
+        && Number((typedLease as Record<string, unknown>).generation) === heartbeatTypedFastLease.generation;
       if (!active) {
         foregroundTyped?.close();
         foregroundTyped = null;
@@ -2319,9 +2330,13 @@ export async function handleStrategicResident(
         };
       }
     }
-    if (typedFastLease !== null) {
-      body.typed_fast_lease_id = typedFastLease.leaseId;
-      body.typed_fast_generation = typedFastLease.generation;
+    // Fence the response against the exact lease identity represented by this
+    // request. A heartbeat sent before acquisition must not revoke a lease that
+    // finishes warming while the request is in flight.
+    const heartbeatTypedFastLease = typedFastLease === null ? null : { ...typedFastLease };
+    if (heartbeatTypedFastLease !== null) {
+      body.typed_fast_lease_id = heartbeatTypedFastLease.leaseId;
+      body.typed_fast_generation = heartbeatTypedFastLease.generation;
       body.typed_fast_ttl_seconds = 300;
     }
     if (handledIds && handledIds.length > 0) {
@@ -2346,7 +2361,7 @@ export async function handleStrategicResident(
         HEARTBEAT_API_MAX_RETRIES,
         HEARTBEAT_API_TIMEOUT,
       ) as SessionHeartbeatResponse;
-      applyHeartbeatResponse(resp);
+      applyHeartbeatResponse(resp, heartbeatTypedFastLease);
       return resp;
     } catch (e) {
       const msg = String(e);
@@ -2361,10 +2376,10 @@ export async function handleStrategicResident(
     }
   };
 
-  const releaseTypedFastLease = async (reason: string): Promise<void> => {
-    const lease = typedFastLease;
-    typedFastLease = null;
-    if (!lease) return;
+  const releaseExactTypedFastLease = async (
+    lease: TypedFastLeaseIdentity,
+    reason: string,
+  ): Promise<void> => {
     try {
       await apiPost(
         `/api/agent/projects/${projectId}/strategic-session/typed-fast-lease/release`,
@@ -2386,6 +2401,13 @@ export async function handleStrategicResident(
     }
   };
 
+  const releaseTypedFastLease = async (reason: string): Promise<void> => {
+    const lease = typedFastLease;
+    if (!lease) return;
+    typedFastLease = null;
+    await releaseExactTypedFastLease(lease, reason);
+  };
+
   /**
    * Provision (or re-provision) the restricted Fast child. Capacity and warm-up
    * failures are transient in a pooled runner, so they must not permanently
@@ -2393,7 +2415,13 @@ export async function handleStrategicResident(
    */
   const ensureTypedFastReady = async (): Promise<boolean> => {
     if (!typedFastConfig.activated) return false;
-    if (typedFastReady && foregroundTyped !== null && typedFastLease !== null) return true;
+    if (typedFastReady && foregroundTyped !== null && typedFastLease !== null) {
+      if (foregroundTyped.isAlive()) return true;
+      typedFastReady = false;
+      foregroundTyped.close();
+      foregroundTyped = null;
+      await releaseTypedFastLease('foreground_process_gone');
+    }
     // Provisioning is kicked off beside the main Resident loop.  Never await
     // the same provider probe from message admission: that would make a hung
     // foreground CLI prevent both polling and liveness heartbeats.
@@ -2405,6 +2433,7 @@ export async function handleStrategicResident(
     typedFastProvisioning = true;
     typedFastReady = false;
     let warmingController: ForegroundTypedController | null = null;
+    let acquiredLease: TypedFastLeaseIdentity | null = null;
     try {
       const leaseResponse = await apiPost(
         `/api/agent/projects/${projectId}/strategic-session/typed-fast-lease/acquire`,
@@ -2429,10 +2458,11 @@ export async function handleStrategicResident(
           ? leaseResponse.reason : 'lease was not admitted';
         throw new Error(`typed Fast capacity unavailable: ${reason}`);
       }
-      typedFastLease = {
+      acquiredLease = {
         leaseId: (lease as Record<string, unknown>).lease_id as string,
         generation: (lease as Record<string, unknown>).generation as number,
       };
+      typedFastLease = acquiredLease;
       warmingController = new ForegroundTypedController({
         adapter: typedFastConfig.adapter,
         model: typedFastConfig.model,
@@ -2440,6 +2470,14 @@ export async function handleStrategicResident(
       });
       foregroundTyped = warmingController;
       await warmingController.ensureReady();
+      const warmingStillCurrent = foregroundTyped === warmingController
+        && typedFastLease?.leaseId === acquiredLease.leaseId
+        && typedFastLease.generation === acquiredLease.generation;
+      if (!warmingStillCurrent) {
+        warmingController.close();
+        await releaseExactTypedFastLease(acquiredLease, 'readiness_superseded');
+        return false;
+      }
       typedFastReady = true;
       typedFastProvisionRetryAt = 0;
       sendLog(
@@ -2450,8 +2488,16 @@ export async function handleStrategicResident(
     } catch (error) {
       typedFastReady = false;
       warmingController?.close();
-      foregroundTyped = null;
-      await releaseTypedFastLease('readiness_failed');
+      if (foregroundTyped === warmingController) foregroundTyped = null;
+      const failedLease = acquiredLease;
+      if (
+        failedLease !== null
+        && typedFastLease?.leaseId === failedLease.leaseId
+        && typedFastLease.generation === failedLease.generation
+      ) {
+        typedFastLease = null;
+        await releaseExactTypedFastLease(failedLease, 'readiness_failed');
+      }
       sendLog(
         ws,
         `[resident] typed Fast unavailable before admission: ${sanitize(String(error))}; retrying while preserving operator input\n`,
@@ -3816,7 +3862,16 @@ export async function handleStrategicResident(
     if (messageIds.length !== selectedMessages.length || messageIds.length === 0) return 'deferred';
     if (!pendingClaimRequest) {
       if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
-      if (!typedFastReady || foregroundTyped === null || typedFastLease === null) {
+      if (
+        !typedFastReady || foregroundTyped === null || typedFastLease === null
+        || !foregroundTyped.isAlive()
+      ) {
+        if (foregroundTyped !== null && !foregroundTyped.isAlive()) {
+          typedFastReady = false;
+          foregroundTyped.close();
+          foregroundTyped = null;
+          await releaseTypedFastLease('foreground_process_gone');
+        }
         kickTypedFastProvisioning();
         return 'not_available';
       }

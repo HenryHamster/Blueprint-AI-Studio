@@ -256,7 +256,6 @@ export function buildClaudeForegroundLaunch(
   }
   const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--input-format', 'stream-json'];
   if (model) args.push('--model', model);
-  if (effort) args.push('--effort', effort);
   args.push(
     '--mcp-config', mcpConfigPath,
     '--strict-mcp-config',

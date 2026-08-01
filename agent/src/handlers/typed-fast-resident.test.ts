@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ResidentSession } from '../providers/resident-session.js';
+import type { ForegroundResidentAdapter } from '../providers/foreground-resident.js';
 import {
   _typedFastInternals,
+  ForegroundTypedController,
   MAX_TYPED_WORKDAY_REQUESTS_PER_TURN,
   newTypedConversationReceipt,
   typedFastAbandonDisposition,
@@ -8,7 +11,33 @@ import {
   typedFastFailureBackoffMs,
 } from './typed-fast-resident.js';
 
+afterEach(() => { vi.useRealTimers(); });
+
 describe('typed Fast local receipt fence', () => {
+  it('closes and rejects a readiness probe that never settles', async () => {
+    vi.useFakeTimers();
+    const close = vi.fn();
+    const adapter: ForegroundResidentAdapter = {
+      id: 'never-ready',
+      validation: 'qualified',
+      start: () => ({
+        isAlive: () => true,
+        sendTurn: () => new Promise<never>(() => {}),
+        close,
+      } as unknown as ResidentSession),
+    };
+    const controller = new ForegroundTypedController({ adapter });
+    try {
+      const assertion = expect(controller.ensureReady()).rejects.toThrow(/controller deadline/);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await assertion;
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(controller.isAlive()).toBe(false);
+    } finally {
+      controller.close();
+    }
+  });
+
   it('binds a public completion to the exact claimed message set', () => {
     const receipt = {
       claim_id: 'claim-1', message_ids: ['message-a', 'message-b'], idempotency_key: 'key-1',
