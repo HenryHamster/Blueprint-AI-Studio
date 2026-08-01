@@ -7,9 +7,12 @@ import {
   type StrategicContextEnvelopeTransport,
 } from './strategic-context-envelope.js';
 
-function transport(overrides: Partial<StrategicContextEnvelopeTransport> = {}) {
+function transport(
+  overrides: Partial<StrategicContextEnvelopeTransport> = {},
+  envelopeVersion: number = 2,
+) {
   const envelope = {
-    version: 2,
+    version: envelopeVersion,
     project_id: '11111111-1111-4111-8111-111111111111',
     context_authority_generation: 4,
     privacy_generation: 2,
@@ -62,6 +65,18 @@ describe('persisted Strategic context envelope', () => {
     const delta = buildFastResidentContextFrame(first, 80);
     expect(delta).toContain('What if eta is smaller?');
     expect(delta).not.toContain('Earlier context that the warm child already saw.');
+  });
+
+  it('accepts still-valid V1 packets during rollout and rejects unknown versions', () => {
+    const expected = {
+      contextAuthorityGeneration: 4,
+      privacyGeneration: 2,
+      now: new Date('2030-01-01T00:00:00.000Z'),
+    };
+    expect(verifyStrategicContextEnvelope(transport({}, 1), expected).envelope.version).toBe(1);
+    expect(() => verifyStrategicContextEnvelope(transport({}, 3), expected)).toThrow(
+      /version is unsupported/,
+    );
   });
 
   it('fails closed on hash, authority, privacy, transcript, and expiry drift', () => {

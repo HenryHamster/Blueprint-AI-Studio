@@ -40,13 +40,21 @@ from app.time_utils import _utcnow
 def test_agent_verifier_supports_the_backend_envelope_schema_version():
     """Prevent backend envelope evolution from silently disabling Fast."""
 
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "agent"
-        / "src"
-        / "handlers"
-        / "strategic-context-envelope.ts"
-    ).read_text(encoding="utf-8")
+    relative_source = Path("agent/src/handlers/strategic-context-envelope.ts")
+    source_path = next(
+        (
+            candidate
+            for candidate in (
+                Path("/repo") / relative_source,
+                Path("/") / relative_source,
+                Path(__file__).resolve().parents[2] / relative_source,
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    assert source_path is not None
+    source = source_path.read_text(encoding="utf-8")
     match = re.search(
         r"STRATEGIC_CONTEXT_ENVELOPE_VERSION\s*=\s*(\d+)", source
     )
