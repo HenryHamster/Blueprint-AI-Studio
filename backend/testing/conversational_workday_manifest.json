@@ -232,6 +232,8 @@
         "test_stop_handoff_is_atomic_with_session_end",
         "test_unattended_cap_persists_message_handoff",
         "test_unattended_cap_handoff_is_atomic_with_cap_end",
+        "test_stale_continuation_lease_atomically_terminalizes_resident_task",
+        "test_cap_never_terminalizes_cross_project_resident_task_pointer",
         "test_handoff_releases_unanswered_and_resolves_answered",
         "test_handoff_survives_rearm_rollback",
         "test_handoff_treats_canonical_child_reply_as_answer_evidence",
