@@ -9,7 +9,7 @@ import {
 
 function transport(overrides: Partial<StrategicContextEnvelopeTransport> = {}) {
   const envelope = {
-    version: 1,
+    version: 2,
     project_id: '11111111-1111-4111-8111-111111111111',
     context_authority_generation: 4,
     privacy_generation: 2,
@@ -18,6 +18,7 @@ function transport(overrides: Partial<StrategicContextEnvelopeTransport> = {}) {
     problem_model: { intent: { purpose: 'Work through the theory' } },
     decisions: [],
     memory: { active: [] },
+    memory_v2: { evidence_cards: [], raw_suffix: [], memory_degraded: false },
     recent_conversation: [
       { sequence: 80, content: 'Earlier context that the warm child already saw.' },
       { sequence: 81, content: 'What if eta is smaller?' },

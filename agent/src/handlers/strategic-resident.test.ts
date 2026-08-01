@@ -657,7 +657,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       created_at: new Date().toISOString(), from_type: 'user',
     };
     const canonicalEnvelope = {
-      version: 1,
+      version: 2,
       project_id: '11111111-1111-4111-8111-111111111111',
       context_authority_generation: 1,
       privacy_generation: 1,
@@ -816,7 +816,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       created_at: new Date().toISOString(), from_type: 'user',
     };
     const canonicalEnvelope = {
-      version: 1,
+      version: 2,
       project_id: '11111111-1111-4111-8111-111111111111',
       context_authority_generation: 2,
       privacy_generation: 1,
@@ -967,7 +967,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     const envelopeFor = (messageId: string) => {
       const transcriptSequence = messageId === staleM1.id ? 101 : 102;
       const canonicalEnvelope = {
-        version: 1,
+        version: 2,
         project_id: '11111111-1111-4111-8111-111111111111',
         context_authority_generation: 4,
         privacy_generation: 2,
@@ -1069,7 +1069,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         : { messages: [] },
     ));
     const canonicalEnvelope = {
-      version: 1,
+      version: 2,
       project_id: '11111111-1111-4111-8111-111111111111',
       context_authority_generation: 4,
       privacy_generation: 2,
@@ -1256,7 +1256,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     });
 
     const canonicalEnvelope = {
-      version: 1,
+      version: 2,
       project_id: '11111111-1111-4111-8111-111111111111',
       context_authority_generation: 4,
       privacy_generation: 2,
@@ -1383,7 +1383,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     });
 
     const canonicalEnvelope = {
-      version: 1,
+      version: 2,
       project_id: '11111111-1111-4111-8111-111111111111',
       context_authority_generation: 4,
       privacy_generation: 2,
