@@ -1232,7 +1232,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(releaseCalls).toEqual([]);
   });
 
-  it('completes a pure Fast message while an autonomous Workday turn keeps running', async () => {
+  it('completes a pure Fast message without starting idle Workday', async () => {
     vi.useFakeTimers();
     const operatorMessage = {
       id: 'typed-fast-parallel-message',
@@ -1319,30 +1319,28 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       workdayRequests: [],
     }));
 
-    let resolveAutonomous!: (result: ResidentTurnResult) => void;
-    const autonomous = new Promise<ResidentTurnResult>((resolve) => {
-      resolveAutonomous = resolve;
-    });
-    const workday = makeSession(() => autonomous, () => true);
+    const workday = makeSession(
+      async () => turnResult({ resultText: 'idle Workday must not run' }),
+      () => true,
+    );
     mockStartSession.mockReturnValue(workday);
 
     const done = run('typed-fast-parallel', {
       ...qualifiedPayload(),
       strategic_session_autonomous: true,
+      strategic_session_idle_tick_seconds: 1,
       strategic_session_message_poll_seconds: 0.001,
       strategic_session_min_tick_seconds: 1,
     });
-    // Let startup, repository freshness, the initial empty poll, and the
-    // autonomous turn all settle before watchTurn's foreground poll fires.
+    // Let startup, the initial empty poll, and Fast's foreground poll settle.
     await vi.advanceTimersByTimeAsync(1_000);
 
     expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.some(([url]) =>
       url.endsWith('/conversation/turns/complete'))).toBe(true);
     expect(workday.interrupt).not.toHaveBeenCalled();
-    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(workday.sendTurn).not.toHaveBeenCalled();
 
-    resolveAutonomous(turnResult({ resultText: 'TICK-VERDICT: CLEAR — background done' }));
     await vi.advanceTimersByTimeAsync(2_000);
     await done;
   });

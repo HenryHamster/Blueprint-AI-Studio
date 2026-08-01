@@ -341,7 +341,7 @@
         "waits through retryable legacy grace without publishing loser helpers",
         "acquires the fenced slot before readiness and releases it on normal shutdown",
         "closes a lease-lost Fast controller without giving its next tagged message to Workday",
-        "completes a pure Fast message while an autonomous Workday turn keeps running",
+        "completes a pure Fast message without starting idle Workday",
         "preserves the operator message without broad Workday fallback when Fast capacity is denied",
         "continues polling and heartbeating while the Fast readiness probe is pending",
         "ignores a stale heartbeat response sent before the Fast lease was acquired",

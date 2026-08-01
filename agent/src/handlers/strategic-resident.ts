@@ -1103,6 +1103,12 @@ export async function handleStrategicResident(
       ? payload.typed_fast_qualification
       : undefined,
   });
+  // Once Fast owns the public conversation, Workday is an on-demand research
+  // lane rather than a second autonomous mind. It still handles explicit Fast
+  // consultations and the ordinary fallback path, but it must not burn turns
+  // merely because the project clock moved while nobody asked it to do
+  // anything. Workday-only sessions retain their autonomous behavior.
+  const workdayOnDemand = typedFastConfig.activated;
   let typedFastReady = typedFastConfig.activated;
   let typedFastProvisioning = false;
   let typedFastProvisionAttempt: Promise<boolean> | null = null;
@@ -4688,10 +4694,17 @@ export async function handleStrategicResident(
       // and folds any re-arm (authority_held:true — set when a new operator
       // message re-engages) so the NEXT iteration reopens the autonomous path.
       // We never self-prompt or mutate strategic state on a lapsed lease.
-      if (callCoordinator.suppressAutonomy() || !autonomousActive(cfg.autonomousEnabled, authorityHeld)) {
+      if (
+        callCoordinator.suppressAutonomy()
+        || workdayOnDemand
+        || !autonomousActive(cfg.autonomousEnabled, authorityHeld)
+      ) {
+        const waitingReason = workdayOnDemand
+          ? 'Workday is ready when Fast needs deeper research'
+          : 'Waiting in chat-only mode';
         setResidentActivity(
           'waiting',
-          'Waiting in chat-only mode',
+          waitingReason,
           new Date(Date.now() + cfg.messagePollMs).toISOString(),
         );
         // Poll operator messages at the fast cadence (the fast path at the top of
