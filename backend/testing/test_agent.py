@@ -11444,6 +11444,124 @@ async def test_post_commit_lock_on_retry_returns_pending_not_500(
 
 
 @pytest.mark.asyncio
+async def test_exact_ended_resident_terminal_retry_drives_post_commit(
+    client: AsyncClient, db_session, mocker
+):
+    """Cap/lapse ends the session before the agent's final status callback.
+
+    The exact ended generation/incarnation may consume the server-owned pending
+    marker, while the ordinary Resident authority fence remains closed.
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    process_post_commit = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="Ended Resident Retry", user_id="test-user-resident")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_id = uuid.uuid4()
+    incarnation_id = uuid.uuid4()
+    session_id = "ended-resident-session"
+    generation = 4
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "resident_session": True}],
+        vm_instance_id="runner:ended-resident",
+        status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": generation,
+            "_post_commit_pending_meta": {
+                "reason": "resident_session_ended",
+                "attempts": 0,
+                "payload": {
+                    "task_id": str(task_id),
+                    "resident_incarnation_id": str(incarnation_id),
+                    "status": "COMPLETED",
+                    "artifact_type": "RESEARCH_FINDINGS",
+                    "logs": "Canonical server-authored Resident completion",
+                },
+            },
+        },
+    )
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "ended",
+            "stop_requested": True,
+            "session_id": session_id,
+            "task_id": str(task_id),
+            "worker_generation": generation,
+            "worker_incarnation_id": str(incarnation_id),
+        }
+    }
+    db_session.add(project)
+    db_session.add(task)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    rejected = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(uuid.uuid4()),
+            "status": "COMPLETED",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert rejected.status_code == 409
+    process_post_commit.assert_not_awaited()
+    await db_session.refresh(task)
+    assert task.post_commit_pending is True
+
+    conflicting = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(incarnation_id),
+            "status": "FAILED",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert conflicting.status_code == 409
+    process_post_commit.assert_not_awaited()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.post_commit_pending is True
+
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(incarnation_id),
+            "status": "COMPLETED",
+            "logs": "Tampered callback content must not reach post-commit",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "accepted"
+    process_post_commit.assert_awaited_once()
+    processed_payload = process_post_commit.await_args.args[1]
+    assert processed_payload.status == TaskStatus.COMPLETED
+    assert processed_payload.logs == "Canonical server-authored Resident completion"
+    await db_session.refresh(task)
+    assert task.post_commit_pending is False
+    assert "_post_commit_pending_meta" not in (task.context or {})
+
+
+@pytest.mark.asyncio
 async def test_post_commit_disconnect_on_retry_returns_pending_not_500(
     client: AsyncClient, db_session, mocker
 ):
