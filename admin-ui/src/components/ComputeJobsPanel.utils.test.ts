@@ -37,10 +37,10 @@ const A_RESULT = { armA: { value: 1.5, met: true, cost_usd: null } };
 
 describe('computeJobTerminalLabel', () => {
   it('prefers canonical experiment status over legacy SUCCESS outcome', () => {
-    expect(computeJobTerminalLabel(job({
-      outcome: 'SUCCESS',
+    expect(computeJobTerminalLabel({
+      ...job({ outcome: 'SUCCESS' }),
       experiment_status: 'CRITERION_NOT_MET',
-    }))).toBe('Criterion not met');
+    } as ComputeJob)).toBe('Criterion not met');
   });
 });
 

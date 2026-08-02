@@ -1139,14 +1139,24 @@ describe('useLogViewer strategist events', () => {
     // No completion yet.
     expect(result.current.lv.lastCycleCompletion).toBeNull();
 
-    // Emit completion with an outcome summary.
+    // Emit the full canonical v1 completion envelope the backend sends. Its
+    // directions refetch surface must not prevent this lifecycle event from
+    // clearing the active state and recording its receipt.
     act(() => {
       ws.emit({
         event: 'strategic_cycle_completed',
         data: {
+          schema_version: 1,
+          project_id: 'proj1',
+          resource: 'strategic_cycle',
+          action: 'completed',
+          refetch: { surfaces: ['strategic_session', 'directions'] },
           task_id: 'task-1',
           cycle_id: 'cycle-42',
           phase: 2,
+          phase_number: 2,
+          phase_label: 'Strategic review',
+          phase_state: 'cycle_done',
           completion: {
             status: 'completed',
             created_count: 2,
@@ -1165,6 +1175,12 @@ describe('useLogViewer strategist events', () => {
               warned_count: 1,
               blocked_count: 0,
             },
+          },
+          strategic: {
+            kind: 'cycle',
+            task_id: 'task-1',
+            phase: 2,
+            cycle_id: 'cycle-42',
           },
         },
       });

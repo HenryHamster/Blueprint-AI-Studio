@@ -6121,7 +6121,7 @@ async def test_step7_stalled_cycle_already_terminal_task_untouched(
 
 @pytest.mark.asyncio
 async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
-    """Stalled-cycle alerts must broadcast only after the batch commit succeeds."""
+    """Phase-one stall broadcasts its alert then canonical completion after commit."""
     project = await _make_project(reaper_db)
     task = Task(
         project_id=project.id,
@@ -6154,9 +6154,12 @@ async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
     mocker.patch.object(reaper_db, "commit", side_effect=_tracking_commit)
 
     async def _tracking_broadcast(project_id, event, payload):
-        events.append(("broadcast", event, payload.get("severity")))
+        events.append(("broadcast", event, payload))
 
     mocker.patch("app.broadcast.broadcast_to_project", side_effect=_tracking_broadcast)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", side_effect=_tracking_broadcast
+    )
 
     stalled = await _rs.sweep_stalled_strategic_cycles(
         reaper_db,
@@ -6166,10 +6169,89 @@ async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
 
     assert stalled == 1
     assert "commit" in events
-    assert ("broadcast", "alert_created", "WARNING") in events
-    assert events.index("commit") < events.index(
-        ("broadcast", "alert_created", "WARNING")
+    alert = next(event for event in events if event[1] == "alert_created")
+    completion = next(
+        event for event in events if event[1] == "strategic_cycle_completed"
     )
+    assert alert[2]["severity"] == "WARNING"
+    payload = completion[2]
+    assert payload["task_id"] == payload["strategic"]["task_id"] == str(task.id)
+    assert payload["cycle_id"] == payload["strategic"]["cycle_id"] == str(cycle.id)
+    assert payload["phase"] == payload["phase_number"] == payload["strategic"]["phase"] == 1
+    assert payload["phase_state"] == "stalled_phase1"
+    assert payload["refetch"] == {"surfaces": ["strategic_session", "directions"]}
+    assert payload["completion"]["status"] == "failed"
+    assert payload["completion"]["status_message"] == (
+        "reaper declared strategic cycle stalled in phase1 after >3h"
+    )
+    assert payload["completion"]["failure_reason"] == (
+        "reaper_stall: cycle in phase1 >3h with no completion"
+    )
+    assert events.index("commit") < events.index(alert) < events.index(completion)
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_phase2_completion_broadcasts_after_commit(reaper_db, mocker):
+    """Phase-two stall uses the same post-commit canonical completion contract."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=4),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    events: list = []
+    real_commit = reaper_db.commit
+
+    async def _tracking_commit(*args, **kwargs):
+        events.append("commit")
+        return await real_commit(*args, **kwargs)
+
+    async def _tracking_broadcast(project_id, event, payload):
+        events.append(("broadcast", event, payload))
+
+    mocker.patch.object(reaper_db, "commit", side_effect=_tracking_commit)
+    mocker.patch("app.broadcast.broadcast_to_project", side_effect=_tracking_broadcast)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", side_effect=_tracking_broadcast
+    )
+
+    assert await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    ) == 1
+
+    alert = next(event for event in events if event[1] == "alert_created")
+    completion = next(
+        event for event in events if event[1] == "strategic_cycle_completed"
+    )
+    assert completion[2]["task_id"] == str(task.id)
+    assert completion[2]["cycle_id"] == str(cycle.id)
+    assert completion[2]["phase"] == completion[2]["phase_number"] == 2
+    assert completion[2]["phase_state"] == "stalled_phase2"
+    assert completion[2]["completion"]["status"] == "failed"
+    assert completion[2]["completion"]["status_message"] == (
+        "reaper declared strategic cycle stalled in phase2 after >3h"
+    )
+    assert completion[2]["completion"]["failure_reason"] == (
+        "reaper_stall: cycle in phase2 >3h with no completion"
+    )
+    assert events.index("commit") < events.index(alert) < events.index(completion)
 
 
 @pytest.mark.asyncio
@@ -6202,6 +6284,9 @@ async def test_step7_stalled_cycle_does_not_broadcast_on_commit_failure(
     broadcast = mocker.patch(
         "app.broadcast.broadcast_to_project", new_callable=AsyncMock
     )
+    completion_broadcast = mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
     mocker.patch.object(
         reaper_db, "commit", side_effect=RuntimeError("stalled-cycle commit boom")
     )
@@ -6214,6 +6299,52 @@ async def test_step7_stalled_cycle_does_not_broadcast_on_commit_failure(
         )
 
     broadcast.assert_not_called()
+    completion_broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_completion_broadcast_failure_is_nonfatal(
+    reaper_db, mocker
+):
+    """A completion delivery error cannot undo a durably stalled cycle."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase1",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    completion_broadcast = mocker.patch(
+        "app.strategic_events.broadcast_to_project",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("completion websocket unavailable"),
+    )
+
+    assert await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    ) == 1
+
+    completion_broadcast.assert_awaited_once()
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert task.status == TaskStatus.FAILED
+    assert cycle.outcome == "stalled_phase1"
 
 
 @pytest.mark.asyncio

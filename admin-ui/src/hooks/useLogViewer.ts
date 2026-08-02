@@ -575,9 +575,7 @@ export function useLogViewer({
         }
         return;
       }
-      if (msg.event === 'strategic_updated' || refetchSurfaces.has('directions')) {
-        refetchDirections();
-      } else if (msg.event === 'strategic_cycle_started') {
+      if (msg.event === 'strategic_cycle_started') {
         setStrategistActive(true);
         setLastCycleCompletion(null); // clear previous receipt when new cycle begins
         setCycleProgress({
@@ -595,6 +593,15 @@ export function useLogViewer({
         if (msg.data?.completion && typeof msg.data.completion === 'object') {
           setLastCycleCompletion(msg.data.completion as StrategicCycleCompletion);
         }
+      }
+      // Handle lifecycle state above before the canonical envelope's directions
+      // surface schedules the shared refresh. Legacy completion events still
+      // refresh directions even without a refetch surface.
+      if (
+        msg.event === 'strategic_updated'
+        || msg.event === 'strategic_cycle_completed'
+        || refetchSurfaces.has('directions')
+      ) {
         refetchDirections();
       }
     } catch {

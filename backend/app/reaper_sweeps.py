@@ -476,6 +476,7 @@ async def sweep_stalled_strategic_cycles(
         StrategicCycle,
     )
     from app.broadcast import broadcast_to_project as _bcast
+    from app.strategic_events import emit_strategic_cycle_completed
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 
     # Pause-aware: a cycle whose completion handler simply could not run while
@@ -490,6 +491,7 @@ async def sweep_stalled_strategic_cycles(
         return 0
     actually_stalled: list = []
     pending_broadcasts: list[tuple[str, dict]] = []
+    pending_completion_events: list[tuple[str, str, int, str, dict]] = []
 
     # Lock the owning projects (then cycles, then tasks) without locking the
     # broad discovery scan. These bounded statements follow the canonical
@@ -637,6 +639,24 @@ async def sweep_stalled_strategic_cycles(
             )
         session.add(c)
         actually_stalled.append(c)
+        if linked_task_id is not None:
+            phase_number = 1 if stalled_phase == "phase1" else 2
+            pending_completion_events.append(
+                (
+                    str(c.project_id),
+                    str(linked_task_id),
+                    phase_number,
+                    str(c.id),
+                    {
+                        "status": "failed",
+                        "status_message": (
+                            f"reaper declared strategic cycle stalled in "
+                            f"{stalled_phase} after >3h"
+                        ),
+                        "failure_reason": c.failure_reason,
+                    },
+                )
+            )
         try:
             alert = Alert(
                 project_id=c.project_id,
@@ -674,6 +694,25 @@ async def sweep_stalled_strategic_cycles(
                 logger.warning(
                     f"[REAPER] Stalled-cycle alert broadcast failed for "
                     f"{payload.get('alert_id')}: {_bcast_err}"
+                )
+        for project_id, task_id, phase, cycle_id, completion in pending_completion_events:
+            try:
+                await emit_strategic_cycle_completed(
+                    project_id,
+                    task_id,
+                    phase,
+                    cycle_id=cycle_id,
+                    phase_state=(
+                        strategic_cycle.OUTCOME_STALLED_PHASE1
+                        if phase == 1
+                        else strategic_cycle.OUTCOME_STALLED_PHASE2
+                    ),
+                    completion=completion,
+                )
+            except Exception as _bcast_err:  # noqa: PERF203, BLE001
+                logger.warning(
+                    f"[REAPER] Stalled-cycle completion broadcast failed for "
+                    f"cycle {cycle_id}: {_bcast_err}"
                 )
         logger.info(
             f"[REAPER] Marked {len(actually_stalled)} strategic cycle(s) stalled"
