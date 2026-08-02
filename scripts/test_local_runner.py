@@ -6024,6 +6024,21 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             "No version-mismatch warning expected when version_hint is absent",
         )
 
+    def test_unknown_version_hint_is_not_actionable(self):
+        """Missing local deploy metadata must not take runner capacity offline."""
+        for value in (None, "", "  ", "unknown", " UNKNOWN ", "local-dev"):
+            with self.subTest(value=value):
+                self.assertIsNone(local_runner._actionable_version_hint(value))
+
+    def test_real_version_hints_remain_actionable(self):
+        """SHA and legacy release hints still participate in stale detection."""
+        for value in (
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            "v99-abcdef01",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(local_runner._actionable_version_hint(value), value)
+
 
 class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
     """Heartbeat loop: jitter spreads restarts; network failure streak escalates."""

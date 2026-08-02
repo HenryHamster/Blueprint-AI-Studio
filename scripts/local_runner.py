@@ -1381,6 +1381,23 @@ def _describe_sha(version_str: str) -> str | None:
     return None
 
 
+def _actionable_version_hint(value: object) -> str | None:
+    """Return a deploy identity only when the server supplied a real hint.
+
+    Local and development orchestrators can legitimately lack ``DEPLOY_SHA``
+    metadata and historically expose the sentinel ``"unknown"``. Treating that
+    sentinel as a commit makes every healthy runner drain and retry updates
+    forever, even when it is already on the newest checkout.
+    """
+
+    if not isinstance(value, str):
+        return None
+    hint = value.strip()
+    if not hint or hint.lower() in {"unknown", "local-dev"}:
+        return None
+    return hint
+
+
 def _node_runtime_ok() -> bool:
     """Return True iff ``node --version`` actually runs (binary present + executable).
 
@@ -4079,7 +4096,9 @@ def _heartbeat_loop(
                     # heartbeat (see body.update above).
                     if live_config is not None:
                         live_config.apply(resp_body.get("config"))
-                    version_hint = resp_body.get("version_hint")
+                    version_hint = _actionable_version_hint(
+                        resp_body.get("version_hint")
+                    )
                     if version_hint and version:
                         runner_sha = _describe_sha(version)
                         if version_hint == accepted_ancestor_version_hint:
