@@ -121,17 +121,8 @@ resource "terraform_data" "restore_verifier_configuration" {
       error_message = "the exact archive name, both generations, SHA-256, and byte size must be supplied together or all omitted."
     }
     precondition {
-      condition = (
-        !var.enable_restore_drill_schedule ||
-        (
-          var.restore_verifier_expected_archive_name == "" &&
-          var.restore_verifier_expected_archive_generation == "" &&
-          var.restore_verifier_expected_manifest_generation == "" &&
-          var.restore_verifier_expected_archive_sha256 == "" &&
-          var.restore_verifier_expected_archive_size_bytes == 0
-        )
-      )
-      error_message = "recurring restore drills must select fresh archives and cannot retain a one-shot exact archive pin."
+      condition     = !var.enable_restore_drill_schedule
+      error_message = "recurring restore drills are disabled until archives use an independently trusted custom-format provenance contract."
     }
   }
 }

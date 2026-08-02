@@ -81,7 +81,6 @@ resource "google_project_iam_custom_role" "restore_verifier_sql" {
     "cloudsql.instances.create",
     "cloudsql.instances.delete",
     "cloudsql.instances.get",
-    "cloudsql.instances.import",
     "cloudsql.instances.list",
     "cloudsql.operations.get",
     "cloudsql.users.update",

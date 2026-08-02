@@ -1,13 +1,15 @@
 # Recovery restore verifier
 
 This image performs a destructive restore drill only inside the dedicated
-recovery project. It selects the newest
-`local-postgres-exports/*.sql.gz.manifest.json` success marker, requires an
-exact matching archive, streams that archive through SHA-256 verification,
-and ignores corrupt or orphaned objects. It then creates a uniquely named
-PostgreSQL 15 Cloud SQL instance with private IP only, imports the plain SQL
-gzip archive, connects through the bundled digest-verified Cloud SQL Auth
-Proxy, runs non-sensitive schema and aggregate checks, records evidence in
+recovery project. It validates a
+`local-postgres-exports/*.sql.gz.manifest.json` success marker against a
+complete operator-supplied immutable pin, streams that exact generation through
+second-pass SHA-256 and gzip validation, and ignores corrupt or orphaned
+objects. It then creates a uniquely named PostgreSQL 15 Cloud SQL instance with
+private IP only, connects through the bundled digest-verified Cloud SQL Auth
+Proxy, restores through a pinned PostgreSQL 15.18 `psql` client in restricted
+mode and a single transaction, runs non-sensitive schema and aggregate checks,
+records evidence in
 Cloud Logging and the recovery bucket, and deletes the instance.
 
 Every drill instance is labelled `blueprint-purpose=restore-drill` and receives
@@ -35,12 +37,12 @@ For a one-shot pre-cutover drill, all five of these must be supplied together:
 - `EXPECTED_ARCHIVE_SHA256`
 - `EXPECTED_ARCHIVE_SIZE_BYTES`
 
-That mode directly loads and verifies the named immutable object generations;
-it never substitutes a newer archive. Immediately before and after Cloud SQL's
-unversioned import operation, the verifier also requires that pinned generation
-to remain the current retained object, so any privileged replacement makes the
-drill fail. Scheduled runs omit all five values, hash only the newest completion
-manifest, and fail rather than mask a corrupt newest backup.
+The verifier never substitutes a newer archive. It reopens only the specified
+GCS generation, revalidates compressed size and SHA-256 before allowing the
+single transaction to commit, bounds decompression, and requires the matching
+PostgreSQL dump restrict envelope. Recurring unpinned drills are deliberately
+disabled until future backups use custom-format dumps with an independently
+trusted provenance contract.
 
 Optional bounded settings:
 
@@ -48,6 +50,9 @@ Optional bounded settings:
 - `DRILL_INSTANCE_TTL_MINUTES` (default 180, maximum 1440)
 - `DRILL_OPERATION_TIMEOUT_SECONDS` (default 3600, maximum 7200)
 - `DRILL_PROXY_START_TIMEOUT_SECONDS` (default 60, maximum 120)
+- `DRILL_TASK_WORK_TIMEOUT_SECONDS` (default 6000, maximum 6600; combined
+  with cleanup limits so at least 300 seconds remain for evidence emission)
+- `DRILL_CLEANUP_TIMEOUT_SECONDS` (default and maximum 600)
 - `RECOVERY_ARCHIVE_PREFIX` and `RECOVERY_EVIDENCE_PREFIX`
 
 `--janitor-only` runs reconciliation without creating a drill instance. The
@@ -55,7 +60,7 @@ Terraform-scheduled janitor uses this mode; normal invocations reconcile first
 and then perform the full drill.
 
 The runtime identity must be recovery-project-only. It needs narrowly scoped
-Cloud SQL lifecycle/import/connect permissions, archive read and CMEK decrypt,
+Cloud SQL lifecycle/connect permissions, archive read and CMEK decrypt,
 evidence-object creation, and Cloud Logging write. It must not receive any IAM
 permission in the production project.
 
@@ -66,9 +71,10 @@ and allows only metadata/DNS, restricted Google APIs, and the private Cloud SQL
 proxy port. The image is accepted only from the dedicated recovery-project
 repository by digest; its base image and Python dependency graph are also
 content-pinned. The
-database password is generated in memory, passed only through HTTPS to the
-Admin API and the in-process database driver, cleared before evidence writing,
-and never placed in a process command or log.
+database password is generated in memory, passed through HTTPS to the Admin API,
+and exposed to `psql` only through a temporary owner-only passfile that is
+removed before evidence writing. It is never placed in a process command,
+environment variable, or log.
 
 After intentionally changing `requirements.txt`, regenerate
 `requirements.lock` for Python 3.12 Linux amd64 with `uv pip compile

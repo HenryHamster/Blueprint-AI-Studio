@@ -3,16 +3,20 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import hashlib
 import os
 import re
 import secrets
+import signal
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +46,9 @@ _HIGH_ENTROPY_PROVIDER_MESSAGE_RE = re.compile(
     r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+_DUMP_RESTRICT_DIRECTIVE_RE = re.compile(
+    rb"^\\(restrict|unrestrict) ([A-Za-z0-9]{16,128})\r?\n$"
+)
 _REVISION_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 _PREFIX_RE = re.compile(r"^[a-zA-Z0-9_./-]{1,160}$")
 _INSTANCE_RE = re.compile(r"^[a-z][a-z0-9-]{0,96}[a-z0-9]$")
@@ -52,6 +59,13 @@ _DATABASE_NAME = "blueprint"
 _DATABASE_USER = "postgres"
 _DRILL_TIER = "db-custom-1-3840"
 _DRILL_DISK_GB = 20
+_MAX_IMPORT_EXPANSION_RATIO = 256
+_MAX_IMPORT_UNCOMPRESSED_BYTES = 18 * 1024 * 1024 * 1024
+_PSQL_TIMEOUT_BINARY = "/usr/bin/timeout"
+_CLOUD_RUN_TASK_TIMEOUT_SECONDS = 7200
+_DELETE_REQUEST_ALLOWANCE_SECONDS = 60
+_EVIDENCE_RESERVE_SECONDS = 300
+_JANITOR_WORK_TIMEOUT_SECONDS = 720
 _COMPUTE_NETWORK_SELF_LINK_PREFIXES = (
     "https://compute.googleapis.com/compute/v1/",
     "https://www.googleapis.com/compute/v1/",
@@ -180,6 +194,9 @@ class Config:
     operation_timeout_seconds: int
     proxy_start_timeout_seconds: int
     proxy_binary: str
+    psql_binary: str
+    task_work_timeout_seconds: int
+    cleanup_timeout_seconds: int
     expected_archive: ArchivePin | None
 
     @classmethod
@@ -201,6 +218,9 @@ class Config:
         ).strip()
         proxy_binary = values.get(
             "CLOUD_SQL_PROXY_BINARY", "/usr/local/bin/cloud-sql-proxy"
+        ).strip()
+        psql_binary = values.get(
+            "PSQL_BINARY", "/usr/lib/postgresql/15/bin/psql"
         ).strip()
         expected_archive_values = {
             "name": values.get("EXPECTED_ARCHIVE_NAME", "").strip(),
@@ -247,6 +267,8 @@ class Config:
             raise DrillError("configuration", "invalid_storage_prefix")
         if not Path(proxy_binary).is_absolute():
             raise DrillError("configuration", "proxy_binary_not_absolute")
+        if not Path(psql_binary).is_absolute():
+            raise DrillError("configuration", "psql_binary_not_absolute")
         expected_archive: ArchivePin | None = None
         if any(expected_archive_values.values()):
             if not all(expected_archive_values.values()):
@@ -278,6 +300,29 @@ class Config:
                 sha256=expected_archive_values["sha256"],
                 size=int(expected_archive_values["size"]),
             )
+
+        task_work_timeout_seconds = _bounded_int(
+            values,
+            "DRILL_TASK_WORK_TIMEOUT_SECONDS",
+            default=6000,
+            minimum=900,
+            maximum=6600,
+        )
+        cleanup_timeout_seconds = _bounded_int(
+            values,
+            "DRILL_CLEANUP_TIMEOUT_SECONDS",
+            default=600,
+            minimum=60,
+            maximum=600,
+        )
+        if (
+            task_work_timeout_seconds
+            + _DELETE_REQUEST_ALLOWANCE_SECONDS
+            + cleanup_timeout_seconds
+            + _EVIDENCE_RESERVE_SECONDS
+            > _CLOUD_RUN_TASK_TIMEOUT_SECONDS
+        ):
+            raise DrillError("configuration", "unsafe_task_timeout_budget")
 
         return cls(
             recovery_project_id=recovery_project,
@@ -317,6 +362,9 @@ class Config:
                 maximum=120,
             ),
             proxy_binary=proxy_binary,
+            psql_binary=psql_binary,
+            task_work_timeout_seconds=task_work_timeout_seconds,
+            cleanup_timeout_seconds=cleanup_timeout_seconds,
             expected_archive=expected_archive,
         )
 
@@ -521,6 +569,37 @@ class RecoveryStorage:
             or int(getattr(current, "size", 0) or 0) != archive.size
         ):
             raise DrillError("archive_import", "archive_generation_changed")
+
+    def open_archive(self, archive: Archive) -> Any:
+        if (
+            archive.bucket != self._config.bucket_name
+            or not _ARCHIVE_OBJECT_RE.fullmatch(archive.name)
+            or not archive.name.startswith(self._config.archive_prefix)
+            or not archive.name.endswith(".sql.gz")
+            or not archive.generation.isdigit()
+            or archive.size <= 0
+            or not re.fullmatch(r"[0-9a-f]{64}", archive.sha256)
+        ):
+            raise DrillError("archive_import", "archive_identity_invalid")
+        blob = self._bucket().blob(
+            archive.name,
+            generation=int(archive.generation),
+        )
+        try:
+            blob.reload(timeout=60)
+        except Exception as exc:
+            raise DrillError(
+                "archive_import", "archive_generation_unavailable"
+            ) from exc
+        if (
+            str(getattr(blob, "generation", "") or "") != archive.generation
+            or int(getattr(blob, "size", 0) or 0) != archive.size
+        ):
+            raise DrillError("archive_import", "archive_generation_changed")
+        try:
+            return blob.open("rb")
+        except Exception as exc:
+            raise DrillError("archive_import", "archive_stream_unavailable") from exc
 
     def write_evidence(self, object_name: str, payload: dict[str, Any]) -> None:
         encoded = json.dumps(
@@ -746,23 +825,6 @@ class SqlAdminRest:
         )
         return self._operation_name(payload, "database_user")
 
-    def import_archive(self, instance: str, archive_uri: str) -> str:
-        instance = self._part(instance, _INSTANCE_RE)
-        payload = self._request(
-            "POST",
-            f"/projects/{self.project_id}/instances/{instance}/import",
-            stage="archive_import",
-            body={
-                "importContext": {
-                    "kind": "sql#importContext",
-                    "fileType": "SQL",
-                    "uri": archive_uri,
-                    "database": _DATABASE_NAME,
-                }
-            },
-        )
-        return self._operation_name(payload, "archive_import")
-
     def get_operation(self, operation: str, *, stage: str) -> dict[str, Any]:
         operation = self._part(operation, _OPERATION_RE)
         return self._request(
@@ -804,6 +866,7 @@ class Runtime:
     sleep: Callable[[float], None] = time.sleep
     password: Callable[[int], str] = secrets.token_urlsafe
     suffix: Callable[[int], str] = secrets.token_hex
+    archive_import: Callable[[Any, Config, Archive, str, float], dict[str, Any]] | None = None
 
 
 def _instance_name(now: datetime, suffix: str) -> str:
@@ -867,7 +930,7 @@ def _is_owned_cleanup_target(
 
 
 def _reconcile_drill_instances(
-    runtime: Runtime, config: Config, now: datetime
+    runtime: Runtime, config: Config, now: datetime, *, deadline: float | None = None
 ) -> list[str]:
     """Delete expired or ambiguous instances that are unambiguously drill-owned."""
 
@@ -897,7 +960,9 @@ def _reconcile_drill_instances(
             continue
         operation = runtime.sql.delete_instance(name)
         if operation:
-            _wait_operation(runtime, config, operation, stage="janitor")
+            _wait_operation(
+                runtime, config, operation, stage="janitor", deadline=deadline
+            )
         removed.append(name)
     return removed
 
@@ -908,9 +973,12 @@ def _wait_operation(
     operation: str,
     *,
     stage: str,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    deadline = runtime.monotonic() + config.operation_timeout_seconds
-    while runtime.monotonic() < deadline:
+    operation_deadline = runtime.monotonic() + config.operation_timeout_seconds
+    if deadline is not None:
+        operation_deadline = min(operation_deadline, deadline)
+    while runtime.monotonic() < operation_deadline:
         payload = runtime.sql.get_operation(operation, stage=stage)
         status = payload.get("status")
         if status == "DONE":
@@ -920,6 +988,8 @@ def _wait_operation(
         if status not in {"PENDING", "RUNNING"}:
             raise DrillError(stage, "unexpected_operation_status")
         runtime.sleep(5)
+    if deadline is not None and runtime.monotonic() >= deadline:
+        raise DrillError(stage, "task_deadline_exceeded")
     raise DrillError(stage, "operation_timed_out")
 
 
@@ -997,6 +1067,338 @@ def _stop_proxy(process: Any | None) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+class _DigestingReader:
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._stream.read(size)
+        if chunk:
+            self.size += len(chunk)
+            self.digest.update(chunk)
+        return chunk
+
+
+def _wait_database_ready(
+    runtime: Runtime,
+    config: Config,
+    password: str,
+    *,
+    deadline: float,
+) -> None:
+    readiness_deadline = min(
+        deadline,
+        runtime.monotonic() + config.proxy_start_timeout_seconds,
+    )
+    while runtime.monotonic() < readiness_deadline:
+        try:
+            with runtime.db_connect(
+                host="127.0.0.1",
+                port=_PROXY_PORT,
+                dbname=_DATABASE_NAME,
+                user=_DATABASE_USER,
+                password=password,
+                connect_timeout=5,
+                sslmode="disable",
+            ) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                    if cursor.fetchone() == (1,):
+                        return
+        except Exception:
+            runtime.sleep(1)
+    raise DrillError("database_ready", "database_not_ready")
+
+
+def _stop_child(process: Any | None) -> None:
+    if process is None:
+        return
+    # On an abort, EOF is not a safe way to stop psql: with
+    # --single-transaction it can turn a fully received script into a commit.
+    # Prove the child is stopped before closing its input.  The success path is
+    # the only caller that deliberately closes stdin while psql is running.
+    if process.poll() is None:
+        pid = getattr(process, "pid", None)
+        if os.name != "nt" and isinstance(pid, int):
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if os.name != "nt" and isinstance(pid, int):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            process.wait(timeout=5)
+    stdin = getattr(process, "stdin", None)
+    if (
+        process.poll() is not None
+        and stdin is not None
+        and not getattr(stdin, "closed", False)
+    ):
+        try:
+            stdin.close()
+        except Exception:
+            pass
+
+
+def _stream_diagnostic(
+    runtime: Runtime,
+    process: Any | None,
+    compressed_bytes: int,
+    uncompressed_bytes: int,
+    started_at: float,
+) -> dict[str, int]:
+    diagnostic = {
+        "compressed_bytes": max(0, int(compressed_bytes)),
+        "uncompressed_bytes": max(0, int(uncompressed_bytes)),
+        "elapsed_seconds": max(0, int(runtime.monotonic() - started_at)),
+    }
+    if process is not None:
+        return_code = process.poll()
+        if isinstance(return_code, int):
+            diagnostic["psql_exit_code"] = return_code
+    return diagnostic
+
+
+def _psql_failure_code(return_code: Any) -> str:
+    if return_code == 2:
+        return "psql_connection_failed"
+    if return_code == 3:
+        return "psql_script_failed"
+    return "psql_failed"
+
+
+def _stream_archive_to_psql(
+    runtime: Runtime,
+    config: Config,
+    archive: Archive,
+    password: str,
+    deadline: float,
+) -> dict[str, Any]:
+    if runtime.archive_import is not None:
+        return runtime.archive_import(runtime, config, archive, password, deadline)
+    remaining = int(deadline - runtime.monotonic())
+    if remaining <= 0:
+        raise DrillError("archive_import", "task_deadline_exceeded")
+    command = [
+        _PSQL_TIMEOUT_BINARY,
+        "--signal=TERM",
+        "--kill-after=10s",
+        f"{remaining}s",
+        config.psql_binary,
+        "--host=127.0.0.1",
+        f"--port={_PROXY_PORT}",
+        f"--username={_DATABASE_USER}",
+        f"--dbname={_DATABASE_NAME}",
+        "--no-password",
+        "--single-transaction",
+        "--file=-",
+        "--no-psqlrc",
+        "--quiet",
+        "--set=ON_ERROR_STOP=1",
+    ]
+    child_env = {
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "PGAPPNAME": "blueprint-restore-verifier",
+        "PGCONNECT_TIMEOUT": "10",
+    }
+    process = None
+    compressed = _DigestingReader(None)
+    uncompressed_size = 0
+    stream_started_at = runtime.monotonic()
+    restrict_key: bytes | None = None
+    unrestrict_seen = False
+    maximum_uncompressed = min(
+        _MAX_IMPORT_UNCOMPRESSED_BYTES,
+        archive.size * _MAX_IMPORT_EXPANSION_RATIO,
+    )
+    try:
+        if ":" in password or "\\" in password or "\n" in password or "\r" in password:
+            raise DrillError("archive_import", "password_not_passfile_safe")
+        with tempfile.TemporaryDirectory(prefix="blueprint-restore-") as pass_dir:
+            if os.name != "nt":
+                os.chmod(pass_dir, stat.S_IRWXU)
+            pass_path = os.path.join(pass_dir, "pgpass")
+            descriptor = os.open(
+                pass_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            try:
+                os.write(
+                    descriptor,
+                    (
+                        f"127.0.0.1:{_PROXY_PORT}:{_DATABASE_NAME}:"
+                        f"{_DATABASE_USER}:{password}\n"
+                    ).encode("utf-8"),
+                )
+            finally:
+                os.close(descriptor)
+            child_env["PGPASSFILE"] = pass_path
+            process = runtime.popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=child_env,
+                close_fds=True,
+                start_new_session=True,
+            )
+            if process.stdin is None:
+                raise DrillError("archive_import", "psql_stdin_unavailable")
+            outer_restrict_key = secrets.token_hex(32).encode("ascii")
+            process.stdin.write(b"\\restrict " + outer_restrict_key + b"\n")
+            with runtime.storage.open_archive(archive) as source:
+                compressed = _DigestingReader(source)
+                try:
+                    with gzip.GzipFile(fileobj=compressed, mode="rb") as sql_stream:
+                        at_line_start = True
+                        while True:
+                            if runtime.monotonic() >= deadline:
+                                raise DrillError(
+                                    "archive_import", "task_deadline_exceeded"
+                                )
+                            if process.poll() is not None:
+                                raise DrillError("archive_import", "psql_failed")
+                            chunk = sql_stream.readline(65537)
+                            if not chunk:
+                                break
+                            uncompressed_size += len(chunk)
+                            if uncompressed_size > maximum_uncompressed:
+                                raise DrillError(
+                                    "archive_import",
+                                    "archive_expansion_limit_exceeded",
+                                )
+                            directive = (
+                                _DUMP_RESTRICT_DIRECTIVE_RE.fullmatch(chunk)
+                                if at_line_start and chunk.endswith(b"\n")
+                                else None
+                            )
+                            if directive is not None:
+                                directive_name, directive_key = directive.groups()
+                                if directive_name == b"restrict":
+                                    if restrict_key is not None or unrestrict_seen:
+                                        raise DrillError(
+                                            "archive_import",
+                                            "archive_restrict_envelope_invalid",
+                                        )
+                                    restrict_key = directive_key
+                                elif (
+                                    restrict_key is None
+                                    or unrestrict_seen
+                                    or directive_key != restrict_key
+                                ):
+                                    raise DrillError(
+                                        "archive_import",
+                                        "archive_restrict_envelope_invalid",
+                                    )
+                                else:
+                                    unrestrict_seen = True
+                            else:
+                                process.stdin.write(chunk)
+                            at_line_start = chunk.endswith(b"\n")
+                except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+                    raise DrillError(
+                        "archive_import", "archive_gzip_invalid"
+                    ) from exc
+            if restrict_key is None or not unrestrict_seen:
+                raise DrillError(
+                    "archive_import", "archive_restrict_envelope_missing"
+                )
+            if compressed.size != archive.size:
+                raise DrillError("archive_import", "archive_size_changed")
+            observed_sha256 = compressed.digest.hexdigest()
+            if observed_sha256 != archive.sha256:
+                raise DrillError("archive_import", "archive_digest_changed")
+            process.stdin.close()
+            return_code = process.wait(
+                timeout=max(1, int(deadline - runtime.monotonic()))
+            )
+            if return_code == 124:
+                raise DrillError(
+                    "archive_import",
+                    "psql_timed_out",
+                    diagnostic=_stream_diagnostic(
+                        runtime,
+                        process,
+                        compressed.size,
+                        uncompressed_size,
+                        stream_started_at,
+                    ),
+                )
+            if return_code != 0:
+                raise DrillError(
+                    "archive_import",
+                    _psql_failure_code(return_code),
+                    diagnostic=_stream_diagnostic(
+                        runtime,
+                        process,
+                        compressed.size,
+                        uncompressed_size,
+                        stream_started_at,
+                    ),
+                )
+    except DrillError as exc:
+        if not exc.diagnostic:
+            exc.diagnostic.update(
+                _stream_diagnostic(
+                    runtime,
+                    process,
+                    compressed.size,
+                    uncompressed_size,
+                    stream_started_at,
+                )
+            )
+        raise
+    except BrokenPipeError as exc:
+        return_code = process.poll() if process is not None else None
+        raise DrillError(
+            "archive_import",
+            _psql_failure_code(return_code),
+            diagnostic=_stream_diagnostic(
+                runtime,
+                process,
+                compressed.size,
+                uncompressed_size,
+                stream_started_at,
+            ),
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DrillError(
+            "archive_import",
+            "psql_timed_out",
+            diagnostic=_stream_diagnostic(
+                runtime,
+                process,
+                compressed.size,
+                uncompressed_size,
+                stream_started_at,
+            ),
+        ) from exc
+    except OSError as exc:
+        raise DrillError("archive_import", "archive_stream_failed") from exc
+    finally:
+        _stop_child(process)
+    return {
+        "compressed_bytes": compressed.size,
+        "uncompressed_bytes": uncompressed_size,
+        "sha256": observed_sha256,
+    }
 
 
 def _database_checks(
@@ -1135,6 +1537,7 @@ def _safe_evidence_name(
 
 def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
     started_at = runtime.now().astimezone(timezone.utc)
+    work_deadline = runtime.monotonic() + config.task_work_timeout_seconds
     drill_id = _instance_name(started_at, runtime.suffix(3))
     expires_at = datetime.fromtimestamp(
         started_at.timestamp() + config.instance_ttl_seconds, tz=timezone.utc
@@ -1164,8 +1567,10 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
     restore_verified_at: datetime | None = None
 
     try:
+        if config.expected_archive is None and runtime.archive_import is None:
+            raise DrillError("configuration", "restore_requires_expected_archive")
         evidence["janitor_removed"] = _reconcile_drill_instances(
-            runtime, config, started_at
+            runtime, config, started_at, deadline=work_deadline
         )
         evidence["stage"] = "archive_selection"
         archive = runtime.storage.latest_archive(started_at)
@@ -1196,7 +1601,13 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
             if exc.definitive_rejection:
                 instance_request_state = "rejected"
             raise
-        _wait_operation(runtime, config, operation, stage="instance_create")
+        _wait_operation(
+            runtime,
+            config,
+            operation,
+            stage="instance_create",
+            deadline=work_deadline,
+        )
 
         evidence["stage"] = "instance_verify"
         connection_name = _verify_private_instance(
@@ -1205,31 +1616,68 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
 
         evidence["stage"] = "database_create"
         operation = runtime.sql.create_database(drill_id, _DATABASE_NAME)
-        _wait_operation(runtime, config, operation, stage="database_create")
+        _wait_operation(
+            runtime,
+            config,
+            operation,
+            stage="database_create",
+            deadline=work_deadline,
+        )
 
         evidence["stage"] = "database_user"
         password = runtime.password(48)
         if len(password) < 48:
             raise DrillError("database_user", "password_generation_failed")
         operation = runtime.sql.set_postgres_password(drill_id, password)
-        _wait_operation(runtime, config, operation, stage="database_user")
-
-        evidence["stage"] = "archive_import"
-        runtime.storage.assert_import_generation_current(archive)
-        operation = runtime.sql.import_archive(drill_id, archive.uri)
-        _wait_operation(runtime, config, operation, stage="archive_import")
-        runtime.storage.assert_import_generation_current(archive)
-        evidence["archive"]["generation_stable_during_import"] = True
+        _wait_operation(
+            runtime,
+            config,
+            operation,
+            stage="database_user",
+            deadline=work_deadline,
+        )
 
         evidence["stage"] = "proxy_start"
         proxy, _proxy_command = _start_proxy(runtime, config, connection_name)
+
+        evidence["stage"] = "database_ready"
+        _wait_database_ready(
+            runtime,
+            config,
+            password,
+            deadline=work_deadline,
+        )
+
+        evidence["stage"] = "archive_import"
+        runtime.storage.assert_import_generation_current(archive)
+        import_result = _stream_archive_to_psql(
+            runtime,
+            config,
+            archive,
+            password,
+            work_deadline,
+        )
+        runtime.storage.assert_import_generation_current(archive)
+        evidence["archive"].update(
+            {
+                "restore_method": "generation-pinned-gzip-psql",
+                "generation_pinned_read": True,
+                "compressed_size_reverified": (
+                    import_result["compressed_bytes"] == archive.size
+                ),
+                "compressed_sha256_reverified": (
+                    import_result["sha256"] == archive.sha256
+                ),
+                "uncompressed_bytes": import_result["uncompressed_bytes"],
+            }
+        )
 
         evidence["stage"] = "database_verify"
         checks, revision = _database_checks(runtime, config, password)
         checks.insert(
             0,
             {
-                "name": "archive_decryption_and_import",
+                "name": "archive_decryption_and_restore",
                 "passed": True,
             },
         )
@@ -1293,8 +1741,15 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
                 try:
                     delete_operation = runtime.sql.delete_instance(drill_id)
                     if delete_operation:
+                        cleanup_deadline = (
+                            runtime.monotonic() + config.cleanup_timeout_seconds
+                        )
                         _wait_operation(
-                            runtime, config, delete_operation, stage="cleanup"
+                            runtime,
+                            config,
+                            delete_operation,
+                            stage="cleanup",
+                            deadline=cleanup_deadline,
                         )
                     evidence["cleanup"]["completed"] = True
                 except Exception:
@@ -1362,23 +1817,47 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
     return (0 if evidence["outcome"] == "success" else 1), evidence
 
 
-def _validate_proxy_binary(path_text: str) -> None:
+def _validate_executable(path_text: str, failure_prefix: str) -> None:
     path = Path(path_text)
     try:
         info = path.lstat()
     except OSError as exc:
-        raise DrillError("configuration", "proxy_binary_unavailable") from exc
+        raise DrillError(
+            "configuration", f"{failure_prefix}_binary_unavailable"
+        ) from exc
     if (
         stat.S_ISLNK(info.st_mode)
         or not stat.S_ISREG(info.st_mode)
         or not (info.st_mode & stat.S_IXUSR)
         or info.st_mode & 0o022
     ):
-        raise DrillError("configuration", "proxy_binary_insecure")
+        raise DrillError("configuration", f"{failure_prefix}_binary_insecure")
+
+
+def _validate_psql_version(path_text: str) -> None:
+    try:
+        result = subprocess.run(
+            [path_text, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            close_fds=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:
+        raise DrillError("configuration", "psql_version_unavailable") from exc
+    match = re.fullmatch(rb"psql \(PostgreSQL\) 15\.(\d+)[^\r\n]*\r?\n?", result.stdout)
+    if result.returncode != 0 or match is None or int(match.group(1)) < 18:
+        raise DrillError("configuration", "psql_version_insecure")
 
 
 def build_runtime(config: Config) -> Runtime:
-    _validate_proxy_binary(config.proxy_binary)
+    _validate_executable(config.proxy_binary, "proxy")
+    _validate_executable(config.psql_binary, "psql")
+    _validate_executable(_PSQL_TIMEOUT_BINARY, "timeout")
+    _validate_psql_version(config.psql_binary)
     try:
         import google.auth
         import psycopg
@@ -1420,7 +1899,15 @@ def main(argv: list[str] | None = None) -> int:
         runtime = build_runtime(config)
         if args == ["--janitor-only"]:
             now = runtime.now().astimezone(timezone.utc)
-            removed = _reconcile_drill_instances(runtime, config, now)
+            janitor_deadline = (
+                runtime.monotonic() + _JANITOR_WORK_TIMEOUT_SECONDS
+            )
+            removed = _reconcile_drill_instances(
+                runtime,
+                config,
+                now,
+                deadline=janitor_deadline,
+            )
             event = {
                 "event": "db_restore_drill_janitor",
                 "outcome": "success",

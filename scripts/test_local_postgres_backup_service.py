@@ -204,7 +204,8 @@ class LocalPostgresBackupTests(unittest.TestCase):
             'resource "google_service_account" "local_postgres_backup_writer"'
         )
         end = iam.index(
-            'resource "google_storage_bucket_iam_member" "recovery_cloud_sql_reader"'
+            'resource "google_project_iam_member" '
+            '"recovery_cloud_sql_service_agent"'
         )
         writer = iam[start:end]
         self.assertIn('role   = "roles/storage.objectCreator"', writer)

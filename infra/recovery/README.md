@@ -96,12 +96,14 @@ dependency. Keep
 layer and the verifier image exists by immutable digest.
 
 Terraform then creates two recovery-project Cloud Run jobs. The janitor has a
-separate identity that cannot read archives or create/import Cloud SQL
+separate identity that cannot read archives or create Cloud SQL
 instances and remains enabled independently of the full drill. Once explicitly
-scheduled, a weekly drill
-integrity-checks the newest manifest/archive pair, creates a private
-PostgreSQL 15 Cloud SQL instance, imports and probes it, writes evidence, and
-deletes it. A separate 30-minute janitor lists only recovery-project Cloud SQL
+invoked with a complete immutable archive pin, the drill creates a private
+PostgreSQL 15 Cloud SQL instance, streams the verified archive through a
+restricted PostgreSQL 15.18 client over the private Auth Proxy, probes it,
+writes evidence, and deletes it. Recurring drills remain fail-closed until
+future backups use a trusted custom-format provenance contract. A separate
+30-minute janitor lists only recovery-project Cloud SQL
 instances and deletes expired or ambiguous instances only when both their
 `bp-restore-` name and `blueprint-purpose=restore-drill` label prove
 ownership. Cleanup intent is recorded before every create request, so an
@@ -115,9 +117,9 @@ evidence, and then explicitly remove the lifecycle guards in a reviewed change.
 
 The verifier requires `RECOVERY_PROJECT_NUMBER` and reloads the archive bucket
 before any list or evidence write. It refuses to proceed unless the bucket's
-authoritative project number matches. Cloud SQL's recovery-project service
-identity receives object-view and key-decrypt access only to this archive
-bucket/key; it receives no production-project or archive-write permission.
+authoritative project number matches. The verifier alone receives archive read
+and key-decrypt access; ephemeral Cloud SQL identities receive no archive or
+key access.
 
 This root is intentionally not disposable after it contains recovery data:
 the KMS key has Terraform `prevent_destroy`, the bucket has `force_destroy =
