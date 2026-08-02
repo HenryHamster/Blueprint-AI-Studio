@@ -748,6 +748,7 @@ def _instance_body(config: Config, name: str, expires_at: datetime) -> dict[str,
         "name": name,
         "region": config.region,
         "databaseVersion": "POSTGRES_15",
+        "sqlNetworkArchitecture": "NEW_NETWORK_ARCHITECTURE",
         "settings": {
             "tier": _DRILL_TIER,
             "availabilityType": "ZONAL",
@@ -855,8 +856,12 @@ def _verify_private_instance(instance: dict[str, Any], config: Config) -> str:
     if (
         instance.get("project") not in {None, config.recovery_project_id}
         or instance.get("databaseVersion") != "POSTGRES_15"
+        or instance.get("sqlNetworkArchitecture")
+        != "NEW_NETWORK_ARCHITECTURE"
         or ip_config.get("ipv4Enabled") is not False
         or ip_config.get("privateNetwork") != config.private_network
+        or ip_config.get("allocatedIpRange")
+        != config.private_service_range
     ):
         raise DrillError("instance_verify", "instance_not_private_recovery_only")
     for address in instance.get("ipAddresses") or []:

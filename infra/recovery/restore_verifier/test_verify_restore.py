@@ -97,6 +97,7 @@ class FakeSql:
         return {
             "project": "blueprint-recovery",
             "databaseVersion": "POSTGRES_15",
+            "sqlNetworkArchitecture": "NEW_NETWORK_ARCHITECTURE",
             "connectionName": f"blueprint-recovery:us-central1:{name}",
             "settings": {
                 "ipConfiguration": {
@@ -104,6 +105,7 @@ class FakeSql:
                     "privateNetwork": (
                         "/projects/blueprint-recovery/global/networks/recovery"
                     ),
+                    "allocatedIpRange": "blueprint-restore-private-services",
                 }
             },
             "ipAddresses": [{"type": "PRIVATE", "ipAddress": "10.2.0.3"}],
@@ -580,7 +582,11 @@ class CloudSqlContractTests(unittest.TestCase):
         name = "bp-restore-202607301200-a1b2c3"
         body = verifier._instance_body(cfg, name, NOW + timedelta(hours=3))
         self.assertEqual(body["databaseVersion"], "POSTGRES_15")
+        self.assertEqual(
+            body["sqlNetworkArchitecture"], "NEW_NETWORK_ARCHITECTURE"
+        )
         settings = body["settings"]
+        self.assertNotIn("sqlNetworkArchitecture", settings)
         self.assertEqual(settings["tier"], "db-custom-1-3840")
         self.assertEqual(settings["dataDiskSizeGb"], "20")
         self.assertFalse(settings["storageAutoResize"])
@@ -664,6 +670,7 @@ class CloudSqlContractTests(unittest.TestCase):
         instance = {
             "project": "blueprint-recovery",
             "databaseVersion": "POSTGRES_15",
+            "sqlNetworkArchitecture": "NEW_NETWORK_ARCHITECTURE",
             "connectionName": (
                 "blueprint-recovery:us-central1:"
                 "bp-restore-202607301200-a1b2c3"
@@ -674,12 +681,33 @@ class CloudSqlContractTests(unittest.TestCase):
                     "privateNetwork": (
                         "/projects/blueprint-recovery/global/networks/recovery"
                     ),
+                    "allocatedIpRange": "blueprint-restore-private-services",
                 }
             },
             "ipAddresses": [{"type": "PRIMARY", "ipAddress": "35.1.2.3"}],
         }
         with self.assertRaisesRegex(verifier.DrillError, "public_ip_present"):
             verifier._verify_private_instance(instance, config())
+
+    def test_instance_verification_rejects_network_architecture_or_range_drift(self):
+        base = FakeSql().get_instance("bp-restore-202607301200-a1b2c3")
+        for mutate in (
+            lambda value: value.pop("sqlNetworkArchitecture"),
+            lambda value: value.__setitem__(
+                "sqlNetworkArchitecture", "OLD_NETWORK_ARCHITECTURE"
+            ),
+            lambda value: value["settings"]["ipConfiguration"].__setitem__(
+                "allocatedIpRange", "unexpected-range"
+            ),
+        ):
+            instance = json.loads(json.dumps(base))
+            mutate(instance)
+            with self.subTest(instance=instance):
+                with self.assertRaisesRegex(
+                    verifier.DrillError,
+                    "instance_not_private_recovery_only",
+                ):
+                    verifier._verify_private_instance(instance, config())
 
     def test_operation_failure_and_timeout_fail_closed(self):
         failed_sql = FakeSql(fail_stage="archive_import")
