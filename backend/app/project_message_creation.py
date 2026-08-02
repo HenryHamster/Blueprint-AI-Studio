@@ -118,7 +118,13 @@ OPERATOR_CONTEXT_TEXT_CAPS = {
     "dedupe_key": 240,
 }
 RESERVED_OPERATOR_CONTEXT_KEYS = frozenset(
-    {"event_type", "strategic_session", "operator_command", "check_in"}
+    {
+        "event_type",
+        "strategic_session",
+        "operator_command",
+        "check_in",
+        "_resident_activation_prompt",
+    }
 )
 
 
@@ -545,6 +551,7 @@ async def create_operator_project_message(
     message_type: MessageType,
     content: str,
     context: dict[str, Any] | None,
+    server_context: dict[str, Any] | None = None,
     workbench_context: dict[str, Any] | None,
     idempotency_key: str | None,
     persist_empty_workbench_context: bool = False,
@@ -578,7 +585,10 @@ async def create_operator_project_message(
             detail="Workbench context too large (max 50KB)",
         )
 
-    message_context = _operator_context(context)
+    message_context = {
+        **_operator_context(context),
+        **dict(server_context or {}),
+    }
     request_fingerprint = _operator_request_fingerprint(
         user_id=user_id,
         message_type=message_type,

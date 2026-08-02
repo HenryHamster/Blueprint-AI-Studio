@@ -1205,6 +1205,42 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.textContent).toContain('Should I keep this path?');
   });
 
+  test('hides the Workday activation trigger but shows its model-generated reply', async () => {
+    const activation = makeMsg({
+      id: 'workday-activation',
+      from_type: 'user',
+      message_type: 'NOTE',
+      content: 'Internal instruction that must not appear as operator text',
+      context: { _resident_activation_prompt: true },
+      surface: 'conversation',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const opening = makeMsg({
+      id: 'workday-opening',
+      from_type: 'strategist',
+      message_type: 'NOTE',
+      content: 'Want to pick up the memory architecture question?',
+      surface: 'conversation',
+      created_at: '2026-06-01T10:00:01Z',
+    });
+
+    const el = await renderPanel(
+      { filterChrome: 'minimal' },
+      [activation, opening],
+    );
+
+    await waitFor(() => {
+      expect(el.textContent).toContain(
+        'Want to pick up the memory architecture question?',
+      );
+    });
+    expect(el.textContent).not.toContain(
+      'Internal instruction that must not appear as operator text',
+    );
+    expect(el.querySelector('[data-message-id="workday-activation"]')).toBeNull();
+    expect(el.querySelector('[data-message-id="workday-opening"]')).not.toBeNull();
+  });
+
   test('full message chrome keeps triage actions available', async () => {
     const feedback = makeMsg({
       id: 'feedback-action',

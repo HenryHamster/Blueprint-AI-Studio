@@ -523,6 +523,29 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     vi.useRealTimers();
   });
 
+  it('publishes a ready waiting state before entering the conversational loop', async () => {
+    mockApiGet.mockResolvedValue({ messages: [] });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+    const statusRef = { value: '' };
+    let statusAtLoopEntry = '';
+    mockStartSession.mockReturnValue(makeSession(
+      async () => turnResult(),
+      () => {
+        statusAtLoopEntry = statusRef.value;
+        return false;
+      },
+    ));
+
+    await handleStrategicResident(
+      'resident-ready-status',
+      { project_name: 'P', open_messages: [], strategic_session_autonomous: false },
+      { project_metadata: { project_id: 'ready-project' }, context: {} },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+
+    expect(statusAtLoopEntry).toBe('Resident ready — waiting for operator input');
+  });
+
   it('acquires the fenced slot before readiness and releases it on normal shutdown', async () => {
     const order: string[] = [];
     mockApiGet.mockResolvedValue({ messages: [] });
