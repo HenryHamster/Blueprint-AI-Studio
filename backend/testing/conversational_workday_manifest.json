@@ -164,6 +164,15 @@
       ]
     },
     {
+      "path": "agent/src/index.provider-runner.test.ts",
+      "reason": "Protects Claude capability negotiation used by Resident startup, including split stdout/stderr help output, truncated help retries, and environment-scoped caching. Runner admission and Resident launch must interpret the same CLI capability surface.",
+      "test_ids": [
+        "retries a truncated Claude help surface before caching Resident capabilities",
+        "recognizes Resident flags emitted on Claude help stderr",
+        "does not reuse Claude capabilities across distinct executable environments"
+      ]
+    },
+    {
       "path": "agent/src/handlers/strategic-resident-prompt.test.ts",
       "reason": "Protects the canonical process-level Strategic Resident identity, its strategic object model, implementation boundary, direction coherence rules, and native operator reply protocol.",
       "test_ids": [

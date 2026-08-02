@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import type WebSocket from 'ws';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import { getCheckRunawayStatus, isCheckInvocation, recordCheckOutcome } from '../fix-loop-events.js';
@@ -121,6 +121,24 @@ function claudeFlagsFromHelp(helpText: string): ReadonlySet<string> {
   return new Set(helpText.match(/--[a-zA-Z0-9-]+/g) ?? []);
 }
 
+function claudeHelpOutput(command: string, env: NodeJS.ProcessEnv): string | null {
+  const result = spawnSync(command, ['--help'], {
+    env,
+    encoding: 'utf8',
+    timeout: 5_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.error || result.status !== 0) return null;
+  // Claude distributions do not consistently choose the same stream for help.
+  // The runner readiness probe already combines both; the launch-time probe
+  // must do the same or a runner can be admitted and then rejected by Resident.
+  const output = [result.stdout, result.stderr]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .join('\n')
+    .trim();
+  return output || null;
+}
+
 /**
  * Returns the optional Claude CLI capabilities advertised by this binary.
  * A failed or ambiguous probe deliberately returns null (fail open): launch
@@ -142,13 +160,7 @@ export function probeClaudeCapabilities(command: string, env: NodeJS.ProcessEnv)
       claudeCapabilityByEnvironment.set(environmentKey, cached);
       return cached;
     }
-    const help = execFileSync(command, ['--help'], {
-      env,
-      encoding: 'utf8',
-      timeout: 5_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const helpText = typeof help === 'string' ? help.trim() : '';
+    const helpText = claudeHelpOutput(command, env) ?? '';
     let capabilities = helpText ? claudeFlagsFromHelp(helpText) : null;
     // Some packaged Claude CLIs have intermittently emitted a truncated help
     // surface. Retry a suspiciously incomplete result before caching it; a
@@ -156,18 +168,13 @@ export function probeClaudeCapabilities(command: string, env: NodeJS.ProcessEnv)
     // required-flag gate still fails closed.
     if (capabilities && [...CLAUDE_RESIDENT_REQUIRED_FLAGS].some((flag) => !capabilities?.has(flag))) {
       try {
-        const retryHelp = execFileSync(command, ['--help'], {
-          env,
-          encoding: 'utf8',
-          timeout: 5_000,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        const retryText = typeof retryHelp === 'string' ? retryHelp.trim() : '';
+        const retryText = claudeHelpOutput(command, env) ?? '';
         const retryCapabilities = retryText ? claudeFlagsFromHelp(retryText) : null;
-        const retryProvesResidentSupport = retryCapabilities
-          && [...CLAUDE_RESIDENT_REQUIRED_FLAGS].every((flag) => retryCapabilities.has(flag));
-        if (retryCapabilities && (retryProvesResidentSupport || retryCapabilities.size > capabilities.size)) {
-          capabilities = retryCapabilities;
+        if (retryCapabilities) {
+          // A truncated help render can omit a different section on each call.
+          // Union independently observed flags instead of choosing one partial
+          // render and discarding valid evidence from the other.
+          capabilities = new Set([...capabilities, ...retryCapabilities]);
         }
       } catch {
         // Keep the first definite result; required consumers still fail closed.
