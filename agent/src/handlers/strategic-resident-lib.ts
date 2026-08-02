@@ -864,6 +864,12 @@ export const MAX_POLL_PAGES = 100;
  * persisted `message_cursor`; else start a short window in the past so a message
  * sent moments before the session started (often the one that triggered it) is
  * still picked up on the first poll.
+ *
+ * A fresh worker can also be handed older, still-open operator messages in its
+ * bootstrap payload. Rewind to the earliest of those explicit rows so the
+ * canonical status=open poll can admit and claim them. Merely rendering them in
+ * the bootstrap prompt is insufficient in on-demand mode because Workday does
+ * not run a turn until a message is admitted.
  */
 export function initialCursor(
   task: Record<string, unknown>,
@@ -874,10 +880,22 @@ export function initialCursor(
     ? task.context as Record<string, unknown>
     : {};
   const fromCtx = str(ctx.message_cursor);
-  if (fromCtx) return fromCtx;
   const fromPayload = str(payload.message_cursor);
-  if (fromPayload) return fromPayload;
-  return new Date(now - 2 * 60_000).toISOString();
+  const base = fromCtx || fromPayload || new Date(now - 2 * 60_000).toISOString();
+  let earliest = base;
+  let earliestMs = Date.parse(base);
+  if (Number.isNaN(earliestMs)) earliestMs = Infinity;
+  const openMessages = Array.isArray(payload.open_messages) ? payload.open_messages : [];
+  for (const raw of openMessages) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const createdAt = str((raw as Record<string, unknown>).created_at);
+    const createdAtMs = Date.parse(createdAt);
+    if (!Number.isNaN(createdAtMs) && createdAtMs < earliestMs) {
+      earliest = createdAt;
+      earliestMs = createdAtMs;
+    }
+  }
+  return earliest;
 }
 
 /**

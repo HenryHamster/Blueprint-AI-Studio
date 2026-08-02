@@ -2,14 +2,27 @@ FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f14
 
 ARG CLOUD_SQL_PROXY_VERSION=2.22.0
 ARG CLOUD_SQL_PROXY_SHA256=42e73a8775bc3300b6514816cc4893f01b109a50f65aa779a451d3e4ff4c3ead
+ARG POSTGRESQL_CLIENT_VERSION=15.18-0+deb12u1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      "postgresql-client-15=${POSTGRESQL_CLIENT_VERSION}" \
     && curl --fail --location --proto '=https' --tlsv1.2 \
       "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64" \
       --output /usr/local/bin/cloud-sql-proxy \
     && echo "${CLOUD_SQL_PROXY_SHA256}  /usr/local/bin/cloud-sql-proxy" | sha256sum --check --strict \
     && chmod 0555 /usr/local/bin/cloud-sql-proxy \
+    && psql --version | grep -E '^psql \(PostgreSQL\) 15\.18 ' \
+    && groupadd --gid 65532 blueprint \
+    && useradd \
+      --uid 65532 \
+      --gid 65532 \
+      --home-dir /nonexistent \
+      --shell /usr/sbin/nologin \
+      --no-create-home \
+      blueprint \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 

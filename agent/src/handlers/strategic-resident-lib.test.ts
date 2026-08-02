@@ -131,6 +131,25 @@ describe('initialCursor', () => {
     const cur = initialCursor({}, {}, now);
     expect(new Date(cur).getTime()).toBe(now - 2 * 60_000);
   });
+
+  it('rewinds a persisted cursor to include an explicitly shipped open message', () => {
+    const cur = initialCursor(
+      { context: { message_cursor: '2026-06-01T12:00:00Z' } },
+      { open_messages: [{ id: 'pending', created_at: '2026-06-01T10:00:00Z' }] },
+    );
+    expect(cur).toBe('2026-06-01T10:00:00Z');
+  });
+
+  it('does not move a cursor forward for newer or malformed open-message timestamps', () => {
+    const cur = initialCursor(
+      { context: { message_cursor: '2026-06-01T12:00:00Z' } },
+      { open_messages: [
+        { id: 'newer', created_at: '2026-06-01T13:00:00Z' },
+        { id: 'malformed', created_at: 'not-a-date' },
+      ] },
+    );
+    expect(cur).toBe('2026-06-01T12:00:00Z');
+  });
 });
 
 describe('advanceCursorFromMessages', () => {

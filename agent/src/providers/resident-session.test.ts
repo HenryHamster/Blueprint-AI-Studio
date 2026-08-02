@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import path from 'path';
 
 // ── Hoisted setup ─────────────────────────────────────────────────────────────
 vi.hoisted(() => {
@@ -9,6 +10,17 @@ vi.hoisted(() => {
 // ── Module mocks ─────────────────────────────────────────────────────────────
 vi.mock('child_process', () => ({
   spawn: vi.fn(),
+}));
+
+vi.mock('fs', () => ({
+  default: {
+    readFileSync: vi.fn(() => { throw new Error('ENOENT'); }),
+    mkdirSync: vi.fn(),
+    writeFileSync: vi.fn(),
+  },
+  readFileSync: vi.fn(() => { throw new Error('ENOENT'); }),
+  mkdirSync: vi.fn(),
+  writeFileSync: vi.fn(),
 }));
 
 vi.mock('../index.js', () => ({
@@ -67,9 +79,10 @@ vi.mock('./runners.js', () => ({
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 import { spawn } from 'child_process';
+import fs from 'fs';
 import { startResidentClaudeSession } from './resident-session.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
-import { recordLlmTokens, recordNumTurns } from '../index.js';
+import { normalizeClaudeConfigContent, recordLlmTokens, recordNumTurns } from '../index.js';
 import { encodeUserTurnBlocks } from './resident-stream.js';
 import {
   probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
@@ -127,6 +140,12 @@ const STRATEGIC_CREATE = './strategic create-direction \'{}\'';
 describe('startResidentClaudeSession', () => {
   beforeEach(() => {
     vi.mocked(spawn).mockReset();
+    vi.mocked(fs.readFileSync).mockReset();
+    vi.mocked(fs.readFileSync).mockImplementation(() => { throw new Error('ENOENT'); });
+    vi.mocked(fs.mkdirSync).mockReset();
+    vi.mocked(fs.writeFileSync).mockReset();
+    vi.mocked(normalizeClaudeConfigContent).mockReset();
+    vi.mocked(normalizeClaudeConfigContent).mockImplementation((_path, content) => content);
     vi.mocked(probeClaudeCapabilities).mockReset();
     vi.mocked(probeClaudeCapabilities).mockReturnValue(new Set([
       '--input-format', '--append-system-prompt', '--mcp-config',
@@ -158,6 +177,32 @@ describe('startResidentClaudeSession', () => {
     expect(registerChildPid).toHaveBeenCalledWith(4242);
     session.close();
   });
+
+  it('materializes Claude workspace trust before spawning a Resident', () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    vi.mocked(normalizeClaudeConfigContent).mockReturnValueOnce('{"trusted":true}');
+
+    const session = startResidentClaudeSession({
+      workspace: '/workspace/agent',
+      env: { HOME: '/resident-home' },
+    });
+
+    const configPath = path.join('/resident-home', '.claude.json');
+    expect(normalizeClaudeConfigContent).toHaveBeenCalledWith(
+      configPath, '{}', '/workspace/agent',
+    );
+    expect(fs.mkdirSync).toHaveBeenCalledWith(path.dirname(configPath), {
+      recursive: true,
+      mode: 0o700,
+    });
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      configPath, '{"trusted":true}',
+      { encoding: 'utf8', mode: 0o600 },
+    );
+    session.close();
+  });
+
   it('applies the Claude optional-flag compatibility gate before resident spawn', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);

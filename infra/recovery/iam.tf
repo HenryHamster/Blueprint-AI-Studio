@@ -28,25 +28,6 @@ resource "google_storage_bucket_iam_member" "local_postgres_backup_writer" {
   member = "serviceAccount:${google_service_account.local_postgres_backup_writer[0].email}"
 }
 
-# Cloud SQL imports the selected drill archive server-side. This recovery-only
-# service identity can read archive objects and decrypt only this archive key;
-# it receives no write/delete permission and no role in the source project.
-resource "google_storage_bucket_iam_member" "recovery_cloud_sql_reader" {
-  count  = local.recovery_enabled ? 1 : 0
-  bucket = google_storage_bucket.db_backup[0].name
-  role   = "roles/storage.objectViewer"
-  member = "serviceAccount:${google_project_service_identity.cloud_sql[0].email}"
-}
-
-resource "google_kms_crypto_key_iam_member" "recovery_cloud_sql_decrypter" {
-  count         = local.recovery_enabled ? 1 : 0
-  crypto_key_id = google_kms_crypto_key.db_backup[0].id
-  role          = "roles/cloudkms.cryptoKeyDecrypter"
-  member        = "serviceAccount:${google_project_service_identity.cloud_sql[0].email}"
-
-  depends_on = [time_sleep.service_agent_propagation]
-}
-
 # Service identities can exist without their standard project grants after
 # project bootstrap or IAM drift. Manage these bindings explicitly so private
 # Cloud SQL creation does not depend on an implicit, out-of-band grant.

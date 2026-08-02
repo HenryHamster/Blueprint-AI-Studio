@@ -577,7 +577,7 @@ function parseSecretFileMode(raw: unknown): number {
 // manifest in-process instead, so keep the invariant here as well: an omitted
 // config becomes a minimal non-secret onboarding/trust config, while a valid
 // operator-supplied object retains all of its other settings.
-function normalizeClaudeConfigContent(
+export function normalizeClaudeConfigContent(
   filePath: string,
   content: string,
   workspace = WORKSPACE,

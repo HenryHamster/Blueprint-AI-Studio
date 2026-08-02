@@ -60,6 +60,12 @@ vi.mock('child_process', () => ({
     kill: vi.fn(),
   }),
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  spawnSync: vi.fn().mockReturnValue({
+    error: undefined,
+    status: 0,
+    stdout: '',
+    stderr: '',
+  }),
   execSync: vi.fn().mockReturnValue(''),
   // reset.ts (now imported transitively via index.ts) wraps execFile with
   // promisify; supply the (cmd, args, opts, callback) shape so reset's
@@ -146,7 +152,7 @@ import {
   HEARTBEAT_INFLIGHT_DEADLINE,
   PROCESS_KILL_GRACE_MS,
 } from './constants.js';
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
 
@@ -1447,9 +1453,17 @@ describe('LLM-no-progress watchdog (in-flight-tool suppression)', () => {
 
   it('disables only the partial-message no-progress watchdog when an old CLI does not advertise partial streaming', async () => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync)
-      .mockReturnValueOnce('claude 0.9.0')
-      .mockReturnValueOnce('Usage: claude [options]\n  --output-format <format>');
+    vi.mocked(spawnSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValueOnce('claude 0.9.0');
+    vi.mocked(spawnSync).mockReturnValue({
+      pid: 123,
+      output: [null, 'Usage: claude [options]\n  --output-format <format>', ''],
+      stdout: 'Usage: claude [options]\n  --output-format <format>',
+      stderr: '',
+      status: 0,
+      signal: null,
+      error: undefined,
+    });
     const { child, handlers, emitStdout } = makeChild(7809);
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);

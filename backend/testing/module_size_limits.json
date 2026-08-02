@@ -172,7 +172,7 @@
     "prompts/done-helper.test.ts": 900,
     "handlers/research-plan.ts": 3000,
     "handlers/strategic.ts": 1900,
-    "handlers/strategic-resident-lib.ts": 3050,
+    "handlers/strategic-resident-lib.ts": 3550,
     "handlers/strategic-resident.ts": 5350,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 1150,

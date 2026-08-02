@@ -44,6 +44,12 @@ vi.mock('child_process', () => ({
     kill: vi.fn(),
   }),
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  spawnSync: vi.fn().mockReturnValue({
+    error: undefined,
+    status: 0,
+    stdout: '',
+    stderr: '',
+  }),
   execSync: vi.fn().mockReturnValue(''),
   // reset.ts (now imported transitively via index.ts) wraps execFile with
   // promisify; supply the (cmd, args, opts, callback) shape so reset's
@@ -102,8 +108,25 @@ import {
   stripUnsupportedClaudeOptionalArgs,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
-import { execFileSync, spawn, execSync } from 'child_process';
+import { execFileSync, spawn, spawnSync, execSync } from 'child_process';
 import fs from 'fs';
+
+function mockSpawnSyncResult(
+  stdout = '',
+  stderr = '',
+  overrides: Partial<ReturnType<typeof spawnSync>> = {},
+): ReturnType<typeof spawnSync> {
+  return {
+    pid: 123,
+    output: [null, stdout, stderr],
+    stdout,
+    stderr,
+    status: 0,
+    signal: null,
+    error: undefined,
+    ...overrides,
+  };
+}
 
 /** Asserts a value is defined and returns it (narrowed). */
 function defined<T>(v: T | undefined | null, msg = 'expected value to be defined'): T {
@@ -665,16 +688,18 @@ describe('provider runner prompt transport', () => {
 
   it('caches Claude capabilities by binary version and preserves model routing while stripping unsupported optional flag values', () => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync)
-      .mockReturnValueOnce('claude 1.2.3')
-      .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>')
-      .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>');
+    vi.mocked(spawnSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValueOnce('claude 1.2.3');
+    vi.mocked(spawnSync).mockReturnValue(mockSpawnSyncResult(
+      'Usage: claude [options]\n  --model <model>\n  --effort <level>',
+    ));
     const first = probeClaudeCapabilities('claude', process.env);
     const second = probeClaudeCapabilities('claude', process.env);
 
     expect(first).toEqual(new Set(['--model', '--effort']));
     expect(second).toBe(first);
-    expect(execFileSync).toHaveBeenCalledTimes(3);
+    expect(execFileSync).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledTimes(2);
     expect(stripUnsupportedClaudeOptionalArgs(
       ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], first,
     )).toEqual(['--model', 'glm-5.2', '--effort', 'high']);
@@ -685,9 +710,10 @@ describe('provider runner prompt transport', () => {
 
   it('retries a truncated Claude help surface before caching Resident capabilities', () => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync)
-      .mockReturnValueOnce('claude 2.1.220')
-      .mockReturnValueOnce([
+    vi.mocked(spawnSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValueOnce('claude 2.1.220');
+    vi.mocked(spawnSync)
+      .mockReturnValueOnce(mockSpawnSyncResult([
         'Usage: claude [options]',
         '  --model <model>',
         '  --effort <level>',
@@ -695,8 +721,8 @@ describe('provider runner prompt transport', () => {
         '  --input-format <format>',
         '  --output-format <format>',
         '  --verbose',
-      ].join('\n'))
-      .mockReturnValueOnce([
+      ].join('\n')))
+      .mockReturnValueOnce(mockSpawnSyncResult([
         'Usage: claude [options]',
         '  --model <model>',
         '  --input-format <format>',
@@ -704,11 +730,43 @@ describe('provider runner prompt transport', () => {
         '  --mcp-config <path>',
         '  --strict-mcp-config',
         '  --allowedTools <tool>',
-      ].join('\n'));
+      ].join('\n')));
 
     const capabilities = probeClaudeCapabilities('claude', process.env);
 
     expect(capabilities).toEqual(new Set([
+      '--model',
+      '--effort',
+      '--include-partial-messages',
+      '--input-format',
+      '--output-format',
+      '--verbose',
+      '--append-system-prompt',
+      '--mcp-config',
+      '--strict-mcp-config',
+      '--allowedTools',
+    ]));
+    expect(probeClaudeCapabilities('claude', process.env)).toBe(capabilities);
+    expect(execFileSync).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledTimes(2);
+  });
+
+  it('recognizes Resident flags emitted on Claude help stderr', () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(spawnSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValueOnce('2.1.220 (Claude Code)');
+    vi.mocked(spawnSync).mockReturnValueOnce(mockSpawnSyncResult(
+      'Usage: claude [options]\n  --model <model>',
+      [
+        '--input-format <format>',
+        '--append-system-prompt <prompt>',
+        '--mcp-config <path>',
+        '--strict-mcp-config',
+        '--allowedTools <tool>',
+      ].join('\n'),
+    ));
+
+    expect(probeClaudeCapabilities('claude', process.env)).toEqual(new Set([
       '--model',
       '--input-format',
       '--append-system-prompt',
@@ -716,21 +774,20 @@ describe('provider runner prompt transport', () => {
       '--strict-mcp-config',
       '--allowedTools',
     ]));
-    expect(probeClaudeCapabilities('claude', process.env)).toBe(capabilities);
-    expect(execFileSync).toHaveBeenCalledTimes(3);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
   });
 
   it('does not reuse Claude capabilities across distinct executable environments', () => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockImplementation((_command, args, options) => {
-      if (args?.[0] === '--version') return '2.1.220 (Claude Code)\n';
-      if (args?.[0] === '--help') {
-        const probePath = (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.PATH;
-        return probePath === '/modern/bin'
+    vi.mocked(spawnSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('2.1.220 (Claude Code)\n');
+    vi.mocked(spawnSync).mockImplementation((_command, _args, options) => {
+      const probePath = options?.env?.PATH;
+      return mockSpawnSyncResult(
+        probePath === '/modern/bin'
           ? '--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools'
-          : '--input-format --mcp-config --strict-mcp-config --allowedTools';
-      }
-      return '';
+          : '--input-format --mcp-config --strict-mcp-config --allowedTools',
+      );
     });
 
     const legacy = probeClaudeCapabilities('claude', {
@@ -746,17 +803,23 @@ describe('provider runner prompt transport', () => {
 
     expect(legacy?.has('--append-system-prompt')).toBe(false);
     expect(modern?.has('--append-system-prompt')).toBe(true);
-    expect(execFileSync).toHaveBeenCalledTimes(5);
+    expect(execFileSync).toHaveBeenCalledTimes(2);
+    expect(spawnSync).toHaveBeenCalledTimes(3);
   });
 
   it('fails open when the Claude capability probe is ambiguous or fails', () => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValueOnce('claude 1.2.4').mockReturnValueOnce('');
+    vi.mocked(spawnSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValueOnce('claude 1.2.4');
+    vi.mocked(spawnSync).mockReturnValueOnce(mockSpawnSyncResult());
     expect(probeClaudeCapabilities('claude', process.env)).toBeNull();
     expect(stripUnsupportedClaudeOptionalArgs(['--effort', 'high'], null)).toEqual(['--effort', 'high']);
 
     __resetClaudeCapabilityCacheForTesting();
-    vi.mocked(execFileSync).mockImplementationOnce(() => { throw new Error('help unavailable'); });
+    vi.mocked(execFileSync).mockReturnValueOnce('claude 1.2.4');
+    vi.mocked(spawnSync).mockReturnValueOnce(mockSpawnSyncResult('', '', {
+      error: new Error('help unavailable'), status: null,
+    }));
     expect(probeClaudeCapabilities('claude', process.env)).toBeNull();
   });
 

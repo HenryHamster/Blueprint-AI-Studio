@@ -13,8 +13,18 @@ import pytest
 import app.routers.agent_status as agent_status_module
 import app.routers.admin_project_strategic_session as strategic_session_router
 from app.database import resolve_async_engine
-from app.models import MessageSurface, MessageType, Project, Task, TaskStatus
-from app.project_message_creation import create_operator_project_message
+from app.models import (
+    MessageSurface,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
+from app.project_message_creation import (
+    _operator_context,
+    create_operator_project_message,
+)
 from app.routers.admin_agent_ops import _enforce_resident_mutation_fence
 from app.routers.agent_status import (
     _restore_resident_retry_binding,
@@ -26,9 +36,11 @@ from app.strategic_state_read_model import (
 )
 from app.strategic_completion import _maybe_retry_workday_auto_start
 from app.strategic_resident_session import (
+    RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY,
     RESIDENT_SESSION_KEY,
     RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_KEY,
+    _enqueue_resident_activation_turn,
     authoritative_resident_session_snapshot,
     reconcile_terminal_resident_worker,
     start_resident_session,
@@ -49,6 +61,12 @@ def test_workday_availability_does_not_consult_removed_global_gate():
         eligible_live_runner_count=1,
         runner_options=[],
     ) == {"available": True, "state": "ready", "reason": None}
+
+
+def test_operator_context_cannot_spoof_hidden_workday_activation_marker():
+    assert RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY not in _operator_context(
+        {RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY: True}
+    )
 
 
 def test_workday_active_session_reports_active_on_its_pinned_runner():
@@ -183,6 +201,76 @@ async def _make_resident_record(
     await session.refresh(project)
 
     return project, task, runner_id
+
+
+@pytest.mark.asyncio
+async def test_workday_activation_enqueues_one_canonical_fast_turn_per_session(
+    db_session,
+):
+    project, _, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    snapshot = await authoritative_resident_session_snapshot(db_session, project)
+    assert snapshot is not None
+
+    await _enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id="operator",
+        snapshot=snapshot,
+    )
+    # A retry/adoption of the same session must not create another opening.
+    await _enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id="operator",
+        snapshot=snapshot,
+    )
+
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    opening = rows[0]
+    assert opening.from_type == "user"
+    assert opening.surface == MessageSurface.CONVERSATION
+    assert opening.message_type == MessageType.NOTE
+    assert opening.status == "open"
+    assert opening.handling_state == "pending"
+    assert opening.resident_session_id == snapshot["session_id"]
+    assert opening.idempotency_key == f"resident-activation:{snapshot['session_id']}"
+    assert opening.context[RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY] is True
+    assert "started Workday" in opening.content
+
+
+@pytest.mark.asyncio
+async def test_workday_activation_enqueue_failure_does_not_fail_started_session(
+    db_session, mocker
+):
+    project, _, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    project_id = project.id
+    snapshot = await authoritative_resident_session_snapshot(db_session, project)
+    assert snapshot is not None
+    mocker.patch(
+        "app.project_message_creation.create_operator_project_message",
+        new=mocker.AsyncMock(side_effect=RuntimeError("message store unavailable")),
+    )
+
+    await _enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id="operator",
+        snapshot=snapshot,
+    )
+
+    fresh = await db_session.get(Project, project_id)
+    assert fresh is not None
+    assert fresh.vision[RESIDENT_SESSION_KEY]["status"] == "active"
+
 
 @pytest.mark.asyncio
 async def test_resident_fresh_attempt_restores_actual_runner_columns(db_session):

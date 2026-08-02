@@ -31,14 +31,17 @@ if [[ -z "$runner_temp" || ! -d "$runner_temp" ]]; then
 fi
 
 completion_marker="$(mktemp "${runner_temp%/}/blueprint-viewport-completion.XXXXXX")"
+attempt_output="$(mktemp "${runner_temp%/}/blueprint-viewport-output.XXXXXX")"
 rm -f "$completion_marker"
-trap 'rm -f "$completion_marker"' EXIT INT TERM
+trap 'rm -f "$completion_marker" "$attempt_output"' EXIT INT TERM
 
 attempt_status=1
 attempt_timed_out=false
+attempt_provider_disconnected=false
 
 run_attempt() {
   rm -f "$completion_marker"
+  : > "$attempt_output"
   BLUEPRINT_VIEWPORT_COMPLETION_MARKER="$completion_marker" \
     timeout --signal=TERM --kill-after="$kill_after" "$attempt_timeout" \
     bash -c '
@@ -46,8 +49,10 @@ run_attempt() {
       child_status=$?
       printf "%s\n" "$child_status" > "$BLUEPRINT_VIEWPORT_COMPLETION_MARKER" || exit 125
       exit "$child_status"
-    ' _ "$@"
-  outer_status=$?
+    ' _ "$@" 2>&1 | tee "$attempt_output"
+  pipeline_status=("${PIPESTATUS[@]}")
+  outer_status="${pipeline_status[0]}"
+  tee_status="${pipeline_status[1]}"
 
   if [[ -f "$completion_marker" ]]; then
     IFS= read -r attempt_status < "$completion_marker"
@@ -64,11 +69,31 @@ run_attempt() {
       attempt_timed_out=false
     fi
   fi
+
+  attempt_provider_disconnected=false
+  if [[ "$tee_status" -ne 0 ]]; then
+    echo "::error::Could not capture viewport provider output" >&2
+    attempt_status=125
+    attempt_timed_out=false
+    return
+  fi
+  if [[ "$attempt_status" -ne 0 ]] \
+    && grep -Fq "Failed to fetch dynamically imported module:" "$attempt_output" \
+    && grep -Fq "Cannot connect to the iframe." "$attempt_output" \
+    && grep -Fq "unhandled error during the test run." "$attempt_output"; then
+    attempt_provider_disconnected=true
+  fi
 }
 
 run_attempt "$@"
+retry_reason=""
 if [[ "$attempt_timed_out" == true ]]; then
-  echo "::warning::Viewport provider timed out; retrying once in a fresh container" >&2
+  retry_reason="timed out"
+elif [[ "$attempt_provider_disconnected" == true ]]; then
+  retry_reason="disconnected from its browser iframe"
+fi
+if [[ -n "$retry_reason" ]]; then
+  echo "::warning::Viewport provider ${retry_reason}; retrying once in a fresh container" >&2
   docker rm -f "$container_name" >/dev/null 2>&1 || true
   run_attempt "$@"
 fi

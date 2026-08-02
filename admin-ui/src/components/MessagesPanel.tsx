@@ -1274,9 +1274,16 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // identity, never message content, is the reconciliation key: identical text
   // sent intentionally must remain two distinct turns.
   const renderedConversationMessages = useMemo(() => {
-    if (!conversationMode || !optimisticSend) return conversationMessages;
-    const alreadyDurable = conversationMessages.some(m => messageHasClientIdentity(m, optimisticSend.key));
-    if (alreadyDurable) return conversationMessages;
+    // The Workday start action is represented by a canonical conversation row
+    // so Fast can claim it through the normal fenced reply path. It is not an
+    // operator-authored chat bubble, though, so only hide that trigger input;
+    // the model-generated Strategic reply remains visible like any other reply.
+    const visibleMessages = conversationMessages.filter(
+      message => message.context?._resident_activation_prompt !== true,
+    );
+    if (!conversationMode || !optimisticSend) return visibleMessages;
+    const alreadyDurable = visibleMessages.some(m => messageHasClientIdentity(m, optimisticSend.key));
+    if (alreadyDurable) return visibleMessages;
     const optimisticMessage = {
       id: `optimistic:${optimisticSend.key}`,
       project_id: selectedProjectId ?? '',
@@ -1293,7 +1300,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       reply_to_message_id: optimisticSend.reply_to_message_id ?? null,
       idempotency_key: optimisticSend.key,
     } satisfies ProjectMessage;
-    return [...conversationMessages, optimisticMessage];
+    return [...visibleMessages, optimisticMessage];
   }, [conversationMode, optimisticSend, conversationMessages, selectedProjectId]);
   const showEmptyConversationHint = conversationMode && !loading && conversationMessages.length === 0;
   // Clear the working state once a FRESH strategist reply lands (compare reply

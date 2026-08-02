@@ -404,6 +404,14 @@ def _prepare_system_script_bundle_dir(bundle_dir: Path) -> None:
                 f"system script directory {directory} must be root-owned and "
                 "not group/world-writable"
             )
+        if os.name != "nt":
+            # mkdir honors the installer's umask. A security-conscious 0077
+            # umask therefore creates a new bundle root as 0700 even though
+            # mode=0755 was requested, which prevents the non-root API,
+            # worker, and edge services from traversing to their immutable
+            # entrypoints. The contents are non-secret executable code; keep
+            # ownership trusted and make only traversal/read access public.
+            os.chmod(directory, 0o755)
 
 
 def _validate_installed_system_script(path: Path, expected: bytes) -> None:

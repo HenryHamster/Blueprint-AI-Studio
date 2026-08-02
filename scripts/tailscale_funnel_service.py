@@ -160,6 +160,7 @@ def start(
         [
             str(config.binary),
             "funnel",
+            "--yes",
             "--bg",
             "--https=443",
             config.target,
@@ -185,6 +186,7 @@ def stop(
         [
             str(config.binary),
             "funnel",
+            "--yes",
             "--https=443",
             config.target,
             "off",

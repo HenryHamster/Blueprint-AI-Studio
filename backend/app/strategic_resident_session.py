@@ -62,6 +62,8 @@ from app.voice_credentials import (
 from app.models import (
     ArtifactType,
     Direction,
+    MessageSurface,
+    MessageType,
     Project,
     ProjectMessage,
     StrategicCycle,
@@ -154,6 +156,20 @@ RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT = "cycle_in_flight"
 # pinned ``runner_id`` — Workday does NOT auto-migrate to another device; the
 # operator restarts the session to pick another (operator decision (c)).
 RESIDENT_SESSION_REASON_RUNNER_OFFLINE = "runner_offline"
+
+# A Workday start is itself an operator conversational action. Once the worker
+# exists, enqueue one normal Fast-owned turn so the operator gets an immediate,
+# context-aware opening instead of waiting for a later typed message. The input
+# row stays canonical (Fast must be able to claim it) but carries a presentation
+# marker so the UI can hide the synthetic operator bubble. The reply is always
+# model-generated through the ordinary conversation completion fence.
+RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY = "_resident_activation_prompt"
+_RESIDENT_ACTIVATION_PROMPT = (
+    "The operator just started Workday. Send one brief, natural, context-aware "
+    "opening message now. Continue the existing conversation when useful; "
+    "otherwise ask what they want to work through. Do not describe startup "
+    "mechanics, claim completed work, or use a canned greeting."
+)
 
 # Runtime-config: max wall-clock a resident session may run WITHOUT any operator
 # interaction before the heartbeat stops renewing the lease (so the legacy
@@ -4381,6 +4397,12 @@ async def _auto_start_on_workday_entry(
             )
             # Started cleanly — drop any stale blocked-reason on the same session.
             await set_resident_session_blocked_reason(fresh, project, None)
+            await _enqueue_resident_activation_turn(
+                fresh,
+                project,
+                operator_user_id=operator_user_id,
+                snapshot=snapshot,
+            )
             return snapshot
     except Exception as exc:
         if isinstance(exc, (_ResidentCycleInFlight, _ResidentEnsureModeChanged)):
@@ -4402,6 +4424,59 @@ async def _auto_start_on_workday_entry(
         )
         return None
 
+
+async def _enqueue_resident_activation_turn(
+    session: AsyncSession,
+    project: Project,
+    *,
+    operator_user_id: str,
+    snapshot: dict[str, Any],
+) -> None:
+    """Best-effort enqueue of the model-generated Workday opening turn.
+
+    This intentionally uses the canonical operator-message creation path: Fast
+    sees, claims, and completes the turn exactly like a typed operator message,
+    including its normal memory/context envelope and public-reply fence. The
+    per-session idempotency key makes retries/adoption safe. Failure here cannot
+    undo a successfully started Workday session.
+    """
+
+    session_id = str(snapshot.get("session_id") or "").strip()
+    if not session_id or snapshot.get("status") != STATUS_ACTIVE:
+        return
+    project_id = project.id
+    try:
+        # Local import avoids the project_message_creation -> resident-session
+        # association import cycle at module load time.
+        from app.project_message_creation import (  # noqa: PLC0415
+            create_operator_project_message,
+        )
+
+        await create_operator_project_message(
+            session,
+            project=project,
+            user_id=operator_user_id,
+            message_type=MessageType.NOTE,
+            content=_RESIDENT_ACTIVATION_PROMPT,
+            context=None,
+            server_context={RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY: True},
+            workbench_context=None,
+            idempotency_key=f"resident-activation:{session_id}",
+            surface=MessageSurface.CONVERSATION,
+            include_strategic_session_snapshot=False,
+        )
+    except Exception:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "[RESIDENT_SESSION] Workday started but activation turn enqueue "
+            "failed for project %s session %s",
+            project_id,
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _mark_terminal_recovery_failed(

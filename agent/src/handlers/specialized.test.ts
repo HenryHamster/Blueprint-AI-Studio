@@ -169,7 +169,7 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 // Import handlers/index.ts first so audits.ts is loaded in the test module
-// context before the importOriginal chain (inside vi.mock('../index.js', ...))
+// context before the index-module mock's importOriginal chain
 // can load it from a different path.  Without this, the direct import of
 // audits.ts in handlers/index.ts creates a shorter circular-module path that
 // causes audits.ts to bind to the actual ../index.ts instead of the mock.

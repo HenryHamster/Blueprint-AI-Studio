@@ -364,6 +364,9 @@ class RenderTests(unittest.TestCase):
         self.assertIn("ProtectHome=read-only", rendered)
         self.assertIn("ProtectKernelModules=true", rendered)
         self.assertIn("PrivateDevices=true", rendered)
+        self.assertIn("StartLimitIntervalSec=0", rendered)
+        self.assertNotIn("StartLimitBurst=", rendered)
+        self.assertIn("RestartSec=30", rendered)
 
     def test_system_unit_rejects_an_untrusted_user_name(self):
         with patch.dict(os.environ, {"SUDO_USER": "runner\nUser=root"}, clear=True):
@@ -439,6 +442,26 @@ class InstallTests(unittest.TestCase):
             ),
             patch.object(node, "_prepare_local_postgres_data_dir"),
         ]
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory modes are required")
+    def test_system_script_bundle_repairs_umask_restricted_traversal(self):
+        bundle_dir = self.script_root / ("a" * 64)
+        previous_umask = os.umask(0o077)
+        try:
+            bundle_dir.mkdir(parents=True, mode=0o755)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(self.script_root.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(bundle_dir.stat().st_mode & 0o777, 0o700)
+
+        with patch.object(node, "_SYSTEM_SCRIPT_ROOT", self.script_root), patch.object(
+            node, "_TRUSTED_PATH_UID", os.getuid()
+        ):
+            node._prepare_system_script_bundle_dir(bundle_dir)
+
+        self.assertEqual(self.script_root.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(bundle_dir.stat().st_mode & 0o777, 0o755)
 
     @staticmethod
     def _control_plane_config():

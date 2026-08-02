@@ -4546,6 +4546,12 @@ export async function handleStrategicResident(
   // it is never treated as proof of authority.
   applyHeartbeatResponse(initialAuthorityAdmission);
   lastLivenessHeartbeatAt = Date.now();
+  // Provider launch and the canonical loop are now live. Do not leave the task
+  // reporting its provisioning label forever when there is simply no operator
+  // turn to run; Fast warm-up is opportunistic and Workday remains the fallback.
+  statusRef.value = 'Resident ready — waiting for operator input';
+  setResidentActivity('waiting', 'Waiting for operator input or project movement');
+  streamer.status('Resident ready — waiting for operator input');
   if (typedFastConfig.activated) {
     // Fast warm-up is opportunistic.  A provider readiness probe must not hold
     // the persistent Resident before its first message poll or heartbeat.

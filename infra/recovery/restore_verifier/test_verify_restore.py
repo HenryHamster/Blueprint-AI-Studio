@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import json
+import gzip
 import hashlib
 import io
+import os
+import stat
 import subprocess
+import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import verify_restore as verifier
 
@@ -30,6 +35,7 @@ def config(**overrides):
         "RECOVERY_PRIVATE_SERVICE_RANGE": "blueprint-restore-private-services",
         "EXPECTED_ALEMBIC_REVISION": "0711",
         "CLOUD_SQL_PROXY_BINARY": str(Path(__file__).resolve()),
+        "PSQL_BINARY": str(Path(__file__).resolve()),
     }
     values.update(overrides)
     return verifier.Config.from_env(values)
@@ -97,13 +103,16 @@ class FakeSql:
         return {
             "project": "blueprint-recovery",
             "databaseVersion": "POSTGRES_15",
+            "sqlNetworkArchitecture": "NEW_NETWORK_ARCHITECTURE",
             "connectionName": f"blueprint-recovery:us-central1:{name}",
             "settings": {
                 "ipConfiguration": {
                     "ipv4Enabled": False,
                     "privateNetwork": (
-                        "/projects/blueprint-recovery/global/networks/recovery"
+                        "https://compute.googleapis.com/compute/v1/"
+                        "projects/blueprint-recovery/global/networks/recovery"
                     ),
+                    "allocatedIpRange": "blueprint-restore-private-services",
                 }
             },
             "ipAddresses": [{"type": "PRIVATE", "ipAddress": "10.2.0.3"}],
@@ -120,10 +129,6 @@ class FakeSql:
     def set_postgres_password(self, instance, password):
         self.calls.append(("set_password", instance, password))
         return "op-password"
-
-    def import_archive(self, instance, uri):
-        self.calls.append(("import_archive", instance, uri))
-        return "op-import"
 
     def get_operation(self, operation, *, stage):
         self.calls.append(("get_operation", operation, stage))
@@ -252,11 +257,23 @@ def runtime(
         passwords.append(value)
         return value
 
+    selected_storage = storage or FakeStorage()
+
+    def archive_import(_runtime, _config, selected, _password, _deadline):
+        if (sql or result_sql).fail_stage == "archive_import":
+            raise verifier.DrillError("archive_import", "operation_failed")
+        return {
+            "compressed_bytes": selected.size,
+            "uncompressed_bytes": selected.size * 4,
+            "sha256": selected.sha256,
+        }
+
     times = iter([NOW, NOW + timedelta(minutes=7), NOW + timedelta(minutes=8)])
+    result_sql = sql or FakeSql()
     result = verifier.Runtime(
-        storage=storage or FakeStorage(),
+        storage=selected_storage,
         logger=logger or FakeLogger(),
-        sql=sql or FakeSql(),
+        sql=result_sql,
         db_connect=lambda **_kwargs: FakeConnection(
             FakeCursor(revision=revision, missing_schema=missing_schema)
         ),
@@ -267,11 +284,23 @@ def runtime(
         sleep=lambda _seconds: None,
         password=password,
         suffix=lambda _bytes: "a1b2c3",
+        archive_import=archive_import,
     )
     return result, process, proxy_commands, passwords
 
 
 class ConfigTests(unittest.TestCase):
+    def test_normalizes_legacy_leading_slash_network_input(self):
+        cfg = config(
+            RECOVERY_PRIVATE_NETWORK=(
+                "/projects/blueprint-recovery/global/networks/recovery"
+            )
+        )
+        self.assertEqual(
+            cfg.private_network,
+            "projects/blueprint-recovery/global/networks/recovery",
+        )
+
     def test_requires_independent_projects_and_recovery_network(self):
         with self.assertRaisesRegex(verifier.DrillError, "projects_not_independent"):
             config(SOURCE_PROJECT_ID="blueprint-recovery")
@@ -299,6 +328,13 @@ class ConfigTests(unittest.TestCase):
             verifier.DrillError, "invalid_drill_operation_timeout_seconds"
         ):
             config(DRILL_OPERATION_TIMEOUT_SECONDS="forever")
+        with self.assertRaisesRegex(
+            verifier.DrillError, "unsafe_task_timeout_budget"
+        ):
+            config(
+                DRILL_TASK_WORK_TIMEOUT_SECONDS="6600",
+                DRILL_CLEANUP_TIMEOUT_SECONDS="600",
+            )
 
     def test_exact_archive_pin_is_all_or_nothing(self):
         with self.assertRaisesRegex(
@@ -353,6 +389,27 @@ class StorageTests(unittest.TestCase):
         client.bucket.return_value = bucket
         client.list_blobs.return_value = [manifest_blob]
         return client
+
+    def test_import_reopens_only_the_exact_validated_generation(self):
+        selected = archive()
+        blob = Mock()
+        blob.generation = int(selected.generation)
+        blob.size = selected.size
+        stream = io.BytesIO(b"payload")
+        blob.open.return_value = stream
+        bucket = Mock()
+        bucket.project_number = 123456789012
+        bucket.blob.return_value = blob
+        client = Mock()
+        client.bucket.return_value = bucket
+        storage = verifier.RecoveryStorage(client, config())
+
+        self.assertIs(storage.open_archive(selected), stream)
+        bucket.blob.assert_called_once_with(
+            selected.name,
+            generation=int(selected.generation),
+        )
+        blob.reload.assert_called_once_with(timeout=60)
 
     def test_selects_only_integrity_verified_manifest_archive_and_enforces_rpo(self):
         client = self.client_with_archive()
@@ -536,6 +593,8 @@ class CloudSqlContractTests(unittest.TestCase):
             "google_project_iam_member.recovery_service_networking_service_agent,",
             prerequisites,
         )
+        self.assertNotIn("recovery_cloud_sql_reader", iam)
+        self.assertNotIn("recovery_cloud_sql_decrypter", iam)
 
     def test_restore_verifier_can_read_only_its_bucket_metadata(self):
         terraform = (
@@ -574,13 +633,21 @@ class CloudSqlContractTests(unittest.TestCase):
             '"serviceusage.services.use"',
             terraform[role_start:role_end],
         )
+        self.assertNotIn(
+            '"cloudsql.instances.import"',
+            terraform[role_start:role_end],
+        )
 
     def test_instance_payload_is_postgres15_private_only_and_expiring(self):
         cfg = config()
         name = "bp-restore-202607301200-a1b2c3"
         body = verifier._instance_body(cfg, name, NOW + timedelta(hours=3))
         self.assertEqual(body["databaseVersion"], "POSTGRES_15")
+        self.assertEqual(
+            body["sqlNetworkArchitecture"], "NEW_NETWORK_ARCHITECTURE"
+        )
         settings = body["settings"]
+        self.assertNotIn("sqlNetworkArchitecture", settings)
         self.assertEqual(settings["tier"], "db-custom-1-3840")
         self.assertEqual(settings["dataDiskSizeGb"], "20")
         self.assertFalse(settings["storageAutoResize"])
@@ -588,7 +655,11 @@ class CloudSqlContractTests(unittest.TestCase):
         ip_config = settings["ipConfiguration"]
         self.assertIs(ip_config["ipv4Enabled"], False)
         self.assertEqual(ip_config["authorizedNetworks"], [])
-        self.assertIn("blueprint-recovery", ip_config["privateNetwork"])
+        self.assertEqual(
+            ip_config["privateNetwork"],
+            "https://compute.googleapis.com/compute/v1/"
+            "projects/blueprint-recovery/global/networks/recovery",
+        )
         self.assertEqual(
             ip_config["allocatedIpRange"], "blueprint-restore-private-services"
         )
@@ -597,29 +668,6 @@ class CloudSqlContractTests(unittest.TestCase):
             settings["userLabels"]["blueprint-purpose"], "restore-drill"
         )
         self.assertIn("expires-epoch", settings["userLabels"])
-
-    def test_rest_client_is_recovery_project_scoped_and_has_request_timeout(self):
-        response = SimpleNamespace(
-            status_code=200,
-            content=b'{"name":"op-1"}',
-            json=lambda: {"name": "op-1"},
-        )
-        session = Mock()
-        session.request.return_value = response
-        client = verifier.SqlAdminRest(session, "blueprint-recovery")
-        operation = client.import_archive(
-            "bp-restore-202607301200-a1b2c3",
-            "gs://blueprint-recovery-archives/archive.sql.gz",
-        )
-        self.assertEqual(operation, "op-1")
-        _, url = session.request.call_args.args
-        self.assertIn("/projects/blueprint-recovery/", url)
-        self.assertNotIn("blueprint-production", url)
-        kwargs = session.request.call_args.kwargs
-        self.assertEqual(kwargs["timeout"], (10, 60))
-        self.assertEqual(
-            kwargs["json"]["importContext"]["fileType"], "SQL"
-        )
 
     def test_rest_client_preserves_only_safe_failure_diagnostics(self):
         response = SimpleNamespace(
@@ -646,9 +694,60 @@ class CloudSqlContractTests(unittest.TestCase):
                 "http_status": 400,
                 "provider_status": "INVALID_ARGUMENT",
                 "provider_reason": "BAD_REQUEST",
+                "provider_message_redacted": True,
             },
         )
         self.assertNotIn("secret", json.dumps(raised.exception.diagnostic))
+
+    def test_rest_client_preserves_safe_bounded_instance_create_message(self):
+        message = (
+            "Project blueprint-recovery has invalid private network name "
+            "/projects/blueprint-recovery/global/networks/recovery"
+        )
+        response = SimpleNamespace(
+            status_code=400,
+            content=b"safe",
+            json=lambda: {
+                "error": {
+                    "message": message,
+                    "errors": [{"reason": "invalid", "message": message}],
+                }
+            },
+        )
+        session = Mock()
+        session.request.return_value = response
+        client = verifier.SqlAdminRest(session, "blueprint-recovery")
+        with self.assertRaises(verifier.AdminApiError) as raised:
+            client.create_instance("bp-restore-202607301200-a1b2c3", {})
+        self.assertEqual(
+            raised.exception.diagnostic,
+            {
+                "http_status": 400,
+                "provider_reason": "INVALID",
+                "provider_message": message,
+            },
+        )
+
+    def test_provider_message_filter_rejects_secret_like_or_high_entropy_data(self):
+        self.assertIsNone(
+            verifier._safe_provider_message("Invalid bearer token abc123")
+        )
+        self.assertIsNone(
+            verifier._safe_provider_message("Invalid value " + "a" * 64)
+        )
+        self.assertIsNone(
+            verifier._safe_provider_message(
+                "Invalid value "
+                "sk-proj-abcdefghijklmnopqrstuvwx-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            )
+        )
+        self.assertIsNone(
+            verifier._safe_provider_message("Invalid network\x00name")
+        )
+        self.assertEqual(
+            verifier._safe_provider_message("Invalid network\n name"),
+            "Invalid network name",
+        )
 
     def test_rest_client_transport_failure_is_ambiguous_and_non_sensitive(self):
         session = Mock()
@@ -664,6 +763,7 @@ class CloudSqlContractTests(unittest.TestCase):
         instance = {
             "project": "blueprint-recovery",
             "databaseVersion": "POSTGRES_15",
+            "sqlNetworkArchitecture": "NEW_NETWORK_ARCHITECTURE",
             "connectionName": (
                 "blueprint-recovery:us-central1:"
                 "bp-restore-202607301200-a1b2c3"
@@ -672,14 +772,67 @@ class CloudSqlContractTests(unittest.TestCase):
                 "ipConfiguration": {
                     "ipv4Enabled": False,
                     "privateNetwork": (
-                        "/projects/blueprint-recovery/global/networks/recovery"
+                        "projects/blueprint-recovery/global/networks/recovery"
                     ),
+                    "allocatedIpRange": "blueprint-restore-private-services",
                 }
             },
             "ipAddresses": [{"type": "PRIMARY", "ipAddress": "35.1.2.3"}],
         }
         with self.assertRaisesRegex(verifier.DrillError, "public_ip_present"):
             verifier._verify_private_instance(instance, config())
+
+    def test_instance_verification_rejects_network_architecture_or_range_drift(self):
+        base = FakeSql().get_instance("bp-restore-202607301200-a1b2c3")
+        for mutate in (
+            lambda value: value.pop("sqlNetworkArchitecture"),
+            lambda value: value.__setitem__(
+                "sqlNetworkArchitecture", "OLD_NETWORK_ARCHITECTURE"
+            ),
+            lambda value: value["settings"]["ipConfiguration"].__setitem__(
+                "allocatedIpRange", "unexpected-range"
+            ),
+        ):
+            instance = json.loads(json.dumps(base))
+            mutate(instance)
+            with self.subTest(instance=instance):
+                with self.assertRaisesRegex(
+                    verifier.DrillError,
+                    "instance_not_private_recovery_only",
+                ):
+                    verifier._verify_private_instance(instance, config())
+
+    def test_instance_verification_rejects_noncanonical_or_cross_project_network(self):
+        base = FakeSql().get_instance("bp-restore-202607301200-a1b2c3")
+        for private_network in (
+            "/projects/blueprint-recovery/global/networks/recovery",
+            "projects/blueprint-production/global/networks/recovery",
+            "projects/blueprint-recovery/global/networks/other",
+            (
+                "https://attacker.invalid/compute/v1/"
+                "projects/blueprint-recovery/global/networks/recovery"
+            ),
+        ):
+            instance = json.loads(json.dumps(base))
+            instance["settings"]["ipConfiguration"][
+                "privateNetwork"
+            ] = private_network
+            with self.subTest(private_network=private_network):
+                with self.assertRaisesRegex(
+                    verifier.DrillError,
+                    "instance_not_private_recovery_only",
+                ):
+                    verifier._verify_private_instance(instance, config())
+
+    def test_instance_verification_accepts_documented_network_resource_path(self):
+        instance = FakeSql().get_instance("bp-restore-202607301200-a1b2c3")
+        instance["settings"]["ipConfiguration"]["privateNetwork"] = (
+            "projects/blueprint-recovery/global/networks/recovery"
+        )
+        self.assertEqual(
+            verifier._verify_private_instance(instance, config()),
+            "blueprint-recovery:us-central1:bp-restore-202607301200-a1b2c3",
+        )
 
     def test_operation_failure_and_timeout_fail_closed(self):
         failed_sql = FakeSql(fail_stage="archive_import")
@@ -752,6 +905,316 @@ class CloudSqlContractTests(unittest.TestCase):
             )
 
 
+@unittest.skipIf(os.name == "nt", "secure passfile semantics require POSIX")
+class StreamImportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._original_tempdir = tempfile.tempdir
+        if os.name == "nt":
+            tempfile.tempdir = str(Path(__file__).resolve().parent)
+
+    @classmethod
+    def tearDownClass(cls):
+        tempfile.tempdir = cls._original_tempdir
+
+    class Sink:
+        def __init__(self, *, owner=None, fail=False):
+            self.data = bytearray()
+            self.closed = False
+            self.fail = fail
+            self.owner = owner
+
+        def write(self, value):
+            if self.fail:
+                raise BrokenPipeError()
+            self.data.extend(value)
+            return len(value)
+
+        def close(self):
+            if self.owner is not None and not self.owner.finished:
+                self.owner.stdin_closed_while_running = True
+            self.closed = True
+
+    class Process:
+        def __init__(self, *, return_code=0, fail_write=False):
+            self.return_code = return_code
+            self.finished = False
+            self.terminated = False
+            self.killed = False
+            self.stdin_closed_while_running = False
+            self.stdin = StreamImportTests.Sink(owner=self, fail=fail_write)
+
+        def poll(self):
+            return self.return_code if self.finished else None
+
+        def wait(self, timeout):
+            self.finished = True
+            return self.return_code
+
+        def terminate(self):
+            self.terminated = True
+            self.finished = True
+
+        def kill(self):
+            self.killed = True
+            self.finished = True
+
+    @staticmethod
+    def payload(*, envelope=True, malicious=False):
+        key = b"A" * 32
+        body = b"CREATE TABLE restored(id integer);\n"
+        if malicious:
+            body += b"\\! touch /tmp/should-not-run\n"
+        if envelope:
+            body = b"\\restrict " + key + b"\n" + body
+            body += b"\\unrestrict " + key + b"\n"
+        return body
+
+    def stream_runtime(self, compressed, process):
+        class Storage:
+            def open_archive(self, _selected):
+                return io.BytesIO(compressed)
+
+        calls = []
+
+        def popen(command, **kwargs):
+            pass_path = kwargs["env"]["PGPASSFILE"]
+            kwargs["observed_passfile_mode"] = stat.S_IMODE(
+                os.stat(pass_path).st_mode
+            )
+            kwargs["observed_passdir_mode"] = stat.S_IMODE(
+                os.stat(os.path.dirname(pass_path)).st_mode
+            )
+            calls.append((command, kwargs))
+            return process
+
+        return SimpleNamespace(
+            archive_import=None,
+            monotonic=lambda: 0,
+            storage=Storage(),
+            popen=popen,
+        ), calls
+
+    def selected(self, compressed, *, sha256=None, size=None):
+        return verifier.Archive(
+            bucket="blueprint-recovery-archives",
+            name="local-postgres-exports/pinned.sql.gz",
+            generation="123",
+            created_at=NOW,
+            size=len(compressed) if size is None else size,
+            sha256=sha256 or hashlib.sha256(compressed).hexdigest(),
+            manifest_generation="124",
+        )
+
+    def test_stream_is_generation_verified_restricted_and_password_safe(self):
+        sql = self.payload(malicious=True)
+        compressed = gzip.compress(sql)
+        process = self.Process()
+        rt, calls = self.stream_runtime(compressed, process)
+        password = "safe-password-" + "x" * 48
+        result = verifier._stream_archive_to_psql(
+            rt, config(), self.selected(compressed), password, 100
+        )
+        self.assertEqual(result["compressed_bytes"], len(compressed))
+        self.assertEqual(result["sha256"], hashlib.sha256(compressed).hexdigest())
+        restored = bytes(process.stdin.data)
+        self.assertTrue(restored.startswith(b"\\restrict "))
+        self.assertEqual(restored.count(b"\\restrict "), 1)
+        self.assertNotIn(b"\\unrestrict", restored)
+        self.assertIn(b"\\! touch /tmp/should-not-run", restored)
+        command, kwargs = calls[0]
+        self.assertIn("--single-transaction", command)
+        self.assertIn("--file=-", command)
+        self.assertIn("--set=ON_ERROR_STOP=1", command)
+        self.assertNotIn(password, " ".join(command))
+        self.assertNotIn("PGPASSWORD", kwargs["env"])
+        self.assertEqual(kwargs["observed_passfile_mode"], 0o600)
+        self.assertEqual(kwargs["observed_passdir_mode"], 0o700)
+        pass_path = kwargs["env"]["PGPASSFILE"]
+        self.assertFalse(os.path.exists(pass_path))
+
+    def test_stream_rejects_missing_or_mismatched_restrict_envelope(self):
+        for sql in (
+            self.payload(envelope=False),
+            b"\\restrict " + b"A" * 32 + b"\nSELECT 1;\n\\unrestrict " + b"B" * 32 + b"\n",
+        ):
+            compressed = gzip.compress(sql)
+            process = self.Process()
+            rt, _ = self.stream_runtime(compressed, process)
+            with self.subTest(sql=sql), self.assertRaisesRegex(
+                verifier.DrillError, "archive_restrict_envelope"
+            ):
+                verifier._stream_archive_to_psql(
+                    rt, config(), self.selected(compressed), "x" * 48, 100
+                )
+            self.assertTrue(process.terminated)
+
+    def test_stream_fails_before_commit_on_second_pass_integrity_error(self):
+        compressed = gzip.compress(self.payload())
+        process = self.Process()
+        rt, _ = self.stream_runtime(compressed, process)
+        with self.assertRaisesRegex(verifier.DrillError, "archive_digest_changed"):
+            verifier._stream_archive_to_psql(
+                rt,
+                config(),
+                self.selected(compressed, sha256="b" * 64),
+                "x" * 48,
+                100,
+            )
+        self.assertTrue(process.terminated)
+        self.assertFalse(process.stdin_closed_while_running)
+
+    def test_stream_rejects_corrupt_gzip_and_expansion_limit(self):
+        corrupt = b"not-gzip"
+        process = self.Process()
+        rt, _ = self.stream_runtime(corrupt, process)
+        with self.assertRaisesRegex(verifier.DrillError, "archive_gzip_invalid"):
+            verifier._stream_archive_to_psql(
+                rt, config(), self.selected(corrupt), "x" * 48, 100
+            )
+
+        compressed = gzip.compress(self.payload())
+        process = self.Process()
+        rt, _ = self.stream_runtime(compressed, process)
+        with patch.object(verifier, "_MAX_IMPORT_UNCOMPRESSED_BYTES", 8):
+            with self.assertRaisesRegex(
+                verifier.DrillError, "archive_expansion_limit_exceeded"
+            ):
+                verifier._stream_archive_to_psql(
+                    rt, config(), self.selected(compressed), "x" * 48, 100
+                )
+
+    def test_stream_propagates_psql_failure_and_broken_pipe(self):
+        compressed = gzip.compress(self.payload())
+        for process in (
+            self.Process(return_code=1),
+            self.Process(fail_write=True),
+        ):
+            rt, _ = self.stream_runtime(compressed, process)
+            with self.subTest(process=process), self.assertRaisesRegex(
+                verifier.DrillError, "psql_failed"
+            ):
+                verifier._stream_archive_to_psql(
+                    rt, config(), self.selected(compressed), "x" * 48, 100
+                )
+
+    def test_stream_classifies_psql_exit_and_records_bounded_diagnostics(self):
+        compressed = gzip.compress(self.payload())
+        for return_code, expected_code in (
+            (2, "psql_connection_failed"),
+            (3, "psql_script_failed"),
+        ):
+            process = self.Process(return_code=return_code)
+            rt, _ = self.stream_runtime(compressed, process)
+            with self.subTest(return_code=return_code), self.assertRaises(
+                verifier.DrillError
+            ) as raised:
+                verifier._stream_archive_to_psql(
+                    rt, config(), self.selected(compressed), "x" * 48, 100
+                )
+            self.assertEqual(raised.exception.code, expected_code)
+            self.assertEqual(
+                raised.exception.diagnostic,
+                {
+                    "compressed_bytes": len(compressed),
+                    "uncompressed_bytes": len(self.payload()),
+                    "elapsed_seconds": 0,
+                    "psql_exit_code": return_code,
+                },
+            )
+
+
+@unittest.skipUnless(
+    os.environ.get("RUN_RESTORE_INTEGRATION") == "1",
+    "requires isolated PostgreSQL 15 container",
+)
+class PostgresStreamIntegrationTests(unittest.TestCase):
+    password = "integration-password-" + "x" * 32
+
+    def invoke(self, sql, *, expected_sha256=None):
+        compressed = gzip.compress(sql)
+
+        class Storage:
+            def open_archive(self, _selected):
+                return io.BytesIO(compressed)
+
+        selected = verifier.Archive(
+            bucket="blueprint-recovery-archives",
+            name="local-postgres-exports/integration.sql.gz",
+            generation="1",
+            created_at=NOW,
+            size=len(compressed),
+            sha256=expected_sha256 or hashlib.sha256(compressed).hexdigest(),
+            manifest_generation="2",
+        )
+        rt = SimpleNamespace(
+            archive_import=None,
+            monotonic=time.monotonic,
+            storage=Storage(),
+            popen=subprocess.Popen,
+        )
+        return verifier._stream_archive_to_psql(
+            rt,
+            config(PSQL_BINARY="/usr/lib/postgresql/15/bin/psql"),
+            selected,
+            self.password,
+            time.monotonic() + 60,
+        )
+
+    def connect(self):
+        import psycopg
+
+        return psycopg.connect(
+            host="127.0.0.1",
+            port=verifier._PROXY_PORT,
+            dbname="blueprint",
+            user="postgres",
+            password=self.password,
+        )
+
+    @staticmethod
+    def envelope(body):
+        key = b"B" * 32
+        return b"\\restrict " + key + b"\n" + body + b"\\unrestrict " + key + b"\n"
+
+    def test_copy_restricted_mode_and_transaction_rollback(self):
+        successful = self.envelope(
+            b"CREATE TABLE restore_copy(id integer);\n"
+            b"COPY restore_copy (id) FROM stdin;\n1\n2\n\\.\n"
+        )
+        self.invoke(successful)
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM restore_copy")
+            self.assertEqual(cursor.fetchone(), (2,))
+            cursor.execute("DROP TABLE restore_copy")
+
+        failing = self.envelope(
+            b"CREATE TABLE restore_rollback(id integer);\n"
+            b"SELECT * FROM intentionally_missing_relation;\n"
+        )
+        with self.assertRaisesRegex(verifier.DrillError, "psql_script_failed"):
+            self.invoke(failing)
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.restore_rollback')")
+            self.assertEqual(cursor.fetchone(), (None,))
+
+        marker = Path("/tmp/blueprint-psql-escape")
+        marker.unlink(missing_ok=True)
+        malicious = self.envelope(b"\\! touch /tmp/blueprint-psql-escape\n")
+        with self.assertRaisesRegex(verifier.DrillError, "psql_script_failed"):
+            self.invoke(malicious)
+        self.assertFalse(marker.exists())
+
+        wrong_digest = self.envelope(
+            b"CREATE TABLE restore_digest_rollback(id integer);\n"
+        )
+        with self.assertRaisesRegex(verifier.DrillError, "archive_digest_changed"):
+            self.invoke(wrong_digest, expected_sha256="f" * 64)
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.restore_digest_rollback')")
+            self.assertEqual(cursor.fetchone(), (None,))
+
+
 class ProbeTests(unittest.TestCase):
     def test_schema_revision_and_required_columns_are_exact(self):
         rt, *_ = runtime(revision="0710")
@@ -786,11 +1249,10 @@ class DrillLifecycleTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertEqual(len(storage.writes), 1)
         self.assertEqual(len(storage.import_generation_checks), 2)
-        self.assertTrue(evidence["archive"]["generation_stable_during_import"])
+        self.assertTrue(evidence["archive"]["generation_pinned_read"])
+        self.assertTrue(evidence["archive"]["compressed_size_reverified"])
+        self.assertTrue(evidence["archive"]["compressed_sha256_reverified"])
         self.assertEqual(len(logger.writes), 1)
-        self.assertTrue(
-            any(call[0] == "import_archive" for call in sql.calls)
-        )
         self.assertTrue(
             any(call[0] == "delete_instance" for call in sql.calls)
         )
@@ -801,7 +1263,7 @@ class DrillLifecycleTests(unittest.TestCase):
         self.assertNotIn(passwords[0], serialized)
         self.assertNotIn(passwords[0], " ".join(proxy_command))
         check_names = {item["name"] for item in evidence["checks"]}
-        self.assertIn("archive_decryption_and_import", check_names)
+        self.assertIn("archive_decryption_and_restore", check_names)
         self.assertIn("app_health_query", check_names)
         self.assertIn("app_schema_compatible", check_names)
         self.assertIn("non_sensitive_row_counts", check_names)
@@ -1119,6 +1581,24 @@ class DrillLifecycleTests(unittest.TestCase):
         verifier._stop_proxy(process)
         process.terminate.assert_called_once()
         process.kill.assert_called_once()
+
+
+class EntryPointTests(unittest.TestCase):
+    def test_janitor_has_deadline_below_cloud_run_timeout(self):
+        rt = SimpleNamespace(
+            now=lambda: NOW,
+            monotonic=lambda: 100,
+            logger=SimpleNamespace(write=Mock()),
+        )
+        reconcile = Mock(return_value=[])
+        with (
+            patch.object(verifier.Config, "from_env", return_value=config()),
+            patch.object(verifier, "build_runtime", return_value=rt),
+            patch.object(verifier, "_reconcile_drill_instances", reconcile),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(verifier.main(["--janitor-only"]), 0)
+        self.assertEqual(reconcile.call_args.kwargs["deadline"], 820)
 
 
 if __name__ == "__main__":

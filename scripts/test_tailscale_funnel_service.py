@@ -55,6 +55,7 @@ class FunnelServiceTests(unittest.TestCase):
                 [
                     str(self.binary),
                     "funnel",
+                    "--yes",
                     "--bg",
                     "--https=443",
                     "http://127.0.0.1:8080",
@@ -105,6 +106,7 @@ class FunnelServiceTests(unittest.TestCase):
             [
                 str(self.binary),
                 "funnel",
+                "--yes",
                 "--https=443",
                 "http://127.0.0.1:8080",
                 "off",

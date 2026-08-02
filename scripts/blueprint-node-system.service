@@ -9,8 +9,11 @@ After=network-online.target
 Wants=network-online.target
 @UNIT_REQUIRES@
 @UNIT_AFTER@
-StartLimitIntervalSec=60
-StartLimitBurst=3
+# A temporary loss of Wi-Fi/default route can make startup fail repeatedly.
+# Do not leave a local control-plane or runner permanently rate-limited after
+# connectivity returns; retry at a bounded cadence until the dependency is
+# healthy again.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -29,7 +32,7 @@ PrivateDevices=true
 @EXEC_START_PRE@
 ExecStart=@PYTHON@ @EXECUTABLE@
 Restart=always
-RestartSec=5
+RestartSec=30
 EnvironmentFile=@ENV_FILE_PREFIX@@ENV_FILE@
 StandardOutput=journal
 StandardError=journal
