@@ -751,29 +751,53 @@ both databases to accept independent production writes.
     both snapshots. On failure, keep all application units stopped, reinitialize
     the target deliberately, and investigate; never continue from a partially
     examined target.
-11. Start only the local API and prove its health before starting the edge:
+11. While the imported database remains quiescent and every application unit
+    is still stopped, manually run the local backup service. Verify the
+    recovery-bucket archive and manifest, pin that exact generation in the
+    independent recovery verifier, and require a successful restore drill with
+    cleanup evidence before allowing any application process to connect.
+12. Make an explicit go/no-go decision. Starting the API can run mutating
+    initialization and background tasks even while it is loopback-only, so
+    **API activation is the rollback boundary**. Start only the local API and
+    keep the edge and worker stopped:
 
     ```bash
     sudo systemctl start blueprint-api.service
     sudo systemctl is-active blueprint-api.service
+    ```
+
+    Verify the loopback health and read-only API paths. On any failure after
+    API activation, stop the API, verify it is inactive, and keep the edge and
+    worker stopped to contain further local writes. Keep Cloud Run fenced and
+    roll forward locally unless a reviewed reverse synchronization proves
+    Cloud SQL contains every local write. Public OAuth/App callbacks, webhooks,
+    WebSockets, CORS, and browser-origin behavior cannot be exercised until the
+    edge starts.
+13. Start the edge to expose Funnel to callbacks, webhooks, and users:
+
+    ```bash
     sudo systemctl start blueprint-edge.service
     sudo systemctl is-active blueprint-edge.service
     ```
 
-    Verify health, authentication,
-    GitHub OAuth/App callbacks and webhooks, WebSockets, CORS, artifact signed
-    URLs, and one controlled production write. This first local write crosses
-    the rollback boundary.
-12. Only after the controlled write succeeds, start the worker and confirm
-   exactly one process owns advisory leadership and dispatch/reaper heartbeats
-   are current. Start and manually exercise the backup service, verify its
-   recovery-bucket manifest independently, then enable the backup timer.
-13. Keep Cloud Run write-fenced and Cloud SQL frozen with deletion protection,
+    Immediately verify health, authentication, GitHub OAuth/App callbacks and
+    webhooks, WebSockets, CORS, artifact signed URLs, and one controlled
+    production write. On any failure after edge activation, immediately stop
+    the edge and API, verify both are inactive, and keep the worker stopped to
+    contain new local writes. Keep Cloud Run fenced and roll forward locally
+    unless a reviewed reverse synchronization proves Cloud SQL contains every
+    local write.
+14. Run another manual backup after the controlled write and independently
+    verify its manifest. Then start the worker and confirm exactly one process
+    owns advisory leadership and dispatch/reaper heartbeats are current. Enable
+    the backup timer only after those checks pass.
+15. Keep Cloud Run write-fenced and Cloud SQL frozen with deletion protection,
    PITR, and backups for at least 72 hours and multiple successful local
    backups. Do not delete Cloud SQL during the observation window.
 
-The rollback boundary is the first production write committed to local
-PostgreSQL. Before that point, keep all local application units stopped, rotate
+The rollback boundary is API activation, because its initialization and
+background tasks can write without public traffic. Before that point, stop and
+verify API, edge, and worker are all inactive, rotate
 the Cloud SQL `postgres` password back to the original value still held by the
 old production secret (again using `--prompt-for-password`, never argv), verify
 the resulting `UPDATE_USER` operation is `DONE`, apply the previously reviewed
@@ -790,8 +814,9 @@ retaining the non-secret evidence and dump under the approved retention policy:
 sudo rm -- /var/lib/blueprint/cutover/cloudsql-source-password
 ```
 
-After the first local write, a direct rollback to the old Cloud SQL database
-discards every local-only write and is therefore unsafe. Failback then requires
+After API activation, assume a local write may have committed. A direct
+rollback to the old Cloud SQL database can discard local-only writes and is
+therefore unsafe. Failback then requires
 a reviewed reverse migration or restore into Cloud SQL, a new write freeze,
 reconciliation evidence, and an explicit operator decision. Do not describe
 “restart Cloud Run” as a complete rollback after local writes begin.

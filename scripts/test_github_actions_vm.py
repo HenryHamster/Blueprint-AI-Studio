@@ -275,7 +275,7 @@ class AssetSecurityTests(unittest.TestCase):
             workflow,
         )
 
-    def test_viewport_retry_distinguishes_timeout_from_child_exit(self):
+    def test_viewport_retry_distinguishes_infrastructure_from_child_exit(self):
         bash = None
         if os.name == "nt":
             git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
@@ -302,17 +302,29 @@ class AssetSecurityTests(unittest.TestCase):
             attempt_log = temp / "attempt.log"
             fake_docker = fake_bin / "docker"
             fake_docker.write_text(
-                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$DOCKER_LOG"\n',
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "'
+                + bash_path(docker_log)
+                + '"\n',
                 encoding="utf-8",
             )
             fake_docker.chmod(0o755)
+            fake_tee = fake_bin / "tee"
+            fake_tee.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [[ "${FAIL_TEE:-}" == "1" ]]; then\n'
+                "  cat >/dev/null\n"
+                "  exit 1\n"
+                "fi\n"
+                'exec /usr/bin/tee "$@"\n',
+                encoding="utf-8",
+            )
+            fake_tee.chmod(0o755)
 
             env = os.environ.copy()
             env.update(
                 {
                     "BLUEPRINT_VIEWPORT_KILL_AFTER": "0.1s",
                     "ATTEMPT_LOG": bash_path(attempt_log),
-                    "DOCKER_LOG": bash_path(docker_log),
                     "PATH": f"{bash_path(fake_bin)}:{env.get('PATH', '')}",
                     "RUNNER_TEMP": bash_path(temp),
                 }
@@ -348,6 +360,67 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertEqual(normal_failure.returncode, 42, normal_failure.stderr)
             self.assertFalse(docker_log.exists())
 
+            env["FAIL_TEE"] = "1"
+            capture_failure = run("exit 0")
+            env.pop("FAIL_TEE")
+            self.assertEqual(capture_failure.returncode, 125, capture_failure.stderr)
+            self.assertIn(
+                "Could not capture viewport provider output", capture_failure.stderr
+            )
+            self.assertFalse(docker_log.exists())
+
+            partial_provider_error = run(
+                'printf "%s\\n" "Cannot connect to the iframe."; exit 43'
+            )
+            self.assertEqual(
+                partial_provider_error.returncode, 43, partial_provider_error.stderr
+            )
+            self.assertFalse(docker_log.exists())
+
+            provider_disconnect_then_success = run(
+                'if [[ ! -e "$ATTEMPT_LOG" ]]; then '
+                'printf "attempt\\n" > "$ATTEMPT_LOG"; '
+                'printf "%s\\n" "Failed to fetch dynamically imported module: test" '
+                '"Cannot connect to the iframe." '
+                '"Vitest caught 1 unhandled error during the test run."; '
+                'exit 1; '
+                'fi; '
+                'printf "attempt\\n" >> "$ATTEMPT_LOG"'
+            )
+            self.assertEqual(
+                provider_disconnect_then_success.returncode,
+                0,
+                provider_disconnect_then_success.stderr,
+            )
+            self.assertIn(
+                "disconnected from its browser iframe; retrying once",
+                provider_disconnect_then_success.stderr,
+            )
+            self.assertEqual(
+                attempt_log.read_text(encoding="utf-8").count("attempt"), 2
+            )
+            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+
+            docker_log.unlink()
+            attempt_log.unlink()
+            persistent_provider_disconnect = run(
+                'printf "%s\\n" "Failed to fetch dynamically imported module: test" '
+                '"Cannot connect to the iframe." '
+                '"Vitest caught 1 unhandled error during the test run."; '
+                "exit 44"
+            )
+            self.assertEqual(
+                persistent_provider_disconnect.returncode,
+                44,
+                persistent_provider_disconnect.stderr,
+            )
+            self.assertIn(
+                "disconnected from its browser iframe; retrying once",
+                persistent_provider_disconnect.stderr,
+            )
+            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+
+            docker_log.unlink()
             responsive_timeout = run('echo attempt >> "$ATTEMPT_LOG"; sleep 2')
             self.assertEqual(responsive_timeout.returncode, 124)
             self.assertIn("timed out; retrying once", responsive_timeout.stderr)
