@@ -103,7 +103,8 @@ class FakeSql:
                 "ipConfiguration": {
                     "ipv4Enabled": False,
                     "privateNetwork": (
-                        "/projects/blueprint-recovery/global/networks/recovery"
+                        "https://compute.googleapis.com/compute/v1/"
+                        "projects/blueprint-recovery/global/networks/recovery"
                     ),
                     "allocatedIpRange": "blueprint-restore-private-services",
                 }
@@ -274,6 +275,17 @@ def runtime(
 
 
 class ConfigTests(unittest.TestCase):
+    def test_normalizes_legacy_leading_slash_network_input(self):
+        cfg = config(
+            RECOVERY_PRIVATE_NETWORK=(
+                "/projects/blueprint-recovery/global/networks/recovery"
+            )
+        )
+        self.assertEqual(
+            cfg.private_network,
+            "projects/blueprint-recovery/global/networks/recovery",
+        )
+
     def test_requires_independent_projects_and_recovery_network(self):
         with self.assertRaisesRegex(verifier.DrillError, "projects_not_independent"):
             config(SOURCE_PROJECT_ID="blueprint-recovery")
@@ -594,7 +606,11 @@ class CloudSqlContractTests(unittest.TestCase):
         ip_config = settings["ipConfiguration"]
         self.assertIs(ip_config["ipv4Enabled"], False)
         self.assertEqual(ip_config["authorizedNetworks"], [])
-        self.assertIn("blueprint-recovery", ip_config["privateNetwork"])
+        self.assertEqual(
+            ip_config["privateNetwork"],
+            "https://compute.googleapis.com/compute/v1/"
+            "projects/blueprint-recovery/global/networks/recovery",
+        )
         self.assertEqual(
             ip_config["allocatedIpRange"], "blueprint-restore-private-services"
         )
@@ -652,9 +668,60 @@ class CloudSqlContractTests(unittest.TestCase):
                 "http_status": 400,
                 "provider_status": "INVALID_ARGUMENT",
                 "provider_reason": "BAD_REQUEST",
+                "provider_message_redacted": True,
             },
         )
         self.assertNotIn("secret", json.dumps(raised.exception.diagnostic))
+
+    def test_rest_client_preserves_safe_bounded_instance_create_message(self):
+        message = (
+            "Project blueprint-recovery has invalid private network name "
+            "/projects/blueprint-recovery/global/networks/recovery"
+        )
+        response = SimpleNamespace(
+            status_code=400,
+            content=b"safe",
+            json=lambda: {
+                "error": {
+                    "message": message,
+                    "errors": [{"reason": "invalid", "message": message}],
+                }
+            },
+        )
+        session = Mock()
+        session.request.return_value = response
+        client = verifier.SqlAdminRest(session, "blueprint-recovery")
+        with self.assertRaises(verifier.AdminApiError) as raised:
+            client.create_instance("bp-restore-202607301200-a1b2c3", {})
+        self.assertEqual(
+            raised.exception.diagnostic,
+            {
+                "http_status": 400,
+                "provider_reason": "INVALID",
+                "provider_message": message,
+            },
+        )
+
+    def test_provider_message_filter_rejects_secret_like_or_high_entropy_data(self):
+        self.assertIsNone(
+            verifier._safe_provider_message("Invalid bearer token abc123")
+        )
+        self.assertIsNone(
+            verifier._safe_provider_message("Invalid value " + "a" * 64)
+        )
+        self.assertIsNone(
+            verifier._safe_provider_message(
+                "Invalid value "
+                "sk-proj-abcdefghijklmnopqrstuvwx-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            )
+        )
+        self.assertIsNone(
+            verifier._safe_provider_message("Invalid network\x00name")
+        )
+        self.assertEqual(
+            verifier._safe_provider_message("Invalid network\n name"),
+            "Invalid network name",
+        )
 
     def test_rest_client_transport_failure_is_ambiguous_and_non_sensitive(self):
         session = Mock()
@@ -679,7 +746,7 @@ class CloudSqlContractTests(unittest.TestCase):
                 "ipConfiguration": {
                     "ipv4Enabled": False,
                     "privateNetwork": (
-                        "/projects/blueprint-recovery/global/networks/recovery"
+                        "projects/blueprint-recovery/global/networks/recovery"
                     ),
                     "allocatedIpRange": "blueprint-restore-private-services",
                 }
@@ -708,6 +775,38 @@ class CloudSqlContractTests(unittest.TestCase):
                     "instance_not_private_recovery_only",
                 ):
                     verifier._verify_private_instance(instance, config())
+
+    def test_instance_verification_rejects_noncanonical_or_cross_project_network(self):
+        base = FakeSql().get_instance("bp-restore-202607301200-a1b2c3")
+        for private_network in (
+            "/projects/blueprint-recovery/global/networks/recovery",
+            "projects/blueprint-production/global/networks/recovery",
+            "projects/blueprint-recovery/global/networks/other",
+            (
+                "https://attacker.invalid/compute/v1/"
+                "projects/blueprint-recovery/global/networks/recovery"
+            ),
+        ):
+            instance = json.loads(json.dumps(base))
+            instance["settings"]["ipConfiguration"][
+                "privateNetwork"
+            ] = private_network
+            with self.subTest(private_network=private_network):
+                with self.assertRaisesRegex(
+                    verifier.DrillError,
+                    "instance_not_private_recovery_only",
+                ):
+                    verifier._verify_private_instance(instance, config())
+
+    def test_instance_verification_accepts_documented_network_resource_path(self):
+        instance = FakeSql().get_instance("bp-restore-202607301200-a1b2c3")
+        instance["settings"]["ipConfiguration"]["privateNetwork"] = (
+            "projects/blueprint-recovery/global/networks/recovery"
+        )
+        self.assertEqual(
+            verifier._verify_private_instance(instance, config()),
+            "blueprint-recovery:us-central1:bp-restore-202607301200-a1b2c3",
+        )
 
     def test_operation_failure_and_timeout_fail_closed(self):
         failed_sql = FakeSql(fail_stage="archive_import")

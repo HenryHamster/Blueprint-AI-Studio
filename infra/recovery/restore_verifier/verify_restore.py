@@ -25,6 +25,23 @@ _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
 _REGION_RE = re.compile(r"^[a-z]+-[a-z0-9]+[0-9]$")
 _NETWORK_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 _SAFE_API_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_SAFE_PROVIDER_MESSAGE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9 .,;:_/@()+\-]{0,511}$"
+)
+_SENSITIVE_PROVIDER_MESSAGE_RE = re.compile(
+    r"authorization|bearer|token|password|secret|credential|private[ _-]?key|"
+    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    re.IGNORECASE,
+)
+_HIGH_ENTROPY_PROVIDER_MESSAGE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"[A-Fa-f0-9]{32,}|"
+    r"(?:sk|pk|rk)[_-][A-Za-z0-9_-]{16,}|"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}|"
+    r"[A-Za-z0-9_+=-]{40,}"
+    r")(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 _REVISION_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 _PREFIX_RE = re.compile(r"^[a-zA-Z0-9_./-]{1,160}$")
 _INSTANCE_RE = re.compile(r"^[a-z][a-z0-9-]{0,96}[a-z0-9]$")
@@ -35,6 +52,10 @@ _DATABASE_NAME = "blueprint"
 _DATABASE_USER = "postgres"
 _DRILL_TIER = "db-custom-1-3840"
 _DRILL_DISK_GB = 20
+_COMPUTE_NETWORK_SELF_LINK_PREFIXES = (
+    "https://compute.googleapis.com/compute/v1/",
+    "https://www.googleapis.com/compute/v1/",
+)
 _REQUIRED_COLUMNS = {
     "alembic_version": {"version_num"},
     "alloweduser": {"id", "email", "role"},
@@ -82,6 +103,43 @@ def _required(env: dict[str, str], name: str) -> str:
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise DrillError("configuration", f"invalid_{name.lower()}")
     return value
+
+
+def _network_resource_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    resource_path = value
+    for prefix in _COMPUTE_NETWORK_SELF_LINK_PREFIXES:
+        if value.startswith(prefix):
+            resource_path = value.removeprefix(prefix)
+            break
+    parts = resource_path.split("/")
+    if (
+        len(parts) != 5
+        or parts[0] != "projects"
+        or not _PROJECT_RE.fullmatch(parts[1])
+        or parts[2:4] != ["global", "networks"]
+        or not _NETWORK_NAME_RE.fullmatch(parts[4])
+    ):
+        return None
+    return resource_path
+
+
+def _network_self_link(resource_path: str) -> str:
+    return f"{_COMPUTE_NETWORK_SELF_LINK_PREFIXES[0]}{resource_path}"
+
+
+def _safe_provider_message(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    if (
+        not _SAFE_PROVIDER_MESSAGE_RE.fullmatch(normalized)
+        or _SENSITIVE_PROVIDER_MESSAGE_RE.search(normalized)
+        or _HIGH_ENTROPY_PROVIDER_MESSAGE_RE.search(normalized)
+    ):
+        return None
+    return normalized
 
 
 def _bounded_int(
@@ -227,7 +285,7 @@ class Config:
             source_project_id=source_project,
             bucket_name=bucket,
             region=region,
-            private_network=f"/{normalized_network}",
+            private_network=normalized_network,
             private_service_range=private_service_range,
             expected_revision=revision,
             archive_prefix=archive_prefix,
@@ -575,6 +633,21 @@ class SqlAdminRest:
                             diagnostic[key] = re.sub(
                                 r"(?<=[a-z0-9])(?=[A-Z])", "_", value
                             ).replace("-", "_").upper()
+                    if stage == "instance_create" and status in {400, 422}:
+                        nested_message = (
+                            errors[0].get("message")
+                            if isinstance(errors, list)
+                            and errors
+                            and isinstance(errors[0], dict)
+                            else None
+                        )
+                        provider_message = _safe_provider_message(
+                            nested_message or error.get("message")
+                        )
+                        if provider_message is None:
+                            diagnostic["provider_message_redacted"] = True
+                        else:
+                            diagnostic["provider_message"] = provider_message
             raise AdminApiError(
                 stage,
                 code,
@@ -760,7 +833,7 @@ def _instance_body(config: Config, name: str, expires_at: datetime) -> dict[str,
             "backupConfiguration": {"enabled": False},
             "ipConfiguration": {
                 "ipv4Enabled": False,
-                "privateNetwork": config.private_network,
+                "privateNetwork": _network_self_link(config.private_network),
                 "allocatedIpRange": config.private_service_range,
                 "authorizedNetworks": [],
             },
@@ -859,7 +932,8 @@ def _verify_private_instance(instance: dict[str, Any], config: Config) -> str:
         or instance.get("sqlNetworkArchitecture")
         != "NEW_NETWORK_ARCHITECTURE"
         or ip_config.get("ipv4Enabled") is not False
-        or ip_config.get("privateNetwork") != config.private_network
+        or _network_resource_path(ip_config.get("privateNetwork"))
+        != config.private_network
         or ip_config.get("allocatedIpRange")
         != config.private_service_range
     ):
