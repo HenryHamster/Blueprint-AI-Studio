@@ -1,7 +1,11 @@
 import { spawn } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import {
-  WORKSPACE, getAgentToken, log, recordLlmCallStart, recordLlmTokens, recordNumTurns, sanitize,
+  WORKSPACE, getAgentToken, log, normalizeClaudeConfigContent,
+  recordLlmCallStart, recordLlmTokens, recordNumTurns, sanitize,
 } from '../index.js';
 import { writeAgentTokenFile } from '../token-file.js';
 import { PROCESS_KILL_GRACE_MS } from '../constants.js';
@@ -49,6 +53,40 @@ const RESIDENT_TURN_FORCE_SETTLE_MS = 20_000;       // stall+interrupt → force
 // operator-reply and bounded autonomous turns finish well within it.
 const DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS = 15 * 60_000;
 const OPERATOR_REPLY_TYPES = new Set(['NOTE', 'QUESTION', 'FEEDBACK', 'BUG_REPORT', 'BLOCKER']);
+
+/**
+ * Resident sessions bypass the ordinary task bootstrap that materializes and
+ * normalizes ``~/.claude.json``.  On sandboxed local runners that leaves
+ * Claude's project trust prompt active, so it ignores the session's declared
+ * permissions and exits before a provider turn.  The sandbox HOME is ephemeral,
+ * therefore write the same minimal onboarding/trust state immediately before
+ * starting the long-lived child rather than relying on host configuration.
+ */
+function ensureResidentClaudeWorkspaceTrust(
+  childEnv: NodeJS.ProcessEnv,
+  workspace: string,
+): void {
+  const home = childEnv.HOME || process.env.HOME || os.homedir();
+  const configPath = path.join(home, '.claude.json');
+  let existing = '{}';
+  try {
+    existing = fs.readFileSync(configPath, 'utf8');
+  } catch {
+    // A missing config is normal for OAuth-backed runners.  The normalizer
+    // creates the least-privilege onboarding/trust shell from an empty object.
+  }
+  const normalized = normalizeClaudeConfigContent(configPath, existing, workspace);
+  if (normalized === existing) return;
+  try {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(configPath, normalized, { encoding: 'utf8', mode: 0o600 });
+  } catch (error) {
+    // Do not turn a writable-config inconvenience into a resident crash.  The
+    // provider's own stderr remains the authoritative diagnostic if it still
+    // cannot start, while ordinary cloud runners retain their existing config.
+    log(`[resident] unable to materialize Claude workspace trust: ${sanitize(error instanceof Error ? error.message : String(error))}`);
+  }
+}
 
 /** The exact reply arguments observed on the native MCP tool_use event. */
 export interface ResidentOperatorReply {
@@ -323,6 +361,8 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // A foreground Call Resident has no helpers and must not create or inherit
   // that backend credential in its isolated environment.
   if (!opts.foregroundLaunch) writeAgentTokenFile(getAgentToken());
+
+  ensureResidentClaudeWorkspaceTrust(childEnv, workspace);
 
   const child = spawn(base.command, args, {
     cwd: opts.foregroundLaunch?.cwd ?? workspace,
